@@ -54,9 +54,11 @@ class MinimaxSearch:
         tensor = torch.zeros(1, 19, self.board_size, self.board_size, device=self.device)
         
         # 当前玩家棋子
-        tensor[0, 0][board == current_player] = 1
+        mask_current = torch.tensor(board == current_player, dtype=torch.bool, device=self.device)
+        tensor[0, 0][mask_current] = 1
         # 对手棋子
-        tensor[0, 8][board == -current_player] = 1
+        mask_opponent = torch.tensor(board == -current_player, dtype=torch.bool, device=self.device)
+        tensor[0, 8][mask_opponent] = 1
         # 当前玩家标记
         tensor[0, 16] = 1 if current_player == 1 else -1
         # 合法着法标记
