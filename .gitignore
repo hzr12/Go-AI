@@ -45,6 +45,7 @@ logs/
 
 # Game data (extracted)
 /data/games/
+data/games.tgz
 
 # OS
 .DS_Store
