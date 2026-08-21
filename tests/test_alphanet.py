@@ -12,7 +12,7 @@ from src.networks.policy_network import PolicyNetwork
 from src.networks.value_network import ValueNetwork
 from src.networks.fast_network import FastPolicyNetwork
 from src.networks.alphanet import AlphaGoNet
-from src.training.trainer import GoGame, ReplayBuffer, AlphaGoTrainer
+from src.training.trainer import GoGame, PrioritizedReplayBuffer, AlphaGoTrainer
 from src.inference import GoAI
 
 
@@ -176,17 +176,17 @@ class TestGoGame:
         assert tensor.shape == (19, 9, 9)
 
 
-class TestReplayBuffer:
-    """测试经验回放缓冲区"""
+class TestPrioritizedReplayBuffer:
+    """测试优先经验回放缓冲区"""
     
     def test_buffer_initialization(self):
         """测试缓冲区初始化"""
-        buffer = ReplayBuffer(capacity=100)
+        buffer = PrioritizedReplayBuffer(capacity=100)
         assert len(buffer) == 0
     
     def test_push_and_sample(self):
         """测试存储和采样"""
-        buffer = ReplayBuffer(capacity=100)
+        buffer = PrioritizedReplayBuffer(capacity=100)
         state = np.random.randn(19, 9, 9)
         action = 0
         reward = 1.0
@@ -197,7 +197,7 @@ class TestReplayBuffer:
         buffer.push(state, action, reward, next_state, done, policy)
         assert len(buffer) == 1
         
-        states, actions, rewards, next_states, dones, policies = buffer.sample(1)
+        states, actions, rewards, next_states, dones, policies, indices, weights = buffer.sample(1)
         assert states.shape == (1, 19, 9, 9)
         assert actions.shape == (1,)
         assert rewards.shape == (1,)

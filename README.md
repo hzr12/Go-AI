@@ -10,6 +10,14 @@
 - **自我对弈**：从零开始学习，无需棋谱数据
 - **可扩展**：支持9×9到19×19棋盘
 
+## 训练改进
+
+- **密集奖励**：每步都给领地差作为即时奖励，解决稀疏奖励问题
+- **N-step回报**：用n步回报替代仅终端奖励，加速价值学习
+- **对称性增强**：8种棋盘变换，数据量提升8倍
+- **优先经验回放**：根据TD-error优先采样，提高学习效率
+- **温度衰减**：随训练降低温度，平衡探索与利用
+
 ## 架构
 
 ```
@@ -78,7 +86,7 @@ python -m src.inference --model models/alphago_model.pth --mode analyze
 python scripts/train.py --num-games 5000
 
 # GPU训练（推荐）
-python scripts/train.py --num-games 5000 --device cuda --use-amp --batch-size 256
+python scripts/train.py --num-games 5000 --device cuda --use-amp --batch-size 384
 
 # 自定义参数
 python scripts/train.py --num-games 10000 \
@@ -119,17 +127,22 @@ python -m pytest tests/test_alphanet.py::TestAlphaGoTrainer -v
 | `--policy-weight` | 1.0 | 策略损失权重 |
 | `--value-weight` | 1.0 | 价值损失权重 |
 | `--fast-weight` | 0.5 | 快速策略损失权重 |
-| `--temperature` | 1.0 | 温度参数 |
+| `--temperature` | 1.0 | 初始温度 |
+| `--temperature-min` | 0.1 | 最小温度 |
+| `--temperature-decay` | 0.9999 | 温度衰减率 |
+| `--n-step` | 5 | N-step回报步数 |
+| `--gamma` | 0.99 | 折扣因子 |
+| `--use-augmentation` | True | 启用数据增强 |
+| `--use-prioritized-replay` | True | 启用优先经验回放 |
 | `--use-amp` | 自动 | 使用混合精度 |
 
 ## 训练流程
 
-1. **自我对弈**：策略网络生成着法，收集游戏数据
-2. **训练**：同时训练三个网络
-   - 策略损失：KL散度（从自我对弈策略学习）
-   - 价值损失：MSE（从游戏结果学习）
-   - 快速策略损失：KL散度（从策略网络蒸馏）
-3. **保存**：定期保存模型检查点
+1. **Phase 1**: 填充缓冲区（~1250局）
+2. **Phase 2**: 交替自我对弈+训练
+   - 每256局自我对弈
+   - 100步训练
+   - 定期保存模型
 
 ## 项目结构
 
@@ -156,7 +169,7 @@ Go-AI/
 ## 性能
 
 - **推理速度**：~1000 moves/sec (CPU)
-- **训练速度**：~0.3s/game (CPU), ~0.05s/game (GPU)
+- **训练速度**：~0.3s/局 (CPU), ~0.05s/局 (GPU)
 - **内存占用**：~500MB (CPU), ~1GB (GPU)
 
 ## 依赖
