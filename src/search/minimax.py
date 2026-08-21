@@ -6,7 +6,7 @@ from ..networks.resnet import MuZeroNet
 
 
 class MinimaxSearch:
-    """Minimax搜索算法，带Alpha-Beta剪枝，GPU优化"""
+    """Minimax搜索算法，GPU批量推理优化"""
     
     def __init__(self, 
                  model: MuZeroNet,
@@ -37,7 +37,7 @@ class MinimaxSearch:
         self.action_size = board_size * board_size
         self.use_amp = use_amp
         
-        # 预创建action_one_hot模板，避免重复创建
+        # 预创建所有action one-hot模板
         self._create_action_templates()
     
     def _create_action_templates(self):
@@ -82,172 +82,157 @@ class MinimaxSearch:
         
         return tensor
     
-    def get_candidate_moves(self, board: np.ndarray, current_player: int) -> List[Tuple[int, float]]:
-        """使用策略网络获取候选着法"""
-        with torch.no_grad():
-            tensor = self.board_to_tensor(board, current_player)
-            
-            # 使用AMP
-            if self.use_amp and self.device == 'cuda':
-                with torch.cuda.amp.autocast():
-                    state, policy, value = self.model.initial_inference(tensor)
-            else:
-                state, policy, value = self.model.initial_inference(tensor)
-            
-            # 获取策略概率
-            policy_probs = F.softmax(policy, dim=1).cpu().numpy()[0]
-            
-            # 获取合法着法
-            legal_moves = self.get_legal_moves(board)
-            
-            # 按概率排序
-            move_probs = [(move, policy_probs[move]) for move in legal_moves]
-            move_probs.sort(key=lambda x: x[1], reverse=True)
-            
-            # 返回Top-K候选
-            return move_probs[:self.top_k]
+    def _forward(self, tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """统一的网络前向传播，自动处理AMP"""
+        if self.use_amp and self.device == 'cuda':
+            with torch.cuda.amp.autocast():
+                return self.model.initial_inference(tensor)
+        else:
+            return self.model.initial_inference(tensor)
     
-    def minimax(self, 
-                state: torch.Tensor, 
-                depth: int, 
-                is_maximizing: bool, 
-                alpha: float = float('-inf'), 
-                beta: float = float('inf')) -> float:
+    def _prediction(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """统一的prediction网络前向传播"""
+        if self.use_amp and self.device == 'cuda':
+            with torch.cuda.amp.autocast():
+                return self.model.prediction(state)
+        else:
+            return self.model.prediction(state)
+    
+    def _dynamics(self, state: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """统一的dynamics网络前向传播"""
+        if self.use_amp and self.device == 'cuda':
+            with torch.cuda.amp.autocast():
+                return self.model.dynamics(state, action)
+        else:
+            return self.model.dynamics(state, action)
+    
+    def _batch_dynamics(self, state: torch.Tensor, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Minimax搜索
+        批量dynamics推理：一次评估多个候选着法
+        state: (1, C, H, W)
+        actions: (N, 1, H, W) - N个候选着法的one-hot
+        返回: next_states (N, C, H, W), rewards (N, 1)
+        """
+        # 扩展state以匹配batch_size
+        batch_size = actions.shape[0]
+        state_expanded = state.expand(batch_size, -1, -1, -1)
         
-        Args:
-            state: 当前状态
-            depth: 剩余搜索深度
-            is_maximizing: 是否为最大化玩家
-            alpha: Alpha值（用于Alpha-Beta剪枝）
-            beta: Beta值（用于Alpha-Beta剪枝）
-            
-        Returns:
-            评估值
+        if self.use_amp and self.device == 'cuda':
+            with torch.cuda.amp.autocast():
+                next_states, rewards = self.model.dynamics(state_expanded, actions)
+        else:
+            next_states, rewards = self.model.dynamics(state_expanded, actions)
+        
+        return next_states, rewards
+    
+    def _batch_prediction(self, states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        批量prediction推理：一次评估多个状态
+        states: (N, C, H, W)
+        返回: policies (N, action_size), values (N, 1)
+        """
+        if self.use_amp and self.device == 'cuda':
+            with torch.cuda.amp.autocast():
+                policies, values = self.model.prediction(states)
+        else:
+            policies, values = self.model.prediction(states)
+        
+        return policies, values
+    
+    def get_candidate_moves_gpu(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        GPU上获取候选着法（不传回CPU）
+        返回: candidate_indices (top_k), policy_probs (action_size)
+        """
+        policy, _ = self._prediction(state)
+        policy_probs = F.softmax(policy, dim=1).squeeze(0)  # (action_size,)
+        
+        # 使用torch.topk在GPU上选择Top-K
+        top_k_values, top_k_indices = torch.topk(policy_probs, self.top_k)
+        
+        return top_k_indices, policy_probs
+    
+    def minimax_batch(self, 
+                      state: torch.Tensor, 
+                      depth: int, 
+                      is_maximizing: bool, 
+                      alpha: float = float('-inf'), 
+                      beta: float = float('inf')) -> float:
+        """
+        GPU批量Minimax搜索
         """
         if depth == 0:
-            # 叶节点：使用价值网络评估
+            # 叶节点：批量评估
             with torch.no_grad():
-                if self.use_amp and self.device == 'cuda':
-                    with torch.cuda.amp.autocast():
-                        _, value = self.model.prediction(state)
-                else:
-                    _, value = self.model.prediction(state)
+                _, value = self._prediction(state)
                 return value.item()
         
-        # 获取候选着法
+        # 获取Top-K候选（GPU上）
+        candidate_indices, policy_probs = self.get_candidate_moves_gpu(state)
+        
+        # 批量构建候选着法的one-hot
+        candidate_actions = self.action_templates[candidate_indices]  # (top_k, 1, H, W)
+        
+        # 批量dynamics推理（一次性评估所有候选）
         with torch.no_grad():
-            if self.use_amp and self.device == 'cuda':
-                with torch.cuda.amp.autocast():
-                    policy, _ = self.model.prediction(state)
-            else:
-                policy, _ = self.model.prediction(state)
-            policy_probs = F.softmax(policy, dim=1).cpu().numpy()[0]
+            next_states, rewards = self._batch_dynamics(state, candidate_actions)
         
-        # 获取合法着法（简化：假设所有位置都合法）
-        legal_moves = list(range(self.action_size))
-        
-        # 按概率排序并取Top-K
-        move_probs = [(move, policy_probs[move]) for move in legal_moves]
-        move_probs.sort(key=lambda x: x[1], reverse=True)
-        candidate_moves = [move for move, _ in move_probs[:self.top_k]]
-        
+        # 逐个评估（因为alpha-beta剪枝需要顺序执行）
         if is_maximizing:
             max_eval = float('-inf')
-            for move in candidate_moves:
-                # 使用预创建的action_one-hot
-                action_one_hot = self.action_templates[move].unsqueeze(0)
-                
-                # 递归推理
-                with torch.no_grad():
-                    if self.use_amp and self.device == 'cuda':
-                        with torch.cuda.amp.autocast():
-                            next_state, reward = self.model.dynamics(state, action_one_hot)
-                    else:
-                        next_state, reward = self.model.dynamics(state, action_one_hot)
-                    next_state = next_state + 0.0  # 残差连接
-                
-                eval_score = self.minimax(next_state, depth - 1, False, alpha, beta)
-                eval_score += reward.item()  # 加上即时奖励
+            for i in range(min(self.top_k, candidate_indices.shape[0])):
+                eval_score = self.minimax_batch(next_states[i].unsqueeze(0), depth - 1, False, alpha, beta)
+                eval_score += rewards[i].item()
                 
                 max_eval = max(max_eval, eval_score)
                 alpha = max(alpha, eval_score)
                 
                 if self.use_alpha_beta and beta <= alpha:
-                    break  # Beta剪枝
+                    break
             
             return max_eval
         else:
             min_eval = float('inf')
-            for move in candidate_moves:
-                # 使用预创建的action_one-hot
-                action_one_hot = self.action_templates[move].unsqueeze(0)
-                
-                # 递归推理
-                with torch.no_grad():
-                    if self.use_amp and self.device == 'cuda':
-                        with torch.cuda.amp.autocast():
-                            next_state, reward = self.model.dynamics(state, action_one_hot)
-                    else:
-                        next_state, reward = self.model.dynamics(state, action_one_hot)
-                    next_state = next_state + 0.0  # 残差连接
-                
-                eval_score = self.minimax(next_state, depth - 1, True, alpha, beta)
-                eval_score -= reward.item()  # 对手的奖励是我们的损失
+            for i in range(min(self.top_k, candidate_indices.shape[0])):
+                eval_score = self.minimax_batch(next_states[i].unsqueeze(0), depth - 1, True, alpha, beta)
+                eval_score -= rewards[i].item()
                 
                 min_eval = min(min_eval, eval_score)
                 beta = min(beta, eval_score)
                 
                 if self.use_alpha_beta and beta <= alpha:
-                    break  # Alpha剪枝
+                    break
             
             return min_eval
     
     def search(self, board: np.ndarray, current_player: int) -> Tuple[int, float]:
         """
         执行搜索，返回最佳着法
-        
-        Args:
-            board: 当前棋盘状态
-            current_player: 当前玩家 (1 或 -1)
-            
-        Returns:
-            (最佳着法, 评估值)
         """
         with torch.no_grad():
             # 获取初始状态
             tensor = self.board_to_tensor(board, current_player)
+            state, initial_policy, initial_value = self._forward(tensor)
             
-            # 使用AMP
-            if self.use_amp and self.device == 'cuda':
-                with torch.cuda.amp.autocast():
-                    state, initial_policy, initial_value = self.model.initial_inference(tensor)
-            else:
-                state, initial_policy, initial_value = self.model.initial_inference(tensor)
+            # 获取Top-K候选（GPU上）
+            candidate_indices, policy_probs = self.get_candidate_moves_gpu(state)
             
-            # 获取候选着法
-            candidates = self.get_candidate_moves(board, current_player)
+            # 批量构建候选着法的one-hot
+            candidate_actions = self.action_templates[candidate_indices]
             
+            # 批量dynamics推理（一次性评估所有候选）
+            next_states, rewards = self._batch_dynamics(state, candidate_actions)
+            
+            # 逐个搜索（alpha-beta剪枝需要顺序执行）
             best_move = None
             best_score = float('-inf')
             
-            # 对每个候选着法进行评估
-            for move, prob in candidates:
-                # 使用预创建的action_one-hot
-                action_one_hot = self.action_templates[move].unsqueeze(0)
+            for i in range(min(self.top_k, candidate_indices.shape[0])):
+                move = candidate_indices[i].item()
                 
-                # 递归推理
-                if self.use_amp and self.device == 'cuda':
-                    with torch.cuda.amp.autocast():
-                        next_state, reward = self.model.dynamics(state, action_one_hot)
-                else:
-                    next_state, reward = self.model.dynamics(state, action_one_hot)
-                next_state = next_state + 0.0  # 残差连接
-                
-                # Minimax搜索
-                score = self.minimax(next_state, self.search_depth - 1, False)
-                score += reward.item()  # 加上即时奖励
+                # Minimax搜索（确保4D输入）
+                score = self.minimax_batch(next_states[i].unsqueeze(0), self.search_depth - 1, False)
+                score += rewards[i].item()
                 
                 if score > best_score:
                     best_score = score
@@ -259,13 +244,7 @@ class MinimaxSearch:
         """获取所有着法的概率分布（用于训练）"""
         with torch.no_grad():
             tensor = self.board_to_tensor(board, current_player)
-            
-            # 使用AMP
-            if self.use_amp and self.device == 'cuda':
-                with torch.cuda.amp.autocast():
-                    state, policy, value = self.model.initial_inference(tensor)
-            else:
-                state, policy, value = self.model.initial_inference(tensor)
+            state, policy, value = self._forward(tensor)
             
             # 获取策略概率
             policy_probs = F.softmax(policy, dim=1).cpu().numpy()[0]
@@ -275,7 +254,24 @@ class MinimaxSearch:
             if total > 0:
                 policy_probs /= total
             else:
-                # 如果没有概率，使用均匀分布
                 policy_probs = np.ones(self.action_size) / self.action_size
             
             return policy_probs
+    
+    def get_candidate_moves(self, board: np.ndarray, current_player: int) -> List[Tuple[int, float]]:
+        """使用策略网络获取候选着法（兼容旧接口）"""
+        with torch.no_grad():
+            tensor = self.board_to_tensor(board, current_player)
+            state, policy, value = self._forward(tensor)
+            
+            # 获取策略概率
+            policy_probs = F.softmax(policy, dim=1).cpu().numpy()[0]
+            
+            # 获取合法着法
+            legal_moves = self.get_legal_moves(board)
+            
+            # 按概率排序
+            move_probs = [(move, policy_probs[move]) for move in legal_moves]
+            move_probs.sort(key=lambda x: x[1], reverse=True)
+            
+            return move_probs[:self.top_k]
