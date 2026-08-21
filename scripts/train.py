@@ -134,7 +134,10 @@ def main():
     if args.pretrain_data:
         print(f"\nLoading pretrain data from: {args.pretrain_data}")
         loader = GameLoader(args.board_size)
-        game_records = loader.load_directory(args.pretrain_data)
+        if os.path.isfile(args.pretrain_data):
+            game_records = loader.load_tgz(args.pretrain_data)
+        else:
+            game_records = loader.load_directory(args.pretrain_data)
         print(f"Loaded {len(game_records)} games")
         
         if game_records:

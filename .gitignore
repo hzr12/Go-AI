@@ -40,9 +40,14 @@ ENV/
 # Training outputs
 models/
 logs/
-data/
 *.pth
 *.npz
+
+# Game data
+/data/
+*.sgf
+*.tgz
+*.tar.gz
 
 # OS
 .DS_Store
