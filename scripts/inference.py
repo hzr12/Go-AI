@@ -20,11 +20,15 @@ def main():
     parser.add_argument('--search-depth', type=int, default=10, help='搜索深度')
     parser.add_argument('--top-k', type=int, default=5, help='候选着法数量')
     parser.add_argument('--device', type=str, default='cpu', help='设备')
+    parser.add_argument('--use-amp', action='store_true', help='使用自动混合精度')
     parser.add_argument('--mode', type=str, default='play', 
                        choices=['play', 'eval', 'analyze'],
                        help='运行模式')
     
     args = parser.parse_args()
+    
+    # 检测是否使用AMP
+    use_amp = args.use_amp or args.device == 'cuda'
     
     # 创建AI
     ai = GoAI(
@@ -32,7 +36,8 @@ def main():
         board_size=args.board_size,
         search_depth=args.search_depth,
         top_k=args.top_k,
-        device=args.device
+        device=args.device,
+        use_amp=use_amp
     )
     
     if args.mode == 'play':

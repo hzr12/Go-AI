@@ -14,7 +14,8 @@ class GoAI:
                  search_depth: int = 10,
                  top_k: int = 5,
                  use_alpha_beta: bool = True,
-                 device: str = 'cpu'):
+                 device: str = 'cpu',
+                 use_amp: bool = False):
         """
         初始化围棋AI
         
@@ -25,9 +26,11 @@ class GoAI:
             top_k: 候选着法数量
             use_alpha_beta: 是否使用Alpha-Beta剪枝
             device: 设备 (cpu/cuda)
+            use_amp: 是否使用自动混合精度
         """
         self.board_size = board_size
         self.device = device
+        self.use_amp = use_amp
         
         # 创建网络
         self.model = MuZeroNet(
@@ -48,7 +51,8 @@ class GoAI:
             search_depth=search_depth,
             top_k=top_k,
             use_alpha_beta=use_alpha_beta,
-            device=device
+            device=device,
+            use_amp=use_amp
         )
         
         # 棋盘状态

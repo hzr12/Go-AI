@@ -30,6 +30,7 @@ def main():
     parser.add_argument('--num-games', type=int, default=5000, help='训练局数')
     parser.add_argument('--save-path', type=str, default='models/model.pth', help='模型保存路径')
     parser.add_argument('--device', type=str, default='auto', help='设备 (auto/cpu/cuda)')
+    parser.add_argument('--use-amp', action='store_true', help='使用自动混合精度训练')
     
     args = parser.parse_args()
     
@@ -49,6 +50,9 @@ def main():
             device=args.device
         )
     
+    # 检测是否使用AMP
+    use_amp = args.use_amp or config.device == 'cuda'
+    
     print(f"Configuration: {args.config}")
     print(f"Board size: {config.board_size}")
     print(f"Channels: {config.channels}")
@@ -59,6 +63,7 @@ def main():
     print(f"Batch size: {config.batch_size}")
     print(f"Num games: {config.num_games}")
     print(f"Device: {config.device}")
+    print(f"Use AMP: {use_amp}")
     
     # 创建网络
     model = MuZeroNet(
@@ -80,7 +85,8 @@ def main():
         weight_decay=config.weight_decay,
         batch_size=config.batch_size,
         buffer_size=config.buffer_size,
-        device=config.device
+        device=config.device,
+        use_amp=use_amp
     )
     
     # 开始训练

@@ -1,11 +1,12 @@
 import torch
+import torch.nn.functional as F
 import numpy as np
 from typing import List, Tuple, Optional
 from ..networks.resnet import MuZeroNet
 
 
 class MinimaxSearch:
-    """Minimax搜索算法，带Alpha-Beta剪枝"""
+    """Minimax搜索算法，带Alpha-Beta剪枝，GPU优化"""
     
     def __init__(self, 
                  model: MuZeroNet,
@@ -13,7 +14,8 @@ class MinimaxSearch:
                  search_depth: int = 10,
                  top_k: int = 5,
                  use_alpha_beta: bool = True,
-                 device: str = 'cpu'):
+                 device: str = 'cpu',
+                 use_amp: bool = False):
         """
         初始化Minimax搜索
         
@@ -24,6 +26,7 @@ class MinimaxSearch:
             top_k: 策略网络选择的候选着法数量
             use_alpha_beta: 是否使用Alpha-Beta剪枝
             device: 设备 (cpu/cuda)
+            use_amp: 是否使用自动混合精度
         """
         self.model = model
         self.board_size = board_size
@@ -32,6 +35,21 @@ class MinimaxSearch:
         self.use_alpha_beta = use_alpha_beta
         self.device = device
         self.action_size = board_size * board_size
+        self.use_amp = use_amp
+        
+        # 预创建action_one_hot模板，避免重复创建
+        self._create_action_templates()
+    
+    def _create_action_templates(self):
+        """预创建所有可能的action one-hot张量"""
+        self.action_templates = torch.zeros(
+            self.action_size, 1, self.board_size, self.board_size, 
+            device=self.device
+        )
+        for i in range(self.action_size):
+            self.action_templates[i].view(1, -1).scatter_(
+                1, torch.tensor([[i]], device=self.device), 1
+            )
     
     def get_legal_moves(self, board: np.ndarray) -> List[int]:
         """获取合法着法（简单实现：空位）"""
@@ -44,13 +62,6 @@ class MinimaxSearch:
     
     def board_to_tensor(self, board: np.ndarray, current_player: int) -> torch.Tensor:
         """将棋盘转换为网络输入张量"""
-        # 简单实现：19通道
-        # 通道0-7: 当前玩家棋子位置（8步历史）
-        # 通道8-15: 对手棋子位置（8步历史）
-        # 通道16: 当前玩家标记
-        # 通道17: 合法着法标记
-        # 通道18: 棋盘大小标记
-        
         tensor = torch.zeros(1, 19, self.board_size, self.board_size, device=self.device)
         
         # 当前玩家棋子
@@ -63,9 +74,11 @@ class MinimaxSearch:
         tensor[0, 16] = 1 if current_player == 1 else -1
         # 合法着法标记
         legal_moves = self.get_legal_moves(board)
-        for move in legal_moves:
-            i, j = move // self.board_size, move % self.board_size
-            tensor[0, 17, i, j] = 1
+        if legal_moves:
+            legal_tensor = torch.tensor(legal_moves, device=self.device)
+            rows = legal_tensor // self.board_size
+            cols = legal_tensor % self.board_size
+            tensor[0, 17, rows, cols] = 1
         
         return tensor
     
@@ -73,10 +86,16 @@ class MinimaxSearch:
         """使用策略网络获取候选着法"""
         with torch.no_grad():
             tensor = self.board_to_tensor(board, current_player)
-            state, policy, value = self.model.initial_inference(tensor)
+            
+            # 使用AMP
+            if self.use_amp and self.device == 'cuda':
+                with torch.cuda.amp.autocast():
+                    state, policy, value = self.model.initial_inference(tensor)
+            else:
+                state, policy, value = self.model.initial_inference(tensor)
             
             # 获取策略概率
-            policy_probs = torch.softmax(policy, dim=1).cpu().numpy()[0]
+            policy_probs = F.softmax(policy, dim=1).cpu().numpy()[0]
             
             # 获取合法着法
             legal_moves = self.get_legal_moves(board)
@@ -110,12 +129,21 @@ class MinimaxSearch:
         if depth == 0:
             # 叶节点：使用价值网络评估
             with torch.no_grad():
-                _, value = self.model.prediction(state)
+                if self.use_amp and self.device == 'cuda':
+                    with torch.cuda.amp.autocast():
+                        _, value = self.model.prediction(state)
+                else:
+                    _, value = self.model.prediction(state)
                 return value.item()
         
         # 获取候选着法
-        policy, _ = self.model.prediction(state)
-        policy_probs = torch.softmax(policy, dim=1).cpu().numpy()[0]
+        with torch.no_grad():
+            if self.use_amp and self.device == 'cuda':
+                with torch.cuda.amp.autocast():
+                    policy, _ = self.model.prediction(state)
+            else:
+                policy, _ = self.model.prediction(state)
+            policy_probs = F.softmax(policy, dim=1).cpu().numpy()[0]
         
         # 获取合法着法（简化：假设所有位置都合法）
         legal_moves = list(range(self.action_size))
@@ -128,13 +156,17 @@ class MinimaxSearch:
         if is_maximizing:
             max_eval = float('-inf')
             for move in candidate_moves:
-                # 创建动作one-hot
-                action_one_hot = torch.zeros(1, 1, self.board_size, self.board_size, device=self.device)
-                action_one_hot.view(1, -1).scatter_(1, torch.tensor([[move]], device=self.device), 1)
+                # 使用预创建的action_one-hot
+                action_one_hot = self.action_templates[move].unsqueeze(0)
                 
                 # 递归推理
-                next_state, reward = self.model.dynamics(state, action_one_hot)
-                next_state = next_state + 0.0  # 残差连接
+                with torch.no_grad():
+                    if self.use_amp and self.device == 'cuda':
+                        with torch.cuda.amp.autocast():
+                            next_state, reward = self.model.dynamics(state, action_one_hot)
+                    else:
+                        next_state, reward = self.model.dynamics(state, action_one_hot)
+                    next_state = next_state + 0.0  # 残差连接
                 
                 eval_score = self.minimax(next_state, depth - 1, False, alpha, beta)
                 eval_score += reward.item()  # 加上即时奖励
@@ -149,13 +181,17 @@ class MinimaxSearch:
         else:
             min_eval = float('inf')
             for move in candidate_moves:
-                # 创建动作one-hot
-                action_one_hot = torch.zeros(1, 1, self.board_size, self.board_size, device=self.device)
-                action_one_hot.view(1, -1).scatter_(1, torch.tensor([[move]], device=self.device), 1)
+                # 使用预创建的action_one-hot
+                action_one_hot = self.action_templates[move].unsqueeze(0)
                 
                 # 递归推理
-                next_state, reward = self.model.dynamics(state, action_one_hot)
-                next_state = next_state + 0.0  # 残差连接
+                with torch.no_grad():
+                    if self.use_amp and self.device == 'cuda':
+                        with torch.cuda.amp.autocast():
+                            next_state, reward = self.model.dynamics(state, action_one_hot)
+                    else:
+                        next_state, reward = self.model.dynamics(state, action_one_hot)
+                    next_state = next_state + 0.0  # 残差连接
                 
                 eval_score = self.minimax(next_state, depth - 1, True, alpha, beta)
                 eval_score -= reward.item()  # 对手的奖励是我们的损失
@@ -182,7 +218,13 @@ class MinimaxSearch:
         with torch.no_grad():
             # 获取初始状态
             tensor = self.board_to_tensor(board, current_player)
-            state, initial_policy, initial_value = self.model.initial_inference(tensor)
+            
+            # 使用AMP
+            if self.use_amp and self.device == 'cuda':
+                with torch.cuda.amp.autocast():
+                    state, initial_policy, initial_value = self.model.initial_inference(tensor)
+            else:
+                state, initial_policy, initial_value = self.model.initial_inference(tensor)
             
             # 获取候选着法
             candidates = self.get_candidate_moves(board, current_player)
@@ -192,12 +234,15 @@ class MinimaxSearch:
             
             # 对每个候选着法进行评估
             for move, prob in candidates:
-                # 创建动作one-hot
-                action_one_hot = torch.zeros(1, 1, self.board_size, self.board_size, device=self.device)
-                action_one_hot.view(1, -1).scatter_(1, torch.tensor([[move]], device=self.device), 1)
+                # 使用预创建的action_one-hot
+                action_one_hot = self.action_templates[move].unsqueeze(0)
                 
                 # 递归推理
-                next_state, reward = self.model.dynamics(state, action_one_hot)
+                if self.use_amp and self.device == 'cuda':
+                    with torch.cuda.amp.autocast():
+                        next_state, reward = self.model.dynamics(state, action_one_hot)
+                else:
+                    next_state, reward = self.model.dynamics(state, action_one_hot)
                 next_state = next_state + 0.0  # 残差连接
                 
                 # Minimax搜索
@@ -214,10 +259,16 @@ class MinimaxSearch:
         """获取所有着法的概率分布（用于训练）"""
         with torch.no_grad():
             tensor = self.board_to_tensor(board, current_player)
-            state, policy, value = self.model.initial_inference(tensor)
+            
+            # 使用AMP
+            if self.use_amp and self.device == 'cuda':
+                with torch.cuda.amp.autocast():
+                    state, policy, value = self.model.initial_inference(tensor)
+            else:
+                state, policy, value = self.model.initial_inference(tensor)
             
             # 获取策略概率
-            policy_probs = torch.softmax(policy, dim=1).cpu().numpy()[0]
+            policy_probs = F.softmax(policy, dim=1).cpu().numpy()[0]
             
             # 归一化
             total = policy_probs.sum()

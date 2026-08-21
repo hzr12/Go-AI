@@ -153,7 +153,8 @@ class Trainer:
                  weight_decay: float = 1e-4,
                  batch_size: int = 64,
                  buffer_size: int = 1000,
-                 device: str = 'cpu'):
+                 device: str = 'cpu',
+                 use_amp: bool = False):
         """
         初始化训练器
         
@@ -167,11 +168,13 @@ class Trainer:
             batch_size: 批量大小
             buffer_size: 缓冲区大小
             device: 设备
+            use_amp: 是否使用自动混合精度
         """
         self.model = model.to(device)
         self.device = device
         self.board_size = board_size
         self.batch_size = batch_size
+        self.use_amp = use_amp
         
         # 优化器
         self.optimizer = torch.optim.AdamW(
@@ -193,7 +196,8 @@ class Trainer:
             board_size=board_size,
             search_depth=search_depth,
             top_k=top_k,
-            device=device
+            device=device,
+            use_amp=use_amp
         )
         
         # 经验回放
@@ -208,7 +212,7 @@ class Trainer:
         self.max_grad_norm = 1.0
         
         # 混合精度训练（GPU）
-        self.scaler = torch.cuda.amp.GradScaler() if device == 'cuda' else None
+        self.scaler = torch.cuda.amp.GradScaler() if (device == 'cuda' and use_amp) else None
     
     def self_play(self, num_games: int = 100) -> List[Dict]:
         """
