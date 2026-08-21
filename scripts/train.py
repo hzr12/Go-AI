@@ -52,6 +52,9 @@ def main():
     parser.add_argument('--pretrain-augment', action='store_true', default=True, help='预训练数据增强')
     parser.add_argument('--pretrain-save', type=str, default='models/pretrained.pth', help='预训练模型保存路径')
     
+    # 断点续训参数
+    parser.add_argument('--resume', type=str, default='', help='从检查点恢复训练(模型路径)')
+    
     args = parser.parse_args()
     
     # 自动检测设备
@@ -80,10 +83,11 @@ def main():
         print(f"    Window size: {args.attention_window_size}")
         print(f"    Num heads: {args.attention_num_heads}")
         print(f"    Global tokens: {args.attention_num_global_tokens}")
-    if args.pretrain_data:
-        print(f"  Pretrain data: {args.pretrain_data}")
+    print(f"  Pretrain data: {args.pretrain_data}")
         print(f"  Pretrain epochs: {args.pretrain_epochs}")
         print(f"  Pretrain save: {args.pretrain_save}")
+    if args.resume:
+        print(f"  Resume from: {args.resume}")
     
     # 创建网络
     model = AlphaGoNet(
@@ -114,6 +118,20 @@ def main():
     print(f"  Policy: {policy_params:,} ({policy_params/1000:.1f}K)")
     print(f"  Value: {value_params:,} ({value_params/1000:.1f}K)")
     print(f"  Fast: {fast_params:,} ({fast_params/1000:.1f}K)")
+    
+    # 加载检查点
+    start_epoch = 0
+    if args.resume and os.path.exists(args.resume):
+        checkpoint = torch.load(args.resume, map_location=device)
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+        print(f"\nResumed from: {args.resume}")
+        if 'total_games' in checkpoint:
+            print(f"  Previous games: {checkpoint['total_games']}")
+        if 'total_steps' in checkpoint:
+            print(f"  Previous steps: {checkpoint['total_steps']}")
     
     # 创建训练器
     trainer = AlphaGoTrainer(
