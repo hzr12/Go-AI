@@ -272,7 +272,8 @@ class AlphaGoTrainer:
         self.scaler = torch.cuda.amp.GradScaler() if (device == 'cuda' and use_amp) else None
     
     def pretrain_on_games(self, game_records: List, epochs: int = 10, 
-                         batch_size: int = 256, augment: bool = True) -> Dict[str, float]:
+                         batch_size: int = 256, augment: bool = True,
+                         save_path: str = '') -> Dict[str, float]:
         """
         在棋谱数据上预训练
         
@@ -372,6 +373,17 @@ class AlphaGoTrainer:
         
         avg_total_loss = total_loss / num_batches if num_batches > 0 else 0
         print(f"Pretraining completed: Avg Loss={avg_total_loss:.4f}")
+        
+        if save_path:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            torch.save({
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'phase': 'pretrain',
+                'epochs': epochs,
+                'pretrain_loss': avg_total_loss
+            }, save_path)
+            print(f"Pretrained model saved: {save_path}")
         
         return {
             'pretrain_loss': avg_total_loss,

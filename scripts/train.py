@@ -50,6 +50,7 @@ def main():
     parser.add_argument('--pretrain-data', type=str, default='', help='棋谱数据目录')
     parser.add_argument('--pretrain-epochs', type=int, default=10, help='预训练轮数')
     parser.add_argument('--pretrain-augment', action='store_true', default=True, help='预训练数据增强')
+    parser.add_argument('--pretrain-save', type=str, default='models/pretrained.pth', help='预训练模型保存路径')
     
     args = parser.parse_args()
     
@@ -82,6 +83,7 @@ def main():
     if args.pretrain_data:
         print(f"  Pretrain data: {args.pretrain_data}")
         print(f"  Pretrain epochs: {args.pretrain_epochs}")
+        print(f"  Pretrain save: {args.pretrain_save}")
     
     # 创建网络
     model = AlphaGoNet(
@@ -145,7 +147,8 @@ def main():
                 game_records=game_records,
                 epochs=args.pretrain_epochs,
                 batch_size=args.batch_size,
-                augment=args.pretrain_augment
+                augment=args.pretrain_augment,
+                save_path=args.pretrain_save
             )
     
     # 开始训练
