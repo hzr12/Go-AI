@@ -199,6 +199,7 @@ class AlphaGoTrainer:
         
         # 经验回放
         self.replay_buffer = ReplayBuffer(buffer_size)
+        self.buffer_size = buffer_size
         
         # 损失函数
         self.policy_loss_fn = nn.CrossEntropyLoss()
@@ -351,9 +352,10 @@ class AlphaGoTrainer:
                     'result': result
                 })
                 
-                # 每局输出进度
-                result_str = {1: '黑胜', -1: '白胜', 0: '平局'}.get(result, '未知')
-                print(f"  Game {game_idx + 1}/{num_games}: {step}步, 结果={result_str}, 耗时={game_time:.1f}s, 缓冲区={len(self.replay_buffer)}")
+                # 仅最后一局输出结果
+                if game_idx == num_games - 1:
+                    result_str = {1: '黑胜', -1: '白胜', 0: '平局'}.get(result, '未知')
+                    print(f"  Last game: {step}步, 结果={result_str}")
         
         total_time = time.time() - total_start
         print(f"Self-play完成: {num_games}局, 总耗时={total_time:.1f}s, 平均={total_time/num_games:.1f}s/局")
@@ -455,11 +457,21 @@ class AlphaGoTrainer:
         total_steps = 0
         total_start = time.time()
         
+        # Phase 1: 填充缓冲区直到上限
+        buffer_fill_games = min(num_games, self.buffer_size // self.board_size // self.board_size + 1)
+        buffer_fill_games = min(buffer_fill_games, num_games)
+        print(f"\n{'='*50}")
+        print(f"Phase 1: Filling buffer ({buffer_fill_games} games)")
+        print(f"{'='*50}")
+        self.self_play(buffer_fill_games)
+        total_games += buffer_fill_games
+        
+        # Phase 2: 交替自我对弈和训练
         while total_games < num_games:
             # 自我对弈
             remaining_games = min(games_per_batch, num_games - total_games)
             print(f"\n{'='*50}")
-            print(f"Self-play phase: {remaining_games} games (无搜索，纯网络推理)")
+            print(f"Self-play: {remaining_games} games")
             print(f"{'='*50}")
             self.self_play(remaining_games)
             total_games += remaining_games
