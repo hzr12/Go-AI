@@ -43,11 +43,8 @@ logs/
 *.pth
 *.npz
 
-# Game data
-/data/
-*.sgf
-*.tgz
-*.tar.gz
+# Game data (extracted)
+/data/games/
 
 # OS
 .DS_Store
