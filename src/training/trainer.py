@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import os
 from typing import List, Tuple, Dict, Optional
 from collections import deque
 import random
@@ -148,6 +149,7 @@ class Trainer:
                  model: MuZeroNet,
                  board_size: int = 9,
                  search_depth: int = 10,
+                 search_depth_self_play: int = 3,
                  top_k: int = 5,
                  lr: float = 1e-3,
                  weight_decay: float = 1e-4,
@@ -161,7 +163,8 @@ class Trainer:
         Args:
             model: MuZero网络
             board_size: 棋盘大小
-            search_depth: 搜索深度
+            search_depth: 推理时搜索深度
+            search_depth_self_play: 自我对弈时搜索深度（应较小以加快速度）
             top_k: 候选着法数量
             lr: 学习率
             weight_decay: 权重衰减
@@ -190,11 +193,21 @@ class Trainer:
             eta_min=1e-5
         )
         
-        # 搜索算法
+        # 推理用搜索算法（深搜索）
         self.search = MinimaxSearch(
             model=model,
             board_size=board_size,
             search_depth=search_depth,
+            top_k=top_k,
+            device=device,
+            use_amp=use_amp
+        )
+        
+        # 自我对弈用搜索算法（浅搜索，加速训练）
+        self.search_self_play = MinimaxSearch(
+            model=model,
+            board_size=board_size,
+            search_depth=search_depth_self_play,
             top_k=top_k,
             device=device,
             use_amp=use_amp
@@ -224,9 +237,12 @@ class Trainer:
         Returns:
             游戏记录列表
         """
+        import time
         games_data = []
+        total_start = time.time()
         
         for game_idx in range(num_games):
+            game_start = time.time()
             game = GoGame(self.board_size)
             game.reset()
             
@@ -242,9 +258,9 @@ class Trainer:
                 # 获取当前状态
                 state_tensor = game.get_state_tensor()
                 
-                # 使用搜索获取着法和策略
-                move, score = self.search.search(game.board, game.current_player)
-                policy = self.search.get_move_probabilities(game.board, game.current_player)
+                # 使用浅搜索获取着法（只调用一次）
+                move, score = self.search_self_play.search(game.board, game.current_player)
+                policy = self.search_self_play.get_move_probabilities(game.board, game.current_player)
                 
                 # 存储数据
                 game_states.append(state_tensor)
@@ -284,6 +300,7 @@ class Trainer:
                     game_policies[i]
                 )
             
+            game_time = time.time() - game_start
             games_data.append({
                 'states': game_states,
                 'actions': game_actions,
@@ -291,8 +308,12 @@ class Trainer:
                 'result': result
             })
             
-            if (game_idx + 1) % 10 == 0:
-                print(f"Self-play: {game_idx + 1}/{num_games} games completed")
+            # 每局输出进度
+            result_str = {1: '黑胜', -1: '白胜', 0: '平局'}.get(result, '未知')
+            print(f"  Game {game_idx + 1}/{num_games}: {step}步, 结果={result_str}, 耗时={game_time:.1f}s, 缓冲区={len(self.replay_buffer)}")
+        
+        total_time = time.time() - total_start
+        print(f"Self-play完成: {num_games}局, 总耗时={total_time:.1f}s, 平均={total_time/num_games:.1f}s/局")
         
         return games_data
     
@@ -322,14 +343,17 @@ class Trainer:
         if self.scaler is not None:
             with torch.cuda.amp.autocast():
                 # 前向传播
-                _, initial_policy, initial_value = self.model.initial_inference(states_tensor)
+                state, initial_policy, initial_value = self.model.initial_inference(states_tensor)
                 
-                # 动态模型预测
+                # 动态模型预测（使用隐藏状态，而非原始输入）
                 action_one_hot = torch.zeros(states_tensor.shape[0], 1, self.board_size, self.board_size, device=self.device)
                 action_one_hot.view(-1, 81).scatter_(1, actions_tensor.unsqueeze(1), 1)
                 
-                next_state_pred, reward_pred = self.model.dynamics(states_tensor, action_one_hot)
+                next_state_pred, reward_pred = self.model.dynamics(state, action_one_hot)
                 next_policy_pred, next_value_pred = self.model.prediction(next_state_pred)
+                
+                # 目标隐藏状态（将next_states_tensor通过表示网络）
+                target_state, _, _ = self.model.initial_inference(next_states_tensor)
                 
                 # 计算损失
                 policy_loss = self.policy_loss_fn(initial_policy, target_policies_tensor)
@@ -337,7 +361,7 @@ class Trainer:
                 reward_loss = self.reward_loss_fn(reward_pred.squeeze(), rewards_tensor)
                 
                 # 动态模型损失（状态预测）
-                state_loss = F.mse_loss(next_state_pred, next_states_tensor)
+                state_loss = F.mse_loss(next_state_pred, target_state)
                 
                 # 总损失
                 total_loss = policy_loss + value_loss + 0.5 * reward_loss + 0.5 * state_loss
@@ -351,19 +375,22 @@ class Trainer:
             self.scaler.update()
         else:
             # 标准训练
-            _, initial_policy, initial_value = self.model.initial_inference(states_tensor)
+            state, initial_policy, initial_value = self.model.initial_inference(states_tensor)
             
             action_one_hot = torch.zeros(states_tensor.shape[0], 1, self.board_size, self.board_size, device=self.device)
             action_one_hot.view(-1, 81).scatter_(1, actions_tensor.unsqueeze(1), 1)
             
-            next_state_pred, reward_pred = self.model.dynamics(states_tensor, action_one_hot)
+            next_state_pred, reward_pred = self.model.dynamics(state, action_one_hot)
             next_policy_pred, next_value_pred = self.model.prediction(next_state_pred)
+            
+            # 目标隐藏状态（将next_states_tensor通过表示网络）
+            target_state, _, _ = self.model.initial_inference(next_states_tensor)
             
             # 计算损失
             policy_loss = self.policy_loss_fn(initial_policy, target_policies_tensor)
             value_loss = self.value_loss_fn(initial_value.squeeze(), rewards_tensor)
             reward_loss = self.reward_loss_fn(reward_pred.squeeze(), rewards_tensor)
-            state_loss = F.mse_loss(next_state_pred, next_states_tensor)
+            state_loss = F.mse_loss(next_state_pred, target_state)
             
             total_loss = policy_loss + value_loss + 0.5 * reward_loss + 0.5 * state_loss
             
@@ -396,18 +423,24 @@ class Trainer:
             save_interval: 保存间隔
             save_path: 保存路径
         """
+        import time
         total_games = 0
         total_steps = 0
+        total_start = time.time()
         
         while total_games < num_games:
             # 自我对弈
             remaining_games = min(games_per_batch, num_games - total_games)
-            print(f"\n=== Self-play phase: {remaining_games} games ===")
+            print(f"\n{'='*50}")
+            print(f"Self-play phase: {remaining_games} games (搜索深度={self.search_self_play.search_depth})")
+            print(f"{'='*50}")
             self.self_play(remaining_games)
             total_games += remaining_games
             
             # 训练
-            print(f"\n=== Training phase ===")
+            print(f"\n{'='*50}")
+            print(f"Training phase")
+            print(f"{'='*50}")
             num_train_steps = min(100, len(self.replay_buffer) // self.batch_size)
             
             for step in range(num_train_steps):
@@ -415,20 +448,23 @@ class Trainer:
                 total_steps += 1
                 
                 if step % 10 == 0 and losses:
-                    print(f"Step {total_steps}: "
-                          f"Total Loss: {losses['total_loss']:.4f}, "
-                          f"Policy: {losses['policy_loss']:.4f}, "
-                          f"Value: {losses['value_loss']:.4f}, "
-                          f"LR: {losses['learning_rate']:.6f}")
+                    print(f"  Step {total_steps}: "
+                          f"Loss={losses['total_loss']:.4f}, "
+                          f"Policy={losses['policy_loss']:.4f}, "
+                          f"Value={losses['value_loss']:.4f}, "
+                          f"LR={losses['learning_rate']:.6f}")
             
             # 保存模型
             if total_games % save_interval == 0:
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
                 torch.save({
                     'model_state_dict': self.model.state_dict(),
                     'optimizer_state_dict': self.optimizer.state_dict(),
                     'total_games': total_games,
                     'total_steps': total_steps
                 }, save_path)
-                print(f"Model saved to {save_path} (Games: {total_games})")
+                elapsed = time.time() - total_start
+                print(f"\nModel saved: {save_path} (Games: {total_games}, Elapsed: {elapsed:.0f}s)")
         
-        print(f"\nTraining completed! Total games: {total_games}, Total steps: {total_steps}")
+        total_time = time.time() - total_start
+        print(f"\nTraining completed! Games: {total_games}, Steps: {total_steps}, Time: {total_time:.0f}s")

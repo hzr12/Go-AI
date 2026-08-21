@@ -23,11 +23,13 @@ def main():
     parser.add_argument('--board-size', type=int, default=9, help='棋盘大小')
     parser.add_argument('--channels', type=int, default=64, help='网络通道数')
     parser.add_argument('--num-res-blocks', type=int, default=4, help='残差块数量')
-    parser.add_argument('--search-depth', type=int, default=10, help='搜索深度')
+    parser.add_argument('--search-depth', type=int, default=10, help='推理搜索深度')
+    parser.add_argument('--search-depth-self-play', type=int, default=3, help='自我对弈搜索深度（越小越快）')
     parser.add_argument('--top-k', type=int, default=5, help='候选着法数量')
     parser.add_argument('--lr', type=float, default=1e-3, help='学习率')
     parser.add_argument('--batch-size', type=int, default=64, help='批量大小')
     parser.add_argument('--num-games', type=int, default=5000, help='训练局数')
+    parser.add_argument('--games-per-batch', type=int, default=256, help='每批对弈局数')
     parser.add_argument('--save-path', type=str, default='models/model.pth', help='模型保存路径')
     parser.add_argument('--device', type=str, default='auto', help='设备 (auto/cpu/cuda)')
     parser.add_argument('--use-amp', action='store_true', help='使用自动混合精度训练')
@@ -57,7 +59,8 @@ def main():
     print(f"Board size: {config.board_size}")
     print(f"Channels: {config.channels}")
     print(f"Res blocks: {config.num_res_blocks}")
-    print(f"Search depth: {config.search_depth}")
+    print(f"Search depth (inference): {config.search_depth}")
+    print(f"Search depth (self-play): {args.search_depth_self_play}")
     print(f"Top K: {config.top_k}")
     print(f"Learning rate: {config.learning_rate}")
     print(f"Batch size: {config.batch_size}")
@@ -80,6 +83,7 @@ def main():
         model=model,
         board_size=config.board_size,
         search_depth=config.search_depth,
+        search_depth_self_play=args.search_depth_self_play,
         top_k=config.top_k,
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
@@ -95,7 +99,7 @@ def main():
     
     trainer.train(
         num_games=config.num_games,
-        games_per_batch=config.games_per_batch,
+        games_per_batch=args.games_per_batch,
         save_interval=config.save_interval,
         save_path=args.save_path
     )
