@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-训练脚本
+训练脚本 - AlphaGo多网络版本
 """
 
 import sys
@@ -8,89 +8,100 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
-from src.networks.resnet import MuZeroNet
-from src.training.trainer import Trainer
-from src.config.config import Config, get_config
+from src.networks.alphanet import AlphaGoNet
+from src.training.trainer import AlphaGoTrainer
 
 
 def main():
     """主函数"""
     import argparse
     
-    parser = argparse.ArgumentParser(description='训练围棋AI')
-    parser.add_argument('--config', type=str, default='default', 
-                       help='配置名称 (default/fast/accurate/cpu/gpu)')
+    parser = argparse.ArgumentParser(description='训练AlphaGo围棋AI')
     parser.add_argument('--board-size', type=int, default=9, help='棋盘大小')
-    parser.add_argument('--channels', type=int, default=64, help='网络通道数')
-    parser.add_argument('--num-res-blocks', type=int, default=4, help='残差块数量')
-    parser.add_argument('--search-depth', type=int, default=10, help='推理搜索深度')
-    parser.add_argument('--search-depth-self-play', type=int, default=3, help='自我对弈搜索深度（越小越快）')
-    parser.add_argument('--top-k', type=int, default=5, help='候选着法数量')
+    parser.add_argument('--backbone-channels', type=int, default=64, help='骨干网络通道数')
+    parser.add_argument('--backbone-res-blocks', type=int, default=4, help='骨干网络残差块数量')
+    parser.add_argument('--policy-channels', type=int, default=32, help='策略网络通道数')
+    parser.add_argument('--value-channels', type=int, default=16, help='价值网络通道数')
+    parser.add_argument('--fast-channels', type=int, default=72, help='快速策略网络通道数')
+    parser.add_argument('--fast-res-blocks', type=int, default=3, help='快速策略网络残差块数量')
     parser.add_argument('--lr', type=float, default=1e-3, help='学习率')
-    parser.add_argument('--batch-size', type=int, default=64, help='批量大小')
+    parser.add_argument('--batch-size', type=int, default=256, help='批量大小')
     parser.add_argument('--num-games', type=int, default=5000, help='训练局数')
     parser.add_argument('--games-per-batch', type=int, default=256, help='每批对弈局数')
-    parser.add_argument('--save-path', type=str, default='models/model.pth', help='模型保存路径')
+    parser.add_argument('--save-path', type=str, default='models/alphago_model.pth', help='模型保存路径')
     parser.add_argument('--device', type=str, default='auto', help='设备 (auto/cpu/cuda)')
-    parser.add_argument('--use-amp', action='store_true', help='使用自动混合精度训练')
+    parser.add_argument('--use-amp', action='store_true', help='使用自动混合精度')
+    parser.add_argument('--policy-weight', type=float, default=1.0, help='策略损失权重')
+    parser.add_argument('--value-weight', type=float, default=1.0, help='价值损失权重')
+    parser.add_argument('--fast-weight', type=float, default=0.5, help='快速策略损失权重')
+    parser.add_argument('--temperature', type=float, default=1.0, help='温度参数')
+    parser.add_argument('--top-k', type=int, default=5, help='候选着法数量')
     
     args = parser.parse_args()
     
-    # 获取配置
-    if args.config != 'default':
-        config = get_config(args.config)
+    # 自动检测设备
+    if args.device == 'auto':
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
     else:
-        config = Config(
-            board_size=args.board_size,
-            channels=args.channels,
-            num_res_blocks=args.num_res_blocks,
-            search_depth=args.search_depth,
-            top_k=args.top_k,
-            learning_rate=args.lr,
-            batch_size=args.batch_size,
-            num_games=args.num_games,
-            device=args.device
-        )
+        device = args.device
     
     # 检测是否使用AMP
-    use_amp = args.use_amp or config.device == 'cuda'
+    use_amp = args.use_amp or device == 'cuda'
     
-    print(f"Configuration: {args.config}")
-    print(f"Board size: {config.board_size}")
-    print(f"Channels: {config.channels}")
-    print(f"Res blocks: {config.num_res_blocks}")
-    print(f"Search depth (inference): {config.search_depth}")
-    print(f"Search depth (self-play): {args.search_depth_self_play}")
-    print(f"Top K: {config.top_k}")
-    print(f"Learning rate: {config.learning_rate}")
-    print(f"Batch size: {config.batch_size}")
-    print(f"Num games: {config.num_games}")
-    print(f"Device: {config.device}")
-    print(f"Use AMP: {use_amp}")
+    print(f"Configuration:")
+    print(f"  Board size: {args.board_size}")
+    print(f"  Backbone: {args.backbone_channels}ch × {args.backbone_res_blocks}rb")
+    print(f"  Policy: {args.policy_channels}ch")
+    print(f"  Value: {args.value_channels}ch")
+    print(f"  Fast: {args.fast_channels}ch × {args.fast_res_blocks}rb")
+    print(f"  Learning rate: {args.lr}")
+    print(f"  Batch size: {args.batch_size}")
+    print(f"  Num games: {args.num_games}")
+    print(f"  Device: {device}")
+    print(f"  Use AMP: {use_amp}")
+    print(f"  Loss weights: P={args.policy_weight}, V={args.value_weight}, F={args.fast_weight}")
     
     # 创建网络
-    model = MuZeroNet(
-        in_channels=config.in_channels,
-        channels=config.channels,
-        num_res_blocks=config.num_res_blocks,
-        action_size=config.action_size
+    model = AlphaGoNet(
+        in_channels=19,
+        backbone_channels=args.backbone_channels,
+        backbone_res_blocks=args.backbone_res_blocks,
+        policy_channels=args.policy_channels,
+        value_channels=args.value_channels,
+        fast_channels=args.fast_channels,
+        fast_res_blocks=args.fast_res_blocks,
+        action_size=args.board_size * args.board_size
     )
     
-    print(f"\nModel parameters: {sum(p.numel() for p in model.parameters()):,}")
+    # 计算参数量
+    total_params = sum(p.numel() for p in model.parameters())
+    backbone_params = sum(p.numel() for p in model.backbone.parameters())
+    policy_params = sum(p.numel() for p in model.policy.parameters())
+    value_params = sum(p.numel() for p in model.value.parameters())
+    fast_params = sum(p.numel() for p in model.fast_policy.parameters())
+    
+    print(f"\nNetwork parameters:")
+    print(f"  Total: {total_params:,} ({total_params/1000:.1f}K)")
+    print(f"  Backbone: {backbone_params:,} ({backbone_params/1000:.1f}K)")
+    print(f"  Policy: {policy_params:,} ({policy_params/1000:.1f}K)")
+    print(f"  Value: {value_params:,} ({value_params/1000:.1f}K)")
+    print(f"  Fast: {fast_params:,} ({fast_params/1000:.1f}K)")
     
     # 创建训练器
-    trainer = Trainer(
+    trainer = AlphaGoTrainer(
         model=model,
-        board_size=config.board_size,
-        search_depth=config.search_depth,
-        search_depth_self_play=args.search_depth_self_play,
-        top_k=config.top_k,
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay,
-        batch_size=config.batch_size,
-        buffer_size=config.buffer_size,
-        device=config.device,
-        use_amp=use_amp
+        board_size=args.board_size,
+        lr=args.lr,
+        weight_decay=1e-4,
+        batch_size=args.batch_size,
+        buffer_size=10000,
+        device=device,
+        use_amp=use_amp,
+        policy_weight=args.policy_weight,
+        value_weight=args.value_weight,
+        fast_weight=args.fast_weight,
+        temperature=args.temperature,
+        top_k=args.top_k
     )
     
     # 开始训练
@@ -98,9 +109,9 @@ def main():
     print(f"Save path: {args.save_path}")
     
     trainer.train(
-        num_games=config.num_games,
+        num_games=args.num_games,
         games_per_batch=args.games_per_batch,
-        save_interval=config.save_interval,
+        save_interval=100,
         save_path=args.save_path
     )
     

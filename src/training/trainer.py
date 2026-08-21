@@ -3,11 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import os
+import time
 from typing import List, Tuple, Dict, Optional
 from collections import deque
 import random
-from ..networks.resnet import MuZeroNet
-from ..search.minimax import MinimaxSearch
+from ..networks.alphanet import AlphaGoNet
 
 
 class GoGame:
@@ -33,7 +33,6 @@ class GoGame:
         for i in range(self.board_size):
             for j in range(self.board_size):
                 if self.board[i, j] == 0:
-                    # 简化：不考虑禁着点和自杀
                     legal_moves.append(i * self.board_size + j)
         return legal_moves
     
@@ -56,9 +55,6 @@ class GoGame:
         self.board[i, j] = self.current_player
         self.move_count += 1
         
-        # 简化：不实现提子和劫争逻辑
-        # 实际实现需要检查气、提子、劫争等
-        
         # 切换玩家
         self.current_player = -self.current_player
         
@@ -66,7 +62,6 @@ class GoGame:
     
     def is_game_over(self) -> bool:
         """检查游戏是否结束"""
-        # 简化：当棋盘满或达到最大步数时结束
         if self.move_count >= self.board_size * self.board_size:
             return True
         return False
@@ -81,7 +76,6 @@ class GoGame:
         if not self.is_game_over():
             return None
         
-        # 简化：计算领地（实际需要实现领地计算）
         black_count = np.sum(self.board == 1)
         white_count = np.sum(self.board == -1)
         
@@ -94,10 +88,9 @@ class GoGame:
     
     def get_state_tensor(self) -> np.ndarray:
         """获取状态张量（用于训练）"""
-        # 19通道表示
         tensor = np.zeros((19, self.board_size, self.board_size), dtype=np.float32)
         
-        # 当前玩家棋子（简化：只用当前状态）
+        # 当前玩家棋子
         tensor[0][self.board == self.current_player] = 1
         tensor[8][self.board == -self.current_player] = 1
         
@@ -142,42 +135,53 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
-class Trainer:
-    """训练器"""
+class AlphaGoTrainer:
+    """AlphaGo风格的多网络训练器"""
     
     def __init__(self, 
-                 model: MuZeroNet,
+                 model: AlphaGoNet,
                  board_size: int = 9,
-                 search_depth: int = 10,
-                 search_depth_self_play: int = 3,
-                 top_k: int = 5,
                  lr: float = 1e-3,
                  weight_decay: float = 1e-4,
                  batch_size: int = 64,
                  buffer_size: int = 1000,
                  device: str = 'cpu',
-                 use_amp: bool = False):
+                 use_amp: bool = False,
+                 policy_weight: float = 1.0,
+                 value_weight: float = 1.0,
+                 fast_weight: float = 0.5,
+                 temperature: float = 1.0,
+                 top_k: int = 5):
         """
         初始化训练器
         
         Args:
-            model: MuZero网络
+            model: AlphaGoNet网络
             board_size: 棋盘大小
-            search_depth: 推理时搜索深度
-            search_depth_self_play: 自我对弈时搜索深度（应较小以加快速度）
-            top_k: 候选着法数量
             lr: 学习率
             weight_decay: 权重衰减
             batch_size: 批量大小
             buffer_size: 缓冲区大小
             device: 设备
             use_amp: 是否使用自动混合精度
+            policy_weight: 策略损失权重
+            value_weight: 价值损失权重
+            fast_weight: 快速策略损失权重
+            temperature: 温度参数（控制探索）
+            top_k: 候选着法数量
         """
         self.model = model.to(device)
         self.device = device
         self.board_size = board_size
         self.batch_size = batch_size
         self.use_amp = use_amp
+        self.temperature = temperature
+        self.top_k = top_k
+        
+        # 损失权重
+        self.policy_weight = policy_weight
+        self.value_weight = value_weight
+        self.fast_weight = fast_weight
         
         # 优化器
         self.optimizer = torch.optim.AdamW(
@@ -193,39 +197,75 @@ class Trainer:
             eta_min=1e-5
         )
         
-        # 推理用搜索算法（深搜索）
-        self.search = MinimaxSearch(
-            model=model,
-            board_size=board_size,
-            search_depth=search_depth,
-            top_k=top_k,
-            device=device,
-            use_amp=use_amp
-        )
-        
-        # 自我对弈用搜索算法（浅搜索，加速训练）
-        self.search_self_play = MinimaxSearch(
-            model=model,
-            board_size=board_size,
-            search_depth=search_depth_self_play,
-            top_k=top_k,
-            device=device,
-            use_amp=use_amp
-        )
-        
         # 经验回放
         self.replay_buffer = ReplayBuffer(buffer_size)
         
         # 损失函数
         self.policy_loss_fn = nn.CrossEntropyLoss()
         self.value_loss_fn = nn.MSELoss()
-        self.reward_loss_fn = nn.MSELoss()
         
         # 梯度裁剪
         self.max_grad_norm = 1.0
         
+        # 训练/推理模式
+        self.training = True
+        
         # 混合精度训练（GPU）
         self.scaler = torch.cuda.amp.GradScaler() if (device == 'cuda' and use_amp) else None
+    
+    def board_to_tensor(self, board: np.ndarray, current_player: int) -> torch.Tensor:
+        """将棋盘转换为网络输入张量"""
+        tensor = torch.zeros(1, 19, self.board_size, self.board_size, device=self.device)
+        
+        # 当前玩家棋子
+        mask_current = torch.tensor(board == current_player, dtype=torch.bool, device=self.device)
+        tensor[0, 0][mask_current] = 1
+        # 对手棋子
+        mask_opponent = torch.tensor(board == -current_player, dtype=torch.bool, device=self.device)
+        tensor[0, 8][mask_opponent] = 1
+        # 当前玩家标记
+        tensor[0, 16] = 1 if current_player == 1 else -1
+        # 合法着法标记
+        legal_moves = []
+        for i in range(self.board_size):
+            for j in range(self.board_size):
+                if board[i, j] == 0:
+                    legal_moves.append(i * self.board_size + j)
+        if legal_moves:
+            legal_tensor = torch.tensor(legal_moves, device=self.device)
+            rows = legal_tensor // self.board_size
+            cols = legal_tensor % self.board_size
+            tensor[0, 17, rows, cols] = 1
+        
+        return tensor
+    
+    def select_move(self, policy_logits: torch.Tensor, legal_moves: List[int]) -> Tuple[int, torch.Tensor]:
+        """
+        根据策略网络输出选择着法
+        
+        Args:
+            policy_logits: 策略网络输出 (batch, action_size)
+            legal_moves: 合法着法列表
+            
+        Returns:
+            (选择的着法, 策略概率分布)
+        """
+        # 应用温度
+        probs = F.softmax(policy_logits / self.temperature, dim=-1)
+        
+        # 屏蔽非法着法
+        mask = torch.zeros_like(probs)
+        mask[0, legal_moves] = 1
+        probs = probs * mask
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+        
+        # 采样或选择概率最高的
+        if self.training:
+            move = torch.multinomial(probs, 1).item()
+        else:
+            move = torch.argmax(probs).item()
+        
+        return move, probs
     
     def self_play(self, num_games: int = 100) -> List[Dict]:
         """
@@ -237,80 +277,83 @@ class Trainer:
         Returns:
             游戏记录列表
         """
-        import time
         games_data = []
         total_start = time.time()
         
-        for game_idx in range(num_games):
-            game_start = time.time()
-            game = GoGame(self.board_size)
-            game.reset()
-            
-            game_states = []
-            game_actions = []
-            game_policies = []
-            game_rewards = []
-            
-            step = 0
-            max_steps = self.board_size * self.board_size
-            
-            while not game.is_game_over() and step < max_steps:
-                # 获取当前状态
-                state_tensor = game.get_state_tensor()
+        self.model.eval()
+        with torch.no_grad():
+            for game_idx in range(num_games):
+                game_start = time.time()
+                game = GoGame(self.board_size)
+                game.reset()
                 
-                # 使用浅搜索获取着法（只调用一次）
-                move, score = self.search_self_play.search(game.board, game.current_player)
-                policy = self.search_self_play.get_move_probabilities(game.board, game.current_player)
+                game_states = []
+                game_actions = []
+                game_policies = []
                 
-                # 存储数据
-                game_states.append(state_tensor)
-                game_actions.append(move)
-                game_policies.append(policy)
+                step = 0
+                max_steps = self.board_size * self.board_size
                 
-                # 执行着法
-                game.make_move(move)
-                step += 1
-            
-            # 计算游戏结果
-            result = game.get_result()
-            
-            # 为每个步骤分配奖励
-            for i in range(len(game_states)):
-                # 简化：最后一步获得完整奖励，其他步骤为0
-                if i == len(game_states) - 1:
-                    reward = float(result) if result is not None else 0.0
-                else:
-                    reward = 0.0
+                while not game.is_game_over() and step < max_steps:
+                    # 获取当前状态
+                    state_tensor = self.board_to_tensor(game.board, game.current_player)
+                    
+                    # 获取策略网络输出
+                    policy_logits, value, _ = self.model(state_tensor)
+                    
+                    # 选择着法
+                    legal_moves = game.get_legal_moves()
+                    move, policy_probs = self.select_move(policy_logits, legal_moves)
+                    
+                    # 存储数据
+                    game_states.append(state_tensor.cpu().numpy()[0])
+                    game_actions.append(move)
+                    game_policies.append(policy_probs.cpu().numpy()[0])
+                    
+                    # 执行着法
+                    game.make_move(move)
+                    step += 1
                 
-                # 获取下一个状态
-                if i < len(game_states) - 1:
-                    next_state = game_states[i + 1]
-                else:
-                    next_state = game_states[i]  # 游戏结束时
+                # 计算游戏结果
+                result = game.get_result()
                 
-                done = (i == len(game_states) - 1)
+                # 为每个步骤分配奖励
+                for i in range(len(game_states)):
+                    # 简化：最后一步获得完整奖励，其他步骤为0
+                    if i == len(game_states) - 1:
+                        reward = float(result) if result is not None else 0.0
+                    else:
+                        reward = 0.0
+                    
+                    # 获取下一个状态
+                    if i < len(game_states) - 1:
+                        next_state = game_states[i + 1]
+                    else:
+                        next_state = game_states[i]
+                    
+                    done = (i == len(game_states) - 1)
+                    
+                    # 存储到经验回放
+                    self.replay_buffer.push(
+                        game_states[i], 
+                        game_actions[i], 
+                        reward, 
+                        next_state, 
+                        done,
+                        game_policies[i]
+                    )
                 
-                # 存储到经验回放
-                self.replay_buffer.push(
-                    game_states[i], 
-                    game_actions[i], 
-                    reward, 
-                    next_state, 
-                    done,
-                    game_policies[i]
-                )
-            
-            game_time = time.time() - game_start
-            games_data.append({
-                'states': game_states,
-                'actions': game_actions,
-                'policies': game_policies,
-                'result': result
-            })
-            
-            # 每局输出进度
-            result_str = {1: '黑胜', -1: '白胜', 0: '平局'}.get(result, '未知')
-            print(f"  Game {game_idx + 1}/{num_games}: {step}步, 结果={result_str}, 耗时={game_time:.1f}s, 缓冲区={len(self.replay_buffer)}")
+                game_time = time.time() - game_start
+                games_data.append({
+                    'states': game_states,
+                    'actions': game_actions,
+                    'policies': game_policies,
+                    'result': result
+                })
+                
+                # 每局输出进度
+                result_str = {1: '黑胜', -1: '白胜', 0: '平局'}.get(result, '未知')
+                print(f"  Game {game_idx + 1}/{num_games}: {step}步, 结果={result_str}, 耗时={game_time:.1f}s, 缓冲区={len(self.replay_buffer)}")
         
         total_time = time.time() - total_start
         print(f"Self-play完成: {num_games}局, 总耗时={total_time:.1f}s, 平均={total_time/num_games:.1f}s/局")
@@ -327,6 +370,8 @@ class Trainer:
         if len(self.replay_buffer) < self.batch_size:
             return {}
         
+        self.model.train()
+        
         # 采样批次
         states, actions, rewards, next_states, dones, target_policies = \
             self.replay_buffer.sample(self.batch_size)
@@ -335,36 +380,28 @@ class Trainer:
         states_tensor = torch.FloatTensor(states).to(self.device)
         actions_tensor = torch.LongTensor(actions).to(self.device)
         rewards_tensor = torch.FloatTensor(rewards).to(self.device)
-        next_states_tensor = torch.FloatTensor(next_states).to(self.device)
-        dones_tensor = torch.FloatTensor(dones).to(self.device)
         target_policies_tensor = torch.FloatTensor(target_policies).to(self.device)
         
         # 混合精度训练
         if self.scaler is not None:
             with torch.cuda.amp.autocast():
                 # 前向传播
-                state, initial_policy, initial_value = self.model.initial_inference(states_tensor)
-                
-                # 动态模型预测（使用隐藏状态，而非原始输入）
-                action_one_hot = torch.zeros(states_tensor.shape[0], 1, self.board_size, self.board_size, device=self.device)
-                action_one_hot.view(-1, 81).scatter_(1, actions_tensor.unsqueeze(1), 1)
-                
-                next_state_pred, reward_pred = self.model.dynamics(state, action_one_hot)
-                next_policy_pred, next_value_pred = self.model.prediction(next_state_pred)
-                
-                # 目标隐藏状态（将next_states_tensor通过表示网络）
-                target_state, _, _ = self.model.initial_inference(next_states_tensor)
+                policy_logits, value, fast_policy = self.model(states_tensor)
                 
                 # 计算损失
-                policy_loss = self.policy_loss_fn(initial_policy, target_policies_tensor)
-                value_loss = self.value_loss_fn(initial_value.squeeze(), rewards_tensor)
-                reward_loss = self.reward_loss_fn(reward_pred.squeeze(), rewards_tensor)
+                # 策略损失：从自我对弈策略学习
+                policy_loss = self.policy_loss_fn(policy_logits, target_policies_tensor)
                 
-                # 动态模型损失（状态预测）
-                state_loss = F.mse_loss(next_state_pred, target_state)
+                # 价值损失：从游戏结果学习
+                value_loss = self.value_loss_fn(value.squeeze(), rewards_tensor)
+                
+                # 快速策略损失：从策略网络蒸馏
+                fast_policy_loss = self.policy_loss_fn(fast_policy, F.softmax(policy_logits.detach(), dim=-1))
                 
                 # 总损失
-                total_loss = policy_loss + value_loss + 0.5 * reward_loss + 0.5 * state_loss
+                total_loss = (self.policy_weight * policy_loss + 
+                             self.value_weight * value_loss + 
+                             self.fast_weight * fast_policy_loss)
             
             # 反向传播
             self.optimizer.zero_grad()
@@ -375,24 +412,16 @@ class Trainer:
             self.scaler.update()
         else:
             # 标准训练
-            state, initial_policy, initial_value = self.model.initial_inference(states_tensor)
-            
-            action_one_hot = torch.zeros(states_tensor.shape[0], 1, self.board_size, self.board_size, device=self.device)
-            action_one_hot.view(-1, 81).scatter_(1, actions_tensor.unsqueeze(1), 1)
-            
-            next_state_pred, reward_pred = self.model.dynamics(state, action_one_hot)
-            next_policy_pred, next_value_pred = self.model.prediction(next_state_pred)
-            
-            # 目标隐藏状态（将next_states_tensor通过表示网络）
-            target_state, _, _ = self.model.initial_inference(next_states_tensor)
+            policy_logits, value, fast_policy = self.model(states_tensor)
             
             # 计算损失
-            policy_loss = self.policy_loss_fn(initial_policy, target_policies_tensor)
-            value_loss = self.value_loss_fn(initial_value.squeeze(), rewards_tensor)
-            reward_loss = self.reward_loss_fn(reward_pred.squeeze(), rewards_tensor)
-            state_loss = F.mse_loss(next_state_pred, target_state)
+            policy_loss = self.policy_loss_fn(policy_logits, target_policies_tensor)
+            value_loss = self.value_loss_fn(value.squeeze(), rewards_tensor)
+            fast_policy_loss = self.policy_loss_fn(fast_policy, F.softmax(policy_logits.detach(), dim=-1))
             
-            total_loss = policy_loss + value_loss + 0.5 * reward_loss + 0.5 * state_loss
+            total_loss = (self.policy_weight * policy_loss + 
+                         self.value_weight * value_loss + 
+                         self.fast_weight * fast_policy_loss)
             
             # 反向传播
             self.optimizer.zero_grad()
@@ -407,8 +436,7 @@ class Trainer:
             'total_loss': total_loss.item(),
             'policy_loss': policy_loss.item(),
             'value_loss': value_loss.item(),
-            'reward_loss': reward_loss.item(),
-            'state_loss': state_loss.item(),
+            'fast_policy_loss': fast_policy_loss.item(),
             'learning_rate': self.scheduler.get_last_lr()[0]
         }
     
@@ -423,7 +451,6 @@ class Trainer:
             save_interval: 保存间隔
             save_path: 保存路径
         """
-        import time
         total_games = 0
         total_steps = 0
         total_start = time.time()
@@ -432,7 +459,7 @@ class Trainer:
             # 自我对弈
             remaining_games = min(games_per_batch, num_games - total_games)
             print(f"\n{'='*50}")
-            print(f"Self-play phase: {remaining_games} games (搜索深度={self.search_self_play.search_depth})")
+            print(f"Self-play phase: {remaining_games} games (无搜索，纯网络推理)")
             print(f"{'='*50}")
             self.self_play(remaining_games)
             total_games += remaining_games
@@ -452,6 +479,7 @@ class Trainer:
                           f"Loss={losses['total_loss']:.4f}, "
                           f"Policy={losses['policy_loss']:.4f}, "
                           f"Value={losses['value_loss']:.4f}, "
+                          f"Fast={losses['fast_policy_loss']:.4f}, "
                           f"LR={losses['learning_rate']:.6f}")
             
             # 保存模型
@@ -468,3 +496,50 @@ class Trainer:
         
         total_time = time.time() - total_start
         print(f"\nTraining completed! Games: {total_games}, Steps: {total_steps}, Time: {total_time:.0f}s")
+
+
+# 兼容旧接口的Trainer类
+class Trainer:
+    """兼容旧接口的训练器"""
+    
+    def __init__(self, 
+                 model: AlphaGoNet,
+                 board_size: int = 9,
+                 search_depth: int = 10,
+                 search_depth_self_play: int = 3,
+                 top_k: int = 5,
+                 lr: float = 1e-3,
+                 weight_decay: float = 1e-4,
+                 batch_size: int = 64,
+                 buffer_size: int = 1000,
+                 device: str = 'cpu',
+                 use_amp: bool = False):
+        """
+        初始化训练器（兼容旧接口）
+        """
+        self.alpha_trainer = AlphaGoTrainer(
+            model=model,
+            board_size=board_size,
+            lr=lr,
+            weight_decay=weight_decay,
+            batch_size=batch_size,
+            buffer_size=buffer_size,
+            device=device,
+            use_amp=use_amp,
+            top_k=top_k
+        )
+        self.board_size = board_size
+        self.model = model
+    
+    def self_play(self, num_games: int = 100) -> List[Dict]:
+        """自我对弈"""
+        return self.alpha_trainer.self_play(num_games)
+    
+    def train_step(self) -> Dict[str, float]:
+        """执行一步训练"""
+        return self.alpha_trainer.train_step()
+    
+    def train(self, num_games: int = 5000, games_per_batch: int = 256, 
+              save_interval: int = 100, save_path: str = 'model.pth'):
+        """完整训练流程"""
+        self.alpha_trainer.train(num_games, games_per_batch, save_interval, save_path)

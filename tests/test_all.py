@@ -221,33 +221,33 @@ class TestGoAI:
     
     def test_ai_initialization(self):
         """测试AI初始化"""
-        ai = GoAI(board_size=9, search_depth=5, top_k=3)
+        ai = GoAI(board_size=9)
         assert ai.board_size == 9
     
     def test_get_move(self):
         """测试获取着法"""
-        ai = GoAI(board_size=9, search_depth=3, top_k=3)
-        move, score, info = ai.get_move()
+        ai = GoAI(board_size=9)
+        move, info = ai.get_move()
         assert 0 <= move < 81
-        assert isinstance(score, float)
+        assert 'policy' in info
     
     def test_make_move(self):
         """测试执行着法"""
-        ai = GoAI(board_size=9, search_depth=3, top_k=3)
+        ai = GoAI(board_size=9)
         result = ai.make_move(0)
         assert result == True
         assert ai.board[0, 0] == 1
     
     def test_evaluate_position(self):
         """测试评估局面"""
-        ai = GoAI(board_size=9, search_depth=3, top_k=3)
+        ai = GoAI(board_size=9)
         result = ai.evaluate_position()
         assert 'best_move' in result
         assert 'best_prob' in result
     
     def test_suggest_moves(self):
         """测试推荐着法"""
-        ai = GoAI(board_size=9, search_depth=3, top_k=3)
+        ai = GoAI(board_size=9)
         suggestions = ai.suggest_moves(num_moves=5)
         assert len(suggestions) <= 5
         assert all('move' in s for s in suggestions)

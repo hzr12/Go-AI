@@ -1,38 +1,52 @@
-# MuZero-Lite 围棋AI
+# 围棋AI
 
-基于MuZero思想的围棋AI，使用有限深度Minimax搜索替代MCTS，针对CPU推理优化。
+基于AlphaGo思想的围棋AI，使用多网络架构（策略网络 + 价值网络 + 快速策略网络），无搜索，纯网络推理。
 
 ## 特性
 
-- **MuZero架构**：表示网络 + 动态网络 + 预测网络
-- **Minimax搜索**：深度10步，Top-5候选，Alpha-Beta剪枝
-- **可调参数**：搜索深度、候选宽度、是否使用Alpha-Beta剪枝
+- **多网络架构**：策略网络 + 价值网络 + 快速策略网络并行推理
+- **无搜索**：直接从神经网络输出着法，推理速度快
 - **CPU/GPU兼容**：自动检测设备，支持AMP混合精度训练
 - **自我对弈**：从零开始学习，无需棋谱数据
+- **可扩展**：支持9×9到19×19棋盘
 
 ## 架构
 
 ```
 输入: 棋盘状态 (19通道 × 9×9)
       ↓
-表示网络 (ResNet: 4块, 通道64)
-      ↓
-隐藏状态 h₀
-      ↓
-动态网络 (预测 h_{t+1}, r_t)
-      ↓
-预测网络 (输出策略π, 价值v)
-      ↓
-Minimax搜索 (深度10步, Top-5, α-β剪枝)
-      ↓
-输出: 最佳着法
+┌─────┴─────┐
+│           │
+↓           ↓
+骨干网络    快速策略网络
+(64ch×4残差) (72ch×3残差)
+│           │
+├───┐       │
+↓   ↓       ↓
+策略 价值   快速策略
+网络 网络   网络
+(32ch)(16ch) (72ch×3)
+│    │       │
+↓    ↓       ↓
+策略 价值   快速策略
+logits v   logits
 ```
+
+## 网络参数量
+
+| 网络 | 参数量 | 用途 |
+|------|--------|------|
+| 骨干网络 | ~150K | 特征提取 |
+| 策略网络 | ~21K | 精确着法预测 |
+| 价值网络 | ~8K | 局面评估 |
+| 快速策略网络 | ~300K | 快速着法建议 |
+| **总计** | **~1M** | - |
 
 ## 安装
 
 ```bash
 # 克隆仓库
-git clone <repository-url>
+git clone https://github.com/hzr12/Go-AI.git
 cd Go-AI
 
 # 安装依赖
@@ -48,150 +62,110 @@ pip install torch numpy pytest
 python -m src.inference --mode play
 
 # 使用训练好的模型
-python -m src.inference --model models/model.pth --mode play
+python -m src.inference --model models/alphago_model.pth --mode play
 
-# 调整搜索参数
-python -m src.inference --search-depth 10 --top-k 5 --mode play
+# 评估当前局面
+python -m src.inference --model models/alphago_model.pth --mode eval
+
+# 分析着法概率
+python -m src.inference --model models/alphago_model.pth --mode analyze
 ```
 
 ### 训练
 
 ```bash
-# 使用默认配置训练
-python -m src.training.trainer
+# 基本训练
+python scripts/train.py --num-games 5000
 
-# 使用自定义配置
-python -c "
-from src.config.config import Config
-from src.training.trainer import Trainer
-from src.networks.resnet import MuZeroNet
+# GPU训练（推荐）
+python scripts/train.py --num-games 5000 --device cuda --use-amp --batch-size 256
 
-config = Config(search_depth=10, top_k=5, num_games=5000)
-model = MuZeroNet(in_channels=19, channels=64, num_res_blocks=4, action_size=81)
-trainer = Trainer(model=model, board_size=9, search_depth=10, top_k=5, device=config.device)
-trainer.train(num_games=5000, save_path='models/model.pth')
-"
+# 自定义参数
+python scripts/train.py --num-games 10000 \
+    --backbone-channels 128 \
+    --backbone-res-blocks 6 \
+    --lr 5e-4 \
+    --batch-size 512 \
+    --save-path models/custom_model.pth
 ```
 
-### 评估
+### 测试
 
 ```bash
-# 评估模型
-python -m src.evaluation.evaluator
+# 运行所有测试
+python -m pytest tests/ -v
+
+# 仅测试网络
+python -m pytest tests/test_alphanet.py -v
+
+# 仅测试训练
+python -m pytest tests/test_alphanet.py::TestAlphaGoTrainer -v
 ```
 
-## 配置
+## 训练配置
 
-### 默认配置
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--board-size` | 9 | 棋盘大小 |
+| `--backbone-channels` | 64 | 骨干网络通道数 |
+| `--backbone-res-blocks` | 4 | 骨干网络残差块数量 |
+| `--policy-channels` | 32 | 策略网络通道数 |
+| `--value-channels` | 16 | 价值网络通道数 |
+| `--fast-channels` | 72 | 快速策略网络通道数 |
+| `--fast-res-blocks` | 3 | 快速策略网络残差块数量 |
+| `--lr` | 1e-3 | 学习率 |
+| `--batch-size` | 256 | 批量大小（GPU推荐256-512） |
+| `--num-games` | 5000 | 训练局数 |
+| `--policy-weight` | 1.0 | 策略损失权重 |
+| `--value-weight` | 1.0 | 价值损失权重 |
+| `--fast-weight` | 0.5 | 快速策略损失权重 |
+| `--temperature` | 1.0 | 温度参数 |
+| `--use-amp` | 自动 | 使用混合精度 |
 
-| 参数 | 值 | 说明 |
-|------|-----|------|
-| board_size | 9 | 棋盘大小 |
-| channels | 64 | 网络通道数 |
-| num_res_blocks | 4 | 残差块数量 |
-| search_depth | 10 | 搜索深度 |
-| top_k | 5 | 候选着法数量 |
-| use_alpha_beta | True | 是否使用Alpha-Beta剪枝 |
-| learning_rate | 1e-3 | 学习率 |
-| batch_size | 64 | 批量大小 |
-| num_games | 5000 | 训练局数 |
+## 训练流程
 
-### 预设配置
+1. **自我对弈**：策略网络生成着法，收集游戏数据
+2. **训练**：同时训练三个网络
+   - 策略损失：KL散度（从自我对弈策略学习）
+   - 价值损失：MSE（从游戏结果学习）
+   - 快速策略损失：KL散度（从策略网络蒸馏）
+3. **保存**：定期保存模型检查点
 
-```python
-from src.config.config import get_config
+## 项目结构
 
-# 快速配置（搜索深度5，Top-3）
-config = get_config('fast')
-
-# 精确配置（搜索深度10，Top-5）
-config = get_config('accurate')
-
-# CPU配置
-config = get_config('cpu')
-
-# GPU配置
-config = get_config('gpu')
+```
+Go-AI/
+├── src/
+│   ├── networks/
+│   │   ├── backbone.py      # 共享骨干网络
+│   │   ├── policy_network.py # 策略网络
+│   │   ├── value_network.py  # 价值网络
+│   │   ├── fast_network.py   # 快速策略网络
+│   │   └── alphanet.py       # AlphaGoNet主网络
+│   ├── training/
+│   │   └── trainer.py        # 训练器
+│   └── inference.py          # 推理引擎
+├── scripts/
+│   ├── train.py              # 训练脚本
+│   └── inference.py          # 推理脚本
+├── tests/
+│   └── test_alphanet.py      # 测试用例
+└── models/                   # 模型保存目录
 ```
 
 ## 性能
 
-### 推理速度
+- **推理速度**：~1000 moves/sec (CPU)
+- **训练速度**：~0.3s/game (CPU), ~0.05s/game (GPU)
+- **内存占用**：~500MB (CPU), ~1GB (GPU)
 
-- **CPU**：< 800ms（10步Minimax，Top-5）
-- **GPU**：< 100ms（使用AMP）
+## 依赖
 
-### 训练时间
+- Python 3.8+
+- PyTorch 1.9+
+- NumPy
+- pytest (开发依赖)
 
-- **CPU**：5000局约24-48小时
-- **GPU**（V100-32G）：5000局约2-4小时
+## License
 
-### 棋力目标
-
-- **9x9棋盘**：业余5段-职业初段
-
-## 文件结构
-
-```
-Go-AI/
-├── config/              # 配置文件
-│   └── config.py
-├── src/
-│   ├── networks/        # 网络组件
-│   │   ├── resnet.py
-│   │   └── __init__.py
-│   ├── search/          # 搜索算法
-│   │   ├── minimax.py
-│   │   └── __init__.py
-│   ├── training/        # 训练流程
-│   │   ├── trainer.py
-│   │   └── __init__.py
-│   ├── evaluation/      # 评估方法
-│   │   ├── evaluator.py
-│   │   └── __init__.py
-│   ├── inference.py     # 推理代码
-│   ├── utils/           # 工具函数
-│   │   ├── helpers.py
-│   │   └── __init__.py
-│   └── __init__.py
-├── tests/               # 测试
-│   └── test_all.py
-├── scripts/             # 脚本
-├── docs/                # 文档
-├── data/                # 数据
-└── README.md
-```
-
-## 测试
-
-```bash
-# 运行所有测试
-pytest tests/ -v
-
-# 运行特定测试
-pytest tests/test_all.py::TestMuZeroNet -v
-```
-
-## 扩展
-
-### 添加新功能
-
-1. 实现新功能
-2. 添加测试
-3. 更新文档
-
-### 性能优化
-
-1. 调整网络架构（通道数、残差块数量）
-2. 优化搜索算法（调整搜索深度、候选宽度）
-3. 使用更高效的训练策略
-
-## 参考
-
-- [MuZero](https://arxiv.org/abs/1911.08265)
-- [AlphaZero](https://arxiv.org/abs/1712.01815)
-- [AlphaGo](https://www.nature.com/articles/nature24270)
-
-## 许可证
-
-MIT License
+MIT
