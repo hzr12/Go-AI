@@ -25,15 +25,6 @@ class FastPolicyNetwork(nn.Module):
     """快速策略网络：用于快速推理和搜索"""
     
     def __init__(self, in_channels=19, channels=72, num_res_blocks=3, action_size=81):
-        """
-        初始化快速策略网络
-        
-        Args:
-            in_channels: 输入通道数 (19: 原始棋盘状态)
-            channels: 隐藏通道数
-            num_res_blocks: 残差块数量
-            action_size: 动作空间大小 (9x9=81)
-        """
         super(FastPolicyNetwork, self).__init__()
         self.action_size = action_size
         
@@ -44,32 +35,18 @@ class FastPolicyNetwork(nn.Module):
         # 残差块
         self.res_blocks = nn.Sequential(*[ResBlock(channels) for _ in range(num_res_blocks)])
         
-        # 策略头
+        # 策略头（使用AdaptiveAvgPool2d支持任意棋盘大小）
         self.policy_head = nn.Sequential(
             nn.Conv2d(channels, 32, 1, bias=False),
             nn.BatchNorm2d(32),
             nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),  # 全局平均池化到1×1
             nn.Flatten(),
-            nn.Linear(32 * 81, action_size)
+            nn.Linear(32, action_size)
         )
     
     def forward(self, x):
-        """
-        前向传播
-        
-        Args:
-            x: 棋盘状态 (batch, in_channels, 9, 9)
-            
-        Returns:
-            policy: 着法概率分布 (batch, action_size)
-        """
-        # 输入层
         out = F.relu(self.bn_in(self.conv_in(x)))
-        
-        # 残差块
         out = self.res_blocks(out)
-        
-        # 策略头
         policy = self.policy_head(out)
-        
         return policy

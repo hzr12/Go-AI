@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.networks.resnet import MuZeroNet, ResBlock, RepresentationNetwork, DynamicsNetwork, PredictionNetwork
 from src.search.minimax import MinimaxSearch
-from src.training.trainer import GoGame, ReplayBuffer, Trainer
+from src.training.trainer import GoGame, PrioritizedReplayBuffer as ReplayBuffer, Trainer
 from src.evaluation.evaluator import Evaluator
 from src.inference import GoAI
 from src.config.config import Config, get_config
@@ -191,7 +191,7 @@ class TestReplayBuffer:
         buffer.push(state, action, reward, next_state, done, policy)
         assert len(buffer) == 1
         
-        states, actions, rewards, next_states, dones, policies = buffer.sample(1)
+        states, actions, rewards, next_states, dones, policies, indices, weights = buffer.sample(1)
         assert states.shape == (1, 19, 9, 9)
         assert actions.shape == (1,)
         assert rewards.shape == (1,)

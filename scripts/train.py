@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 from src.networks.alphanet import AlphaGoNet
 from src.training.trainer import AlphaGoTrainer
+from src.data.game_loader import GameLoader
 
 
 def main():
@@ -17,6 +18,8 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='训练AlphaGo围棋AI')
+    
+    # 基本参数
     parser.add_argument('--board-size', type=int, default=9, help='棋盘大小')
     parser.add_argument('--backbone-channels', type=int, default=64, help='骨干网络通道数')
     parser.add_argument('--backbone-res-blocks', type=int, default=4, help='骨干网络残差块数量')
@@ -36,6 +39,17 @@ def main():
     parser.add_argument('--fast-weight', type=float, default=0.5, help='快速策略损失权重')
     parser.add_argument('--temperature', type=float, default=1.0, help='温度参数')
     parser.add_argument('--top-k', type=int, default=5, help='候选着法数量')
+    
+    # 稀疏注意力参数
+    parser.add_argument('--use-sparse-attention', action='store_true', help='启用稀疏注意力')
+    parser.add_argument('--attention-window-size', type=int, default=3, help='局部窗口大小')
+    parser.add_argument('--attention-num-heads', type=int, default=4, help='注意力头数')
+    parser.add_argument('--attention-num-global-tokens', type=int, default=9, help='全局token数量')
+    
+    # SGF预训练参数
+    parser.add_argument('--pretrain-data', type=str, default='', help='棋谱数据目录')
+    parser.add_argument('--pretrain-epochs', type=int, default=10, help='预训练轮数')
+    parser.add_argument('--pretrain-augment', action='store_true', default=True, help='预训练数据增强')
     
     args = parser.parse_args()
     
@@ -60,6 +74,14 @@ def main():
     print(f"  Device: {device}")
     print(f"  Use AMP: {use_amp}")
     print(f"  Loss weights: P={args.policy_weight}, V={args.value_weight}, F={args.fast_weight}")
+    print(f"  Sparse attention: {args.use_sparse_attention}")
+    if args.use_sparse_attention:
+        print(f"    Window size: {args.attention_window_size}")
+        print(f"    Num heads: {args.attention_num_heads}")
+        print(f"    Global tokens: {args.attention_num_global_tokens}")
+    if args.pretrain_data:
+        print(f"  Pretrain data: {args.pretrain_data}")
+        print(f"  Pretrain epochs: {args.pretrain_epochs}")
     
     # 创建网络
     model = AlphaGoNet(
@@ -70,7 +92,11 @@ def main():
         value_channels=args.value_channels,
         fast_channels=args.fast_channels,
         fast_res_blocks=args.fast_res_blocks,
-        action_size=args.board_size * args.board_size
+        action_size=args.board_size * args.board_size,
+        use_sparse_attention=args.use_sparse_attention,
+        attention_window_size=args.attention_window_size,
+        attention_num_heads=args.attention_num_heads,
+        attention_num_global_tokens=args.attention_num_global_tokens
     )
     
     # 计算参数量
@@ -103,6 +129,21 @@ def main():
         temperature=args.temperature,
         top_k=args.top_k
     )
+    
+    # SGF预训练
+    if args.pretrain_data:
+        print(f"\nLoading pretrain data from: {args.pretrain_data}")
+        loader = GameLoader(args.board_size)
+        game_records = loader.load_directory(args.pretrain_data)
+        print(f"Loaded {len(game_records)} games")
+        
+        if game_records:
+            trainer.pretrain_on_games(
+                game_records=game_records,
+                epochs=args.pretrain_epochs,
+                batch_size=args.batch_size,
+                augment=args.pretrain_augment
+            )
     
     # 开始训练
     print(f"\nStarting training...")

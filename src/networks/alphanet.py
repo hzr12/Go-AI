@@ -18,7 +18,11 @@ class AlphaGoNet(nn.Module):
                  value_channels=16,
                  fast_channels=72,
                  fast_res_blocks=3,
-                 action_size=81):
+                 action_size=81,
+                 use_sparse_attention=False,
+                 attention_window_size=3,
+                 attention_num_heads=4,
+                 attention_num_global_tokens=9):
         """
         初始化AlphaGoNet
         
@@ -31,6 +35,10 @@ class AlphaGoNet(nn.Module):
             fast_channels: 快速策略网络通道数
             fast_res_blocks: 快速策略网络残差块数量
             action_size: 动作空间大小
+            use_sparse_attention: 是否使用稀疏注意力
+            attention_window_size: 局部窗口大小
+            attention_num_heads: 注意力头数
+            attention_num_global_tokens: 全局token数量
         """
         super(AlphaGoNet, self).__init__()
         self.action_size = action_size
@@ -39,7 +47,11 @@ class AlphaGoNet(nn.Module):
         self.backbone = SharedBackbone(
             in_channels=in_channels,
             channels=backbone_channels,
-            num_res_blocks=backbone_res_blocks
+            num_res_blocks=backbone_res_blocks,
+            use_sparse_attention=use_sparse_attention,
+            attention_window_size=attention_window_size,
+            attention_num_heads=attention_num_heads,
+            attention_num_global_tokens=attention_num_global_tokens
         )
         
         # 策略网络
@@ -68,7 +80,7 @@ class AlphaGoNet(nn.Module):
         前向传播
         
         Args:
-            observation: 棋盘状态 (batch, in_channels, 9, 9)
+            observation: 棋盘状态 (batch, in_channels, H, W)
             
         Returns:
             policy: 策略网络输出 (batch, action_size)

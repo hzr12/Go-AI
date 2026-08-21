@@ -8,6 +8,7 @@ from typing import List, Tuple, Dict, Optional
 from collections import deque
 import random
 from ..networks.alphanet import AlphaGoNet
+from ..data.game_loader import GameLoader, TrainingExample
 
 
 class GoGame:
@@ -269,6 +270,114 @@ class AlphaGoTrainer:
         
         # 混合精度训练
         self.scaler = torch.cuda.amp.GradScaler() if (device == 'cuda' and use_amp) else None
+    
+    def pretrain_on_games(self, game_records: List, epochs: int = 10, 
+                         batch_size: int = 256, augment: bool = True) -> Dict[str, float]:
+        """
+        在棋谱数据上预训练
+        
+        Args:
+            game_records: 棋谱记录列表
+            epochs: 训练轮数
+            batch_size: 批量大小
+            augment: 是否使用数据增强
+            
+        Returns:
+            训练损失字典
+        """
+        if not game_records:
+            print("No game records provided for pretraining")
+            return {}
+        
+        print(f"\n{'='*50}")
+        print(f"Pretraining on {len(game_records)} games")
+        print(f"{'='*50}")
+        
+        # 加载棋谱数据
+        loader = GameLoader(self.board_size)
+        all_training_data = []
+        
+        for i, game in enumerate(game_records):
+            training_data = loader.game_to_training_data(game)
+            all_training_data.extend(training_data)
+            
+            if (i + 1) % 100 == 0:
+                print(f"  Loaded {i + 1}/{len(game_records)} games")
+        
+        print(f"Total training examples: {len(all_training_data)}")
+        
+        # 数据增强
+        if augment:
+            all_training_data = loader.augment_data(all_training_data)
+            print(f"After augmentation: {len(all_training_data)} examples")
+        
+        # 训练
+        self.model.train()
+        total_loss = 0.0
+        num_batches = 0
+        
+        for epoch in range(epochs):
+            epoch_start = time.time()
+            random.shuffle(all_training_data)
+            
+            epoch_loss = 0.0
+            epoch_batches = 0
+            
+            for i in range(0, len(all_training_data), batch_size):
+                batch = all_training_data[i:i+batch_size]
+                
+                # 准备批次数据
+                states = np.array([ex.state for ex in batch])
+                actions = np.array([ex.action for ex in batch])
+                policies = np.array([ex.policy for ex in batch])
+                values = np.array([ex.value for ex in batch], dtype=np.float32)
+                
+                # 转换为张量
+                states_tensor = torch.FloatTensor(states).to(self.device)
+                actions_tensor = torch.LongTensor(actions).to(self.device)
+                policies_tensor = torch.FloatTensor(policies).to(self.device)
+                values_tensor = torch.FloatTensor(values).to(self.device)
+                
+                # 前向传播
+                policy_logits, value, fast_policy = self.model(states_tensor)
+                
+                # 计算损失
+                policy_loss = F.cross_entropy(policy_logits, policies_tensor)
+                value_loss = F.mse_loss(value.squeeze(), values_tensor)
+                fast_policy_loss = F.kl_div(
+                    F.log_softmax(fast_policy, dim=-1),
+                    F.softmax(policy_logits.detach(), dim=-1),
+                    reduction='batchmean'
+                )
+                
+                total_loss_batch = (self.policy_weight * policy_loss + 
+                                   self.value_weight * value_loss + 
+                                   self.fast_weight * fast_policy_loss)
+                
+                # 反向传播
+                self.optimizer.zero_grad()
+                total_loss_batch.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.optimizer.step()
+                
+                epoch_loss += total_loss_batch.item()
+                epoch_batches += 1
+            
+            epoch_time = time.time() - epoch_start
+            avg_loss = epoch_loss / epoch_batches if epoch_batches > 0 else 0
+            total_loss += epoch_loss
+            num_batches += epoch_batches
+            
+            print(f"  Epoch {epoch+1}/{epochs}: Loss={avg_loss:.4f}, Time={epoch_time:.1f}s")
+        
+        avg_total_loss = total_loss / num_batches if num_batches > 0 else 0
+        print(f"Pretraining completed: Avg Loss={avg_total_loss:.4f}")
+        
+        return {
+            'pretrain_loss': avg_total_loss,
+            'epochs': epochs,
+            'total_examples': len(all_training_data)
+        }
     
     def board_to_tensor(self, board: np.ndarray, current_player: int) -> torch.Tensor:
         tensor = torch.zeros(1, 19, self.board_size, self.board_size, device=self.device)
