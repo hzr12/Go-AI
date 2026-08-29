@@ -125,8 +125,24 @@ python scripts/train_sft.py --device cuda --board-size 19 \
 - 既要长程又要省显存：`--attention-mode mix --attn-mode axial`
 - 最强建模（显存充足）：`--attention-mode mix --attn-mode global`
 
-**额外加速**：训练脚本支持 `--use-amp`（fp16 混合精度）；在支持的机器上可用
-`torch.compile(model)` 进一步融合算子（约 20–40% 提速）。
+**额外加速：`torch.compile` 算子融合** ⚡
+在支持的机器（GPU + 可用的 C++ 编译器）上，加 `--compile` 让模型走
+`torch.compile` 图优化，融合卷积/注意力/BN 等算子，**约 20–40% 提速**：
+```bash
+python scripts/train_sft.py --device cuda --use-amp --compile \
+    --board-size 19 --attn-mode window --attn-window 7 \
+    --data data/sgf_19x19.npz --save-path models/sft_attn_19x19.pth
+# 推理引擎同样支持
+python src/inference.py --model models/sft_attn_19x19.pth --compile --mode selfplay
+```
+实现已做安全回退：编译是惰性的，错误在首次前向才暴露，因此会在
+compile 后用 dummy 输入做一次 warmup；若环境缺编译器（如未装 MSVC `cl`
+的 Windows / 无 CUDA 的 CPU），自动回退到 eager 模式并提示，不影响训练推理。
+
+**推荐组合**（叠加 `--use-amp --compile` 收益最大）：
+- 追求最快且显存友好：`--attention-mode mix --attn-mode window --attn-window 7`
+- 既要长程又要省显存：`--attention-mode mix --attn-mode axial`
+- 最强建模（显存充足）：`--attention-mode mix --attn-mode global`
 
 损失：`L = CrossEntropy(policy, move) + MSELoss(value, z)`，其中 `z ∈ {+1,-1}`
 来自棋谱 `RE` 结果（当前执子方视角）。虚着作为最后一类的专用类别
