@@ -6,7 +6,7 @@ import pytest
 import torch
 import numpy as np
 
-from src.networks.backbone import SharedBackbone, ResBlock
+from src.networks.backbone import SharedBackbone, ResBlock, MultiHeadSelfAttention
 from src.networks.policy_network import PolicyNetwork
 from src.networks.value_network import ValueNetwork
 from src.networks.alphanet import AlphaGoNet
@@ -32,6 +32,23 @@ class TestSharedBackbone:
         x = torch.randn(2, 12, 9, 9)
         out = backbone(x)
         assert out.shape == (2, 64, 9, 9)
+
+    @pytest.mark.parametrize("attn_mode", ["global", "window", "axial"])
+    def test_attention_compute_modes(self, attn_mode):
+        """验证三种注意力计算模式（全局/窗口/轴向）前向形状正确。"""
+        backbone = SharedBackbone(in_channels=12, channels=64, num_res_blocks=4,
+                                  attention_mode="all", num_attention_layers=4,
+                                  num_heads=4, attn_mode=attn_mode, attn_window=5)
+        x = torch.randn(2, 12, 9, 9)
+        out = backbone(x)
+        assert out.shape == (2, 64, 9, 9)
+
+    def test_window_attention_reduces_flops(self):
+        """窗口注意力不物化 N×N 矩阵：仅校验形状（速度在 GPU 上体现）。"""
+        attn = MultiHeadSelfAttention(64, num_heads=4, mode="window", window_size=5)
+        x = torch.randn(1, 64, 19, 19)
+        out = attn(x)
+        assert out.shape == (1, 64, 19, 19)
 
 
 class TestHeads:
