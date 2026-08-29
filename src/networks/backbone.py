@@ -22,15 +22,19 @@ class ResBlock(nn.Module):
         return out
 
 
-def _sdpa(q, k, v, dropout_p=0.0):
+def _sdpa(q, k, v, dropout_p=0.0, force_mem_efficient=False):
     """优先走 FlashAttention（Ampere+）/ Memory-Efficient 路径；CPU 自动回退。
 
     q,k,v: (B, Hh, N, head_dim)
+    force_mem_efficient: 跳过 FlashAttention 后端，强制走 memory-efficient / math。
+        用于 window 注意力：其 batch 维被展开为 B*N（可能极大，如 512*361≈18万），
+        且序列长度仅 ws*ws（很小），FlashAttention 内核在此类「超大 batch × 极小 seq」
+        配置上会报 "invalid configuration argument"，必须禁用 flash 后端。
     """
     if hasattr(F, "scaled_dot_product_attention"):
         # q 已在调用处预乘 scale，这里不再缩放
-        if q.shape[-2] != k.shape[-2]:
-            # FlashAttention 后端要求 Q/K/V 序列长度一致；不一致时（理论不该发生）
+        if force_mem_efficient or q.shape[-2] != k.shape[-2]:
+            # FlashAttention 后端要求 Q/K/V 序列长度一致且对极小 seq 不稳定；
             # 强制走 memory-efficient / math 后端，避免 "invalid configuration argument"。
             with torch.backends.cuda.sdp_kernel(
                 enable_flash=False, enable_mem_efficient=True, enable_math=True
@@ -113,7 +117,7 @@ class MultiHeadSelfAttention(nn.Module):
         # 在 N_q=1 这种极小 query 长度上会报 "invalid configuration argument"。
         # 因此用整个窗口做 SDPA（每个位置对窗口内所有 token 算注意力），再取中心输出，
         # 语义等价于「中心位置看窗口邻居」，且 N_q == N_kv 让后端合法。
-        out = _sdpa(qu, ku, vu, dropout_p=self.attn_drop)  # (B*N, Hh, ws*ws, d)
+        out = _sdpa(qu, ku, vu, dropout_p=self.attn_drop, force_mem_efficient=True)  # (B*N, Hh, ws*ws, d)
         center = (ws * ws) // 2
         out = out[:, :, center:center + 1, :]  # (B*N, Hh, 1, d)
         out = out.reshape(B, N, Hh, d).reshape(B, N, Hh * d)
