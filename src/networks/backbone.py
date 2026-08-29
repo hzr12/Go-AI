@@ -140,11 +140,22 @@ def _run_with_optional_disable(fn, *args):
     默认值 True，运行时 set_compile_disable_sparse(False)（A100）无法撤销已应用的
     torch._dynamo.disable。disable 会造成 graph break，break 后的 eager resume 段
     中 autocast 已退出，qkv Linear 以 FP32 执行，进而让 flash-attn 收到 fp32 报错。
-    这里改为每次调用时动态包装（开销纳秒级，可忽略）。
+    这里改为调用时动态包装。注意不能每次调用都 torch.compiler.disable(fn)——
+    那会为每次调用生成新包装器对象，dynamo 视其为新函数反复 trace，64 次后触发
+    cache_size_limit 告警并整体放弃。此处按 fn（bound method 按 __func__+__self__
+    相等）缓存包装器，实例数有限（每注意力块一个），trace 一次后稳定复用。
     """
     if _compile_disable_sparse:
-        return torch.compiler.disable(fn)(*args)
+        wrapped = _disabled_wrapper_cache.get(fn)
+        if wrapped is None:
+            wrapped = torch.compiler.disable(fn)
+            _disabled_wrapper_cache[fn] = wrapped
+        return wrapped(*args)
     return fn(*args)
+
+
+# disable 包装器缓存：key 为 bound method（__eq__ 按 __func__+__self__，可命中）
+_disabled_wrapper_cache = {}
 
 
 class MultiHeadSelfAttention(nn.Module):
