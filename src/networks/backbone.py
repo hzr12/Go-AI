@@ -88,6 +88,7 @@ class MultiHeadSelfAttention(nn.Module):
     def _global_attn(self, q, k, v):
         return _sdpa(q, k, v, dropout_p=self.attn_drop)
 
+    @torch.compiler.disable
     def _window_attn(self, q, k, v, H, W):
         """滑动窗口注意力：对每个位置仅与窗口内 token 交互。
 
@@ -98,6 +99,10 @@ class MultiHeadSelfAttention(nn.Module):
         显存优化：unfold 后沿窗口维 N 分块（chunk），每块只对 G 个窗口做 SDPA，
         避免一次性构造 (B*N, Hh, ws², d) 大矩阵（B*N 在 19x19 上可达数万，直接 OOM）。
         分块后峰值激活只与 B*G 相关，与总 batch 解耦，可支持大 batch。
+
+        @torch.compiler.disable: F.unfold 接动态 view/permute 链会让 inductor 在
+        V100(sm_70)/torch2.1 上触发 PolynomialError（符号 shape 化简失败）。把本方法
+        排除出编译图，其余算子（Linear/BN/卷积/FFN/GEMM）仍被编译融合，提速保留。
         q,k,v: (B, Hh, N, head_dim)，N = H*W。
         """
         ws = self.window_size
@@ -129,6 +134,7 @@ class MultiHeadSelfAttention(nn.Module):
         out = torch.cat(out_chunks, dim=1)  # (B, N, Hh, d)
         return out.reshape(B, N, Hh * d)
 
+    @torch.compiler.disable
     def _sparse_attn(self, q, k, v, H, W):
         """稀疏注意力（固定稀疏模式）：局部滑动窗口 + 跨步长全局 token。
 
@@ -140,6 +146,9 @@ class MultiHeadSelfAttention(nn.Module):
         显著优于纯 window 的长程建模，且远省于全局 O(N²) 注意力。
 
         显存：沿窗口维 N 分块（同 _window_attn 的 window_chunk），避免 B*N 大矩阵。
+
+        @torch.compiler.disable: 同 _window_attn，内部 F.unfold + 动态 view/permute
+        链会让 inductor 在 V100 上报 PolynomialError，排除出编译图。
         q,k,v: (B, Hh, N, head_dim)，N = H*W。
         """
         ws = self.window_size

@@ -27,6 +27,15 @@ from src.data.dataset import SupervisedDataset
 from scripts.build_dataset import build
 
 
+def save_model(model, path):
+    """保存模型权重，并剥离 torch.compile 包装产生的 '_orig_mod.' 前缀，
+    保证存档无论是否经 compile 都能被后续普通加载/resume 使用。"""
+    sd = model.state_dict()
+    if any(k.startswith('_orig_mod.') for k in sd.keys()):
+        sd = {k.replace('_orig_mod.', '', 1): v for k, v in sd.items()}
+    torch.save(sd, path)
+
+
 def setup_logging(log_file, level=logging.INFO):
     """配置 logging：同时写文件与输出到控制台（无缓冲，实时可见）。"""
     logger = logging.getLogger('train')
@@ -227,32 +236,6 @@ def main():
                 _m.window_chunk = args.window_chunk
         logger.info("[model] window_chunk=%d（滑动窗口注意力分块大小）", args.window_chunk)
 
-    # torch.compile 融合算子（GPU 上约 20-40% 提速）。首迭代有编译开销，
-    # 不支持或失败时自动回退到 eager 模式。
-    if args.compile:
-        if hasattr(torch, 'compile'):
-            try:
-                model = torch.compile(model, dynamic=False)
-                # torch.compile 惰性，错误在首次前向才暴露；用 dummy 输入
-                # 触发真实编译并捕获异常（如 CPU 缺 MSVC cl 编译器）。
-                with torch.no_grad():
-                    dummy = torch.zeros(1, 12, args.board_size, args.board_size,
-                                        device=device)
-                    model(dummy)
-                logger.info("[train] 已启用 torch.compile 算子融合")
-            except Exception as e:  # noqa: BLE001
-                logger.warning("[train] torch.compile 不可用，回退 eager: %s", e)
-                model = AlphaGoNet(
-                    in_channels=12, backbone_channels=128,
-                    backbone_res_blocks=12, attention_mode=args.attention_mode,
-                    num_attention_layers=args.num_attention_layers,
-                    num_heads=args.num_heads, attention_dropout=args.attention_dropout,
-                    attn_mode=args.attn_mode, attn_window=args.attn_window,
-                    action_size=args.board_size * args.board_size + 1,
-                ).to(device)
-        else:
-            logger.info("[train] 当前 torch 版本不支持 torch.compile，跳过")
-
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
@@ -282,7 +265,15 @@ def main():
         state_path = args.resume + '.train_state'
         logger.info("[resume] 加载模型权重: %s", args.resume)
         ckpt = torch.load(args.resume, map_location=device)
-        model.load_state_dict(ckpt)
+        # 统一前缀：checkpoint 可能带（来自 compile 存档）或不带 "_orig_mod." 前缀，
+        # 目标模型也可能被 compile 包成 OptimizedModule（内部为 _orig_mod）。
+        # 先全部规范化成不带前缀，再按需补回，保证任意组合都能匹配。
+        ckpt = {k.replace('_orig_mod.', '', 1): v for k, v in ckpt.items()}
+        target = getattr(model, '_orig_mod', model)  # compile 后为真实模块
+        if hasattr(model, '_orig_mod'):
+            ckpt = {'_orig_mod.' + k: v for k, v in ckpt.items()}
+            logger.info("[resume] 模型已 torch.compile 包装，权重按 _orig_mod. 前缀对齐")
+        target.load_state_dict(ckpt)
         if os.path.isfile(state_path):
             tstate = torch.load(state_path, map_location=device)
             optimizer.load_state_dict(tstate['optimizer'])
@@ -298,6 +289,24 @@ def main():
         else:
             logger.warning("[resume] 未找到 %s（仅恢复模型权重，optimizer/scheduler 从头开始）",
                            state_path)
+
+    # torch.compile 融合算子（GPU 上约 20-40%% 提速）。必须在 resume 加载之后再做，
+    # 否则模型会被包成 OptimizedModule，其 state_dict 带 "_orig_mod." 前缀，与
+    # checkpoint 的 "backbone.xxx" 不匹配导致 load 失败。
+    if args.compile:
+        if hasattr(torch, 'compile'):
+            try:
+                model = torch.compile(model, dynamic=False)
+                with torch.no_grad():
+                    dummy = torch.zeros(1, 12, args.board_size, args.board_size,
+                                        device=device)
+                    model(dummy)
+                logger.info("[train] 已启用 torch.compile 算子融合")
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[train] torch.compile 不可用，回退 eager: %s", e)
+        else:
+            logger.info("[train] 当前 torch 版本不支持 torch.compile，跳过")
+
     logger.info("[train] 开始训练 | steps/epoch=%d | 总 steps≈%d | warmup=%d",
                 n_batches, total_steps, warmup_steps)
 
@@ -322,7 +331,7 @@ def main():
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
                 # 保存当前进度，便于减小 batch 后用 --resume 续训
-                torch.save(model.state_dict(), args.out + '.latest')
+                save_model(model, args.out + '.latest')
                 torch.save({
                     'optimizer': optimizer.state_dict(),
                     'scheduler': scheduler.state_dict(),
@@ -362,11 +371,11 @@ def main():
                             scaler.get_scale(), time.time() - t0)
                 if acc > best_eval_acc:
                     best_eval_acc = acc
-                    torch.save(model.state_dict(), args.out)
+                    save_model(model, args.out)
                     logger.info("  -> 保存最佳模型至 %s", args.out)
             if step % args.save_every == 0:
                 # 同时保存完整训练状态，供 --resume 断点续训
-                torch.save(model.state_dict(), args.out + '.latest')
+                save_model(model, args.out + '.latest')
                 torch.save({
                     'optimizer': optimizer.state_dict(),
                     'scheduler': scheduler.state_dict(),
@@ -380,7 +389,7 @@ def main():
                     epoch_loss / max(1, n_batches))
 
     # 最终保存（含训练状态，供 --resume 续训）
-    torch.save(model.state_dict(), args.out)
+    save_model(model, args.out)
     torch.save({
         'optimizer': optimizer.state_dict(),
         'scheduler': scheduler.state_dict(),
