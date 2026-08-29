@@ -82,21 +82,51 @@ python scripts/train_sft.py --device cuda --use-amp \
     --data data/sgf_19x19.npz --save-path models/sft_19x19.pth
 
 # 注意力配置（默认 mix 模式：卷积打底 + 注意力提质）
-#   --attention-mode {none,mix,all}   无注意力 / 混合 / 全注意力
+#   --attention-mode {none,mix,all}   无注意力 / 混合 / 全注意力（主干堆叠）
+#   --attn-mode {global,window,axial} 注意力计算方式（见下）
 #   --num-attention-layers N          mix 模式下注意力块数量
 #   --num-heads H                     多头注意力头数
+#   --attn-window W                   window 模式窗口边长（默认 7）
 python scripts/train_sft.py --device cuda --board-size 19 \
     --attention-mode mix --num-attention-layers 6 --num-heads 8 \
+    --attn-mode window --attn-window 7 \
     --data data/sgf_19x19.npz --save-path models/sft_attn_19x19.pth
 ```
 
 主干注意力：把棋盘 `(B, C, H, W)` 视为 `N=H*W` 个 token 做多头自注意力
 （pre-LayerNorm + FFN），捕捉长程依赖（大龙死活、全局厚薄）；卷积残差块
-负责局部形状。三种模式由 `--attention-mode` 控制：
+负责局部形状。主干堆叠方式由 `--attention-mode` 控制：
 - `none`：纯卷积（最快，局部性最好）
 - `mix`（默认）：在 `num_res_blocks` 个块中均匀穿插 `num_attention_layers`
   个注意力混合块
 - `all`：全部使用「卷积残差 + 注意力」混合块
+
+### 注意力计算模式（`--attn-mode`，提速关键）⚡
+
+注意力内部计算方式决定速度与显存，由 `--attn-mode` 选择：
+
+| 模式 | 复杂度 | 显存 | 长程建模 | 说明 |
+|------|--------|------|----------|------|
+| `global` | O(N²·C) | O(N²) | 最强 | 标准全配对，走 SDPA/FlashAttention |
+| `window` | O(N·w²) | O(N·w²) | 局部为主 | 滑动窗口（w=7 时约 7× 提速），GPU 上最佳性价比 |
+| `axial` | O(2N·√N) | O(N) | 整行/整列 | 先按行后按列两次 1D 注意力，省显存且保长程 |
+
+**实现要点（均已落地）**：
+- 统一使用 `torch.nn.functional.scaled_dot_product_attention`，在 Ampere+
+  GPU 上自动走 **FlashAttention / Memory-Efficient** 路径，**不物化 N×N 矩阵**，
+  显存从 O(N²) 降到 O(N)，速度显著提升；CPU 自动回退到手写注意力。
+- `window` 模式把窗口维并入 batch 后调用 SDPA，GPU 上每个窗口仅算 `w²×w²`，
+  19 路 w=7 时注意力算力约为全局的 `1/7`。
+- `axial` 模式把二维拆成两次 1D SDPA，复杂度约 `2N·max(H,W)`，速度与 global
+  持平但显存更低，适合显存受限又要长程的场景。
+
+**推荐组合**：
+- 追求最快且显存友好：`--attention-mode mix --attn-mode window --attn-window 7`
+- 既要长程又要省显存：`--attention-mode mix --attn-mode axial`
+- 最强建模（显存充足）：`--attention-mode mix --attn-mode global`
+
+**额外加速**：训练脚本支持 `--use-amp`（fp16 混合精度）；在支持的机器上可用
+`torch.compile(model)` 进一步融合算子（约 20–40% 提速）。
 
 损失：`L = CrossEntropy(policy, move) + MSELoss(value, z)`，其中 `z ∈ {+1,-1}`
 来自棋谱 `RE` 结果（当前执子方视角）。虚着作为最后一类的专用类别
