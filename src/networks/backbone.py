@@ -22,28 +22,25 @@ class ResBlock(nn.Module):
         return out
 
 
-def _sdpa(q, k, v, dropout_p=0.0, force_mem_efficient=False):
-    """优先走 FlashAttention（Ampere+）/ Memory-Efficient 路径；CPU 自动回退。
+def _sdpa(q, k, v, dropout_p=0.0, use_math=False):
+    """注意力计算。
 
-    q,k,v: (B, Hh, N, head_dim)
-    force_mem_efficient: 跳过 FlashAttention 后端，强制走 memory-efficient / math。
+    q,k,v: (B, Hh, N, head_dim)。q 已在调用处预乘 scale。
+    use_math: 跳过 F.scaled_dot_product_attention 的所有后端，直接走手写 softmax 注意力。
         用于 window 注意力：其 batch 维被展开为 B*N（可能极大，如 512*361≈18万），
-        且序列长度仅 ws*ws（很小），FlashAttention 内核在此类「超大 batch × 极小 seq」
-        配置上会报 "invalid configuration argument"，必须禁用 flash 后端。
+        且序列长度仅 ws*ws（很小）。FlashAttention 内核在此类「超大 batch × 极小 seq」
+        配置上会报 "invalid configuration argument"；而 torch.backends.cuda.sdp_kernel
+        老 API 在较新 torch 中已被 deprecate 且常不生效，故直接用手写 math 路径最稳。
+        window 的 seq=49，49×49 注意力成本可忽略。
     """
-    if hasattr(F, "scaled_dot_product_attention"):
-        # q 已在调用处预乘 scale，这里不再缩放
-        if force_mem_efficient or q.shape[-2] != k.shape[-2]:
-            # FlashAttention 后端要求 Q/K/V 序列长度一致且对极小 seq 不稳定；
-            # 强制走 memory-efficient / math 后端，避免 "invalid configuration argument"。
-            with torch.backends.cuda.sdp_kernel(
-                enable_flash=False, enable_mem_efficient=True, enable_math=True
-            ):
-                return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
-        return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
-    # 老版本 torch 回退：手写注意力（q 已预乘 scale）
-    attn = (q @ k.transpose(-2, -1))
-    attn = attn.softmax(dim=-1)
+    if use_math or not hasattr(F, "scaled_dot_product_attention"):
+        # 手写注意力（q 已预乘 scale）
+        attn = (q @ k.transpose(-2, -1))
+        attn = attn.softmax(dim=-1)
+        if dropout_p > 0.0:
+            attn = torch.nn.functional.dropout(attn, p=dropout_p)
+        return attn @ v
+    return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
     if dropout_p > 0:
         attn = F.dropout(attn, p=dropout_p)
     return attn @ v
@@ -117,7 +114,7 @@ class MultiHeadSelfAttention(nn.Module):
         # 在 N_q=1 这种极小 query 长度上会报 "invalid configuration argument"。
         # 因此用整个窗口做 SDPA（每个位置对窗口内所有 token 算注意力），再取中心输出，
         # 语义等价于「中心位置看窗口邻居」，且 N_q == N_kv 让后端合法。
-        out = _sdpa(qu, ku, vu, dropout_p=self.attn_drop, force_mem_efficient=True)  # (B*N, Hh, ws*ws, d)
+        out = _sdpa(qu, ku, vu, dropout_p=self.attn_drop, use_math=True)  # (B*N, Hh, ws*ws, d)
         center = (ws * ws) // 2
         out = out[:, :, center:center + 1, :]  # (B*N, Hh, 1, d)
         out = out.reshape(B, N, Hh, d).reshape(B, N, Hh * d)

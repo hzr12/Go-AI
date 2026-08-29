@@ -10,6 +10,7 @@
 """
 
 import argparse
+import logging
 import os
 import random
 import sys
@@ -24,6 +25,27 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.networks.alphanet import AlphaGoNet
 from src.data.dataset import SupervisedDataset
 from scripts.build_dataset import build
+
+
+def setup_logging(log_file, level=logging.INFO):
+    """配置 logging：同时写文件与输出到控制台（无缓冲，实时可见）。"""
+    logger = logging.getLogger('train')
+    logger.setLevel(level)
+    logger.handlers.clear()
+    fmt = logging.Formatter('[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(level)
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+
+    if log_file:
+        os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
+        fh = logging.FileHandler(log_file, encoding='utf-8')
+        fh.setLevel(level)
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    return logger
 
 
 def maybe_autocast(device):
@@ -77,10 +99,11 @@ def load_from_path(path, board_size, max_games_per_tgz=0):
             try:
                 d, n_games, skip = build(src, board_size, max_games_per_tgz)
             except RuntimeError as e:
-                print(f"[data] 跳过分片 {src}：{e}")
+                logger.warning("[data] 跳过分片 %s：%s", src, e)
                 return None, 0, 0
             if n_games == 0:
-                print(f"[data] 跳过分片 {src}：0 有效局（与 --board-size {board_size} 不匹配或空）")
+                logger.warning("[data] 跳过分片 %s：0 有效局（与 --board-size %d 不匹配或空）",
+                               src, board_size)
                 return None, 0, 0
             return d, n_games, skip
 
@@ -131,9 +154,29 @@ def main():
                     help='注意力计算模式: global=全配对, window=滑动窗口, axial=轴向')
     ap.add_argument('--attn-window', type=int, default=7, help='window 模式窗口边长')
     ap.add_argument('--eval-every', type=int, default=5000)
+    ap.add_argument('--log-every', type=int, default=50,
+                    help='每隔多少 step 打印一次训练日志（loss/lr/吞吐/显存）')
+    ap.add_argument('--log-file', default='training.log',
+                    help='训练日志文件路径（同时输出到控制台），设为空字符串可关闭文件日志')
     ap.add_argument('--compile', action='store_true',
                     help='用 torch.compile 融合算子（GPU 上约 20-40%% 提速，首次迭代较慢）')
     args = ap.parse_args()
+
+    # 配置日志（控制台 + 文件），统一用 logger 输出便于事后排查
+    log_file = args.log_file if args.log_file else None
+    logger = setup_logging(log_file)
+    logger.info("=" * 60)
+    logger.info("启动训练 | torch=%s | device=%s | amp=%s",
+                torch.__version__, args.device, args.use_amp)
+    logger.info("配置: data=%s board=%d batch=%d epochs=%d lr=%s wd=%s",
+                args.data, args.board_size, args.batch_size, args.epochs,
+                args.lr, args.weight_decay)
+    logger.info("注意力: mode=%s attn_mode=%s window=%d heads=%d layers=%d dropout=%s compile=%s",
+                args.attention_mode, args.attn_mode, args.attn_window,
+                args.num_heads, args.num_attention_layers, args.attention_dropout, args.compile)
+    logger.info("日志: log_every=%d eval_every=%d save_every=%d out=%s",
+                args.log_every, args.eval_every, args.save_every, args.out)
+    logger.info("=" * 60)
 
     if args.device == 'auto':
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -147,6 +190,7 @@ def main():
 
     dataset = load_from_path(args.data, args.board_size, args.max_games_per_tgz)
     n = len(dataset)
+    logger.info("[data] 总样本数=%d | 训练=%d | 验证=%d", n, int(n * 0.98), n - int(n * 0.98))
     # 留出 held-out 集用于 top-1 准确率监控
     n_train = int(n * 0.98)
     idx_all = np.arange(n)
@@ -167,6 +211,8 @@ def main():
         attn_window=args.attn_window,
         action_size=args.board_size * args.board_size + 1,  # +1 为 pass 类别
     ).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    logger.info("[model] 参数量=%.2fM | 设备=%s", n_params / 1e6, device)
 
     # torch.compile 融合算子（GPU 上约 20-40% 提速）。首迭代有编译开销，
     # 不支持或失败时自动回退到 eager 模式。
@@ -180,9 +226,9 @@ def main():
                     dummy = torch.zeros(1, 12, args.board_size, args.board_size,
                                         device=device)
                     model(dummy)
-                print("[train] 已启用 torch.compile 算子融合")
+                logger.info("[train] 已启用 torch.compile 算子融合")
             except Exception as e:  # noqa: BLE001
-                print(f"[train] torch.compile 不可用，回退 eager: {e}")
+                logger.warning("[train] torch.compile 不可用，回退 eager: %s", e)
                 model = AlphaGoNet(
                     in_channels=12, backbone_channels=128,
                     backbone_res_blocks=12, attention_mode=args.attention_mode,
@@ -192,7 +238,7 @@ def main():
                     action_size=args.board_size * args.board_size + 1,
                 ).to(device)
         else:
-            print("[train] 当前 torch 版本不支持 torch.compile，跳过")
+            logger.info("[train] 当前 torch 版本不支持 torch.compile，跳过")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
@@ -202,6 +248,8 @@ def main():
     step = 0
     best_eval_acc = -1.0
     t0 = time.time()
+    logger.info("[train] 开始训练 | steps/epoch=%d | 总 steps≈%d",
+                (n_train + bs - 1) // bs, args.epochs * (n_train + bs - 1) // bs)
 
     for epoch in range(args.epochs):
         rng.shuffle(train_idx)
@@ -223,24 +271,35 @@ def main():
             step += 1
             epoch_loss += loss.item()
 
+            if step % args.log_every == 0:
+                lr = optimizer.param_groups[0]['lr']
+                mem = torch.cuda.memory_reserved(device) / 1e9 if device == 'cuda' else 0.0
+                speed = step * bs / max(1e-6, time.time() - t0)
+                logger.info("[step %d/%d] loss=%.4f (p=%.4f v=%.4f) lr=%.2e "
+                            "scale=%.0f mem=%.2fGB spd=%.0f s/s elapsed=%.0fs",
+                            step, args.epochs * n_batches,
+                            loss.item(), policy_loss.item(), value_loss.item(),
+                            lr, scaler.get_scale(), mem, speed, time.time() - t0)
+
             if step % args.eval_every == 0 and len(eval_idx) > 0:
                 acc = evaluate(model, dataset, eval_idx, bs, device)
-                print(f"[step {step}] train_loss={epoch_loss / max(1, (i + 1)):.4f} "
-                      f"eval_top1={acc:.4f} scale={scaler.get_scale():.0f} "
-                      f"elapsed={time.time() - t0:.0f}s")
+                logger.info("[eval] step=%d train_loss=%.4f eval_top1=%.4f scale=%.0f elapsed=%.0fs",
+                            step, epoch_loss / max(1, (i + 1)), acc,
+                            scaler.get_scale(), time.time() - t0)
                 if acc > best_eval_acc:
                     best_eval_acc = acc
                     torch.save(model.state_dict(), args.out)
-                    print(f"  -> 保存最佳模型至 {args.out}")
+                    logger.info("  -> 保存最佳模型至 %s", args.out)
             if step % args.save_every == 0:
                 torch.save(model.state_dict(), args.out + '.latest')
         scheduler.step()
-        print(f"epoch {epoch + 1}/{args.epochs} done, loss={epoch_loss / max(1, n_batches):.4f}")
+        logger.info("epoch %d/%d done, loss=%.4f", epoch + 1, args.epochs,
+                    epoch_loss / max(1, n_batches))
 
     # 最终保存
     torch.save(model.state_dict(), args.out)
-    print(f"训练完成。最佳 eval_top1={best_eval_acc:.4f}，模型已保存至 {args.out}")
-    print(f"总耗时 {time.time() - t0:.0f}s")
+    logger.info("训练完成。最佳 eval_top1=%.4f，模型已保存至 %s", best_eval_acc, args.out)
+    logger.info("总耗时 %.0fs", time.time() - t0)
 
 
 @torch.no_grad()
