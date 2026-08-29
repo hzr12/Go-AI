@@ -22,24 +22,48 @@ class ResBlock(nn.Module):
         return out
 
 
-class MultiHeadSelfAttention(nn.Module):
-    """把棋盘 (B, C, H, W) 视为 N=H*W 个 token 的多头自注意力。
+def _sdpa(q, k, v, dropout_p=0.0):
+    """优先走 FlashAttention（Ampere+）/ Memory-Efficient 路径；CPU 自动回退。
 
-    采用 pre-LayerNorm 的 Transformer 风格：
-        y = x + Attn(LN(x))
-        z = y + FFN(LN(y))
+    q,k,v: (B, Hh, N, head_dim)
+    """
+    if hasattr(F, "scaled_dot_product_attention"):
+        # q 已在调用处预乘 scale，这里不再缩放
+        return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+    # 老版本 torch 回退：手写注意力（q 已预乘 scale）
+    attn = (q @ k.transpose(-2, -1))
+    attn = attn.softmax(dim=-1)
+    if dropout_p > 0:
+        attn = F.dropout(attn, p=dropout_p)
+    return attn @ v
+
+
+class MultiHeadSelfAttention(nn.Module):
+    """多头自注意力，支持三种模式以平衡速度与长程建模能力：
+
+    - mode="global" : 标准全局全配对注意力（最贵，长程最强）
+    - mode="window" : 滑动窗口局部注意力（最快，复杂度 O(N·w²)）
+    - mode="axial"  : 轴向注意力，先按行、再按列两次 1D 注意力
+                      （保长程、复杂度约 O(2N·√N)，围棋网格友好）
+
+    内部统一使用 torch.nn.functional.scaled_dot_product_attention，
+    在支持的 GPU 上自动走 FlashAttention / Memory-Efficient 路径，
+    不物化 N×N 注意力矩阵，显著降低显存与耗时；CPU 自动回退。
     """
 
-    def __init__(self, channels, num_heads=4, dropout=0.0):
+    def __init__(self, channels, num_heads=4, dropout=0.0,
+                 mode="global", window_size=7):
         super(MultiHeadSelfAttention, self).__init__()
         assert channels % num_heads == 0, "channels 必须能被 num_heads 整除"
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
         self.scale = self.head_dim ** -0.5
+        self.mode = mode
+        self.window_size = window_size
 
         self.ln1 = nn.LayerNorm(channels)
         self.qkv = nn.Linear(channels, channels * 3, bias=False)
-        self.attn_drop = nn.Dropout(dropout)
+        self.attn_drop = dropout
 
         self.ln2 = nn.LayerNorm(channels)
         self.ffn = nn.Sequential(
@@ -49,49 +73,119 @@ class MultiHeadSelfAttention(nn.Module):
         )
         self.ffn_drop = nn.Dropout(dropout)
 
+    def _to_heads(self, t, B, N):
+        # t: (B, N, C) -> (B, Hh, N, head_dim)
+        return t.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+
+    def _global_attn(self, q, k, v):
+        return _sdpa(q, k, v, dropout_p=self.attn_drop)
+
+    def _window_attn(self, q, k, v, H, W):
+        """滑动窗口注意力：对每个位置仅与窗口内 token 交互。
+
+        用 F.unfold 取每个窗口的 ws*ws 个 token，把窗口维并入 batch 后用
+        torch.nn.functional.scaled_dot_product_attention（GPU 上走 FlashAttention /
+        Memory-Efficient，不物化 N×N 矩阵）计算局部注意力，再取中心位置输出。
+        复杂度 O(N * ws²)，远低于全局 O(N²)，显存同理下降。
+        q,k,v: (B, Hh, N, head_dim)，N = H*W。
+        """
+        ws = self.window_size
+        B, Hh, N, d = q.shape
+
+        # 取窗口邻居: (B, Hh*d, N, ws*ws)
+        qu = F.unfold(q.reshape(B, Hh * d, H, W), kernel_size=ws, padding=ws // 2)
+        ku = F.unfold(k.reshape(B, Hh * d, H, W), kernel_size=ws, padding=ws // 2)
+        vu = F.unfold(v.reshape(B, Hh * d, H, W), kernel_size=ws, padding=ws // 2)
+
+        # 重排为 (B*N, Hh, ws*ws, d)
+        qu = qu.view(B, Hh, d, N, ws * ws).permute(0, 3, 1, 4, 2).reshape(B * N, Hh, ws * ws, d)
+        ku = ku.view(B, Hh, d, N, ws * ws).permute(0, 3, 1, 4, 2).reshape(B * N, Hh, ws * ws, d)
+        vu = vu.view(B, Hh, d, N, ws * ws).permute(0, 3, 1, 4, 2).reshape(B * N, Hh, ws * ws, d)
+
+        # 中心位置 query: 每个窗口第 (ws*ws)//2 个（即中心），(B*N, Hh, 1, d)
+        center = (ws * ws) // 2
+        qc = qu[:, :, center:center + 1, :]  # (B*N, Hh, 1, d)
+
+        # FlashAttention 路径的局部注意力
+        out = _sdpa(qc, ku, vu, dropout_p=self.attn_drop)  # (B*N, Hh, 1, d)
+        out = out.reshape(B, N, Hh, d).reshape(B, N, Hh * d)
+        return out
+
+    def _axial_attn(self, q, k, v, H, W):
+        """轴向注意力：先按行、再按列做 1D 自注意力。
+
+        q,k,v: (B, Hh, N, d)，N=H*W。轴向注意力把二维 token 在单轴上交互，
+        复杂度约 O(2·N·max(H,W))，远低于 O(N²)，同时保留长程（整行/整列）依赖。
+        """
+        B, Hh, N, d = q.shape
+
+        def attn_1d(tokens):
+            # tokens: (B*Hh*L, S, d) -> 把 Hh 融进 batch 做标准 MHA
+            t = tokens.view(-1, Hh, tokens.shape[1], d)
+            return _sdpa(t, t, t, dropout_p=self.attn_drop).view(-1, tokens.shape[1], d)
+
+        # 行注意力：每行 H 个 token 互相看，把 (B,Hh,H,W,d) 重排为 (B*Hh*H, W, d)
+        qr = q.view(B, Hh, H, W, d).reshape(B * Hh * H, W, d)
+        kr = k.view(B, Hh, H, W, d).reshape(B * Hh * H, W, d)
+        vr = v.view(B, Hh, H, W, d).reshape(B * Hh * H, W, d)
+        out_r = attn_1d(qr)  # (B*Hh*H, W, d)
+        out_r = out_r.view(B, Hh, H, W, d)
+
+        # 列注意力：转置后同理，把 (B,Hh,W,H,d) 重排为 (B*Hh*W, H, d)
+        qc = out_r.transpose(2, 3).reshape(B * Hh * W, H, d)
+        kc = k.view(B, Hh, H, W, d).transpose(2, 3).reshape(B * Hh * W, H, d)
+        vc = v.view(B, Hh, H, W, d).transpose(2, 3).reshape(B * Hh * W, H, d)
+        out_c = attn_1d(qc)  # (B*Hh*W, H, d)
+        out_c = out_c.view(B, Hh, W, H, d).transpose(2, 3)  # (B,Hh,H,W,d)
+        return out_c.reshape(B, N, self.num_heads * d)
+
     def forward(self, x):
         # x: (B, C, H, W)
         B, C, H, W = x.shape
         N = H * W
-        # 转成序列: (B, N, C)
-        seq = x.flatten(2).transpose(1, 2)
+        seq = x.flatten(2).transpose(1, 2)  # (B, N, C)
 
-        # 自注意力
         residual = seq
         h = self.ln1(seq)
         qkv = self.qkv(h)  # (B, N, 3C)
         q, k, v = qkv.chunk(3, dim=-1)
-        # (B, Hh, N, head_dim)
-        q = q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        q = self._to_heads(q, B, N)
+        k = self._to_heads(k, B, N)
+        v = self._to_heads(v, B, N)
+        # 预乘 scale 到 q，便于 _sdpa / 手写统一
+        q = q * self.scale
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale  # (B, Hh, N, N)
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        out = attn @ v  # (B, Hh, N, head_dim)
-        out = out.transpose(1, 2).contiguous().view(B, N, C)
+        if self.mode == "window":
+            out = self._window_attn(q, k, v, H, W)
+        elif self.mode == "axial":
+            out = self._axial_attn(q, k, v, H, W)
+        else:  # global
+            out = self._global_attn(q, k, v)  # (B, Hh, N, d)
+            out = out.transpose(1, 2).contiguous().view(B, N, C)
+
         seq = residual + out
 
         # 前馈
         residual = seq
         seq = residual + self.ffn_drop(self.ffn(self.ln2(seq)))
 
-        # 还原为 (B, C, H, W)
         return seq.transpose(1, 2).view(B, C, H, W)
 
 
 class AttentionResBlock(nn.Module):
-    """卷积残差 + 多头自注意力 的混合块。
+    """卷积残差 + 多头自注意力 混合块。
 
-    顺序：卷积残差 -> 自注意力（均带残差）。注意力负责捕捉棋盘上的
-    长程依赖（如整条大龙的死活、全局厚薄），卷积负责局部形状。
+    顺序：卷积残差 -> 自注意力（均带残差）。注意力负责捕捉长程依赖
+    （大龙死活、全局厚薄），卷积负责局部形状。
     """
 
-    def __init__(self, channels, num_heads=4, dropout=0.0):
+    def __init__(self, channels, num_heads=4, dropout=0.0,
+                 attention_mode="global", window_size=7):
         super(AttentionResBlock, self).__init__()
         self.conv = ResBlock(channels)
-        self.attn = MultiHeadSelfAttention(channels, num_heads=num_heads, dropout=dropout)
+        self.attn = MultiHeadSelfAttention(
+            channels, num_heads=num_heads, dropout=dropout,
+            mode=attention_mode, window_size=window_size)
 
     def forward(self, x):
         x = self.conv(x)
@@ -102,50 +196,51 @@ class AttentionResBlock(nn.Module):
 class SharedBackbone(nn.Module):
     """共享表示网络：将棋盘状态编码为隐藏状态。
 
-    支持三种堆叠模式（由 attention_mode 控制）：
-        - "none" : 全部用纯卷积 ResBlock（最快，局部性好）
+    注意力模式（attention_mode 控制主干如何堆叠注意力块）：
+        - "none" : 全部用纯卷积 ResBlock（最快，局部性最好）
         - "mix"  : 在 num_res_blocks 个块中穿插 num_attention_layers 个
                    AttentionResBlock（推荐：卷积打底 + 注意力提质）
         - "all"  : 全部使用 AttentionResBlock
+
+    注意力块内部的计算模式由 attn_mode 控制（全局/窗口/轴向），
+    通过 --attn-mode 配置；窗口大小由 --attn-window 控制。
     """
 
     def __init__(self, in_channels=12, channels=128, num_res_blocks=12,
                  attention_mode="mix", num_attention_layers=4,
-                 num_heads=4, attention_dropout=0.0):
+                 num_heads=4, attention_dropout=0.0,
+                 attn_mode="global", attn_window=7):
         """
         Args:
-            in_channels: 输入通道数（12）
-            channels: 隐藏通道数
-            num_res_blocks: 总块数量（卷积 + 注意力混合块之和）
-            attention_mode: "none" | "mix" | "all"
-            num_attention_layers: mix 模式下注意力块的数量（<= num_res_blocks）
-            num_heads: 注意力头数
+            attention_mode:   主干堆叠模式 "none"|"mix"|"all"
+            num_attention_layers: mix 模式下注意力块数量
+            num_heads:         多头注意力头数
             attention_dropout: 注意力 dropout
+            attn_mode:         注意力计算模式 "global"|"window"|"axial"
+            attn_window:       window 模式的窗口边长
         """
         super(SharedBackbone, self).__init__()
         self.channels = channels
         self.attention_mode = attention_mode
 
-        # 第一层卷积：把 12 通道投影到主干通道
         self.conv1 = nn.Conv2d(in_channels, channels, 3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(channels)
 
-        # 构建块序列
         blocks = self._build_blocks(
-            num_res_blocks, attention_mode, num_attention_layers, channels, num_heads, attention_dropout
-        )
+            num_res_blocks, attention_mode, num_attention_layers,
+            channels, num_heads, attention_dropout, attn_mode, attn_window)
         self.blocks = nn.Sequential(*blocks)
 
-        # 输出层
         self.conv_out = nn.Conv2d(channels, channels, 1, bias=False)
         self.bn_out = nn.BatchNorm2d(channels)
 
     @staticmethod
-    def _build_blocks(num_res_blocks, mode, num_attn, channels, num_heads, dropout):
+    def _build_blocks(num_res_blocks, mode, num_attn, channels, num_heads,
+                      dropout, attn_mode, attn_window):
         if mode == "none" or num_attn <= 0:
             return [ResBlock(channels) for _ in range(num_res_blocks)]
         if mode == "all":
-            return [AttentionResBlock(channels, num_heads, dropout)
+            return [AttentionResBlock(channels, num_heads, dropout, attn_mode, attn_window)
                     for _ in range(num_res_blocks)]
         # mix：均匀地把 num_attn 个注意力块插入到卷积块之间
         num_attn = min(num_attn, num_res_blocks)
@@ -156,7 +251,8 @@ class SharedBackbone(nn.Module):
         blocks = []
         for i in range(num_res_blocks):
             if i in attn_idx:
-                blocks.append(AttentionResBlock(channels, num_heads, dropout))
+                blocks.append(AttentionResBlock(
+                    channels, num_heads, dropout, attn_mode, attn_window))
             else:
                 blocks.append(ResBlock(channels))
         return blocks
