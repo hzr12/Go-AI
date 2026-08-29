@@ -25,6 +25,14 @@ class TestSharedBackbone:
         out = backbone(x)
         assert out.shape == (1, 128, 9, 9)
 
+    @pytest.mark.parametrize("mode", ["none", "mix", "all"])
+    def test_backbone_attention_modes(self, mode):
+        backbone = SharedBackbone(in_channels=12, channels=64, num_res_blocks=6,
+                                  attention_mode=mode, num_attention_layers=3, num_heads=4)
+        x = torch.randn(2, 12, 9, 9)
+        out = backbone(x)
+        assert out.shape == (2, 64, 9, 9)
+
 
 class TestHeads:
     def test_policy_forward(self):
@@ -43,11 +51,14 @@ class TestHeads:
 class TestAlphaGoNet:
     """新架构：输入 12 通道，输出 (policy, value)。"""
 
-    def _make(self, bs=9):
+    def _make(self, bs=9, attention_mode="mix"):
         return AlphaGoNet(
             in_channels=12,
             backbone_channels=128,
             backbone_res_blocks=12,
+            attention_mode=attention_mode,
+            num_attention_layers=4,
+            num_heads=4,
             policy_channels=64,
             value_channels=32,
             action_size=bs * bs + 1,
@@ -69,8 +80,9 @@ class TestAlphaGoNet:
         x = torch.randn(1, 12, 9, 9)
         _, value = model(x)
         # Tanh -> [-1, 1]
-        assert float(value.min()) >= -1.0
-        assert float(value.max()) <= 1.0
+        v = value.detach()
+        assert float(v.min()) >= -1.0
+        assert float(v.max()) <= 1.0
 
 
 class TestGoAISmoke:
