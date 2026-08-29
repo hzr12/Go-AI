@@ -53,6 +53,14 @@ def main():
     ap.add_argument('--board-size', type=int, default=19)
     ap.add_argument('--save-every', type=int, default=2000)
     ap.add_argument('--out', default='models/sft.pt')
+    # 注意力相关
+    ap.add_argument('--attention-mode', default='mix',
+                    choices=['none', 'mix', 'all'],
+                    help='主干注意力模式: none=纯卷积, mix=卷积+注意力混合, all=全注意力')
+    ap.add_argument('--num-attention-layers', type=int, default=4,
+                    help='mix 模式下注意力块数量')
+    ap.add_argument('--num-heads', type=int, default=4, help='多头注意力头数')
+    ap.add_argument('--attention-dropout', type=float, default=0.0)
     ap.add_argument('--eval-every', type=int, default=5000)
     args = ap.parse_args()
 
@@ -80,6 +88,10 @@ def main():
         in_channels=12,
         backbone_channels=128,
         backbone_res_blocks=12,
+        attention_mode=args.attention_mode,
+        num_attention_layers=args.num_attention_layers,
+        num_heads=args.num_heads,
+        attention_dropout=args.attention_dropout,
         action_size=args.board_size * args.board_size + 1,  # +1 为 pass 类别
     ).to(device)
 

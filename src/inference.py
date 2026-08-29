@@ -37,7 +37,8 @@ class GoAI:
     """
 
     def __init__(self, model_path=None, board_size=19, device="auto", use_amp=False,
-                 backbone_channels=128, backbone_res_blocks=12, policy_channels=64, value_channels=32):
+                 backbone_channels=128, backbone_res_blocks=12, policy_channels=64, value_channels=32,
+                 attention_mode="mix", num_attention_layers=4, num_heads=4, attention_dropout=0.0):
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
@@ -48,6 +49,10 @@ class GoAI:
             in_channels=12,
             backbone_channels=backbone_channels,
             backbone_res_blocks=backbone_res_blocks,
+            attention_mode=attention_mode,
+            num_attention_layers=num_attention_layers,
+            num_heads=num_heads,
+            attention_dropout=attention_dropout,
             policy_channels=policy_channels,
             value_channels=value_channels,
             action_size=board_size * board_size + 1,  # +1 = 虚着
@@ -155,7 +160,7 @@ class GoAI:
             while passes < 2 and move_count < max_moves:
                 to_play = board.current_player
                 legal = board.get_legal_moves()
-                if not legal:
+                if len(legal) == 0:
                     passes += 1
                     board.play(-1)
                     move_count += 1
@@ -216,7 +221,7 @@ class GoAI:
                     hist = my_hist[0] if human_color == 1 else my_hist[1]
                     hist.pop(0); hist.append(mv)
             else:
-                if not legal:
+                if len(legal) == 0:
                     board.play(-1); passes += 1
                 else:
                     move_int, is_pass, value = self.choose_move(
@@ -275,7 +280,7 @@ class GoAI:
             if inp in ("pass", ""):
                 board.play(-1); continue
             ok, mv = board.parse_move_str(inp, to_play)
-            if not ok or mv not in legal:
+            if not ok or int(mv) not in legal.tolist():
                 print("非法，重试。"); continue
             board.play(mv)
             hist = my_hist[0] if to_play == 1 else my_hist[1]
@@ -295,10 +300,18 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--topk", type=int, default=10)
     parser.add_argument("--human-color", type=int, default=1)
+    parser.add_argument("--attention-mode", default="mix", choices=["none", "mix", "all"])
+    parser.add_argument("--num-attention-layers", type=int, default=4)
+    parser.add_argument("--num-heads", type=int, default=4)
+    parser.add_argument("--attention-dropout", type=float, default=0.0)
     args = parser.parse_args()
 
     ai = GoAI(model_path=args.model, board_size=args.board_size,
-              device=args.device, use_amp=args.use_amp)
+              device=args.device, use_amp=args.use_amp,
+              attention_mode=args.attention_mode,
+              num_attention_layers=args.num_attention_layers,
+              num_heads=args.num_heads,
+              attention_dropout=args.attention_dropout)
     if args.mode == "selfplay":
         res = ai.self_play(num_games=args.games, temperature=args.temperature, topk=args.topk)
         wr = sum(1 for r in res if r > 0) / max(len(res), 1)
