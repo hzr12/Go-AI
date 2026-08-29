@@ -244,12 +244,14 @@ python scripts/build_dataset.py --src <目录或 .tgz> --out data/sgf_19x19.npz 
 | `--out` | `data/sft_dataset.npz` | 输出 npz 路径（父目录自动 `makedirs`）|
 | `--board-size` | `19` | 只保留该尺寸的棋谱（其余跳过）|
 | `--max-games` | `None`（全部）| 最多处理的棋局数（先小批量跑通用）|
+| `--chunk-size` | `50000` | **流式分片落盘阈值**：每攒够这么多样本就 flush 成一个临时 npz 分片，最后合并成单个 npz。峰值内存仅约一个 chunk（几十 MB），避免全量常驻内存 OOM。设为 `0` 退回旧的全量内存模式 |
 
 行为：
 - 对每局：解析 → 校验 `board_size` 与 `RE`（无效则 `skip`）→ 逐手重放（用 `GoBoard.play`）得到局面 + 监督目标。
 - 每个落子位置产生 **1 个样本**；监督目标 `move` = 该手扁平坐标，`value` = 该局 `RE` 的胜负标签（全样本同值）。
 - 历史 `my_hist`/`op_hist` 用 `split_hist` 从「最近落子序列」拆成各 3 手。
-- 输出统计：`有效局 / 跳过`。
+- **流式模式（`--chunk-size > 0`，默认开启）**：不把全部样本常驻内存，而是每满一个 chunk 就写入临时分片（落盘到系统临时目录），全部解析完成后 `np.concatenate` 各分片再 `np.savez_compressed` 合并输出、并清理临时文件。运行时打印每个分片进度。
+- 输出统计：`有效局 / 跳过` 与最终样本数。
 
 ```bash
 # 示例：先用 200 局跑通，看 有效/跳过 比例
@@ -516,7 +518,7 @@ v = light_rollout(board, fp, max_steps=60, rng=np.random.default_rng(0))   # 发
 | `play()` 返回 `False` | 着法非法（落子撞禁着/自杀/劫）；调用方需判断返回值，不要假设成功 |
 | `board` 无 `to_play` | 引擎用 `current_player`（1/-1），MCTS 内部 `to_play`（1/2）仅用于特征构造，二者不等价 |
 | 数据 `有效/跳过` 比例低 | 棋谱 `RE` 缺失或为和棋、坐标越界；检查 `--board-size` 是否匹配；先 `--max-games 100` 看统计 |
-| npz 太大 / 内存不足 | 减小 `--max-games`；或分批生成多个 npz |
+| npz 太大 / 内存不足 | 用 `--chunk-size`（默认 50000）流式分片落盘，峰值内存仅约一个 chunk；或减小 `--max-games` 分批生成多个 npz 再用 `train_sft.py --data <目录>` 合并训练 |
 | V100 上 bf16 报错 | V100 是 Volta，**无 bf16**，已默认走 fp16（`--use-amp`）|
 | MCTS 选到非法着法 | 极端情况下回退到 `choose_move`（纯策略 argmax）；见 `choose_move_mcts` |
 
