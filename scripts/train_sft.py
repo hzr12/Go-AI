@@ -111,6 +111,45 @@ def _auto_select_device():
     return f'{backend}:{idx}'
 
 
+def _check_training_env(logger):
+    """启动时检查三大加速能力并打印诊断：flash-attn 库 / torch.compile / 混合精度。
+
+    纯检测不改变行为；实际的启用决策在设备路径确定后进行（见 main 中
+    set_flash_attn / args.compile / amp_dtype 分支）。检测结果会写入日志，
+    便于比对云端/本地环境差异。
+    """
+    # 1) flash-attn 独立库（可选依赖，仅 Ampere+ CUDA 有收益）
+    try:
+        import flash_attn  # type: ignore[import-not-found]
+        fa_status = "已安装 v%s" % getattr(flash_attn, "__version__", "?")
+    except Exception:
+        fa_status = ("未安装（可选；Ampere+ CUDA 上比内置 SDPA 再快 20-30%%，"
+                     "安装: pip install flash-attn --no-build-isolation）")
+    # 2) torch.compile（inductor 后端）
+    if hasattr(torch, 'compile'):
+        try:
+            from torch._inductor import config as _ind_cfg  # noqa: F401
+            comp_status = "可用 (inductor)"
+        except Exception:
+            comp_status = "可用"
+    else:
+        comp_status = "不可用（torch<2.0）"
+    # 3) 混合精度（按后端能力）
+    if torch.cuda.is_available():
+        p = torch.cuda.get_device_properties(0)
+        cap = (p.major, p.minor)
+        if cap >= (8, 0):
+            amp_status = "bf16+fp16 可用（%s, sm_%d%d）" % (p.name, cap[0], cap[1])
+        else:
+            amp_status = "仅 fp16（%s, sm_%d%d，Volta/Turing 无 bf16）" % (p.name, cap[0], cap[1])
+    elif npu_is_available():
+        amp_status = "bf16 可用（Ascend NPU）"
+    else:
+        amp_status = "不支持（CPU 走 FP32）"
+    logger.info("[env] flash-attn: %s", fa_status)
+    logger.info("[env] torch.compile: %s | 混合精度: %s", comp_status, amp_status)
+
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.networks.alphanet import AlphaGoNet
 from src.data.dataset import SupervisedDataset
@@ -278,6 +317,8 @@ def main():
     log_file = args.log_file if args.log_file else None
     logger = setup_logging(log_file)
     logger.info("=" * 60)
+    _check_training_env(logger)
+    logger.info("=" * 60)
     logger.info("配置: data=%s board=%d batch=%d epochs=%d lr=%s wd=%s",
                 args.data, args.board_size, args.batch_size, args.epochs,
                 args.lr, args.weight_decay)
@@ -372,6 +413,20 @@ def main():
     from src.networks import backbone as _backbone
     _backbone.set_sdpa_force_math(sdpa_force_math)
     _backbone.set_compile_disable_sparse(compile_disable_sparse)
+
+    # flash-attn 独立库启用决策：仅「Ampere+ CUDA 且走非 math 路径」时尝试加载。
+    # 加载失败自动回退内置 SDPA，不影响训练启动。
+    if _backend == 'cuda' and compute_cap >= (8, 0) and not sdpa_force_math:
+        fa_ok, fa_msg = _backbone.set_flash_attn(True)
+        if fa_ok:
+            logger.info("[env] 注意力内核: flash-attn %s（优先于内置 SDPA）", fa_msg)
+        else:
+            logger.info("[env] 注意力内核: 内置 SDPA（flash-attn %s）", fa_msg)
+    else:
+        _backbone.set_flash_attn(False)
+        logger.info("[env] 注意力内核: %s",
+                    "手写 math（%s 不支持 Flash）" % (_backend.upper(),)
+                    if sdpa_force_math else "内置 SDPA")
 
     logger.info("启动训练 | torch=%s | device=%s | amp_dtype=%s scaler=%s channels_last=%s",
                 torch.__version__, device, amp_dtype, use_scaler, use_channels_last)

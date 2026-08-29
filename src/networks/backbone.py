@@ -36,10 +36,24 @@ def _sdpa(q, k, v, dropout_p=0.0, use_math=False):
 
     模块级开关 _sdpa_force_math（在 train_sft.py 里按 GPU 能力设置）会覆盖 use_math：
     V100 强制 math，A100 强制走 SDPA 后端。
+
+    注意力后端优先级（非 math 时）：
+      1. flash-attn 独立库（set_flash_attn(True) 成功加载时）——最快、显存最低，
+         仅 Ampere+ CUDA 可用；
+      2. torch 内置 F.scaled_dot_product_attention（自动选 flash/mem-efficient 后端）；
+      3. 手写 math（use_math=True 时直接走这条）。
     """
     # 模块级覆盖：训练脚本按 GPU 能力设置（A100 走 Flash，V100 走 math）
     if _sdpa_force_math:
         use_math = True
+    if not use_math and _flash_attn_func is not None:
+        # flash-attn 独立库：要求 (B, S, Hh, d) 布局（头维 -2、head_dim -1）。
+        # 我们的 (B, Hh, N, d) 中 head_dim 为最内层（stride=1），transpose 后满足
+        # flash-attn 的 last-dim contiguous 要求，无需显式 .contiguous() 拷贝。
+        out = _flash_attn_func(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+            dropout_p=dropout_p, causal=False)
+        return out.transpose(1, 2)
     if use_math or not hasattr(F, "scaled_dot_product_attention"):
         # 手写注意力（q 已预乘 scale）
         attn = (q @ k.transpose(-2, -1))
@@ -48,6 +62,31 @@ def _sdpa(q, k, v, dropout_p=0.0, use_math=False):
             attn = torch.nn.functional.dropout(attn, p=dropout_p)
         return attn @ v
     return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+
+
+# flash-attn 独立库的内核句柄（None=未启用）。由 train_sft.py 启动时按
+# 「库已安装 + Ampere+ CUDA」条件调用 set_flash_attn(True) 加载。
+_flash_attn_func = None
+
+
+def set_flash_attn(enabled: bool):
+    """尝试加载 flash-attn 独立库内核。返回 (是否启用, 状态描述)。
+
+    enabled=False 直接卸载回退 SDPA；enabled=True 时 import flash_attn，
+    成功则 _sdpa 优先走 flash-attn 内核，失败（未安装/导入错误）返回原因并回退。
+    """
+    global _flash_attn_func
+    if not enabled:
+        _flash_attn_func = None
+        return False, "已禁用"
+    try:
+        import flash_attn  # type: ignore[import-not-found]
+        from flash_attn import flash_attn_func  # type: ignore[import-not-found]  # noqa: F401
+        _flash_attn_func = flash_attn_func
+        return True, "已启用 (v%s)" % getattr(flash_attn, "__version__", "?")
+    except Exception as e:
+        _flash_attn_func = None
+        return False, "不可用: %s" % e
 
 
 # 模块级开关：是否强制走手写 math 注意力。
