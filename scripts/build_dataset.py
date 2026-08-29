@@ -81,57 +81,81 @@ def build(src, board_size, max_games):
     parser = SGFParser()
     boards, my_hists, op_hists, kos, moves, values, to_plays = [], [], [], [], [], [], []
 
+    # 数据源解析：目录模式下递归收集所有 .tgz/.tar.gz 与子目录（各子源再各自
+    # 递归找 .sgf / 解 tgz），合并成一个数据集。单文件/tgz 则只有自身一个源。
+    if os.path.isdir(src):
+        import glob
+        tgzs = (sorted(glob.glob(os.path.join(src, '**', '*.tgz'), recursive=True))
+                + sorted(glob.glob(os.path.join(src, '**', '*.tar.gz'), recursive=True)))
+        subdirs = sorted(d for d in glob.glob(os.path.join(src, '*')) if os.path.isdir(d))
+        sources = tgzs + subdirs
+        if not sources:
+            sources = [src]  # 目录本身直接含 .sgf
+    else:
+        sources = [src]
+
     n_games = 0
     skip = 0
-    for name, raw in iter_sgf_bytes(src):
-        if max_games and n_games >= max_games:
-            break
-        text = raw.decode('utf-8', 'ignore')
-        game = parser.parse_string(text)
-        if game is None or game.board_size != board_size:
-            skip += 1
+    for s in sources:
+        try:
+            stream = iter_sgf_bytes(s)
+        except Exception as e:  # noqa: BLE001
+            print(f"[build] 跳过分片 {s}：{e}")
             continue
-        # 校验所有坐标在棋盘范围内（pass 为 -1 合法），超出则整局丢弃。
-        ok = True
-        for mv in game.moves:
-            r, c = mv.position
-            if (r, c) != (-1, -1) and not (0 <= r < board_size and 0 <= c < board_size):
-                ok = False
+        for name, raw in stream:
+            if max_games and n_games >= max_games:
                 break
-        if not ok:
-            skip += 1
-            continue
-        if len(game.moves) < 2:
-            skip += 1
-            continue
-        value = parse_result_to_value(game.result)
-        if value is None:
-            skip += 1
-            continue
+            text = raw.decode('utf-8', 'ignore')
+            game = parser.parse_string(text)
+            # 只跳过「大于目标尺寸」的棋谱（无法放进小棋盘）。
+            # 小于目标的（如 9x9 棋谱喂到 19x19）做居中 pad，见下方 off。
+            if game is None or game.board_size > board_size:
+                skip += 1
+                continue
+            # 小棋盘居中到大棋盘的偏移量（9x9->19x19 时 off=5，棋形居中不偏）
+            off = (board_size - game.board_size) // 2 if game.board_size != board_size else 0
+            # 校验所有坐标在原始棋谱尺寸范围内（pass 为 -1 合法），超出则整局丢弃。
+            ok = True
+            for mv in game.moves:
+                r, c = mv.position
+                if (r, c) != (-1, -1) and not (0 <= r < game.board_size and 0 <= c < game.board_size):
+                    ok = False
+                    break
+            if not ok:
+                skip += 1
+                continue
+            if len(game.moves) < 2:
+                skip += 1
+                continue
+            value = parse_result_to_value(game.result)
+            if value is None:
+                skip += 1
+                continue
 
-        board = GoBoard(board_size, komi=game.komi)
-        history = []  # 扁平坐标序列（pass 记为 -1）
-        for mv in game.moves:
-            to_play = board.current_player
-            recent = history[-3:] if len(history) >= 3 else history
-            my_h, op_h = split_hist(recent, to_play)
-            ko = board.ko_point
-            r, c = mv.position
-            target = -1 if (r, c) == (-1, -1) else r * board_size + c
+            board = GoBoard(board_size, komi=game.komi)
+            history = []  # 扁平坐标序列（pass 记为 -1）
+            for mv in game.moves:
+                to_play = board.current_player
+                recent = history[-3:] if len(history) >= 3 else history
+                my_h, op_h = split_hist(recent, to_play)
+                ko = board.ko_point
+                r, c = mv.position
+                # 落子坐标：pass 记 -1；否则把小棋盘坐标居中映射到大棋盘
+                target = -1 if (r, c) == (-1, -1) else (r + off) * board_size + (c + off)
 
-            boards.append(board.board.copy())
-            my_hists.append(pad3(my_h))
-            op_hists.append(pad3(op_h))
-            kos.append(ko)
-            moves.append(target)
-            values.append(value)
-            to_plays.append(to_play)
+                boards.append(board.board.copy())
+                my_hists.append(pad3(my_h))
+                op_hists.append(pad3(op_h))
+                kos.append(ko)
+                moves.append(target)
+                values.append(value)
+                to_plays.append(to_play)
 
-            play_move = -1 if (r, c) == (-1, -1) else r * board_size + c
-            board.play(play_move)
-            history.append(play_move)
+                play_move = -1 if (r, c) == (-1, -1) else (r + off) * board_size + (c + off)
+                board.play(play_move)
+                history.append(play_move)
 
-        n_games += 1
+            n_games += 1
 
     if n_games == 0:
         raise RuntimeError("未解析到任何有效棋谱，请检查 --src 与 --board-size")

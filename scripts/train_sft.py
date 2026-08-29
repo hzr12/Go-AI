@@ -23,6 +23,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.networks.alphanet import AlphaGoNet
 from src.data.dataset import SupervisedDataset
+from scripts.build_dataset import build
 
 
 def maybe_autocast(device):
@@ -37,13 +38,77 @@ def maybe_autocast(device):
 
 
 def load_dataset(path):
+    """加载单个 .npz 训练集。"""
     d = np.load(path, allow_pickle=False)
     return SupervisedDataset({k: d[k] for k in d.files})
 
 
+def _concat_dicts(dicts):
+    """按相同 key 沿第 0 轴拼接多个数据 dict（字段形状一致）。"""
+    out = {}
+    for k in dicts[0].keys():
+        out[k] = np.concatenate([dd[k] for dd in dicts], axis=0)
+    return out
+
+
+def load_from_path(path, board_size, max_games_per_tgz=0):
+    """加载训练数据。
+
+    - 若 path 是文件：按 .npz 加载（兼容原行为）。
+    - 若 path 是目录：递归扫描其下所有 .tgz/.tar.gz（用 build_dataset.build 解析）
+      与 .npz（直接加载），合并成一个 SupervisedDataset。这样可直接喂一个装着
+      多个分片 tgz 的文件夹，无需先手动 build_dataset 成单个 npz。
+    """
+    if os.path.isdir(path):
+        import glob
+        tgzs = (sorted(glob.glob(os.path.join(path, '**', '*.tgz'), recursive=True))
+                + sorted(glob.glob(os.path.join(path, '**', '*.tar.gz'), recursive=True)))
+        npzs = sorted(glob.glob(os.path.join(path, '**', '*.npz'), recursive=True))
+        # 直接子目录也作为数据源（build 支持递归解析目录内的 .sgf，
+        # 例如 data/games/ 这种已解压的棋谱目录）
+        subdirs = sorted(d for d in glob.glob(os.path.join(path, '*'))
+                         if os.path.isdir(d) and d not in npzs)
+        dicts = []
+        n_games_total = 0
+        n_skip_total = 0
+
+        def _try_build(src):
+            """build 可能对单个分片返回 0 有效局并抛 RuntimeError，这里吞掉并跳过。"""
+            try:
+                d, n_games, skip = build(src, board_size, max_games_per_tgz)
+            except RuntimeError as e:
+                print(f"[data] 跳过分片 {src}：{e}")
+                return None, 0, 0
+            if n_games == 0:
+                print(f"[data] 跳过分片 {src}：0 有效局（与 --board-size {board_size} 不匹配或空）")
+                return None, 0, 0
+            return d, n_games, skip
+
+        for tg in tgzs + subdirs:
+            d, n_games, skip = _try_build(tg)
+            if d is not None:
+                dicts.append(d)
+                n_games_total += n_games
+                n_skip_total += skip
+        print(f"[data] 已解析 {len(dicts)} 个有效分片，有效局 {n_games_total}，跳过 {n_skip_total}")
+        for npz in npzs:
+            dd = np.load(npz, allow_pickle=False)
+            dicts.append({k: dd[k] for k in dd.files})
+        if not dicts:
+            raise RuntimeError(
+                f"目录 {path} 下未解析到任何有效棋谱，请检查 --board-size 是否与棋谱尺寸匹配")
+        merged = _concat_dicts(dicts)
+        print(f"[data] 合并后样本数 {merged['boards'].shape[0]}")
+        return SupervisedDataset(merged)
+    return load_dataset(path)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--data', required=True)
+    ap.add_argument('--data', required=True,
+                    help="单个 .npz 训练集，或包含多个 .tgz/.tar.gz/.npz 的目录（自动合并所有分片）")
+    ap.add_argument('--max-games-per-tgz', type=int, default=0,
+                    help="目录模式下每个 tgz 最多解析的棋局数（0=全部），用于子采样控制内存")
     ap.add_argument('--device', default='auto')
     ap.add_argument('--use-amp', action='store_true')
     ap.add_argument('--batch-size', type=int, default=512)
@@ -80,7 +145,7 @@ def main():
         torch.backends.cudnn.benchmark = True
         torch.set_num_threads(min(8, os.cpu_count() or 8))
 
-    dataset = load_dataset(args.data)
+    dataset = load_from_path(args.data, args.board_size, args.max_games_per_tgz)
     n = len(dataset)
     # 留出 held-out 集用于 top-1 准确率监控
     n_train = int(n * 0.98)
