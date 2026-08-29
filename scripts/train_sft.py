@@ -665,6 +665,19 @@ def main():
                             loss.item(), policy_loss.item(), value_loss.item(),
                             lr, scaler.get_scale(), mem, speed, time.time() - t0)
 
+                # 内核剖析结束：打印 top CUDA kernel 耗时表
+                if _prof_ctx is not None and step >= _prof_at + 50:
+                    _prof_ctx.__exit__(None, None, None)
+                    try:
+                        table = _prof_ctx.key_averages().table(
+                            sort_by='cuda_time_total', row_limit=18)
+                        logger.info("[profile] 内核耗时 top-18（CUDA 时间排序）:\n%s",
+                                    table)
+                    except Exception as pe:  # noqa: BLE001
+                        logger.warning("[profile] 结果输出失败: %s", pe)
+                    _prof_ctx = None
+                    _prof_at = 0
+
             if step % args.eval_every == 0 and len(eval_idx) > 0:
                 acc = evaluate(model, dataset, eval_idx, bs, device, amp_dtype, use_channels_last)
                 logger.info("[eval] step=%d train_loss=%.4f eval_top1=%.4f scale=%.0f elapsed=%.0fs",
