@@ -160,24 +160,45 @@ class SGFParser:
         
         return properties
     
+    def _coord_from(self, pos_str: str):
+        """SGF 坐标 -> (row, col)。空串或超范围（`tt` 等）表示 pass，返回 (-1, -1)。"""
+        if not pos_str:
+            return (-1, -1)
+        col = ord(pos_str[0]) - ord('a')
+        row = ord(pos_str[1]) - ord('a')
+        # SGF 标准坐标范围是 a..s (0..18)。超出（如 t=19，常见 pass 哨兵）按 pass 处理。
+        if not (0 <= row <= 18 and 0 <= col <= 18):
+            return (-1, -1)
+        return (row, col)
+
     def _extract_moves(self, sgf_string: str) -> List[Move]:
-        """提取棋步"""
+        """
+        提取棋步，保持原始顺序。
+
+        关键修复：
+          1. pass 现在用空坐标 ``B[]`` / ``W[]`` 表示，此前被 ``([a-s]{2})``
+             正则丢弃，导致黑白顺序错位。这里用 ``[^]]*`` 捕获（允许空串）。
+          2. ``AB[..]``（黑让子）与 ``AW[..]``（白让子）作为开局先行子，
+             必须按其出现的先后并入棋步序列，否则重放从第一步起就错位。
+        """
         moves = []
-        
-        # 匹配棋步模式: B[aa] 或 W[ab]
-        pattern = r'([BW])\[([a-s]{2})\]'
-        matches = re.finditer(pattern, sgf_string)
-        
-        for match in matches:
-            color = match.group(1)
-            pos_str = match.group(2)
-            
-            # 转换坐标
-            col = ord(pos_str[0]) - ord('a')
-            row = ord(pos_str[1]) - ord('a')
-            
-            moves.append(Move(color=color, position=(row, col)))
-        
+
+        # 匹配棋步标记：B / W（普通手）与 AB / AW（让子）。
+        # 关键：必须以 ';' 或字符串开头锚定，避免把属性键 BR/WR/PB/PW/KM 等
+        # 里的 'B'/'W' 误当成落子（此前会导致坐标乱序）。
+        token_pattern = re.compile(r'(?:;|\A)(AB|AW|[BW])((\[[^\]]*\])+)')
+
+        for token in token_pattern.finditer(sgf_string):
+            key = token.group(1)
+            bracket_block = token.group(2)
+            for val in re.findall(r'\[([^\]]*)\]', bracket_block):
+                if key in ('B', 'W'):
+                    color = key
+                else:  # AW -> 白, AB -> 黑
+                    color = 'W' if key == 'AW' else 'B'
+                row, col = self._coord_from(val)
+                moves.append(Move(color=color, position=(row, col)))
+
         return moves
     
     def validate_board_size(self, game: GameRecord, target_size: int) -> bool:
