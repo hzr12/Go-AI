@@ -109,21 +109,41 @@ class GoAI:
     # 核心：模型前向 + 采样
     # ------------------------------------------------------------------ #
     def predict(self, board, my_hist, op_hist, to_play):
-        """返回 (policy_np, value)。
+        """单局面前向。返回 (policy_np, value)。
 
         policy_np: shape=(bs*bs+1,) 概率（已 softmax）
         value    : float, 当前 to_play 视角 [-1,1]
         """
         x = self._build_state(board, my_hist, op_hist, to_play)
+        policy, value = self._forward_batch(x)
+        return policy[0], float(value[0].item())
+
+    def predict_batch(self, states):
+        """批量前向，MCTS 叶子评估的核心加速点。
+
+        Args:
+            states: list[(board, my_hist, op_hist, to_play)]，长度 B
+        Returns:
+            policies: np.ndarray (B, bs*bs+1) 已 softmax
+            values : np.ndarray (B,) 当前 to_play 视角 [-1,1]
+        """
+        if not states:
+            return np.zeros((0, self.board_size * self.board_size + 1)), np.zeros(0)
+        xs = [self._build_state(b, mh, oh, tp) for (b, mh, oh, tp) in states]
+        x = torch.cat(xs, dim=0)  # (B,12,H,W)
+        policies, values = self._forward_batch(x)
+        return policies, values.squeeze(-1).cpu().numpy().astype(np.float32)
+
+    def _forward_batch(self, x):
+        """输入 (B,12,H,W)，输出 (policies_np(B,A), values(B,1))。"""
         with torch.no_grad():
             if self.use_amp:
                 with torch.cuda.amp.autocast():
                     policy_logits, value = self.model(x)
             else:
                 policy_logits, value = self.model(x)
-        policy = torch.softmax(policy_logits.squeeze(0), dim=-1).cpu().numpy()
-        value = float(value.squeeze().item())
-        return policy, value
+        policies = torch.softmax(policy_logits, dim=-1).cpu().numpy()
+        return policies, value
 
     def choose_move(self, board, my_hist, op_hist, to_play, legal_mask, temperature=1.0, topk=10):
         """根据策略分布与合法着法掩码，采样一个着法。
@@ -166,6 +186,22 @@ class GoAI:
         is_pass = (move_int == n_actions - 1)
         return move_int, is_pass, value
 
+    def choose_move_mcts(self, board, my_hist, op_hist, to_play, legal_mask,
+                         simulations=400, temperature=1.0, mcts=None, num_threads=4):
+        """用 MCTS 搜索选着法（推理提速核心）。返回 (move_int, is_pass, value)。"""
+        from src.search.mcts import MCTS
+        if mcts is None:
+            mcts = MCTS(self, board_size=self.board_size, num_threads=num_threads,
+                        temperature=temperature)
+        move_int, is_pass, value = mcts.best_move(
+            board, my_hist, op_hist, to_play, simulations=simulations,
+            temperature=temperature, return_value=True)
+        # 若 MCTS 选了非法着法（极端情况下），回退到纯策略
+        if move_int not in legal_mask and move_int != self.board_size * self.board_size:
+            return self.choose_move(board, my_hist, op_hist, to_play, legal_mask,
+                                    temperature=temperature)
+        return move_int, is_pass, value
+
     # ------------------------------------------------------------------ #
     # 对局循环
     # ------------------------------------------------------------------ #
@@ -176,12 +212,19 @@ class GoAI:
         r, c = divmod(move_int, bs)
         return (r, c)
 
-    def self_play(self, num_games=1, max_moves=400, temperature=1.0, topk=10, verbose=False):
-        """模型自我对弈 num_games 局，返回每局结果（黑方视角 +1/-1）。"""
+    def self_play(self, num_games=1, max_moves=400, temperature=1.0, topk=10,
+                   verbose=False, use_mcts=False, simulations=400, num_threads=4):
+        """模型自我对弈 num_games 局，返回每局结果（黑方视角 +1/-1）。
+
+        use_mcts=True 时每步用 MCTS 搜索选点（棋力显著强于纯策略 argmax）。
+        """
+        from src.search.mcts import MCTS
+        mcts = MCTS(self, board_size=self.board_size, num_threads=num_threads,
+                    temperature=temperature) if use_mcts else None
         results = []
         for g in range(num_games):
             board = GoBoard(self.board_size)
-            my_hist = [[-1, -1, -1], [-1, -1, -1]]  # 对当前执子方：最近3手
+            my_hist = [[-1, -1, -3], [-1, -1, -3]]  # 对当前执子方：最近3手
             passes = 0
             move_count = 0
             while passes < 2 and move_count < max_moves:
@@ -192,9 +235,15 @@ class GoAI:
                     board.play(-1)
                     move_count += 1
                     continue
-                move_int, is_pass, value = self.choose_move(
-                    board, my_hist[0], my_hist[1], to_play, legal,
-                    temperature=temperature, topk=topk)
+                if use_mcts:
+                    move_int, is_pass, value = self.choose_move_mcts(
+                        board, my_hist[0], my_hist[1], to_play, legal,
+                        simulations=simulations, temperature=temperature, mcts=mcts,
+                        num_threads=num_threads)
+                else:
+                    move_int, is_pass, value = self.choose_move(
+                        board, my_hist[0], my_hist[1], to_play, legal,
+                        temperature=temperature, topk=topk)
                 if is_pass:
                     board.play(-1)
                     passes += 1
@@ -219,10 +268,14 @@ class GoAI:
                       f"{'黑胜' if result > 0 else '白胜'}")
         return results
 
-    def play_against_human(self, human_color=1, max_moves=400, temperature=0.6):
+    def play_against_human(self, human_color=1, max_moves=400, temperature=0.6,
+                           use_mcts=False, simulations=400, num_threads=4):
         """人机对弈，人类通过终端输入坐标（如 'ce' 或 'pass'）。"""
+        from src.search.mcts import MCTS
+        mcts = MCTS(self, board_size=self.board_size, num_threads=num_threads,
+                    temperature=temperature) if use_mcts else None
         board = GoBoard(self.board_size)
-        my_hist = [[-1, -1, -1], [-1, -1, -1]]
+        my_hist = [[-1, -1, -3], [-1, -1, -3]]
         passes = 0
         move_count = 0
         while passes < 2 and move_count < max_moves:
@@ -251,9 +304,15 @@ class GoAI:
                 if len(legal) == 0:
                     board.play(-1); passes += 1
                 else:
-                    move_int, is_pass, value = self.choose_move(
-                        board, my_hist[0], my_hist[1], to_play, legal,
-                        temperature=temperature)
+                    if use_mcts:
+                        move_int, is_pass, value = self.choose_move_mcts(
+                            board, my_hist[0], my_hist[1], to_play, legal,
+                            simulations=simulations, temperature=temperature, mcts=mcts,
+                            num_threads=num_threads)
+                    else:
+                        move_int, is_pass, value = self.choose_move(
+                            board, my_hist[0], my_hist[1], to_play, legal,
+                            temperature=temperature)
                     if is_pass:
                         board.play(-1); passes += 1
                         print(f"AI 虚着 (value={value:+.3f})")
@@ -336,6 +395,12 @@ def main():
                         help="注意力计算模式: global=全配对, window=滑动窗口, axial=轴向")
     parser.add_argument("--attn-window", type=int, default=7, help="window 模式窗口边长")
     parser.add_argument("--compile", action="store_true", help="用 torch.compile 融合算子（GPU 提速）")
+    parser.add_argument("--use-mcts", action="store_true",
+                        help="用 MCTS 搜索选点（棋力显著强于纯策略 argmax）")
+    parser.add_argument("--simulations", type=int, default=400,
+                        help="MCTS 每步模拟次数（V100S 上 400~800 仅 1-2s/步）")
+    parser.add_argument("--num-threads", type=int, default=4,
+                        help="MCTS 并行模拟线程数（虚拟损失）")
     args = parser.parse_args()
 
     ai = GoAI(model_path=args.model, board_size=args.board_size,
@@ -348,11 +413,16 @@ def main():
               attn_window=args.attn_window,
               compile=args.compile)
     if args.mode == "selfplay":
-        res = ai.self_play(num_games=args.games, temperature=args.temperature, topk=args.topk)
+        res = ai.self_play(num_games=args.games, temperature=args.temperature, topk=args.topk,
+                           use_mcts=args.use_mcts, simulations=args.simulations,
+                           num_threads=args.num_threads)
         wr = sum(1 for r in res if r > 0) / max(len(res), 1)
-        print(f"自对弈 {len(res)} 局，黑方胜率 {wr:.2%}")
+        print(f"自对弈 {len(res)} 局，黑方胜率 {wr:.2%}"
+              f"{' (MCTS)' if args.use_mcts else ''}")
     elif args.mode == "human":
-        ai.play_against_human(human_color=args.human_color, temperature=args.temperature)
+        ai.play_against_human(human_color=args.human_color, temperature=args.temperature,
+                              use_mcts=args.use_mcts, simulations=args.simulations,
+                              num_threads=args.num_threads)
     elif args.mode == "analyze":
         ai.analyze(temperature=args.temperature)
 

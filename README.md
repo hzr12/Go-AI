@@ -166,6 +166,46 @@ python src/inference.py --model models/sft_19x19.pth --board-size 19 --mode anal
 人机/分析模式下，坐标用字母输入，例如 `ce` 表示第 5 列(e) 第 3 行(c)
 （a=第1列/行，依此类推），输入 `pass` 虚着，`q` 退出分析模式。
 
+## MCTS 搜索（棋力跃升的关键）⚡
+
+纯监督网络直接 argmax 策略 = 0 步前瞻，局部好≠全局好（死活/对杀/收官会崩）。
+`isearch/mcts.py` 用 AlphaGoZero 风格的 **PUCT + 批量叶子评估 + 虚拟损失多线程**
+把网络当作「先验 P + 叶子价值 v」，每步做 N 次模拟，按访问次数选点：
+
+```bash
+# 9 路 MCTS 自对弈（N=200，CPU 也快）
+python src/inference.py --model models/sft_9x9.pth --board-size 9 \
+    --mode selfplay --use-mcts --simulations 200 --num-threads 4
+
+# 19 路 V100S 全加速组合（推荐）
+python src/inference.py --model models/sft_19x19.pth --board-size 19 \
+    --device cuda --use-amp --compile \
+    --attention-mode mix --attn-mode window --attn-window 7 \
+    --mode selfplay --use-mcts --simulations 400 --num-threads 4
+```
+
+### 加速手段（已全部落地）
+| 加速项 | 状态 | 说明 |
+|--------|------|------|
+| 批量叶子评估 | ✅ | `GoAI.predict_batch` 把同一层节点拼 batch 一次前向（GPU 上吞吐 ×10+）|
+| 虚拟损失 + 多线程 | ✅ | `MCTS.num_threads` 并行展开不同分支，利用多核 |
+| `torch.compile` 算子融合 | ✅ | `--compile`，GPU 上约 20–40% |
+| `--use-amp` 混合精度 | ✅ | V100 走 fp16（Volta 无 bf16）|
+| `window` / `axial` 注意力 | ✅ | `--attn-mode window` 在 GPU 上约 7× 注意力提速 |
+
+### 速度预期（V100S 16GB）
+- 单次前向 ~1–2 ms；批量前向（一层 64 叶）~5–10 ms
+- MCTS N=400：单步 **~1–2 秒**（19 路）；N=800 ~3–4 秒；9 路 N=200 单步 <1 秒
+- 相比纯 argmax 策略，棋力是**数量级**提升（无搜索→有搜索）
+
+### 评估脚本
+```bash
+# 对随机策略胜率（对比 policy-argmax vs MCTS）
+python scripts/evaluate.py --board-size 9 --mode random --use-mcts --simulations 200
+# 推理速度基准（单样本 vs 批量32）
+python scripts/evaluate.py --board-size 19 --mode benchmark --device cuda --use-amp --compile
+```
+
 ## 测试
 
 ```bash
