@@ -22,9 +22,21 @@ class AlphaGoNet(nn.Module):
                  in_channels: int = 12,
                  backbone_channels: int = 128,
                  backbone_res_blocks: int = 12,
+                 attention_mode: str = "mix",
+                 num_attention_layers: int = 4,
+                 num_heads: int = 4,
+                 attention_dropout: float = 0.0,
                  policy_channels: int = 32,
                  value_channels: int = 16,
                  action_size: int = 361):
+        """
+        Args:
+            attention_mode:      主干中注意力的使用方式
+                                 "none"(纯卷积) | "mix"(卷积+注意力混合) | "all"(全注意力)
+            num_attention_layers: mix 模式下注意力块数量
+            num_heads:           多头注意力头数
+            attention_dropout:   注意力 dropout
+        """
         super(AlphaGoNet, self).__init__()
         self.action_size = action_size
 
@@ -32,6 +44,10 @@ class AlphaGoNet(nn.Module):
             in_channels=in_channels,
             channels=backbone_channels,
             num_res_blocks=backbone_res_blocks,
+            attention_mode=attention_mode,
+            num_attention_layers=num_attention_layers,
+            num_heads=num_heads,
+            attention_dropout=attention_dropout,
         )
 
         self.policy = PolicyNetwork(
