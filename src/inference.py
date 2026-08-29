@@ -38,7 +38,8 @@ class GoAI:
 
     def __init__(self, model_path=None, board_size=19, device="auto", use_amp=False,
                  backbone_channels=128, backbone_res_blocks=12, policy_channels=64, value_channels=32,
-                 attention_mode="mix", num_attention_layers=4, num_heads=4, attention_dropout=0.0):
+                 attention_mode="mix", num_attention_layers=4, num_heads=4, attention_dropout=0.0,
+                 attn_mode="global", attn_window=7):
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
@@ -53,6 +54,8 @@ class GoAI:
             num_attention_layers=num_attention_layers,
             num_heads=num_heads,
             attention_dropout=attention_dropout,
+            attn_mode=attn_mode,
+            attn_window=attn_window,
             policy_channels=policy_channels,
             value_channels=value_channels,
             action_size=board_size * board_size + 1,  # +1 = 虚着
@@ -304,6 +307,10 @@ def main():
     parser.add_argument("--num-attention-layers", type=int, default=4)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--attention-dropout", type=float, default=0.0)
+    parser.add_argument("--attn-mode", default="global",
+                        choices=["global", "window", "axial"],
+                        help="注意力计算模式: global=全配对, window=滑动窗口, axial=轴向")
+    parser.add_argument("--attn-window", type=int, default=7, help="window 模式窗口边长")
     args = parser.parse_args()
 
     ai = GoAI(model_path=args.model, board_size=args.board_size,
@@ -311,7 +318,9 @@ def main():
               attention_mode=args.attention_mode,
               num_attention_layers=args.num_attention_layers,
               num_heads=args.num_heads,
-              attention_dropout=args.attention_dropout)
+              attention_dropout=args.attention_dropout,
+              attn_mode=args.attn_mode,
+              attn_window=args.attn_window)
     if args.mode == "selfplay":
         res = ai.self_play(num_games=args.games, temperature=args.temperature, topk=args.topk)
         wr = sum(1 for r in res if r > 0) / max(len(res), 1)

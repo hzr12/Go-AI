@@ -61,6 +61,10 @@ def main():
                     help='mix 模式下注意力块数量')
     ap.add_argument('--num-heads', type=int, default=4, help='多头注意力头数')
     ap.add_argument('--attention-dropout', type=float, default=0.0)
+    ap.add_argument('--attn-mode', default='global',
+                    choices=['global', 'window', 'axial'],
+                    help='注意力计算模式: global=全配对, window=滑动窗口, axial=轴向')
+    ap.add_argument('--attn-window', type=int, default=7, help='window 模式窗口边长')
     ap.add_argument('--eval-every', type=int, default=5000)
     args = ap.parse_args()
 
@@ -92,6 +96,8 @@ def main():
         num_attention_layers=args.num_attention_layers,
         num_heads=args.num_heads,
         attention_dropout=args.attention_dropout,
+        attn_mode=args.attn_mode,
+        attn_window=args.attn_window,
         action_size=args.board_size * args.board_size + 1,  # +1 为 pass 类别
     ).to(device)
 

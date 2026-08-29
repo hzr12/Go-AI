@@ -26,6 +26,8 @@ class AlphaGoNet(nn.Module):
                  num_attention_layers: int = 4,
                  num_heads: int = 4,
                  attention_dropout: float = 0.0,
+                 attn_mode: str = "global",
+                 attn_window: int = 7,
                  policy_channels: int = 32,
                  value_channels: int = 16,
                  action_size: int = 361):
@@ -36,6 +38,8 @@ class AlphaGoNet(nn.Module):
             num_attention_layers: mix 模式下注意力块数量
             num_heads:           多头注意力头数
             attention_dropout:   注意力 dropout
+            attn_mode:           注意力计算模式 "global"|"window"|"axial"
+            attn_window:         window 模式的窗口边长
         """
         super(AlphaGoNet, self).__init__()
         self.action_size = action_size
@@ -48,6 +52,8 @@ class AlphaGoNet(nn.Module):
             num_attention_layers=num_attention_layers,
             num_heads=num_heads,
             attention_dropout=attention_dropout,
+            attn_mode=attn_mode,
+            attn_window=attn_window,
         )
 
         self.policy = PolicyNetwork(
