@@ -153,6 +153,8 @@ def main():
                     choices=['global', 'window', 'axial'],
                     help='注意力计算模式: global=全配对, window=滑动窗口, axial=轴向')
     ap.add_argument('--attn-window', type=int, default=7, help='window 模式窗口边长')
+    ap.add_argument('--window-chunk', type=int, default=128,
+                    help='window 注意力沿窗口维分块大小（越小越省显存，过大易 OOM）')
     ap.add_argument('--eval-every', type=int, default=5000)
     ap.add_argument('--log-every', type=int, default=50,
                     help='每隔多少 step 打印一次训练日志（loss/lr/吞吐/显存）')
@@ -171,9 +173,10 @@ def main():
     logger.info("配置: data=%s board=%d batch=%d epochs=%d lr=%s wd=%s",
                 args.data, args.board_size, args.batch_size, args.epochs,
                 args.lr, args.weight_decay)
-    logger.info("注意力: mode=%s attn_mode=%s window=%d heads=%d layers=%d dropout=%s compile=%s",
+    logger.info("注意力: mode=%s attn_mode=%s window=%d heads=%d layers=%d dropout=%s compile=%s chunk=%d",
                 args.attention_mode, args.attn_mode, args.attn_window,
-                args.num_heads, args.num_attention_layers, args.attention_dropout, args.compile)
+                args.num_heads, args.num_attention_layers, args.attention_dropout, args.compile,
+                args.window_chunk)
     logger.info("日志: log_every=%d eval_every=%d save_every=%d out=%s",
                 args.log_every, args.eval_every, args.save_every, args.out)
     logger.info("=" * 60)
@@ -213,6 +216,13 @@ def main():
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     logger.info("[model] 参数量=%.2fM | 设备=%s", n_params / 1e6, device)
+
+    # 将 window_chunk（分块大小）透传到所有 window 注意力层，控制显存峰值
+    if args.window_chunk > 0:
+        for _m in model.modules():
+            if hasattr(_m, 'window_chunk'):
+                _m.window_chunk = args.window_chunk
+        logger.info("[model] window_chunk=%d（滑动窗口注意力分块大小）", args.window_chunk)
 
     # torch.compile 融合算子（GPU 上约 20-40% 提速）。首迭代有编译开销，
     # 不支持或失败时自动回退到 eager 模式。

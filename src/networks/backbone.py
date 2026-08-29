@@ -117,7 +117,7 @@ class MultiHeadSelfAttention(nn.Module):
         out_chunks = []
         # 每块 G 个窗口，峰值激活正比于 B*G。G 取小值（默认 256）即可让大 batch 不 OOM：
         # 典型 (B=200, G=256, Hh=4, ws²=49, d=32, 前后向×2) ≈ 200*256*4*49*32*2*4B ≈ 1.3GB。
-        G = max(1, getattr(self, 'window_chunk', 256))
+        G = max(1, getattr(self, 'window_chunk', 128))
         for s in range(0, N, G):
             e = min(s + G, N)
             qc = qu[:, s:e].reshape(B * (e - s), Hh, ws * ws, d)
