@@ -427,7 +427,10 @@ def main():
 
     # flash-attn 独立库启用决策：仅「Ampere+ CUDA 且走非 math 路径」时尝试加载。
     # 加载失败自动回退内置 SDPA，不影响训练启动。
-    if _backend == 'cuda' and compute_cap >= (8, 0) and not sdpa_force_math:
+    # 环境变量 GOAI_FLASH=0 可强制禁用（A/B 实测用：稀疏注意力分块 seq 仅 ~30，
+    # flash 小 kernel 密集发射在部分配置下比手写 math 更慢，需实测决定）。
+    _flash_wanted = os.environ.get('GOAI_FLASH', '1') != '0'
+    if _flash_wanted and _backend == 'cuda' and compute_cap >= (8, 0) and not sdpa_force_math:
         fa_ok, fa_msg = _backbone.set_flash_attn(True)
         if fa_ok:
             logger.info("[env] 注意力内核: flash-attn %s（优先于内置 SDPA）", fa_msg)
@@ -435,9 +438,12 @@ def main():
             logger.info("[env] 注意力内核: 内置 SDPA（flash-attn %s）", fa_msg)
     else:
         _backbone.set_flash_attn(False)
-        logger.info("[env] 注意力内核: %s",
-                    "手写 math（%s 不支持 Flash）" % (_backend.upper(),)
-                    if sdpa_force_math else "内置 SDPA")
+        if not _flash_wanted:
+            logger.info("[env] 注意力内核: 手写 math（GOAI_FLASH=0 已禁用 flash）")
+        else:
+            logger.info("[env] 注意力内核: %s",
+                        "手写 math（%s 不支持 Flash）" % (_backend.upper(),)
+                        if sdpa_force_math else "内置 SDPA")
 
     logger.info("启动训练 | torch=%s | device=%s | amp_dtype=%s scaler=%s channels_last=%s",
                 torch.__version__, device, amp_dtype, use_scaler, use_channels_last)
@@ -576,8 +582,23 @@ def main():
         model.train()
         epoch_loss = 0.0
         n_batches = (len(train_idx) + bs - 1) // bs
+        # 内核级剖析（诊断用）：GOAI_PROFILE=<step> 从该 step 起 profiling 50 个
+        # step，结束打印 top CUDA kernel 耗时表，用于定位 740ms/step 的去向。
+        _prof_at = int(os.environ.get('GOAI_PROFILE', '0') or 0)
+        _prof_ctx = None
         for i in range(n_batches):
             try:
+                if _prof_at > 0 and step == _prof_at and _prof_ctx is None:
+                    try:
+                        from torch.profiler import (profile, ProfilerActivity)
+                        _prof_ctx = profile(
+                            activities=[ProfilerActivity.CPU,
+                                        ProfilerActivity.CUDA])
+                        _prof_ctx.__enter__()
+                        logger.info("[profile] 已开始内核剖析（50 steps）...")
+                    except Exception as pe:  # noqa: BLE001
+                        logger.warning("[profile] 不可用: %s", pe)
+                        _prof_at = 0
                 sel = train_idx[i * bs:(i + 1) * bs]
                 state, move_t, value_t = dataset.sample_batch(sel, device)
                 # A100 上转 NHWC 以匹配模型 channels_last 布局，卷积更快
