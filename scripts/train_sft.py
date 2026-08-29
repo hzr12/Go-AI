@@ -150,7 +150,7 @@ def main():
     ap.add_argument('--num-heads', type=int, default=4, help='多头注意力头数')
     ap.add_argument('--attention-dropout', type=float, default=0.0)
     ap.add_argument('--attn-mode', default='global',
-                    choices=['global', 'window', 'axial'],
+                    choices=['global', 'window', 'axial', 'sparse'],
                     help='注意力计算模式: global=全配对, window=滑动窗口, axial=轴向')
     ap.add_argument('--attn-window', type=int, default=7, help='window 模式窗口边长')
     ap.add_argument('--window-chunk', type=int, default=128,

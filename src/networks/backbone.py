@@ -129,6 +129,67 @@ class MultiHeadSelfAttention(nn.Module):
         out = torch.cat(out_chunks, dim=1)  # (B, N, Hh, d)
         return out.reshape(B, N, Hh * d)
 
+    def _sparse_attn(self, q, k, v, H, W):
+        """稀疏注意力（固定稀疏模式）：局部滑动窗口 + 跨步长全局 token。
+
+        每个 query 位置只与两类 key 交互：
+          1) 自身 (ws×ws) 局部窗口内的 token（局部性，同 window）；
+          2) 每隔 stride=ws 下采样的「全局代表 token」（长程信息通路）。
+        总序列长度 = ws² + ng（ng≈(H/ws)×(W/ws)），与 window 同量级显存，
+        但全局 token 之间又各自在窗口内连通，使整盘信息可经 2~3 跳传播，
+        显著优于纯 window 的长程建模，且远省于全局 O(N²) 注意力。
+
+        显存：沿窗口维 N 分块（同 _window_attn 的 window_chunk），避免 B*N 大矩阵。
+        q,k,v: (B, Hh, N, head_dim)，N = H*W。
+        """
+        ws = self.window_size
+        stride = ws  # 全局 token 每隔 stride 取一个（块中心）
+        B, Hh, N, d = q.shape
+
+        # ---- 局部窗口邻居 (B, N, Hh, ws², d) ----
+        qu = F.unfold(q.reshape(B, Hh * d, H, W), kernel_size=ws, padding=ws // 2)
+        ku = F.unfold(k.reshape(B, Hh * d, H, W), kernel_size=ws, padding=ws // 2)
+        vu = F.unfold(v.reshape(B, Hh * d, H, W), kernel_size=ws, padding=ws // 2)
+        qu = qu.view(B, Hh, d, N, ws * ws).permute(0, 3, 1, 4, 2)  # (B, N, Hh, ws², d)
+        ku = ku.view(B, Hh, d, N, ws * ws).permute(0, 3, 1, 4, 2)
+        vu = vu.view(B, Hh, d, N, ws * ws).permute(0, 3, 1, 4, 2)
+
+        # ---- 全局代表 token：从 k/v 按 stride 下采样块中心 ----
+        # k: (B, Hh, N, d) -> (B, Hh, H, W, d)
+        kg = k.reshape(B, Hh, H, W, d)
+        vg = v.reshape(B, Hh, H, W, d)
+        gh, gw = H // stride, W // stride
+        # 截断到 stride 的整数倍（丢弃边界余数行/列，仅影响全局 token 覆盖，
+        # 不影响局部窗口对全图的覆盖）
+        kg = kg[:, :, :gh * stride, :gw * stride, :]
+        vg = vg[:, :, :gh * stride, :gw * stride, :]
+        # 取每 stride×stride 块的中心坐标
+        kg = kg.view(B, Hh, gh, stride, gw, stride, d)[:, :, :, stride // 2, :, stride // 2, :]
+        vg = vg.view(B, Hh, gh, stride, gw, stride, d)[:, :, :, stride // 2, :, stride // 2, :]
+        ng = gh * gw
+        kg = kg.reshape(B, Hh, ng, d)  # (B, Hh, ng, d)
+        vg = vg.reshape(B, Hh, ng, d)
+
+        center = (ws * ws) // 2
+        out_chunks = []
+        G = max(1, getattr(self, 'window_chunk', 128))
+        for s in range(0, N, G):
+            e = min(s + G, N)
+            qc = qu[:, s:e].reshape(B * (e - s), Hh, ws * ws, d)
+            kc = ku[:, s:e].reshape(B * (e - s), Hh, ws * ws, d)
+            vc = vu[:, s:e].reshape(B * (e - s), Hh, ws * ws, d)
+            # query 用局部中心 token 的 q；key/value = 局部窗口 + 全局 token
+            q_center = qc[:, :, center:center + 1, :]  # (B*G, Hh, 1, d)
+            # 全局 token 广播到当前窗口块 (B*G, Hh, ng, d)
+            k_glob = kg.unsqueeze(1).expand(B, e - s, Hh, ng, d).reshape(B * (e - s), Hh, ng, d)
+            v_glob = vg.unsqueeze(1).expand(B, e - s, Hh, ng, d).reshape(B * (e - s), Hh, ng, d)
+            k_all = torch.cat([kc, k_glob], dim=2)  # (B*G, Hh, ws²+ng, d)
+            v_all = torch.cat([vc, v_glob], dim=2)
+            oc = _sdpa(q_center, k_all, v_all, dropout_p=self.attn_drop, use_math=True)
+            out_chunks.append(oc.reshape(B, e - s, Hh, d))
+        out = torch.cat(out_chunks, dim=1)  # (B, N, Hh, d)
+        return out.reshape(B, N, Hh * d)
+
     def _axial_attn(self, q, k, v, H, W):
         """轴向注意力：先按行、再按列做 1D 自注意力。
 
@@ -177,6 +238,8 @@ class MultiHeadSelfAttention(nn.Module):
             out = self._window_attn(q, k, v, H, W)
         elif self.mode == "axial":
             out = self._axial_attn(q, k, v, H, W)
+        elif self.mode == "sparse":
+            out = self._sparse_attn(q, k, v, H, W)  # (B, N, C)
         else:  # global
             out = self._global_attn(q, k, v)  # (B, Hh, N, d)
             out = out.transpose(1, 2).contiguous().view(B, N, C)
