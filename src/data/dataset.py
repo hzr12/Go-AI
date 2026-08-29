@@ -47,12 +47,12 @@ class SupervisedDataset:
         state_tensor: (B, 12, H, W) float32
         move_tensor:  (B,) int64
         value_tensor: (B, 1) float32
+
+        使用向量化批量特征构造（GoBoard.feature_planes_batched）+ 向量化对称增强，
+        避免逐样本 Python 循环，训练吞吐显著更高。
         """
         bs = self.board_size
         B = len(idxs)
-        states = np.zeros((B, 12, bs, bs), dtype=np.float32)
-        moves_out = np.empty(B, dtype=np.int64)
-
         boards = self.boards[idxs]
         my_h = self.my_hist[idxs]
         op_h = self.op_hist[idxs]
@@ -60,31 +60,33 @@ class SupervisedDataset:
         to_play = self.to_play[idxs]
         tforms = np.random.randint(0, 8, size=B)
 
-        for i in range(B):
-            b = boards[i]
-            tp = int(to_play[i])
-            # 复用 GoBoard 构造特征（单一真相来源）
-            gb = self._board
-            gb.board = b
-            gb.ko_point = int(ko[i])
-            gb.current_player = tp
-            plane = gb.feature_planes(my_h[i].tolist(), op_h[i].tolist(), tp)
+        # 批量构造 12 通道特征（B,12,H,W）
+        states = GoBoard.feature_planes_batched(boards, my_h, op_h, to_play, ko)
 
-            # 随机对称增强（对同一变换同时作用于平面与着法）
-            t = int(tforms[i])
-            r = t % 4
-            if r:
-                plane = np.stack([np.rot90(plane[ch], r) for ch in range(12)])
-            if t >= 4:
-                plane = np.fliplr(plane)
-            mv = int(self.moves[idxs[i]])
-            if 0 <= mv < bs * bs:
-                rr, cc = SYMMETRIES[t](*divmod(mv, bs), bs)
-                mv = rr * bs + cc
-            else:  # pass 或越界 -> 专用类别 board_size*board_size
-                mv = bs * bs
-            states[i] = plane
-            moves_out[i] = mv
+        # 向量化对称增强：rot90(k=t%4) 旋转 (H,W) 平面；t>=4 时翻转 H 轴。
+        # 注意: 旧逐样本版用 np.fliplr(plane) 对 (12,H,W) 翻转的是 H 轴(axis=1)，
+        # 这里用显式切片 x[:, :, ::-1, :] 精确复刻，避免 np.fliplr 在 4D 上的隐式轴歧义。
+        rot_k = tforms % 4
+        for k in range(1, 4):  # k=0 无需旋转
+            mask = rot_k == k
+            if mask.any():
+                states[mask] = np.rot90(states[mask], k=k, axes=(2, 3))
+        for t in range(4, 8):
+            mask = tforms == t
+            if mask.any():
+                states[mask] = states[mask][:, :, ::-1, :]
+
+        # 向量化坐标对称变换（move）
+        moves_out = np.full(B, bs * bs, dtype=np.int64)  # 默认 pass/越界 -> 专用类别
+        mv = np.asarray(self.moves[idxs], dtype=np.int64)
+        valid = (mv >= 0) & (mv < bs * bs)
+        r, c = np.divmod(np.where(valid, mv, 0), bs)
+        for t in range(8):
+            mask = tforms == t
+            if not mask.any():
+                continue
+            rr, cc = SYMMETRIES[t](r[mask], c[mask], bs)
+            moves_out[mask] = rr * bs + cc
 
         values = self.values[idxs].astype(np.float32).reshape(-1, 1)
         return (

@@ -257,17 +257,27 @@ def main():
         epoch_loss = 0.0
         n_batches = (len(train_idx) + bs - 1) // bs
         for i in range(n_batches):
-            sel = train_idx[i * bs:(i + 1) * bs]
-            state, move_t, value_t = dataset.sample_batch(sel, device)
-            with maybe_autocast(device):
-                policy_logits, value_pred = model(state)
-                policy_loss = F.cross_entropy(policy_logits.float(), move_t)
-                value_loss = F.mse_loss(value_pred.float().squeeze(), value_t.squeeze())
-                loss = policy_loss + value_loss
-            optimizer.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            try:
+                sel = train_idx[i * bs:(i + 1) * bs]
+                state, move_t, value_t = dataset.sample_batch(sel, device)
+                with maybe_autocast(device):
+                    policy_logits, value_pred = model(state)
+                    policy_loss = F.cross_entropy(policy_logits.float(), move_t)
+                    value_loss = F.mse_loss(value_pred.float().squeeze(), value_t.squeeze())
+                    loss = policy_loss + value_loss
+                optimizer.zero_grad()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                logger.error("=" * 60)
+                logger.error("CUDA 显存不足 (OOM)！当前 --batch-size=%d 过大。", bs)
+                logger.error("window 注意力在 19x19 上把 batch 展开为 B*361，显存增长很快。")
+                logger.error("建议减小 --batch-size（如 128/96/64），或调小 --attn-window。")
+                logger.error("已清理显存并退出，请调整参数后重跑。")
+                logger.error("=" * 60)
+                sys.exit(1)
             step += 1
             epoch_loss += loss.item()
 

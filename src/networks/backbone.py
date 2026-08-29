@@ -92,9 +92,12 @@ class MultiHeadSelfAttention(nn.Module):
         """滑动窗口注意力：对每个位置仅与窗口内 token 交互。
 
         用 F.unfold 取每个窗口的 ws*ws 个 token，把窗口维并入 batch 后用
-        torch.nn.functional.scaled_dot_product_attention（GPU 上走 FlashAttention /
-        Memory-Efficient，不物化 N×N 矩阵）计算局部注意力，再取中心位置输出。
-        复杂度 O(N * ws²)，远低于全局 O(N²)，显存同理下降。
+        手写 softmax 注意力（use_math，绕开 V100 上不可用的 FlashAttention）计算
+        局部注意力，再取中心位置输出。复杂度 O(N * ws²)。
+
+        显存优化：unfold 后沿窗口维 N 分块（chunk），每块只对 G 个窗口做 SDPA，
+        避免一次性构造 (B*N, Hh, ws², d) 大矩阵（B*N 在 19x19 上可达数万，直接 OOM）。
+        分块后峰值激活只与 B*G 相关，与总 batch 解耦，可支持大 batch。
         q,k,v: (B, Hh, N, head_dim)，N = H*W。
         """
         ws = self.window_size
@@ -105,20 +108,26 @@ class MultiHeadSelfAttention(nn.Module):
         ku = F.unfold(k.reshape(B, Hh * d, H, W), kernel_size=ws, padding=ws // 2)
         vu = F.unfold(v.reshape(B, Hh * d, H, W), kernel_size=ws, padding=ws // 2)
 
-        # 重排为 (B*N, Hh, ws*ws, d)
-        qu = qu.view(B, Hh, d, N, ws * ws).permute(0, 3, 1, 4, 2).reshape(B * N, Hh, ws * ws, d)
-        ku = ku.view(B, Hh, d, N, ws * ws).permute(0, 3, 1, 4, 2).reshape(B * N, Hh, ws * ws, d)
-        vu = vu.view(B, Hh, d, N, ws * ws).permute(0, 3, 1, 4, 2).reshape(B * N, Hh, ws * ws, d)
+        # 重排为 (B, N, Hh, ws*ws, d) 便于沿 N 分块
+        qu = qu.view(B, Hh, d, N, ws * ws).permute(0, 3, 1, 4, 2)  # (B, N, Hh, ws², d)
+        ku = ku.view(B, Hh, d, N, ws * ws).permute(0, 3, 1, 4, 2)
+        vu = vu.view(B, Hh, d, N, ws * ws).permute(0, 3, 1, 4, 2)
 
-        # 注意：query/key/value 序列长度必须一致（均为 ws*ws），否则 FlashAttention
-        # 在 N_q=1 这种极小 query 长度上会报 "invalid configuration argument"。
-        # 因此用整个窗口做 SDPA（每个位置对窗口内所有 token 算注意力），再取中心输出，
-        # 语义等价于「中心位置看窗口邻居」，且 N_q == N_kv 让后端合法。
-        out = _sdpa(qu, ku, vu, dropout_p=self.attn_drop, use_math=True)  # (B*N, Hh, ws*ws, d)
         center = (ws * ws) // 2
-        out = out[:, :, center:center + 1, :]  # (B*N, Hh, 1, d)
-        out = out.reshape(B, N, Hh, d).reshape(B, N, Hh * d)
-        return out
+        out_chunks = []
+        # 每块 G 个窗口，峰值激活正比于 B*G。G 取小值（默认 256）即可让大 batch 不 OOM：
+        # 典型 (B=200, G=256, Hh=4, ws²=49, d=32, 前后向×2) ≈ 200*256*4*49*32*2*4B ≈ 1.3GB。
+        G = max(1, getattr(self, 'window_chunk', 256))
+        for s in range(0, N, G):
+            e = min(s + G, N)
+            qc = qu[:, s:e].reshape(B * (e - s), Hh, ws * ws, d)
+            kc = ku[:, s:e].reshape(B * (e - s), Hh, ws * ws, d)
+            vc = vu[:, s:e].reshape(B * (e - s), Hh, ws * ws, d)
+            oc = _sdpa(qc, kc, vc, dropout_p=self.attn_drop, use_math=True)  # (B*G, Hh, ws², d)
+            oc = oc[:, :, center:center + 1, :]  # (B*G, Hh, 1, d)
+            out_chunks.append(oc.reshape(B, e - s, Hh, d))
+        out = torch.cat(out_chunks, dim=1)  # (B, N, Hh, d)
+        return out.reshape(B, N, Hh * d)
 
     def _axial_attn(self, q, k, v, H, W):
         """轴向注意力：先按行、再按列做 1D 自注意力。

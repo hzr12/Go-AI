@@ -372,8 +372,94 @@ class GoBoard:
         return planes
 
     @staticmethod
+    def feature_planes_batched(boards, my_hist, op_hist, to_play, ko=None):
+        """向量化批量版 feature_planes，语义与单图 feature_planes 完全一致。
+
+        输入:
+            boards   : (B, n, n) int8，取值 -1/0/1
+            my_hist  : (B, 3) int16，己方前 3 手扁平坐标（-1 填充）
+            op_hist  : (B, 3) int16
+            to_play  : (B,) int8，轮到谁落子（1 黑 / -1 白）
+            ko       : (B,) int16，劫禁着点扁平坐标（-1 无）；可选，用于通道 8 排除
+        返回: (B, 12, n, n) float32
+
+        性能: 用 scipy.ndimage.label 一次性标注连通块并向量化计算气数，
+            避免单图版的双层 Python for 循环（每个非空点一次 flood fill），
+            在 B 较大时（训练 batch）提速数倍。
+        """
+        from scipy.ndimage import label as _label
+        boards = np.asarray(boards)
+        B, n, _ = boards.shape
+        planes = np.zeros((B, 12, n, n), dtype=np.float32)
+        to_play = np.asarray(to_play).reshape(B, 1, 1)
+        opp = -to_play  # (B,1,1)
+
+        # 通道 0/4: 己方/对手棋子
+        planes[:, 0] = (boards == to_play)
+        planes[:, 4] = (boards == opp)
+
+        # 通道 1-3 / 5-7: 历史手（高级索引 scatter）
+        my_hist = np.asarray(my_hist).reshape(B, 3)
+        op_hist = np.asarray(op_hist).reshape(B, 3)
+        for k in range(3):
+            mv = my_hist[:, k]
+            valid = mv >= 0
+            r, c = np.divmod(np.where(valid, mv, 0), n)
+            planes[np.arange(B)[valid], 1 + k, r[valid], c[valid]] = 1.0
+            mv = op_hist[:, k]
+            valid = mv >= 0
+            r, c = np.divmod(np.where(valid, mv, 0), n)
+            planes[np.arange(B)[valid], 5 + k, r[valid], c[valid]] = 1.0
+
+        # 通道 8: 合法点掩码（空点，劫禁着点排除）—— 与单图 get_legal_moves 一致
+        legal = (boards == 0).astype(np.float32)
+        if ko is not None:
+            ko = np.asarray(ko).reshape(B)
+            for b in range(B):
+                if ko[b] >= 0:
+                    r, c = divmod(int(ko[b]), n)
+                    legal[b, r, c] = 0.0
+        planes[:, 8] = legal
+
+        # 通道 9: 执子方常数
+        planes[:, 9] = to_play.astype(np.float32)
+
+        # 通道 10/11: 气数=1 掩码（向量化连通块标注 + 邻空计数）
+        my_lib1 = np.zeros((B, n, n), dtype=np.float32)
+        op_lib1 = np.zeros((B, n, n), dtype=np.float32)
+        struct = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)  # 4 邻域
+        for b in range(B):
+            board_b = boards[b]
+            tp = int(to_play[b, 0, 0])
+            opp_b = -tp
+            empty = (board_b == 0)
+            # 每个棋子点的 4 邻域空点坐标数（整数 0-4），与单图
+            # _group_liberty_count 逐点计数语义一致（每个空邻域坐标各算 1 气）。
+            up = np.zeros_like(empty, dtype=np.int64); up[:-1, :] = empty[1:, :]
+            down = np.zeros_like(empty, dtype=np.int64); down[1:, :] = empty[:-1, :]
+            left = np.zeros_like(empty, dtype=np.int64); left[:, :-1] = empty[:, 1:]
+            right = np.zeros_like(empty, dtype=np.int64); right[:, 1:] = empty[:, :-1]
+            neigh_empty = up.astype(np.int64) + down + left + right
+            for color, lib_plane in ((tp, my_lib1[b]), (opp_b, op_lib1[b])):
+                mask = (board_b == color)
+                if not mask.any():
+                    continue
+                labelled, num = _label(mask, structure=struct)
+                if num == 0:
+                    continue
+                # 每个 group 的邻空数 = 该 group 内点邻域空点坐标总数（不去重空块）
+                # 用 np.add.at 仅对棋子点（mask 为真）按 labelled 累加 neigh_empty。
+                lib_counts = np.zeros(num + 1, dtype=np.int64)
+                np.add.at(lib_counts, labelled[mask], neigh_empty[mask])
+                lib1_mask = (lib_counts[labelled] == 1) & mask
+                lib_plane[lib1_mask] = 1.0
+
+        planes[:, 10] = my_lib1
+        planes[:, 11] = op_lib1
+        return planes
+
+    @staticmethod
     def apply_symmetry(state_12ch, move, transform_id, board_size):
-        """对 12 通道特征与着法做 8 种对称变换之一。"""
         planes = np.array(state_12ch)
         for ch in range(planes.shape[0]):
             planes[ch] = np.rot90(planes[ch], k=transform_id % 4)
