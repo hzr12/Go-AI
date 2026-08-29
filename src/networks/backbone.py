@@ -47,6 +47,13 @@ def _sdpa(q, k, v, dropout_p=0.0, use_math=False):
     if _sdpa_force_math:
         use_math = True
     if not use_math and _flash_attn_func is not None:
+        # flash-attn 只接受 fp16/bf16。正常由 autocast 保证 bf16；若上游发生 dtype
+        # 泄漏（如 graph-break resume 段的 eager 重算），这里兜底转 bf16，避免
+        # "FlashAttention only support fp16 and bf16 data type" 直接崩溃。
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            q = q.to(torch.bfloat16)
+            k = k.to(torch.bfloat16)
+            v = v.to(torch.bfloat16)
         # flash-attn 独立库：要求 (B, S, Hh, d) 布局（头维 -2、head_dim -1）。
         # 我们的 (B, Hh, N, d) 中 head_dim 为最内层（stride=1），transpose 后满足
         # flash-attn 的 last-dim contiguous 要求，无需显式 .contiguous() 拷贝。
@@ -115,15 +122,18 @@ def set_compile_disable_sparse(flag: bool) -> None:
     _compile_disable_sparse = bool(flag)
 
 
-def _maybe_compiler_disable(fn):
-    """条件性 torch.compiler.disable 装饰器。
+def _run_with_optional_disable(fn, *args):
+    """运行时按开关决定是否将 fn 排除出 torch.compile 图。
 
-    仅当 _compile_disable_sparse=True（V100 等老卡）时排除编译；
-    A100 上直接返回原函数，纳入编译图。
+    注意：不能用装饰器在类定义时静态包装——装饰器在 import 求值时模块开关还是
+    默认值 True，运行时 set_compile_disable_sparse(False)（A100）无法撤销已应用的
+    torch._dynamo.disable。disable 会造成 graph break，break 后的 eager resume 段
+    中 autocast 已退出，qkv Linear 以 FP32 执行，进而让 flash-attn 收到 fp32 报错。
+    这里改为每次调用时动态包装（开销纳秒级，可忽略）。
     """
     if _compile_disable_sparse:
-        return torch.compiler.disable(fn)
-    return fn
+        return torch.compiler.disable(fn)(*args)
+    return fn(*args)
 
 
 class MultiHeadSelfAttention(nn.Module):
@@ -168,7 +178,6 @@ class MultiHeadSelfAttention(nn.Module):
     def _global_attn(self, q, k, v):
         return _sdpa(q, k, v, dropout_p=self.attn_drop)
 
-    @_maybe_compiler_disable
     def _window_attn(self, q, k, v, H, W):
         """滑动窗口注意力：对每个位置仅与窗口内 token 交互。
 
@@ -216,7 +225,6 @@ class MultiHeadSelfAttention(nn.Module):
         out = torch.cat(out_chunks, dim=1)  # (B, N, Hh, d)
         return out.reshape(B, N, Hh * d)
 
-    @_maybe_compiler_disable
     def _sparse_attn(self, q, k, v, H, W):
         """稀疏注意力（固定稀疏模式）：局部滑动窗口 + 跨步长全局 token。
 
@@ -327,11 +335,11 @@ class MultiHeadSelfAttention(nn.Module):
         q = q * self.scale
 
         if self.mode == "window":
-            out = self._window_attn(q, k, v, H, W)
+            out = _run_with_optional_disable(self._window_attn, q, k, v, H, W)
         elif self.mode == "axial":
             out = self._axial_attn(q, k, v, H, W)
         elif self.mode == "sparse":
-            out = self._sparse_attn(q, k, v, H, W)  # (B, N, C)
+            out = _run_with_optional_disable(self._sparse_attn, q, k, v, H, W)  # (B, N, C)
         else:  # global
             out = self._global_attn(q, k, v)  # (B, Hh, N, d)
             out = out.transpose(1, 2).contiguous().view(B, N, C)

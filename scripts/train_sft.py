@@ -60,6 +60,10 @@ def npu_grad_scaler(enabled: bool):
 
 
 def npu_out_of_memory_error_type():
+    # 未装 torch_npu 的环境（纯 CUDA 开发机）torch.npu 属性不存在，
+    # 必须先 hasattr 守卫，否则 OOM 异常处理路径本身会抛 AttributeError
+    if not hasattr(torch, 'npu'):
+        return None
     return getattr(torch.npu, 'OutOfMemoryError', None)
 
 
@@ -361,6 +365,8 @@ def main():
         _dev_idx = 0
     if _backend == 'cuda' and torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
+        # A100+ 上开启 TF32：未被 autocast 覆盖的 fp32 matmul/conv 走 TF32 tensor core
+        torch.set_float32_matmul_precision('high')
         torch.set_num_threads(min(8, os.cpu_count() or 8))
         props = torch.cuda.get_device_properties(_dev_idx)
         gpu_name = props.name
@@ -502,6 +508,12 @@ def main():
         if not os.path.isfile(args.resume):
             raise FileNotFoundError(f"--resume 指定的模型不存在: {args.resume}")
         state_path = args.resume + '.train_state'
+        if not os.path.isfile(state_path):
+            # 兼容训练中途 save_every 的快照命名：<out>.latest.train_state
+            _latest = args.resume + '.latest.train_state'
+            if os.path.isfile(_latest):
+                state_path = _latest
+                logger.info("[resume] 使用中途快照训练状态: %s", _latest)
         logger.info("[resume] 加载模型权重: %s", args.resume)
         ckpt = torch.load(args.resume, map_location=device)
         # 统一前缀：checkpoint 可能带（来自 compile 存档）或不带 "_orig_mod." 前缀，
@@ -536,12 +548,17 @@ def main():
         if hasattr(torch, 'compile'):
             try:
                 model = torch.compile(model, dynamic=False, mode=args.compile_mode)
-                with torch.no_grad():
+                # 预热前向必须与真实训练一致地包 autocast：flash-attn 只接受 fp16/bf16，
+                # FP32 输入直灌会报 "FlashAttention only support fp16 and bf16 data
+                # type"，导致 compile 被误判为不可用而回退 eager。
+                with torch.no_grad(), maybe_autocast(device, amp_dtype):
                     dummy = torch.zeros(1, 12, args.board_size, args.board_size,
                                         device=device)
                     model(dummy)
                 logger.info("[train] 已启用 torch.compile 算子融合")
             except Exception as e:  # noqa: BLE001
+                # 真正回退 eager：剥离 OptimizedModule 包装，恢复原始模块引用
+                model = getattr(model, '_orig_mod', model)
                 logger.warning("[train] torch.compile 不可用，回退 eager: %s", e)
         else:
             logger.info("[train] 当前 torch 版本不支持 torch.compile，跳过")
