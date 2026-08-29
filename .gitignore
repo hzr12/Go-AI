@@ -20,7 +20,7 @@ models/
 
 # 数据集（原始 SGF / 生成的 npz 较大）
 data/*.npz
-data/*.tgz
+data/.tgz
 data/*.tar.gz
 data/raw/
 data/games/
