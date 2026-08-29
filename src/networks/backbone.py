@@ -28,11 +28,18 @@ def _sdpa(q, k, v, dropout_p=0.0, use_math=False):
     q,k,v: (B, Hh, N, head_dim)。q 已在调用处预乘 scale。
     use_math: 跳过 F.scaled_dot_product_attention 的所有后端，直接走手写 softmax 注意力。
         用于 window 注意力：其 batch 维被展开为 B*N（可能极大，如 512*361≈18万），
-        且序列长度仅 ws*ws（很小）。FlashAttention 内核在此类「超大 batch × 极小 seq」
-        配置上会报 "invalid configuration argument"；而 torch.backends.cuda.sdp_kernel
-        老 API 在较新 torch 中已被 deprecate 且常不生效，故直接用手写 math 路径最稳。
+        且序列长度仅 ws*ws（很小）。在 Volta(V100, sm_70) 等老架构上 FlashAttention 内核
+        不可用（会报 "invalid configuration argument"），故走手写 math 路径最稳；
         window 的 seq=49，49×49 注意力成本可忽略。
+        在 Ampere+(A100/H100, sm_80+) 上则由调用方传 use_math=False，自动走
+        FlashAttention / Memory-Efficient 后端，速度更快、显存更省，且能被 torch.compile 融合。
+
+    模块级开关 _sdpa_force_math（在 train_sft.py 里按 GPU 能力设置）会覆盖 use_math：
+    V100 强制 math，A100 强制走 SDPA 后端。
     """
+    # 模块级覆盖：训练脚本按 GPU 能力设置（A100 走 Flash，V100 走 math）
+    if _sdpa_force_math:
+        use_math = True
     if use_math or not hasattr(F, "scaled_dot_product_attention"):
         # 手写注意力（q 已预乘 scale）
         attn = (q @ k.transpose(-2, -1))
@@ -41,9 +48,43 @@ def _sdpa(q, k, v, dropout_p=0.0, use_math=False):
             attn = torch.nn.functional.dropout(attn, p=dropout_p)
         return attn @ v
     return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
-    if dropout_p > 0:
-        attn = F.dropout(attn, p=dropout_p)
-    return attn @ v
+
+
+# 模块级开关：是否强制走手写 math 注意力。
+# 默认 True（最保守，兼容 V100 等老卡）；train_sft.py 在检测到 Ampere+ 后会设为 False
+# 以启用 FlashAttention 后端。窗口/稀疏注意力在 A100 上 batch 维被展开为 B*N，
+# 但若序列长度极小（ws²+ng≈数十），较新 torch 的 SDPA 后端能正常处理，无需 math。
+_sdpa_force_math = True
+
+
+def set_sdpa_force_math(flag: bool) -> None:
+    """由训练脚本在启动时按 GPU 能力设置。flag=True 强制手写 math（V100）。"""
+    global _sdpa_force_math
+    _sdpa_force_math = bool(flag)
+
+
+# 模块级开关：是否将 window/sparse 注意力排除出 torch.compile 图。
+# V100(sm_70)/torch2.1 上 F.unfold + 动态 view/permute 链会让 inductor 触发
+# PolynomialError，必须 disable；Ampere+(A100) 上 inductor 成熟，能正常编译 unfold，
+# 故不 disable，使整个注意力被编译融合，提速更明显。
+_compile_disable_sparse = True
+
+
+def set_compile_disable_sparse(flag: bool) -> None:
+    """由训练脚本按 GPU 能力设置。flag=True 时 window/sparse 注意力排除编译（V100）。"""
+    global _compile_disable_sparse
+    _compile_disable_sparse = bool(flag)
+
+
+def _maybe_compiler_disable(fn):
+    """条件性 torch.compiler.disable 装饰器。
+
+    仅当 _compile_disable_sparse=True（V100 等老卡）时排除编译；
+    A100 上直接返回原函数，纳入编译图。
+    """
+    if _compile_disable_sparse:
+        return torch.compiler.disable(fn)
+    return fn
 
 
 class MultiHeadSelfAttention(nn.Module):
@@ -88,7 +129,7 @@ class MultiHeadSelfAttention(nn.Module):
     def _global_attn(self, q, k, v):
         return _sdpa(q, k, v, dropout_p=self.attn_drop)
 
-    @torch.compiler.disable
+    @_maybe_compiler_disable
     def _window_attn(self, q, k, v, H, W):
         """滑动窗口注意力：对每个位置仅与窗口内 token 交互。
 
@@ -100,9 +141,10 @@ class MultiHeadSelfAttention(nn.Module):
         避免一次性构造 (B*N, Hh, ws², d) 大矩阵（B*N 在 19x19 上可达数万，直接 OOM）。
         分块后峰值激活只与 B*G 相关，与总 batch 解耦，可支持大 batch。
 
-        @torch.compiler.disable: F.unfold 接动态 view/permute 链会让 inductor 在
-        V100(sm_70)/torch2.1 上触发 PolynomialError（符号 shape 化简失败）。把本方法
-        排除出编译图，其余算子（Linear/BN/卷积/FFN/GEMM）仍被编译融合，提速保留。
+        @_maybe_compiler_disable: 仅 V100(sm_70)/torch2.1 上 F.unfold 接动态 view/permute
+        链会让 inductor 触发 PolynomialError，此时排除出编译图；A100(sm_80+) 上 inductor
+        成熟可正常编译 unfold，不禁用，使整个注意力被融合。use_math 由 _SDPA_FORCE_MATH
+        模块开关决定（V100 走手写 softmax，A100 走 FlashAttention 后端）。
         q,k,v: (B, Hh, N, head_dim)，N = H*W。
         """
         ws = self.window_size
@@ -128,13 +170,14 @@ class MultiHeadSelfAttention(nn.Module):
             qc = qu[:, s:e].reshape(B * (e - s), Hh, ws * ws, d)
             kc = ku[:, s:e].reshape(B * (e - s), Hh, ws * ws, d)
             vc = vu[:, s:e].reshape(B * (e - s), Hh, ws * ws, d)
-            oc = _sdpa(qc, kc, vc, dropout_p=self.attn_drop, use_math=True)  # (B*G, Hh, ws², d)
+            oc = _sdpa(qc, kc, vc, dropout_p=self.attn_drop,
+                       use_math=_sdpa_force_math)  # V100 走 math；A100 走 Flash
             oc = oc[:, :, center:center + 1, :]  # (B*G, Hh, 1, d)
             out_chunks.append(oc.reshape(B, e - s, Hh, d))
         out = torch.cat(out_chunks, dim=1)  # (B, N, Hh, d)
         return out.reshape(B, N, Hh * d)
 
-    @torch.compiler.disable
+    @_maybe_compiler_disable
     def _sparse_attn(self, q, k, v, H, W):
         """稀疏注意力（固定稀疏模式）：局部滑动窗口 + 跨步长全局 token。
 
@@ -147,8 +190,8 @@ class MultiHeadSelfAttention(nn.Module):
 
         显存：沿窗口维 N 分块（同 _window_attn 的 window_chunk），避免 B*N 大矩阵。
 
-        @torch.compiler.disable: 同 _window_attn，内部 F.unfold + 动态 view/permute
-        链会让 inductor 在 V100 上报 PolynomialError，排除出编译图。
+        @_maybe_compiler_disable: 同 _window_attn，仅 V100 上排除编译，A100 纳入编译图。
+        use_math 由 _SDPA_FORCE_MATH 模块开关决定（V100 走手写 softmax，A100 走 FlashAttention）。
         q,k,v: (B, Hh, N, head_dim)，N = H*W。
         """
         ws = self.window_size
@@ -194,7 +237,8 @@ class MultiHeadSelfAttention(nn.Module):
             v_glob = vg.unsqueeze(1).expand(B, e - s, Hh, ng, d).reshape(B * (e - s), Hh, ng, d)
             k_all = torch.cat([kc, k_glob], dim=2)  # (B*G, Hh, ws²+ng, d)
             v_all = torch.cat([vc, v_glob], dim=2)
-            oc = _sdpa(q_center, k_all, v_all, dropout_p=self.attn_drop, use_math=True)
+            oc = _sdpa(q_center, k_all, v_all, dropout_p=self.attn_drop,
+                       use_math=_sdpa_force_math)  # V100 走 math；A100 走 Flash
             out_chunks.append(oc.reshape(B, e - s, Hh, d))
         out = torch.cat(out_chunks, dim=1)  # (B, N, Hh, d)
         return out.reshape(B, N, Hh * d)

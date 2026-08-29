@@ -36,7 +36,7 @@ def save_model(model, path):
     torch.save(sd, path)
 
 
-def setup_logging(log_file, level=logging.INFO):
+def setup_logging(log_file, level: int = logging.INFO) -> logging.Logger:
     """配置 logging：同时写文件与输出到控制台（无缓冲，实时可见）。"""
     logger = logging.getLogger('train')
     logger.setLevel(level)
@@ -57,14 +57,15 @@ def setup_logging(log_file, level=logging.INFO):
     return logger
 
 
-def maybe_autocast(device):
-    """仅在 CUDA 上开启 fp16 autocast，CPU 返回 nullcontext。"""
+def maybe_autocast(device, dtype=torch.float16):
+    """仅在 CUDA 上开启 autocast，dtype 由 GPU 能力决定（A100=bf16, V100=fp16）。
+    CPU 或 amp 关闭时返回 nullcontext。"""
     if device == 'cuda':
         if hasattr(torch, 'amp') and hasattr(torch.amp, 'autocast'):
             try:
-                return torch.amp.autocast('cuda')
+                return torch.amp.autocast('cuda', dtype=dtype)
             except TypeError:
-                return torch.cuda.amp.autocast()
+                return torch.cuda.amp.autocast(enabled=True, dtype=dtype)
     return nullcontext()
 
 
@@ -174,14 +175,16 @@ def main():
                          '.train_state.pt 恢复 optimizer/scheduler/step 计数继续训练')
     ap.add_argument('--compile', action='store_true',
                     help='用 torch.compile 融合算子（GPU 上约 20-40%% 提速，首次迭代较慢）')
+    ap.add_argument('--compile-mode', default='default',
+                    choices=['default', 'max-autotune', 'reduce-overhead'],
+                    help='torch.compile 模式: default=常规融合, max-autotune=A100 上进一步 '
+                         '自动调优提速（编译更久）, reduce-overhead=小 batch 低开销')
     args = ap.parse_args()
 
     # 配置日志（控制台 + 文件），统一用 logger 输出便于事后排查
     log_file = args.log_file if args.log_file else None
     logger = setup_logging(log_file)
     logger.info("=" * 60)
-    logger.info("启动训练 | torch=%s | device=%s | amp=%s",
-                torch.__version__, args.device, args.use_amp)
     logger.info("配置: data=%s board=%d batch=%d epochs=%d lr=%s wd=%s",
                 args.data, args.board_size, args.batch_size, args.epochs,
                 args.lr, args.weight_decay)
@@ -198,10 +201,57 @@ def main():
     else:
         device = args.device
     use_amp = args.use_amp or (device == 'cuda')
-    # V100 是 Volta：无 bf16，使用 fp16
-    if device == 'cuda':
+
+    # ---- A100 自适应路径：按 GPU 计算能力自动开启 BF16 / FlashAttention / channels_last ----
+    # sm_80+ (Ampere: A100/A800/H100/L4/4090 等) 原生支持 BF16 与 FlashAttention 后端，
+    # 显存带宽也更高。V100(sm_70, Volta) 仅 FP16、无 Flash，需走保守路径。
+    # 此段决定：
+    #   - amp_dtype:   A100->bfloat16（无需 loss scaling），V100->float16
+    #   - use_scaler:  BF16 下关闭 GradScaler（不会下溢），FP16 下开启
+    #   - channels_last: A100 上卷积走 NHWC 更快；V100 收益有限默认关
+    #   - sdpa_force_math / compile_disable_sparse: V100 强制手写 math + 禁用稀疏注意力编译
+    amp_dtype = torch.float16
+    use_scaler = use_amp
+    use_channels_last = False
+    sdpa_force_math = True
+    compile_disable_sparse = True
+    gpu_name = 'N/A'
+    compute_cap = (0, 0)
+    if device == 'cuda' and torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
         torch.set_num_threads(min(8, os.cpu_count() or 8))
+        props = torch.cuda.get_device_properties(0)
+        gpu_name = props.name
+        compute_cap = (props.major, props.minor)
+        is_ampere_plus = compute_cap >= (8, 0)
+        if is_ampere_plus:
+            amp_dtype = torch.bfloat16
+            use_scaler = False  # BF16 几乎不下溢，去掉 GradScaler 省一次 CUDA 同步
+            use_channels_last = True
+            sdpa_force_math = False  # A100 走 FlashAttention 后端
+            compile_disable_sparse = False  # A100 上 unfold 可被 inductor 编译
+            logger.info("[device] %s (sm_%d%d) | 启用 A100 路径: BF16 + FlashAttn + "
+                        "channels_last + 全量 compile", gpu_name, *compute_cap)
+        else:
+            # V100 等老卡：保守路径（与原行为一致）
+            amp_dtype = torch.float16
+            use_scaler = use_amp
+            use_channels_last = False
+            sdpa_force_math = True
+            compile_disable_sparse = True
+            logger.info("[device] %s (sm_%d%d) | 走保守路径: FP16 + 手写 math 注意力 + "
+                        "稀疏注意力禁用编译", gpu_name, *compute_cap)
+        # 把注意力后端/编译开关透传给 backbone 模块
+        from src.networks import backbone as _backbone
+        _backbone.set_sdpa_force_math(sdpa_force_math)
+        _backbone.set_compile_disable_sparse(compile_disable_sparse)
+    else:
+        from src.networks import backbone as _backbone
+        _backbone.set_sdpa_force_math(sdpa_force_math)
+        _backbone.set_compile_disable_sparse(compile_disable_sparse)
+
+    logger.info("启动训练 | torch=%s | device=%s | amp_dtype=%s scaler=%s channels_last=%s",
+                torch.__version__, device, amp_dtype, use_scaler, use_channels_last)
 
     dataset = load_from_path(args.data, args.board_size, args.max_games_per_tgz)
     n = len(dataset)
@@ -229,6 +279,12 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     logger.info("[model] 参数量=%.2fM | 设备=%s", n_params / 1e6, device)
 
+    # A100 上把卷积型特征（N,C,H,W）转 channels_last(NHWC)，卷积算子走更快内存布局。
+    # 输入 state 也需同步转格式（见训练/评估循环），故这里仅转换模型权重布局。
+    if use_channels_last and device == 'cuda':
+        model = model.to(memory_format=torch.channels_last)  # type: ignore[call-overload]
+        logger.info("[model] 已启用 channels_last (NHWC) 内存格式（A100 卷积加速）")
+
     # 将 window_chunk（分块大小）透传到所有 window 注意力层，控制显存峰值
     if args.window_chunk > 0:
         for _m in model.modules():
@@ -237,7 +293,9 @@ def main():
         logger.info("[model] window_chunk=%d（滑动窗口注意力分块大小）", args.window_chunk)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    # A100/BF16 下 use_scaler=False（BF16 不下溢，省去 loss scaling 的额外 CUDA 同步）；
+    # V100/FP16 下开启 GradScaler。
+    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
 
     # ---- 学习率调度：基于“总 step 数”而非 epoch 数 ----
     # 旧版用 T_max=args.epochs 导致余弦在第 1 个 epoch 结束就被砍到 ~0，
@@ -296,7 +354,7 @@ def main():
     if args.compile:
         if hasattr(torch, 'compile'):
             try:
-                model = torch.compile(model, dynamic=False)
+                model = torch.compile(model, dynamic=False, mode=args.compile_mode)
                 with torch.no_grad():
                     dummy = torch.zeros(1, 12, args.board_size, args.board_size,
                                         device=device)
@@ -319,7 +377,10 @@ def main():
             try:
                 sel = train_idx[i * bs:(i + 1) * bs]
                 state, move_t, value_t = dataset.sample_batch(sel, device)
-                with maybe_autocast(device):
+                # A100 上转 NHWC 以匹配模型 channels_last 布局，卷积更快
+                if use_channels_last:
+                    state = state.to(memory_format=torch.channels_last)
+                with maybe_autocast(device, amp_dtype):
                     policy_logits, value_pred = model(state)
                     policy_loss = F.cross_entropy(policy_logits.float(), move_t)
                     value_loss = F.mse_loss(value_pred.float().squeeze(), value_t.squeeze())
@@ -365,7 +426,7 @@ def main():
                             lr, scaler.get_scale(), mem, speed, time.time() - t0)
 
             if step % args.eval_every == 0 and len(eval_idx) > 0:
-                acc = evaluate(model, dataset, eval_idx, bs, device)
+                acc = evaluate(model, dataset, eval_idx, bs, device, amp_dtype, use_channels_last)
                 logger.info("[eval] step=%d train_loss=%.4f eval_top1=%.4f scale=%.0f elapsed=%.0fs",
                             step, epoch_loss / max(1, (i + 1)), acc,
                             scaler.get_scale(), time.time() - t0)
@@ -404,14 +465,16 @@ def main():
 
 
 @torch.no_grad()
-def evaluate(model, dataset, eval_idx, bs, device):
+def evaluate(model, dataset, eval_idx, bs, device, amp_dtype, use_channels_last):
     model.eval()
     correct = 0
     total = 0
     for i in range(0, len(eval_idx), bs):
         sel = eval_idx[i:i + bs]
         state, move_t, _ = dataset.sample_batch(sel, device)
-        with maybe_autocast(device):
+        if use_channels_last:
+            state = state.to(memory_format=torch.channels_last)
+        with maybe_autocast(device, amp_dtype):
             policy_logits, _ = model(state)
         pred = policy_logits.argmax(dim=-1)
         correct += int((pred.cpu() == move_t.cpu()).sum())
