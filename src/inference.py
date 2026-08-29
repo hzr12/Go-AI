@@ -39,12 +39,20 @@ class GoAI:
     def __init__(self, model_path=None, board_size=19, device="auto", use_amp=False,
                  backbone_channels=128, backbone_res_blocks=12, policy_channels=64, value_channels=32,
                  attention_mode="mix", num_attention_layers=4, num_heads=4, attention_dropout=0.0,
-                 attn_mode="global", attn_window=7, compile=False):
+                 attn_mode="global", attn_window=7, compile=False, tf32=False,
+                 channels_last=True):
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
         self.use_amp = use_amp and self.device.startswith("cuda")
         self.board_size = board_size
+        # 网络侧压：tf32 让 V100/Amp 上的 fp32 matmul 走 TensorFloat-32（约 2-4x 提速，
+        # 精度损失对推理可忽略）；channels_last 让 conv 走 NHWC 内存布局（conv 友好）。
+        self.tf32 = tf32 and self.device.startswith("cuda")
+        if self.tf32:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        self.channels_last = channels_last and self.device.startswith("cuda")
 
         self.model = AlphaGoNet(
             in_channels=12,
@@ -63,12 +71,16 @@ class GoAI:
         # torch.compile 融合算子（GPU 上约 20-40% 提速），不支持时回退 eager。
         # 注意：torch.compile 是惰性的，错误在首次前向才抛出，因此编译后用
         # dummy 输入做一次 warmup 以触发真实编译并捕获异常。
+        if self.channels_last:
+            self.model = self.model.to(memory_format=torch.channels_last)
         if compile and hasattr(torch, "compile"):
             try:
                 self.model = torch.compile(self.model, dynamic=False)
                 with torch.no_grad():
                     dummy = torch.zeros(1, 12, self.board_size, self.board_size,
                                         device=self.device)
+                    if self.channels_last:
+                        dummy = dummy.to(memory_format=torch.channels_last)
                     self.model(dummy)
                 print("[GoAI] 已启用 torch.compile 算子融合")
             except Exception as e:  # noqa: BLE001
@@ -84,6 +96,10 @@ class GoAI:
                     value_channels=value_channels,
                     action_size=board_size * board_size + 1,
                 ).to(self.device)
+                if self.channels_last:
+                    self.model = self.model.to(memory_format=torch.channels_last)
+        if self.tf32:
+            print("[GoAI] 已启用 TF32 矩阵乘法加速 (CUDA)")
         self.model.eval()
 
         if model_path and os.path.exists(model_path):
@@ -99,10 +115,17 @@ class GoAI:
     # ------------------------------------------------------------------ #
     # 特征构造
     # ------------------------------------------------------------------ #
-    def _build_state(self, board, my_hist, op_hist, to_play):
-        """用统一的 feature_planes 构造 12 通道状态张量。"""
-        planes = board.feature_planes(my_hist, op_hist, to_play=to_play)
-        x = torch.from_numpy(planes).unsqueeze(0).to(self.device).float()
+    def _build_state(self, board, my_hist, op_hist, to_play, planes=None):
+        """用统一的 feature_planes 构造 12 通道状态张量。
+
+        planes: 可选，预先算好的 12 通道 np.ndarray (12,H,W)。传入可避免重复
+        feature_planes 计算（MCTS 增量特征场景）。
+        """
+        if planes is None:
+            planes = board.feature_planes(my_hist, op_hist, to_play=to_play)
+        x = torch.from_numpy(np.ascontiguousarray(planes)).unsqueeze(0).to(self.device).float()
+        if self.channels_last:
+            x = x.to(memory_format=torch.channels_last)
         return x
 
     # ------------------------------------------------------------------ #
@@ -122,15 +145,27 @@ class GoAI:
         """批量前向，MCTS 叶子评估的核心加速点。
 
         Args:
-            states: list[(board, my_hist, op_hist, to_play)]，长度 B
+            states: list[(board, my_hist, op_hist, to_play)] 或
+                    list[(None, my_hist, op_hist, to_play, planes)]（带预计算特征）
+                    长度 B
         Returns:
             policies: np.ndarray (B, bs*bs+1) 已 softmax
             values : np.ndarray (B,) 当前 to_play 视角 [-1,1]
         """
         if not states:
             return np.zeros((0, self.board_size * self.board_size + 1)), np.zeros(0)
-        xs = [self._build_state(b, mh, oh, tp) for (b, mh, oh, tp) in states]
+        xs = []
+        for st in states:
+            if len(st) == 5:
+                # 增量特征：第 5 项为预计算 12 通道 planes
+                b, mh, oh, tp, planes = st
+                xs.append(self._build_state(b, mh, oh, tp, planes=planes))
+            else:
+                b, mh, oh, tp = st
+                xs.append(self._build_state(b, mh, oh, tp))
         x = torch.cat(xs, dim=0)  # (B,12,H,W)
+        if self.channels_last:
+            x = x.to(memory_format=torch.channels_last)
         policies, values = self._forward_batch(x)
         return policies, values.squeeze(-1).cpu().numpy().astype(np.float32)
 
@@ -187,12 +222,17 @@ class GoAI:
         return move_int, is_pass, value
 
     def choose_move_mcts(self, board, my_hist, op_hist, to_play, legal_mask,
-                         simulations=400, temperature=1.0, mcts=None, num_threads=4):
-        """用 MCTS 搜索选着法（推理提速核心）。返回 (move_int, is_pass, value)。"""
+                         simulations=400, temperature=1.0, mcts=None, num_threads=4,
+                         use_rollout=False, rollout_lambda=0.25):
+        """用 MCTS 搜索选着法（推理提速核心）。返回 (move_int, is_pass, value)。
+
+        use_rollout / rollout_lambda 启用 LightPLS：叶子价值融合轻量 rollout。
+        """
         from src.search.mcts import MCTS
         if mcts is None:
             mcts = MCTS(self, board_size=self.board_size, num_threads=num_threads,
-                        temperature=temperature)
+                        temperature=temperature, use_rollout=use_rollout,
+                        rollout_lambda=rollout_lambda)
         move_int, is_pass, value = mcts.best_move(
             board, my_hist, op_hist, to_play, simulations=simulations,
             temperature=temperature, return_value=True)
@@ -213,14 +253,17 @@ class GoAI:
         return (r, c)
 
     def self_play(self, num_games=1, max_moves=400, temperature=1.0, topk=10,
-                   verbose=False, use_mcts=False, simulations=400, num_threads=4):
+                   verbose=False, use_mcts=False, simulations=400, num_threads=4,
+                   use_rollout=False, rollout_lambda=0.25):
         """模型自我对弈 num_games 局，返回每局结果（黑方视角 +1/-1）。
 
         use_mcts=True 时每步用 MCTS 搜索选点（棋力显著强于纯策略 argmax）。
+        use_rollout=True 时叶子价值融合轻量 rollout（LightPLS）。
         """
         from src.search.mcts import MCTS
         mcts = MCTS(self, board_size=self.board_size, num_threads=num_threads,
-                    temperature=temperature) if use_mcts else None
+                    temperature=temperature, use_rollout=use_rollout,
+                    rollout_lambda=rollout_lambda) if use_mcts else None
         results = []
         for g in range(num_games):
             board = GoBoard(self.board_size)
@@ -239,7 +282,8 @@ class GoAI:
                     move_int, is_pass, value = self.choose_move_mcts(
                         board, my_hist[0], my_hist[1], to_play, legal,
                         simulations=simulations, temperature=temperature, mcts=mcts,
-                        num_threads=num_threads)
+                        num_threads=num_threads, use_rollout=use_rollout,
+                        rollout_lambda=rollout_lambda)
                 else:
                     move_int, is_pass, value = self.choose_move(
                         board, my_hist[0], my_hist[1], to_play, legal,
@@ -269,11 +313,13 @@ class GoAI:
         return results
 
     def play_against_human(self, human_color=1, max_moves=400, temperature=0.6,
-                           use_mcts=False, simulations=400, num_threads=4):
+                           use_mcts=False, simulations=400, num_threads=4,
+                           use_rollout=False, rollout_lambda=0.25):
         """人机对弈，人类通过终端输入坐标（如 'ce' 或 'pass'）。"""
         from src.search.mcts import MCTS
         mcts = MCTS(self, board_size=self.board_size, num_threads=num_threads,
-                    temperature=temperature) if use_mcts else None
+                    temperature=temperature, use_rollout=use_rollout,
+                    rollout_lambda=rollout_lambda) if use_mcts else None
         board = GoBoard(self.board_size)
         my_hist = [[-1, -1, -3], [-1, -1, -3]]
         passes = 0
@@ -308,7 +354,8 @@ class GoAI:
                         move_int, is_pass, value = self.choose_move_mcts(
                             board, my_hist[0], my_hist[1], to_play, legal,
                             simulations=simulations, temperature=temperature, mcts=mcts,
-                            num_threads=num_threads)
+                            num_threads=num_threads, use_rollout=use_rollout,
+                            rollout_lambda=rollout_lambda)
                     else:
                         move_int, is_pass, value = self.choose_move(
                             board, my_hist[0], my_hist[1], to_play, legal,
@@ -395,12 +442,18 @@ def main():
                         help="注意力计算模式: global=全配对, window=滑动窗口, axial=轴向")
     parser.add_argument("--attn-window", type=int, default=7, help="window 模式窗口边长")
     parser.add_argument("--compile", action="store_true", help="用 torch.compile 融合算子（GPU 提速）")
+    parser.add_argument("--tf32", action="store_true",
+                        help="CUDA tf32 matmul（V100/Amp 上约 2-4x fp32 提速，精度损失可忽略）")
     parser.add_argument("--use-mcts", action="store_true",
                         help="用 MCTS 搜索选点（棋力显著强于纯策略 argmax）")
     parser.add_argument("--simulations", type=int, default=400,
                         help="MCTS 每步模拟次数（V100S 上 400~800 仅 1-2s/步）")
     parser.add_argument("--num-threads", type=int, default=4,
                         help="MCTS 并行模拟线程数（虚拟损失）")
+    parser.add_argument("--use-rollout", action="store_true",
+                        help="LightPLS：叶子价值融合轻量 rollout（Tromp-Taylor 快数子）")
+    parser.add_argument("--rollout-lambda", type=float, default=0.25,
+                        help="LightPLS rollout 价值权重 (0=只用网络, 1=只用 rollout)")
     args = parser.parse_args()
 
     ai = GoAI(model_path=args.model, board_size=args.board_size,
@@ -411,18 +464,24 @@ def main():
               attention_dropout=args.attention_dropout,
               attn_mode=args.attn_mode,
               attn_window=args.attn_window,
-              compile=args.compile)
+              compile=args.compile, tf32=args.tf32)
     if args.mode == "selfplay":
         res = ai.self_play(num_games=args.games, temperature=args.temperature, topk=args.topk,
                            use_mcts=args.use_mcts, simulations=args.simulations,
-                           num_threads=args.num_threads)
+                           num_threads=args.num_threads,
+                           use_rollout=args.use_rollout, rollout_lambda=args.rollout_lambda)
         wr = sum(1 for r in res if r > 0) / max(len(res), 1)
+        tag = " (MCTS"
+        if args.use_rollout:
+            tag += "+LightPLS"
+        tag += ")"
         print(f"自对弈 {len(res)} 局，黑方胜率 {wr:.2%}"
-              f"{' (MCTS)' if args.use_mcts else ''}")
+              f"{tag if args.use_mcts else ''}")
     elif args.mode == "human":
         ai.play_against_human(human_color=args.human_color, temperature=args.temperature,
                               use_mcts=args.use_mcts, simulations=args.simulations,
-                              num_threads=args.num_threads)
+                              num_threads=args.num_threads,
+                              use_rollout=args.use_rollout, rollout_lambda=args.rollout_lambda)
     elif args.mode == "analyze":
         ai.analyze(temperature=args.temperature)
 

@@ -179,19 +179,29 @@ python src/inference.py --model models/sft_9x9.pth --board-size 9 \
 
 # 19 路 V100S 全加速组合（推荐）
 python src/inference.py --model models/sft_19x19.pth --board-size 19 \
-    --device cuda --use-amp --compile \
+    --device cuda --use-amp --compile --tf32 \
     --attention-mode mix --attn-mode window --attn-window 7 \
     --mode selfplay --use-mcts --simulations 400 --num-threads 4
+
+# 开启 LightPLS：叶子价值融合轻量 rollout（低价提升搜索深度/棋力）
+python src/inference.py --model models/sft_9x9.pth --board-size 9 \
+    --mode selfplay --use-mcts --simulations 400 --num-threads 4 \
+    --use-rollout --rollout-lambda 0.25
 ```
 
 ### 加速手段（已全部落地）
 | 加速项 | 状态 | 说明 |
 |--------|------|------|
 | 批量叶子评估 | ✅ | `GoAI.predict_batch` 把同一层节点拼 batch 一次前向（GPU 上吞吐 ×10+）|
-| 虚拟损失 + 多线程 | ✅ | `MCTS.num_threads` 并行展开不同分支，利用多核 |
+| **跨线程合并 batch（生产者-消费者）** | ✅ | worker 线程只选路径（廉价），主线程统一 `deepcopy`+`feature_planes`+`predict_batch`，每个叶子只算一次特征 |
+| 增量特征 | ✅ | `predict_batch` 接受预计算 12 通道 planes，省去重复 `feature_planes` 计算 |
+| TF32 matmul | ✅ | `--tf32`，V100/Amp 上 fp32 矩阵乘约 2–4×，精度损失可忽略 |
+| `channels_last` 内存布局 | ✅ | CUDA 上 conv 走 NHWC，conv 友好提速 |
+| 虚拟损失 + 多线程 | ✅ | `MCTS.num_threads` 并行选路径，利用多核 |
 | `torch.compile` 算子融合 | ✅ | `--compile`，GPU 上约 20–40% |
 | `--use-amp` 混合精度 | ✅ | V100 走 fp16（Volta 无 bf16）|
 | `window` / `axial` 注意力 | ✅ | `--attn-mode window` 在 GPU 上约 7× 注意力提速 |
+| **LightPLS 轻量 rollout** | ✅ | `--use-rollout --rollout-lambda`：叶子价值融合 Tromp-Taylor 快数子，低价提升棋力 |
 
 ### 速度预期（V100S 16GB）
 - 单次前向 ~1–2 ms；批量前向（一层 64 叶）~5–10 ms

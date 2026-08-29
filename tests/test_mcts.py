@@ -69,8 +69,35 @@ def test_mcts_prefers_capture_over_random():
     assert move_int in legal or move_int == 9 * 9
 
 
+def test_light_rollout_runs():
+    """LightPLS 轻量 rollout 应当能在终局返回 [-1,1] 的 Tromp-Taylor 胜率。"""
+    from src.search.light_rollout import FastPolicy, light_rollout
+    board = GoBoard(9)
+    hist = [[-1, -1, -3], [-1, -1, -3]]
+    policy = FastPolicy(9)
+    rng = np.random.default_rng(0)
+    # 跑几局随机推演，结果都应在 [-1,1]
+    for _ in range(3):
+        v = light_rollout(board, policy, max_steps=60, rng=rng)
+        assert -1.0 <= v <= 1.0
+
+
+def test_mcts_with_rollout_runs():
+    """启用 LightPLS (use_rollout) 的 MCTS 应当正常返回合法着法。"""
+    ai = _make_ai(9)
+    board = GoBoard(9)
+    hist = [[-1, -1, -3], [-1, -1, -3]]
+    mcts = MCTS(ai, board_size=9, num_threads=2, temperature=0.0,
+                use_rollout=True, rollout_lambda=0.25)
+    move_int, is_pass, value = mcts.best_move(
+        board, hist[0], hist[1], to_play=1, simulations=30, return_value=True)
+    assert isinstance(move_int, int)
+    assert 0 <= move_int <= 9 * 9
+
+
 if __name__ == "__main__":
     for fn in [test_predict_batch_shape, test_mcts_runs_and_returns_valid_move,
-               test_mcts_visits_sum_positive, test_mcts_prefers_capture_over_random]:
+               test_mcts_visits_sum_positive, test_mcts_prefers_capture_over_random,
+               test_light_rollout_runs, test_mcts_with_rollout_runs]:
         fn()
         print(f"PASS {fn.__name__}")
