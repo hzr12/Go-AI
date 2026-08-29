@@ -160,6 +160,9 @@ def main():
                     help='每隔多少 step 打印一次训练日志（loss/lr/吞吐/显存）')
     ap.add_argument('--log-file', default='training.log',
                     help='训练日志文件路径（同时输出到控制台），设为空字符串可关闭文件日志')
+    ap.add_argument('--resume', default='',
+                    help='断点续训：指定已保存的 .pth 模型路径，会从该权重 + 同目录 '
+                         '.train_state.pt 恢复 optimizer/scheduler/step 计数继续训练')
     ap.add_argument('--compile', action='store_true',
                     help='用 torch.compile 融合算子（GPU 上约 20-40%% 提速，首次迭代较慢）')
     args = ap.parse_args()
@@ -252,16 +255,53 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs))
+
+    # ---- 学习率调度：基于“总 step 数”而非 epoch 数 ----
+    # 旧版用 T_max=args.epochs 导致余弦在第 1 个 epoch 结束就被砍到 ~0，
+    # 后续 epoch 在 lr≈0 附近横盘。这里用真实总 step 数，并加前 5% step 线性 warmup。
+    n_batches = (n_train + args.batch_size - 1) // args.batch_size
+    total_steps = max(1, args.epochs * n_batches)
+    warmup_steps = max(1, int(total_steps * 0.05))
+    after_warmup = max(1, total_steps - warmup_steps)
+    warmup_sched = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
+    cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=after_warmup)
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_steps])
 
     bs = args.batch_size
     step = 0
     best_eval_acc = -1.0
+    start_epoch = 0
     t0 = time.time()
-    logger.info("[train] 开始训练 | steps/epoch=%d | 总 steps≈%d",
-                (n_train + bs - 1) // bs, args.epochs * (n_train + bs - 1) // bs)
 
-    for epoch in range(args.epochs):
+    # ---- 断点续训：从 --resume 指定的模型权重 + 同目录 .train_state.pt 恢复 ----
+    if args.resume:
+        if not os.path.isfile(args.resume):
+            raise FileNotFoundError(f"--resume 指定的模型不存在: {args.resume}")
+        state_path = args.resume + '.train_state'
+        logger.info("[resume] 加载模型权重: %s", args.resume)
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt)
+        if os.path.isfile(state_path):
+            tstate = torch.load(state_path, map_location=device)
+            optimizer.load_state_dict(tstate['optimizer'])
+            scheduler.load_state_dict(tstate['scheduler'])
+            scaler.load_state_dict(tstate['scaler'])
+            step = tstate.get('step', 0)
+            best_eval_acc = tstate.get('best_eval_acc', -1.0)
+            start_epoch = tstate.get('epoch', 0)
+            if 'rng' in tstate:
+                torch.set_rng_state(tstate['rng'].cpu())
+            logger.info("[resume] 恢复训练状态 | step=%d best_eval_acc=%.4f epoch=%d",
+                        step, best_eval_acc, start_epoch)
+        else:
+            logger.warning("[resume] 未找到 %s（仅恢复模型权重，optimizer/scheduler 从头开始）",
+                           state_path)
+    logger.info("[train] 开始训练 | steps/epoch=%d | 总 steps≈%d | warmup=%d",
+                n_batches, total_steps, warmup_steps)
+
+    for epoch in range(start_epoch, args.epochs):
         rng.shuffle(train_idx)
         model.train()
         epoch_loss = 0.0
@@ -281,13 +321,27 @@ def main():
                 scaler.update()
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
+                # 保存当前进度，便于减小 batch 后用 --resume 续训
+                torch.save(model.state_dict(), args.out + '.latest')
+                torch.save({
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                    'scaler': scaler.state_dict(),
+                    'step': step,
+                    'epoch': epoch,
+                    'best_eval_acc': best_eval_acc,
+                    'rng': torch.get_rng_state(),
+                }, args.out + '.latest.train_state')
                 logger.error("=" * 60)
                 logger.error("CUDA 显存不足 (OOM)！当前 --batch-size=%d 过大。", bs)
                 logger.error("window 注意力在 19x19 上把 batch 展开为 B*361，显存增长很快。")
                 logger.error("建议减小 --batch-size（如 128/96/64），或调小 --attn-window。")
+                logger.error("已保存进度至 %s.latest(.train_state)，可用 --resume 续训。",
+                             args.out)
                 logger.error("已清理显存并退出，请调整参数后重跑。")
                 logger.error("=" * 60)
                 sys.exit(1)
+            scheduler.step()   # 每个 step 推进一步（warmup+cosine 调度依赖逐 step）
             step += 1
             epoch_loss += loss.item()
 
@@ -297,7 +351,7 @@ def main():
                 speed = step * bs / max(1e-6, time.time() - t0)
                 logger.info("[step %d/%d] loss=%.4f (p=%.4f v=%.4f) lr=%.2e "
                             "scale=%.0f mem=%.2fGB spd=%.0f s/s elapsed=%.0fs",
-                            step, args.epochs * n_batches,
+                            step, total_steps,
                             loss.item(), policy_loss.item(), value_loss.item(),
                             lr, scaler.get_scale(), mem, speed, time.time() - t0)
 
@@ -311,13 +365,31 @@ def main():
                     torch.save(model.state_dict(), args.out)
                     logger.info("  -> 保存最佳模型至 %s", args.out)
             if step % args.save_every == 0:
+                # 同时保存完整训练状态，供 --resume 断点续训
                 torch.save(model.state_dict(), args.out + '.latest')
-        scheduler.step()
+                torch.save({
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                    'scaler': scaler.state_dict(),
+                    'step': step,
+                    'epoch': epoch,
+                    'best_eval_acc': best_eval_acc,
+                    'rng': torch.get_rng_state(),
+                }, args.out + '.latest.train_state')
         logger.info("epoch %d/%d done, loss=%.4f", epoch + 1, args.epochs,
                     epoch_loss / max(1, n_batches))
 
-    # 最终保存
+    # 最终保存（含训练状态，供 --resume 续训）
     torch.save(model.state_dict(), args.out)
+    torch.save({
+        'optimizer': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict(),
+        'scaler': scaler.state_dict(),
+        'step': step,
+        'epoch': args.epochs,
+        'best_eval_acc': best_eval_acc,
+        'rng': torch.get_rng_state(),
+    }, args.out + '.train_state')
     logger.info("训练完成。最佳 eval_top1=%.4f，模型已保存至 %s", best_eval_acc, args.out)
     logger.info("总耗时 %.0fs", time.time() - t0)
 
