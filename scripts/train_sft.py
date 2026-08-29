@@ -348,8 +348,11 @@ def main():
     #   - use_channels_last: A100 卷积走 NHWC 更快；NPU/CPU 收益有限默认关
     #   - sdpa_force_math: NPU 上 FlashAttention 后端不稳（CANN SDPA 与 CUDA 不同），
     #                     强制走手写 math 注意力最稳；V100 同样强制 math；A100 走 Flash
-    #   - compile_disable_sparse: V100 inductor 对 unfold 触发 PolynomialError 需禁用；
-    #                      A100 可编译；NPU 上 torch.compile(inductor) 不可用，直接整体禁用
+    #   - compile_disable_sparse: 所有后端统一禁用——unfold 产生 (B, Hh*d, N, ws²) 巨型
+    #                      中间张量，inductor freezing 常量折叠会以 fp32 物化
+    #                      (B,N,Hh,ws²,d)（batch512 下单个 4.3GB）直接编译期 OOM；
+    #                      稀疏/窗口注意力走 eager+autocast（V100 验证过的稳定路径），
+    #                      编译图仅覆盖卷积/线性/FFN。NPU 上 inductor 本身不可用
     amp_dtype = torch.float16
     use_scaler = use_amp
     use_channels_last = False
@@ -377,9 +380,11 @@ def main():
             use_scaler = False  # BF16 几乎不下溢，去掉 GradScaler 省一次 CUDA 同步
             use_channels_last = True
             sdpa_force_math = False  # A100 走 FlashAttention 后端
-            compile_disable_sparse = False  # A100 上 unfold 可被 inductor 编译
+            # unfold 巨型中间张量会触发 inductor freezing 以 fp32 物化 (B,N,Hh,ws²,d)
+            # 导致编译期 OOM（batch512 下单个 4.3GB），必须排除出编译图
+            compile_disable_sparse = True
             logger.info("[device] %s (sm_%d%d) | 启用 A100 路径: BF16 + FlashAttn + "
-                        "channels_last + 全量 compile", gpu_name, *compute_cap)
+                        "channels_last + compile(卷积/线性/FFN)", gpu_name, *compute_cap)
         else:
             # V100 等老卡：保守路径（与原行为一致）
             amp_dtype = torch.float16
