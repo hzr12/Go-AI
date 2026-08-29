@@ -29,6 +29,13 @@ def _sdpa(q, k, v, dropout_p=0.0):
     """
     if hasattr(F, "scaled_dot_product_attention"):
         # q 已在调用处预乘 scale，这里不再缩放
+        if q.shape[-2] != k.shape[-2]:
+            # FlashAttention 后端要求 Q/K/V 序列长度一致；不一致时（理论不该发生）
+            # 强制走 memory-efficient / math 后端，避免 "invalid configuration argument"。
+            with torch.backends.cuda.sdp_kernel(
+                enable_flash=False, enable_mem_efficient=True, enable_math=True
+            ):
+                return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
         return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
     # 老版本 torch 回退：手写注意力（q 已预乘 scale）
     attn = (q @ k.transpose(-2, -1))
@@ -102,12 +109,13 @@ class MultiHeadSelfAttention(nn.Module):
         ku = ku.view(B, Hh, d, N, ws * ws).permute(0, 3, 1, 4, 2).reshape(B * N, Hh, ws * ws, d)
         vu = vu.view(B, Hh, d, N, ws * ws).permute(0, 3, 1, 4, 2).reshape(B * N, Hh, ws * ws, d)
 
-        # 中心位置 query: 每个窗口第 (ws*ws)//2 个（即中心），(B*N, Hh, 1, d)
+        # 注意：query/key/value 序列长度必须一致（均为 ws*ws），否则 FlashAttention
+        # 在 N_q=1 这种极小 query 长度上会报 "invalid configuration argument"。
+        # 因此用整个窗口做 SDPA（每个位置对窗口内所有 token 算注意力），再取中心输出，
+        # 语义等价于「中心位置看窗口邻居」，且 N_q == N_kv 让后端合法。
+        out = _sdpa(qu, ku, vu, dropout_p=self.attn_drop)  # (B*N, Hh, ws*ws, d)
         center = (ws * ws) // 2
-        qc = qu[:, :, center:center + 1, :]  # (B*N, Hh, 1, d)
-
-        # FlashAttention 路径的局部注意力
-        out = _sdpa(qc, ku, vu, dropout_p=self.attn_drop)  # (B*N, Hh, 1, d)
+        out = out[:, :, center:center + 1, :]  # (B*N, Hh, 1, d)
         out = out.reshape(B, N, Hh, d).reshape(B, N, Hh * d)
         return out
 
