@@ -17,7 +17,7 @@ src/
     sgf_parser.py       SGF 棋谱解析（含让子 AB/AW、贴目 KM、虚着 []）
     dataset.py          监督学习数据集（紧凑 npz + 随机对称增广）
   networks/
-    backbone.py         共享残差骨干（ResBlock × N）
+    backbone.py         共享骨干（卷积残差 + 可选多头自注意力混合）
     policy_network.py   策略头（1×1 卷积 + 全局平均池化 + 线性）
     value_network.py    价值头（Tanh 输出 [-1,1]）
     alphanet.py         AlphaGoNet：串联上述三者的总模型
@@ -80,7 +80,23 @@ python scripts/train_sft.py --device cpu --board-size 9 --batch-size 128 --epoch
 python scripts/train_sft.py --device cuda --use-amp \
     --board-size 19 --batch-size 512 --epochs 5 \
     --data data/sgf_19x19.npz --save-path models/sft_19x19.pth
+
+# 注意力配置（默认 mix 模式：卷积打底 + 注意力提质）
+#   --attention-mode {none,mix,all}   无注意力 / 混合 / 全注意力
+#   --num-attention-layers N          mix 模式下注意力块数量
+#   --num-heads H                     多头注意力头数
+python scripts/train_sft.py --device cuda --board-size 19 \
+    --attention-mode mix --num-attention-layers 6 --num-heads 8 \
+    --data data/sgf_19x19.npz --save-path models/sft_attn_19x19.pth
 ```
+
+主干注意力：把棋盘 `(B, C, H, W)` 视为 `N=H*W` 个 token 做多头自注意力
+（pre-LayerNorm + FFN），捕捉长程依赖（大龙死活、全局厚薄）；卷积残差块
+负责局部形状。三种模式由 `--attention-mode` 控制：
+- `none`：纯卷积（最快，局部性最好）
+- `mix`（默认）：在 `num_res_blocks` 个块中均匀穿插 `num_attention_layers`
+  个注意力混合块
+- `all`：全部使用「卷积残差 + 注意力」混合块
 
 损失：`L = CrossEntropy(policy, move) + MSELoss(value, z)`，其中 `z ∈ {+1,-1}`
 来自棋谱 `RE` 结果（当前执子方视角）。虚着作为最后一类的专用类别
