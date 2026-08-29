@@ -22,6 +22,13 @@ class ResBlock(nn.Module):
         return out
 
 
+# flash-attn 内核的 batch 维参与 CUDA grid 坐标，受 grid y/z 维上限 65535 约束。
+# window/sparse 注意力把 batch 展开为 B*G（如 512*128=65536，恰好超限 1），会报
+# "CUDA error: invalid configuration argument"。取保守阈值 32768：超过则强制回退
+# 手写 math——这些分块调用的 seq 仅 ~50（49 窗口 + 全局 token），math 成本可忽略。
+_FLASH_BATCH_LIMIT = 32768
+
+
 def _sdpa(q, k, v, dropout_p=0.0, use_math=False):
     """注意力计算。
 
@@ -45,6 +52,10 @@ def _sdpa(q, k, v, dropout_p=0.0, use_math=False):
     """
     # 模块级覆盖：训练脚本按 GPU 能力设置（A100 走 Flash，V100 走 math）
     if _sdpa_force_math:
+        use_math = True
+    # batch 超过 flash 内核 grid 上限时强制 math（内置 SDPA 的 flash/mem-efficient
+    # 后端对同配置有相同限制，一并排除）。典型触发：window/sparse 的 B*G=65536。
+    if q.shape[0] > _FLASH_BATCH_LIMIT:
         use_math = True
     if not use_math and _flash_attn_func is not None:
         # flash-attn 只接受 fp16/bf16。正常由 autocast 保证 bf16；若上游发生 dtype
