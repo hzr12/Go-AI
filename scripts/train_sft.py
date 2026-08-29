@@ -66,6 +66,8 @@ def main():
                     help='注意力计算模式: global=全配对, window=滑动窗口, axial=轴向')
     ap.add_argument('--attn-window', type=int, default=7, help='window 模式窗口边长')
     ap.add_argument('--eval-every', type=int, default=5000)
+    ap.add_argument('--compile', action='store_true',
+                    help='用 torch.compile 融合算子（GPU 上约 20-40%% 提速，首次迭代较慢）')
     args = ap.parse_args()
 
     if args.device == 'auto':
@@ -100,6 +102,32 @@ def main():
         attn_window=args.attn_window,
         action_size=args.board_size * args.board_size + 1,  # +1 为 pass 类别
     ).to(device)
+
+    # torch.compile 融合算子（GPU 上约 20-40% 提速）。首迭代有编译开销，
+    # 不支持或失败时自动回退到 eager 模式。
+    if args.compile:
+        if hasattr(torch, 'compile'):
+            try:
+                model = torch.compile(model, dynamic=False)
+                # torch.compile 惰性，错误在首次前向才暴露；用 dummy 输入
+                # 触发真实编译并捕获异常（如 CPU 缺 MSVC cl 编译器）。
+                with torch.no_grad():
+                    dummy = torch.zeros(1, 12, args.board_size, args.board_size,
+                                        device=device)
+                    model(dummy)
+                print("[train] 已启用 torch.compile 算子融合")
+            except Exception as e:  # noqa: BLE001
+                print(f"[train] torch.compile 不可用，回退 eager: {e}")
+                model = AlphaGoNet(
+                    in_channels=12, backbone_channels=128,
+                    backbone_res_blocks=12, attention_mode=args.attention_mode,
+                    num_attention_layers=args.num_attention_layers,
+                    num_heads=args.num_heads, attention_dropout=args.attention_dropout,
+                    attn_mode=args.attn_mode, attn_window=args.attn_window,
+                    action_size=args.board_size * args.board_size + 1,
+                ).to(device)
+        else:
+            print("[train] 当前 torch 版本不支持 torch.compile，跳过")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)

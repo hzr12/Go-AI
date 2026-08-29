@@ -39,7 +39,7 @@ class GoAI:
     def __init__(self, model_path=None, board_size=19, device="auto", use_amp=False,
                  backbone_channels=128, backbone_res_blocks=12, policy_channels=64, value_channels=32,
                  attention_mode="mix", num_attention_layers=4, num_heads=4, attention_dropout=0.0,
-                 attn_mode="global", attn_window=7):
+                 attn_mode="global", attn_window=7, compile=False):
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
@@ -60,6 +60,30 @@ class GoAI:
             value_channels=value_channels,
             action_size=board_size * board_size + 1,  # +1 = 虚着
         ).to(self.device)
+        # torch.compile 融合算子（GPU 上约 20-40% 提速），不支持时回退 eager。
+        # 注意：torch.compile 是惰性的，错误在首次前向才抛出，因此编译后用
+        # dummy 输入做一次 warmup 以触发真实编译并捕获异常。
+        if compile and hasattr(torch, "compile"):
+            try:
+                self.model = torch.compile(self.model, dynamic=False)
+                with torch.no_grad():
+                    dummy = torch.zeros(1, 12, self.board_size, self.board_size,
+                                        device=self.device)
+                    self.model(dummy)
+                print("[GoAI] 已启用 torch.compile 算子融合")
+            except Exception as e:  # noqa: BLE001
+                print(f"[GoAI] torch.compile 不可用，回退 eager: {e}")
+                # 重建未编译模型（前述 compile 包装可能已部分生效）
+                self.model = AlphaGoNet(
+                    in_channels=12, backbone_channels=backbone_channels,
+                    backbone_res_blocks=backbone_res_blocks,
+                    attention_mode=attention_mode,
+                    num_attention_layers=num_attention_layers, num_heads=num_heads,
+                    attention_dropout=attention_dropout, attn_mode=attn_mode,
+                    attn_window=attn_window, policy_channels=policy_channels,
+                    value_channels=value_channels,
+                    action_size=board_size * board_size + 1,
+                ).to(self.device)
         self.model.eval()
 
         if model_path and os.path.exists(model_path):
@@ -311,6 +335,7 @@ def main():
                         choices=["global", "window", "axial"],
                         help="注意力计算模式: global=全配对, window=滑动窗口, axial=轴向")
     parser.add_argument("--attn-window", type=int, default=7, help="window 模式窗口边长")
+    parser.add_argument("--compile", action="store_true", help="用 torch.compile 融合算子（GPU 提速）")
     args = parser.parse_args()
 
     ai = GoAI(model_path=args.model, board_size=args.board_size,
@@ -320,7 +345,8 @@ def main():
               num_heads=args.num_heads,
               attention_dropout=args.attention_dropout,
               attn_mode=args.attn_mode,
-              attn_window=args.attn_window)
+              attn_window=args.attn_window,
+              compile=args.compile)
     if args.mode == "selfplay":
         res = ai.self_play(num_games=args.games, temperature=args.temperature, topk=args.topk)
         wr = sum(1 for r in res if r > 0) / max(len(res), 1)
