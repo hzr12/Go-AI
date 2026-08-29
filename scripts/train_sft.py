@@ -21,6 +21,96 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+
+# ---- NPU(Ascend/CANN) 后端兼容辅助 ----
+# torch_npu 是可选依赖，未安装时不应让静态分析/运行时报错。所有 NPU 访问都经
+# 过这里统一守卫；未安装 torch_npu 的环境（纯 CUDA 开发机）这些函数返回安全默认值。
+def npu_is_available() -> bool:
+    if not hasattr(torch, 'npu'):
+        return False
+    try:
+        return bool(torch.npu.is_available())
+    except Exception:
+        return False
+
+
+def npu_get_device_name(idx: int = 0) -> str:
+    try:
+        return str(torch.npu.get_device_name(idx))
+    except Exception:
+        return 'Ascend-NPU'
+
+
+def npu_memory_reserved(device) -> float:
+    try:
+        return float(torch.npu.memory_reserved(device))
+    except Exception:
+        return 0.0
+
+
+def npu_empty_cache() -> None:
+    try:
+        torch.npu.empty_cache()
+    except Exception:
+        pass
+
+
+def npu_grad_scaler(enabled: bool):
+    return torch.npu.amp.GradScaler(enabled=enabled)
+
+
+def npu_out_of_memory_error_type():
+    return getattr(torch.npu, 'OutOfMemoryError', None)
+
+
+def _auto_select_device():
+    """自动选择最优训练设备。
+
+    策略（按优先级）：
+      1. 探测 CUDA 与 NPU 各卡的空闲显存，挑空闲显存最大的那张卡。
+      2. 若两后端都可用，选「空闲显存更大」的后端（A100 通常 > 910B，但按实测）。
+      3. 都不可用则回退 CPU。
+    返回形如 'cuda:0' / 'npu:1' / 'cpu' 的具体设备串。
+    """
+    def _cuda_free(idx):
+        try:
+            torch.cuda.synchronize(idx)
+            total = torch.cuda.get_device_properties(idx).total_memory
+            alloc = torch.cuda.memory_allocated(idx)
+            return max(0, total - alloc)
+        except Exception:
+            return 0
+
+    def _npu_free(idx):
+        try:
+            total = torch.npu.get_device_properties(idx).total_memory
+            alloc = torch.npu.memory_allocated(idx)
+            return max(0, total - alloc)
+        except Exception:
+            return 0
+
+    best = None  # (free_bytes, backend, idx)
+    if torch.cuda.is_available():
+        n = torch.cuda.device_count()
+        for i in range(n):
+            free = _cuda_free(i)
+            if best is None or free > best[0]:
+                best = (free, 'cuda', i)
+    if npu_is_available():
+        try:
+            n = torch.npu.device_count()
+        except Exception:
+            n = 0
+        for i in range(n):
+            free = _npu_free(i)
+            if best is None or free > best[0]:
+                best = (free, 'npu', i)
+    if best is None:
+        return 'cpu'
+    _, backend, idx = best
+    return f'{backend}:{idx}'
+
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.networks.alphanet import AlphaGoNet
 from src.data.dataset import SupervisedDataset
@@ -58,14 +148,17 @@ def setup_logging(log_file, level: int = logging.INFO) -> logging.Logger:
 
 
 def maybe_autocast(device, dtype=torch.float16):
-    """仅在 CUDA 上开启 autocast，dtype 由 GPU 能力决定（A100=bf16, V100=fp16）。
-    CPU 或 amp 关闭时返回 nullcontext。"""
-    if device == 'cuda':
+    """在 CUDA/NPU 上开启 autocast，dtype 由设备能力决定（A100/BF16、V100/FP16、NPU/BF16）。
+    CPU 或 amp 关闭时返回 nullcontext。device 字符串 'cuda'/'npu' 直接传给 torch.amp.autocast。"""
+    if device in ('cuda', 'npu'):
         if hasattr(torch, 'amp') and hasattr(torch.amp, 'autocast'):
             try:
-                return torch.amp.autocast('cuda', dtype=dtype)
+                return torch.amp.autocast(device, dtype=dtype)
             except TypeError:
-                return torch.cuda.amp.autocast(enabled=True, dtype=dtype)
+                # 老接口回退
+                if device == 'cuda':
+                    return torch.cuda.amp.autocast(enabled=True, dtype=dtype)
+                return torch.npu.amp.autocast(enabled=True, dtype=dtype)
     return nullcontext()
 
 
@@ -197,19 +290,21 @@ def main():
     logger.info("=" * 60)
 
     if args.device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device = _auto_select_device()
     else:
         device = args.device
-    use_amp = args.use_amp or (device == 'cuda')
+    use_amp = args.use_amp or (device.split(':')[0] in ('cuda', 'npu'))
 
-    # ---- A100 自适应路径：按 GPU 计算能力自动开启 BF16 / FlashAttention / channels_last ----
-    # sm_80+ (Ampere: A100/A800/H100/L4/4090 等) 原生支持 BF16 与 FlashAttention 后端，
-    # 显存带宽也更高。V100(sm_70, Volta) 仅 FP16、无 Flash，需走保守路径。
-    # 此段决定：
-    #   - amp_dtype:   A100->bfloat16（无需 loss scaling），V100->float16
-    #   - use_scaler:  BF16 下关闭 GradScaler（不会下溢），FP16 下开启
-    #   - channels_last: A100 上卷积走 NHWC 更快；V100 收益有限默认关
-    #   - sdpa_force_math / compile_disable_sparse: V100 强制手写 math + 禁用稀疏注意力编译
+    # ---- 多后端自适应路径（CUDA / NPU / CPU）----
+    # 各后端能力差异很大，逐后端决定：
+    #   - amp_dtype:       A100/A800/H100(sm_80+) 与 Ascend 910B -> bfloat16（原生支持）
+    #                     V100(sm_70, Volta) -> float16（无 bf16）
+    #   - use_scaler:      BF16 下关闭 GradScaler（不下溢）；FP16 下开启
+    #   - use_channels_last: A100 卷积走 NHWC 更快；NPU/CPU 收益有限默认关
+    #   - sdpa_force_math: NPU 上 FlashAttention 后端不稳（CANN SDPA 与 CUDA 不同），
+    #                     强制走手写 math 注意力最稳；V100 同样强制 math；A100 走 Flash
+    #   - compile_disable_sparse: V100 inductor 对 unfold 触发 PolynomialError 需禁用；
+    #                      A100 可编译；NPU 上 torch.compile(inductor) 不可用，直接整体禁用
     amp_dtype = torch.float16
     use_scaler = use_amp
     use_channels_last = False
@@ -217,10 +312,16 @@ def main():
     compile_disable_sparse = True
     gpu_name = 'N/A'
     compute_cap = (0, 0)
-    if device == 'cuda' and torch.cuda.is_available():
+    _backend = device.split(':')[0]
+    # 具体卡号（device 形如 'cuda:1' / 'npu:0' / 'cpu'），无索引时默认 0
+    try:
+        _dev_idx = int(device.split(':')[1]) if ':' in device else 0
+    except ValueError:
+        _dev_idx = 0
+    if _backend == 'cuda' and torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
         torch.set_num_threads(min(8, os.cpu_count() or 8))
-        props = torch.cuda.get_device_properties(0)
+        props = torch.cuda.get_device_properties(_dev_idx)
         gpu_name = props.name
         compute_cap = (props.major, props.minor)
         is_ampere_plus = compute_cap >= (8, 0)
@@ -241,14 +342,36 @@ def main():
             compile_disable_sparse = True
             logger.info("[device] %s (sm_%d%d) | 走保守路径: FP16 + 手写 math 注意力 + "
                         "稀疏注意力禁用编译", gpu_name, *compute_cap)
-        # 把注意力后端/编译开关透传给 backbone 模块
-        from src.networks import backbone as _backbone
-        _backbone.set_sdpa_force_math(sdpa_force_math)
-        _backbone.set_compile_disable_sparse(compile_disable_sparse)
+    elif _backend == 'npu' and npu_is_available():
+        # Ascend 910B / 910Pro：CANN + torch_npu 后端
+        gpu_name = npu_get_device_name(_dev_idx)
+        torch.set_num_threads(min(8, os.cpu_count() or 8))
+        # 910B 原生 BF16；但 FlashAttention 后端在 CANN 上不稳，强制手写 math 注意力
+        # channels_last 对 NPU 卷积无明确收益，关闭；torch.compile(inductor) 不可用，禁用
+        amp_dtype = torch.bfloat16
+        use_scaler = False  # BF16 不下溢
+        use_channels_last = False
+        sdpa_force_math = True
+        compile_disable_sparse = True
+        logger.info("[device] %s (NPU/CANN) | NPU 路径: BF16 + 手写 math 注意力 + "
+                    "禁用 torch.compile(inductor)", gpu_name)
+        if args.compile:
+            logger.warning("[device] NPU 上 torch.compile(inductor) 不可用，已忽略 --compile；"
+                           "如需图编译请用 torchair (torch_npu.experimental_config)。")
+            args.compile = False
     else:
-        from src.networks import backbone as _backbone
-        _backbone.set_sdpa_force_math(sdpa_force_math)
-        _backbone.set_compile_disable_sparse(compile_disable_sparse)
+        # CPU 或其他：纯 FP32，无 AMP、无 channels_last
+        amp_dtype = torch.float32
+        use_scaler = False
+        use_channels_last = False
+        sdpa_force_math = True
+        compile_disable_sparse = True
+        logger.info("[device] CPU | 走 FP32 路径（无 AMP/编译）")
+
+    # 把注意力后端/编译开关透传给 backbone 模块（所有分支统一设置）
+    from src.networks import backbone as _backbone
+    _backbone.set_sdpa_force_math(sdpa_force_math)
+    _backbone.set_compile_disable_sparse(compile_disable_sparse)
 
     logger.info("启动训练 | torch=%s | device=%s | amp_dtype=%s scaler=%s channels_last=%s",
                 torch.__version__, device, amp_dtype, use_scaler, use_channels_last)
@@ -281,7 +404,7 @@ def main():
 
     # A100 上把卷积型特征（N,C,H,W）转 channels_last(NHWC)，卷积算子走更快内存布局。
     # 输入 state 也需同步转格式（见训练/评估循环），故这里仅转换模型权重布局。
-    if use_channels_last and device == 'cuda':
+    if use_channels_last and _backend == 'cuda':
         model = model.to(memory_format=torch.channels_last)  # type: ignore[call-overload]
         logger.info("[model] 已启用 channels_last (NHWC) 内存格式（A100 卷积加速）")
 
@@ -293,9 +416,12 @@ def main():
         logger.info("[model] window_chunk=%d（滑动窗口注意力分块大小）", args.window_chunk)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    # A100/BF16 下 use_scaler=False（BF16 不下溢，省去 loss scaling 的额外 CUDA 同步）；
-    # V100/FP16 下开启 GradScaler。
-    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+    # BF16 后端（A100/NPU）下 use_scaler=False（BF16 不下溢，省去 loss scaling 的额外同步）；
+    # V100/FP16 下开启 GradScaler。按设备选择 GradScaler 实现。
+    if _backend == 'npu':
+        scaler = npu_grad_scaler(enabled=use_scaler)
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
 
     # ---- 学习率调度：基于“总 step 数”而非 epoch 数 ----
     # 旧版用 T_max=args.epochs 导致余弦在第 1 个 epoch 结束就被砍到 ~0，
@@ -389,8 +515,18 @@ def main():
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
+            except Exception as oom_exc:
+                # 同时捕获 CUDA 与 NPU 的 OOM（两后端异常类型不同）
+                _oom_types = [torch.cuda.OutOfMemoryError]
+                _npu_oom = npu_out_of_memory_error_type()
+                if _npu_oom is not None:
+                    _oom_types.append(_npu_oom)
+                if not isinstance(oom_exc, tuple(_oom_types)):
+                    raise
+                if _backend == 'npu':
+                    npu_empty_cache()
+                else:
+                    torch.cuda.empty_cache()
                 # 保存当前进度，便于减小 batch 后用 --resume 续训
                 save_model(model, args.out + '.latest')
                 torch.save({
@@ -403,7 +539,8 @@ def main():
                     'rng': torch.get_rng_state(),
                 }, args.out + '.latest.train_state')
                 logger.error("=" * 60)
-                logger.error("CUDA 显存不足 (OOM)！当前 --batch-size=%d 过大。", bs)
+                logger.error("%s 显存不足 (OOM)！当前 --batch-size=%d 过大。",
+                             device.upper(), bs)
                 logger.error("window 注意力在 19x19 上把 batch 展开为 B*361，显存增长很快。")
                 logger.error("建议减小 --batch-size（如 128/96/64），或调小 --attn-window。")
                 logger.error("已保存进度至 %s.latest(.train_state)，可用 --resume 续训。",
@@ -417,7 +554,12 @@ def main():
 
             if step % args.log_every == 0:
                 lr = optimizer.param_groups[0]['lr']
-                mem = torch.cuda.memory_reserved(device) / 1e9 if device == 'cuda' else 0.0
+                if _backend == 'cuda':
+                    mem = torch.cuda.memory_reserved(device) / 1e9
+                elif _backend == 'npu':
+                    mem = npu_memory_reserved(device) / 1e9
+                else:
+                    mem = 0.0
                 speed = step * bs / max(1e-6, time.time() - t0)
                 logger.info("[step %d/%d] loss=%.4f (p=%.4f v=%.4f) lr=%.2e "
                             "scale=%.0f mem=%.2fGB spd=%.0f s/s elapsed=%.0fs",
