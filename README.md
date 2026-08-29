@@ -1,184 +1,119 @@
-# 围棋AI
+# Go-AI — 基于监督学习（SFT）的围棋 AI
 
-基于AlphaGo思想的围棋AI，使用多网络架构（策略网络 + 价值网络 + 快速策略网络），无搜索，纯网络推理。
+一个使用 **监督学习** 从 SGF 棋谱训练围棋策略/价值网络的轻量级项目。
+网络结构借鉴 AlphaGo Zero 的「共享骨干 + 策略头 + 价值头」，输入为统一的
+**12 通道特征平面**，输出为 `(policy, value)`。
 
-## 特性
-
-- **多网络架构**：策略网络 + 价值网络 + 快速策略网络并行推理
-- **无搜索**：直接从神经网络输出着法，推理速度快
-- **CPU/GPU兼容**：自动检测设备，支持AMP混合精度训练
-- **自我对弈**：从零开始学习，无需棋谱数据
-- **可扩展**：支持9×9到19×19棋盘
-
-## 训练改进
-
-- **密集奖励**：每步都给领地差作为即时奖励，解决稀疏奖励问题
-- **N-step回报**：用n步回报替代仅终端奖励，加速价值学习
-- **对称性增强**：8种棋盘变换，数据量提升8倍
-- **优先经验回放**：根据TD-error优先采样，提高学习效率
-- **温度衰减**：随训练降低温度，平衡探索与利用
-
-## 架构
-
-```
-输入: 棋盘状态 (19通道 × 9×9)
-      ↓
-┌─────┴─────┐
-│           │
-↓           ↓
-骨干网络    快速策略网络
-(64ch×4残差) (72ch×3残差)
-│           │
-├───┐       │
-↓   ↓       ↓
-策略 价值   快速策略
-网络 网络   网络
-(32ch)(16ch) (72ch×3)
-│    │       │
-↓    ↓       ↓
-策略 价值   快速策略
-logits v   logits
-```
-
-## 网络参数量
-
-| 网络 | 参数量 | 用途 |
-|------|--------|------|
-| 骨干网络 | ~150K | 特征提取 |
-| 策略网络 | ~21K | 精确着法预测 |
-| 价值网络 | ~8K | 局面评估 |
-| 快速策略网络 | ~300K | 快速着法建议 |
-| **总计** | **~1M** | - |
-
-## 安装
-
-```bash
-# 克隆仓库
-git clone https://github.com/hzr12/Go-AI.git
-cd Go-AI
-
-# 安装依赖
-pip install torch numpy pytest
-```
-
-## 使用
-
-### 推理（人机对弈）
-
-```bash
-# 基本用法
-python -m src.inference --mode play
-
-# 使用训练好的模型
-python -m src.inference --model models/alphago_model.pth --mode play
-
-# 评估当前局面
-python -m src.inference --model models/alphago_model.pth --mode eval
-
-# 分析着法概率
-python -m src.inference --model models/alphago_model.pth --mode analyze
-```
-
-### 训练
-
-```bash
-# 基本训练
-python scripts/train.py --num-games 5000
-
-# GPU训练（推荐）
-python scripts/train.py --num-games 5000 --device cuda --use-amp --batch-size 384
-
-# 自定义参数
-python scripts/train.py --num-games 10000 \
-    --backbone-channels 128 \
-    --backbone-res-blocks 6 \
-    --lr 5e-4 \
-    --batch-size 512 \
-    --save-path models/custom_model.pth
-```
-
-### 测试
-
-```bash
-# 运行所有测试
-python -m pytest tests/ -v
-
-# 仅测试网络
-python -m pytest tests/test_alphanet.py -v
-
-# 仅测试训练
-python -m pytest tests/test_alphanet.py::TestAlphaGoTrainer -v
-```
-
-## 训练配置
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--board-size` | 9 | 棋盘大小 |
-| `--backbone-channels` | 64 | 骨干网络通道数 |
-| `--backbone-res-blocks` | 4 | 骨干网络残差块数量 |
-| `--policy-channels` | 32 | 策略网络通道数 |
-| `--value-channels` | 16 | 价值网络通道数 |
-| `--fast-channels` | 72 | 快速策略网络通道数 |
-| `--fast-res-blocks` | 3 | 快速策略网络残差块数量 |
-| `--lr` | 1e-3 | 学习率 |
-| `--batch-size` | 256 | 批量大小（GPU推荐256-512） |
-| `--num-games` | 5000 | 训练局数 |
-| `--policy-weight` | 1.0 | 策略损失权重 |
-| `--value-weight` | 1.0 | 价值损失权重 |
-| `--fast-weight` | 0.5 | 快速策略损失权重 |
-| `--temperature` | 1.0 | 初始温度 |
-| `--temperature-min` | 0.1 | 最小温度 |
-| `--temperature-decay` | 0.9999 | 温度衰减率 |
-| `--n-step` | 5 | N-step回报步数 |
-| `--gamma` | 0.99 | 折扣因子 |
-| `--use-augmentation` | True | 启用数据增强 |
-| `--use-prioritized-replay` | True | 启用优先经验回放 |
-| `--use-amp` | 自动 | 使用混合精度 |
-
-## 训练流程
-
-1. **Phase 1**: 填充缓冲区（~1250局）
-2. **Phase 2**: 交替自我对弈+训练
-   - 每256局自我对弈
-   - 100步训练
-   - 定期保存模型
+- **policy**：棋盘每点 + 虚着(pass) 的概率分布（softmax）
+- **value**：当前执子方视角的局面胜率，tanh 映射到 `[-1, 1]`
 
 ## 项目结构
 
 ```
-Go-AI/
-├── src/
-│   ├── networks/
-│   │   ├── backbone.py      # 共享骨干网络
-│   │   ├── policy_network.py # 策略网络
-│   │   ├── value_network.py  # 价值网络
-│   │   ├── fast_network.py   # 快速策略网络
-│   │   └── alphanet.py       # AlphaGoNet主网络
-│   ├── training/
-│   │   └── trainer.py        # 训练器
-│   └── inference.py          # 推理引擎
-├── scripts/
-│   ├── train.py              # 训练脚本
-│   └── inference.py          # 推理脚本
-├── tests/
-│   └── test_alphanet.py      # 测试用例
-└── models/                   # 模型保存目录
+src/
+  game/go_rules.py      围棋规则引擎（提子 / 打劫 / 禁自杀 / 虚着 / 数子）
+                        + feature_planes() 统一生成 12 通道特征
+  data/
+    sgf_parser.py       SGF 棋谱解析（含让子 AB/AW、贴目 KM、虚着 []）
+    dataset.py          监督学习数据集（紧凑 npz + 随机对称增广）
+  networks/
+    backbone.py         共享残差骨干（ResBlock × N）
+    policy_network.py   策略头（1×1 卷积 + 全局平均池化 + 线性）
+    value_network.py    价值头（Tanh 输出 [-1,1]）
+    alphanet.py         AlphaGoNet：串联上述三者的总模型
+  inference.py          对弈 / 自对弈 / 局面分析引擎（GoAI）
+scripts/
+  build_dataset.py      SGF -> 复局 -> 紧凑 npz 数据集
+  train_sft.py          监督训练（AMP / AdamW / Cosine 调度 / 留出集 top1）
+tests/
+  test_go_rules.py      规则引擎单测（提子 / 劫 / 自杀 / 数子）
+  test_sgf_parser.py    SGF 解析单测
+  test_alphanet.py      网络与推理引擎冒烟测试
 ```
 
-## 性能
+## 特征平面（12 通道，单一数据源）
 
-- **推理速度**：~1000 moves/sec (CPU)
-- **训练速度**：~0.3s/局 (CPU), ~0.05s/局 (GPU)
-- **内存占用**：~500MB (CPU), ~1GB (GPU)
+见 `src/game/go_rules.py::GoBoard.feature_planes`，训练（`dataset.py`）与推理
+（`inference.py`）共用同一实现，避免训练/推理特征不一致：
+
+| 通道 | 含义 |
+|------|------|
+| 0    | 己方棋子 |
+| 1..3 | 己方前 1/2/3 手落子 |
+| 4    | 对手棋子 |
+| 5..7 | 对手前 1/2/3 手落子 |
+| 8    | 合法点掩码（已排除劫禁着点） |
+| 9    | 执子方常数（to_play，±1） |
+| 10   | 己方气数=1 的块掩码 |
+| 11   | 对手气数=1 的块掩码 |
+
+> 视角以「当前执子方」为「己方」，便于网络专注相对态势。
 
 ## 依赖
 
-- Python 3.8+
-- PyTorch 1.9+
-- NumPy
-- pytest (开发依赖)
+```bash
+pip install -r requirements.txt
+```
 
-## License
+## 数据准备
 
-MIT
+将 SGF 棋谱（`.sgf` 或打包的 `.tar.gz` / `.tgz`）放入 `data/` 目录，然后生成训练集：
+
+```bash
+# 9 路
+python scripts/build_dataset.py --board-size 9 --max-games 2000 --output data/sgf_9x9.npz
+# 19 路
+python scripts/build_dataset.py --board-size 19 --max-games 30000 --output data/sgf_19x19.npz
+```
+
+`build_dataset.py` 会：解析 SGF → 用 `GoBoard` 复局 → 每手收集
+`(棋盘, 双方近 3 手历史, 劫点, 着法, 胜负标签, 执子方)`，并做坐标越界 /
+让子 / 结果缺失等过滤，最终保存为紧凑 `npz`。
+
+## 训练
+
+```bash
+# CPU 快速验证
+python scripts/train_sft.py --device cpu --board-size 9 --batch-size 128 --epochs 3
+
+# GPU 全量（19 路，混合精度）
+python scripts/train_sft.py --device cuda --use-amp \
+    --board-size 19 --batch-size 512 --epochs 5 \
+    --data data/sgf_19x19.npz --save-path models/sft_19x19.pth
+```
+
+损失：`L = CrossEntropy(policy, move) + MSELoss(value, z)`，其中 `z ∈ {+1,-1}`
+来自棋谱 `RE` 结果（当前执子方视角）。虚着作为最后一类的专用类别
+`board_size²`。
+
+## 推理 / 对弈
+
+```bash
+# 模型自对弈若干局，输出黑方胜率
+python src/inference.py --model models/sft_19x19.pth --board-size 19 \
+    --mode selfplay --games 4 --temperature 0.8
+
+# 人机对弈（人类执黑先手）
+python src/inference.py --model models/sft_19x19.pth --board-size 19 \
+    --mode human --human-color 1
+
+# 交互式局面分析（展示 AI 的 top-k 候选着法）
+python src/inference.py --model models/sft_19x19.pth --board-size 19 --mode analyze
+```
+
+人机/分析模式下，坐标用字母输入，例如 `ce` 表示第 5 列(e) 第 3 行(c)
+（a=第1列/行，依此类推），输入 `pass` 虚着，`q` 退出分析模式。
+
+## 测试
+
+```bash
+pytest tests/ -q
+```
+
+## 设计说明
+
+- **为什么是监督学习而非强化学习**：本项目目标是「从人类棋谱学习合理着法」，
+  规则引擎保证复局合法，网络在每一步预测与人类相同的着法，并回归终局胜负。
+- **单一特征来源**：`feature_planes` 同时服务训练与推理，杜绝特征漂移。
+- **紧凑数据集**：原始棋局以 `int8` 棋盘 + 历史索引存储，运行时再展开为
+  12 通道并随机施加 8 向对称增广，兼顾内存与数据多样性。
