@@ -1,413 +1,313 @@
-import torch
-import torch.nn.functional as F
+"""
+围棋 AI 推理引擎（监督学习 / SFT 模型）
+
+兼容 src/networks.alphanet.AlphaGoNet 输出的 (policy, value)：
+    - policy: 棋盘上每点 + 虚着(pass) 的概率分布
+    - value : 当前执子方视角的局面胜率，tanh 后落在 [-1, 1]
+
+特征由 src.game.go_rules.GoBoard.feature_planes 统一生成（12 通道），
+与 src.data.dataset 使用同一套特征工程，避免训练/推理不一致。
+"""
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import math
+import time
 import numpy as np
-from typing import Tuple, Optional, Dict, List
+import torch
+
+from src.game.go_rules import GoBoard
 from src.networks.alphanet import AlphaGoNet
 
 
 class GoAI:
-    """AlphaGo风格的围棋AI推理引擎"""
-    
-    def __init__(self, 
-                 model_path: Optional[str] = None,
-                 board_size: int = 9,
-                 device: str = 'cpu',
-                 use_amp: bool = False,
-                 temperature: float = 1.0,
-                 top_k: int = 5,
-                 use_value: bool = True):
-        """
-        初始化围棋AI
-        
-        Args:
-            model_path: 模型路径（可选）
-            board_size: 棋盘大小
-            device: 设备 (cpu/cuda)
-            use_amp: 是否使用自动混合精度
-            temperature: 温度参数（控制探索）
-            top_k: 候选着法数量
-            use_value: 是否使用价值网络评估
-        """
-        self.board_size = board_size
+    """基于 SFT 模型的围棋对弈 / 分析引擎。
+
+    用法示例::
+
+        ai = GoAI(model_path="models/sft_19x19.pth", board_size=19, device="cuda")
+        # 自对弈一局
+        ai.self_play(verbose=True, temperature=0.8)
+        # 人机对弈（人类执黑先手）
+        ai.play_against_human(human_color=1)
+        # 分析某个局面的 top-k 候选着法
+        ai.analyze()
+    """
+
+    def __init__(self, model_path=None, board_size=19, device="auto", use_amp=False,
+                 backbone_channels=128, backbone_res_blocks=12, policy_channels=64, value_channels=32):
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
-        self.use_amp = use_amp
-        self.temperature = temperature
-        self.top_k = top_k
-        self.use_value = use_value
-        
-        # 创建网络
+        self.use_amp = use_amp and self.device.startswith("cuda")
+        self.board_size = board_size
+
         self.model = AlphaGoNet(
-            in_channels=19,
-            backbone_channels=64,
-            backbone_res_blocks=4,
-            policy_channels=32,
-            value_channels=16,
-            fast_channels=72,
-            fast_res_blocks=3,
-            action_size=board_size * board_size
-        ).to(device)
-        
-        # 加载模型（如果提供）
-        if model_path:
-            self.load_model(model_path)
-        
-        # 棋盘状态
-        self.board = np.zeros((board_size, board_size), dtype=np.int8)
-        self.current_player = 1  # 1=黑, -1=白
-        self.move_history = []
-    
-    def load_model(self, model_path: str):
-        """加载模型"""
-        checkpoint = torch.load(model_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"Model loaded from {model_path}")
-    
-    def save_model(self, model_path: str):
-        """保存模型"""
-        torch.save({
-            'model_state_dict': self.model.state_dict(),
-        }, model_path)
-        print(f"Model saved to {model_path}")
-    
-    def reset(self):
-        """重置棋盘"""
-        self.board = np.zeros((self.board_size, self.board_size), dtype=np.int8)
-        self.current_player = 1
-        self.move_history = []
-    
-    def get_legal_moves(self) -> list:
-        """获取合法着法"""
-        legal_moves = []
-        for i in range(self.board_size):
-            for j in range(self.board_size):
-                if self.board[i, j] == 0:
-                    legal_moves.append(i * self.board_size + j)
-        return legal_moves
-    
-    def make_move(self, move: int) -> bool:
-        """
-        执行着法
-        
-        Args:
-            move: 着法位置 (0-80)
-            
-        Returns:
-            是否成功
-        """
-        if move not in self.get_legal_moves():
-            return False
-        
-        i, j = move // self.board_size, move % self.board_size
-        
-        # 放置棋子
-        self.board[i, j] = self.current_player
-        self.move_history.append(move)
-        
-        # 切换玩家
-        self.current_player = -self.current_player
-        
-        return True
-    
-    def board_to_tensor(self) -> torch.Tensor:
-        """将棋盘转换为网络输入张量"""
-        tensor = torch.zeros(1, 19, self.board_size, self.board_size, device=self.device)
-        
-        # 当前玩家棋子
-        mask_current = torch.tensor(self.board == self.current_player, dtype=torch.bool, device=self.device)
-        tensor[0, 0][mask_current] = 1
-        # 对手棋子
-        mask_opponent = torch.tensor(self.board == -self.current_player, dtype=torch.bool, device=self.device)
-        tensor[0, 8][mask_opponent] = 1
-        # 当前玩家标记
-        tensor[0, 16] = 1 if self.current_player == 1 else -1
-        # 合法着法标记
-        legal_moves = self.get_legal_moves()
-        if legal_moves:
-            legal_tensor = torch.tensor(legal_moves, device=self.device)
-            rows = legal_tensor // self.board_size
-            cols = legal_tensor % self.board_size
-            tensor[0, 17, rows, cols] = 1
-        
-        return tensor
-    
-    def get_move(self) -> Tuple[int, Dict]:
-        """
-        获取AI着法
-        
-        Returns:
-            (着法, 详细信息)
-        """
+            in_channels=12,
+            backbone_channels=backbone_channels,
+            backbone_res_blocks=backbone_res_blocks,
+            policy_channels=policy_channels,
+            value_channels=value_channels,
+            action_size=board_size * board_size + 1,  # +1 = 虚着
+        ).to(self.device)
         self.model.eval()
+
+        if model_path and os.path.exists(model_path):
+            state = torch.load(model_path, map_location=self.device)
+            # 兼容直接保存的 state_dict 或 {"model": state_dict}
+            if isinstance(state, dict) and "model" in state:
+                state = state["model"]
+            self.model.load_state_dict(state, strict=False)
+            print(f"[GoAI] 已加载模型: {model_path}  ({device})")
+        else:
+            print(f"[GoAI] 未加载权重（随机初始化），仅用于流程验证。device={device}")
+
+    # ------------------------------------------------------------------ #
+    # 特征构造
+    # ------------------------------------------------------------------ #
+    def _build_state(self, board, my_hist, op_hist, to_play):
+        """用统一的 feature_planes 构造 12 通道状态张量。"""
+        planes = board.feature_planes(my_hist, op_hist, to_play=to_play)
+        x = torch.from_numpy(planes).unsqueeze(0).to(self.device).float()
+        return x
+
+    # ------------------------------------------------------------------ #
+    # 核心：模型前向 + 采样
+    # ------------------------------------------------------------------ #
+    def predict(self, board, my_hist, op_hist, to_play):
+        """返回 (policy_np, value)。
+
+        policy_np: shape=(bs*bs+1,) 概率（已 softmax）
+        value    : float, 当前 to_play 视角 [-1,1]
+        """
+        x = self._build_state(board, my_hist, op_hist, to_play)
         with torch.no_grad():
-            # 获取当前状态
-            tensor = self.board_to_tensor()
-            
-            # 获取三个网络的输出
-            policy_logits, value, fast_policy = self.model(tensor)
-            
-            # 获取合法着法
-            legal_moves = self.get_legal_moves()
-            
-            # 策略网络输出
-            policy_probs = F.softmax(policy_logits / self.temperature, dim=-1).cpu().numpy()[0]
-            
-            # 快速策略网络输出
-            fast_probs = F.softmax(fast_policy / self.temperature, dim=-1).cpu().numpy()[0]
-            
-            # 选择着法
-            if self.use_value:
-                # 使用策略+价值网络结合
-                top_k_indices = np.argsort(policy_probs)[-self.top_k:][::-1]
-                
-                best_score = -float('inf')
-                best_move = legal_moves[0] if legal_moves else 0
-                
-                for move_idx in top_k_indices:
-                    if move_idx in legal_moves:
-                        # 模拟下一步
-                        temp_board = self.board.copy()
-                        i, j = move_idx // self.board_size, move_idx % self.board_size
-                        temp_board[i, j] = self.current_player
-                        
-                        # 获取下一步的价值评估
-                        next_tensor = self._board_to_tensor(temp_board, -self.current_player)
-                        _, next_value, _ = self.model(next_tensor)
-                        
-                        # 计算分数
-                        score = 0.7 * policy_probs[move_idx] + 0.3 * next_value.item()
-                        
-                        if score > best_score:
-                            best_score = score
-                            best_move = move_idx
-                
-                move = best_move
+            if self.use_amp:
+                with torch.cuda.amp.autocast():
+                    policy_logits, value = self.model(x)
             else:
-                # 仅使用策略网络
-                # 屏蔽非法着法
-                mask = np.zeros_like(policy_probs)
-                mask[legal_moves] = 1
-                masked_probs = policy_probs * mask
-                masked_probs = masked_probs / masked_probs.sum()
-                
-                move = np.argmax(masked_probs)
-            
-            # 详细信息
-            info = {
-                'policy': policy_probs,
-                'value': value.item(),
-                'fast_policy': fast_probs,
-                'board': self.board.copy(),
-                'current_player': self.current_player
-            }
-            
-            return move, info
-    
-    def _board_to_tensor(self, board: np.ndarray, current_player: int) -> torch.Tensor:
-        """将指定棋盘状态转换为张量"""
-        tensor = torch.zeros(1, 19, self.board_size, self.board_size, device=self.device)
-        
-        mask_current = torch.tensor(board == current_player, dtype=torch.bool, device=self.device)
-        tensor[0, 0][mask_current] = 1
-        mask_opponent = torch.tensor(board == -current_player, dtype=torch.bool, device=self.device)
-        tensor[0, 8][mask_opponent] = 1
-        tensor[0, 16] = 1 if current_player == 1 else -1
-        
-        legal_moves = []
-        for i in range(self.board_size):
-            for j in range(self.board_size):
-                if board[i, j] == 0:
-                    legal_moves.append(i * self.board_size + j)
-        if legal_moves:
-            legal_tensor = torch.tensor(legal_moves, device=self.device)
-            rows = legal_tensor // self.board_size
-            cols = legal_tensor % self.board_size
-            tensor[0, 17, rows, cols] = 1
-        
-        return tensor
-    
-    def get_move_probabilities(self) -> np.ndarray:
-        """获取所有着法的概率分布"""
-        self.model.eval()
-        with torch.no_grad():
-            tensor = self.board_to_tensor()
-            policy_logits, _, _ = self.model(tensor)
-            probs = F.softmax(policy_logits / self.temperature, dim=-1).cpu().numpy()[0]
-            return probs
-    
-    def evaluate_position(self) -> Dict:
-        """评估当前局面"""
-        self.model.eval()
-        with torch.no_grad():
-            tensor = self.board_to_tensor()
-            policy_logits, value, fast_policy = self.model(tensor)
-            
-            policy_probs = F.softmax(policy_logits, dim=-1).cpu().numpy()[0]
-            fast_probs = F.softmax(fast_policy, dim=-1).cpu().numpy()[0]
-            
-            best_move = np.argmax(policy_probs)
-            best_prob = policy_probs[best_move]
-            
-            return {
-                'best_move': best_move,
-                'best_prob': best_prob,
-                'value': value.item(),
-                'policy': policy_probs,
-                'fast_policy': fast_probs
-            }
-    
-    def suggest_moves(self, num_moves: int = 5) -> list:
-        """推荐多个着法"""
-        probs = self.get_move_probabilities()
-        sorted_indices = np.argsort(probs)[::-1]
-        
-        suggestions = []
-        for i in range(min(num_moves, len(sorted_indices))):
-            move = sorted_indices[i]
-            prob = probs[move]
-            row, col = move // self.board_size, move % self.board_size
-            
-            suggestions.append({
-                'move': move,
-                'position': (row, col),
-                'probability': prob
-            })
-        
-        return suggestions
-    
-    def play_against_human(self):
-        """人机对弈"""
-        print("AlphaGo围棋AI - 人机对弈")
-        print("输入格式: 行号 列号 (0-8)")
-        print("输入 'quit' 退出")
-        print("输入 'board' 显示棋盘")
-        print("输入 'eval' 评估当前局面")
-        print()
-        
-        while True:
-            # 显示棋盘
-            self.print_board()
-            
-            if self.current_player == 1:
-                # 人类玩家（黑棋）
-                user_input = input("\n黑棋着法: ").strip()
-                
-                if user_input.lower() == 'quit':
-                    print("游戏结束")
+                policy_logits, value = self.model(x)
+        policy = torch.softmax(policy_logits.squeeze(0), dim=-1).cpu().numpy()
+        value = float(value.squeeze().item())
+        return policy, value
+
+    def choose_move(self, board, my_hist, op_hist, to_play, legal_mask, temperature=1.0, topk=10):
+        """根据策略分布与合法着法掩码，采样一个着法。
+
+        返回 (move_int, is_pass, value)，move_int 为 board_size*board_size 表示虚着。
+        """
+        policy, value = self.predict(board, my_hist, op_hist, to_play)
+        bs = self.board_size
+        n_actions = bs * bs + 1
+
+        illegal = np.ones(n_actions, dtype=bool)
+        for m in legal_mask:
+            illegal[m] = False
+        # 始终允许虚着
+        illegal[n_actions - 1] = False
+        masked = policy.copy()
+        masked[illegal] = 0.0
+        s = masked.sum()
+        if s <= 0:
+            return n_actions - 1, True, value
+
+        if temperature <= 0:
+            # 贪心
+            move_int = int(np.argmax(masked))
+        else:
+            probs = masked / s
+            # 可选 top-k 截断，降低随机性
+            if topk and topk < len(probs):
+                idx = np.argsort(probs)[::-1][:topk]
+                p2 = np.zeros_like(probs)
+                p2[idx] = probs[idx]
+                probs = p2 / p2.sum()
+            # 温度缩放：对 log 缩放后重新 softmax
+            if temperature != 1.0:
+                logp = np.log(probs + 1e-12)
+                probs = np.exp(logp / max(temperature, 1e-3))
+                probs = probs / probs.sum()
+            move_int = int(np.random.choice(len(probs), p=probs))
+
+        is_pass = (move_int == n_actions - 1)
+        return move_int, is_pass, value
+
+    # ------------------------------------------------------------------ #
+    # 对局循环
+    # ------------------------------------------------------------------ #
+    def _move_int_to_coord(self, move_int):
+        bs = self.board_size
+        if move_int == bs * bs:
+            return None  # pass
+        r, c = divmod(move_int, bs)
+        return (r, c)
+
+    def self_play(self, num_games=1, max_moves=400, temperature=1.0, topk=10, verbose=False):
+        """模型自我对弈 num_games 局，返回每局结果（黑方视角 +1/-1）。"""
+        results = []
+        for g in range(num_games):
+            board = GoBoard(self.board_size)
+            my_hist = [[-1, -1, -1], [-1, -1, -1]]  # 对当前执子方：最近3手
+            passes = 0
+            move_count = 0
+            while passes < 2 and move_count < max_moves:
+                to_play = board.current_player
+                legal = board.get_legal_moves()
+                if not legal:
+                    passes += 1
+                    board.play(-1)
+                    move_count += 1
+                    continue
+                move_int, is_pass, value = self.choose_move(
+                    board, my_hist[0], my_hist[1], to_play, legal,
+                    temperature=temperature, topk=topk)
+                if is_pass:
+                    board.play(-1)
+                    passes += 1
+                else:
+                    r, c = self._move_int_to_coord(move_int)
+                    board.play(r * self.board_size + c)
+                    passes = 0
+                    # 更新历史（最近3手，最新在末尾）
+                    hist = my_hist[0] if to_play == 1 else my_hist[1]
+                    hist.pop(0)
+                    hist.append(r * self.board_size + c)
+                move_count += 1
+                if verbose and (move_count % 10 == 0):
+                    print(f"  game {g} move {move_count} to_play={to_play} "
+                          f"value={value:+.3f} pass={is_pass}")
+            score = board.score()
+            # 黑方(1)视角
+            result = 1.0 if score > 0 else -1.0
+            results.append(result)
+            if verbose:
+                print(f"game {g} finished: score(黑-白)={score:+.1f} -> "
+                      f"{'黑胜' if result > 0 else '白胜'}")
+        return results
+
+    def play_against_human(self, human_color=1, max_moves=400, temperature=0.6):
+        """人机对弈，人类通过终端输入坐标（如 'ce' 或 'pass'）。"""
+        board = GoBoard(self.board_size)
+        my_hist = [[-1, -1, -1], [-1, -1, -1]]
+        passes = 0
+        move_count = 0
+        while passes < 2 and move_count < max_moves:
+            to_play = board.current_player
+            legal = board.get_legal_moves()
+            if to_play == human_color:
+                print(board.to_string())
+                print(f"合法着法数: {len(legal)}  | 输入坐标(如 ce)，或 pass，或 resign")
+                inp = input("你的着法: ").strip().lower()
+                if inp in ("pass", ""):
+                    board.play(-1)
+                    passes += 1
+                elif inp in ("resign", "quit"):
+                    print("你认输。")
                     break
-                elif user_input.lower() == 'board':
-                    continue
-                elif user_input.lower() == 'eval':
-                    eval_result = self.evaluate_position()
-                    print(f"最佳着法: {eval_result['best_move']}")
-                    print(f"置信度: {eval_result['best_prob']:.4f}")
-                    print(f"价值: {eval_result['value']:.4f}")
-                    continue
-                
-                try:
-                    row, col = map(int, user_input.split())
-                    move = row * self.board_size + col
-                except:
-                    print("输入格式错误，请重新输入")
-                    continue
+                else:
+                    ok, mv = board.parse_move_str(inp, human_color)
+                    if not ok or mv not in legal:
+                        print("非法着法，请重试。")
+                        continue
+                    board.play(mv)
+                    passes = 0
+                    hist = my_hist[0] if human_color == 1 else my_hist[1]
+                    hist.pop(0); hist.append(mv)
             else:
-                # AI玩家（白棋）
-                print("\nAI思考中...")
-                move, info = self.get_move()
-                row, col = move // self.board_size, move % self.board_size
-                print(f"AI着法: {row} {col}")
-                print(f"策略网络置信度: {info['policy'][move]:.4f}")
-                print(f"价值评估: {info['value']:.4f}")
-            
-            # 执行着法
-            if not self.make_move(move):
-                print("非法着法，请重新输入")
-                continue
-            
-            # 检查游戏是否结束
-            if len(self.get_legal_moves()) == 0:
-                self.print_board()
-                print("\n游戏结束！")
-                black_count = np.sum(self.board == 1)
-                white_count = np.sum(self.board == -1)
-                if black_count > white_count:
-                    print("黑棋获胜！")
-                elif white_count > black_count:
-                    print("白棋获胜！")
+                if not legal:
+                    board.play(-1); passes += 1
                 else:
-                    print("平局！")
+                    move_int, is_pass, value = self.choose_move(
+                        board, my_hist[0], my_hist[1], to_play, legal,
+                        temperature=temperature)
+                    if is_pass:
+                        board.play(-1); passes += 1
+                        print(f"AI 虚着 (value={value:+.3f})")
+                    else:
+                        r, c = self._move_int_to_coord(move_int)
+                        mv = r * self.board_size + c
+                        board.play(mv); passes = 0
+                        hist = my_hist[0] if to_play == 1 else my_hist[1]
+                        hist.pop(0); hist.append(mv)
+                        print(f"AI 落子 {chr(ord('a')+c)}{chr(ord('a')+r)} (value={value:+.3f})")
+            move_count += 1
+        print(board.to_string())
+        score = board.score()
+        print(f"终局 score(黑-白)={score:+.1f} -> {'黑胜' if score > 0 else '白胜'}")
+
+    def analyze(self, max_moves=400, temperature=0.0):
+        """交互式分析：从当前局面出发，展示 AI 的 top-k 候选着法。"""
+        board = GoBoard(self.board_size)
+        my_hist = [[-1, -1, -1], [-1, -1, -1]]
+        print("逐步分析（输入坐标落子，pass 虚着，auto 让 AI 走，q 退出）")
+        while True:
+            to_play = board.current_player
+            print(board.to_string())
+            legal = board.get_legal_moves()
+            policy, value = self.predict(board, my_hist[0], my_hist[1], to_play)
+            bs = self.board_size
+            ranked = []
+            for m in legal:
+                ranked.append((m, float(policy[m])))
+            ranked.append((bs * bs, float(policy[bs * bs])))  # pass
+            ranked.sort(key=lambda t: t[1], reverse=True)
+            print(f"当前 to_play={to_play}  value={value:+.3f}")
+            for m, p in ranked[:8]:
+                if m == bs * bs:
+                    print(f"  pass        p={p:.3f}")
+                else:
+                    r, c = divmod(m, bs)
+                    print(f"  {chr(ord('a')+c)}{chr(ord('a')+r)} (idx {m:3d})  p={p:.3f}")
+            inp = input("> ").strip().lower()
+            if inp in ("q", "quit"):
                 break
-    
-    def print_board(self):
-        """打印棋盘"""
-        print("\n  ", end="")
-        for j in range(self.board_size):
-            print(f"{j} ", end="")
-        print()
-        
-        for i in range(self.board_size):
-            print(f"{i} ", end="")
-            for j in range(self.board_size):
-                if self.board[i, j] == 1:
-                    print("● ", end="")
-                elif self.board[i, j] == -1:
-                    print("○ ", end="")
+            if inp == "auto":
+                mv = ranked[0][0]
+                if mv == bs * bs:
+                    board.play(-1)
                 else:
-                    print(". ", end="")
-            print()
-        
-        print(f"\n当前玩家: {'黑棋' if self.current_player == 1 else '白棋'}")
-        print(f"已下{len(self.move_history)}步")
+                    board.play(mv)
+                    hist = my_hist[0] if to_play == 1 else my_hist[1]
+                    hist.pop(0); hist.append(mv)
+                continue
+            if inp in ("pass", ""):
+                board.play(-1); continue
+            ok, mv = board.parse_move_str(inp, to_play)
+            if not ok or mv not in legal:
+                print("非法，重试。"); continue
+            board.play(mv)
+            hist = my_hist[0] if to_play == 1 else my_hist[1]
+            hist.pop(0); hist.append(mv)
 
 
 def main():
-    """主函数"""
     import argparse
-    
-    parser = argparse.ArgumentParser(description='AlphaGo围棋AI推理')
-    parser.add_argument('--model', type=str, help='模型路径')
-    parser.add_argument('--board-size', type=int, default=9, help='棋盘大小')
-    parser.add_argument('--device', type=str, default='cpu', help='设备')
-    parser.add_argument('--use-amp', action='store_true', help='使用自动混合精度')
-    parser.add_argument('--use-value', action='store_true', default=True, help='使用价值网络')
-    parser.add_argument('--mode', type=str, default='play', 
-                       choices=['play', 'eval', 'analyze'],
-                       help='运行模式')
-    
+    parser = argparse.ArgumentParser(description="围棋 SFT 模型推理 / 对弈")
+    parser.add_argument("--model", type=str, default=None, help="模型权重路径")
+    parser.add_argument("--board-size", type=int, default=19)
+    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--use-amp", action="store_true")
+    parser.add_argument("--mode", type=str, default="selfplay",
+                        choices=["selfplay", "human", "analyze"])
+    parser.add_argument("--games", type=int, default=1)
+    parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--topk", type=int, default=10)
+    parser.add_argument("--human-color", type=int, default=1)
     args = parser.parse_args()
-    
-    # 创建AI
-    ai = GoAI(
-        model_path=args.model,
-        board_size=args.board_size,
-        device=args.device,
-        use_amp=args.use_amp,
-        use_value=args.use_value
-    )
-    
-    if args.mode == 'play':
-        # 人机对弈
-        ai.play_against_human()
-    elif args.mode == 'eval':
-        # 评估当前局面
-        eval_result = ai.evaluate_position()
-        print(f"最佳着法: {eval_result['best_move']}")
-        print(f"置信度: {eval_result['best_prob']:.4f}")
-        print(f"价值: {eval_result['value']:.4f}")
-    elif args.mode == 'analyze':
-        # 分析着法
-        eval_result = ai.evaluate_position()
-        print(f"策略网络Top-5:")
-        top5 = np.argsort(eval_result['policy'])[-5:][::-1]
-        for i, move in enumerate(top5):
-            row, col = move // ai.board_size, move % ai.board_size
-            print(f"  {i+1}. {row} {col}: {eval_result['policy'][move]:.4f}")
-        
-        print(f"\n快速策略Top-5:")
-        top5_fast = np.argsort(eval_result['fast_policy'])[-5:][::-1]
-        for i, move in enumerate(top5_fast):
-            row, col = move // ai.board_size, move % ai.board_size
-            print(f"  {i+1}. {row} {col}: {eval_result['fast_policy'][move]:.4f}")
+
+    ai = GoAI(model_path=args.model, board_size=args.board_size,
+              device=args.device, use_amp=args.use_amp)
+    if args.mode == "selfplay":
+        res = ai.self_play(num_games=args.games, temperature=args.temperature, topk=args.topk)
+        wr = sum(1 for r in res if r > 0) / max(len(res), 1)
+        print(f"自对弈 {len(res)} 局，黑方胜率 {wr:.2%}")
+    elif args.mode == "human":
+        ai.play_against_human(human_color=args.human_color, temperature=args.temperature)
+    elif args.mode == "analyze":
+        ai.analyze(temperature=args.temperature)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
