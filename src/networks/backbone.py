@@ -200,35 +200,52 @@ class MultiHeadSelfAttention(nn.Module):
     def _global_attn(self, q, k, v):
         return _sdpa(q, k, v, dropout_p=self.attn_drop)
 
-    def _window_attn(self, q, k, v, H, W):
-        """滑动窗口注意力：对每个位置仅与窗口内 token 交互。
+    def _local_windows(self, t, H, W):
+        """真 2D 局部窗口提取（2026-09 语义修正版）。
 
-        用 F.unfold 取每个窗口的 ws*ws 个 token，把窗口维并入 batch 后用
+        返回 (B, N, Hh, ws², d)：第 n=(i,j) 个位置对应以其为中心的 ws×ws 窗口，
+        kernel 顺序 kh*ws+kw，越界补零。与 F.unfold 的 im2col 真窗口逐位一致。
+
+        实现：F.pad + Tensor.unfold（纯 strided view，零拷贝取窗）+ 一次满带宽
+        contiguous 拷贝，替代「F.unfold im2col + view/permute 二次重排」——
+        比旧路径少一次整块拷贝，且消除旧 view(B,Hh,d,N,ws²) 的 kernel/position
+        divmod 交换 bug（旧「窗口」实为 raster 展平序列上起点 (n·ws²) mod N 的
+        1D 循环滑窗，并非 2D 局部窗口）。
+        ⚠ 语义与旧 checkpoint 不兼容（旧权重在 scramble 语义下训练，需重训/重评估）。
+        """
+        ws = self.window_size
+        B, Hh, N, d = t.shape
+        pad = ws // 2
+        tp = F.pad(t.reshape(B, Hh * d, H, W), (pad, pad, pad, pad))
+        tv = tp.unfold(2, ws, 1).unfold(3, ws, 1)           # (B,C,H,W,kh,kw) 纯 view
+        tv = tv.reshape(B, Hh, d, H, W, ws, ws) \
+               .permute(0, 3, 4, 1, 5, 6, 2)                # (B,H,W,Hh,kh,kw,d)
+        return tv.reshape(B, N, Hh, ws * ws, d)             # 满带宽拷贝
+
+    def _window_attn(self, q, k, v, H, W):
+        """滑动窗口注意力：对每个位置仅与其 (ws×ws) 2D 局部窗口内 token 交互。
+
+        取每个窗口的 ws*ws 个 token，把窗口维并入 batch 后用
         手写 softmax 注意力（use_math，绕开 V100 上不可用的 FlashAttention）计算
         局部注意力，再取中心位置输出。复杂度 O(N * ws²)。
 
-        显存优化：unfold 后沿窗口维 N 分块（chunk），每块只对 G 个窗口做 SDPA，
+        显存优化：沿窗口维 N 分块（chunk），每块只对 G 个窗口做 SDPA，
         避免一次性构造 (B*N, Hh, ws², d) 大矩阵（B*N 在 19x19 上可达数万，直接 OOM）。
         分块后峰值激活只与 B*G 相关，与总 batch 解耦，可支持大 batch。
 
-        @_maybe_compiler_disable: 仅 V100(sm_70)/torch2.1 上 F.unfold 接动态 view/permute
+        @_maybe_compiler_disable: 仅 V100(sm_70)/torch2.1 上动态 view/permute
         链会让 inductor 触发 PolynomialError，此时排除出编译图；A100(sm_80+) 上 inductor
-        成熟可正常编译 unfold，不禁用，使整个注意力被融合。use_math 由 _SDPA_FORCE_MATH
+        成熟可正常编译，不禁用，使整个注意力被融合。use_math 由 _SDPA_FORCE_MATH
         模块开关决定（V100 走手写 softmax，A100 走 FlashAttention 后端）。
         q,k,v: (B, Hh, N, head_dim)，N = H*W。
         """
         ws = self.window_size
         B, Hh, N, d = q.shape
 
-        # 取窗口邻居: (B, Hh*d, N, ws*ws)
-        qu = F.unfold(q.reshape(B, Hh * d, H, W), kernel_size=ws, padding=ws // 2)
-        ku = F.unfold(k.reshape(B, Hh * d, H, W), kernel_size=ws, padding=ws // 2)
-        vu = F.unfold(v.reshape(B, Hh * d, H, W), kernel_size=ws, padding=ws // 2)
-
-        # 重排为 (B, N, Hh, ws*ws, d) 便于沿 N 分块
-        qu = qu.view(B, Hh, d, N, ws * ws).permute(0, 3, 1, 4, 2)  # (B, N, Hh, ws², d)
-        ku = ku.view(B, Hh, d, N, ws * ws).permute(0, 3, 1, 4, 2)
-        vu = vu.view(B, Hh, d, N, ws * ws).permute(0, 3, 1, 4, 2)
+        # 取窗口邻居: (B, N, Hh, ws², d)——真 2D 局部窗口
+        qu = self._local_windows(q, H, W)
+        ku = self._local_windows(k, H, W)
+        vu = self._local_windows(v, H, W)
 
         center = (ws * ws) // 2
         out_chunks = []
@@ -253,64 +270,56 @@ class MultiHeadSelfAttention(nn.Module):
         每个 query 位置只与两类 key 交互：
           1) 自身 (ws×ws) 局部窗口内的 token（局部性，同 window）；
           2) 每隔 stride=ws 下采样的「全局代表 token」（长程信息通路）。
-        总序列长度 = ws² + ng（ng≈(H/ws)×(W/ws)），与 window 同量级显存，
-        但全局 token 之间又各自在窗口内连通，使整盘信息可经 2~3 跳传播，
-        显著优于纯 window 的长程建模，且远省于全局 O(N²) 注意力。
 
-        显存：沿窗口维 N 分块（同 _window_attn 的 window_chunk），避免 B*N 大矩阵。
+        性能设计（2026-09 重写，含语义修正）：
+          - 语义修正：旧实现的 view(B,Hh,d,N,ws²) 把 F.unfold 的 kernel 槽与
+            position 按 divmod(n·ws²+w, N) 交换了——「窗口」实为 raster 展平
+            序列上的 1D 循环滑窗，并非 docstring 宣称的 2D 局部窗口。本版修正
+            为以 (i,j) 为中心的真 2D 局部窗口（见 _local_windows）。
+            ⚠ 与旧 checkpoint 不兼容（旧权重在 scramble 语义下训练，需重训/重评估）。
+          - 性能：k/v 用 pad + Tensor.unfold strided view + 一次满带宽拷贝，
+            消除 F.unfold im2col（profiler 占 27.6%）与二次重排；全链零 slice
+            分块节点；q 只取窗口中心（= 自身位置，O(N·d) 小拷贝，不再为它做
+            O(N·ws²·d) 的全量 unfold）。
+          - 不再分块：query 只有中心 1 个 token，注意力矩阵
+            (B*N, Hh, 1, ws²+ng) 极小，单次成型即可。
 
-        @_maybe_compiler_disable: 同 _window_attn，仅 V100 上排除编译，A100 纳入编译图。
-        use_math 由 _SDPA_FORCE_MATH 模块开关决定（V100 走手写 softmax，A100 走 FlashAttention）。
-        q,k,v: (B, Hh, N, head_dim)，N = H*W。
+        q,k,v: (B, Hh, N, head_dim)，N = H*W。返回 (B, N, Hh*d)。
         """
         ws = self.window_size
         stride = ws  # 全局 token 每隔 stride 取一个（块中心）
         B, Hh, N, d = q.shape
 
-        # ---- 局部窗口邻居 (B, N, Hh, ws², d) ----
-        qu = F.unfold(q.reshape(B, Hh * d, H, W), kernel_size=ws, padding=ws // 2)
-        ku = F.unfold(k.reshape(B, Hh * d, H, W), kernel_size=ws, padding=ws // 2)
-        vu = F.unfold(v.reshape(B, Hh * d, H, W), kernel_size=ws, padding=ws // 2)
-        qu = qu.view(B, Hh, d, N, ws * ws).permute(0, 3, 1, 4, 2)  # (B, N, Hh, ws², d)
-        ku = ku.view(B, Hh, d, N, ws * ws).permute(0, 3, 1, 4, 2)
-        vu = vu.view(B, Hh, d, N, ws * ws).permute(0, 3, 1, 4, 2)
+        # ---- 1) k/v：真 2D 局部窗口，单次满带宽拷贝（无 im2col、无 slice 节点）----
+        kw = self._local_windows(k, H, W).reshape(B * N, Hh, ws * ws, d)
+        vw = self._local_windows(v, H, W).reshape(B * N, Hh, ws * ws, d)
 
-        # ---- 全局代表 token：从 k/v 按 stride 下采样块中心 ----
-        # k: (B, Hh, N, d) -> (B, Hh, H, W, d)
-        kg = k.reshape(B, Hh, H, W, d)
-        vg = v.reshape(B, Hh, H, W, d)
+        # ---- 2) q 即窗口中心（= 自身位置）：纯 head 主序重排，一次小拷贝 ----
+        # 注意不可经纠缠 reshape(B,Hh*d,H,W) 取中心——纠缠空间的中心槽并非自身 token。
+        qc = q.permute(0, 2, 1, 3).reshape(B * N, Hh, 1, d)   # (B*N, Hh, 1, d) 小拷贝
+
+        # ---- 4) 全局代表 token：块中心（pattern 与旧实现一致）----
         gh, gw = H // stride, W // stride
-        # 截断到 stride 的整数倍（丢弃边界余数行/列，仅影响全局 token 覆盖，
-        # 不影响局部窗口对全图的覆盖）
-        kg = kg[:, :, :gh * stride, :gw * stride, :]
-        vg = vg[:, :, :gh * stride, :gw * stride, :]
-        # 取每 stride×stride 块的中心坐标
-        kg = kg.view(B, Hh, gh, stride, gw, stride, d)[:, :, :, stride // 2, :, stride // 2, :]
-        vg = vg.view(B, Hh, gh, stride, gw, stride, d)[:, :, :, stride // 2, :, stride // 2, :]
         ng = gh * gw
-        kg = kg.reshape(B, Hh, ng, d)  # (B, Hh, ng, d)
+        kg = k.reshape(B, Hh, H, W, d)[:, :, :gh * stride, :gw * stride, :]
+        kg = kg.view(B, Hh, gh, stride, gw, stride, d)[:, :, :, stride // 2, :, stride // 2, :]
+        kg = kg.reshape(B, Hh, ng, d)                       # (B,Hh,ng,d)
+        vg = v.reshape(B, Hh, H, W, d)[:, :, :gh * stride, :gw * stride, :]
+        vg = vg.view(B, Hh, gh, stride, gw, stride, d)[:, :, :, stride // 2, :, stride // 2, :]
         vg = vg.reshape(B, Hh, ng, d)
 
-        center = (ws * ws) // 2
-        out_chunks = []
-        G = max(1, getattr(self, 'window_chunk', 128))
-        for s in range(0, N, G):
-            e = min(s + G, N)
-            qc = qu[:, s:e].reshape(B * (e - s), Hh, ws * ws, d)
-            kc = ku[:, s:e].reshape(B * (e - s), Hh, ws * ws, d)
-            vc = vu[:, s:e].reshape(B * (e - s), Hh, ws * ws, d)
-            # query 用局部中心 token 的 q；key/value = 局部窗口 + 全局 token
-            q_center = qc[:, :, center:center + 1, :]  # (B*G, Hh, 1, d)
-            # 全局 token 广播到当前窗口块 (B*G, Hh, ng, d)
-            k_glob = kg.unsqueeze(1).expand(B, e - s, Hh, ng, d).reshape(B * (e - s), Hh, ng, d)
-            v_glob = vg.unsqueeze(1).expand(B, e - s, Hh, ng, d).reshape(B * (e - s), Hh, ng, d)
-            k_all = torch.cat([kc, k_glob], dim=2)  # (B*G, Hh, ws²+ng, d)
-            v_all = torch.cat([vc, v_glob], dim=2)
-            oc = _sdpa(q_center, k_all, v_all, dropout_p=self.attn_drop,
-                       use_math=_sdpa_force_math)  # V100 走 math；A100 走 Flash
-            out_chunks.append(oc.reshape(B, e - s, Hh, d))
-        out = torch.cat(out_chunks, dim=1)  # (B, N, Hh, d)
-        return out.reshape(B, N, Hh * d)
+        # ---- 5) 广播到每个 token：expand 纯 view + 一次 reshape 拷贝 ----
+        k_glob = kg.unsqueeze(1).expand(B, N, Hh, ng, d).reshape(B * N, Hh, ng, d)
+        v_glob = vg.unsqueeze(1).expand(B, N, Hh, ng, d).reshape(B * N, Hh, ng, d)
+
+        # ---- 6) 拼接 + 单次成型注意力（无分块循环）----
+        k_all = torch.cat([kw, k_glob], dim=2)              # (B*N, Hh, ws²+ng, d)
+        v_all = torch.cat([vw, v_glob], dim=2)
+        oc = _sdpa(qc, k_all, v_all, dropout_p=self.attn_drop,
+                   use_math=_sdpa_force_math)               # (B*N, Hh, 1, d)
+
+        # ---- 7) 回到 (B, N, Hh*d)：head 主序展平，纯 view 无拷贝 ----
+        return oc.view(B, N, Hh, d).reshape(B, N, Hh * d)
 
     def _axial_attn(self, q, k, v, H, W):
         """轴向注意力：先按行、再按列做 1D 自注意力。
