@@ -379,12 +379,16 @@ class MCTS:
             node.virtual_loss = 0
 
     def search(self, root_board, my_hist, op_hist, to_play, simulations=400,
-               verbose=False, path_moves=None):
+               verbose=False, path_moves=None, progress_cb=None):
         """执行 MCTS，返回按访问次数分布（已 softmax/temperature）的 action 概率。
 
         path_moves: 可选，从**上一次 search 的根局面**到当前局面的着法序列
             （GoBoard 编码，pass 为 -1）。提供且上一次的树仍在时，沿已有子树
             下潜复用（访问/价值统计继承），否则从零建树。
+
+        progress_cb: 可选，progress_cb(sims_done, root)，每完成一次模拟调用一次
+            （sims_done 为已完成模拟数，root 为当前根节点）。用于 UI 实时渲染；
+            回调异常会被吞掉，不影响搜索。
 
         Returns:
             visits: np.ndarray (n_actions,) 各着法访问次数
@@ -494,14 +498,17 @@ class MCTS:
             # 攒够一批（或接近）再统一展开，平衡并行度与 batch 利用率
             if len(batch) >= self.num_threads or expanded_count + len(batch) >= total:
                 for pth in batch:
-                    sim_count = expanded_count + 1
-                    print(f"  [DEBUG] 正在执行第 {sim_count} 次模拟...", flush=True)
                     leaf = pth[-1]
                     leaf.board = self._replay_path(pth)
                     self._expand(leaf)
                     leaf.board = None  # 展开完成即释放盘面
                     self._backup(pth, v_leaf=-leaf.value_sum)  # leaf 我方视角
                     expanded_count += 1
+                    if progress_cb is not None:
+                        try:
+                            progress_cb(expanded_count, root)
+                        except Exception:  # noqa: BLE001
+                            pass
                 batch = []
         finished.set()
         for t in threads:

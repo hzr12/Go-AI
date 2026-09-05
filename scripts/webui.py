@@ -10,8 +10,10 @@ src.search.mcts.MCTS（含 2026-09 的树复用与增量展开优化）。
 
 特性:
   - 19×19 棋盘（人执黑 / AI 执白），点击落子，支持 pass
+  - 悔棋：连 AI 应手一并回退（MCTS 树复用路径同步回退），终局后可复活
   - 中国规则（数子法 + 贴目 7.5），终局自动计分
   - AI 每步 MCTS 实时搜索：top 候选着法叠加在棋盘上（访问次数热力）
+  - 每次模拟实时渲染：搜索期间前端轮询 /api/search_progress，visits 热力逐模拟演化
   -   侧栏显示各候选 visits / prior / AI 胜率 / 根价值 / 搜索耗时
   - MCTS 树复用（path_moves）：整局搜索树跨步继承，AI 越下越快
   - 可选纯策略模式（无 MCTS）：单次网络前向即落子，秒级响应
@@ -56,6 +58,8 @@ class Session:
         self.default_mode = default_mode
         self.hybrid_sims = hybrid_sims
         self.hybrid_blend = hybrid_blend
+        self._progress_lock = threading.Lock()  # 保护 search_progress（搜索线程写/轮询线程读）
+        self.search_progress = None             # 最近一次搜索进度快照（实时渲染用）
         self.reset()
 
     def reset(self):
@@ -70,6 +74,28 @@ class Session:
         self.log = []                              # AI 步日志
         self.game_over = False
         self.final_score = None
+        self.search_progress = None
+
+    def _progress_cb(self, sims_done, root):
+        """MCTS 每次模拟后的进度回调：快照根 children 的 visits/胜率供前端轮询。"""
+        bs = self.size
+        cands = []
+        for mv, child in root.children.items():
+            q_child = child.q()  # child.to_play（=人类）视角
+            cands.append({
+                "mv": mv, "r": mv // bs, "c": mv % bs,
+                "visits": int(child.visit),
+                "prior": round(float(child.prior), 4),
+                "ai_winrate": round(0.5 - q_child / 2.0, 3),
+            })
+        cands.sort(key=lambda x: -x["visits"])
+        snap = {"sims": sims_done, "candidates": cands[:10]}
+        with self._progress_lock:
+            self.search_progress = snap
+
+    def progress(self):
+        with self._progress_lock:
+            return self.search_progress
 
     # ---- 视图 ---------------------------------------------------------------
 
@@ -114,6 +140,32 @@ class Session:
             self.final_score = self.board.score()
             self.game_over = True
 
+    def _rebuild_after_undo(self):
+        """从 board.move_history 重建悔棋后的派生状态（hist/last_move/终局判定等）。"""
+        n = self.size
+        hist = [[-1, -1, -1], [-1, -1, -1]]
+        last_move = None
+        for idx, mv in enumerate(self.board.move_history):
+            color = 1 if idx % 2 == 0 else -1  # 黑先
+            if mv >= 0:
+                h = hist[0] if color == 1 else hist[1]
+                h.pop(0)
+                h.append(mv)
+                last_move = (mv // n, mv % n)
+            else:
+                last_move = "pass"
+        self.hist = hist
+        self.last_move = last_move
+        self.move_count = len(self.board.move_history)
+        self.candidates = []
+        self.ai_info = None
+        if self.board.passes >= 2:
+            self.final_score = self.board.score()
+            self.game_over = True
+        else:
+            self.final_score = None
+            self.game_over = False
+
     # ---- 动作 ---------------------------------------------------------------
 
     def human_move(self, mv):
@@ -130,6 +182,27 @@ class Session:
 
     def human_pass(self):
         return self.human_move(PASS)
+
+    def undo(self):
+        """悔棋：撤销到上一次人类落子之前。
+
+        - AI 已应手（轮到人类）：连撤 AI 一手 + 人类一手，共两手
+        - AI 未应手（轮到 AI，人类刚落子）：只撤人类一手
+        - 终局后也可悔棋复活对局
+        path_moves（MCTS 树复用路径）同步回退，保证搜索树位置一致。
+        """
+        with self.lock:
+            if not self.board._undo_stack:
+                return {"error": "没有可撤销的着法"}
+            steps = 2 if self.board.current_player == 1 else 1
+            steps = min(steps, len(self.board._undo_stack))
+            for _ in range(steps):
+                if not self.board.undo():
+                    break
+                if self.path_moves:
+                    self.path_moves.pop()
+            self._rebuild_after_undo()
+            return self.state()
 
     def _ai_move_policy(self):
         """纯策略模式：单次网络前向选点，完全不做 MCTS 搜索（极速，棋力=策略网络本身）。"""
@@ -187,10 +260,13 @@ class Session:
         n_actions = bs * bs + 1
         sims = self.hybrid_sims
         t0 = time.perf_counter()
+        with self._progress_lock:
+            self.search_progress = None
         policy, _value = self.ai.predict(self.board, self.hist[0], self.hist[1], to_play)
         visits, _probs, root_value = self.mcts.search(
             self.board, self.hist[0], self.hist[1], to_play,
-            simulations=sims, path_moves=self.path_moves)
+            simulations=sims, path_moves=self.path_moves,
+            progress_cb=self._progress_cb)
         elapsed = time.perf_counter() - t0
 
         pol = np.asarray(policy).reshape(-1).astype(np.float64).copy()
@@ -250,9 +326,12 @@ class Session:
             to_play = self.board.current_player
             legal = self.board.get_legal_moves()
             t0 = time.perf_counter()
+            with self._progress_lock:
+                self.search_progress = None
             visits, probs, root_value = self.mcts.search(
                 self.board, self.hist[0], self.hist[1], to_play,
-                simulations=simulations, path_moves=self.path_moves)
+                simulations=simulations, path_moves=self.path_moves,
+                progress_cb=self._progress_cb)
             elapsed = time.perf_counter() - t0
 
             move_int = int(np.argmax(visits)) if visits.sum() > 0 else len(visits) - 1
@@ -328,6 +407,8 @@ def build_handler(session, html_page=None):
                 self._send_html(page)
             elif self.path == "/api/state":
                 self._send(session.state())
+            elif self.path == "/api/search_progress":
+                self._send({"progress": session.progress()})
             else:
                 self._send({"error": "not found"}, 404)
 
@@ -343,6 +424,8 @@ def build_handler(session, html_page=None):
                     self._send(session.ai_move(
                         simulations=int(body.get("simulations", 50)),
                         mode=body.get("mode")))
+                elif self.path == "/api/undo":
+                    self._send(session.undo())
                 elif self.path == "/api/reset":
                     session.reset()
                     self._send(session.state())
@@ -406,6 +489,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </select></label>
       <button class="primary" id="btnAI">AI 落子</button>
       <button id="btnPass">停一手</button>
+      <button id="btnUndo">悔棋</button>
       <button id="btnReset">新对局</button>
     </div>
     <div id="thinking"></div>
@@ -500,6 +584,7 @@ function render(){
   }
   document.getElementById('log').textContent = (S.log||[]).map(l =>
     `[${l.move}] visits ${l.visits}/${l.simulations} win ${(l.ai_winrate*100).toFixed(0)}% ${l.elapsed}s ${l.sps}/s`).join('\n');
+  document.getElementById('btnUndo').disabled = thinking || !(S.move_count > 0);
   draw();
 }
 
@@ -511,6 +596,7 @@ function setBusy(b){
     b ? (tips[mode] || 'AI 正在 MCTS 搜索…') : '';
   document.getElementById('btnAI').disabled = b;
   document.getElementById('btnPass').disabled = b;
+  document.getElementById('btnUndo').disabled = b || !(S && S.move_count > 0);
 }
 
 async function post(url, body){
@@ -537,10 +623,31 @@ cv.addEventListener('click', async (e) => {
   setBusy(false);
 });
 
+let pollTimer = null;
+function stopProgressPoll(){
+  if (pollTimer){ clearInterval(pollTimer); pollTimer = null; }
+}
+function startProgressPoll(){
+  stopProgressPoll();
+  pollTimer = setInterval(async () => {
+    try {
+      const j = await fetch('/api/search_progress').then(r => r.json());
+      if (j.progress && S && thinking){
+        S.candidates = j.progress.candidates;   // 实时 visits 热力直接替换候选
+        document.getElementById('thinking').textContent =
+          `AI 正在 MCTS 搜索… ${j.progress.sims} 模拟`;
+        draw();
+      }
+    } catch(e){}
+  }, 120);
+}
+
 async function aiTurn(){
   const mode = document.getElementById('mode').value;
   const sims = parseInt(document.getElementById('sims').value);
+  if (mode !== 'policy') startProgressPoll();
   const st = await post('/api/ai_move', {simulations: sims, mode: mode});
+  stopProgressPoll();
   if (st && st.over && st.score !== null){
     document.getElementById('thinking').textContent =
       `对局结束：黑${st.score>0?'胜':'负'}（黑-白 = ${st.score>0?'+':''}${st.score.toFixed(1)}）`;
@@ -555,6 +662,11 @@ document.getElementById('btnPass').onclick = async () => {
   if (thinking) return; setBusy(true);
   const st = await post('/api/human_pass', {});
   if (st && !st.over && st.to_play === -1) await aiTurn();
+  setBusy(false);
+};
+document.getElementById('btnUndo').onclick = async () => {
+  if (thinking) return; setBusy(true);
+  await post('/api/undo', {});
   setBusy(false);
 };
 document.getElementById('btnReset').onclick = async () => {
