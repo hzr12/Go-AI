@@ -67,7 +67,8 @@ class MCTS:
                  rollout_threads=None, expand_topk=0, expand_chunk=0,
                  solver_thresh=0.9, spec_prefetch=True,
                  leaf_ab_depth=0, leaf_ab_width=4, leaf_ab_weight=0.5,
-                 leaf_ab_uncertain=0.85, priors_leaf=False):
+                 leaf_ab_uncertain=0.85, priors_leaf=False,
+                 dirichlet_alpha=0.0, dirichlet_eps=0.0):
         """
         Args:
             ai:            GoAI 实例（需支持 predict_batch）
@@ -121,6 +122,10 @@ class MCTS:
         self.leaf_ab_weight = float(leaf_ab_weight)
         self.leaf_ab_uncertain = float(leaf_ab_uncertain)
         self.priors_leaf = bool(priors_leaf)
+        # 自对弈探索：根展开时先验混入 Dirichlet 噪声（0=关闭，对弈不受影响）。
+        # 注意：树复用复用根不重新展开，故仅每局首手有噪声——训练管线每局新建树即可。
+        self.dir_alpha = float(dirichlet_alpha)
+        self.dir_eps = float(dirichlet_eps)
         self._fast_policy = FastPolicy(board_size) if use_rollout else None
         self._rng = np.random.default_rng(1234)
 
@@ -224,8 +229,17 @@ class MCTS:
             self._eval_children(board, to_play, leaf, candidates)
             # 叶子价值用“子节点平均 q”反推（对手视角取负）
             leaf.value_sum = -sum(c.q() for c in leaf.children.values()) / max(len(leaf.children), 1)
+        self._apply_root_noise(leaf)
         leaf.visit = 1
         leaf.expanded = True
+
+    def _apply_root_noise(self, leaf):
+        """根展开后混入 Dirichlet 噪声（自对弈探索）。"""
+        if self.dir_eps > 0 and self.dir_alpha > 0 and leaf.parent is None and leaf.children:
+            noise = np.random.default_rng().dirichlet(
+                [self.dir_alpha] * len(leaf.children))
+            for c, en in zip(leaf.children.values(), noise):
+                c.prior = (1.0 - self.dir_eps) * c.prior + self.dir_eps * en
 
     def _eval_children(self, board, to_play, leaf, moves, priors=None):
         """评估一批候选着法并创建子节点。返回各子节点叶子视角价值列表。
