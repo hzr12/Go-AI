@@ -1025,7 +1025,7 @@ def main():
         ai.quantize_dynamic()
     if args.onnx:
         ai.export_onnx(args.onnx)
-    session = Session(ai, board_size=args.board_size, num_threads=1,
+    session = Session(ai, board_size=ai.board_size, num_threads=1,
                       default_mode=args.mode, expand_topk=args.expand_topk,
                       expand_chunk=args.expand_chunk,
                       solver_thresh=args.solver_thresh,

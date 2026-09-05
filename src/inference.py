@@ -107,10 +107,45 @@ class GoAI:
             # 兼容直接保存的 state_dict 或 {"model": state_dict}
             if isinstance(state, dict) and "model" in state:
                 state = state["model"]
+            # 从 policy 头输出层形状推断训练棋盘大小，防止 19 路权重载入
+            # 9 路网络时 strict=False 静默留下随机 policy 头
+            inferred = self._infer_board_size(state)
+            if inferred is not None and inferred != self.board_size:
+                print(f"[GoAI] 权重按 {inferred} 路训练（当前 board_size={self.board_size}），"
+                      f"已按权重自动调整棋盘大小")
+                self.board_size = inferred
+                self.model = AlphaGoNet(
+                    in_channels=12,
+                    backbone_channels=backbone_channels,
+                    backbone_res_blocks=backbone_res_blocks,
+                    attention_mode=attention_mode,
+                    num_attention_layers=num_attention_layers,
+                    num_heads=num_heads,
+                    attention_dropout=attention_dropout,
+                    attn_mode=attn_mode,
+                    attn_window=attn_window,
+                    policy_channels=policy_channels,
+                    value_channels=value_channels,
+                    action_size=inferred * inferred + 1,
+                ).to(self.device)
+                if self.channels_last:
+                    self.model = self.model.to(memory_format=torch.channels_last)
             self.model.load_state_dict(state, strict=False)
             print(f"[GoAI] 已加载模型: {model_path}  ({device})")
         else:
             print(f"[GoAI] 未加载权重（随机初始化），仅用于流程验证。device={device}")
+
+    def _infer_board_size(self, state):
+        """从 policy 头输出层权重形状推断训练棋盘大小（输出维 = n²+1）。"""
+        import math
+        best = None
+        for k, v in state.items():
+            if "policy" in k and isinstance(v, torch.Tensor) and v.dim() == 2:
+                n1 = v.shape[0]
+                n = int(round(math.sqrt(max(n1 - 1, 0))))
+                if n >= 5 and n * n + 1 == n1:
+                    best = n
+        return best
 
     # ------------------------------------------------------------------ #
     # 特征构造

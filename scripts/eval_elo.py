@@ -256,6 +256,7 @@ def main():
     ai = GoAI(model_path=args.model, board_size=args.board_size, device=args.device,
               use_amp=args.device.startswith("cuda"),
               attn_mode="window", attn_window=7)
+    args.board_size = ai.board_size  # 权重自带棋盘大小时自动校正
     max_moves = args.max_moves or 3 * args.board_size * args.board_size
 
     players = {}
