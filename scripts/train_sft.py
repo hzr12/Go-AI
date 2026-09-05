@@ -743,6 +743,7 @@ def evaluate(model, dataset, eval_idx, bs, device, amp_dtype, use_channels_last)
         pred = policy_logits.argmax(dim=-1)
         correct += int((pred.cpu() == move_t.cpu()).sum())
         total += len(sel)
+    model.train()  # 恢复训练模式：否则 eval 后 BN 冻结 running stats、继续训练时前向失真
     return correct / max(1, total)
 
 
