@@ -23,12 +23,13 @@ def load_ai(args):
         model_path=args.model, board_size=args.board_size, device=device,
         use_amp=args.use_amp, attention_mode=args.attention_mode,
         num_attention_layers=args.num_attention_layers, num_heads=args.num_heads,
+        policy_channels=args.policy_channels, value_channels=args.value_channels,
         attn_mode=args.attn_mode, attn_window=args.attn_window, compile=args.compile,
     )
     return ai, device
 
 
-def evaluate_vs_random(ai, board_size, num_games=100, use_mcts=False, simulations=400, num_threads=4):
+def evaluate_vs_random(ai, board_size, num_games=100, use_mcts=False, simulations=400, num_threads=4, topk=10):
     """模型（黑）对随机策略（白），返回胜率（模型视角）。"""
     wins = losses = draws = 0
     for g in range(num_games):
@@ -46,7 +47,7 @@ def evaluate_vs_random(ai, board_size, num_games=100, use_mcts=False, simulation
                     mv, _, _ = ai.choose_move_mcts(board, my_hist[0], my_hist[1], to_play,
                                                   legal, simulations=simulations, num_threads=num_threads)
                 else:
-                    mv, _, _ = ai.choose_move(board, my_hist[0], my_hist[1], to_play, legal, topk=p.topk)
+                    mv, _, _ = ai.choose_move(board, my_hist[0], my_hist[1], to_play, legal, topk=topk)
                 if mv == board_size * board_size:
                     board.play(-1)
                 else:
@@ -98,6 +99,10 @@ def main():
     parser.add_argument("--attention-mode", default="mix", choices=["none", "mix", "all"])
     parser.add_argument("--num-attention-layers", type=int, default=4)
     parser.add_argument("--num-heads", type=int, default=4)
+    parser.add_argument("--policy-channels", type=int, default=32,
+                        help="policy 头隐层通道（须与训练时一致，训练默认 32）")
+    parser.add_argument("--value-channels", type=int, default=16,
+                        help="value 头隐层通道（须与训练时一致，训练默认 16）")
     parser.add_argument("--attn-mode", default="global", choices=["global", "window", "axial"])
     parser.add_argument("--attn-window", type=int, default=7)
     parser.add_argument("--compile", action="store_true")
@@ -114,7 +119,7 @@ def main():
     if p.mode == "random":
         res = evaluate_vs_random(ai, p.board_size, num_games=p.num_games,
                                  use_mcts=p.use_mcts, simulations=p.simulations,
-                                 num_threads=p.num_threads)
+                                 num_threads=p.num_threads, topk=p.topk)
         tag = "MCTS" if p.use_mcts else "policy-argmax"
         print(f"[{tag}] vs 随机 {p.num_games} 局: 胜 {res['wins']} 负 {res['losses']} 平 {res['draws']} "
               f"胜率 {res['win_rate']:.1%}")

@@ -37,7 +37,7 @@ class GoAI:
     """
 
     def __init__(self, model_path=None, board_size=19, device="auto", use_amp=False,
-                 backbone_channels=128, backbone_res_blocks=12, policy_channels=64, value_channels=32,
+                 backbone_channels=128, backbone_res_blocks=12, policy_channels=32, value_channels=16,
                  attention_mode="mix", num_attention_layers=4, num_heads=4, attention_dropout=0.0,
                  attn_mode="global", attn_window=7, compile=False, tf32=False,
                  channels_last=True):
@@ -223,10 +223,12 @@ class GoAI:
 
     def choose_move_mcts(self, board, my_hist, op_hist, to_play, legal_mask,
                          simulations=400, temperature=1.0, mcts=None, num_threads=4,
-                         use_rollout=False, rollout_lambda=0.25):
+                         use_rollout=False, rollout_lambda=0.25, path_moves=None):
         """用 MCTS 搜索选着法（推理提速核心）。返回 (move_int, is_pass, value)。
 
         use_rollout / rollout_lambda 启用 LightPLS：叶子价值融合轻量 rollout。
+        path_moves: 从上次 MCTS 搜索根局面到当前的着法序列（GoBoard 编码，
+            pass=-1），提供时复用上次搜索树的子树（访问/价值统计继承）。
         """
         from src.search.mcts import MCTS
         if mcts is None:
@@ -235,7 +237,7 @@ class GoAI:
                         rollout_lambda=rollout_lambda)
         move_int, is_pass, value = mcts.best_move(
             board, my_hist, op_hist, to_play, simulations=simulations,
-            temperature=temperature, return_value=True)
+            temperature=temperature, return_value=True, path_moves=path_moves)
         # 若 MCTS 选了非法着法（极端情况下），回退到纯策略
         if move_int not in legal_mask and move_int != self.board_size * self.board_size:
             return self.choose_move(board, my_hist, op_hist, to_play, legal_mask,
@@ -270,12 +272,14 @@ class GoAI:
             my_hist = [[-1, -1, -3], [-1, -1, -3]]  # 对当前执子方：最近3手
             passes = 0
             move_count = 0
+            path_moves = []  # 自上次 MCTS 搜索根以来的着法序列（树复用），新局重置
             while passes < 2 and move_count < max_moves:
                 to_play = board.current_player
                 legal = board.get_legal_moves()
                 if len(legal) == 0:
                     passes += 1
                     board.play(-1)
+                    path_moves.append(-1)
                     move_count += 1
                     continue
                 if use_mcts:
@@ -283,7 +287,7 @@ class GoAI:
                         board, my_hist[0], my_hist[1], to_play, legal,
                         simulations=simulations, temperature=temperature, mcts=mcts,
                         num_threads=num_threads, use_rollout=use_rollout,
-                        rollout_lambda=rollout_lambda)
+                        rollout_lambda=rollout_lambda, path_moves=path_moves)
                 else:
                     move_int, is_pass, value = self.choose_move(
                         board, my_hist[0], my_hist[1], to_play, legal,
@@ -291,10 +295,12 @@ class GoAI:
                 if is_pass:
                     board.play(-1)
                     passes += 1
+                    path_moves.append(-1)
                 else:
                     r, c = self._move_int_to_coord(move_int)
                     board.play(r * self.board_size + c)
                     passes = 0
+                    path_moves.append(r * self.board_size + c)
                     # 更新历史（最近3手，最新在末尾）
                     hist = my_hist[0] if to_play == 1 else my_hist[1]
                     hist.pop(0)
@@ -324,6 +330,7 @@ class GoAI:
         my_hist = [[-1, -1, -3], [-1, -1, -3]]
         passes = 0
         move_count = 0
+        path_moves = []  # 自上次 MCTS 搜索根以来的着法序列（树复用）
         while passes < 2 and move_count < max_moves:
             to_play = board.current_player
             legal = board.get_legal_moves()
@@ -334,6 +341,7 @@ class GoAI:
                 if inp in ("pass", ""):
                     board.play(-1)
                     passes += 1
+                    path_moves.append(-1)
                 elif inp in ("resign", "quit"):
                     print("你认输。")
                     break
@@ -344,29 +352,33 @@ class GoAI:
                         continue
                     board.play(mv)
                     passes = 0
+                    path_moves.append(mv)
                     hist = my_hist[0] if human_color == 1 else my_hist[1]
                     hist.pop(0); hist.append(mv)
             else:
                 if len(legal) == 0:
                     board.play(-1); passes += 1
+                    path_moves.append(-1)
                 else:
                     if use_mcts:
                         move_int, is_pass, value = self.choose_move_mcts(
                             board, my_hist[0], my_hist[1], to_play, legal,
                             simulations=simulations, temperature=temperature, mcts=mcts,
                             num_threads=num_threads, use_rollout=use_rollout,
-                            rollout_lambda=rollout_lambda)
+                            rollout_lambda=rollout_lambda, path_moves=path_moves)
                     else:
                         move_int, is_pass, value = self.choose_move(
                             board, my_hist[0], my_hist[1], to_play, legal,
                             temperature=temperature)
                     if is_pass:
                         board.play(-1); passes += 1
+                        path_moves.append(-1)
                         print(f"AI 虚着 (value={value:+.3f})")
                     else:
                         r, c = self._move_int_to_coord(move_int)
                         mv = r * self.board_size + c
                         board.play(mv); passes = 0
+                        path_moves.append(mv)
                         hist = my_hist[0] if to_play == 1 else my_hist[1]
                         hist.pop(0); hist.append(mv)
                         print(f"AI 落子 {chr(ord('a')+c)}{chr(ord('a')+r)} (value={value:+.3f})")
@@ -437,6 +449,10 @@ def main():
     parser.add_argument("--num-attention-layers", type=int, default=4)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--attention-dropout", type=float, default=0.0)
+    parser.add_argument("--policy-channels", type=int, default=32,
+                        help="policy 头隐层通道（须与训练时一致，训练默认 32）")
+    parser.add_argument("--value-channels", type=int, default=16,
+                        help="value 头隐层通道（须与训练时一致，训练默认 16）")
     parser.add_argument("--attn-mode", default="global",
                         choices=["global", "window", "axial"],
                         help="注意力计算模式: global=全配对, window=滑动窗口, axial=轴向")
@@ -462,6 +478,8 @@ def main():
               num_attention_layers=args.num_attention_layers,
               num_heads=args.num_heads,
               attention_dropout=args.attention_dropout,
+              policy_channels=args.policy_channels,
+              value_channels=args.value_channels,
               attn_mode=args.attn_mode,
               attn_window=args.attn_window,
               compile=args.compile, tf32=args.tf32)

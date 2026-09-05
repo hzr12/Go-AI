@@ -31,7 +31,7 @@ def test_mcts_runs_and_returns_valid_move():
     ai = _make_ai(9)
     board = GoBoard(9)
     hist = [[-1, -1, -3], [-1, -1, -3]]
-    mcts = MCTS(ai, board_size=9, num_threads=2, temperature=0.0)
+    mcts = MCTS(ai, board_size=9, num_threads=1, temperature=0.0)
     move_int, is_pass, value = mcts.best_move(
         board, hist[0], hist[1], to_play=1, simulations=50, return_value=True)
     assert isinstance(move_int, int)
@@ -43,7 +43,7 @@ def test_mcts_visits_sum_positive():
     ai = _make_ai(9)
     board = GoBoard(9)
     hist = [[-1, -1, -3], [-1, -1, -3]]
-    mcts = MCTS(ai, board_size=9, num_threads=2)
+    mcts = MCTS(ai, board_size=9, num_threads=1)
     visits, probs, root_value = mcts.search(
         board, hist[0], hist[1], to_play=1, simulations=50)
     assert visits.sum() > 0
@@ -62,7 +62,7 @@ def test_mcts_prefers_capture_over_random():
     board.board[3][3] = 1
     board.board[2][4] = 1
     hist = [[-1, -1, -3], [-1, -1, -3]]
-    mcts = MCTS(ai, board_size=9, num_threads=2, temperature=0.0)
+    mcts = MCTS(ai, board_size=9, num_threads=1, temperature=0.0)
     move_int, is_pass = mcts.best_move(
         board, hist[0], hist[1], to_play=1, simulations=30)
     legal = board.get_legal_moves()
@@ -87,7 +87,7 @@ def test_mcts_with_rollout_runs():
     ai = _make_ai(9)
     board = GoBoard(9)
     hist = [[-1, -1, -3], [-1, -1, -3]]
-    mcts = MCTS(ai, board_size=9, num_threads=2, temperature=0.0,
+    mcts = MCTS(ai, board_size=9, num_threads=1, temperature=0.0,
                 use_rollout=True, rollout_lambda=0.25)
     move_int, is_pass, value = mcts.best_move(
         board, hist[0], hist[1], to_play=1, simulations=30, return_value=True)

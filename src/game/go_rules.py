@@ -56,6 +56,7 @@ class GoBoard:
         self.ko_point = -1       # 打劫禁着点（扁平坐标），-1 表示无
         self.passes = 0          # 连续 pass 计数
         self.move_history = []   # 记录每步落子扁平坐标，pass 记为 -1
+        self._undo_stack = []    # 撤销栈：每项 (move, captured|None, prev_ko, prev_passes, prev_player)
 
     # ---- 基础查询 ----------------------------------------------------------
 
@@ -151,14 +152,19 @@ class GoBoard:
 
     # ---- 落子 --------------------------------------------------------------
 
-    def play(self, move: int) -> bool:
+    def play(self, move: int, record: bool = True) -> bool:
         """
         落子。move 为扁平坐标 (0..size*size-1)，或 -1 表示 pass。
         返回是否成功（非法落子返回 False 且不改变状态）。
+
+        record=True（默认）时把撤销信息压入 _undo_stack，可用 undo() 撤销
+        本次落子（含提子恢复 / 劫点 / pass 计数 / 历史 / 执子方）。
         """
         n = self.board_size
         if move == -1:
             # pass
+            if record:
+                self._undo_stack.append((-1, None, self.ko_point, self.passes, self.current_player))
             self.passes += 1
             self.ko_point = -1
             self.move_history.append(-1)
@@ -195,6 +201,11 @@ class GoBoard:
         for (cr, cc) in captured:
             self.board[cr, cc] = 0
 
+        # 压撤销信息（此时 ko/passes/player 尚未更新）
+        if record:
+            self._undo_stack.append(
+                (move, captured, self.ko_point, self.passes, self.current_player))
+
         # 打劫判定：提掉恰好 1 子，且落子子本身恰好只剩 1 气（即被提点）-> 形成劫
         if len(captured) == 1 and self._group_liberty_count(r, c) == 1:
             self.ko_point = captured[0][0] * n + captured[0][1]
@@ -204,6 +215,29 @@ class GoBoard:
         self.passes = 0
         self.move_history.append(move)
         self.current_player = -self.current_player
+        return True
+
+    def undo(self) -> bool:
+        """撤销最近一次成功 play（须 play(record=True)）。
+
+        完整恢复：棋盘子与被提子、劫禁着点、pass 计数、着法历史、执子方。
+        返回是否成功（栈空返回 False）。
+        """
+        if not self._undo_stack:
+            return False
+        move, captured, ko, passes, player = self._undo_stack.pop()
+        n = self.board_size
+        if move != -1:
+            r, c = divmod(move, n)
+            self.board[r, c] = 0
+            if captured:
+                cap_color = -player  # 被提子为落子方对手
+                for (cr, cc) in captured:
+                    self.board[cr, cc] = cap_color
+        self.move_history.pop()
+        self.ko_point = ko
+        self.passes = passes
+        self.current_player = player
         return True
 
     # ---- 终局与计分 --------------------------------------------------------
