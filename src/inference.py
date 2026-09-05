@@ -22,6 +22,15 @@ from src.game.go_rules import GoBoard
 from src.networks.alphanet import AlphaGoNet
 
 
+def _ensure_torch_npu():
+    """导入 torch_npu（必须先于 .to('npu') 调用，注册 Ascend 后端）。返回是否可用。"""
+    try:
+        import torch_npu  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
 class GoAI:
     """基于 SFT 模型的围棋对弈 / 分析引擎。
 
@@ -42,9 +51,18 @@ class GoAI:
                  attn_mode="global", attn_window=7, compile=False, tf32=False,
                  channels_last=True):
         if device == "auto":
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            device = "cuda" if torch.cuda.is_available() else (
+                "npu" if _ensure_torch_npu() and torch.npu.is_available() else "cpu")
         self.device = device
-        self.use_amp = use_amp and self.device.startswith("cuda")
+        self.is_npu = device.startswith("npu")
+        if self.is_npu and not _ensure_torch_npu():
+            raise RuntimeError("--device npu 需要 torch_npu（须与 CANN 版本匹配，"
+                               "910A 用 torch_npu 1.11~2.1 均可）")
+        # 910A 不支持 bf16，NPU 上一律 fp16 autocast；CPU 不开 amp
+        self.use_amp = use_amp and (self.device.startswith("cuda") or self.is_npu)
+        if self.is_npu:
+            print("[GoAI] Ascend NPU 推理：fp16 autocast（910A 无 bf16），"
+                  "math 注意力，勿开 --compile")
         self.board_size = board_size
         # 网络侧压：tf32 让 V100/Amp 上的 fp32 matmul 走 TensorFloat-32（约 2-4x 提速，
         # 精度损失对推理可忽略）；channels_last 让 conv 走 NHWC 内存布局（conv 友好）。
@@ -73,7 +91,9 @@ class GoAI:
         # dummy 输入做一次 warmup 以触发真实编译并捕获异常。
         if self.channels_last:
             self.model = self.model.to(memory_format=torch.channels_last)
-        if compile and hasattr(torch, "compile"):
+        if compile and self.is_npu:
+            print("[GoAI] NPU 不支持 torch.compile，已忽略")
+        elif compile and hasattr(torch, "compile"):
             try:
                 self.model = torch.compile(self.model, dynamic=False)
                 with torch.no_grad():
@@ -208,8 +228,12 @@ class GoAI:
         """输入 (B,12,H,W)，输出 (policies_np(B,A), values(B,1))。"""
         with torch.no_grad():
             if self.use_amp:
-                with torch.cuda.amp.autocast():
-                    policy_logits, value = self.model(x)
+                if self.is_npu:
+                    with torch.autocast(device_type="npu", dtype=torch.float16):
+                        policy_logits, value = self.model(x)
+                else:
+                    with torch.cuda.amp.autocast():
+                        policy_logits, value = self.model(x)
             else:
                 policy_logits, value = self.model(x)
         policies = torch.softmax(policy_logits, dim=-1).cpu().numpy()

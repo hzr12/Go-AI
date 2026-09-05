@@ -170,6 +170,7 @@ def main():
     np.random.seed(42)
 
     ai = GoAI(model_path=args.model, board_size=args.board_size, device=device,
+              use_amp=True,   # cuda/npu 启用 amp，cpu 内部自动忽略
               attn_mode="window", attn_window=7)
     bs = ai.board_size
     n_actions = bs * bs + 1

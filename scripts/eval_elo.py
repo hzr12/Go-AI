@@ -254,7 +254,7 @@ def main():
     torch.manual_seed(args.seed)
 
     ai = GoAI(model_path=args.model, board_size=args.board_size, device=args.device,
-              use_amp=args.device.startswith("cuda"),
+              use_amp=True,   # cuda/npu 启用 amp，cpu 内部自动忽略
               attn_mode="window", attn_window=7)
     args.board_size = ai.board_size  # 权重自带棋盘大小时自动校正
     max_moves = args.max_moves or 3 * args.board_size * args.board_size
