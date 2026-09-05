@@ -61,6 +61,7 @@ class Session:
         self.board = GoBoard(self.size)
         self.hist = [[-1, -1, -1], [-1, -1, -1]]  # [黑方最近3手, 白方最近3手]
         self.path_moves = []                       # MCTS 树复用：自上次搜索根的着法序列
+        self.mcts._prev_root = None                # 丢弃旧局搜索树（防错误复用子树）
         self.move_count = 0
         self.last_move = None                      # (r, c) 或 ('pass',)
         self.candidates = []                       # AI 最近一次搜索的 top 候选
