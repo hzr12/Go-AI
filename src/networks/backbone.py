@@ -247,34 +247,48 @@ class MultiHeadSelfAttention(nn.Module):
         return tv.reshape(B, N, Hh, ws * ws, d)             # 满带宽拷贝
 
     def _window_attn(self, q, k, v, H, W):
-        """滑动窗口注意力：对每个位置仅与其 (ws×ws) 2D 局部窗口内 token 交互。
+        """块状窗口注意力（2026-09 定稿，Swin 风格，替代滑动窗口）。
 
-        取每个窗口的 ws*ws 个 token，对窗口中心槽做注意力后输出。复杂度 O(N * ws²)。
+        将 H×W pad 到 ws 整除后切成不重叠 ws×ws 窗口，窗口内 token 全配对
+        做标准多头注意力（window partition + SDPA），每 token 与同块内
+        ws²-1 个邻居交互（块边界两侧不互看，棋盘外 pad 补零）。
 
-        性能设计（2026-09 重写定稿）：
-          - 单一路径：bmm+softmax 一次成型（_window_sdpa），零分块/零 slice/零
-            cat。attn 矩阵仅 (B*N, Hh, 1, ws²)（中心 1 query），~55MB/层可物化，
-            不需要 FlashAttention（1×25 微序列形状对 flash tiling 极不友好，
-            A100 profiler 实测 varlen backward 为 forward 的 3.6 倍）。
-          - 窗口内容为真 2D 局部窗口（语义修正见 _local_windows）；中心槽按纠缠
-            语义取自窗口张量（与旧实现同位）。
-        q,k,v: (B, Hh, N, head_dim)，N = H*W。
+        为什么替代滑动窗口（A100 profiler 驱动）：
+          - 滑动窗口需为每个位置展开 ws² 个 key（窗口张量 (B*N,Hh,ws²,d)，
+            ws=7/batch640 时 2.9GB/个 ×2(k,v)×4 层），copy_/clone/reshape
+            搬运占 CUDA ~45%；且 (1×d)@(d×ws²) 的 bmm 退化为 batched GEMV，
+            cuBLAS 走 gemvx/sm_75 低效内核（bmm 家族占 CUDA ~67%）。
+          - 块状窗口的 partition 重排仅 O(N·C)（滑动窗口的 1/ws² 搬运量），
+            注意力恢复为标准 MHA 形状 (B*nW, Hh, ws², ws²)——直接走
+            FlashAttention / SDPA 高效内核，注意力矩阵不物化。
+          - 语义变更：滑动 → 块状。⚠ 与滑动窗口 checkpoint 不兼容，需重训。
+
+        q,k,v: (B, Hh, N, head_dim)（q 已预乘 scale），N=H*W。返回 (B, N, C)。
         """
         ws = self.window_size
         B, Hh, N, d = q.shape
-        center = (ws * ws) // 2
+        H2 = ((H + ws - 1) // ws) * ws
+        W2 = ((W + ws - 1) // ws) * ws
+        ph, pw = H2 - H, W2 - W
+        nwH, nwW = H2 // ws, W2 // ws
+        nW = nwH * nwW
 
-        # 取窗口邻居: (B, N, Hh, ws², d)——真 2D 局部窗口
-        qu = self._local_windows(q, H, W)
-        ku = self._local_windows(k, H, W)
-        vu = self._local_windows(v, H, W)
+        def part(t):   # (B,Hh,N,d) -> (B*nW, Hh, ws², d)
+            x = t.view(B, Hh, H, W, d)
+            if ph or pw:
+                x = F.pad(x, (0, 0, 0, pw, 0, ph))   # (d 无, W 右, H 下)
+            x = x.view(B, Hh, nwH, ws, nwW, ws, d)
+            return x.permute(0, 2, 4, 1, 3, 5, 6) \
+                    .reshape(B * nW, Hh, ws * ws, d)
 
-        # 窗口中心槽（纠缠语义，与旧实现同位）作为 query；k/v 零拷贝 view
-        qc = qu[:, :, :, center, :].reshape(B * N, Hh, 1, d)
-        kw = ku.reshape(B * N, Hh, ws * ws, d)
-        vw = vu.reshape(B * N, Hh, ws * ws, d)
-        oc = _window_sdpa(qc, kw, vw, dropout_p=self.attn_drop)  # (B*N, Hh, 1, d)
-        return oc.view(B, N, Hh, d).reshape(B, N, Hh * d)
+        def unpart(o):  # (B*nW, Hh, ws², d) -> (B, N, Hh*d)
+            x = o.view(B, nwH, nwW, Hh, ws, ws, d)
+            x = x.permute(0, 3, 1, 4, 2, 5, 6).reshape(B, Hh, H2, W2, d)
+            if ph or pw:
+                x = x[:, :, :H, :W, :]               # 裁掉 pad（零化仅 ~40MB）
+            return x.permute(0, 2, 3, 1, 4).reshape(B, N, Hh * d)
+
+        return unpart(_sdpa(part(q), part(k), part(v), dropout_p=self.attn_drop))
 
     def _sparse_attn(self, q, k, v, H, W):
         """稀疏注意力（固定稀疏模式）：局部滑动窗口 + 跨步长全局 token。
