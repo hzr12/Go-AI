@@ -46,7 +46,8 @@ class Session:
     def __init__(self, ai, board_size=19, num_threads=1, default_mode="mcts",
                  expand_topk=32, expand_chunk=8, solver_thresh=0.9,
                  spec_prefetch=True, leaf_ab_depth=0, leaf_ab_width=4,
-                 priors_leaf=False, hybrid_sims=32, hybrid_blend=0.5):
+                 priors_leaf=False, hybrid_sims=32, hybrid_blend=0.5,
+                 policy_depth=1, policy_width=4, policy_topk=12):
         self.ai = ai
         self.size = board_size
         self.lock = threading.Lock()
@@ -58,11 +59,17 @@ class Session:
         self.default_mode = default_mode
         self.hybrid_sims = hybrid_sims
         self.hybrid_blend = hybrid_blend
+        self.policy_depth = max(1, int(policy_depth))
+        self.policy_width = max(1, int(policy_width))
+        self.policy_topk = max(2, int(policy_topk))
         self._progress_lock = threading.Lock()  # 保护 search_progress（搜索线程写/轮询线程读）
         self.search_progress = None             # 最近一次搜索进度快照（实时渲染用）
+        self.human_color = 1                    # 人类执子（1=黑先手, -1=白）
         self.reset()
 
-    def reset(self):
+    def reset(self, human_color=None):
+        if human_color is not None:
+            self.human_color = human_color
         self.board = GoBoard(self.size)
         self.hist = [[-1, -1, -1], [-1, -1, -1]]  # [黑方最近3手, 白方最近3手]
         self.path_moves = []                       # MCTS 树复用：自上次搜索根的着法序列
@@ -75,6 +82,7 @@ class Session:
         self.game_over = False
         self.final_score = None
         self.search_progress = None
+        self.wr_hist = []   # 胜率曲线采样 [{mc:手数, wr:AI视角胜率}]（AI 每手记一次）
 
     def _progress_cb(self, sims_done, root):
         """MCTS 每次模拟后的进度回调：快照根 children 的 visits/胜率供前端轮询。"""
@@ -110,13 +118,16 @@ class Session:
             "size": self.size,
             "board": self.board.board.reshape(-1).tolist(),
             "to_play": self.board.current_player,
+            "human_color": self.human_color,
             "move_count": self.move_count,
             "last_move": self.last_move,
             "over": over,
             "score": score,
+            "lead": self.board.score(),   # 中盘形势（中国规则数子估分，含 7.5 贴目）
             "candidates": self.candidates,
             "ai_info": self.ai_info,
             "log": self.log[-40:],
+            "wr_hist": self.wr_hist,
         }
 
     def _apply_move(self, mv, mover):
@@ -159,6 +170,7 @@ class Session:
         self.move_count = len(self.board.move_history)
         self.candidates = []
         self.ai_info = None
+        self.wr_hist = [e for e in self.wr_hist if e["mc"] <= self.move_count]
         if self.board.passes >= 2:
             self.final_score = self.board.score()
             self.game_over = True
@@ -172,7 +184,7 @@ class Session:
         with self.lock:
             if self.game_over:
                 return {"error": "对局已结束"}
-            if self.board.current_player != 1:
+            if self.board.current_player != self.human_color:
                 return {"error": "当前轮到 AI"}
             legal = self.board.get_legal_moves()
             if mv != PASS and (mv < 0 or mv >= len(legal) or not legal[mv]):
@@ -194,7 +206,7 @@ class Session:
         with self.lock:
             if not self.board._undo_stack:
                 return {"error": "没有可撤销的着法"}
-            steps = 2 if self.board.current_player == 1 else 1
+            steps = 2 if self.board.current_player == self.human_color else 1
             steps = min(steps, len(self.board._undo_stack))
             for _ in range(steps):
                 if not self.board.undo():
@@ -205,30 +217,44 @@ class Session:
             return self.state()
 
     def _ai_move_policy(self):
-        """纯策略模式：单次网络前向选点，完全不做 MCTS 搜索（极速，棋力=策略网络本身）。"""
+        """纯策略模式：单次网络前向选点（policy_depth>=2 时做 2 步批量推演）。"""
         to_play = self.board.current_player
         legal = self.board.get_legal_moves()
         bs = self.size
         n_actions = bs * bs + 1
         t0 = time.perf_counter()
-        policy, value = self.ai.predict(self.board, self.hist[0], self.hist[1], to_play)
+        if self.policy_depth >= 2:
+            out, masked, move_int, value = self.mcts.lookahead2(
+                self.board, self.hist[0], self.hist[1], to_play,
+                topk=self.policy_topk, width=self.policy_width)
+        else:
+            policy, value = self.ai.predict(self.board, self.hist[0], self.hist[1], to_play)
+            masked = policy.copy()
+            for m in range(n_actions - 1):
+                if not legal[m]:
+                    masked[m] = 0.0
+            move_int = int(np.argmax(masked))
         elapsed = time.perf_counter() - t0
 
-        masked = policy.copy()
-        for m in range(n_actions - 1):
-            if not legal[m]:
-                masked[m] = 0.0
-        move_int = int(np.argmax(masked))
-
-        # top 候选（policy 概率；visits 字段放概率×1000 供棋盘热力渲染）
-        ranked = sorted(
-            ((m, float(masked[m])) for m in range(n_actions - 1) if masked[m] > 0),
-            key=lambda t: -t[1])[:10]
-        self.candidates = [{
-            "mv": m, "r": m // bs, "c": m % bs,
-            "visits": max(1, int(round(p * 1000))), "prior": round(p, 4),
-            "ai_winrate": round((value + 1) / 2.0, 3),
-        } for m, p in ranked]
+        if self.policy_depth >= 2:
+            # top 候选按推演价值排序（prior 列=根策略概率，visits 列=概率×1000 供热力）
+            ranked = sorted(out.items(), key=lambda t: -t[1])[:10]
+            self.candidates = [{
+                "mv": m, "r": m // bs, "c": m % bs,
+                "visits": max(1, int(round(float(masked[m]) * 1000))),
+                "prior": round(float(masked[m]), 4),
+                "ai_winrate": round((v + 1) / 2.0, 3),
+            } for m, v in ranked]
+        else:
+            # top 候选（policy 概率；visits 字段放概率×1000 供棋盘热力渲染）
+            ranked = sorted(
+                ((m, float(masked[m])) for m in range(n_actions - 1) if masked[m] > 0),
+                key=lambda t: -t[1])[:10]
+            self.candidates = [{
+                "mv": m, "r": m // bs, "c": m % bs,
+                "visits": max(1, int(round(p * 1000))), "prior": round(p, 4),
+                "ai_winrate": round((value + 1) / 2.0, 3),
+            } for m, p in ranked]
 
         is_pass = (move_int == n_actions - 1)
         self._apply_move(PASS if is_pass else move_int, "ai")
@@ -245,6 +271,7 @@ class Session:
         }
         self.ai_info = info
         self.log.append(info)
+        self.wr_hist.append({"mc": self.move_count, "wr": ai_winrate})
         return self.state()
 
     def _ai_move_hybrid(self):
@@ -262,19 +289,32 @@ class Session:
         t0 = time.perf_counter()
         with self._progress_lock:
             self.search_progress = None
-        policy, _value = self.ai.predict(self.board, self.hist[0], self.hist[1], to_play)
         visits, _probs, root_value = self.mcts.search(
             self.board, self.hist[0], self.hist[1], to_play,
             simulations=sims, path_moves=self.path_moves,
             progress_cb=self._progress_cb)
+        if self.policy_depth >= 2:
+            # 策略分量升级为 2 步推演价值分布（softmax(T=0.2) 伪概率）
+            vals, _p, _bm, _bv = self.mcts.lookahead2(
+                self.board, self.hist[0], self.hist[1], to_play,
+                topk=self.policy_topk, width=self.policy_width)
+            ks = np.full(n_actions, -np.inf)
+            for m, v in vals.items():
+                ks[m] = v
+            fin = np.isfinite(ks)
+            pol_n = np.zeros(n_actions)
+            if fin.any():
+                ex = np.exp((ks[fin] - ks[fin].max()) / 0.2)
+                pol_n[fin] = ex / ex.sum()
+        else:
+            policy, _value = self.ai.predict(self.board, self.hist[0], self.hist[1], to_play)
+            pol = np.asarray(policy).reshape(-1).astype(np.float64).copy()
+            for m in range(n_actions - 1):
+                if not legal[m]:
+                    pol[m] = 0.0
+            ps = pol.sum()
+            pol_n = pol / ps if ps > 0 else np.zeros_like(pol)
         elapsed = time.perf_counter() - t0
-
-        pol = np.asarray(policy).reshape(-1).astype(np.float64).copy()
-        for m in range(n_actions - 1):
-            if not legal[m]:
-                pol[m] = 0.0
-        ps = pol.sum()
-        pol_n = pol / ps if ps > 0 else np.zeros_like(pol)
         vs = visits.astype(np.float64)
         vs_n = vs / vs.sum() if vs.sum() > 0 else np.zeros_like(vs)
         score = self.hybrid_blend * pol_n + (1.0 - self.hybrid_blend) * vs_n
@@ -310,13 +350,14 @@ class Session:
         }
         self.ai_info = info
         self.log.append(info)
+        self.wr_hist.append({"mc": self.move_count, "wr": ai_winrate})
         return self.state()
 
     def ai_move(self, simulations, temperature=0.0, mode=None):
         with self.lock:
             if self.game_over:
                 return {"error": "对局已结束"}
-            if self.board.current_player == 1:
+            if self.board.current_player == self.human_color:
                 return {"error": "当前轮到人类"}
             mode = mode or self.default_mode
             if mode == "policy":
@@ -375,6 +416,7 @@ class Session:
             }
             self.ai_info = info
             self.log.append(info)
+            self.wr_hist.append({"mc": self.move_count, "wr": ai_winrate})
             return self.state()
 
 
@@ -427,7 +469,8 @@ def build_handler(session, html_page=None):
                 elif self.path == "/api/undo":
                     self._send(session.undo())
                 elif self.path == "/api/reset":
-                    session.reset()
+                    color = body.get("color")
+                    session.reset(human_color={"black": 1, "white": -1}.get(color))
                     self._send(session.state())
                 else:
                     self._send({"error": "not found"}, 404)
@@ -446,36 +489,80 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <title>Go-AI MCTS WebUI</title>
 <style>
-  body { background:#1c1f26; color:#d7dae0; font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
-         margin:0; padding:16px; display:flex; gap:20px; }
-  #boardWrap { background:#2a2e37; padding:12px; border-radius:10px; }
-  canvas { cursor:pointer; display:block; }
-  #panel { width:380px; display:flex; flex-direction:column; gap:12px; }
-  .card { background:#2a2e37; border-radius:10px; padding:12px 14px; }
-  h2 { margin:0 0 8px; font-size:15px; color:#8ab4f8; }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  td, th { padding:3px 6px; text-align:left; border-bottom:1px solid #3a3f4a; }
-  th { color:#9aa0a6; font-weight:normal; }
-  .mv { font-family:monospace; color:#8ab4f8; }
-  .bar { height:16px; background:#444; border-radius:8px; overflow:hidden; margin-top:6px; }
-  .bar > div { height:100%; background:#5bb974; text-align:center; font-size:11px;
-               color:#111; line-height:16px; transition:width .4s; }
-  select, button { background:#3a3f4a; color:#d7dae0; border:1px solid #4a5060;
-                   border-radius:6px; padding:6px 12px; font-size:13px; cursor:pointer; }
-  button:hover { background:#4a5160; }
-  button.primary { background:#8ab4f8; color:#111; border:none; font-weight:bold; }
-  button:disabled { opacity:.4; cursor:default; }
-  #thinking { color:#fbbc64; font-size:13px; min-height:18px; }
-  #log { font-size:12px; color:#9aa0a6; max-height:220px; overflow-y:auto;
-         font-family:monospace; white-space:pre-wrap; }
-  .stat { display:flex; justify-content:space-between; font-size:13px; padding:2px 0; }
-  .stat b { color:#8ab4f8; }
-  #err { color:#f28b82; font-size:13px; min-height:16px; }
+  :root {
+    --bg:#14171d; --card:#1f242d; --card2:#262c38; --line:#323947;
+    --txt:#d7dae0; --dim:#9aa0a6; --accent:#8ab4f8; --green:#5bb974; --warn:#fbbc64; --red:#f28b82;
+  }
+  * { box-sizing: border-box; }
+  body { background:var(--bg); color:var(--txt); font-family:"Segoe UI","Microsoft YaHei",sans-serif;
+         margin:0; padding:16px; display:flex; gap:18px; }
+  #boardWrap { position:relative; background:var(--card); padding:10px; border-radius:14px;
+               box-shadow:0 4px 18px rgba(0,0,0,.45); }
+  canvas { cursor:pointer; display:block; border-radius:8px; }
+  #overlay { position:absolute; inset:10px; border-radius:8px; background:rgba(10,12,16,.72);
+             display:flex; align-items:center; justify-content:center; }
+  #overlay.hidden { display:none; }
+  .over-card { background:var(--card2); border:1px solid var(--line); border-radius:12px;
+               padding:22px 32px; text-align:center; box-shadow:0 6px 24px rgba(0,0,0,.5); }
+  #overTitle { font-size:22px; font-weight:bold; color:var(--accent); margin-bottom:6px; }
+  #overSub { font-size:13px; color:var(--dim); margin-bottom:14px; }
+  #panel { width:390px; display:flex; flex-direction:column; gap:12px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px;
+          padding:12px 14px; box-shadow:0 2px 8px rgba(0,0,0,.3); }
+  h2 { margin:0 0 8px; font-size:13px; color:var(--accent); letter-spacing:.06em; }
+  .status-card { display:flex; justify-content:space-between; align-items:center;
+                 font-size:13px; padding:10px 14px; }
+  #turn b { color:var(--accent); }
+  #mvcount { color:var(--dim); font-variant-numeric:tabular-nums; }
+  table { width:100%; border-collapse:collapse; font-size:13px; font-variant-numeric:tabular-nums; }
+  td, th { padding:3px 6px; text-align:left; border-bottom:1px solid var(--line); }
+  th { color:var(--dim); font-weight:normal; }
+  tr:last-child td { border-bottom:none; }
+  .mv { font-family:Consolas,monospace; color:var(--accent); }
+  .bar { height:14px; background:#3a4150; border-radius:7px; overflow:hidden; margin:6px 0 2px; }
+  .bar > div { height:100%; background:linear-gradient(90deg,#4a9e63,#5bb974); text-align:center;
+               font-size:11px; color:#0d1a10; line-height:14px; transition:width .4s; }
+  select, button { background:#2c3340; color:var(--txt); border:1px solid #3d4655;
+                   border-radius:8px; padding:6px 12px; font-size:13px; cursor:pointer;
+                   transition:background .15s, transform .05s; }
+  button:hover:not(:disabled) { background:#38414f; }
+  button:active:not(:disabled) { transform:translateY(1px); }
+  button.primary { background:var(--accent); color:#0e1420; border:none; font-weight:bold; }
+  button.primary:hover:not(:disabled) { background:#9cc1fa; }
+  button:disabled { opacity:.35; cursor:default; }
+  #thinking { color:var(--warn); font-size:13px; min-height:20px; display:flex;
+              align-items:center; gap:6px; }
+  #thinking.busy::before { content:''; width:9px; height:9px; border-radius:50%; flex:none;
+                           background:var(--warn); animation:pulse 1s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity:.25; transform:scale(.75); }
+                     50% { opacity:1; transform:scale(1.1); } }
+  #log { font-size:12px; color:var(--dim); max-height:200px; overflow-y:auto;
+         font-family:Consolas,monospace; white-space:pre-wrap; font-variant-numeric:tabular-nums; }
+  .stat { display:flex; justify-content:space-between; font-size:13px; padding:2px 0;
+          font-variant-numeric:tabular-nums; }
+  .stat b { color:var(--accent); font-weight:600; }
+  #err { color:var(--red); font-size:13px; min-height:16px; }
+  #toast { position:absolute; left:50%; bottom:26px; transform:translateX(-50%);
+           background:rgba(20,24,32,.92); border:1px solid var(--line); color:var(--txt);
+           padding:6px 16px; border-radius:20px; font-size:13px; transition:opacity .3s;
+           pointer-events:none; }
+  #toast.hidden { opacity:0; }
 </style>
 </head>
 <body>
-<div id="boardWrap"><canvas id="bd" width="660" height="660"></canvas></div>
+<div id="boardWrap">
+  <canvas id="bd" width="660" height="660"></canvas>
+  <div id="toast" class="hidden"></div>
+  <div id="overlay" class="hidden">
+    <div class="over-card">
+      <div id="overTitle"></div>
+      <div id="overSub"></div>
+      <button class="primary" id="btnAgain">再来一局</button>
+    </div>
+  </div>
+</div>
 <div id="panel">
+  <div class="card status-card"><span id="turn">—</span><span id="lead"></span><span id="mvcount"></span></div>
   <div class="card">
     <h2>控制</h2>
     <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
@@ -483,6 +570,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <option value="hybrid" __SEL_HYBRID__>策略+少量MCTS</option>
         <option value="mcts" __SEL_MCTS__>MCTS 搜索</option>
         <option value="policy" __SEL_POLICY__>纯策略（无搜索）</option>
+      </select></label>
+      <label>先后手 <select id="color">
+        <option value="black">你执黑</option>
+        <option value="white">你执白</option>
       </select></label>
       <label>模拟数 <select id="sims">
         <option selected>50</option><option>400</option><option>800</option><option>1600</option>
@@ -500,14 +591,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="stat"><span>着法</span><b id="stMove">-</b></div>
     <div class="stat"><span>AI 胜率</span><b id="stWin">-</b></div>
     <div class="bar"><div id="winBar" style="width:50%">50%</div></div>
-    <div class="stat" style="margin-top:6px"><span>总访问 / 模拟数</span><b id="stVisits">-</b></div>
+    <div class="stat" style="margin-top:6px"><span id="stVisitsLabel">总访问 / 模拟数</span><b id="stVisits">-</b></div>
     <div class="stat"><span>搜索耗时</span><b id="stTime">-</b></div>
     <div class="stat"><span>吞吐 (sims/s)</span><b id="stSps">-</b></div>
   </div>
   <div class="card">
-    <h2>MCTS Top 候选</h2>
-    <table><thead><tr><th>着法</th><th>visits</th><th>prior</th><th>AI 胜率</th></tr></thead>
-    <tbody id="cand"></tbody></table>
+    <h2>胜率曲线（你方视角）</h2>
+    <canvas id="wrChart" width="360" height="110" style="width:100%; display:block;"></canvas>
+  </div>
+  <div class="card">
+    <h2>候选着法</h2>
+    <table><thead id="candHead"></thead><tbody id="cand"></tbody></table>
   </div>
   <div class="card"><h2>日志</h2><div id="log"></div></div>
 </div>
@@ -515,88 +609,245 @@ HTML_PAGE = r"""<!DOCTYPE html>
 const N = 19, PAD = 34, CS = (660 - PAD * 2) / (N - 1);
 const cv = document.getElementById('bd'), ctx = cv.getContext('2d');
 let S = null, thinking = false;
+let ripple = null, lastStateKey = null, toastTimer = null;
 
-const STARS = [[3,3],[3,9],[3,15],[9,3],[9,9],[9,15],[15,3],[15,9],[15,9],[15,15]].filter(
+const STARS = [[3,3],[3,9],[3,15],[9,3],[9,9],[9,15],[15,3],[15,9],[15,15]].filter(
   (v,i,a) => a.findIndex(x => x[0]===v[0]&&x[1]===v[1]) === i);
-const cands = {};  // "r,c" -> candidate
 
+function modeSel(){ return document.getElementById('mode').value; }
 function xy(rc){ return {x: PAD + rc*CS, y: PAD + rc*CS}; }
 
+// ---- 木纹底图（离屏预渲染一次，避免每帧重绘） ----
+const wood = document.createElement('canvas'); wood.width = wood.height = 660;
+(function(){
+  const w = wood.getContext('2d');
+  const g = w.createLinearGradient(0, 0, 660, 660);
+  g.addColorStop(0, '#e2b96f'); g.addColorStop(0.55, '#d7ac5c'); g.addColorStop(1, '#c89d4f');
+  w.fillStyle = g; w.fillRect(0, 0, 660, 660);
+  w.strokeStyle = 'rgba(122,84,26,.09)';
+  for (let y = 4; y < 664; y += 6){
+    w.beginPath();
+    for (let x = 0; x <= 660; x += 22){
+      const yy = y + Math.sin((x + y * 7) * 0.021) * 2.2;
+      x === 0 ? w.moveTo(x, yy) : w.lineTo(x, yy);
+    }
+    w.stroke();
+  }
+  const v = w.createRadialGradient(330, 330, 230, 330, 330, 480);
+  v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, 'rgba(60,35,5,.16)');
+  w.fillStyle = v; w.fillRect(0, 0, 660, 660);
+})();
+
+function drawStone(v, p, q, R){
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,.4)'; ctx.shadowBlur = 4; ctx.shadowOffsetY = 2;
+  const g = ctx.createRadialGradient(p.x - R*0.32, q.y - R*0.36, R*0.1, p.x, q.y, R);
+  if (v === 1){ g.addColorStop(0, '#585858'); g.addColorStop(1, '#060606'); }
+  else { g.addColorStop(0, '#ffffff'); g.addColorStop(1, '#c4c4c4'); }
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(p.x, q.y, R, 0, 2*Math.PI); ctx.fill();
+  ctx.restore();
+}
+
 function draw(){
-  ctx.fillStyle = "#dcb35c"; ctx.fillRect(0,0,660,660);
-  ctx.strokeStyle = "#7a5c28"; ctx.lineWidth = 1;
+  ctx.drawImage(wood, 0, 0);
+  ctx.strokeStyle = '#6d4f1f'; ctx.lineWidth = 1;
   for (let i=0;i<N;i++){
     const p = xy(i);
     ctx.beginPath(); ctx.moveTo(PAD, p.y); ctx.lineTo(660-PAD, p.y); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(p.x, PAD); ctx.lineTo(p.x, 660-PAD); ctx.stroke();
   }
-  ctx.fillStyle = "#3a2a10";
+  ctx.fillStyle = '#3a2a10';
   for (const [r,c] of STARS){ const p = xy(c), q = xy(r);
     ctx.beginPath(); ctx.arc(p.x, q.y, 3.4, 0, 2*Math.PI); ctx.fill(); }
-  ctx.fillStyle = "#5a4318"; ctx.font = "12px monospace";
+  ctx.fillStyle = 'rgba(50,32,6,.75)'; ctx.font = '12px Consolas,monospace';
   for (let i=0;i<N;i++){ const p = xy(i);
     ctx.fillText(String.fromCharCode(65+i), p.x-4, 16);
     ctx.fillText(String(N-i), 8, p.y+4); }
   if (!S) return;
-  const B = S.board;
+  const B = S.board, R = CS*0.46;
   for (let i=0;i<N*N;i++){
     const v = B[i]; if (v===0) continue;
-    const r = Math.floor(i/N), c = i%N, p = xy(c), q = xy(r);
-    ctx.beginPath(); ctx.arc(p.x, q.y, CS*0.46, 0, 2*Math.PI);
-    ctx.fillStyle = v===1 ? "#111" : "#f5f5f5"; ctx.fill();
-    ctx.strokeStyle = v===1 ? "#000" : "#888"; ctx.stroke();
+    const r = Math.floor(i/N), c = i%N;
+    drawStone(v, xy(c), xy(r), R);
   }
-  if (S.last_move && S.last_move !== "pass"){
+  // 最后一手：落子涟漪 + 红圈标记
+  if (S.last_move && S.last_move !== 'pass'){
     const p = xy(S.last_move[1]), q = xy(S.last_move[0]);
-    ctx.beginPath(); ctx.arc(p.x, q.y, CS*0.16, 0, 2*Math.PI);
-    ctx.fillStyle = "#e5443c"; ctx.fill();
+    if (ripple){
+      const k = Math.min(1, (performance.now() - ripple.t0) / 380);
+      ctx.beginPath(); ctx.arc(p.x, q.y, R*(1 + 0.6*k), 0, 2*Math.PI);
+      ctx.strokeStyle = 'rgba(229,68,60,' + ((1-k)*0.8).toFixed(3) + ')';
+      ctx.lineWidth = 2.5; ctx.stroke(); ctx.lineWidth = 1;
+      if (k < 1) requestAnimationFrame(draw);
+    }
+    ctx.beginPath(); ctx.arc(p.x, q.y, R-2.5, 0, 2*Math.PI);
+    ctx.strokeStyle = '#e5443c'; ctx.lineWidth = 2; ctx.stroke(); ctx.lineWidth = 1;
   }
-  for (const cd of (S.candidates||[])){
-    if (B[cd.r*N+cd.c] !== 0) continue;
-    const p = xy(cd.c), q = xy(cd.r);
-    const mx = Math.max(...(S.candidates.map(x=>x.visits)));
-    const rad = CS*0.22 + CS*0.3*(cd.visits/mx);
-    ctx.beginPath(); ctx.arc(p.x, q.y, rad, 0, 2*Math.PI);
-    ctx.fillStyle = "rgba(91,185,116,.55)"; ctx.fill();
-    ctx.strokeStyle = "#2e7d4f"; ctx.stroke();
-    ctx.fillStyle = "#12331d"; ctx.font = "bold 11px monospace"; ctx.textAlign="center";
-    ctx.fillText(cd.visits, p.x, q.y+4); ctx.textAlign="left";
+  // 候选热力：数字按模式区分（MCTS/hybrid=visits，纯策略=策略概率%）
+  const mode = modeSel(), candsList = S.candidates || [];
+  if (candsList.length){
+    const mx = Math.max(...candsList.map(x => x.visits));
+    for (const cd of candsList){
+      if (B[cd.r*N+cd.c] !== 0) continue;
+      const p = xy(cd.c), q = xy(cd.r);
+      const rad = CS*0.22 + CS*0.3*(cd.visits/mx);
+      ctx.beginPath(); ctx.arc(p.x, q.y, rad, 0, 2*Math.PI);
+      ctx.fillStyle = 'rgba(91,185,116,.55)'; ctx.fill();
+      ctx.strokeStyle = '#2e7d4f'; ctx.stroke();
+      ctx.fillStyle = '#12331d'; ctx.textAlign = 'center';
+      ctx.font = 'bold ' + (mode==='policy' ? '10px' : '11px') + ' Consolas,monospace';
+      ctx.fillText(mode==='policy' ? (cd.prior*100).toFixed(0)+'%' : cd.visits, p.x, q.y+4);
+      ctx.textAlign = 'left';
+    }
+  }
+}
+
+function candHeader(mode){
+  const cols = { mcts:   ['着法','visits','prior','AI胜率'],
+                 hybrid: ['着法','visits','策略%','得分','胜率'],
+                 policy: ['着法','策略%','AI胜率'] }[mode];
+  document.getElementById('candHead').innerHTML =
+    '<tr>' + cols.map(c => `<th>${c}</th>`).join('') + '</tr>';
+}
+
+function candRow(mode, cd){
+  const mv = `<td class="mv">${String.fromCharCode(65+cd.c)}${N-cd.r}</td>`;
+  const win = `<td>${(cd.ai_winrate*100).toFixed(0)}%</td>`;
+  const pr = `<td>${(cd.prior*100).toFixed(1)}%</td>`;
+  if (mode === 'mcts')
+    return `<tr>${mv}<td>${cd.visits}</td>${pr}${win}</tr>`;
+  if (mode === 'hybrid')
+    return `<tr>${mv}<td>${cd.visits}</td>${pr}<td>${cd.score!==undefined?cd.score:'-'}</td>${win}</tr>`;
+  return `<tr>${mv}${pr}${win}</tr>`;
+}
+
+function showToast(msg){
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.remove('hidden');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.add('hidden'), 2200);
+}
+
+function maybeRipple(){
+  const key = S.move_count + ':' + JSON.stringify(S.last_move);
+  if (key === lastStateKey) return;
+  lastStateKey = key;
+  if (S.last_move === 'pass'){
+    showToast(S.ai_info && S.ai_info.move === 'pass' ? 'AI 虚着' : '你虚着一手');
+  } else if (S.last_move){
+    ripple = {r: S.last_move[0], c: S.last_move[1], t0: performance.now()};
+    requestAnimationFrame(draw);
+  }
+}
+
+function updateStatus(){
+  const turn = document.getElementById('turn'), lead = document.getElementById('lead');
+  document.getElementById('mvcount').textContent = `第 ${S.move_count} 手`;
+  const you = S.human_color === 1 ? '黑' : '白';
+  const ai = S.human_color === 1 ? '白' : '黑';
+  if (S.over){ turn.innerHTML = '对局结束'; lead.textContent = ''; return; }
+  if (thinking){ turn.innerHTML = `AI（${ai}）思考中…`; }
+  else { turn.innerHTML = S.to_play === 1 ? `轮到你 <b>执${you}</b>` : `轮到 AI <b>执${ai}</b>`; }
+  // 目差（中国规则数子估分，含 7.5 贴目；中盘仅供形势参考）
+  const L = S.lead;
+  if (L === undefined || L === null) lead.textContent = '';
+  else if (L > 0) lead.textContent = `形势 黑+${L.toFixed(1)}`;
+  else if (L < 0) lead.textContent = `形势 白+${(-L).toFixed(1)}`;
+  else lead.textContent = '形势 均势';
+}
+
+function updateOverlay(){
+  const ov = document.getElementById('overlay');
+  if (S.over && S.score !== null && S.score !== undefined){
+    document.getElementById('overTitle').textContent =
+      S.score > 0 ? '你赢了 · 黑胜' : '你输了 · 白胜';
+    document.getElementById('overSub').textContent =
+      `黑-白 = ${S.score>0?'+':''}${S.score.toFixed(1)} · 共 ${S.move_count} 手`;
+    ov.classList.remove('hidden');
+  } else {
+    ov.classList.add('hidden');
   }
 }
 
 function render(){
   if (!S) return;
+  const mode = modeSel();
+  maybeRipple();
+  candHeader(mode);
+  updateStatus();
+  updateOverlay();
   document.getElementById('stMove').textContent = S.ai_info ? S.ai_info.move : '-';
   document.getElementById('stWin').textContent = S.ai_info ? (S.ai_info.ai_winrate*100).toFixed(1)+'%' : '-';
   const wr = S.ai_info ? S.ai_info.ai_winrate : 0.5;
   const bar = document.getElementById('winBar');
   bar.style.width = (wr*100).toFixed(0)+'%'; bar.textContent = (wr*100).toFixed(0)+'%';
-  document.getElementById('stVisits').textContent = S.ai_info ? `${S.ai_info.visits} / ${S.ai_info.simulations}` : '-';
+  document.getElementById('stVisitsLabel').textContent =
+    {mcts:'总访问 / 模拟数', hybrid:'根 visits / 模拟数', policy:'推理方式'}[mode];
+  document.getElementById('stVisits').textContent = !S.ai_info ? '-' :
+    (mode === 'policy' ? '单次前向' : `${S.ai_info.visits} / ${S.ai_info.simulations}`);
   document.getElementById('stTime').textContent = S.ai_info ? S.ai_info.elapsed+' s' : '-';
   document.getElementById('stSps').textContent = S.ai_info ? S.ai_info.sps : '-';
   const tb = document.getElementById('cand'); tb.innerHTML = '';
   for (const cd of (S.candidates||[])){
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td class="mv">${String.fromCharCode(65+cd.c)}${N-cd.r}</td>` +
-      `<td>${cd.visits}</td><td>${(cd.prior*100).toFixed(1)}%</td>` +
-      `<td>${(cd.ai_winrate*100).toFixed(0)}%</td>`;
+    tr.innerHTML = candRow(mode, cd);
     tb.appendChild(tr);
   }
   document.getElementById('log').textContent = (S.log||[]).map(l =>
-    `[${l.move}] visits ${l.visits}/${l.simulations} win ${(l.ai_winrate*100).toFixed(0)}% ${l.elapsed}s ${l.sps}/s`).join('\n');
+    `[${l.move}] ${l.mode==='policy' ? '前向' : 'visits '+l.visits+'/'+l.simulations} ` +
+    `win ${(l.ai_winrate*100).toFixed(0)}% ${l.elapsed}s`).join('\n');
   document.getElementById('btnUndo').disabled = thinking || !(S.move_count > 0);
   draw();
+  drawWr();
+}
+
+function drawWr(){
+  const c = document.getElementById('wrChart'), g = c.getContext('2d');
+  const W = c.width, H = c.height, Lft = 34, Rt = 8, Tp = 8, Bt = 16;
+  g.clearRect(0, 0, W, H);
+  g.strokeStyle = '#323947'; g.fillStyle = '#9aa0a6';
+  g.font = '10px Consolas,monospace'; g.lineWidth = 1;
+  for (const [v, lab] of [[1, '100%'], [0.5, '50%'], [0, '0%']]){
+    const y = Tp + (H - Tp - Bt) * (1 - v);
+    g.beginPath(); g.moveTo(Lft, y); g.lineTo(W - Rt, y); g.stroke();
+    g.textAlign = 'right'; g.fillText(lab, Lft - 4, y + 3);
+  }
+  const pts = S ? (S.wr_hist || []) : [];
+  if (!pts.length){
+    g.textAlign = 'center'; g.fillStyle = '#565e6d';
+    g.fillText('AI 每落一手记录一次你方胜率', W / 2, H / 2 + 3);
+    return;
+  }
+  const maxX = Math.max(pts[pts.length - 1].mc, 20);
+  const X = mc => Lft + (W - Lft - Rt) * mc / maxX;
+  const Y = wr => Tp + (H - Tp - Bt) * (1 - wr);
+  const hp = pts.map(p => ({x: X(p.mc), y: Y(1 - p.wr)}));  // 你方胜率 = 1 - AI视角
+  g.beginPath(); g.moveTo(hp[0].x, Y(0.5));
+  hp.forEach(p => g.lineTo(p.x, p.y));
+  g.lineTo(hp[hp.length - 1].x, Y(0.5)); g.closePath();
+  g.fillStyle = 'rgba(138,180,248,.15)'; g.fill();
+  g.beginPath(); hp.forEach((p, i) => i ? g.lineTo(p.x, p.y) : g.moveTo(p.x, p.y));
+  g.strokeStyle = '#8ab4f8'; g.lineWidth = 2; g.stroke(); g.lineWidth = 1;
+  const last = hp[hp.length - 1];
+  g.beginPath(); g.arc(last.x, last.y, 3, 0, 2*Math.PI); g.fillStyle = '#8ab4f8'; g.fill();
+  g.textAlign = 'left'; g.fillStyle = '#d7dae0';
+  g.fillText((pts[pts.length-1].mc) + '手', W - Rt - 26, H - 4);
+  const wrNow = 1 - pts[pts.length - 1].wr;
+  g.fillText((wrNow*100).toFixed(0) + '%', Math.min(last.x + 5, W - 32), Math.max(12, last.y + 3));
 }
 
 function setBusy(b){
   thinking = b;
-  const mode = document.getElementById('mode').value;
-  const tips = {policy: 'AI 单次前向推理…', hybrid: 'AI 策略+少量MCTS…'};
-  document.getElementById('thinking').textContent =
-    b ? (tips[mode] || 'AI 正在 MCTS 搜索…') : '';
+  const mode = modeSel();
+  const tips = {policy: 'AI 单次前向推理', hybrid: 'AI 策略+少量MCTS'};
+  const el = document.getElementById('thinking');
+  el.classList.toggle('busy', b);
+  el.textContent = b ? (tips[mode] || 'AI 正在 MCTS 搜索') : '';
   document.getElementById('btnAI').disabled = b;
   document.getElementById('btnPass').disabled = b;
   document.getElementById('btnUndo').disabled = b || !(S && S.move_count > 0);
+  render();
 }
 
 async function post(url, body){
@@ -609,7 +860,7 @@ async function post(url, body){
 }
 
 cv.addEventListener('click', async (e) => {
-  if (thinking || !S || S.over || S.to_play !== 1) return;
+  if (thinking || !S || S.over || S.to_play !== S.human_color) return;
   const rect = cv.getBoundingClientRect();
   const mx = e.clientX - rect.left, my = e.clientY - rect.top;
   const c = Math.round((mx - PAD)/CS), r = Math.round((my - PAD)/CS);
@@ -619,7 +870,7 @@ cv.addEventListener('click', async (e) => {
   if (S.board[r*N+c] !== 0) return;
   setBusy(true);
   const st = await post('/api/human_move', {move: r*N+c});
-  if (st && !st.over && st.to_play === -1) await aiTurn();
+  if (st && !st.over && st.to_play !== S.human_color) await aiTurn();
   setBusy(false);
 });
 
@@ -635,7 +886,7 @@ function startProgressPoll(){
       if (j.progress && S && thinking){
         S.candidates = j.progress.candidates;   // 实时 visits 热力直接替换候选
         document.getElementById('thinking').textContent =
-          `AI 正在 MCTS 搜索… ${j.progress.sims} 模拟`;
+          `AI 搜索中… ${j.progress.sims} 模拟`;
         draw();
       }
     } catch(e){}
@@ -643,14 +894,13 @@ function startProgressPoll(){
 }
 
 async function aiTurn(){
-  const mode = document.getElementById('mode').value;
+  const mode = modeSel();
   const sims = parseInt(document.getElementById('sims').value);
   if (mode !== 'policy') startProgressPoll();
   const st = await post('/api/ai_move', {simulations: sims, mode: mode});
   stopProgressPoll();
   if (st && st.over && st.score !== null){
-    document.getElementById('thinking').textContent =
-      `对局结束：黑${st.score>0?'胜':'负'}（黑-白 = ${st.score>0?'+':''}${st.score.toFixed(1)}）`;
+    document.getElementById('thinking').textContent = '';
   }
 }
 
@@ -661,7 +911,7 @@ document.getElementById('btnAI').onclick = async () => {
 document.getElementById('btnPass').onclick = async () => {
   if (thinking) return; setBusy(true);
   const st = await post('/api/human_pass', {});
-  if (st && !st.over && st.to_play === -1) await aiTurn();
+  if (st && !st.over && st.to_play !== S.human_color) await aiTurn();
   setBusy(false);
 };
 document.getElementById('btnUndo').onclick = async () => {
@@ -669,17 +919,30 @@ document.getElementById('btnUndo').onclick = async () => {
   await post('/api/undo', {});
   setBusy(false);
 };
-document.getElementById('btnReset').onclick = async () => {
+document.getElementById('btnReset').onclick = newGame;
+document.getElementById('btnAgain').onclick = newGame;
+async function newGame(){
   if (thinking) return; setBusy(true);
-  await post('/api/reset', {}); setBusy(false);
-};
+  const color = document.getElementById('color').value;
+  const st = await post('/api/reset', {color: color});
+  setBusy(false);
+  // AI 执黑先手时立即落子
+  if (st && !st.over && st.to_play !== st.human_color){ setBusy(true); await aiTurn(); setBusy(false); }
+}
+document.getElementById('color').addEventListener('change', async function(){
+  if (thinking){ this.value = S && S.human_color === 1 ? 'black' : 'white'; return; }
+  await newGame();
+});
 document.getElementById('mode').addEventListener('change', function(){
   document.getElementById('sims').disabled = (this.value !== 'mcts');
+  render();
 });
 document.getElementById('sims').disabled =
   (document.getElementById('mode').value !== 'mcts');
 
-(async () => { const s = await fetch('/api/state').then(r=>r.json()); S = s; render(); })();
+(async () => { const s = await fetch('/api/state').then(r=>r.json()); S = s;
+  document.getElementById('color').value = S.human_color === -1 ? 'white' : 'black';
+  render(); })();
 </script>
 </body>
 </html>
@@ -721,12 +984,21 @@ def main():
                     help="叶子内浅层 α-β 深度（0=关闭；2-4 = speculative 深化，棋力换时间）")
     ap.add_argument("--leaf-ab-width", type=int, default=4,
                     help="叶内 α-β 每节点 policy top-W 走法排序宽度")
+    ap.add_argument("--policy-depth", type=int, default=1, choices=[1, 2],
+                    help="策略分量推演步数：2=根候选各推 2 步（对手最佳应手回传，"
+                         "共 3 次批量前向，policy/hybrid 模式生效）")
+    ap.add_argument("--policy-width", type=int, default=4,
+                    help="2 步推演中对手每候选考察的应手数（top-W）")
+    ap.add_argument("--policy-topk", type=int, default=12,
+                    help="2 步推演的根候选数（policy top-K）")
     ap.add_argument("--quantize", action="store_true",
                     help="CPU int8 动态量化 Linear 层（与 --compile 互斥）")
     ap.add_argument("--onnx", nargs="?", const="models/goai_cpu.onnx", default=None,
                     help="导出 ONNX 并用 onnxruntime 推理（CPU 提速 1.5-3x，需 pip install onnx onnxruntime）")
     ap.add_argument("--use-rollout", action="store_true", help="启用 LightPLS 价值融合")
     ap.add_argument("--rollout-lambda", type=float, default=0.25)
+    ap.add_argument("--rollout-steps", type=int, default=None,
+                    help="单次 rollout 最大步数（默认 2×N²；CPU 19 路建议 60-120 控制耗时）")
     args = ap.parse_args()
 
     model_path = args.model
@@ -762,9 +1034,13 @@ def main():
                       leaf_ab_width=args.leaf_ab_width,
                       priors_leaf=args.priors_leaf,
                       hybrid_sims=args.hybrid_sims,
-                      hybrid_blend=args.hybrid_blend)
+                      hybrid_blend=args.hybrid_blend,
+                      policy_depth=args.policy_depth,
+                      policy_width=args.policy_width,
+                      policy_topk=args.policy_topk)
     session.mcts.use_rollout = args.use_rollout
     session.mcts.rollout_lambda = args.rollout_lambda
+    session.mcts.rollout_steps = args.rollout_steps
     if args.use_rollout:
         session.mcts._fast_policy = __import__(
             "src.search.light_rollout", fromlist=["FastPolicy"]).FastPolicy(args.board_size)

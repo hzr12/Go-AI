@@ -337,6 +337,88 @@ class MCTS:
                 break  # β 截断
         return best if best > -2.0 else v_static
 
+    def lookahead2(self, board, my_hist, op_hist, to_play, topk=12, width=4):
+        """策略 2 步批量推演：我方候选 → 对手最佳应手，价值回传。
+
+        流程（共 3 次批量前向，无递归）：
+          1. 根前向 → policy top-K 候选；
+          2. K 个候选位置拼一个 batch 前向（对手视角 policy+value）；
+          3. 每个候选取对手 top-W 应手，全部拼一个 batch 前向（回到我方视角）。
+
+        我走 mv 的价值 = min_j V(mv → 对手第 j 应手)（对手挑对我最差的）。
+        仅在传入棋盘上 play/undo，不破坏调用方状态。
+        返回 ({mv: 我方视角价值}, 根 masked policy)。
+        """
+        n = self.n_actions
+        legal = board.get_legal_moves()
+        cands = [int(m) for m in np.where(legal)[0]] + [n - 1]  # 末位 pass
+
+        # 1) 根前向
+        planes = board.feature_planes(my_hist, op_hist, to_play)
+        pol, _ = self.ai.predict_batch(
+            [(None, list(my_hist), list(op_hist), to_play, planes)])
+        p = np.asarray(pol).reshape(-1)
+        masked = np.zeros(n)
+        masked[cands] = p[cands]
+        order = [int(m) for m in np.argsort(-masked)[:max(1, topk)]]
+
+        child_to = 2 if to_play == 1 else 1
+        my_h = op_hist if child_to == 1 else my_hist
+        op_h = my_hist if child_to == 1 else op_hist
+
+        # 2) 第一层批量：K 个候选位置（对手视角）
+        states1 = []
+        kept = []
+        for mv in order:
+            pmv = -1 if mv == n - 1 else mv
+            if not board.play(pmv):
+                continue
+            states1.append((None, list(my_h), list(op_h), child_to,
+                            board.feature_planes(my_h, op_h, child_to)))
+            board.undo()
+            kept.append(mv)
+        if not kept:
+            return {}, masked, n - 1, 0.0
+        pols, _vals1 = self.ai.predict_batch(states1)
+
+        # 3) 第二层批量：每个候选下对手 top-W 应手（回到我方视角）
+        states2 = []
+        owner = []   # 每个 state2 对应 kept 的下标 i
+        for i, mv in enumerate(kept):
+            pmv = -1 if mv == n - 1 else mv
+            if not board.play(pmv):
+                continue
+            pi = np.asarray(pols[i]).reshape(-1)
+            opp_legal = [int(m) for m in np.where(board.get_legal_moves())[0]] + [n - 1]
+            opp = sorted(opp_legal, key=lambda m: -pi[m])[:max(1, width)]
+            for omv in opp:
+                opmv = -1 if omv == n - 1 else omv
+                if not board.play(opmv):
+                    continue
+                states2.append((None, list(my_hist), list(op_hist), to_play,
+                                board.feature_planes(my_hist, op_hist, to_play)))
+                owner.append(i)
+                board.undo()   # 撤对手应手
+            board.undo()       # 撤我方候选
+        out = {}
+        if states2:
+            _, vals2 = self.ai.predict_batch(states2)
+            worst = {}   # i -> 对手最佳应手后的我方最差价值
+            for i, v in zip(owner, vals2):
+                v = float(np.asarray(v).reshape(-1)[0])  # 我方视角
+                worst[i] = min(worst.get(i, 2.0), v)
+            for i, mv in enumerate(kept):
+                if i in worst:
+                    out[mv] = worst[i]
+                else:
+                    # 对手无应手记录（罕见）：退化为候选位置价值取负
+                    out[mv] = -float(np.asarray(_vals1[i]).reshape(-1)[0])
+        else:
+            for i, mv in enumerate(kept):
+                out[mv] = -float(np.asarray(_vals1[i]).reshape(-1)[0])
+        best_mv = max(out, key=lambda m: out[m])
+        return out, masked, best_mv, out[best_mv]
+
     def _replay_path(self, path):
         """从根局面沿 path 重放着法，返回 leaf 局面的独立棋盘副本。
 

@@ -72,7 +72,9 @@ class MctsPlayer:
     """MCTS（blend=0）/ 策略+少量MCTS（blend>0，score=blend*policy+(1-blend)*visits）。"""
 
     def __init__(self, ai, board_size, sims=100, blend=0.0, priors_leaf=False,
-                 expand_topk=32, expand_chunk=8, num_threads=1):
+                 expand_topk=32, expand_chunk=8, num_threads=1,
+                 leaf_ab_depth=0, leaf_ab_width=4, policy_depth=1,
+                 policy_width=4, policy_topk=12):
         self.ai = ai
         self.board_size = board_size
         self.n_actions = board_size * board_size + 1
@@ -82,13 +84,19 @@ class MctsPlayer:
         self.expand_topk = expand_topk
         self.expand_chunk = expand_chunk
         self.num_threads = num_threads
+        self.leaf_ab_depth = leaf_ab_depth
+        self.leaf_ab_width = leaf_ab_width
+        self.policy_depth = policy_depth
+        self.policy_width = policy_width
+        self.policy_topk = policy_topk
         self.mcts = None
 
     def new_game(self):
         # 每局新建搜索树：旧局的树对新局是错误先验（webui reset 也同理）
         self.mcts = MCTS(self.ai, board_size=self.board_size, num_threads=self.num_threads,
                          expand_topk=self.expand_topk, expand_chunk=self.expand_chunk,
-                         priors_leaf=self.priors_leaf)
+                         priors_leaf=self.priors_leaf,
+                         leaf_ab_depth=self.leaf_ab_depth, leaf_ab_width=self.leaf_ab_width)
         self.path_moves = []
 
     def select(self, board, h_black, h_white, to_play, legal, path_moves):
@@ -98,11 +106,26 @@ class MctsPlayer:
             simulations=self.sims, path_moves=self.path_moves)
         if self.blend <= 0.0:
             return int(np.argmax(visits))
-        policy, _ = self.ai.predict(board, h_black, h_white, to_play)
-        pol = np.asarray(policy).reshape(-1).astype(np.float64).copy()
-        pol[:len(legal)][~legal] = 0.0
-        ps = pol.sum()
-        pol_n = pol / ps if ps > 0 else np.zeros_like(pol)
+        if self.policy_depth >= 2:
+            # 策略分量 = 2 步批量推演价值分布（softmax(T=0.2) 伪概率）
+            vals, _p, _bm, _bv = self.mcts.lookahead2(
+                board, h_black, h_white, to_play,
+                topk=self.policy_topk, width=self.policy_width)
+            n = self.mcts.n_actions
+            ks = np.full(n, -np.inf)
+            for m, v in vals.items():
+                ks[m] = v
+            fin = np.isfinite(ks)
+            pol_n = np.zeros(n)
+            if fin.any():
+                ex = np.exp((ks[fin] - ks[fin].max()) / 0.2)
+                pol_n[fin] = ex / ex.sum()
+        else:
+            policy, _ = self.ai.predict(board, h_black, h_white, to_play)
+            pol = np.asarray(policy).reshape(-1).astype(np.float64).copy()
+            pol[:len(legal)][~legal] = 0.0
+            ps = pol.sum()
+            pol_n = pol / ps if ps > 0 else np.zeros_like(pol)
         vs = visits.astype(np.float64)
         vs_n = vs / vs.sum() if vs.sum() > 0 else np.zeros_like(vs)
         score = self.blend * pol_n + (1.0 - self.blend) * vs_n
@@ -142,7 +165,12 @@ def make_player(spec, ai, board_size, expand_topk, expand_chunk):
             ai, board_size, sims=int(kv.get("sims", 100)),
             blend=float(kv.get("blend", 0.5 if ptype == "hybrid" else 0.0)),
             priors_leaf=kv.get("leaf", "0") in ("1", "true", "True"),
-            expand_topk=expand_topk, expand_chunk=expand_chunk)
+            expand_topk=expand_topk, expand_chunk=expand_chunk,
+            leaf_ab_depth=int(kv.get("abdepth", 0)),
+            leaf_ab_width=int(kv.get("abwidth", 4)),
+            policy_depth=int(kv.get("pdepth", 1)),
+            policy_width=int(kv.get("pwidth", 4)),
+            policy_topk=int(kv.get("ptopk", 12)))
     raise ValueError(f"未知棋手类型: {ptype}")
 
 
