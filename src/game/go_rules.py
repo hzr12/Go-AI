@@ -12,8 +12,9 @@
   - 打劫（单子劫禁着，标准 ko）
   - 禁自杀（落子后自身无气且未提子则非法）
   - pass（连续两次 pass 终局）
-  - Tromp-Taylor 计分 + 贴目（默认 6.5）
-未实现（监督学习不需要）：超级劫、积攒劫、多劫循环判定。
+  - 中国规则计分：数子法（区域计分）+ 贴目 7.5
+    （计分算法与 Tromp-Taylor 等价：空点归最近同色连通块；差异见 score() 注释）
+未实现（监督学习不需要）：超级劫、积攒劫、多劫循环判定、终局死子人工判定。
 """
 
 import numpy as np
@@ -44,7 +45,7 @@ def transform_coord(r: int, c: int, transform_id: int, board_size: int) -> int:
 class GoBoard:
     """围棋棋盘。内部棋盘取值：-1=白, 0=空, 1=黑。"""
 
-    def __init__(self, board_size: int = 19, komi: float = 6.5):
+    def __init__(self, board_size: int = 19, komi: float = 7.5):
         self.board_size = board_size
         self.komi = komi
         self.reset()
@@ -247,8 +248,13 @@ class GoBoard:
 
     def score(self) -> float:
         """
-        Tromp-Taylor 计分：空点归最近同色连通块；黑分 = 黑子 + 黑围空，白同理 + 贴目。
+        中国规则（数子法）计分：区域计分，黑分 = 黑子 + 黑围空，白同理 + 贴目 7.5。
         返回黑方视角得分（>0 黑胜，<0 白胜）。
+
+        算法与 Tromp-Taylor 计分等价（空点归仅与一种颜色相邻的空区域）。
+        与正式中国规则的差异：正式规则终局需先提净死子再数子；本实现没有
+        死子判定，因此对局双方应在 pass 认输前实际提掉对方的死子，否则死子
+        所在点会被判为双方共邻的中立区域，不参与计分。
         """
         n = self.board_size
         board = self.board
