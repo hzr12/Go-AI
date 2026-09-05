@@ -16,6 +16,7 @@ MCTS 搜索（AlphaGoZero 风格 PUCT），基于 SFT 主线的 GoAI 网络。
 
 import math
 import copy
+import time
 import threading
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
@@ -265,13 +266,17 @@ class MCTS:
                     path = self._select(root)
                     leaf = path[-1]
                     if leaf.expanded:
-                        # 已被其他线程抢先展开：本线程无事可做
+                        # 已被其他线程抢先展开：本线程无事可做。
+                        # sleep 释放 GIL，避免自旋挤占主线程的 torch 推理。
+                        pass
+                    else:
+                        for node in path:
+                            node.virtual_loss += int(self.virtual_loss)
+                        leaf.expanded = True  # 逻辑占位，真正展开在主线程
+                        produced += 1
+                        leaf_q.put(path)
                         continue
-                    for node in path:
-                        node.virtual_loss += int(self.virtual_loss)
-                    leaf.expanded = True  # 逻辑占位，真正展开在主线程
-                    produced += 1
-                leaf_q.put(path)
+                time.sleep(0.001)
 
         threads = []
         for _ in range(self.num_threads):

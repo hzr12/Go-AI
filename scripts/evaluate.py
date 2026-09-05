@@ -32,31 +32,43 @@ def load_ai(args):
 def evaluate_vs_random(ai, board_size, num_games=100, use_mcts=False, simulations=400, num_threads=4, topk=10):
     """模型（黑）对随机策略（白），返回胜率（模型视角）。"""
     wins = losses = draws = 0
+    mcts = None
+    if use_mcts:
+        from src.search.mcts import MCTS
+        # 跨步复用同一 MCTS 实例：配合 path_moves 实现搜索树继承（越下越快）
+        mcts = MCTS(ai, board_size=board_size, num_threads=num_threads)
     for g in range(num_games):
         board = GoBoard(board_size)
         my_hist = [[-1, -1, -3], [-1, -1, -3]]
         passes = 0
         mc = 0
+        path_moves = []
         while passes < 2 and mc < 400:
             to_play = board.current_player
             legal = board.get_legal_moves()
             if len(legal) == 0:
-                board.play(-1); passes += 1; mc += 1; continue
+                board.play(-1); passes += 1; mc += 1; path_moves.append(-1); continue
             if to_play == 1:  # 模型执黑
                 if use_mcts:
                     mv, _, _ = ai.choose_move_mcts(board, my_hist[0], my_hist[1], to_play,
-                                                  legal, simulations=simulations, num_threads=num_threads)
+                                                  legal, simulations=simulations,
+                                                  num_threads=num_threads, mcts=mcts,
+                                                  path_moves=path_moves)
                 else:
                     mv, _, _ = ai.choose_move(board, my_hist[0], my_hist[1], to_play, legal, topk=topk)
                 if mv == board_size * board_size:
                     board.play(-1)
+                    path_moves.append(-1)
+                    passes += 1
                 else:
                     board.play(mv)
+                    path_moves.append(mv)
                     h = my_hist[0]; h.pop(0); h.append(mv)
-                passes = 0 if mv != board_size * board_size else passes + 1
+                    passes = 0
             else:  # 随机执白
                 mv = int(np.random.choice(legal))
                 board.play(mv)
+                path_moves.append(mv)
                 h = my_hist[1]; h.pop(0); h.append(mv)
                 passes = 0
             mc += 1
@@ -103,7 +115,7 @@ def main():
                         help="policy 头隐层通道（须与训练时一致，训练默认 32）")
     parser.add_argument("--value-channels", type=int, default=16,
                         help="value 头隐层通道（须与训练时一致，训练默认 16）")
-    parser.add_argument("--attn-mode", default="global", choices=["global", "window", "axial"])
+    parser.add_argument("--attn-mode", default="window", choices=["global", "window", "axial"])
     parser.add_argument("--attn-window", type=int, default=7)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--mode", type=str, default="random",
@@ -111,7 +123,7 @@ def main():
     parser.add_argument("--num-games", type=int, default=100)
     parser.add_argument("--use-mcts", action="store_true")
     parser.add_argument("--simulations", type=int, default=400)
-    parser.add_argument("--num-threads", type=int, default=4)
+    parser.add_argument("--num-threads", type=int, default=1)
     parser.add_argument("--topk", type=int, default=10)
     p = parser.parse_args()
 
