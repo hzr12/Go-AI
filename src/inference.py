@@ -180,6 +180,66 @@ class GoAI:
         policies = torch.softmax(policy_logits, dim=-1).cpu().numpy()
         return policies, value
 
+    # ------------------------------------------------------------------ #
+    # CPU 推理加速：int8 动态量化 / ONNX Runtime 后端
+    # ------------------------------------------------------------------ #
+    def quantize_dynamic(self):
+        """CPU int8 动态量化（Linear 层，x86 VNNI 收益明显）。
+
+        须在 torch.compile 之前调用（量化编译后模型无意义）。失败时保持 fp32。
+        """
+        try:
+            self.model = torch.ao.quantization.quantize_dynamic(
+                self.model, {torch.nn.Linear}, dtype=torch.qint8)
+            self.model.eval()
+            print("[GoAI] 已启用 CPU int8 动态量化 (Linear)")
+            return True
+        except Exception as e:  # noqa: BLE001
+            print(f"[GoAI] 动态量化失败，保持 fp32: {e}")
+            return False
+
+    def export_onnx(self, onnx_path):
+        """导出 ONNX 并把推理后端切换到 onnxruntime（CPU 提速约 1.5-3x）。
+
+        需 `pip install onnx onnxruntime`。失败时保持 torch 后端并返回 False。
+        仅支持 CPU 推理（use_amp 自动失效）。
+        """
+        try:
+            import onnxruntime as ort
+        except ImportError:
+            print("[GoAI] 未安装 onnx/onnxruntime（pip install onnx onnxruntime），保持 torch 后端")
+            return False
+        try:
+            self.model = self.model.cpu().eval()
+            dummy = torch.zeros(1, 12, self.board_size, self.board_size)
+            torch.onnx.export(
+                self.model, dummy, onnx_path,
+                input_names=["x"], output_names=["policy", "value"],
+                dynamic_axes={"x": {0: "batch"},
+                              "policy": {0: "batch"},
+                              "value": {0: "batch"}},
+                opset_version=18)
+            self._ort = ort.InferenceSession(
+                onnx_path, providers=["CPUExecutionProvider"])
+            self._forward_batch = self._forward_batch_onnx  # 实例属性遮蔽方法
+            print(f"[GoAI] 已切换 ONNX Runtime 推理后端: {onnx_path}")
+            return True
+        except Exception as e:  # noqa: BLE001
+            print(f"[GoAI] ONNX 导出失败，保持 torch 后端: {e}")
+            return False
+
+    def _forward_batch_onnx(self, x):
+        """onnxruntime 后端。输入 (B,12,H,W)，返回值形状与 _forward_batch 对齐。
+
+        导出捕获的是模型原始输出（policy 为 logits），此处补 softmax 与
+        torch 后端（_forward_batch 内 softmax）对齐。
+        """
+        xnp = x.detach().cpu().numpy().astype(np.float32)
+        pol, val = self._ort.run(None, {"x": xnp})
+        pol = torch.from_numpy(np.asarray(pol))
+        pol = torch.softmax(pol, dim=-1)
+        return pol, torch.from_numpy(np.asarray(val)).reshape(-1, 1)
+
     def choose_move(self, board, my_hist, op_hist, to_play, legal_mask, temperature=1.0, topk=10):
         """根据策略分布与合法着法掩码，采样一个着法。
 

@@ -11,8 +11,9 @@ src.search.mcts.MCTS（含 2026-09 的树复用与增量展开优化）。
 特性:
   - 19×19 棋盘（人执黑 / AI 执白），点击落子，支持 pass
   - AI 每步 MCTS 实时搜索：top 候选着法叠加在棋盘上（访问次数热力）
-  - 侧栏显示各候选 visits / prior / AI 胜率 / 根价值 / 搜索耗时
+  -   侧栏显示各候选 visits / prior / AI 胜率 / 根价值 / 搜索耗时
   - MCTS 树复用（path_moves）：整局搜索树跨步继承，AI 越下越快
+  - 可选纯策略模式（无 MCTS）：单次网络前向即落子，秒级响应
 """
 
 import sys
@@ -22,9 +23,8 @@ import time
 import argparse
 import threading
 
-import faulthandler
 import numpy as np
-faulthandler.dump_traceback_later(45, repeat=True)  # 诊断：卡死时转储线程栈
+import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -40,11 +40,21 @@ PASS = -1
 class Session:
     """服务端单局对弈状态（人执黑 / AI 执白）。"""
 
-    def __init__(self, ai, board_size=19, num_threads=1):
+    def __init__(self, ai, board_size=19, num_threads=1, default_mode="mcts",
+                 expand_topk=32, expand_chunk=8, solver_thresh=0.9,
+                 spec_prefetch=True, leaf_ab_depth=0, leaf_ab_width=4,
+                 priors_leaf=False, hybrid_sims=32, hybrid_blend=0.5):
         self.ai = ai
         self.size = board_size
         self.lock = threading.Lock()
-        self.mcts = MCTS(ai, board_size=board_size, num_threads=num_threads)
+        self.mcts = MCTS(ai, board_size=board_size, num_threads=num_threads,
+                         expand_topk=expand_topk, expand_chunk=expand_chunk,
+                         solver_thresh=solver_thresh, spec_prefetch=spec_prefetch,
+                         leaf_ab_depth=leaf_ab_depth, leaf_ab_width=leaf_ab_width,
+                         priors_leaf=priors_leaf)
+        self.default_mode = default_mode
+        self.hybrid_sims = hybrid_sims
+        self.hybrid_blend = hybrid_blend
         self.reset()
 
     def reset(self):
@@ -119,12 +129,122 @@ class Session:
     def human_pass(self):
         return self.human_move(PASS)
 
-    def ai_move(self, simulations, temperature=0.0):
+    def _ai_move_policy(self):
+        """纯策略模式：单次网络前向选点，完全不做 MCTS 搜索（极速，棋力=策略网络本身）。"""
+        to_play = self.board.current_player
+        legal = self.board.get_legal_moves()
+        bs = self.size
+        n_actions = bs * bs + 1
+        t0 = time.perf_counter()
+        policy, value = self.ai.predict(self.board, self.hist[0], self.hist[1], to_play)
+        elapsed = time.perf_counter() - t0
+
+        masked = policy.copy()
+        for m in range(n_actions - 1):
+            if not legal[m]:
+                masked[m] = 0.0
+        move_int = int(np.argmax(masked))
+
+        # top 候选（policy 概率；visits 字段放概率×1000 供棋盘热力渲染）
+        ranked = sorted(
+            ((m, float(masked[m])) for m in range(n_actions - 1) if masked[m] > 0),
+            key=lambda t: -t[1])[:10]
+        self.candidates = [{
+            "mv": m, "r": m // bs, "c": m % bs,
+            "visits": max(1, int(round(p * 1000))), "prior": round(p, 4),
+            "ai_winrate": round((value + 1) / 2.0, 3),
+        } for m, p in ranked]
+
+        is_pass = (move_int == n_actions - 1)
+        self._apply_move(PASS if is_pass else move_int, "ai")
+        ai_winrate = round((value + 1) / 2.0, 3)
+        mv_str = "pass" if is_pass else f"{chr(ord('a') + self.last_move[1])}{self.last_move[0] + 1}"
+        info = {
+            "move": mv_str,
+            "visits": 1,
+            "simulations": 1,
+            "ai_winrate": ai_winrate,
+            "elapsed": round(elapsed, 3),
+            "sps": int(1 / max(elapsed, 1e-6)),
+            "mode": "policy",
+        }
+        self.ai_info = info
+        self.log.append(info)
+        return self.state()
+
+    def _ai_move_hybrid(self):
+        """策略+少量MCTS：策略网络主导选点，小规模搜索做价值修正。
+
+        score = blend * policy(合法归一) + (1-blend) * visits(归一)。
+        少量模拟下 visits 分布噪声大，策略分量保证下限；搜索分量提供
+        value 头/子节点评估对局部战术的修正。建议配合 --priors-leaf。
+        """
+        to_play = self.board.current_player
+        legal = self.board.get_legal_moves()
+        bs = self.size
+        n_actions = bs * bs + 1
+        sims = self.hybrid_sims
+        t0 = time.perf_counter()
+        policy, _value = self.ai.predict(self.board, self.hist[0], self.hist[1], to_play)
+        visits, _probs, root_value = self.mcts.search(
+            self.board, self.hist[0], self.hist[1], to_play,
+            simulations=sims, path_moves=self.path_moves)
+        elapsed = time.perf_counter() - t0
+
+        pol = np.asarray(policy).reshape(-1).astype(np.float64).copy()
+        for m in range(n_actions - 1):
+            if not legal[m]:
+                pol[m] = 0.0
+        ps = pol.sum()
+        pol_n = pol / ps if ps > 0 else np.zeros_like(pol)
+        vs = visits.astype(np.float64)
+        vs_n = vs / vs.sum() if vs.sum() > 0 else np.zeros_like(vs)
+        score = self.hybrid_blend * pol_n + (1.0 - self.hybrid_blend) * vs_n
+        move_int = int(np.argmax(score))
+
+        # top 候选：MCTS 根子节点，按混合得分排序（prior 列显示策略分量）
+        root = getattr(self.mcts, "_prev_root", None)
+        cands = []
+        if root is not None:
+            for mv, child in root.children.items():
+                cands.append({
+                    "mv": mv, "r": mv // bs, "c": mv % bs,
+                    "visits": int(child.visit),
+                    "prior": round(float(pol_n[mv]), 4),
+                    "ai_winrate": round(0.5 - child.q() / 2.0, 3),
+                    "score": round(float(score[mv]), 4),
+                })
+            cands.sort(key=lambda x: -x["score"])
+        self.candidates = cands[:10]
+
+        is_pass = (move_int == n_actions - 1)
+        self._apply_move(PASS if is_pass else move_int, "ai")
+        ai_winrate = round((root_value + 1) / 2.0, 3)
+        mv_str = "pass" if is_pass else f"{chr(ord('a') + self.last_move[1])}{self.last_move[0] + 1}"
+        info = {
+            "move": mv_str,
+            "visits": int(visits.sum()),
+            "simulations": sims,
+            "ai_winrate": ai_winrate,
+            "elapsed": round(elapsed, 2),
+            "sps": int(sims / max(elapsed, 1e-6)),
+            "mode": "hybrid",
+        }
+        self.ai_info = info
+        self.log.append(info)
+        return self.state()
+
+    def ai_move(self, simulations, temperature=0.0, mode=None):
         with self.lock:
             if self.game_over:
                 return {"error": "对局已结束"}
             if self.board.current_player == 1:
                 return {"error": "当前轮到人类"}
+            mode = mode or self.default_mode
+            if mode == "policy":
+                return self._ai_move_policy()
+            if mode == "hybrid":
+                return self._ai_move_hybrid()
             to_play = self.board.current_player
             legal = self.board.get_legal_moves()
             t0 = time.perf_counter()
@@ -170,13 +290,16 @@ class Session:
                 "ai_winrate": ai_winrate,
                 "elapsed": round(elapsed, 2),
                 "sps": int(simulations / max(elapsed, 1e-6)),
+                "mode": "mcts",
             }
             self.ai_info = info
             self.log.append(info)
             return self.state()
 
 
-def build_handler(session):
+def build_handler(session, html_page=None):
+    page = HTML_PAGE if html_page is None else html_page
+
     class Handler(BaseHTTPRequestHandler):
         def _send(self, obj, code=200):
             body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -200,7 +323,7 @@ def build_handler(session):
 
         def do_GET(self):
             if self.path == "/" or self.path.startswith("/index"):
-                self._send_html(HTML_PAGE)
+                self._send_html(page)
             elif self.path == "/api/state":
                 self._send(session.state())
             else:
@@ -216,7 +339,8 @@ def build_handler(session):
                     self._send(session.human_pass())
                 elif self.path == "/api/ai_move":
                     self._send(session.ai_move(
-                        simulations=int(body.get("simulations", 400))))
+                        simulations=int(body.get("simulations", 50)),
+                        mode=body.get("mode")))
                 elif self.path == "/api/reset":
                     session.reset()
                     self._send(session.state())
@@ -270,8 +394,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div class="card">
     <h2>控制</h2>
     <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+      <label>模式 <select id="mode">
+        <option value="hybrid" __SEL_HYBRID__>策略+少量MCTS</option>
+        <option value="mcts" __SEL_MCTS__>MCTS 搜索</option>
+        <option value="policy" __SEL_POLICY__>纯策略（无搜索）</option>
+      </select></label>
       <label>模拟数 <select id="sims">
-        <option selected>200</option><option>400</option><option>800</option><option>1600</option>
+        <option selected>50</option><option>400</option><option>800</option><option>1600</option>
       </select></label>
       <button class="primary" id="btnAI">AI 落子</button>
       <button id="btnPass">停一手</button>
@@ -374,7 +503,10 @@ function render(){
 
 function setBusy(b){
   thinking = b;
-  document.getElementById('thinking').textContent = b ? 'AI 正在 MCTS 搜索…' : '';
+  const mode = document.getElementById('mode').value;
+  const tips = {policy: 'AI 单次前向推理…', hybrid: 'AI 策略+少量MCTS…'};
+  document.getElementById('thinking').textContent =
+    b ? (tips[mode] || 'AI 正在 MCTS 搜索…') : '';
   document.getElementById('btnAI').disabled = b;
   document.getElementById('btnPass').disabled = b;
 }
@@ -404,8 +536,9 @@ cv.addEventListener('click', async (e) => {
 });
 
 async function aiTurn(){
+  const mode = document.getElementById('mode').value;
   const sims = parseInt(document.getElementById('sims').value);
-  const st = await post('/api/ai_move', {simulations: sims});
+  const st = await post('/api/ai_move', {simulations: sims, mode: mode});
   if (st && st.over && st.score !== null){
     document.getElementById('thinking').textContent =
       `对局结束：黑${st.score>0?'胜':'负'}（黑-白 = ${st.score>0?'+':''}${st.score.toFixed(1)}）`;
@@ -426,6 +559,11 @@ document.getElementById('btnReset').onclick = async () => {
   if (thinking) return; setBusy(true);
   await post('/api/reset', {}); setBusy(false);
 };
+document.getElementById('mode').addEventListener('change', function(){
+  document.getElementById('sims').disabled = (this.value !== 'mcts');
+});
+document.getElementById('sims').disabled =
+  (document.getElementById('mode').value !== 'mcts');
 
 (async () => { const s = await fetch('/api/state').then(r=>r.json()); S = s; render(); })();
 </script>
@@ -441,6 +579,38 @@ def main():
     ap.add_argument("--device", default="auto")
     ap.add_argument("--port", type=int, default=7860)
     ap.add_argument("--num-threads", type=int, default=8, help="MCTS 选路径线程数")
+    ap.add_argument("--mode", choices=["hybrid", "mcts", "policy"], default="hybrid",
+                    help="默认 AI 落子模式：hybrid=策略+少量MCTS（默认）, mcts=MCTS 搜索, "
+                         "policy=纯策略单次前向（无搜索）")
+    ap.add_argument("--hybrid-sims", type=int, default=32,
+                    help="hybrid 模式每次落子的 MCTS 模拟数（少量）")
+    ap.add_argument("--hybrid-blend", type=float, default=0.5,
+                    help="hybrid 模式策略分量权重：score=blend*policy+(1-blend)*visits（1=纯策略）")
+    ap.add_argument("--priors-leaf", action="store_true",
+                    help="子节点先验改用叶子自身 policy（标准 AlphaZero 方案；少量模拟时"
+                         "搜索更贴近策略网络，hybrid 模式推荐开启）")
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile 算子融合（MCTS 网络评估提速 20-40%%；与量化/ONNX 互斥）")
+    ap.add_argument("--tf32", action="store_true",
+                    help="CUDA tf32 matmul（fp32 matmul 约 2-4x 提速）")
+    ap.add_argument("--cpu-threads", type=int, default=0,
+                    help="torch CPU 线程数（0=自动取 CPU 核数；与 --num-threads 无关）")
+    ap.add_argument("--expand-topk", type=int, default=32,
+                    help="MCTS 展开候选截断为 policy top-K（0=全部 ~N²+1 个，GPU 可关；CPU 建议 16-32）")
+    ap.add_argument("--expand-chunk", type=int, default=8,
+                    help="展开期 α-β 界截断块大小：按 prior 降序分块评估，发现必胜着即截断（0=一块评完，GPU 建议 0）")
+    ap.add_argument("--solver-thresh", type=float, default=0.9,
+                    help="MCTS-Solver 必胜/必败判定阈值（价值域 [-1,1]）")
+    ap.add_argument("--no-prefetch", action="store_true",
+                    help="关闭 worker 推测性预评估（默认开启，与主线程前向重叠）")
+    ap.add_argument("--leaf-ab-depth", type=int, default=0,
+                    help="叶子内浅层 α-β 深度（0=关闭；2-4 = speculative 深化，棋力换时间）")
+    ap.add_argument("--leaf-ab-width", type=int, default=4,
+                    help="叶内 α-β 每节点 policy top-W 走法排序宽度")
+    ap.add_argument("--quantize", action="store_true",
+                    help="CPU int8 动态量化 Linear 层（与 --compile 互斥）")
+    ap.add_argument("--onnx", nargs="?", const="models/goai_cpu.onnx", default=None,
+                    help="导出 ONNX 并用 onnxruntime 推理（CPU 提速 1.5-3x，需 pip install onnx onnxruntime）")
     ap.add_argument("--use-rollout", action="store_true", help="启用 LightPLS 价值融合")
     ap.add_argument("--rollout-lambda", type=float, default=0.25)
     args = ap.parse_args()
@@ -449,17 +619,48 @@ def main():
     if not os.path.isfile(model_path):
         print(f"[warn] 模型 {model_path} 不存在，使用随机权重（仅可验证流程）")
         model_path = None
+
+    # CPU 线程配置（先于推理；interop=1 避免双层层级争抢）
+    n_threads = args.cpu_threads if args.cpu_threads > 0 else (os.cpu_count() or 1)
+    try:
+        torch.set_num_threads(n_threads)
+        torch.set_num_interop_threads(1)
+        print(f"[webui] torch CPU 线程数 = {n_threads}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] 线程配置失败（可忽略）: {e}")
+
+    # 量化/ONNX 与 torch.compile 互斥（量化编译后模型无意义）
+    use_compile = args.compile and not (args.quantize or args.onnx)
     ai = GoAI(model_path=model_path, board_size=args.board_size, device=args.device,
               use_amp=True, attn_mode="window", attn_window=7,
+              compile=use_compile, tf32=args.tf32,
               channels_last=(args.device.split(":")[0] == "cuda"))
-    session = Session(ai, board_size=args.board_size, num_threads=1)
+    if args.quantize:
+        ai.quantize_dynamic()
+    if args.onnx:
+        ai.export_onnx(args.onnx)
+    session = Session(ai, board_size=args.board_size, num_threads=1,
+                      default_mode=args.mode, expand_topk=args.expand_topk,
+                      expand_chunk=args.expand_chunk,
+                      solver_thresh=args.solver_thresh,
+                      spec_prefetch=not args.no_prefetch,
+                      leaf_ab_depth=args.leaf_ab_depth,
+                      leaf_ab_width=args.leaf_ab_width,
+                      priors_leaf=args.priors_leaf,
+                      hybrid_sims=args.hybrid_sims,
+                      hybrid_blend=args.hybrid_blend)
     session.mcts.use_rollout = args.use_rollout
     session.mcts.rollout_lambda = args.rollout_lambda
     if args.use_rollout:
         session.mcts._fast_policy = __import__(
             "src.search.light_rollout", fromlist=["FastPolicy"]).FastPolicy(args.board_size)
 
-    handler = build_handler(session)
+    html_page = (HTML_PAGE
+                 .replace("__SEL_HYBRID__", "selected" if args.mode == "hybrid" else "")
+                 .replace("__SEL_MCTS__", "selected" if args.mode == "mcts" else "")
+                 .replace("__SEL_POLICY__", "selected" if args.mode == "policy" else ""))
+
+    handler = build_handler(session, html_page)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
     print(f"WebUI: http://127.0.0.1:{args.port}  (模型={args.model if model_path else '随机权重'}, "
           f"设备={ai.device}, 线程={args.num_threads})")

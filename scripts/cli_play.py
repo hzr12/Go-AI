@@ -175,7 +175,7 @@ def main():
                     help="0=贪心取访问最高；>0 按访问分布采样")
     ap.add_argument("--use-rollout", action="store_true")
     ap.add_argument("--rollout-lambda", type=float, default=0.25)
-    ap.add_argument("--topk", type=int, default=8, help="候选表显示条数")
+    ap.add_argument("--topk", type=int, default=5, help="候选表显示条数")
     args = ap.parse_args()
 
     model_path = args.model

@@ -41,6 +41,8 @@ class MCTSNode:
     value_sum: float = 0.0          # 累加（对手视角）价值，取负即我方
     virtual_loss: int = 0           # 并行模拟占位的虚拟损失
     expanded: bool = False
+    proved: int = 0                 # MCTS-Solver：+1=to_play 必胜, -1=to_play 必败, 0=未知
+    prefetch: Optional[tuple] = None  # worker 推测性预评估缓存 (policy_np, value_float)
 
     def q(self):
         """我方（to_play）视角的平均价值估计。"""
@@ -62,7 +64,10 @@ class MCTS:
     def __init__(self, ai, board_size, c_puct=1.4, virtual_loss=4.0,
                  num_threads=4, temperature=1.0, temperature_decay=0.0,
                  use_rollout=False, rollout_lambda=0.25, rollout_steps=None,
-                 rollout_threads=None):
+                 rollout_threads=None, expand_topk=0, expand_chunk=0,
+                 solver_thresh=0.9, spec_prefetch=True,
+                 leaf_ab_depth=0, leaf_ab_width=4, leaf_ab_weight=0.5,
+                 leaf_ab_uncertain=0.85, priors_leaf=False):
         """
         Args:
             ai:            GoAI 实例（需支持 predict_batch）
@@ -74,6 +79,26 @@ class MCTS:
             rollout_lambda: rollout 价值在叶子价值中的权重 (0=只用网络, 1=只用 rollout)
             rollout_steps: 单次 rollout 最大步数（默认 2*N*N）
             rollout_threads: rollout 线程数（默认与 num_threads 同）
+            expand_topk:   展开候选截断（0=全部 ~N²+1 个）。>0 时先前向叶子本身，
+                按 policy 取 top-K 合法候选再评估子节点——每次模拟批量从 ~N²+1
+                降到 K+1，CPU 推理提速一个数量级；低 prior 点几乎不影响棋力。
+            expand_chunk:  展开期 α-β 界截断的评估块大小（0=一块评完，GPU 推荐 0）。
+                >0 时按 prior 降序分块评估子节点，一旦发现叶子视角 ≥ solver_thresh
+                的必胜着立即停止评估剩余块（省前向）。
+            solver_thresh: MCTS-Solver 必胜判定阈值；叶子下全部候选 ≤ -该值时判必败。
+                proven 结果作为 ±1 绝对值回传并在选路径时优先/回避。
+            spec_prefetch: worker 选路径占位后推测性预评估叶子（与主线程 batch 前向
+                重叠），_expand 直接复用，省掉每模拟 1 次叶子前向。
+            leaf_ab_depth: 叶子内浅层 α-β 深度（0=关闭）。>0 且叶子净价值不确定
+                （|v| < leaf_ab_uncertain）时，在叶子下用 value 头静态评估、policy
+                排序走 depth 层 negamax α-β（speculative 深化，棋力换时间）。
+            leaf_ab_width: 叶内 α-β 每节点最多扩展的着法数（policy 排序）。
+            leaf_ab_weight: AB 结果与净价值的融合权重（0=只用净价值）。
+            leaf_ab_uncertain: 净价值绝对值低于该值才触发叶内 α-β。
+            priors_leaf: 子节点先验改用叶子自身 policy 在该着法上的值（标准
+                AlphaZero 方案）。默认 False=沿用旧方案（子局面自身 policy 在
+                同一着法上的值，非标准、少模拟时偏离策略网络）；True 时少量
+                模拟的 visits 分布更贴近策略网络（策略+少量MCTS 的基础）。
         """
         self.ai = ai
         self.bs = board_size
@@ -87,6 +112,15 @@ class MCTS:
         self.rollout_lambda = float(rollout_lambda)
         self.rollout_steps = rollout_steps
         self.rollout_threads = rollout_threads or num_threads
+        self.expand_topk = max(0, int(expand_topk))
+        self.expand_chunk = max(0, int(expand_chunk))
+        self.solver_thresh = float(solver_thresh)
+        self.spec_prefetch = bool(spec_prefetch)
+        self.leaf_ab_depth = max(0, int(leaf_ab_depth))
+        self.leaf_ab_width = max(1, int(leaf_ab_width))
+        self.leaf_ab_weight = float(leaf_ab_weight)
+        self.leaf_ab_uncertain = float(leaf_ab_uncertain)
+        self.priors_leaf = bool(priors_leaf)
         self._fast_policy = FastPolicy(board_size) if use_rollout else None
         self._rng = np.random.default_rng(1234)
 
@@ -95,28 +129,47 @@ class MCTS:
         return list(h)
 
     def _select(self, node):
-        """从根递归选到叶子（PUCT + 虚拟损失）。返回路径。"""
+        """从根递归选到叶子（PUCT + 虚拟损失 + proven 剪枝）。返回路径。
+
+        MCTS-Solver 选择规则：存在 proven loss 子节点（其 to_play 必败）→
+        立即选它（我方必胜着，无需再探）；proven win 子节点（其 to_play 必胜）
+        优先跳过，仅当全部子节点均 proven win 时才回退选择。
+        """
         path = [node]
         cur = node
         while cur.children:
             best, best_score = None, -1e9
+            proven_loss = None
+            proven_win = []
             for child in cur.children.values():
+                if child.proved == -1:
+                    proven_loss = child
+                    break
+                if child.proved == 1:
+                    proven_win.append(child)
+                    continue
                 score = child.q() + child.u(self.c_puct)
                 if score > best_score:
                     best_score, best = score, child
-            cur = best
+            if proven_loss is not None:
+                cur = proven_loss
+            else:
+                cur = best if best is not None else proven_win[0]
             path.append(cur)
         return path
 
     def _expand(self, leaf):
-        """扩展叶子：批量评估所有合法着法的先验 P 与局面价值 v。
+        """扩展叶子：评估合法着法的先验 P 与局面价值 v。
 
-        2026-09 重写（去 deepcopy）：
-          - 旧实现对每个候选着法 copy.deepcopy(整盘) 再 play，19 路中盘
-            ~250 候选 × 每叶子 → 每叶子 25-75ms 纯 deepcopy，是搜索最大瓶颈；
-          - 新实现：在叶子的棋盘上「play → 构造 planes → (rollout) → undo」
-            串行推进（undo 完整恢复棋盘/提子/劫/历史），特征用 predict_batch
-            的 5 元组 planes 模式传入；子节点不再持有棋盘（需要时从根重放）。
+        2026-09 二期（Speculative MCTS+Alpha-Beta，目标 CPU 提速）：
+          - expand_topk：先前向叶子本身（优先复用 worker 的推测性预评估
+            prefetch，与主线程 batch 前向重叠），按叶子 policy 截断 top-K 候选；
+          - expand_chunk：按 prior 降序分块评估子节点并维护 α 界，出现叶子视角
+            ≥ solver_thresh 的必胜着立即截断（MCTS-Solver，Winands 2008 风格），
+            剩余低 prior 候选不再评估/建节点；全部候选 ≤ -solver_thresh 判必败；
+          - leaf_ab_depth>0：叶子净价值不确定时在叶子下做浅层 negamax α-β
+            （value 头静态评估 + policy 排序），结果按 leaf_ab_weight 融合；
+          - proven 结果（±1）经 _backup 逐层回传，_select 优先必胜着/回避必败着。
         """
         board = leaf.board
         to_play = leaf.to_play
@@ -127,9 +180,64 @@ class MCTS:
         #   搜索过其他位置。改用 np.where 取真实合法坐标。
         candidates = [int(m) for m in np.where(legal)[0]] + [self.n_actions - 1]  # 末位为 pass
 
+        leaf_v = None  # leaf.to_play 视角
+        if self.expand_topk and self.expand_topk < len(candidates):
+            # 叶子前向：优先复用 worker 推测性预评估（已与主线程 batch 重叠）
+            if leaf.prefetch is not None:
+                lp, leaf_v = leaf.prefetch
+                leaf.prefetch = None
+            else:
+                leaf_planes = board.feature_planes(leaf.my_hist, leaf.op_hist, to_play)
+                lp, lv = self.ai.predict_batch(
+                    [(None, list(leaf.my_hist), list(leaf.op_hist), to_play, leaf_planes)])
+                leaf_v = float(np.asarray(lv[0]).reshape(-1)[0])
+
+            masked = np.zeros(self.n_actions, dtype=np.float64)
+            masked[candidates] = np.asarray(lp).reshape(-1)[candidates]
+            # prior 降序 = α-β 的走法排序
+            order = [int(m) for m in np.argsort(-masked)[:self.expand_topk]]
+            # priors_leaf：叶子自身 policy 作子节点先验（标准 AlphaZero 方案）
+            priors = ({int(m): float(masked[m]) for m in order}
+                      if self.priors_leaf else None)
+
+            # speculative 叶内 α-β（可选）：净价值不确定时深化
+            if self.leaf_ab_depth > 0 and abs(leaf_v) < self.leaf_ab_uncertain:
+                ab_v = self._leaf_ab(board, to_play, leaf.my_hist, leaf.op_hist,
+                                     self.leaf_ab_depth, self.leaf_ab_width)
+                leaf_v = (1.0 - self.leaf_ab_weight) * leaf_v + self.leaf_ab_weight * ab_v
+                if ab_v >= self.solver_thresh:
+                    leaf.proved = 1
+                elif ab_v <= -self.solver_thresh:
+                    leaf.proved = -1
+
+            if self.expand_chunk > 0 and len(order) > self.expand_chunk:
+                all_vals = self._expand_chunked(board, to_play, leaf, order, priors)
+            else:
+                all_vals = self._eval_children(board, to_play, leaf, order, priors)
+            if leaf.proved == 0 and all_vals and \
+                    max(all_vals) <= -self.solver_thresh:
+                leaf.proved = -1  # 全部候选都输 → to_play 必败
+            leaf.value_sum = (-1.0 if leaf.proved == 1 else
+                              1.0 if leaf.proved == -1 else -leaf_v)
+        else:
+            # 全量路径（GPU）：保持原行为，一批评完
+            self._eval_children(board, to_play, leaf, candidates)
+            # 叶子价值用“子节点平均 q”反推（对手视角取负）
+            leaf.value_sum = -sum(c.q() for c in leaf.children.values()) / max(len(leaf.children), 1)
+        leaf.visit = 1
+        leaf.expanded = True
+
+    def _eval_children(self, board, to_play, leaf, moves, priors=None):
+        """评估一批候选着法并创建子节点。返回各子节点叶子视角价值列表。
+
+        在叶子的棋盘上「play → 构造 planes → (rollout) → undo」串行推进
+        （undo 完整恢复棋盘/提子/劫/历史），子节点不持有棋盘。
+        priors: 可选 {mv: prior}，提供时用叶子 policy 先验（priors_leaf），
+        否则用子局面自身 policy（旧方案）。
+        """
         states = []       # (None, my_h, op_h, child_to, planes) —— 增量特征模式
         child_meta = []   # (mv, child_to, my_h, op_h, rollout_value|None)
-        for mv in candidates:
+        for mv in moves:
             pmv = -1 if mv == self.n_actions - 1 else mv
             if not board.play(pmv):
                 continue  # 理论不应发生（候选来自合法掩码）
@@ -146,10 +254,14 @@ class MCTS:
             child_meta.append((mv, child_to, my_h, op_h, rv))
             board.undo()
 
+        if not states:
+            return []
         policies, values = self.ai.predict_batch(states)
+        leaf_view_vals = []
         for i, (mv, child_to, my_h, op_h, rv) in enumerate(child_meta):
-            prior = float(np.asarray(policies[i, mv]).reshape(-1)[0])
-            # value 是 child.to_play 视角，对 leaf 而言是对手价值 -> 取负存为 value_sum 起点
+            prior = (priors[mv] if priors is not None
+                     else float(np.asarray(policies[i, mv]).reshape(-1)[0]))
+            # value 是 child.to_play 视角，取负即叶子（child 对手）视角
             net_v = -float(np.asarray(values[i]).reshape(-1)[0])
             if rv is not None:
                 roll_v = -rv  # child 视角 -> leaf 对手视角取负
@@ -166,11 +278,64 @@ class MCTS:
             child.value_sum = net_v
             child.visit = 1
             leaf.children[mv] = child
+            leaf_view_vals.append(net_v)
+        return leaf_view_vals
 
-        # 叶子本身用“最优子局面对手价值”反推价值：取平均 child q 的相反数
-        leaf.value_sum = -sum(c.q() for c in leaf.children.values()) / max(len(leaf.children), 1)
-        leaf.visit = 1
-        leaf.expanded = True
+    def _expand_chunked(self, board, to_play, leaf, order, priors=None):
+        """α-β 界截断：按 prior 降序分块评估子节点。
+
+        每评完一块检查「叶子视角最优值」：一旦 ≥ solver_thresh（必胜着）立即
+        截断并标记 proven win，剩余候选不再评估/建节点——被截掉的候选多为
+        低 prior 尾部，对搜索几乎无影响，前向量显著下降。
+        """
+        kept_vals = []
+        chunk = max(1, self.expand_chunk)
+        for i in range(0, len(order), chunk):
+            part = order[i:i + chunk]
+            vals = self._eval_children(board, to_play, leaf, part, priors)
+            kept_vals.extend(vals)
+            if vals and max(kept_vals) >= self.solver_thresh:
+                leaf.proved = 1
+                break
+        return kept_vals
+
+    def _leaf_ab(self, board, to_play, my_hist, op_hist, depth, width,
+                 alpha=-1.0, beta=1.0):
+        """叶子内浅层 negamax α-β（speculative 深化）。
+
+        每个访问节点做 1 次前向：value 头当静态评估、policy top-width 当走法
+        排序。depth=0 时即静态评估。返回 to_play 视角价值。在传入棋盘上
+        play/undo（undo 完整恢复，不破坏调用方的展开流程）。
+        """
+        legal = [int(m) for m in np.where(board.get_legal_moves())[0]] + [self.n_actions - 1]
+        planes = board.feature_planes(my_hist, op_hist, to_play)
+        pol, val = self.ai.predict_batch(
+            [(None, list(my_hist), list(op_hist), to_play, planes)])
+        v_static = float(np.asarray(val[0]).reshape(-1)[0])
+        if depth <= 0:
+            return v_static
+        p = np.asarray(pol).reshape(-1)
+        order = sorted(legal, key=lambda m: -p[m])[:width]
+        best = -2.0
+        for mv in order:
+            pmv = -1 if mv == self.n_actions - 1 else mv
+            if not board.play(pmv):
+                continue
+            child_to = 2 if to_play == 1 else 1
+            if child_to == 1:
+                my_h, op_h = op_hist, my_hist
+            else:
+                my_h, op_h = my_hist, op_hist
+            v = -self._leaf_ab(board, child_to, my_h, op_h, depth - 1, width,
+                               -beta, -alpha)
+            board.undo()
+            if v > best:
+                best = v
+            if best > alpha:
+                alpha = best
+            if alpha >= beta:
+                break  # β 截断
+        return best if best > -2.0 else v_static
 
     def _replay_path(self, path):
         """从根局面沿 path 重放着法，返回 leaf 局面的独立棋盘副本。
@@ -202,6 +367,15 @@ class MCTS:
                 v = -v                    # 逐层翻转视角（父节点=对手）
                 node.visit += 1
                 node.value_sum += -v      # value_sum 存对手视角，q() 取负即我方
+                # MCTS-Solver 证明回传：
+                #   子节点 proven loss（其 to_play 必败）→ 本方有必胜着 → 本节点 proven win
+                #   本节点全部子节点均 proven win（对手到哪都赢）→ 本节点 proven loss
+                if node.proved == 0:
+                    if path[idx + 1].proved == -1:
+                        node.proved = 1
+                    elif node.children and all(
+                            c.proved == 1 for c in node.children.values()):
+                        node.proved = -1
             node.virtual_loss = 0
 
     def search(self, root_board, my_hist, op_hist, to_play, simulations=400,
@@ -275,6 +449,29 @@ class MCTS:
                         leaf.expanded = True  # 逻辑占位，真正展开在主线程
                         produced += 1
                         leaf_q.put(path)
+                        # 推测性预评估：占位后立刻在 worker 线程前向叶子
+                        #（torch 前向释放 GIL，与主线程 batch 评估重叠），
+                        # 主线程 _expand 命中即复用，省掉每模拟 1 次叶子前向。
+                        # 竞态安全：_expand 消费时置 None，未命中则主线程自行前向。
+                        if self.spec_prefetch and leaf.board is None \
+                                and leaf.prefetch is None:
+                            try:
+                                pb = copy.deepcopy(self._cur_root_board)
+                                for nd in path[1:]:
+                                    pmv = -1 if nd.move_int == self.n_actions - 1 \
+                                        else nd.move_int
+                                    if not pb.play(pmv):
+                                        break
+                                planes = pb.feature_planes(
+                                    leaf.my_hist, leaf.op_hist, leaf.to_play)
+                                pol, val = self.ai.predict_batch(
+                                    [(None, list(leaf.my_hist), list(leaf.op_hist),
+                                      leaf.to_play, planes)])
+                                leaf.prefetch = (
+                                    np.asarray(pol[0]).reshape(-1),
+                                    float(np.asarray(val[0]).reshape(-1)[0]))
+                            except Exception:  # noqa: BLE001
+                                leaf.prefetch = None
                         continue
                 time.sleep(0.001)
 
@@ -297,6 +494,8 @@ class MCTS:
             # 攒够一批（或接近）再统一展开，平衡并行度与 batch 利用率
             if len(batch) >= self.num_threads or expanded_count + len(batch) >= total:
                 for pth in batch:
+                    sim_count = expanded_count + 1
+                    print(f"  [DEBUG] 正在执行第 {sim_count} 次模拟...", flush=True)
                     leaf = pth[-1]
                     leaf.board = self._replay_path(pth)
                     self._expand(leaf)
