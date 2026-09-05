@@ -163,6 +163,16 @@ def _window_sdpa(qw, kw, vw, dropout_p=0.0):
     """
     M, Hh, _, d = qw.shape
     S = kw.shape[2]
+    if _flash_attn_varlen_func is not None and M > _FLASH_BATCH_LIMIT:
+        # varlen 的 batch 维（= 窗口数 M）同样受 flash 内核 grid.z ≤ 65535 限制，
+        # 超限时按窗口维分批调用。dim0 连续 slice 的 forward 是零拷贝 view，
+        # backward 是一次 memset+scatter（k/v 各 ~1.8GB @ HBM 满带宽 ≈ 1.3ms/次，
+        # 每 step 合计约数十 ms，远小于旧 math eager 的全部耗时）。
+        chunks = []
+        for s in range(0, M, _FLASH_BATCH_LIMIT):
+            e = min(s + _FLASH_BATCH_LIMIT, M)
+            chunks.append(_window_sdpa(qw[s:e], kw[s:e], vw[s:e], dropout_p))
+        return torch.cat(chunks, dim=0)
     if _flash_attn_varlen_func is not None:
         qf = qw.reshape(M, Hh, d)                # 每窗口 1 个 query token
         kf = kw.reshape(M * S, Hh, d)            # 每窗口 S 个 key/value token
