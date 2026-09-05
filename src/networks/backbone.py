@@ -85,7 +85,6 @@ def _sdpa(q, k, v, dropout_p=0.0, use_math=False):
 # flash-attn 独立库的内核句柄（None=未启用）。由 train_sft.py 启动时按
 # 「库已安装 + Ampere+ CUDA」条件调用 set_flash_attn(True) 加载。
 _flash_attn_func = None
-_flash_attn_varlen_func = None
 
 
 def set_flash_attn(enabled: bool):
@@ -93,29 +92,20 @@ def set_flash_attn(enabled: bool):
 
     enabled=False 直接卸载回退 SDPA；enabled=True 时 import flash_attn，
     成功则 _sdpa 优先走 flash-attn 内核，失败（未安装/导入错误）返回原因并回退。
-    varlen 接口用于 window/sparse 注意力（见 _window_sdpa）：其 batch 维展开为
-    B*N（可达数十万），超过 flash 常规内核的 grid 上限，varlen 用 cu_seqlens
-    把窗口压进序列维后无此限制。
+    注意：window/sparse 注意力不走 flash（形状为每窗口 1×S 微序列，见
+    _window_sdpa 的 docstring），flash 仅用于 global/axial 等标准 MHA 形状。
     """
-    global _flash_attn_func, _flash_attn_varlen_func
+    global _flash_attn_func
     if not enabled:
         _flash_attn_func = None
-        _flash_attn_varlen_func = None
         return False, "已禁用"
     try:
         import flash_attn  # type: ignore[import-not-found]
         from flash_attn import flash_attn_func  # type: ignore[import-not-found]  # noqa: F401
-        try:
-            from flash_attn import flash_attn_varlen_func  # type: ignore[import-not-found]
-        except Exception:
-            _flash_attn_varlen_func = None
-        else:
-            _flash_attn_varlen_func = flash_attn_varlen_func
         _flash_attn_func = flash_attn_func
         return True, "已启用 (v%s)" % getattr(flash_attn, "__version__", "?")
     except Exception as e:
         _flash_attn_func = None
-        _flash_attn_varlen_func = None
         return False, "不可用: %s" % e
 
 
@@ -132,61 +122,22 @@ def set_sdpa_force_math(flag: bool) -> None:
     _sdpa_force_math = bool(flag)
 
 
-# varlen cu_seqlens 缓存：窗口数与序列长在训练中固定，避免每步重建。
-_cu_seqlens_cache = {}
-
-
-def _cu_seqlens(total, seqlen, device):
-    """构造 varlen 接口的 cu_seqlens（int32）：total 个窗口、每窗口 seqlen 个 token。"""
-    key = (total, seqlen, str(device))
-    t = _cu_seqlens_cache.get(key)
-    if t is None:
-        t = torch.arange(0, (total + 1) * seqlen, seqlen, device=device, dtype=torch.int32)
-        _cu_seqlens_cache[key] = t
-    return t
-
-
 def _window_sdpa(qw, kw, vw, dropout_p=0.0):
-    """window/sparse 注意力的 batch 展开调用。
+    """window/sparse 注意力的 batch 展开调用（math 一次成型）。
 
     qw: (M, Hh, 1, d)；kw/vw: (M, Hh, S, d)，M = B*N 可达数十万。
-    旧路径因 M 超过 flash 内核 grid batch 上限（_FLASH_BATCH_LIMIT）被强制
-    回退手写 math + 数据分块（slice 零化 + cat），是大头耗时来源。本函数：
-      1) flash-attn 库可用时走 varlen 接口：窗口压进序列维（q 每窗口 1 token、
-         k/v 每窗口 S 个 token），一次成型、无 batch 上限、注意力矩阵不物化；
-         softmax_scale 显式传 1.0，与旧 math 路径（q@kᵀ 不除 √d）数值语义一致，
-         仅替换内核、不改训练动力学。
-      2) 否则回退手写 math 一次成型（无分块、无 slice），公式与旧 _sdpa math
-         路径逐位一致。
+
+    为什么不用 FlashAttention（2026-09 A100 profiler 实测定案）：
+      本注意力的形状是每窗口 1 query × S(=25) keys 的微序列——flash 内核按
+      128-token tiling 设计，25-token 序列浪费 ~80% 算力，且 varlen backward
+      实测为 forward 的 3.6 倍（11s vs 3s/50steps，占训练 CUDA 时间 39%）。
+      正确工具是 bmm+softmax：attn 矩阵仅 (M, Hh, 1, S)≈55MB/层，完全可物化，
+      3 个大 kernel 一次成型——零 slice/cat/clone（旧分块的 slice_backward +
+      copy_ + fill_ 零化家族占 CUDA 时间 ~36%，一并消失）。
+      公式与旧 _sdpa math 路径逐位一致（q@kᵀ 无 scale），训练动力学零变化。
 
     返回 (M, Hh, 1, d)。
     """
-    M, Hh, _, d = qw.shape
-    S = kw.shape[2]
-    if _flash_attn_varlen_func is not None and M > _FLASH_BATCH_LIMIT:
-        # varlen 的 batch 维（= 窗口数 M）同样受 flash 内核 grid.z ≤ 65535 限制，
-        # 超限时按窗口维分批调用。dim0 连续 slice 的 forward 是零拷贝 view，
-        # backward 是一次 memset+scatter（k/v 各 ~1.8GB @ HBM 满带宽 ≈ 1.3ms/次，
-        # 每 step 合计约数十 ms，远小于旧 math eager 的全部耗时）。
-        chunks = []
-        for s in range(0, M, _FLASH_BATCH_LIMIT):
-            e = min(s + _FLASH_BATCH_LIMIT, M)
-            chunks.append(_window_sdpa(qw[s:e], kw[s:e], vw[s:e], dropout_p))
-        return torch.cat(chunks, dim=0)
-    if _flash_attn_varlen_func is not None:
-        qf = qw.reshape(M, Hh, d)                # 每窗口 1 个 query token
-        kf = kw.reshape(M * S, Hh, d)            # 每窗口 S 个 key/value token
-        vf = vw.reshape(M * S, Hh, d)
-        if qf.dtype not in (torch.float16, torch.bfloat16):
-            qf = qf.to(torch.bfloat16)
-            kf = kf.to(torch.bfloat16)
-            vf = vf.to(torch.bfloat16)
-        out = _flash_attn_varlen_func(
-            qf, kf, vf,
-            _cu_seqlens(M, 1, qf.device), _cu_seqlens(M, S, qf.device),
-            1, S, dropout_p=dropout_p, softmax_scale=1.0, causal=False)
-        return out.view(M, Hh, 1, d)
-    # 手写 math 一次成型（与旧 _sdpa math 路径同公式：q@kᵀ 无 scale）
     attn = (qw @ kw.transpose(-2, -1)).softmax(dim=-1)   # (M, Hh, 1, S)
     if dropout_p > 0.0:
         attn = torch.nn.functional.dropout(attn, p=dropout_p)
@@ -300,16 +251,11 @@ class MultiHeadSelfAttention(nn.Module):
 
         取每个窗口的 ws*ws 个 token，对窗口中心槽做注意力后输出。复杂度 O(N * ws²)。
 
-        性能设计（2026-09 重写）：
-          - Flash 路径（A100，_sdpa_force_math=False）：经 _window_sdpa 走
-            flash-attn varlen 接口一次成型。旧实现因 batch 展开 B*N 超过 flash
-            内核 grid 上限（_FLASH_BATCH_LIMIT）被强制回退手写 math，且沿 N
-            分块（window_chunk 循环）——每层 3 组 slice（SliceBackward 零化）+
-            cat，是训练耗时大头。varlen 把窗口压进序列维：无 batch 上限、注意力
-            矩阵不物化、零 slice/cat；softmax_scale=1.0 与旧 math 数值语义一致
-            （仅换内核，不改训练动力学）。
-          - Math 路径（V100 无 FlashAttn）：保留沿 N 分块循环，控制 math 物化
-            (B*G, Hh, ws², ws²) 注意力矩阵的峰值显存。
+        性能设计（2026-09 重写定稿）：
+          - 单一路径：bmm+softmax 一次成型（_window_sdpa），零分块/零 slice/零
+            cat。attn 矩阵仅 (B*N, Hh, 1, ws²)（中心 1 query），~55MB/层可物化，
+            不需要 FlashAttention（1×25 微序列形状对 flash tiling 极不友好，
+            A100 profiler 实测 varlen backward 为 forward 的 3.6 倍）。
           - 窗口内容为真 2D 局部窗口（语义修正见 _local_windows）；中心槽按纠缠
             语义取自窗口张量（与旧实现同位）。
         q,k,v: (B, Hh, N, head_dim)，N = H*W。
@@ -323,28 +269,12 @@ class MultiHeadSelfAttention(nn.Module):
         ku = self._local_windows(k, H, W)
         vu = self._local_windows(v, H, W)
 
-        if not _sdpa_force_math:
-            # ---- Flash/varlen 路径：一次成型，零 slice/cat ----
-            qc = qu[:, :, :, center, :].reshape(B * N, Hh, 1, d)  # 窗口中心槽（纠缠语义）
-            kw = ku.reshape(B * N, Hh, ws * ws, d)                # 连续 → 零拷贝 view
-            vw = vu.reshape(B * N, Hh, ws * ws, d)
-            oc = _window_sdpa(qc, kw, vw, dropout_p=self.attn_drop)  # (B*N, Hh, 1, d)
-            return oc.view(B, N, Hh, d).reshape(B, N, Hh * d)
-
-        # ---- Math 分块路径（V100）----
-        out_chunks = []
-        # 每块 G 个窗口，峰值激活正比于 B*G（math 需物化注意力矩阵）。
-        G = max(1, getattr(self, 'window_chunk', 128))
-        for s in range(0, N, G):
-            e = min(s + G, N)
-            qc = qu[:, s:e].reshape(B * (e - s), Hh, ws * ws, d)
-            kc = ku[:, s:e].reshape(B * (e - s), Hh, ws * ws, d)
-            vc = vu[:, s:e].reshape(B * (e - s), Hh, ws * ws, d)
-            oc = _sdpa(qc, kc, vc, dropout_p=self.attn_drop, use_math=True)
-            oc = oc[:, :, center:center + 1, :]  # (B*G, Hh, 1, d)
-            out_chunks.append(oc.reshape(B, e - s, Hh, d))
-        out = torch.cat(out_chunks, dim=1)  # (B, N, Hh, d)
-        return out.reshape(B, N, Hh * d)
+        # 窗口中心槽（纠缠语义，与旧实现同位）作为 query；k/v 零拷贝 view
+        qc = qu[:, :, :, center, :].reshape(B * N, Hh, 1, d)
+        kw = ku.reshape(B * N, Hh, ws * ws, d)
+        vw = vu.reshape(B * N, Hh, ws * ws, d)
+        oc = _window_sdpa(qc, kw, vw, dropout_p=self.attn_drop)  # (B*N, Hh, 1, d)
+        return oc.view(B, N, Hh, d).reshape(B, N, Hh * d)
 
     def _sparse_attn(self, q, k, v, H, W):
         """稀疏注意力（固定稀疏模式）：局部滑动窗口 + 跨步长全局 token。
