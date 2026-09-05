@@ -558,6 +558,17 @@ def main():
     if args.compile:
         if hasattr(torch, 'compile'):
             try:
+                # 4 个注意力块实例 × window/sparse 两个禁用点 × train/eval 两态，
+                # dynamo 按 fn 身份分缓存，默认上限 64 会被打满触发反复重编译。
+                # 注意：函数内不能写 `import torch._dynamo`（会把 torch 绑定为
+                # 局部变量，导致函数开头 UnboundLocalError），用 importlib 规避。
+                import importlib
+                _dynamo_mod = importlib.import_module('torch._dynamo')
+                _dynamo_mod.config.cache_size_limit = max(
+                    256, _dynamo_mod.config.cache_size_limit)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
                 model = torch.compile(model, dynamic=False, mode=args.compile_mode)
                 # 预热前向必须与真实训练一致地包 autocast：flash-attn 只接受 fp16/bf16，
                 # FP32 输入直灌会报 "FlashAttention only support fp16 and bf16 data
