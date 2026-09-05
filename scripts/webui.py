@@ -495,7 +495,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   * { box-sizing: border-box; }
   body { background:var(--bg); color:var(--txt); font-family:"Segoe UI","Microsoft YaHei",sans-serif;
-         margin:0; padding:16px; display:flex; gap:18px; }
+         margin:0; padding:16px; display:flex; flex-wrap:wrap; gap:18px; align-items:flex-start; }
   #boardWrap { position:relative; background:var(--card); padding:10px; border-radius:14px;
                box-shadow:0 4px 18px rgba(0,0,0,.45); }
   canvas { cursor:pointer; display:block; border-radius:8px; }
@@ -507,6 +507,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   #overTitle { font-size:22px; font-weight:bold; color:var(--accent); margin-bottom:6px; }
   #overSub { font-size:13px; color:var(--dim); margin-bottom:14px; }
   #panel { width:390px; display:flex; flex-direction:column; gap:12px; }
+  #side { width:330px; display:flex; flex-direction:column; gap:12px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:12px;
           padding:12px 14px; box-shadow:0 2px 8px rgba(0,0,0,.3); }
   h2 { margin:0 0 8px; font-size:13px; color:var(--accent); letter-spacing:.06em; }
@@ -599,6 +600,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <h2>胜率曲线（你方视角）</h2>
     <canvas id="wrChart" width="360" height="110" style="width:100%; display:block;"></canvas>
   </div>
+</div>
+<div id="side">
   <div class="card">
     <h2>候选着法</h2>
     <table><thead id="candHead"></thead><tbody id="cand"></tbody></table>
@@ -829,6 +832,15 @@ function drawWr(){
   g.fillStyle = 'rgba(138,180,248,.15)'; g.fill();
   g.beginPath(); hp.forEach((p, i) => i ? g.lineTo(p.x, p.y) : g.moveTo(p.x, p.y));
   g.strokeStyle = '#8ab4f8'; g.lineWidth = 2; g.stroke(); g.lineWidth = 1;
+  // AI 自认失误标记：相邻两手胜率跳变 >20% 画小红点
+  for (let i = 1; i < pts.length; i++){
+    const wrPrev = 1 - pts[i-1].wr, wrCur = 1 - pts[i].wr;
+    if (Math.abs(wrCur - wrPrev) > 0.2){
+      g.beginPath(); g.arc(hp[i].x, hp[i].y, 3.2, 0, 2*Math.PI);
+      g.fillStyle = '#f28b82'; g.fill();
+      g.strokeStyle = '#7a2f2a'; g.lineWidth = 1; g.stroke();
+    }
+  }
   const last = hp[hp.length - 1];
   g.beginPath(); g.arc(last.x, last.y, 3, 0, 2*Math.PI); g.fillStyle = '#8ab4f8'; g.fill();
   g.textAlign = 'left'; g.fillStyle = '#d7dae0';
