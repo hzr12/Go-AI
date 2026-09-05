@@ -45,6 +45,10 @@ class GoAI:
         ai.analyze()
     """
 
+    # NPU batch 归桶：CANN 按输入形状编译算子，MCTS 的零散 batch（尾批 6、7 等）
+    # 每种形状都要单独编译一次；归桶补零后形状固定，编译缓存才能跨调用命中。
+    _NPU_BATCH_BUCKETS = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256)
+
     def __init__(self, model_path=None, board_size=19, device="auto", use_amp=False,
                  backbone_channels=128, backbone_res_blocks=12, policy_channels=32, value_channels=16,
                  attention_mode="mix", num_attention_layers=4, num_heads=4, attention_dropout=0.0,
@@ -62,7 +66,8 @@ class GoAI:
         self.use_amp = use_amp and (self.device.startswith("cuda") or self.is_npu)
         if self.is_npu:
             print("[GoAI] Ascend NPU 推理：fp16 autocast（910A 无 bf16），"
-                  "math 注意力，勿开 --compile")
+                  "math 注意力，勿开 --compile。若每次启动 warmup 都超过 1 分钟，"
+                  "先执行 export ASCEND_CACHE_PATH=~/ascend_cache 持久化算子编译缓存")
         self.board_size = board_size
         # 网络侧压：tf32 让 V100/Amp 上的 fp32 matmul 走 TensorFloat-32（约 2-4x 提速，
         # 精度损失对推理可忽略）；channels_last 让 conv 走 NHWC 内存布局（conv 友好）。
@@ -152,6 +157,19 @@ class GoAI:
                     self.model = self.model.to(memory_format=torch.channels_last)
             self.model.load_state_dict(state, strict=False)
             print(f"[GoAI] 已加载模型: {model_path}  ({device})")
+
+        # NPU 首次前向会触发 CANN 算子初始化（可能 1-3 分钟且无输出），
+        # 这里主动 warmup 并打印进度，避免被误认为卡死。
+        if self.is_npu and model_path:
+            print("[GoAI] NPU 首次前向 warmup 中（CANN 算子初始化，可能需要 1-3 分钟）…",
+                  flush=True)
+            t0 = time.time()
+            dummy = torch.zeros(1, 12, self.board_size, self.board_size,
+                                device=self.device)
+            with torch.no_grad():
+                self._forward_batch(dummy)
+            print(f"[GoAI] NPU warmup 完成: {time.time() - t0:.1f}s（仅首次，后续为毫秒级）",
+                  flush=True)
         else:
             print(f"[GoAI] 未加载权重（随机初始化），仅用于流程验证。device={device}")
 
@@ -226,18 +244,30 @@ class GoAI:
 
     def _forward_batch(self, x):
         """输入 (B,12,H,W)，输出 (policies_np(B,A), values(B,1))。"""
+        B = x.shape[0]
+        if self.is_npu and B > 1:
+            # batch 归桶补零：稳定算子形状，命中 CANN 编译缓存
+            bucket = next((b for b in self._NPU_BATCH_BUCKETS if b >= B), None)
+            if bucket is not None and bucket > B:
+                x = torch.cat([x, x.new_zeros(bucket - B, *x.shape[1:])], 0)
         with torch.no_grad():
             if self.use_amp:
                 if self.is_npu:
-                    with torch.autocast(device_type="npu", dtype=torch.float16):
-                        policy_logits, value = self.model(x)
+                    # 兼容老 torch_npu：新 torch.autocast("npu") API 不可用时
+                    # 回退 torch.npu.amp.autocast()
+                    try:
+                        with torch.autocast(device_type="npu", dtype=torch.float16):
+                            policy_logits, value = self.model(x)
+                    except (RuntimeError, AttributeError, TypeError):
+                        with torch.npu.amp.autocast():
+                            policy_logits, value = self.model(x)
                 else:
                     with torch.cuda.amp.autocast():
                         policy_logits, value = self.model(x)
             else:
                 policy_logits, value = self.model(x)
-        policies = torch.softmax(policy_logits, dim=-1).cpu().numpy()
-        return policies, value
+        policies = torch.softmax(policy_logits[:B], dim=-1).cpu().numpy()
+        return policies, value[:B]
 
     # ------------------------------------------------------------------ #
     # CPU 推理加速：int8 动态量化 / ONNX Runtime 后端
