@@ -1036,8 +1036,12 @@ def main():
     if args.quantize:
         ai.quantize_dynamic()
     if args.onnx:
-        ai.export_onnx(args.onnx)
-    session = Session(ai, board_size=ai.board_size, num_threads=1,
+        # MCTS 多线程会并发调用 predict；把 ONNX 单调用线程数按并发数折半，
+        # 避免多个 ort.run 各占满核导致超线程争抢（num_threads=1 时仍用满核）。
+        _ncpu = max(1, (os.cpu_count() or 1))
+        _ort_intra = max(1, _ncpu // max(1, args.num_threads))
+        ai.export_onnx(args.onnx, ort_intra_threads=_ort_intra)
+    session = Session(ai, board_size=ai.board_size, num_threads=args.num_threads,
                       default_mode=args.mode, expand_topk=args.expand_topk,
                       expand_chunk=args.expand_chunk,
                       solver_thresh=args.solver_thresh,

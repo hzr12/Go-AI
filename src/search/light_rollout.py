@@ -16,6 +16,47 @@ import numpy as np
 from src.game.go_rules import GoBoard
 
 
+def _fast_atari_mask(board: GoBoard, player) -> np.ndarray:
+    """返回 (n*n,) bool：player 方「仅 1 口气」的棋子位置（打吃）。
+
+    用单次稀疏 BFS 对每个同色连通块计数自由点，替代完整 feature_planes
+    （后者每步都做多层 Python flood-fill）。rollout 中每步调用也极快。
+    player: 棋子值（1 或 -1，= board.current_player）。
+    """
+    n = board.board_size
+    b = board.board
+    occ = (b == player)
+    atari = np.zeros((n, n), dtype=bool)
+    visited = np.zeros((n, n), dtype=bool)
+    seeds = np.argwhere(occ)
+    if seeds.size == 0:
+        return atari.reshape(-1)
+    nb = ((1, 0), (-1, 0), (0, 1), (0, -1))
+    for (y, x) in seeds:
+        if visited[y, x]:
+            continue
+        stack = [(y, x)]
+        visited[y, x] = True
+        group = []
+        libs = set()
+        while stack:
+            cy, cx = stack.pop()
+            group.append((cy, cx))
+            for dy, dx in nb:
+                ny, nx = cy + dy, cx + dx
+                if 0 <= ny < n and 0 <= nx < n:
+                    v = b[ny, nx]
+                    if v == 0:
+                        libs.add((ny, nx))
+                    elif v == player and not visited[ny, nx]:
+                        visited[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(libs) == 1:
+            for (gy, gx) in group:
+                atari[gy, gx] = True
+    return atari.reshape(-1)
+
+
 class FastPolicy:
     """极轻量走子策略：对合法点做档位打分，按 softmax 采样。
 
@@ -43,14 +84,20 @@ class FastPolicy:
         neigh[:-1, :]  += occ[1:, :]     # 下方
         neigh[:, 1:]   += occ[:, :-1]    # 左方
         neigh[:, :-1]  += occ[:, 1:]     # 右方
-        my_atari = board.feature_planes([], [])[10].reshape(-1)
+        # 打吃惩罚：用廉价 BFS 计算「当前方处于打吃（仅 1 口气）的棋子」，
+        # 替代 board.feature_planes([], [])[10]——后者每步都做完整 Python flood-fill
+        # 特征，是 rollout 的主要性能杀手（每局 60 步 × 每步 2 次特征 ≈ 万次调用）。
+        my_atari = _fast_atari_mask(board, board.current_player)
         for i in range(a):
             if not legal[i]:
                 logit[i] = -1e9
                 continue
             logit[i] = 0.3 * neigh.reshape(-1)[i] - self._atari_penalty * my_atari[i]
         if self.weights is not None:
-            fp = board.feature_planes([], []).reshape(12, -1)
+            # 仅在显式提供线性权重时才计算完整特征（默认 FastPolicy 不触发）
+            fp = board.feature_planes_batched(
+                b[None], [[-1, -1, -3]], [[-1, -1, -3]],
+                [abs(board.current_player)], [board.ko_point]).reshape(12, -1)
             if self.weights.ndim == 1 and self.weights.shape[0] == 12:
                 logit = logit + np.tensordot(self.weights, fp, axes=([0], [0])).reshape(-1).astype(np.float32)
         # 追加 pass 着法（索引 n*n），logit=0

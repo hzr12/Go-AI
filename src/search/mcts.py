@@ -140,6 +140,43 @@ class MCTS:
             board.board[None], [list(my_hist)], [list(op_hist)],
             [to_play], [board.ko_point])[0]
 
+    def _child_states(self, board, moves, my_hist, op_hist, to_play):
+        """给定局面与候选着法，返回各子局面的 (GoBoard, my_h, op_h, to_play)。
+
+        子节点持有完整棋盘深拷贝，供后续「按层批量前向 / 再展开」复用；
+        在传入棋盘上 play/undo（调用方状态不破坏）。
+        """
+        out = []
+        for mv in moves:
+            pmv = -1 if mv == self.n_actions - 1 else mv
+            if not board.play(pmv):
+                continue
+            child_to = 2 if to_play == 1 else 1
+            cmy = list(op_hist) if child_to == 1 else list(my_hist)
+            cop = list(my_hist) if child_to == 1 else list(op_hist)
+            cb = copy.deepcopy(board)
+            out.append((cb, cmy, cop, child_to))
+            board.undo()
+        return out
+
+    def _forward_level(self, nodes):
+        """对一批节点批量前向，返回 (policies(B,A), values(B,))。
+
+        一次性组装整批 12 通道特征 + 单次 predict，最大化 CPU/ONNX 吞吐
+        （替代 predict_batch 逐子建特征 + 碎片化单图前向）。
+        """
+        if not nodes:
+            return np.zeros((0, self.n_actions)), np.zeros(0)
+        arrays = np.stack([n[0].board for n in nodes])
+        my_hs = [n[1] for n in nodes]
+        op_hs = [n[2] for n in nodes]
+        tps = [n[3] for n in nodes]
+        kos = [n[0].ko_point for n in nodes]
+        planes = nodes[0][0].feature_planes_batched(arrays, my_hs, op_hs, tps, kos)
+        states = [(None, my_hs[i], op_hs[i], tps[i], planes[i])
+                  for i in range(len(nodes))]
+        return self.ai.predict_batch(states)
+
     def _select(self, node):
         """从根递归选到叶子（PUCT + 虚拟损失 + proven 剪枝）。返回路径。
 
@@ -330,41 +367,64 @@ class MCTS:
 
     def _leaf_ab(self, board, to_play, my_hist, op_hist, depth, width,
                  alpha=-1.0, beta=1.0):
-        """叶子内浅层 negamax α-β（speculative 深化）。
+        """叶子内浅层 negamax（speculative 深化），改为「逐层批量 minimax」。
 
-        每个访问节点做 1 次前向：value 头当静态评估、policy top-width 当走法
-        排序。depth=0 时即静态评估。返回 to_play 视角价值。在传入棋盘上
-        play/undo（undo 完整恢复，不破坏调用方的展开流程）。
+        原实现在每节点同步 1 次单图前向、递归 depth 层 → 共 1+width+width²+…
+        次碎片化 ort.run，CPU/ONNX 下极慢（depth2/width4 即 21 次单图）。
+
+        现把同层所有节点拼成一个 batch：特征与推理都一次性批量完成，总前向
+        次数降到 depth+1 次（depth2/width4：21→3），且单 batch 更大、吞吐更高。
+        返回 to_play 视角价值。省略跨层 α-β 剪枝（叶内启发式足够，且全展开
+        minimax 比剪枝更稳）。调用方棋盘状态不被破坏（子节点用深拷贝）。
         """
-        legal = [int(m) for m in np.where(board.get_legal_moves())[0]] + [self.n_actions - 1]
-        planes = self._planes1(board, my_hist, op_hist, to_play)
-        pol, val = self.ai.predict_batch(
-            [(None, list(my_hist), list(op_hist), to_play, planes)])
-        v_static = float(np.asarray(val[0]).reshape(-1)[0])
+        # depth<=0：静态评估（单节点批量前向）
         if depth <= 0:
-            return v_static
-        p = np.asarray(pol).reshape(-1)
+            pol, val = self._forward_level(
+                [(board, list(my_hist), list(op_hist), to_play)])
+            return float(np.asarray(val[0]).reshape(-1)[0])
+
+        # 根前向取 policy，对直接子节点排序（1 次前向）
+        rpol, _ = self._forward_level(
+            [(board, list(my_hist), list(op_hist), to_play)])
+        p = np.asarray(rpol[0]).reshape(-1)
+        legal = [int(m) for m in np.where(board.get_legal_moves())[0]] + [self.n_actions - 1]
         order = sorted(legal, key=lambda m: -p[m])[:width]
-        best = -2.0
-        for mv in order:
-            pmv = -1 if mv == self.n_actions - 1 else mv
-            if not board.play(pmv):
-                continue
-            child_to = 2 if to_play == 1 else 1
-            if child_to == 1:
-                my_h, op_h = op_hist, my_hist
-            else:
-                my_h, op_h = my_hist, op_hist
-            v = -self._leaf_ab(board, child_to, my_h, op_h, depth - 1, width,
-                               -beta, -alpha)
-            board.undo()
-            if v > best:
-                best = v
-            if best > alpha:
-                alpha = best
-            if alpha >= beta:
-                break  # β 截断
-        return best if best > -2.0 else v_static
+
+        # 逐层生成子树（每层节点 = 上层节点按 policy 选出的 width 个孩子）
+        levels = [self._child_states(board, order, my_hist, op_hist, to_play)]
+        if not levels[0]:
+            return -2.0
+        child_ranges = []  # levels[L] 中每个节点的子节点在 levels[L+1] 的 [s,e)
+        for _ in range(1, depth):
+            prev = levels[-1]
+            pols, _ = self._forward_level(prev)  # 取本层 policy 排序下一层
+            nxt, ranges = [], []
+            for i, nd in enumerate(prev):
+                cb, cmy, cop, cto = nd
+                pp = np.asarray(pols[i]).reshape(-1)
+                lleg = [int(m) for m in np.where(cb.get_legal_moves())[0]] + [self.n_actions - 1]
+                porder = sorted(lleg, key=lambda m: -pp[m])[:width]
+                s = len(nxt)
+                nxt.extend(self._child_states(cb, porder, cmy, cop, cto))
+                ranges.append((s, len(nxt)))
+            levels.append(nxt)
+            child_ranges.append(ranges)
+
+        # 逐层批量前向得到静态价值（每层 1 次批量，特征+推理都批量）
+        values = [self._forward_level(lvl)[1] for lvl in levels]
+        values = [[float(v) for v in vals] for vals in values]
+
+        # 自底向上传播 minimax：父值 = max_j(-child_j 值)
+        node_val = [list(v) for v in values]
+        for L in reversed(range(len(levels) - 1)):
+            ranges = child_ranges[L]
+            for i in range(len(levels[L])):
+                s, e = ranges[i]
+                ch = node_val[L + 1][s:e]
+                node_val[L][i] = max((-cv for cv in ch), default=-2.0)
+
+        # 根价值 = max over 根的直接子节点 of -child 值
+        return max((-cv for cv in node_val[0]), default=-2.0)
 
     def lookahead2(self, board, my_hist, op_hist, to_play, topk=12, width=4):
         """策略 2 步批量推演：我方候选 → 对手最佳应手，价值回传。
@@ -577,8 +637,10 @@ class MCTS:
                                         else nd.move_int
                                     if not pb.play(pmv):
                                         break
-                                planes = pb.feature_planes(
-                                    leaf.my_hist, leaf.op_hist, leaf.to_play)
+                                planes = pb.feature_planes_batched(
+                                    pb.board[None], [list(leaf.my_hist)],
+                                    [list(leaf.op_hist)], [leaf.to_play],
+                                    [pb.ko_point])[0]
                                 pol, val = self.ai.predict_batch(
                                     [(None, list(leaf.my_hist), list(leaf.op_hist),
                                       leaf.to_play, planes)])

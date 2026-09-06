@@ -299,11 +299,14 @@ class GoAI:
             print(f"[GoAI] 动态量化失败，保持 fp32: {e}")
             return False
 
-    def export_onnx(self, onnx_path):
+    def export_onnx(self, onnx_path, ort_intra_threads=None):
         """导出 ONNX 并把推理后端切换到 onnxruntime（CPU 提速约 1.5-3x）。
 
         需 `pip install onnx onnxruntime`。失败时保持 torch 后端并返回 False。
         仅支持 CPU 推理（use_amp 自动失效）。
+
+        ort_intra_threads: 每个 ort.run 的内部线程数。None 时取满核；MCTS 多线程
+            并发调用 predict 时建议传入 max(1, ncpu // num_threads) 以避免超线程争抢。
         """
         try:
             import onnxruntime as ort
@@ -320,8 +323,18 @@ class GoAI:
                               "policy": {0: "batch"},
                               "value": {0: "batch"}},
                 opset_version=18)
+            # 图优化 + 线程设置：ORT_ENABLE_ALL 打开常量折叠/算子融合/布局优化；
+            # intra_op 用满物理核（单次大 batch 吞吐最高），inter_op=1（本引擎
+            # 已自行多线程调度，避免 ort 内部再开并行导致超线程争抢）。
+            so = ort.SessionOptions()
+            so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            _ncpu = max(1, (os.cpu_count() or 1))
+            so.intra_op_num_threads = ort_intra_threads or _ncpu
+            so.inter_op_num_threads = 1
+            so.enable_mem_pattern = True
             self._ort = ort.InferenceSession(
-                onnx_path, providers=["CPUExecutionProvider"])
+                onnx_path, sess_options=so, providers=["CPUExecutionProvider"])
             self._forward_batch = self._forward_batch_onnx  # 实例属性遮蔽方法
             print(f"[GoAI] 已切换 ONNX Runtime 推理后端: {onnx_path}")
             return True
