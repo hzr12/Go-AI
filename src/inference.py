@@ -205,7 +205,9 @@ class GoAI:
         feature_planes 计算（MCTS 增量特征场景）。
         """
         if planes is None:
-            planes = board.feature_planes(my_hist, op_hist, to_play=to_play)
+            planes = board.feature_planes_batched(
+                board.board[None], [list(my_hist)], [list(op_hist)],
+                [to_play], [board.ko_point])[0]
         x = torch.from_numpy(np.ascontiguousarray(planes)).unsqueeze(0).to(self.device).float()
         if self.channels_last:
             x = x.to(memory_format=torch.channels_last)

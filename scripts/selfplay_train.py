@@ -64,7 +64,9 @@ def self_play_game(ai, board_size, sims, max_moves, temperature,
         print(f"    [move {mc + 1}] to_play={to_play} legal={len(legal)}",
               flush=True)
         # 记录训练样本：当前局面特征 + visit 分布（policy 目标）+ 执子方
-        planes = np.ascontiguousarray(board.feature_planes(hists[0], hists[1], to_play))
+        planes = np.ascontiguousarray(board.feature_planes_batched(
+            board.board[None], [list(hists[0])], [list(hists[1])],
+            [to_play], [board.ko_point])[0])
         vt = np.zeros(n_actions)
         vs = visits.sum()
         if vs > 0:
@@ -80,9 +82,14 @@ def self_play_game(ai, board_size, sims, max_moves, temperature,
         else:
             mv = int(np.random.choice(n_actions, p=p / s))
         pmv = -1 if mv == n_actions - 1 else mv
-        if not board.play(pmv):
+        success = board.play(pmv)
+        if not success:
             pmv = -1
-            board.play(-1)
+            # 手动同步 board 状态，模拟一次 Pass
+            board.passes += 1
+            board.ko_point = -1
+            board.move_history.append(-1)
+            board.current_player = -board.current_player
         path_moves.append(pmv)
         # 落子或 pass 都把"最近一手"推进到 hists，避免 hists 与棋盘状态错位
         # （play(-1) 已正确翻转 current_player 并更新 board.move_history）

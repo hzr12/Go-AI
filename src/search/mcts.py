@@ -133,6 +133,13 @@ class MCTS:
     def _clone_hist(self, h):
         return list(h)
 
+    @staticmethod
+    def _planes1(board, my_hist, op_hist, to_play):
+        """单局面 12 通道特征，但走向量化批量接口（B=1），与 feature_planes 语义一致。"""
+        return board.feature_planes_batched(
+            board.board[None], [list(my_hist)], [list(op_hist)],
+            [to_play], [board.ko_point])[0]
+
     def _select(self, node):
         """从根递归选到叶子（PUCT + 虚拟损失 + proven 剪枝）。返回路径。
 
@@ -192,7 +199,7 @@ class MCTS:
                 lp, leaf_v = leaf.prefetch
                 leaf.prefetch = None
             else:
-                leaf_planes = board.feature_planes(leaf.my_hist, leaf.op_hist, to_play)
+                leaf_planes = self._planes1(board, leaf.my_hist, leaf.op_hist, to_play)
                 lp, lv = self.ai.predict_batch(
                     [(None, list(leaf.my_hist), list(leaf.op_hist), to_play, leaf_planes)])
                 leaf_v = float(np.asarray(lv[0]).reshape(-1)[0])
@@ -244,13 +251,13 @@ class MCTS:
     def _eval_children(self, board, to_play, leaf, moves, priors=None):
         """评估一批候选着法并创建子节点。返回各子节点叶子视角价值列表。
 
-        在叶子的棋盘上「play → 构造 planes → (rollout) → undo」串行推进
-        （undo 完整恢复棋盘/提子/劫/历史），子节点不持有棋盘。
+        在叶子的棋盘上「play → 快照 → (rollout) → undo」串行推进；子节点不持有棋盘。
+        所有子局面的 12 通道特征用 feature_planes_batched 一次性向量化构造
+        （替代逐子 Python flood-fill），CPU 特征侧提速数倍。
         priors: 可选 {mv: prior}，提供时用叶子 policy 先验（priors_leaf），
         否则用子局面自身 policy（旧方案）。
         """
-        states = []       # (None, my_h, op_h, child_to, planes) —— 增量特征模式
-        child_meta = []   # (mv, child_to, my_h, op_h, rollout_value|None)
+        child_boards, my_hs, op_hs, to_plays, kos, child_meta = [], [], [], [], [], []
         for mv in moves:
             pmv = -1 if mv == self.n_actions - 1 else mv
             if not board.play(pmv):
@@ -258,18 +265,26 @@ class MCTS:
             child_to = 2 if to_play == 1 else 1
             my_h = leaf.op_hist if child_to == 1 else leaf.my_hist
             op_h = leaf.my_hist if child_to == 1 else leaf.op_hist
-            planes = board.feature_planes(my_h, op_h, child_to)
+            child_boards.append(board.board.copy())
+            my_hs.append(list(my_h))
+            op_hs.append(list(op_h))
+            to_plays.append(child_to)
+            kos.append(board.ko_point)
             rv = None
             if self.use_rollout and self.rollout_lambda > 0.0:
                 # LightPLS 在 play 后、undo 前的子局面推演（内部自带只读拷贝）
                 rv = light_rollout(board, self._fast_policy,
                                    max_steps=self.rollout_steps, rng=self._rng)
-            states.append((None, list(my_h), list(op_h), child_to, planes))
             child_meta.append((mv, child_to, my_h, op_h, rv))
             board.undo()
 
-        if not states:
+        if not child_meta:
             return []
+        # 向量化一次性构造整批子节点特征
+        planes_batch = board.feature_planes_batched(
+            np.stack(child_boards), my_hs, op_hs, to_plays, kos)
+        states = [(None, list(mh), list(oh), ct, planes_batch[i])
+                  for i, (mv, ct, mh, oh, rv) in enumerate(child_meta)]
         policies, values = self.ai.predict_batch(states)
         leaf_view_vals = []
         for i, (mv, child_to, my_h, op_h, rv) in enumerate(child_meta):
@@ -322,7 +337,7 @@ class MCTS:
         play/undo（undo 完整恢复，不破坏调用方的展开流程）。
         """
         legal = [int(m) for m in np.where(board.get_legal_moves())[0]] + [self.n_actions - 1]
-        planes = board.feature_planes(my_hist, op_hist, to_play)
+        planes = self._planes1(board, my_hist, op_hist, to_play)
         pol, val = self.ai.predict_batch(
             [(None, list(my_hist), list(op_hist), to_play, planes)])
         v_static = float(np.asarray(val[0]).reshape(-1)[0])
@@ -368,7 +383,7 @@ class MCTS:
         cands = [int(m) for m in np.where(legal)[0]] + [n - 1]  # 末位 pass
 
         # 1) 根前向
-        planes = board.feature_planes(my_hist, op_hist, to_play)
+        planes = self._planes1(board, my_hist, op_hist, to_play)
         pol, _ = self.ai.predict_batch(
             [(None, list(my_hist), list(op_hist), to_play, planes)])
         p = np.asarray(pol).reshape(-1)
@@ -388,7 +403,7 @@ class MCTS:
             if not board.play(pmv):
                 continue
             states1.append((None, list(my_h), list(op_h), child_to,
-                            board.feature_planes(my_h, op_h, child_to)))
+                            self._planes1(board, my_h, op_h, child_to)))
             board.undo()
             kept.append(mv)
         if not kept:
@@ -410,7 +425,7 @@ class MCTS:
                 if not board.play(opmv):
                     continue
                 states2.append((None, list(my_hist), list(op_hist), to_play,
-                                board.feature_planes(my_hist, op_hist, to_play)))
+                                self._planes1(board, my_hist, op_hist, to_play)))
                 owner.append(i)
                 board.undo()   # 撤对手应手
             board.undo()       # 撤我方候选
