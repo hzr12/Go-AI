@@ -108,9 +108,10 @@ class MctsPlayer:
             return int(np.argmax(visits))
         if self.policy_depth >= 2:
             # 策略分量 = 2 步批量推演价值分布（softmax(T=0.2) 伪概率）
-            vals, _p, _bm, _bv = self.mcts.lookahead2(
+            vals, _p, _bm, _bv = self.mcts.lookahead(
                 board, h_black, h_white, to_play,
-                topk=self.policy_topk, width=self.policy_width)
+                topk=self.policy_topk, width=self.policy_width,
+                depth=self.policy_depth)
             n = self.mcts.n_actions
             ks = np.full(n, -np.inf)
             for m, v in vals.items():

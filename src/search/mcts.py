@@ -183,27 +183,45 @@ class MCTS:
         MCTS-Solver 选择规则：存在 proven loss 子节点（其 to_play 必败）→
         立即选它（我方必胜着，无需再探）；proven win 子节点（其 to_play 必胜）
         优先跳过，仅当全部子节点均 proven win 时才回退选择。
+
+        ⚠ 关键（num_threads=1 卡死的根因）：必须跳过「已占位(exanded)但仍无
+        children」的子节点。这类节点已被某个 worker 选中送去主线程展开、或是
+        上一轮遗留的死节点。旧实现只看 `while cur.children` 下降、不认 expanded
+        标记，于是单 worker 产出后立刻又选回同一个待展开叶子 → 判定 expanded
+        → 空转，产出与展开彻底串行（实测 num_threads=1 极慢/卡死）。跳过它才能
+        让 worker 超前产出多条路径，与主线程的前向重叠。
         """
         path = [node]
         cur = node
         while cur.children:
             best, best_score = None, -1e9
+            fallback, fallback_score = None, -1e9  # 全部子节点都在途时的退路
             proven_loss = None
             proven_win = []
             for child in cur.children.values():
+                score = child.q() + child.u(self.c_puct)
+                if score > fallback_score:
+                    fallback_score, fallback = score, child
+                if child.expanded and not child.children:
+                    continue  # 在途/死节点：跳过，改选其他分支
                 if child.proved == -1:
                     proven_loss = child
                     break
                 if child.proved == 1:
                     proven_win.append(child)
                     continue
-                score = child.q() + child.u(self.c_puct)
                 if score > best_score:
                     best_score, best = score, child
             if proven_loss is not None:
                 cur = proven_loss
+            elif best is not None:
+                cur = best
+            elif fallback is not None:
+                cur = fallback  # 全在途：退回最佳占位节点（worker 自旋等主线程）
+            elif proven_win:
+                cur = proven_win[0]
             else:
-                cur = best if best is not None else proven_win[0]
+                break
             path.append(cur)
         return path
 
@@ -426,87 +444,85 @@ class MCTS:
         # 根价值 = max over 根的直接子节点 of -child 值
         return max((-cv for cv in node_val[0]), default=-2.0)
 
-    def lookahead2(self, board, my_hist, op_hist, to_play, topk=12, width=4):
-        """策略 2 步批量推演：我方候选 → 对手最佳应手，价值回传。
+    def lookahead(self, board, my_hist, op_hist, to_play, topk=12, width=4,
+                  depth=2):
+        """策略 N 步批量推演（minimax 展开 top-K/width 着法树，价值回传）。
 
-        流程（共 3 次批量前向，无递归）：
-          1. 根前向 → policy top-K 候选；
-          2. K 个候选位置拼一个 batch 前向（对手视角 policy+value）；
-          3. 每个候选取对手 top-W 应手，全部拼一个 batch 前向（回到我方视角）。
+        depth 真正控制推演层数：2=根候选→对手最佳应手→评估（共 depth+1 次批量前向）；
+        3=再多一层我方应手，以此类推。根取 top-K 候选，之后各层取 top-W 应手，
+        交替最小化/最大化「根玩家视角价值」（对手层取 min，我方层取 max）。
 
-        我走 mv 的价值 = min_j V(mv → 对手第 j 应手)（对手挑对我最差的）。
-        仅在传入棋盘上 play/undo，不破坏调用方状态。
-        返回 ({mv: 我方视角价值}, 根 masked policy)。
+        与 _leaf_ab 同样的「逐层批量」思路：每层节点拼一个 batch 一次前向，
+        既能吃到 ONNX 大 batch 吞吐，又让 depth 任意可调（旧 lookahead2 写死 2 步、
+        policy_depth 形同开关）。仅在传入棋盘上 play/undo（_child_states 用深拷贝）。
+
+        返回 ({mv: 根玩家视角价值}, 根 masked policy, 最佳 mv, 最佳价值)。
         """
         n = self.n_actions
-        legal = board.get_legal_moves()
-        cands = [int(m) for m in np.where(legal)[0]] + [n - 1]  # 末位 pass
+        legal = [int(m) for m in np.where(board.get_legal_moves())[0]] + [n - 1]
 
-        # 1) 根前向
+        # 根前向取 policy 与 top-K 候选
         planes = self._planes1(board, my_hist, op_hist, to_play)
         pol, _ = self.ai.predict_batch(
             [(None, list(my_hist), list(op_hist), to_play, planes)])
         p = np.asarray(pol).reshape(-1)
         masked = np.zeros(n)
-        masked[cands] = p[cands]
+        masked[legal] = p[legal]
         order = [int(m) for m in np.argsort(-masked)[:max(1, topk)]]
-
-        child_to = 2 if to_play == 1 else 1
-        my_h = op_hist if child_to == 1 else my_hist
-        op_h = my_hist if child_to == 1 else op_hist
-
-        # 2) 第一层批量：K 个候选位置（对手视角）
-        states1 = []
-        kept = []
-        for mv in order:
-            pmv = -1 if mv == n - 1 else mv
-            if not board.play(pmv):
-                continue
-            states1.append((None, list(my_h), list(op_h), child_to,
-                            self._planes1(board, my_h, op_h, child_to)))
-            board.undo()
-            kept.append(mv)
-        if not kept:
+        if not order:
             return {}, masked, n - 1, 0.0
-        pols, _vals1 = self.ai.predict_batch(states1)
 
-        # 3) 第二层批量：每个候选下对手 top-W 应手（回到我方视角）
-        states2 = []
-        owner = []   # 每个 state2 对应 kept 的下标 i
-        for i, mv in enumerate(kept):
-            pmv = -1 if mv == n - 1 else mv
-            if not board.play(pmv):
-                continue
-            pi = np.asarray(pols[i]).reshape(-1)
-            opp_legal = [int(m) for m in np.where(board.get_legal_moves())[0]] + [n - 1]
-            opp = sorted(opp_legal, key=lambda m: -pi[m])[:max(1, width)]
-            for omv in opp:
-                opmv = -1 if omv == n - 1 else omv
-                if not board.play(opmv):
-                    continue
-                states2.append((None, list(my_hist), list(op_hist), to_play,
-                                self._planes1(board, my_hist, op_hist, to_play)))
-                owner.append(i)
-                board.undo()   # 撤对手应手
-            board.undo()       # 撤我方候选
-        out = {}
-        if states2:
-            _, vals2 = self.ai.predict_batch(states2)
-            worst = {}   # i -> 对手最佳应手后的我方最差价值
-            for i, v in zip(owner, vals2):
-                v = float(np.asarray(v).reshape(-1)[0])  # 我方视角
-                worst[i] = min(worst.get(i, 2.0), v)
-            for i, mv in enumerate(kept):
-                if i in worst:
-                    out[mv] = worst[i]
-                else:
-                    # 对手无应手记录（罕见）：退化为候选位置价值取负
-                    out[mv] = -float(np.asarray(_vals1[i]).reshape(-1)[0])
-        else:
-            for i, mv in enumerate(kept):
-                out[mv] = -float(np.asarray(_vals1[i]).reshape(-1)[0])
-        best_mv = max(out, key=lambda m: out[m])
-        return out, masked, best_mv, out[best_mv]
+        # 逐层生成子树（每层节点 = 上层节点按 policy 选出的 top-W 孩子）
+        levels = [self._child_states(board, order, my_hist, op_hist, to_play)]
+        child_ranges = []  # levels[L] 中每个节点的子节点在 levels[L+1] 的 [s,e)
+        all_pols, all_vals = [], []
+        pol0, val0 = self._forward_level(levels[0])  # 取本层 policy + 静态价值
+        all_pols.append(pol0)
+        all_vals.append(val0)
+        for _ in range(1, depth):
+            prev = levels[-1]
+            pols = all_pols[-1]
+            nxt, ranges = [], []
+            for i, nd in enumerate(prev):
+                cb, cmy, cop, cto = nd
+                pp = np.asarray(pols[i]).reshape(-1)
+                lleg = [int(m) for m in np.where(cb.get_legal_moves())[0]] + [n - 1]
+                porder = sorted(lleg, key=lambda m: -pp[m])[:max(1, width)]
+                s = len(nxt)
+                nxt.extend(self._child_states(cb, porder, cmy, cop, cto))
+                ranges.append((s, len(nxt)))
+            levels.append(nxt)
+            child_ranges.append(ranges)
+            if not nxt:
+                break
+            pnxt, vnxt = self._forward_level(nxt)
+            all_pols.append(pnxt)
+            all_vals.append(vnxt)
+
+        # 各层静态价值转到「根玩家视角」（forward 返回的是该节点 to_play 视角）
+        node_val = []
+        for L, lvl in enumerate(levels):
+            node_val.append([
+                (float(all_vals[L][i]) if lvl[i][3] == to_play
+                 else -float(all_vals[L][i]))
+                for i in range(len(lvl))
+            ])
+
+        # 自底向上传播：奇数层（我方）取 max，偶数层（对手）取 min
+        for L in reversed(range(len(levels) - 1)):
+            ranges = child_ranges[L]
+            is_max = (L % 2 == 1)
+            for i in range(len(levels[L])):
+                s, e = ranges[i]
+                ch = node_val[L + 1][s:e]
+                if ch:  # 有孩子 → 按层性质聚合；无孩子 → 保留自身静态价值
+                    node_val[L][i] = (max if is_max else min)(ch)
+
+        # 根每个候选的最终价值 = 其对应子节点（对手层）的根视角价值
+        out = {order[i]: node_val[0][i] for i in range(len(order))}
+        best_mv = max(out, key=lambda m: out[m]) if out else (n - 1)
+        best_v = out[best_mv] if out else 0.0
+        return out, masked, best_mv, best_v
 
     def _replay_path(self, path):
         """从根局面沿 path 重放着法，返回 leaf 局面的独立棋盘副本。
@@ -602,12 +618,13 @@ class MCTS:
         leaf_q: _queue.Queue = _queue.Queue()
         finished = threading.Event()
         produced = 0
+        pending = 0   # 已入队、主线程尚未展开完成的路径数
         expanded_count = 0
         total = simulations
         lock = threading.Lock()
 
         def worker():
-            nonlocal produced
+            nonlocal produced, pending
             while not finished.is_set():
                 with lock:
                     if produced >= total:
@@ -615,14 +632,20 @@ class MCTS:
                     path = self._select(root)
                     leaf = path[-1]
                     if leaf.expanded:
-                        # 已被其他线程抢先展开：本线程无事可做。
+                        # 已被其他线程抢先展开/尚在途：本线程无事可做，
                         # sleep 释放 GIL，避免自旋挤占主线程的 torch 推理。
+                        # 若已无任何在途工作，说明可选叶子全是「已展开但无
+                        # children」的死节点，再等也不会有进展 → 退出，避免
+                        # 主线程永远等不到产出（死锁）。
+                        if pending <= 0 and leaf_q.empty():
+                            return
                         pass
                     else:
                         for node in path:
                             node.virtual_loss += int(self.virtual_loss)
                         leaf.expanded = True  # 逻辑占位，真正展开在主线程
                         produced += 1
+                        pending += 1
                         leaf_q.put(path)
                         # 推测性预评估：占位后立刻在 worker 线程前向叶子
                         #（torch 前向释放 GIL，与主线程 batch 评估重叠），
@@ -660,6 +683,9 @@ class MCTS:
 
         # 主线程：消费队列，批量展开
         batch: List[list] = []
+        # 攒批上限与 num_threads 解耦：num_threads=1 时也要能一次吞下 worker
+        # 超前产出的多条路径，否则退化成「产出1→展开1」的完全串行（卡死根因）。
+        batch_cap = max(self.num_threads, 8)
         while expanded_count < total:
             try:
                 path = leaf_q.get(timeout=0.2)
@@ -668,24 +694,43 @@ class MCTS:
                     break
                 continue
             batch.append(path)
-            # 攒够一批（或接近）再统一展开，平衡并行度与 batch 利用率
-            if len(batch) >= self.num_threads or expanded_count + len(batch) >= total:
-                for pth in batch:
-                    leaf = pth[-1]
-                    leaf.board = self._replay_path(pth)
-                    self._expand(leaf)
-                    leaf.board = None  # 展开完成即释放盘面
-                    self._backup(pth, v_leaf=-leaf.value_sum)  # leaf 我方视角
-                    expanded_count += 1
-                    if progress_cb is not None:
-                        try:
-                            progress_cb(expanded_count, root)
-                        except Exception:  # noqa: BLE001
-                            pass
-                batch = []
+            # 把队列里已就绪的一并取走，凑大 batch 提高前向利用率
+            while len(batch) < batch_cap:
+                try:
+                    batch.append(leaf_q.get_nowait())
+                except _queue.Empty:
+                    break
+            for pth in batch:
+                leaf = pth[-1]
+                leaf.board = self._replay_path(pth)
+                self._expand(leaf)
+                leaf.board = None  # 展开完成即释放盘面
+                self._backup(pth, v_leaf=-leaf.value_sum)  # leaf 我方视角
+                expanded_count += 1
+                pending -= 1
+                if progress_cb is not None:
+                    try:
+                        progress_cb(expanded_count, root)
+                    except Exception:  # noqa: BLE001
+                        pass
+            batch = []
         finished.set()
         for t in threads:
             t.join(timeout=1.0)
+        # 收尾：队列中未处理的路径，其叶子被占位(expanded=True)却未真正展开，
+        # 路径上的虚拟损失也没回收。若不复位，下一轮树复用时这些节点既无
+        # children 又被判 expanded → worker 永远无法产出（死锁）；残留虚拟损失
+        # 还会让它们的 PUCT 分数长期偏低，搜索统计被污染。
+        while True:
+            try:
+                pth = leaf_q.get_nowait()
+            except _queue.Empty:
+                break
+            if not pth:
+                continue
+            for nd in pth:
+                nd.virtual_loss = 0
+            pth[-1].expanded = False
 
         visits = np.zeros(self.n_actions, dtype=np.int64)
         for mv, child in root.children.items():

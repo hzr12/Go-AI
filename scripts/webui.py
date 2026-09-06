@@ -224,9 +224,10 @@ class Session:
         n_actions = bs * bs + 1
         t0 = time.perf_counter()
         if self.policy_depth >= 2:
-            out, masked, move_int, value = self.mcts.lookahead2(
+            out, masked, move_int, value = self.mcts.lookahead(
                 self.board, self.hist[0], self.hist[1], to_play,
-                topk=self.policy_topk, width=self.policy_width)
+                topk=self.policy_topk, width=self.policy_width,
+                depth=self.policy_depth)
         else:
             policy, value = self.ai.predict(self.board, self.hist[0], self.hist[1], to_play)
             masked = policy.copy()
@@ -295,9 +296,10 @@ class Session:
             progress_cb=self._progress_cb)
         if self.policy_depth >= 2:
             # 策略分量升级为 2 步推演价值分布（softmax(T=0.2) 伪概率）
-            vals, _p, _bm, _bv = self.mcts.lookahead2(
+            vals, _p, _bm, _bv = self.mcts.lookahead(
                 self.board, self.hist[0], self.hist[1], to_play,
-                topk=self.policy_topk, width=self.policy_width)
+                topk=self.policy_topk, width=self.policy_width,
+                depth=self.policy_depth)
             ks = np.full(n_actions, -np.inf)
             for m, v in vals.items():
                 ks[m] = v
@@ -996,13 +998,14 @@ def main():
                     help="叶子内浅层 α-β 深度（0=关闭；2-4 = speculative 深化，棋力换时间）")
     ap.add_argument("--leaf-ab-width", type=int, default=4,
                     help="叶内 α-β 每节点 policy top-W 走法排序宽度")
-    ap.add_argument("--policy-depth", type=int, default=1, choices=[1, 2],
-                    help="策略分量推演步数：2=根候选各推 2 步（对手最佳应手回传，"
-                         "共 3 次批量前向，policy/hybrid 模式生效）")
+    ap.add_argument("--policy-depth", type=int, default=1,
+                    help="策略分量推演层数（minimax 展开深度）：1=关闭推演，直接用根策略概率；"
+                         "2=根候选→对手最佳应手→评估（3 次批量前向）；3+=再深挖一层我方应手，"
+                         "以此类推。policy/hybrid 模式的策略分量生效。逐层批量前向，层数越大越慢。")
     ap.add_argument("--policy-width", type=int, default=4,
-                    help="2 步推演中对手每候选考察的应手数（top-W）")
+                    help="N 步推演中非根层每节点考察的应手数（top-W）")
     ap.add_argument("--policy-topk", type=int, default=12,
-                    help="2 步推演的根候选数（policy top-K）")
+                    help="N 步推演的根候选数（policy top-K）")
     ap.add_argument("--quantize", action="store_true",
                     help="CPU int8 动态量化 Linear 层（与 --compile 互斥）")
     ap.add_argument("--onnx", nargs="?", const="models/goai_cpu.onnx", default=None,
@@ -1035,13 +1038,15 @@ def main():
               channels_last=(args.device.split(":")[0] == "cuda"))
     if args.quantize:
         ai.quantize_dynamic()
+    # MCTS worker 线程数收敛到物理核数：超过核数只会空耗/争抢，无收益。
+    _ncpu = max(1, (os.cpu_count() or 1))
+    _nt = min(args.num_threads, _ncpu) if args.num_threads > 0 else _ncpu
     if args.onnx:
-        # MCTS 多线程会并发调用 predict；把 ONNX 单调用线程数按并发数折半，
-        # 避免多个 ort.run 各占满核导致超线程争抢（num_threads=1 时仍用满核）。
-        _ncpu = max(1, (os.cpu_count() or 1))
-        _ort_intra = max(1, _ncpu // max(1, args.num_threads))
+        # 单次 ort.run 内部线程数取「核数的一半、至少 2」：既保证大 batch 单调用
+        # 并行度，又给多个并发 predict 留出余量（避免超线程争抢）。
+        _ort_intra = max(2, _ncpu // 2)
         ai.export_onnx(args.onnx, ort_intra_threads=_ort_intra)
-    session = Session(ai, board_size=ai.board_size, num_threads=args.num_threads,
+    session = Session(ai, board_size=ai.board_size, num_threads=_nt,
                       default_mode=args.mode, expand_topk=args.expand_topk,
                       expand_chunk=args.expand_chunk,
                       solver_thresh=args.solver_thresh,
@@ -1069,7 +1074,7 @@ def main():
     handler = build_handler(session, html_page)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
     print(f"WebUI: http://127.0.0.1:{args.port}  (模型={args.model if model_path else '随机权重'}, "
-          f"设备={ai.device}, 线程={args.num_threads})")
+          f"设备={ai.device}, MCTS线程={_nt}, ONNX内部线程={_ort_intra if args.onnx else 'N/A'})")
     print("Ctrl+C 退出")
     try:
         server.serve_forever()
