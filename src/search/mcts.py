@@ -116,7 +116,11 @@ class MCTS:
         self.expand_topk = max(0, int(expand_topk))
         self.expand_chunk = max(0, int(expand_chunk))
         self.solver_thresh = float(solver_thresh)
-        self.spec_prefetch = bool(spec_prefetch)
+        # 推测性预评估只在多 worker 下有收益：worker 持锁做 batch=1 前向，
+        # 与主线程的批量前向争抢 CPU/GIL；num_threads<=1 时主线程本来就要做
+        # 这一次叶子前向，prefetch 只是把它挪到 worker 线程再跟主线程抢核，
+        # 净亏。故单 worker 时自动关闭（--no-prefetch 仍可显式控制）。
+        self.spec_prefetch = bool(spec_prefetch) and self.num_threads > 1
         self.leaf_ab_depth = max(0, int(leaf_ab_depth))
         self.leaf_ab_width = max(1, int(leaf_ab_width))
         self.leaf_ab_weight = float(leaf_ab_weight)
@@ -408,14 +412,19 @@ class MCTS:
         legal = [int(m) for m in np.where(board.get_legal_moves())[0]] + [self.n_actions - 1]
         order = sorted(legal, key=lambda m: -p[m])[:width]
 
-        # 逐层生成子树（每层节点 = 上层节点按 policy 选出的 width 个孩子）
+        # 逐层生成子树（每层节点 = 上层节点按 policy 选出的 width 个孩子）。
+        # ⚠ 修复重复前向：旧实现在生成下一层时对本层 forward 一次取 policy，
+        #   下面又对本层 forward 一次取静态价值——同一批节点白白多算一次。
+        #   现改为生成过程中每层只 forward 一次，policy 与价值一次同时拿到，
+        #   _leaf_ab 总前向次数从 depth+2 降到 depth+1（depth2/width4：4→3）。
         levels = [self._child_states(board, order, my_hist, op_hist, to_play)]
         if not levels[0]:
             return -2.0
         child_ranges = []  # levels[L] 中每个节点的子节点在 levels[L+1] 的 [s,e)
+        pols, vals = self._forward_level(levels[0])
+        all_vals = [[float(v) for v in vals]]
         for _ in range(1, depth):
             prev = levels[-1]
-            pols, _ = self._forward_level(prev)  # 取本层 policy 排序下一层
             nxt, ranges = [], []
             for i, nd in enumerate(prev):
                 cb, cmy, cop, cto = nd
@@ -427,13 +436,13 @@ class MCTS:
                 ranges.append((s, len(nxt)))
             levels.append(nxt)
             child_ranges.append(ranges)
-
-        # 逐层批量前向得到静态价值（每层 1 次批量，特征+推理都批量）
-        values = [self._forward_level(lvl)[1] for lvl in levels]
-        values = [[float(v) for v in vals] for vals in values]
+            if not nxt:
+                break
+            pols, vnext = self._forward_level(nxt)
+            all_vals.append([float(v) for v in vnext])
 
         # 自底向上传播 minimax：父值 = max_j(-child_j 值)
-        node_val = [list(v) for v in values]
+        node_val = [list(v) for v in all_vals]
         for L in reversed(range(len(levels) - 1)):
             ranges = child_ranges[L]
             for i in range(len(levels[L])):
