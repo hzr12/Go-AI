@@ -47,7 +47,7 @@ class GoAI:
 
     # NPU batch 归桶：CANN 按输入形状编译算子，MCTS 的零散 batch（尾批 6、7 等）
     # 每种形状都要单独编译一次；归桶补零后形状固定，编译缓存才能跨调用命中。
-    _NPU_BATCH_BUCKETS = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256)
+    _NPU_BATCH_BUCKETS = (1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 192, 256)
 
     def __init__(self, model_path=None, board_size=19, device="auto", use_amp=False,
                  backbone_channels=128, backbone_res_blocks=12, policy_channels=32, value_channels=16,
@@ -164,10 +164,20 @@ class GoAI:
             print("[GoAI] NPU 首次前向 warmup 中（CANN 算子初始化，可能需要 1-3 分钟）…",
                   flush=True)
             t0 = time.time()
-            dummy = torch.zeros(1, 12, self.board_size, self.board_size,
-                                device=self.device)
-            with torch.no_grad():
-                self._forward_batch(dummy)
+            # 预热 predict_batch 真实路径（含 autocast + batch 归桶补零）：
+            # 让每个桶形状的 CANN 图在启动时一次性编译并落盘到 ASCEND_CACHE_PATH，
+            # 避免自对弈每个新进程 / 新 batch 形状都冷编译 ~100s 而误判卡死。
+            board = GoBoard(self.board_size)
+            my_hist = [[-1, -1, -3], [-1, -1, -3]]
+            # 只预热自对弈实际会命中的桶形状（expand-chunk=16 → B≤16）。
+            # 32..256 自对弈用不到，留到运行时按需冷编译一次（已落盘缓存，安全）。
+            max_warmup_batch = 16
+            for nb in [b for b in self._NPU_BATCH_BUCKETS if b <= max_warmup_batch]:
+                states = [(board, list(my_hist[0]), list(my_hist[1]), 1)] * nb
+                with torch.no_grad():
+                    self.predict_batch(states)
+                print(f"  [warmup] batch={nb} 编译完成 ({time.time() - t0:.1f}s)",
+                      flush=True)
             print(f"[GoAI] NPU warmup 完成: {time.time() - t0:.1f}s（仅首次，后续为毫秒级）",
                   flush=True)
         else:

@@ -40,7 +40,8 @@ def self_play_game(ai, board_size, sims, max_moves, temperature,
     mcts = MCTS(ai, board_size=board_size, num_threads=1,
                 expand_topk=expand_topk, expand_chunk=expand_chunk,
                 priors_leaf=priors_leaf, temperature=temperature,
-                dirichlet_alpha=dir_alpha, dirichlet_eps=dir_eps)
+                dirichlet_alpha=dir_alpha, dirichlet_eps=dir_eps,
+                spec_prefetch=False)  # NPU 上禁止 worker 线程跑 predict_batch（会死锁）
     board = GoBoard(board_size)
     hists = [[-1, -1, -3], [-1, -1, -3]]  # [黑方, 白方] 最近3手
     n_actions = board_size * board_size + 1
@@ -60,6 +61,8 @@ def self_play_game(ai, board_size, sims, max_moves, temperature,
         visits, probs, _rv = mcts.search(
             board, hists[0], hists[1], to_play,
             simulations=sims, path_moves=path_moves)
+        print(f"    [move {mc + 1}] to_play={to_play} legal={len(legal)}",
+              flush=True)
         # 记录训练样本：当前局面特征 + visit 分布（policy 目标）+ 执子方
         planes = np.ascontiguousarray(board.feature_planes(hists[0], hists[1], to_play))
         vt = np.zeros(n_actions)
@@ -81,10 +84,12 @@ def self_play_game(ai, board_size, sims, max_moves, temperature,
             pmv = -1
             board.play(-1)
         path_moves.append(pmv)
+        # 落子或 pass 都把"最近一手"推进到 hists，避免 hists 与棋盘状态错位
+        # （play(-1) 已正确翻转 current_player 并更新 board.move_history）
+        h = hists[0] if to_play == 1 else hists[1]
+        h.pop(0)
+        h.append(pmv)
         if pmv >= 0:
-            h = hists[0] if to_play == 1 else hists[1]
-            h.pop(0)
-            h.append(pmv)
             passes = 0
         else:
             passes += 1

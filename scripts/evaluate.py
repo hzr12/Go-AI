@@ -18,15 +18,17 @@ from src.game.go_rules import GoBoard
 
 
 def load_ai(args):
-    device = "cuda" if torch.cuda.is_available() else "cpu" if args.device == "auto" else args.device
+    # 设备交给 GoAI 统一解析：其 auto 逻辑会按 cuda → npu → cpu 自动识别。
+    # 切勿在此提前把 "auto" 解析成 cpu，否则会漏掉 Ascend NPU 的自动识别
+    # （GoAI 的 auto 分支只在收到 "auto" 时触发）。
     ai = GoAI(
-        model_path=args.model, board_size=args.board_size, device=device,
+        model_path=args.model, board_size=args.board_size, device=args.device,
         use_amp=args.use_amp, attention_mode=args.attention_mode,
         num_attention_layers=args.num_attention_layers, num_heads=args.num_heads,
         policy_channels=args.policy_channels, value_channels=args.value_channels,
         attn_mode=args.attn_mode, attn_window=args.attn_window, compile=args.compile,
     )
-    return ai, device
+    return ai, ai.device
 
 
 def evaluate_vs_random(ai, board_size, num_games=100, use_mcts=False, simulations=400, num_threads=4, topk=10):
@@ -82,8 +84,21 @@ def evaluate_vs_random(ai, board_size, num_games=100, use_mcts=False, simulation
     return {"wins": wins, "losses": losses, "draws": draws, "win_rate": wins / num_games}
 
 
-def benchmark(ai, board_size, num_positions=200):
-    """推理速度基准（单样本 vs 批量）。"""
+def _bench_batch(ai, board, my_hist, to_play, nb, num_positions=192):
+    """对固定 batch=n 的前向计时，返回 (平均每次前向耗时, pos/s)。"""
+    states = [(board, list(my_hist[0]), list(my_hist[1]), to_play)] * nb
+    ai.predict_batch(states)  # 预热一次，确保该形状算子已编译
+    iters = max(num_positions // nb, 2)
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        ai.predict_batch(states)
+    total = time.perf_counter() - t0
+    per_call = total / iters
+    return per_call, nb / per_call
+
+
+def benchmark(ai, board_size, num_positions=192):
+    """推理速度基准（单样本 vs 多 batch 形状，定位 NPU 甜点 batch）。"""
     board = GoBoard(board_size)
     my_hist = [[-1, -1, -3], [-1, -1, -3]]
     to_play = 1
@@ -92,14 +107,13 @@ def benchmark(ai, board_size, num_positions=200):
     for _ in range(num_positions):
         ai.predict(board, my_hist[0], my_hist[1], to_play)
     single = (time.perf_counter() - t0) / num_positions
-    # 批量（模拟 MCTS 叶子评估）
-    states = [(board, list(my_hist[0]), list(my_hist[1]), to_play)] * 32
-    t0 = time.perf_counter()
-    for _ in range(num_positions // 32 + 1):
-        ai.predict_batch(states)
-    batched = (time.perf_counter() - (t0)) / max(num_positions // 32, 1)
-    return {"avg_time_single": single, "avg_time_batch32": batched,
-            "throughput_single": 1 / single, "throughput_batch": 32 / batched}
+    res = {"avg_time_single": single, "throughput_single": 1 / single}
+    # 多 batch 形状（覆盖 MCTS 展开 / lookahead2 常用拼接大小）
+    for nb in (8, 16, 32, 48, 64):
+        per_call, tp = _bench_batch(ai, board, my_hist, to_play, nb, num_positions)
+        res[f"avg_time_batch{nb}"] = per_call
+        res[f"throughput_batch{nb}"] = tp
+    return res
 
 
 def main():
@@ -139,8 +153,10 @@ def main():
         res = benchmark(ai, p.board_size)
         print(f"单样本前向: {res['avg_time_single']*1000:.2f} ms "
               f"({res['throughput_single']:.1f} pos/s)")
-        print(f"批量32前向: {res['avg_time_batch32']*1000:.2f} ms "
-              f"({res['throughput_batch']:.1f} pos/s)  [MCTS 叶子评估]")
+        for nb in (8, 16, 32, 48, 64):
+            print(f"批量{nb:>2}前向: {res[f'avg_time_batch{nb}']*1000:.2f} ms "
+                  f"({res[f'throughput_batch{nb}']:.1f} pos/s)"
+                  + ("  [MCTS 叶子评估]" if nb == 32 else ""))
     elif p.mode == "selfplay":
         res = ai.self_play(num_games=p.num_games, use_mcts=p.use_mcts,
                            simulations=p.simulations, num_threads=p.num_threads)
