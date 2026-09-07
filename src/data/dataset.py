@@ -41,13 +41,15 @@ class SupervisedDataset:
     def __len__(self):
         return self.N
 
-    def sample_batch(self, idxs, device='cpu'):
+    def sample_batch_numpy(self, idxs):
         """
-        给定样本下标（numpy int array），返回 (state_tensor, move_tensor, value_tensor)。
-        state_tensor: (B, 12, H, W) float32
-        move_tensor:  (B,) int64
-        value_tensor: (B, 1) float32
+        给定样本下标，返回 numpy 版 (states, moves_out, values)：
+            states    : (B, 12, H, W) float32
+            moves_out : (B,) int64
+            values    : (B, 1) float32
 
+        与 sample_batch 逻辑完全相同（含向量化特征构造与 8 对称增强），只是不转
+        torch 张量——供 MindSpore 训练脚本使用（910B 环境无 torch）。
         使用向量化批量特征构造（GoBoard.feature_planes_batched）+ 向量化对称增强，
         避免逐样本 Python 循环，训练吞吐显著更高。
         """
@@ -89,6 +91,11 @@ class SupervisedDataset:
             moves_out[mask] = rr * bs + cc
 
         values = self.values[idxs].astype(np.float32).reshape(-1, 1)
+        return states, moves_out, values
+
+    def sample_batch(self, idxs, device='cpu'):
+        """numpy 取批 + 转 torch 张量（等价于 sample_batch_numpy 后再 to(device)）。"""
+        states, moves_out, values = self.sample_batch_numpy(idxs)
         return (
             torch.from_numpy(states).to(device),
             torch.from_numpy(moves_out).to(device),

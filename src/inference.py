@@ -350,9 +350,12 @@ class GoAI:
         """
         xnp = x.detach().cpu().numpy().astype(np.float32)
         pol, val = self._ort.run(None, {"x": xnp})
-        pol = torch.from_numpy(np.asarray(pol))
-        pol = torch.softmax(pol, dim=-1)
-        return pol, torch.from_numpy(np.asarray(val)).reshape(-1, 1)
+        pol = np.asarray(pol, dtype=np.float32)
+        # numerically stable softmax (avoid torch dependency in ONNX path)
+        pol -= pol.max(axis=-1, keepdims=True)
+        np.exp(pol, out=pol)
+        pol /= pol.sum(axis=-1, keepdims=True)
+        return torch.from_numpy(pol), torch.from_numpy(np.asarray(val, dtype=np.float32)).reshape(-1, 1)
 
     def choose_move(self, board, my_hist, op_hist, to_play, legal_mask, temperature=1.0, topk=10):
         """根据策略分布与合法着法掩码，采样一个着法。
@@ -450,7 +453,7 @@ class GoAI:
             while passes < 2 and move_count < max_moves:
                 to_play = board.current_player
                 legal = board.get_legal_moves()
-                if len(legal) == 0:
+                if not legal.any():
                     passes += 1
                     board.play(-1)
                     path_moves.append(-1)
@@ -530,7 +533,7 @@ class GoAI:
                     hist = my_hist[0] if human_color == 1 else my_hist[1]
                     hist.pop(0); hist.append(mv)
             else:
-                if len(legal) == 0:
+                if not legal.any():
                     board.play(-1); passes += 1
                     path_moves.append(-1)
                 else:

@@ -1,0 +1,1 @@
+python scripts/webui.py --port 7860 --device cpu --priors-leaf --mode hybrid --hybrid-sims 24 --hybrid-blend 0.5 --expand-topk 12 --expand-chunk 8 --leaf-ab-depth 2 --policy-depth 3 --num-threads 1 --onnx --policy-topk 12 --policy-width 6

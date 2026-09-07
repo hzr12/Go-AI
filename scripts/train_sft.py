@@ -288,6 +288,12 @@ def main():
     ap.add_argument('--save-every', type=int, default=2000)
     ap.add_argument('--out', default='models/sft.pt')
     # 注意力相关
+    ap.add_argument('--backbone-channels', type=int, default=128,
+                    help='主干卷积通道数。容量主开关，实测（19路, mix/window'
+                         ' 注意力, 4 层注意力头）：128×12≈4.06M，192×17≈12.41M，'
+                         '224×12≈12.36M，256×12≈16.13M')
+    ap.add_argument('--backbone-res-blocks', type=int, default=12,
+                    help='主干残差块数量（与 --backbone-channels 共同决定容量）')
     ap.add_argument('--attention-mode', default='mix',
                     choices=['none', 'mix', 'all'],
                     help='主干注意力模式: none=纯卷积, mix=卷积+注意力混合, all=全注意力')
@@ -461,8 +467,8 @@ def main():
 
     model = AlphaGoNet(
         in_channels=12,
-        backbone_channels=128,
-        backbone_res_blocks=12,
+        backbone_channels=args.backbone_channels,
+        backbone_res_blocks=args.backbone_res_blocks,
         attention_mode=args.attention_mode,
         num_attention_layers=args.num_attention_layers,
         num_heads=args.num_heads,

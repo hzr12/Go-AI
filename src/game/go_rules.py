@@ -18,6 +18,7 @@
 """
 
 import numpy as np
+from scipy.ndimage import label as _scipy_label
 
 # 对称变换：8 种（4 旋转 × 2 翻转）。用于数据增强时的坐标重映射。
 # 每个变换是一个函数 (r, c) -> (r, c)，作用在 (board_size, board_size) 的平面上。
@@ -187,8 +188,8 @@ class GoBoard:
         self.board[r, c] = color
         # 提掉相邻 opponent 块中无气的
         captured = []
-        for color, comp in self._neighbor_groups(r, c):
-            if color == opponent:
+        for nb_color, comp in self._neighbor_groups(r, c):
+            if nb_color == opponent:
                 cr0, cc0 = comp[0]
                 if self.board[cr0, cc0] == opponent and not self._group_has_liberty(cr0, cc0):
                     captured.extend(comp)
@@ -427,7 +428,6 @@ class GoBoard:
             避免单图版的双层 Python for 循环（每个非空点一次 flood fill），
             在 B 较大时（训练 batch）提速数倍。
         """
-        from scipy.ndimage import label as _label
         boards = np.asarray(boards)
         B, n, _ = boards.shape
         planes = np.zeros((B, 12, n, n), dtype=np.float32)
@@ -484,7 +484,7 @@ class GoBoard:
                 mask = (board_b == color)
                 if not mask.any():
                     continue
-                labelled, num = _label(mask, structure=struct)
+                labelled, num = _scipy_label(mask, structure=struct)
                 if num == 0:
                     continue
                 # 每个 group 的邻空数 = 该 group 内点邻域空点坐标总数（不去重空块）

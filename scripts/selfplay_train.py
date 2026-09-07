@@ -84,12 +84,9 @@ def self_play_game(ai, board_size, sims, max_moves, temperature,
         pmv = -1 if mv == n_actions - 1 else mv
         success = board.play(pmv)
         if not success:
+            # 着法非法（自杀），退化为 Pass
+            board.play(-1)
             pmv = -1
-            # 手动同步 board 状态，模拟一次 Pass
-            board.passes += 1
-            board.ko_point = -1
-            board.move_history.append(-1)
-            board.current_player = -board.current_player
         path_moves.append(pmv)
         # 落子或 pass 都把"最近一手"推进到 hists，避免 hists 与棋盘状态错位
         # （play(-1) 已正确翻转 current_player 并更新 board.move_history）

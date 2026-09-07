@@ -260,7 +260,7 @@ class Session:
         is_pass = (move_int == n_actions - 1)
         self._apply_move(PASS if is_pass else move_int, "ai")
         ai_winrate = round((value + 1) / 2.0, 3)
-        mv_str = "pass" if is_pass else f"{chr(ord('a') + self.last_move[1])}{self.last_move[0] + 1}"
+        mv_str = "pass" if is_pass else f"{chr(ord('a') + self.last_move[1])}{chr(ord('a') + self.last_move[0])}"
         info = {
             "move": mv_str,
             "visits": 1,
@@ -340,7 +340,7 @@ class Session:
         is_pass = (move_int == n_actions - 1)
         self._apply_move(PASS if is_pass else move_int, "ai")
         ai_winrate = round((root_value + 1) / 2.0, 3)
-        mv_str = "pass" if is_pass else f"{chr(ord('a') + self.last_move[1])}{self.last_move[0] + 1}"
+        mv_str = "pass" if is_pass else f"{chr(ord('a') + self.last_move[1])}{chr(ord('a') + self.last_move[0])}"
         info = {
             "move": mv_str,
             "visits": int(visits.sum()),
@@ -406,7 +406,7 @@ class Session:
             self._apply_move(mv_play, "ai")
             # AI（白）视角胜率
             ai_winrate = round((root_value + 1) / 2.0, 3)
-            mv_str = "pass" if is_pass else f"{chr(ord('a') + self.last_move[1])}{self.last_move[0] + 1}"
+            mv_str = "pass" if is_pass else f"{chr(ord('a') + self.last_move[1])}{chr(ord('a') + self.last_move[0])}"
             info = {
                 "move": mv_str,
                 "visits": int(visits.sum()),
@@ -965,7 +965,7 @@ document.getElementById('sims').disabled =
 
 def main():
     ap = argparse.ArgumentParser(description="Go-AI WebUI（19 路人机对弈 + MCTS 可视化）")
-    ap.add_argument("--model", default="models/sft_19x19_v3.pth")
+    ap.add_argument("--model", default="models/sft_19x19_v4.pth")
     ap.add_argument("--board-size", type=int, default=19)
     ap.add_argument("--device", default="auto")
     ap.add_argument("--port", type=int, default=7860)

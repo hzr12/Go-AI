@@ -57,7 +57,7 @@ def test_mcts_prefers_capture_over_random():
     board = GoBoard(9)
     # 摆一个黑棋能吃白子的形状（简化：仅验证流程稳定）
     board.board[2][2] = 1   # 黑
-    board.board[2][3] = 2   # 白，气被黑包围
+    board.board[2][3] = -1  # 白，气被黑包围
     board.board[1][3] = 1
     board.board[3][3] = 1
     board.board[2][4] = 1

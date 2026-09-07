@@ -1,30 +1,36 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""下载 yenw/computer-go-dataset 的 AlphaGo Zero 全部对局（去重 + 过滤）。
+"""下载 yenw/computer-go-dataset 的高质量棋谱（去重 + 过滤）。
 
-来源：AI/AlphaGo Zero —— DeepMind 公开的 AlphaGo Zero 对局，共 5 组：
-  - Extended Data Figure 1 : 20-block vs AlphaGo Lee
-  - Extended Data Figure 4 : 20-block self-play games
-  - Extended Data Figure 5 : 40-block self-play games
-  - Extended Data Figure 6 : 40-block vs AlphaGo Master
-  - Figure 5               : Timeline
-全部保留（不做配额截断）。
+只取两个「纯度最高」的来源，全部保留（不做配额截断）：
+
+  1. yenw_pro —— Professional/ 职业棋谱 73,522 局（1940-2017）
+     pro1940-1999.zip（10.5MB）+ pro2000+.zip（14.9MB）
+  2. agz     —— AI/AlphaGo Zero/ DeepMind 公开的 AlphaGo Zero 对局，5 组：
+       Extended Data Figure 1 : 20-block vs AlphaGo Lee
+       Extended Data Figure 4 : 20-block self-play games
+       Extended Data Figure 5 : 40-block self-play games
+       Extended Data Figure 6 : 40-block vs AlphaGo Master
+       Figure 5               : Timeline
+
+不引入 TYGEM/TOM/NNGS/OGS 等段位参差或需格式转换的来源。
 
 处理流程：
-  1. GitHub contents API 递归枚举 AI/AlphaGo Zero 下所有文件；
-  2. 逐个下载（zip/7z 解压，sgf 直收）；
-  3. 兼容「一行一盘 SGF」的 txt 存放形式，自动拆成独立 .sgf；
-  4. 按「规范化 B/W 着法序列」sha1 去重，过滤非 19 路 / 过短残局。
+  1. zip 直接解压 / GitHub contents API 递归枚举下载；
+  2. 兼容「一行一盘 SGF」的 txt 存放形式，自动拆成独立 .sgf；
+  3. 按「规范化 B/W 着法序列」sha1 **跨源**去重，过滤非 19 路 / 过短残局。
 
-输出：data/games/games/agz/<序号>.sgf（build_dataset.py 会递归扫描）
+输出：data/games/games/<source>/<序号>.sgf（build_dataset.py 会递归扫描）
 
 用法：
   python scripts/fetch_games.py                 # 全量下载
+  python scripts/fetch_games.py --only yenw_pro # 只下职业棋谱
   python scripts/fetch_games.py --cleanup       # 完成后删除下载与解压的暂存目录
 """
 import argparse
 import hashlib
 import json
+import random
 import re
 import shutil
 import subprocess
@@ -38,7 +44,17 @@ GH_REPO = "yenw/computer-go-dataset"
 GH_API = f"https://api.github.com/repos/{GH_REPO}/contents"
 GH_RAW = f"https://raw.githubusercontent.com/{GH_REPO}/master"
 
-AGZ_DIR = "AI/AlphaGo Zero"
+SOURCES = {
+    "yenw_pro": {
+        "archives": [
+            (f"{GH_RAW}/Professional/pro1940-1999.zip", "zip"),
+            (f"{GH_RAW}/Professional/pro2000+.zip", "zip"),
+        ],
+    },
+    "agz": {
+        "github_dir": "AI/AlphaGo Zero",
+    },
+}
 
 # SGF 着法：;B[pd] / ;W[dd] ；pass 为空坐标 ;B[]
 MOVE_RE = re.compile(r";([BW])\[([a-z]{0,2})\]")
@@ -75,8 +91,8 @@ def download(url, dest):
     for attempt in range(4):
         for u in urls:
             try:
-                print(f"      GET {Path(u).name}  (第 {attempt + 1} 次)",
-                      flush=True)
+                print(f"      GET {Path(urllib.parse.unquote(u)).name}  "
+                      f"(第 {attempt + 1} 次)", flush=True)
                 with urllib.request.urlopen(u, timeout=300) as r, \
                         open(part, "wb") as f:
                     total = int(r.headers.get("Content-Length") or 0)
@@ -173,8 +189,23 @@ def canonical_key(text, board_size=19, min_moves=20):
     return hashlib.sha1(repr(moves).encode("utf-8")).hexdigest()
 
 
+def fetch_archives(archives, name, tmp):
+    """下载并解压一组压缩包，返回收集到的 .sgf 路径。"""
+    files = []
+    for idx, (url, kind) in enumerate(archives):
+        archive = tmp / f"{name}_{idx}.{kind}"
+        download(url, archive)
+        exdir = tmp / f"{name}_{idx}_x"
+        if not any(exdir.rglob("*.sgf")):
+            extract(archive, exdir)
+        got = collect_sgf(exdir)
+        print(f"    -> {len(got)} 局", flush=True)
+        files.extend(got)
+    return files
+
+
 def fetch_github_dir(subdir, name, tmp):
-    """枚举并下载 GitHub 目录下所有文件，返回收集到的 .sgf 路径列表。"""
+    """递归枚举并下载 GitHub 目录下所有文件，返回 .sgf 路径列表。"""
     entries = list(github_walk(subdir))
     print(f"  递归枚举到 {len(entries)} 个文件", flush=True)
     files = []
@@ -210,6 +241,8 @@ def main():
     ap.add_argument("--min-moves", type=int, default=20,
                     help="着法数少于该值视为残局/空局，丢弃")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--only", default="",
+                    help="只处理指定来源（逗号分隔），默认全部")
     ap.add_argument("--tmp", default=".cache_fetch_games",
                     help="下载与解压的暂存目录")
     ap.add_argument("--cleanup", action="store_true",
@@ -218,42 +251,53 @@ def main():
 
     out = Path(args.out)
     tmp = Path(args.tmp)
-    rng = __import__("random").Random(args.seed)
+    rng = random.Random(args.seed)
     seen = set()
+    grand_total = 0
+    only = {s.strip() for s in args.only.split(",") if s.strip()}
 
-    print(f"\n=== AlphaGo Zero ({GH_REPO}/{AGZ_DIR}) ===", flush=True)
-    files = fetch_github_dir(AGZ_DIR, "agz", tmp)
-    print(f"  合计收集到 {len(files)} 个 .sgf", flush=True)
-
-    rng.shuffle(files)
-    dst = out / "agz"
-    if dst.exists():
-        shutil.rmtree(dst)
-    dst.mkdir(parents=True, exist_ok=True)
-
-    kept = dup = bad = 0
-    for f in files:
-        try:
-            text = f.read_text(encoding="utf-8", errors="ignore")
-        except Exception:  # noqa: BLE001
-            bad += 1
+    for name, spec in SOURCES.items():
+        if only and name not in only:
             continue
-        key = canonical_key(text, args.board_size, args.min_moves)
-        if key is None:
-            bad += 1
-            continue
-        if key in seen:
-            dup += 1
-            continue
-        seen.add(key)
-        shutil.copy2(f, dst / f"{kept:06d}.sgf")
-        kept += 1
+        print(f"\n=== {name} ===", flush=True)
+        if "archives" in spec:
+            files = fetch_archives(spec["archives"], name, tmp)
+        else:
+            files = fetch_github_dir(spec["github_dir"], name, tmp)
+        print(f"  合计收集到 {len(files)} 个 .sgf", flush=True)
 
-    print(f"\n写入 {kept} 局 -> {dst}  "
-          f"（重复 {dup}，尺寸/残局过滤 {bad}）", flush=True)
+        rng.shuffle(files)
+        dst = out / name
+        if dst.exists():
+            shutil.rmtree(dst)
+        dst.mkdir(parents=True, exist_ok=True)
+
+        kept = dup = bad = 0
+        for f in files:
+            try:
+                text = f.read_text(encoding="utf-8", errors="ignore")
+            except Exception:  # noqa: BLE001
+                bad += 1
+                continue
+            key = canonical_key(text, args.board_size, args.min_moves)
+            if key is None:
+                bad += 1
+                continue
+            if key in seen:
+                dup += 1
+                continue
+            seen.add(key)
+            shutil.copy2(f, dst / f"{kept:06d}.sgf")
+            kept += 1
+
+        print(f"  写入 {kept} 局 -> {dst}  "
+              f"（跨源重复 {dup}，尺寸/残局过滤 {bad}）", flush=True)
+        grand_total += kept
+
+    print(f"\n完成：共 {grand_total} 局，输出目录 {out.resolve()}", flush=True)
     print("下一步：", flush=True)
     print(f"  python scripts/build_dataset.py --src {args.out} "
-          f"--out data/sgf_19x19_agz.npz --board-size {args.board_size}",
+          f"--out data/sgf_19x19_pro_agz.npz --board-size {args.board_size}",
           flush=True)
 
     if args.cleanup:

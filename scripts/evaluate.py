@@ -68,7 +68,7 @@ def evaluate_vs_random(ai, board_size, num_games=100, use_mcts=False, simulation
                     h = my_hist[0]; h.pop(0); h.append(mv)
                     passes = 0
             else:  # 随机执白
-                mv = int(np.random.choice(legal))
+                mv = int(np.random.choice(np.where(legal)[0]))
                 board.play(mv)
                 path_moves.append(mv)
                 h = my_hist[1]; h.pop(0); h.append(mv)

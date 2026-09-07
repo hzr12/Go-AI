@@ -32,7 +32,7 @@ class MCTSNode:
     board: Optional[GoBoard]        # 节点局面。仅根/待展开叶子临时持有（展开后置 None 释放）
     my_hist: list                   # 当前执子方最近 3 手（clone）
     op_hist: list                   # 对手最近 3 手（clone）
-    to_play: int                    # 1=黑 2=白
+    to_play: int                    # 1=黑 -1=白（与 GoBoard.current_player 一致）
     move_int: int                   # 到达此节点的着法（-1=根）
     parent: Optional["MCTSNode"] = None
     children: dict = field(default_factory=dict)   # move_int -> child
@@ -155,9 +155,9 @@ class MCTS:
             pmv = -1 if mv == self.n_actions - 1 else mv
             if not board.play(pmv):
                 continue
-            child_to = 2 if to_play == 1 else 1
-            cmy = list(op_hist) if child_to == 1 else list(my_hist)
-            cop = list(my_hist) if child_to == 1 else list(op_hist)
+            child_to = -to_play
+            cmy = list(op_hist)
+            cop = list(my_hist)
             cb = copy.deepcopy(board)
             out.append((cb, cmy, cop, child_to))
             board.undo()
@@ -302,7 +302,7 @@ class MCTS:
     def _apply_root_noise(self, leaf):
         """根展开后混入 Dirichlet 噪声（自对弈探索）。"""
         if self.dir_eps > 0 and self.dir_alpha > 0 and leaf.parent is None and leaf.children:
-            noise = np.random.default_rng().dirichlet(
+            noise = np.random.default_rng(self._rng.integers(2**31)).dirichlet(
                 [self.dir_alpha] * len(leaf.children))
             for c, en in zip(leaf.children.values(), noise):
                 c.prior = (1.0 - self.dir_eps) * c.prior + self.dir_eps * en
@@ -321,9 +321,9 @@ class MCTS:
             pmv = -1 if mv == self.n_actions - 1 else mv
             if not board.play(pmv):
                 continue  # 理论不应发生（候选来自合法掩码）
-            child_to = 2 if to_play == 1 else 1
-            my_h = leaf.op_hist if child_to == 1 else leaf.my_hist
-            op_h = leaf.my_hist if child_to == 1 else leaf.op_hist
+            child_to = -to_play
+            my_h = leaf.op_hist
+            op_h = leaf.my_hist
             child_boards.append(board.board.copy())
             my_hs.append(list(my_h))
             op_hs.append(list(op_h))
@@ -419,7 +419,7 @@ class MCTS:
         #   _leaf_ab 总前向次数从 depth+2 降到 depth+1（depth2/width4：4→3）。
         levels = [self._child_states(board, order, my_hist, op_hist, to_play)]
         if not levels[0]:
-            return -2.0
+            return 0.0
         child_ranges = []  # levels[L] 中每个节点的子节点在 levels[L+1] 的 [s,e)
         pols, vals = self._forward_level(levels[0])
         all_vals = [[float(v) for v in vals]]
@@ -448,10 +448,10 @@ class MCTS:
             for i in range(len(levels[L])):
                 s, e = ranges[i]
                 ch = node_val[L + 1][s:e]
-                node_val[L][i] = max((-cv for cv in ch), default=-2.0)
+                node_val[L][i] = max((-cv for cv in ch), default=0.0)
 
         # 根价值 = max over 根的直接子节点 of -child 值
-        return max((-cv for cv in node_val[0]), default=-2.0)
+        return max((-cv for cv in node_val[0]), default=0.0)
 
     def lookahead(self, board, my_hist, op_hist, to_play, topk=12, width=4,
                   depth=2):
@@ -481,8 +481,24 @@ class MCTS:
         if not order:
             return {}, masked, n - 1, 0.0
 
+        # ⚠ 修复 IndexError（实测对局 131 手触发）：_child_states 会跳过
+        # play() 拒绝的着法，因此 levels[0] 可能比 order 短，下方
+        # out[order[i]] = node_val[0][i] 的对位索引就越界。这里先用 play/undo
+        # 过滤出真正可下的 kept，与 levels[0] 一一对应（旧 lookahead2 就有
+        # kept 列表，重写时遗漏了）。
+        kept = []
+        for mv in order:
+            pmv = -1 if mv == n - 1 else mv
+            if board.play(pmv):
+                board.undo()
+                kept.append(mv)
+        if not kept:
+            return {}, masked, n - 1, 0.0
+
         # 逐层生成子树（每层节点 = 上层节点按 policy 选出的 top-W 孩子）
-        levels = [self._child_states(board, order, my_hist, op_hist, to_play)]
+        levels = [self._child_states(board, kept, my_hist, op_hist, to_play)]
+        if not levels[0]:
+            return {}, masked, n - 1, 0.0
         child_ranges = []  # levels[L] 中每个节点的子节点在 levels[L+1] 的 [s,e)
         all_pols, all_vals = [], []
         pol0, val0 = self._forward_level(levels[0])  # 取本层 policy + 静态价值
@@ -528,7 +544,7 @@ class MCTS:
                     node_val[L][i] = (max if is_max else min)(ch)
 
         # 根每个候选的最终价值 = 其对应子节点（对手层）的根视角价值
-        out = {order[i]: node_val[0][i] for i in range(len(order))}
+        out = {kept[i]: node_val[0][i] for i in range(len(kept))}
         best_mv = max(out, key=lambda m: out[m]) if out else (n - 1)
         best_v = out[best_mv] if out else 0.0
         return out, masked, best_mv, best_v
@@ -597,7 +613,7 @@ class MCTS:
         root = self._reuse_root(path_moves)
         if root is None:
             root = MCTSNode(
-                board=copy.deepcopy(root_board),
+                board=self._cur_root_board,
                 my_hist=self._clone_hist(my_hist),
                 op_hist=self._clone_hist(op_hist),
                 to_play=to_play,
@@ -605,7 +621,7 @@ class MCTS:
             )
         else:
             # 复用子树：盘面用当前真实局面刷新（path_moves 已把它推进到同一局面）
-            root.board = copy.deepcopy(root_board)
+            root.board = self._cur_root_board
             root.my_hist = self._clone_hist(my_hist)
             root.op_hist = self._clone_hist(op_hist)
             root.to_play = to_play
@@ -789,11 +805,14 @@ class MCTS:
         path_moves: 从上次 best_move 根局面到当前的着法序列（GoBoard 编码，
             pass=-1），用于搜索树复用；不传则每次从零建树。
         """
+        old_temp = self.temperature
         if temperature is not None:
             self.temperature = temperature
         visits, probs, root_value = self.search(
             root_board, my_hist, op_hist, to_play, simulations=simulations,
             path_moves=path_moves)
+        if temperature is not None:
+            self.temperature = old_temp
         move_int = int(np.argmax(visits)) if visits.sum() > 0 else self.n_actions - 1
         is_pass = (move_int == self.n_actions - 1)
         if return_value:
