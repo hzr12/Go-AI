@@ -111,13 +111,17 @@ def _merge_chunks(tmp_files, out):
     return merged['boards'].shape[0]
 
 
-def build(src, board_size, max_games, chunk_size=0, out=None):
+def build(src, board_size, max_games, chunk_size=0, out=None, tmp_root=None):
     """构建数据集。
 
     - chunk_size=0（默认）：全量常驻内存，返回 (data_dict, n_games, skip)，
       兼容 train_sft.load_from_path 的调用。
     - chunk_size>0 且 out 给定：每攒够 chunk_size 个样本就 flush 成临时分片，
       最后合并成单个 npz（峰值内存仅约一个 chunk），返回 (out_path, n_games, skip)。
+
+    tmp_root: 流式分片暂存目录的**父目录**。默认 None 时由调用方（main）传入
+      输出文件所在目录——不要落到系统临时目录（Windows 上是 C 盘，大数据集
+      会把 C 盘撑爆）。
     """
     parser = SGFParser()
     streaming = chunk_size and out is not None
@@ -194,7 +198,10 @@ def build(src, board_size, max_games, chunk_size=0, out=None):
     n_games = 0
     skip = 0
     if streaming:
-        tmp_dir = tempfile.mkdtemp(prefix="sft_build_")
+        # 分片落在 tmp_root（默认=输出目录），而非系统 temp（Windows 即 C 盘）
+        if tmp_root:
+            os.makedirs(tmp_root, exist_ok=True)
+        tmp_dir = tempfile.mkdtemp(prefix="sft_build_", dir=tmp_root)
     for s in sources:
         try:
             stream = iter_sgf_bytes(s)
@@ -253,16 +260,23 @@ def main():
     ap.add_argument('--chunk-size', type=int, default=50000,
                     help='每攒够这么多样本就落盘一个临时分片，最后合并成单个 npz；'
                          '设为 0 则退回全量常驻内存模式（峰值内存更高）。')
+    ap.add_argument('--tmp-dir', default='',
+                    help='流式分片暂存目录（默认：输出文件所在目录）。'
+                         '大数据集务必确认该目录所在盘有足够空间——不要落到'
+                         '系统 temp（Windows 即 C 盘）。')
     args = ap.parse_args()
 
     chunk = args.chunk_size or 0
-    out_dir = os.path.dirname(args.out) or '.'
+    out_dir = os.path.dirname(os.path.abspath(args.out)) or '.'
     os.makedirs(out_dir, exist_ok=True)
+    # 暂存目录默认跟输出同盘，避免占用系统盘
+    tmp_root = args.tmp_dir or out_dir
 
     if chunk and out_dir:
         # 流式分片落盘：峰值内存仅约一个 chunk
         out_path, n, skip = build(args.src, args.board_size, args.max_games or 0,
-                                  chunk_size=chunk, out=args.out)
+                                  chunk_size=chunk, out=args.out,
+                                  tmp_root=tmp_root)
         print(f"构建完成(流式): 有效局 {n}, 跳过 {skip}, 保存至 {out_path}")
     else:
         # 全量模式：兼容旧行为
