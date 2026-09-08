@@ -19,6 +19,7 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 
@@ -147,7 +148,7 @@ def _check_training_env(logger):
         else:
             amp_status = "仅 fp16（%s, sm_%d%d，Volta/Turing 无 bf16）" % (p.name, cap[0], cap[1])
     elif npu_is_available():
-        amp_status = "bf16 可用（Ascend NPU）"
+        amp_status = "bf16(910B)/fp16(910A) 可用（Ascend NPU，运行时按型号选择）"
     else:
         amp_status = "不支持（CPU 走 FP32）"
     logger.info("[env] flash-attn: %s", fa_status)
@@ -161,32 +162,44 @@ from scripts.build_dataset import build
 
 
 def save_model(model, path):
-    """保存模型权重，并剥离 torch.compile 包装产生的 '_orig_mod.' 前缀，
-    保证存档无论是否经 compile 都能被后续普通加载/resume 使用。"""
+    """保存模型权重，并剥离 DDP 包裹产生的 'module.' 前缀与 torch.compile 产生的
+    '_orig_mod.' 前缀，保证存档无论是否经 DDP/compile 都能被后续普通加载/resume 使用。"""
     sd = model.state_dict()
+    if any(k.startswith('module.') for k in sd.keys()):
+        sd = {k.replace('module.', '', 1): v for k, v in sd.items()}
     if any(k.startswith('_orig_mod.') for k in sd.keys()):
         sd = {k.replace('_orig_mod.', '', 1): v for k, v in sd.items()}
     torch.save(sd, path)
 
 
-def setup_logging(log_file, level: int = logging.INFO) -> logging.Logger:
-    """配置 logging：同时写文件与输出到控制台（无缓冲，实时可见）。"""
+def setup_logging(log_file, level: int = logging.INFO, rank: int = 0) -> logging.Logger:
+    """配置 logging：同时写文件与输出到控制台（无缓冲，实时可见）。
+
+    rank>0（DDP 非主进程）时仅保留 ERROR 以上到 stderr，避免多卡日志刷屏——
+    各进程是独立进程，各自的 logger 互不干扰，这里只控制本进程输出量。
+    """
     logger = logging.getLogger('train')
     logger.setLevel(level)
     logger.handlers.clear()
     fmt = logging.Formatter('[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(level)
-    ch.setFormatter(fmt)
-    logger.addHandler(ch)
+    if rank == 0:
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setLevel(level)
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
 
-    if log_file:
-        os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
-        fh = logging.FileHandler(log_file, encoding='utf-8')
-        fh.setLevel(level)
-        fh.setFormatter(fmt)
-        logger.addHandler(fh)
+        if log_file:
+            os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
+            fh = logging.FileHandler(log_file, encoding='utf-8')
+            fh.setLevel(level)
+            fh.setFormatter(fmt)
+            logger.addHandler(fh)
+    else:
+        eh = logging.StreamHandler(sys.stderr)
+        eh.setLevel(logging.ERROR)
+        eh.setFormatter(fmt)
+        logger.addHandler(eh)
     return logger
 
 
@@ -323,9 +336,17 @@ def main():
                          '自动调优提速（编译更久）, reduce-overhead=小 batch 低开销')
     args = ap.parse_args()
 
+    # ---- 分布式训练环境变量（由 torchrun / mp.spawn 注入）----
+    # RANK/WORLD_SIZE/LOCAL_RANK 同时存在且 WORLD_SIZE>1 时进入 DDP 模式。
+    rank = int(os.environ.get('RANK', '0'))
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+    is_dist = world_size > 1
+    is_main = (rank == 0)
+
     # 配置日志（控制台 + 文件），统一用 logger 输出便于事后排查
     log_file = args.log_file if args.log_file else None
-    logger = setup_logging(log_file)
+    logger = setup_logging(log_file, rank=rank)
     logger.info("=" * 60)
     _check_training_env(logger)
     logger.info("=" * 60)
@@ -340,10 +361,29 @@ def main():
                 args.log_every, args.eval_every, args.save_every, args.out)
     logger.info("=" * 60)
 
-    if args.device == 'auto':
-        device = _auto_select_device()
+    # ---- 分布式训练：设备由 LOCAL_RANK 决定，忽略 --device 卡号 ----
+    # 后端选择：NPU 走 hccl，CUDA 走 nccl。多卡前必须 init_process_group，
+    # 否则后续 .to(device) / DDP 包裹会失败或各卡不互通。
+    if is_dist:
+        _dist_backend = (args.device.split(':')[0]
+                         if args.device not in ('auto', '') else
+                         ('npu' if npu_is_available() else 'cuda'))
+        if _dist_backend == 'npu':
+            dist.init_process_group('hccl')
+            torch.npu.set_device(local_rank)
+        else:
+            dist.init_process_group('nccl')
+            torch.cuda.set_device(local_rank)
+        device = f'{_dist_backend}:{local_rank}'
+        if is_main:
+            logger.info("[ddp] 初始化分布式训练 | backend=%s world_size=%d",
+                        _dist_backend, world_size)
     else:
-        device = args.device
+        if args.device == 'auto':
+            device = _auto_select_device()
+        else:
+            device = args.device
+
     use_amp = args.use_amp or (device.split(':')[0] in ('cuda', 'npu'))
 
     # ---- 多后端自适应路径（CUDA / NPU / CPU）----
@@ -401,18 +441,26 @@ def main():
             logger.info("[device] %s (sm_%d%d) | 走保守路径: FP16 + 手写 math 注意力 + "
                         "稀疏注意力禁用编译", gpu_name, *compute_cap)
     elif _backend == 'npu' and npu_is_available():
-        # Ascend 910B / 910Pro：CANN + torch_npu 后端
+        # Ascend 910B / 910A：CANN + torch_npu 后端
         gpu_name = npu_get_device_name(_dev_idx)
         torch.set_num_threads(min(8, os.cpu_count() or 8))
-        # 910B 原生 BF16；但 FlashAttention 后端在 CANN 上不稳，强制手写 math 注意力
-        # channels_last 对 NPU 卷积无明确收益，关闭；torch.compile(inductor) 不可用，禁用
-        amp_dtype = torch.bfloat16
-        use_scaler = False  # BF16 不下溢
+        # 关键：按芯片型号选精度。910B/910Pro 原生 BF16；910A 无 BF16，必须走
+        # FP16 + GradScaler（与 V100 路径一致）。CANN 上 FlashAttention 后端不稳，
+        # 强制手写 math 注意力；channels_last 对 NPU 卷积无明确收益，关闭；
+        # torch.compile(inductor) 在 NPU 不可用，禁用。
+        if '910B' in gpu_name or '910Pro' in gpu_name or '910-2' in gpu_name:
+            amp_dtype = torch.bfloat16
+            use_scaler = False  # BF16 不下溢
+            logger.info("[device] %s (NPU/CANN) | 910B 路径: BF16 + 手写 math 注意力 + "
+                        "禁用 torch.compile(inductor)", gpu_name)
+        else:
+            amp_dtype = torch.float16
+            use_scaler = use_amp  # 910A 无 BF16，FP16 必须开 GradScaler
+            logger.info("[device] %s (NPU/CANN) | 910A 路径: FP16 + GradScaler + 手写 math "
+                        "注意力 + 禁用 torch.compile(inductor)", gpu_name)
         use_channels_last = False
         sdpa_force_math = True
         compile_disable_sparse = True
-        logger.info("[device] %s (NPU/CANN) | NPU 路径: BF16 + 手写 math 注意力 + "
-                    "禁用 torch.compile(inductor)", gpu_name)
         if args.compile:
             logger.warning("[device] NPU 上 torch.compile(inductor) 不可用，已忽略 --compile；"
                            "如需图编译请用 torchair (torch_npu.experimental_config)。")
@@ -465,6 +513,14 @@ def main():
     train_idx = idx_all[:n_train]
     eval_idx = idx_all[n_train:]
 
+    # 分布式：每张卡用 DistributedSampler 取到不相交的训练分片（会自动 pad 到
+    # 能被 world_size 整除），各卡步数因此一致，避免 DDP 在 barrier 处互相等待。
+    if is_dist:
+        train_sampler = torch.utils.data.DistributedSampler(
+            torch.arange(len(train_idx)), num_replicas=world_size, rank=rank, shuffle=True)
+    else:
+        train_sampler = None
+
     model = AlphaGoNet(
         in_channels=12,
         backbone_channels=args.backbone_channels,
@@ -504,7 +560,13 @@ def main():
     # ---- 学习率调度：基于“总 step 数”而非 epoch 数 ----
     # 旧版用 T_max=args.epochs 导致余弦在第 1 个 epoch 结束就被砍到 ~0，
     # 后续 epoch 在 lr≈0 附近横盘。这里用真实总 step 数，并加前 5% step 线性 warmup。
-    n_batches = (n_train + args.batch_size - 1) // args.batch_size
+    # DDP 下“每卡”样本数约为 n_train/world_size，调度按每卡步数推进，
+    # 这样各卡 LR 曲线一致；有效全局 batch = batch_size * world_size。
+    if is_dist:
+        per_rank = (n_train + world_size - 1) // world_size
+        n_batches = (per_rank + args.batch_size - 1) // args.batch_size
+    else:
+        n_batches = (n_train + args.batch_size - 1) // args.batch_size
     total_steps = max(1, args.epochs * n_batches)
     warmup_steps = max(1, int(total_steps * 0.05))
     after_warmup = max(1, total_steps - warmup_steps)
@@ -591,14 +653,30 @@ def main():
         else:
             logger.info("[train] 当前 torch 版本不支持 torch.compile，跳过")
 
-    logger.info("[train] 开始训练 | steps/epoch=%d | 总 steps≈%d | warmup=%d",
-                n_batches, total_steps, warmup_steps)
+    # 分布式：DDP 包裹需在 torch.compile 之后（算子融合与梯度同步可共存）。
+    # DDP 会为 state_dict 加 "module." 前缀，save_model 已做剥离处理。
+    if is_dist:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[local_rank], output_device=local_rank,
+            find_unused_parameters=False)
+        if is_main:
+            logger.info("[ddp] 已包裹 DistributedDataParallel | world_size=%d", world_size)
+
+    if is_main:
+        logger.info("[train] 开始训练 | steps/epoch=%d | 总 steps≈%d | warmup=%d",
+                    n_batches, total_steps, warmup_steps)
 
     for epoch in range(start_epoch, args.epochs):
-        rng.shuffle(train_idx)
+        # DDP：每卡取本 rank 的不相交分片；set_epoch 让每 epoch 重新洗牌
+        if is_dist and train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+            perm = [int(train_idx[j]) for j in train_sampler]
+        else:
+            rng.shuffle(train_idx)
+            perm = train_idx
         model.train()
         epoch_loss = 0.0
-        n_batches = (len(train_idx) + bs - 1) // bs
+        n_batches = (len(perm) + bs - 1) // bs
         # 内核级剖析（诊断用）：GOAI_PROFILE=<step> 从该 step 起 profiling 50 个
         # step，结束打印 top CUDA kernel 耗时表，用于定位 740ms/step 的去向。
         _prof_at = int(os.environ.get('GOAI_PROFILE', '0') or 0)
@@ -616,7 +694,7 @@ def main():
                     except Exception as pe:  # noqa: BLE001
                         logger.warning("[profile] 不可用: %s", pe)
                         _prof_at = 0
-                sel = train_idx[i * bs:(i + 1) * bs]
+                sel = perm[i * bs:(i + 1) * bs]
                 state, move_t, value_t = dataset.sample_batch(sel, device)
                 # A100 上转 NHWC 以匹配模型 channels_last 布局，卷积更快
                 if use_channels_last:
@@ -642,17 +720,18 @@ def main():
                     npu_empty_cache()
                 else:
                     torch.cuda.empty_cache()
-                # 保存当前进度，便于减小 batch 后用 --resume 续训
-                save_model(model, args.out + '.latest')
-                torch.save({
-                    'optimizer': optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict(),
-                    'scaler': scaler.state_dict(),
-                    'step': step,
-                    'epoch': epoch,
-                    'best_eval_acc': best_eval_acc,
-                    'rng': torch.get_rng_state(),
-                }, args.out + '.latest.train_state')
+                # 保存当前进度，便于减小 batch 后用 --resume 续训（仅主进程写盘，避免多卡并发写同一文件）
+                if is_main:
+                    save_model(model, args.out + '.latest')
+                    torch.save({
+                        'optimizer': optimizer.state_dict(),
+                        'scheduler': scheduler.state_dict(),
+                        'scaler': scaler.state_dict(),
+                        'step': step,
+                        'epoch': epoch,
+                        'best_eval_acc': best_eval_acc,
+                        'rng': torch.get_rng_state(),
+                    }, args.out + '.latest.train_state')
                 logger.error("=" * 60)
                 logger.error("%s 显存不足 (OOM)！当前 --batch-size=%d 过大。",
                              device.upper(), bs)
@@ -695,7 +774,8 @@ def main():
                     _prof_ctx = None
                     _prof_at = 0
 
-            if step % args.eval_every == 0 and len(eval_idx) > 0:
+            if is_main and step % args.eval_every == 0 and len(eval_idx) > 0:
+                # 仅主进程跑评估并选最佳模型，避免每卡重复评估/写盘
                 acc = evaluate(model, dataset, eval_idx, bs, device, amp_dtype, use_channels_last)
                 logger.info("[eval] step=%d train_loss=%.4f eval_top1=%.4f scale=%.0f elapsed=%.0fs",
                             step, epoch_loss / max(1, (i + 1)), acc,
@@ -704,8 +784,8 @@ def main():
                     best_eval_acc = acc
                     save_model(model, args.out)
                     logger.info("  -> 保存最佳模型至 %s", args.out)
-            if step % args.save_every == 0:
-                # 同时保存完整训练状态，供 --resume 断点续训
+            if is_main and step % args.save_every == 0:
+                # 同时保存完整训练状态，供 --resume 断点续训（仅主进程写盘）
                 save_model(model, args.out + '.latest')
                 torch.save({
                     'optimizer': optimizer.state_dict(),
@@ -719,19 +799,25 @@ def main():
         logger.info("epoch %d/%d done, loss=%.4f", epoch + 1, args.epochs,
                     epoch_loss / max(1, n_batches))
 
-    # 最终保存（含训练状态，供 --resume 续训）
-    save_model(model, args.out)
-    torch.save({
-        'optimizer': optimizer.state_dict(),
-        'scheduler': scheduler.state_dict(),
-        'scaler': scaler.state_dict(),
-        'step': step,
-        'epoch': args.epochs,
-        'best_eval_acc': best_eval_acc,
-        'rng': torch.get_rng_state(),
-    }, args.out + '.train_state')
-    logger.info("训练完成。最佳 eval_top1=%.4f，模型已保存至 %s", best_eval_acc, args.out)
-    logger.info("总耗时 %.0fs", time.time() - t0)
+    # 最终保存（含训练状态，供 --resume 续训）——仅主进程写盘
+    if is_main:
+        save_model(model, args.out)
+        torch.save({
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'scaler': scaler.state_dict(),
+            'step': step,
+            'epoch': args.epochs,
+            'best_eval_acc': best_eval_acc,
+            'rng': torch.get_rng_state(),
+        }, args.out + '.train_state')
+        logger.info("训练完成。最佳 eval_top1=%.4f，模型已保存至 %s", best_eval_acc, args.out)
+        logger.info("总耗时 %.0fs", time.time() - t0)
+
+    # DDP：等待所有卡同步后再销毁进程组，避免主进程先退出导致其他卡报错
+    if is_dist:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 @torch.no_grad()
