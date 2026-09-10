@@ -7,6 +7,8 @@
 用法:
     python scripts/build_dataset.py --src data/games.tgz --out data/sft_dataset.npz --board-size 19 --max-games 30000
     python scripts/build_dataset.py --src data/games/      --out data/sft_dataset.npz --board-size 19
+    # 流式构建被中断后，把残留的 chunk_*.npz 分片断点合并成最终 npz：
+    python scripts/build_dataset.py --merge --src data/sft_build_xxx/ --out data/sft_dataset.npz
 """
 
 import argparse
@@ -109,6 +111,100 @@ def _merge_chunks(tmp_files, out):
         except OSError:
             pass
     return merged['boards'].shape[0]
+
+
+def merge_shards(src_dir, out, group=8, clean=False):
+    """断点合并：把 src_dir 下已落盘的 chunk 分片（*.npz）合并成单个 out。
+
+    适用场景：流式构建被中断、临时目录（如 sft_build_xxx/）里残留一堆
+    chunk_XXXXX.npz，用本函数把它们合成最终 npz，且中途可断点续做。
+
+    特性（断点可恢复 + 内存有界）：
+      * 两阶段。阶段1 把每 `group` 个 chunk 合并成一个 part_*.npz（中间分片），
+        峰值内存仅约 `group` 个 chunk；阶段2 把全部 part 合并成最终 out。
+      * 以“文件是否已处理”作为进度状态：阶段1 中已生成 part 的组会被跳过，
+        中断后重跑自动续做剩余组；阶段2 先写 out.tmp 再原子 rename，并落
+        <out>.done 标记，避免半截/重复输出。
+      * 每个 chunk 一旦并入 part，即从 src_dir 移入 _consumed/（--merge-clean
+        则直接删除），保证反复重跑不会重复计数。
+    """
+    import glob as _glob
+    import shutil as _shutil
+    keys = ['boards', 'my_hist', 'op_hist', 'ko', 'moves', 'values', 'to_play']
+    out_base = os.path.basename(out)
+    done_marker = out + '.done'
+    if os.path.isfile(done_marker) and os.path.isfile(out):
+        print(f"[merge] 已完成（存在 {done_marker}），跳过: {out}")
+        return out
+
+    chunks = sorted(
+        f for f in _glob.glob(os.path.join(src_dir, '*.npz'))
+        if os.path.basename(f) != out_base
+        and not os.path.basename(f).startswith('part_')
+        and not f.endswith('.done')
+    )
+    parts_dir = os.path.join(src_dir, 'parts')
+    consumed_dir = os.path.join(src_dir, '_consumed')
+    os.makedirs(parts_dir, exist_ok=True)
+    os.makedirs(consumed_dir, exist_ok=True)
+
+    # 阶段1：chunk -> part（每组 group 个，内存仅约 group 个 chunk）
+    n_groups = (len(chunks) + group - 1) // group if chunks else 0
+    for gi in range(n_groups):
+        part_path = os.path.join(parts_dir, f"part_{gi:05d}.npz")
+        if os.path.isfile(part_path):
+            continue  # 断点续做：该组已合并，跳过
+        grp = chunks[gi * group:(gi + 1) * group]
+        merged = {k: [] for k in keys}
+        for cf in grp:
+            d = np.load(cf, allow_pickle=False)
+            for k in keys:
+                merged[k].append(d[k])
+            d.close()
+        merged = {k: np.concatenate(v, axis=0) for k, v in merged.items()}
+        np.savez_compressed(part_path, **merged)
+        for cf in grp:
+            if clean:
+                try:
+                    os.remove(cf)
+                except OSError:
+                    pass
+            else:
+                _shutil.move(cf, consumed_dir)  # 移走，避免重跑重复计数
+        print(f"[merge] 阶段1: 组 {gi + 1}/{n_groups} -> {os.path.basename(part_path)} "
+              f"（{merged['boards'].shape[0]} 样本）", flush=True)
+
+    # 阶段2：part -> out（原子写入）
+    parts = sorted(_glob.glob(os.path.join(parts_dir, 'part_*.npz')))
+    if not parts:
+        raise RuntimeError(f"未在 {src_dir} 找到任何可合并的 chunk/part 分片")
+    merged = {k: [] for k in keys}
+    for pf in parts:
+        d = np.load(pf, allow_pickle=False)
+        for k in keys:
+            merged[k].append(d[k])
+        d.close()
+    merged = {k: np.concatenate(v, axis=0) for k, v in merged.items()}
+    tmp_out = out + '.tmp'
+    np.savez_compressed(tmp_out, **merged)
+    os.replace(tmp_out, out)  # 原子替换，避免半截文件
+    with open(done_marker, 'w') as fh:
+        fh.write(str(int(merged['boards'].shape[0])))
+    for pf in parts:
+        if clean:
+            try:
+                os.remove(pf)
+            except OSError:
+                pass
+        else:
+            _shutil.move(pf, consumed_dir)
+    try:
+        os.rmdir(parts_dir)
+    except OSError:
+        pass
+    print(f"[merge] 合并完成: {len(parts)} 个分片 -> {out}（{merged['boards'].shape[0]} 样本）",
+          flush=True)
+    return out
 
 
 def build(src, board_size, max_games, chunk_size=0, out=None, tmp_root=None):
@@ -264,7 +360,19 @@ def main():
                     help='流式分片暂存目录（默认：输出文件所在目录）。'
                          '大数据集务必确认该目录所在盘有足够空间——不要落到'
                          '系统 temp（Windows 即 C 盘）。')
+    ap.add_argument('--merge', action='store_true',
+                    help='合并模式：把 --src 目录下已落盘的 chunk_*.npz 分片合并成单个 '
+                         '--out（支持断点续做）。用于流式构建中断后，把残留分片合成最终 npz。')
+    ap.add_argument('--merge-group', type=int, default=8,
+                    help='合并阶段1 每组合并的 chunk 数（控制峰值内存，默认 8）')
+    ap.add_argument('--merge-clean', action='store_true',
+                    help='合并成功后删除已消费的 chunk/part（默认保留到 _consumed/）')
     args = ap.parse_args()
+
+    if args.merge:
+        # 合并模式：把已落盘的分片合成为单个 npz（支持断点续做）
+        merge_shards(args.src, args.out, group=args.merge_group, clean=args.merge_clean)
+        return
 
     chunk = args.chunk_size or 0
     out_dir = os.path.dirname(os.path.abspath(args.out)) or '.'
