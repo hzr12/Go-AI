@@ -474,44 +474,51 @@ class GoBoard:
         legal = (boards == 0).astype(np.float32)
         if ko is not None:
             ko = np.asarray(ko).reshape(B)
-            for b in range(B):
-                if ko[b] >= 0:
-                    r, c = divmod(int(ko[b]), n)
-                    legal[b, r, c] = 0.0
+            vk = ko >= 0
+            if vk.any():
+                # 向量化：只处理真正有劫的样本，取代逐样本 Python 循环
+                bidx = np.nonzero(vk)[0]
+                r, c = np.divmod(ko[bidx].astype(np.int64), n)
+                legal[bidx, r, c] = 0.0
         planes[:, 8] = legal
 
         # 通道 9: 执子方常数
         planes[:, 9] = to_play.astype(np.float32)
 
-        # 通道 10/11: 气数=1 掩码（向量化连通块标注 + 邻空计数）
+        # 通道 10/11: 气数=1 掩码（整批向量化连通块标注 + 邻空计数）
         my_lib1 = np.zeros((B, n, n), dtype=np.float32)
         op_lib1 = np.zeros((B, n, n), dtype=np.float32)
-        struct = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)  # 4 邻域
-        for b in range(B):
-            board_b = boards[b]
-            tp = int(to_play[b, 0, 0])
-            opp_b = -tp
-            empty = (board_b == 0)
-            # 每个棋子点的 4 邻域空点坐标数（整数 0-4），与单图
-            # _group_liberty_count 逐点计数语义一致（每个空邻域坐标各算 1 气）。
-            up = np.zeros_like(empty, dtype=np.int64); up[:-1, :] = empty[1:, :]
-            down = np.zeros_like(empty, dtype=np.int64); down[1:, :] = empty[:-1, :]
-            left = np.zeros_like(empty, dtype=np.int64); left[:, :-1] = empty[:, 1:]
-            right = np.zeros_like(empty, dtype=np.int64); right[:, 1:] = empty[:, :-1]
-            neigh_empty = up.astype(np.int64) + down + left + right
-            for color, lib_plane in ((tp, my_lib1[b]), (opp_b, op_lib1[b])):
-                mask = (board_b == color)
-                if not mask.any():
-                    continue
-                labelled, num = _scipy_label(mask, structure=struct)
-                if num == 0:
-                    continue
-                # 每个 group 的邻空数 = 该 group 内点邻域空点坐标总数（不去重空块）
-                # 用 np.add.at 仅对棋子点（mask 为真）按 labelled 累加 neigh_empty。
-                lib_counts = np.zeros(num + 1, dtype=np.int64)
-                np.add.at(lib_counts, labelled[mask], neigh_empty[mask])
-                lib1_mask = (lib_counts[labelled] == 1) & mask
-                lib_plane[lib1_mask] = 1.0
+        # 每个棋子点的 4 邻域空点坐标数（整数 0-4），整批一次算，与单图
+        # _group_liberty_count 逐点计数语义一致（每个空邻域坐标各算 1 气）。
+        empty = (boards == 0)
+        neigh_empty = np.zeros((B, n, n), dtype=np.int64)
+        neigh_empty[:, :-1, :] += empty[:, 1:, :]
+        neigh_empty[:, 1:, :]  += empty[:, :-1, :]
+        neigh_empty[:, :, :-1] += empty[:, :, 1:]
+        neigh_empty[:, :, 1:]  += empty[:, :, :-1]
+
+        # 关键提速：scipy.ndimage.label 支持 n-D。用 (3,3,3) 结构（仅中间 z 面有
+        # 4 邻域十字，跨 batch 不连通）对整批 (B,H,W) 做 **一次** 标注，各样本
+        # 仍互不连通。旧实现在 for b in range(B) 里逐样本调用 2 次 label
+        #（B=1800 → 3600 次 Python 级调用 + 数万次小数组分配），是特征构造的
+        # 主要 CPU 热点。
+        struct3 = np.zeros((3, 3, 3), dtype=bool)
+        struct3[1] = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
+
+        # to_play 已 reshape 为 (B,1,1)，按样本广播出「己方/对手」颜色
+        for mask, lib_plane in ((boards == to_play, my_lib1),
+                                (boards == -to_play, op_lib1)):
+            if not mask.any():
+                continue
+            labelled, num = _scipy_label(mask, structure=struct3)
+            if num == 0:
+                continue
+            # 每个 group 的邻空数 = 组内棋子点邻域空点坐标总数（不去重空块）。
+            # 背景权重置 0，只累加棋子点；bincount 比逐样本 np.add.at 快一个量级。
+            w = np.where(mask, neigh_empty, 0).ravel()
+            lib_counts = np.bincount(labelled.ravel(), weights=w,
+                                     minlength=num + 1).astype(np.int64)
+            lib_plane[(lib_counts[labelled] == 1) & mask] = 1.0
 
         planes[:, 10] = my_lib1
         planes[:, 11] = op_lib1

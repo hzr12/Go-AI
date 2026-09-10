@@ -820,7 +820,8 @@ def main():
                     policy_loss = F.cross_entropy(policy_logits.float(), move_t)
                     value_loss = F.mse_loss(value_pred.float().squeeze(), value_t.squeeze())
                     loss = policy_loss + value_loss
-                optimizer.zero_grad()
+                # set_to_none=True：直接释放梯度张量而非 memset 置零，省一次全参清零
+                optimizer.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
