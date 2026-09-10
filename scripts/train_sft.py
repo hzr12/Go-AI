@@ -12,8 +12,10 @@
 import argparse
 import logging
 import os
+import queue
 import random
 import sys
+import threading
 import time
 from contextlib import nullcontext
 
@@ -285,6 +287,82 @@ def load_from_path(path, board_size, max_games_per_tgz=0):
     return load_dataset(path)
 
 
+class _BatchPrefetcher:
+    """后台多线程并行构造训练 batch，与 GPU 前向/反向重叠。
+
+    把每个 batch 的样本下标切成 num_workers 个子块，由 num_workers 个后台线程
+    并行调用 dataset.sample_batch_numpy()（scipy.ndimage 释放 GIL，可真正并行），
+    主线程按序拼回整批。这样「CPU 造特征」与「GPU 计算」重叠，消除训练循环里
+    GPU 等 CPU 造数据的空转；同时把 feature_planes_batched 的逐样本循环按线程
+    拆开并行。
+
+    两步流水：submit() 投递一个 batch 的下标，next() 取回构造好的 numpy 数组。
+    两个有界队列提供背压，避免无限预取吃内存。各线程用独立 np.random.Generator，
+    避免争抢全局随机源。
+    """
+
+    def __init__(self, dataset, num_workers=4, prefetch=2, seed=1234):
+        self.dataset = dataset
+        self.k = max(1, int(num_workers))
+        self.prefetch = max(1, int(prefetch))
+        cap = self.k * self.prefetch
+        self._task_q: queue.Queue = queue.Queue(maxsize=cap)
+        self._res_q: queue.Queue = queue.Queue(maxsize=cap)
+        self._step = 0     # 下一个待投递 batch 的编号
+        self._expect = 0   # 下一个待取回 batch 的编号
+        self._rngs = [np.random.default_rng(seed + i) for i in range(self.k)]
+        self._threads = []
+        for wi in range(self.k):
+            t = threading.Thread(target=self._worker, args=(wi,), daemon=True)
+            t.start()
+            self._threads.append(t)
+
+    def _worker(self, wi):
+        rng = self._rngs[wi]
+        while True:
+            item = self._task_q.get()
+            if item is None:
+                return
+            step, pos, sub_idx = item
+            try:
+                s, m, v = self.dataset.sample_batch_numpy(sub_idx, rng=rng)
+                self._res_q.put((step, pos, s, m, v, None))
+            except Exception as e:  # noqa: BLE001
+                self._res_q.put((step, pos, None, None, None, e))
+
+    def submit(self, idxs):
+        """投递一个 batch 的下标（队列满时阻塞，提供背压）。"""
+        step = self._step
+        self._step += 1
+        chunks = np.array_split(np.asarray(idxs), self.k)
+        for pos, sub in enumerate(chunks):
+            if len(sub) == 0:
+                self._res_q.put((step, pos, None, None, None, None))
+            else:
+                self._task_q.put((step, pos, sub))
+
+    def next(self):
+        """取回下一个 batch，返回 (states_np, moves_np, values_np)。"""
+        step = self._expect
+        self._expect += 1
+        parts = [None] * self.k
+        got = 0
+        while got < self.k:
+            r_step, pos, s, m, v, err = self._res_q.get()
+            if r_step != step:
+                raise RuntimeError(f"预取器步序错乱: 期望 {step} 收到 {r_step}")
+            if err is not None:
+                raise err
+            if s is not None:
+                parts[pos] = (s, m, v)
+            got += 1
+        parts = [p for p in parts if p is not None]
+        states = np.concatenate([p[0] for p in parts], axis=0)
+        moves = np.concatenate([p[1] for p in parts], axis=0)
+        values = np.concatenate([p[2] for p in parts], axis=0)
+        return states, moves, values
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--data', required=True,
@@ -325,6 +403,11 @@ def main():
                     help='每隔多少 step 打印一次训练日志（loss/lr/吞吐/显存）')
     ap.add_argument('--log-file', default='training.log',
                     help='训练日志文件路径（同时输出到控制台），设为空字符串可关闭文件日志')
+    ap.add_argument('--prefetch-workers', type=int, default=4,
+                    help='数据预取线程数：每个 batch 切块并行造特征并与 GPU 计算重叠；'
+                         '<=1 关闭预取（回退同步取样）。')
+    ap.add_argument('--prefetch-depth', type=int, default=2,
+                    help='预取流水深度（提前多少个 batch 造好数据，控制内存/吞吐平衡）')
     ap.add_argument('--resume', default='',
                     help='断点续训：指定已保存的 .pth 模型路径，会从该权重 + 同目录 '
                          '.train_state.pt 恢复 optimizer/scheduler/step 计数继续训练')
@@ -666,6 +749,15 @@ def main():
         logger.info("[train] 开始训练 | steps/epoch=%d | 总 steps≈%d | warmup=%d",
                     n_batches, total_steps, warmup_steps)
 
+    # 数据预取器：后台多线程并行造特征，与 GPU 前向/反向重叠（workers<=1 时关闭）
+    pf = None
+    if args.prefetch_workers > 1:
+        pf = _BatchPrefetcher(dataset, num_workers=args.prefetch_workers,
+                              prefetch=args.prefetch_depth)
+        if is_main:
+            logger.info("[data] 预取器已启用 | workers=%d depth=%d",
+                        args.prefetch_workers, args.prefetch_depth)
+
     for epoch in range(start_epoch, args.epochs):
         # DDP：每卡取本 rank 的不相交分片；set_epoch 让每 epoch 重新洗牌
         if is_dist and train_sampler is not None:
@@ -677,6 +769,10 @@ def main():
         model.train()
         epoch_loss = 0.0
         n_batches = (len(perm) + bs - 1) // bs
+        # 预取器：每 epoch 先灌满流水线（提前 depth 个 batch 造好数据）
+        if pf is not None:
+            for _j in range(min(args.prefetch_depth, n_batches)):
+                pf.submit(perm[_j * bs:(_j + 1) * bs])
         # 内核级剖析（诊断用）：GOAI_PROFILE=<step> 从该 step 起 profiling 50 个
         # step，结束打印 top CUDA kernel 耗时表，用于定位 740ms/step 的去向。
         _prof_at = int(os.environ.get('GOAI_PROFILE', '0') or 0)
@@ -694,11 +790,31 @@ def main():
                     except Exception as pe:  # noqa: BLE001
                         logger.warning("[profile] 不可用: %s", pe)
                         _prof_at = 0
-                sel = perm[i * bs:(i + 1) * bs]
-                state, move_t, value_t = dataset.sample_batch(sel, device)
-                # A100 上转 NHWC 以匹配模型 channels_last 布局，卷积更快
-                if use_channels_last:
-                    state = state.to(memory_format=torch.channels_last)
+                if pf is not None:
+                    states_np, moves_np, values_np = pf.next()
+                    state = torch.from_numpy(states_np)
+                    move_t = torch.from_numpy(moves_np)
+                    value_t = torch.from_numpy(values_np)
+                    # A100：转 NHWC 后用 pinned + 非阻塞 H2D，拷贝与后续计算重叠
+                    if use_channels_last:
+                        state = state.to(memory_format=torch.channels_last)
+                    if _backend == 'cuda':
+                        state = state.pin_memory().to(device, non_blocking=True)
+                        move_t = move_t.pin_memory().to(device, non_blocking=True)
+                        value_t = value_t.pin_memory().to(device, non_blocking=True)
+                    else:
+                        state = state.to(device)
+                        move_t = move_t.to(device)
+                        value_t = value_t.to(device)
+                    nxt = i + args.prefetch_depth
+                    if nxt < n_batches:
+                        pf.submit(perm[nxt * bs:(nxt + 1) * bs])
+                else:
+                    sel = perm[i * bs:(i + 1) * bs]
+                    state, move_t, value_t = dataset.sample_batch(sel, device)
+                    # A100 上转 NHWC 以匹配模型 channels_last 布局，卷积更快
+                    if use_channels_last:
+                        state = state.to(memory_format=torch.channels_last)
                 with maybe_autocast(device, amp_dtype):
                     policy_logits, value_pred = model(state)
                     policy_loss = F.cross_entropy(policy_logits.float(), move_t)
@@ -769,75 +885,4 @@ def main():
                             sort_by='cuda_time_total', row_limit=18)
                         logger.info("[profile] 内核耗时 top-18（CUDA 时间排序）:\n%s",
                                     table)
-                    except Exception as pe:  # noqa: BLE001
-                        logger.warning("[profile] 结果输出失败: %s", pe)
-                    _prof_ctx = None
-                    _prof_at = 0
-
-            if is_main and step % args.eval_every == 0 and len(eval_idx) > 0:
-                # 仅主进程跑评估并选最佳模型，避免每卡重复评估/写盘
-                acc = evaluate(model, dataset, eval_idx, bs, device, amp_dtype, use_channels_last)
-                logger.info("[eval] step=%d train_loss=%.4f eval_top1=%.4f scale=%.0f elapsed=%.0fs",
-                            step, epoch_loss / max(1, (i + 1)), acc,
-                            scaler.get_scale(), time.time() - t0)
-                if acc > best_eval_acc:
-                    best_eval_acc = acc
-                    save_model(model, args.out)
-                    logger.info("  -> 保存最佳模型至 %s", args.out)
-            if is_main and step % args.save_every == 0:
-                # 同时保存完整训练状态，供 --resume 断点续训（仅主进程写盘）
-                save_model(model, args.out + '.latest')
-                torch.save({
-                    'optimizer': optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict(),
-                    'scaler': scaler.state_dict(),
-                    'step': step,
-                    'epoch': epoch,
-                    'best_eval_acc': best_eval_acc,
-                    'rng': torch.get_rng_state(),
-                }, args.out + '.latest.train_state')
-        logger.info("epoch %d/%d done, loss=%.4f", epoch + 1, args.epochs,
-                    epoch_loss / max(1, n_batches))
-
-    # 最终保存（含训练状态，供 --resume 续训）——仅主进程写盘
-    if is_main:
-        save_model(model, args.out)
-        torch.save({
-            'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict(),
-            'scaler': scaler.state_dict(),
-            'step': step,
-            'epoch': args.epochs,
-            'best_eval_acc': best_eval_acc,
-            'rng': torch.get_rng_state(),
-        }, args.out + '.train_state')
-        logger.info("训练完成。最佳 eval_top1=%.4f，模型已保存至 %s", best_eval_acc, args.out)
-        logger.info("总耗时 %.0fs", time.time() - t0)
-
-    # DDP：等待所有卡同步后再销毁进程组，避免主进程先退出导致其他卡报错
-    if is_dist:
-        dist.barrier()
-        dist.destroy_process_group()
-
-
-@torch.no_grad()
-def evaluate(model, dataset, eval_idx, bs, device, amp_dtype, use_channels_last):
-    model.eval()
-    correct = 0
-    total = 0
-    for i in range(0, len(eval_idx), bs):
-        sel = eval_idx[i:i + bs]
-        state, move_t, _ = dataset.sample_batch(sel, device)
-        if use_channels_last:
-            state = state.to(memory_format=torch.channels_last)
-        with maybe_autocast(device, amp_dtype):
-            policy_logits, _ = model(state)
-        pred = policy_logits.argmax(dim=-1)
-        correct += int((pred.cpu() == move_t.cpu()).sum())
-        total += len(sel)
-    model.train()  # 恢复训练模式：否则 eval 后 BN 冻结 running stats、继续训练时前向失真
-    return correct / max(1, total)
-
-
-if __name__ == '__main__':
-    main()
+          

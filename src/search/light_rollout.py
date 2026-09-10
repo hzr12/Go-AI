@@ -73,8 +73,6 @@ class FastPolicy:
 
     def logits(self, board: GoBoard) -> np.ndarray:
         n = self.n
-        a = n * n
-        logit = np.zeros(a, dtype=np.float32)
         b = board.board
         legal = board.get_legal_moves()
         # 已有棋子邻接奖励（靠近战斗）：对 4 邻接做 1 次膨胀求和
@@ -88,11 +86,11 @@ class FastPolicy:
         # 替代 board.feature_planes([], [])[10]——后者每步都做完整 Python flood-fill
         # 特征，是 rollout 的主要性能杀手（每局 60 步 × 每步 2 次特征 ≈ 万次调用）。
         my_atari = _fast_atari_mask(board, board.current_player)
-        for i in range(a):
-            if not legal[i]:
-                logit[i] = -1e9
-                continue
-            logit[i] = 0.3 * neigh.reshape(-1)[i] - self._atari_penalty * my_atari[i]
+        # 向量化：合法点 = 0.3*邻子数 - penalty*打吃；非法点 = -1e9。
+        # 旧实现为 n² 次 Python 标量循环，且循环内反复 reshape，rollout 每步都调用。
+        logit = (0.3 * neigh.reshape(-1)
+                 - self._atari_penalty * my_atari).astype(np.float32)
+        logit = np.where(legal, logit, np.float32(-1e9)).astype(np.float32)
         if self.weights is not None:
             # 仅在显式提供线性权重时才计算完整特征（默认 FastPolicy 不触发）
             fp = board.feature_planes_batched(

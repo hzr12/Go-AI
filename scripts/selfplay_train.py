@@ -52,7 +52,8 @@ def self_play_game(ai, board_size, sims, max_moves, temperature,
     while passes < 2 and mc < max_moves:
         to_play = board.current_player
         legal = board.get_legal_moves()
-        if len(legal) == 0:
+        # legal 是长度 n² 的 bool 掩码，len(legal) 恒为 n²，必须用 any() 判断空
+        if not legal.any():
             board.play(-1)
             path_moves.append(-1)
             passes += 1
@@ -61,7 +62,7 @@ def self_play_game(ai, board_size, sims, max_moves, temperature,
         visits, probs, _rv = mcts.search(
             board, hists[0], hists[1], to_play,
             simulations=sims, path_moves=path_moves)
-        print(f"    [move {mc + 1}] to_play={to_play} legal={len(legal)}",
+        print(f"    [move {mc + 1}] to_play={to_play} legal={int(legal.sum())}",
               flush=True)
         # 记录训练样本：当前局面特征 + visit 分布（policy 目标）+ 执子方
         planes = np.ascontiguousarray(board.feature_planes_batched(
@@ -207,8 +208,10 @@ def main():
                     [(planes, vt)]
                 for pl, tv in samples:
                     buffer.append((pl, tv, z))
-            while len(buffer) > args.buffer_size:
-                buffer.pop(0)
+            if len(buffer) > args.buffer_size:
+                # 一次性切片删除，替代逐项 pop(0)：后者每次 O(n) 搬移，
+                # 在 buffer 接近上限时退化成 O(n²)。
+                del buffer[:len(buffer) - args.buffer_size]
             print(f"  [iter {it} game {g + 1}/{args.games}] score={score:+.1f} "
                   f"moves={len(data)} buffer={len(buffer)}", flush=True)
 

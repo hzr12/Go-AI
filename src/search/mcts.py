@@ -15,7 +15,6 @@ MCTS 搜索（AlphaGoZero 风格 PUCT），基于 SFT 主线的 GoAI 网络。
 """
 
 import math
-import copy
 import time
 import threading
 from dataclasses import dataclass, field
@@ -158,7 +157,7 @@ class MCTS:
             child_to = -to_play
             cmy = list(op_hist)
             cop = list(my_hist)
-            cb = copy.deepcopy(board)
+            cb = board.clone()
             out.append((cb, cmy, cop, child_to))
             board.undo()
         return out
@@ -553,10 +552,10 @@ class MCTS:
         """从根局面沿 path 重放着法，返回 leaf 局面的独立棋盘副本。
 
         重放只做 play（不 undo），历史/劫等由叶子节点自身保存的字段提供，
-        这里只需要正确的盘面。单叶子成本 = 1 次 deepcopy + 路径深度次 play，
+        这里只需要正确的盘面。单叶子成本 = 1 次轻量 clone + 路径深度次 play，
         相比旧实现每叶子 ~250 次 deepcopy 降低两个数量级。
         """
-        board = copy.deepcopy(self._cur_root_board)
+        board = self._cur_root_board.clone()
         for node in path[1:]:
             mv = node.move_int
             if not board.play(-1 if mv == self.n_actions - 1 else mv):
@@ -607,7 +606,7 @@ class MCTS:
             probs : np.ndarray (n_actions,) 温度缩放后的选点分布
             root_value: float 根节点我方视角价值估计
         """
-        self._cur_root_board = copy.deepcopy(root_board)
+        self._cur_root_board = root_board.clone()
 
         # ---- 树复用：沿 path_moves 下潜到上次搜索的子树 ----
         root = self._reuse_root(path_moves)
@@ -651,6 +650,8 @@ class MCTS:
         def worker():
             nonlocal produced, pending
             while not finished.is_set():
+                prefetch_leaf = None
+                did_work = False
                 with lock:
                     if produced >= total:
                         return
@@ -664,7 +665,6 @@ class MCTS:
                         # 主线程永远等不到产出（死锁）。
                         if pending <= 0 and leaf_q.empty():
                             return
-                        pass
                     else:
                         for node in path:
                             node.virtual_loss += int(self.virtual_loss)
@@ -672,32 +672,40 @@ class MCTS:
                         produced += 1
                         pending += 1
                         leaf_q.put(path)
-                        # 推测性预评估：占位后立刻在 worker 线程前向叶子
-                        #（torch 前向释放 GIL，与主线程 batch 评估重叠），
-                        # 主线程 _expand 命中即复用，省掉每模拟 1 次叶子前向。
+                        did_work = True
+                        # 推测性预评估：占位后由本线程前向叶子（torch 前向释放
+                        # GIL，与主线程 batch 评估重叠），主线程 _expand 命中即
+                        # 复用，省掉每模拟 1 次叶子前向。
+                        # ⚠ 必须在锁外执行：deepcopy/特征/前向都很贵，若持锁跑
+                        #   会卡住其它 worker 的选路径，多线程并行度退回串行。
                         # 竞态安全：_expand 消费时置 None，未命中则主线程自行前向。
                         if self.spec_prefetch and leaf.board is None \
                                 and leaf.prefetch is None:
-                            try:
-                                pb = copy.deepcopy(self._cur_root_board)
-                                for nd in path[1:]:
-                                    pmv = -1 if nd.move_int == self.n_actions - 1 \
-                                        else nd.move_int
-                                    if not pb.play(pmv):
-                                        break
-                                planes = pb.feature_planes_batched(
-                                    pb.board[None], [list(leaf.my_hist)],
-                                    [list(leaf.op_hist)], [leaf.to_play],
-                                    [pb.ko_point])[0]
-                                pol, val = self.ai.predict_batch(
-                                    [(None, list(leaf.my_hist), list(leaf.op_hist),
-                                      leaf.to_play, planes)])
-                                leaf.prefetch = (
-                                    np.asarray(pol[0]).reshape(-1),
-                                    float(np.asarray(val[0]).reshape(-1)[0]))
-                            except Exception:  # noqa: BLE001
-                                leaf.prefetch = None
-                        continue
+                            prefetch_leaf = leaf
+                if prefetch_leaf is not None:
+                    try:
+                        pb = self._cur_root_board.clone()
+                        for nd in path[1:]:
+                            pmv = -1 if nd.move_int == self.n_actions - 1 \
+                                else nd.move_int
+                            if not pb.play(pmv):
+                                break
+                        planes = pb.feature_planes_batched(
+                            pb.board[None], [list(prefetch_leaf.my_hist)],
+                            [list(prefetch_leaf.op_hist)], [prefetch_leaf.to_play],
+                            [pb.ko_point])[0]
+                        pol, val = self.ai.predict_batch(
+                            [(None, list(prefetch_leaf.my_hist),
+                              list(prefetch_leaf.op_hist),
+                              prefetch_leaf.to_play, planes)])
+                        prefetch_leaf.prefetch = (
+                            np.asarray(pol[0]).reshape(-1),
+                            float(np.asarray(val[0]).reshape(-1)[0]))
+                    except Exception:  # noqa: BLE001
+                        prefetch_leaf.prefetch = None
+                    continue
+                if did_work:
+                    continue
                 time.sleep(0.001)
 
         threads = []

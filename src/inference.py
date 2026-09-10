@@ -239,16 +239,23 @@ class GoAI:
         """
         if not states:
             return np.zeros((0, self.board_size * self.board_size + 1)), np.zeros(0)
-        xs = []
+        planes_list = []
         for st in states:
             if len(st) == 5:
                 # 增量特征：第 5 项为预计算 12 通道 planes
                 b, mh, oh, tp, planes = st
-                xs.append(self._build_state(b, mh, oh, tp, planes=planes))
             else:
                 b, mh, oh, tp = st
-                xs.append(self._build_state(b, mh, oh, tp))
-        x = torch.cat(xs, dim=0)  # (B,12,H,W)
+                planes = None
+            if planes is None:
+                planes = b.feature_planes_batched(
+                    b.board[None], [list(mh)], [list(oh)], [tp], [b.ko_point])[0]
+            planes_list.append(np.ascontiguousarray(planes, dtype=np.float32))
+        # 整批一次 stack + 一次 H2D。旧实现逐样本走 _build_state().to(device)，
+        # 会产生 B 次小拷贝 + B 次 np.ascontiguousarray，批越小越吃亏（MCTS 叶子
+        # 批普遍偏小，放大明显）。
+        x = torch.from_numpy(np.stack(planes_list, axis=0))  # (B,12,H,W)，零拷贝
+        x = x.to(self.device)
         if self.channels_last:
             x = x.to(memory_format=torch.channels_last)
         policies, values = self._forward_batch(x)

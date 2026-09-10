@@ -239,6 +239,7 @@ def build(src, board_size, max_games, chunk_size=0, out=None, tmp_root=None):
     tmp_dir = None
     tmp_files = []
     chunk_idx = 0
+    total_flushed = 0   # 已落盘样本累计（避免每落一片就重读所有分片计数，O(n²)）
     cur = {'boards': [], 'my_hists': [], 'op_hists': [], 'kos': [], 'moves': [], 'values': [], 'to_plays': []}
 
     def _emit(name, raw):
@@ -314,9 +315,10 @@ def build(src, board_size, max_games, chunk_size=0, out=None, tmp_root=None):
                 n_games += 1
             # 流式模式：累计够一个 chunk 就 flush，清空当前 chunk 释放内存
             if streaming and len(cur['boards']) >= chunk_size:
+                total_flushed += len(cur['boards'])
                 tmp_files.append(_flush_chunk(cur, tmp_dir, chunk_idx))
                 chunk_idx += 1
-                print(f"[build] 已落盘分片 #{chunk_idx}（累计样本 {sum(len(np.load(f)['boards']) for f in tmp_files)}）", flush=True)
+                print(f"[build] 已落盘分片 #{chunk_idx}（累计样本 {total_flushed}）", flush=True)
                 cur = {'boards': [], 'my_hists': [], 'op_hists': [], 'kos': [], 'moves': [], 'values': [], 'to_plays': []}
 
     if streaming:

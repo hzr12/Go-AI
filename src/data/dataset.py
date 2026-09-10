@@ -41,7 +41,7 @@ class SupervisedDataset:
     def __len__(self):
         return self.N
 
-    def sample_batch_numpy(self, idxs):
+    def sample_batch_numpy(self, idxs, rng=None):
         """
         给定样本下标，返回 numpy 版 (states, moves_out, values)：
             states    : (B, 12, H, W) float32
@@ -52,6 +52,9 @@ class SupervisedDataset:
         torch 张量——供 MindSpore 训练脚本使用（910B 环境无 torch）。
         使用向量化批量特征构造（GoBoard.feature_planes_batched）+ 向量化对称增强，
         避免逐样本 Python 循环，训练吞吐显著更高。
+
+        rng: 可选随机源，供多线程预取时各线程使用独立 Generator，避免竞争全局
+            np.random。为 None 时沿用全局 np.random（保持原行为）。
         """
         bs = self.board_size
         B = len(idxs)
@@ -60,7 +63,10 @@ class SupervisedDataset:
         op_h = self.op_hist[idxs]
         ko = self.ko[idxs]
         to_play = self.to_play[idxs]
-        tforms = np.random.randint(0, 8, size=B)
+        if rng is None:
+            tforms = np.random.randint(0, 8, size=B)
+        else:
+            tforms = rng.integers(0, 8, size=B)  # Generator 用 integers，非 randint
 
         # 批量构造 12 通道特征（B,12,H,W）
         states = GoBoard.feature_planes_batched(boards, my_h, op_h, to_play, ko)

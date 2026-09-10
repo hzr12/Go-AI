@@ -7,6 +7,13 @@ from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict
 
 
+# 模块级预编译正则：原实现把这些 pattern 放在方法内，每次解析（每局）都重新
+# re.compile；百万级棋谱下这是可观的纯浪费。
+_PROP_RE = re.compile(r'([A-Z]{1,2})\[(.*?)\]')
+_MOVE_TOKEN_RE = re.compile(r'(?:;|\A)(AB|AW|[BW])((\[[^\]]*\])+)')
+_BRACKET_VAL_RE = re.compile(r'\[([^\]]*)\]')
+
+
 @dataclass
 class Move:
     """棋步"""
@@ -109,42 +116,42 @@ class SGFParser:
             return None
     
     def _remove_comments(self, sgf_string: str) -> str:
-        """移除注释"""
-        # 移除C[...]注释
-        result = []
+        """移除 C[...] 注释（支持括号嵌套）。
+
+        用 str.find 在 C 层跳过非注释文本，仅对注释内部做逐字符括号配对，
+        取代旧版「对整串每个字符都做 Python 级判断」的循环——百万级棋谱下
+        这是解析的主要 CPU 开销之一。
+        """
+        out = []
         i = 0
-        in_comment = False
-        bracket_count = 0
-        
-        while i < len(sgf_string):
-            if sgf_string[i:i+2] == 'C[' and not in_comment:
-                in_comment = True
-                bracket_count = 1
-                i += 2
-                continue
-            
-            if in_comment:
-                if sgf_string[i] == '[':
-                    bracket_count += 1
-                elif sgf_string[i] == ']':
-                    bracket_count -= 1
-                    if bracket_count == 0:
-                        in_comment = False
-                i += 1
-                continue
-            
-            result.append(sgf_string[i])
-            i += 1
-        
-        return ''.join(result)
+        n = len(sgf_string)
+        while True:
+            j = sgf_string.find('C[', i)
+            if j < 0:
+                out.append(sgf_string[i:])
+                break
+            out.append(sgf_string[i:j])
+            k = j + 1          # 指向注释开头的 '['
+            depth = 0
+            while k < n:
+                ch = sgf_string[k]
+                if ch == '[':
+                    depth += 1
+                elif ch == ']':
+                    depth -= 1
+                    if depth == 0:
+                        k += 1
+                        break
+                k += 1
+            i = k
+        return ''.join(out)
     
     def _extract_properties(self, sgf_string: str) -> Dict[str, str]:
         """提取属性"""
         properties = {}
         
-        # 匹配属性模式: XX[value]
-        pattern = r'([A-Z]{1,2})\[(.*?)\]'
-        matches = re.finditer(pattern, sgf_string)
+        # 匹配属性模式: XX[value]（模块级预编译正则）
+        matches = _PROP_RE.finditer(sgf_string)
         
         for match in matches:
             key = match.group(1)
@@ -186,12 +193,10 @@ class SGFParser:
         # 匹配棋步标记：B / W（普通手）与 AB / AW（让子）。
         # 关键：必须以 ';' 或字符串开头锚定，避免把属性键 BR/WR/PB/PW/KM 等
         # 里的 'B'/'W' 误当成落子（此前会导致坐标乱序）。
-        token_pattern = re.compile(r'(?:;|\A)(AB|AW|[BW])((\[[^\]]*\])+)')
-
-        for token in token_pattern.finditer(sgf_string):
+        for token in _MOVE_TOKEN_RE.finditer(sgf_string):
             key = token.group(1)
             bracket_block = token.group(2)
-            for val in re.findall(r'\[([^\]]*)\]', bracket_block):
+            for val in _BRACKET_VAL_RE.findall(bracket_block):
                 if key in ('B', 'W'):
                     color = key
                 else:  # AW -> 白, AB -> 黑

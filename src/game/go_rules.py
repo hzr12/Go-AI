@@ -60,6 +60,25 @@ class GoBoard:
         self.move_history = []   # 记录每步落子扁平坐标，pass 记为 -1
         self._undo_stack = []    # 撤销栈：每项 (move, captured|None, prev_ko, prev_passes, prev_player)
 
+    def clone(self) -> "GoBoard":
+        """轻量克隆：只复制推演所需状态（盘面/执子方/劫/连续 pass 计数），
+        **不复制** _undo_stack 与 move_history。
+
+        用于 MCTS 里大量局面推演。原实现用 copy.deepcopy，会把随手数线性增长的
+        撤销栈与着法历史整份复制，是叶子批量展开的主要开销之一。克隆出的棋盘
+        撤销栈为空，仍可正常 play/undo 自己的后续着法（推演不需要旧历史）。
+        """
+        nb = GoBoard.__new__(GoBoard)
+        nb.board_size = self.board_size
+        nb.komi = self.komi
+        nb.board = self.board.copy()
+        nb.current_player = self.current_player
+        nb.ko_point = self.ko_point
+        nb.passes = self.passes
+        nb.move_history = []
+        nb._undo_stack = []
+        return nb
+
     # ---- 基础查询 ----------------------------------------------------------
 
     def __getitem__(self, idx):

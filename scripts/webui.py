@@ -65,6 +65,7 @@ class Session:
         self._progress_lock = threading.Lock()  # 保护 search_progress（搜索线程写/轮询线程读）
         self.search_progress = None             # 最近一次搜索进度快照（实时渲染用）
         self.human_color = 1                    # 人类执子（1=黑先手, -1=白）
+        self._last_prog_t = 0.0                 # 进度回调节流时间戳
         self.reset()
 
     def reset(self, human_color=None):
@@ -82,10 +83,19 @@ class Session:
         self.game_over = False
         self.final_score = None
         self.search_progress = None
+        self._last_prog_t = 0.0
+        # 缓存形势分：score() 是 O(n²) Python flood-fill，原实现每次 /api/state
+        # 都重算（且算两次），这里改为落子/悔棋时算一次。
+        self.lead = self.board.score()
         self.wr_hist = []   # 胜率曲线采样 [{mc:手数, wr:AI视角胜率}]（AI 每手记一次）
 
     def _progress_cb(self, sims_done, root):
         """MCTS 每次模拟后的进度回调：快照根 children 的 visits/胜率供前端轮询。"""
+        # 前端每 120ms 才拉一次进度，没必要每次模拟都重建快照（会拖慢搜索）。
+        now = time.perf_counter()
+        if now - self._last_prog_t < 0.05:
+            return
+        self._last_prog_t = now
         bs = self.size
         cands = []
         for mv, child in root.children.items():
@@ -123,7 +133,7 @@ class Session:
             "last_move": self.last_move,
             "over": over,
             "score": score,
-            "lead": self.board.score(),   # 中盘形势（中国规则数子估分，含 7.5 贴目）
+            "lead": self.lead,   # 缓存的形势分（中国规则数子估分，含 7.5 贴目）
             "candidates": self.candidates,
             "ai_info": self.ai_info,
             "log": self.log[-40:],
@@ -147,8 +157,9 @@ class Session:
         else:
             self.last_move = "pass"
         self.move_count += 1
+        self.lead = self.board.score()  # 落子后更新缓存的形势分
         if self.board.passes >= 2 and self.final_score is None:
-            self.final_score = self.board.score()
+            self.final_score = self.lead
             self.game_over = True
 
     def _rebuild_after_undo(self):
