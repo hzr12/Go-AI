@@ -107,15 +107,18 @@ def augment8(plane, target, n):
     board_t = target[:n * n].reshape(n, n)
     pass_t = target[n * n]
     out = []
-    for k in range(4):
-        for fl in (False, True):
-            pl = np.rot90(plane, k, axes=(1, 2))
-            tb = np.rot90(board_t, k)
-            if fl:
-                pl = pl[:, ::-1]
-                tb = tb[:, ::-1]
-            tv = np.concatenate([tb.reshape(-1), [pass_t]])
-            out.append((np.ascontiguousarray(pl), np.ascontiguousarray(tv)))
+    for t in range(8):
+        k = t % 4
+        pl = plane.copy()
+        tb = board_t.copy()
+        if t >= 4:
+            pl = pl[:, :, ::-1]       # flip W (axis=2 on 3D C,H,W)
+            tb = tb[:, ::-1]          # flip W (axis=1 on 2D H,W)
+        if k > 0:
+            pl = np.rot90(pl, k=-k, axes=(1, 2))  # CW rotation
+            tb = np.rot90(tb, k=-k)                # CW rotation
+        tv = np.concatenate([tb.reshape(-1), [pass_t]])
+        out.append((np.ascontiguousarray(pl), np.ascontiguousarray(tv)))
     return out
 
 

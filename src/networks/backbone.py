@@ -92,8 +92,8 @@ def set_flash_attn(enabled: bool):
 
     enabled=False 直接卸载回退 SDPA；enabled=True 时 import flash_attn，
     成功则 _sdpa 优先走 flash-attn 内核，失败（未安装/导入错误）返回原因并回退。
-    注意：window/sparse 注意力不走 flash（形状为每窗口 1×S 微序列，见
-    _window_sdpa 的 docstring），flash 仅用于 global/axial 等标准 MHA 形状。
+    注意：window/sparse 注意力不走 flash（形状为每窗口 1×S 微序列），
+    flash 仅用于 global/axial 等标准 MHA 形状。
     """
     global _flash_attn_func
     if not enabled:
@@ -120,28 +120,6 @@ def set_sdpa_force_math(flag: bool) -> None:
     """由训练脚本在启动时按 GPU 能力设置。flag=True 强制手写 math（V100）。"""
     global _sdpa_force_math
     _sdpa_force_math = bool(flag)
-
-
-def _window_sdpa(qw, kw, vw, dropout_p=0.0):
-    """window/sparse 注意力的 batch 展开调用（math 一次成型）。
-
-    qw: (M, Hh, 1, d)；kw/vw: (M, Hh, S, d)，M = B*N 可达数十万。
-
-    为什么不用 FlashAttention（2026-09 A100 profiler 实测定案）：
-      本注意力的形状是每窗口 1 query × S(=25) keys 的微序列——flash 内核按
-      128-token tiling 设计，25-token 序列浪费 ~80% 算力，且 varlen backward
-      实测为 forward 的 3.6 倍（11s vs 3s/50steps，占训练 CUDA 时间 39%）。
-      正确工具是 bmm+softmax：attn 矩阵仅 (M, Hh, 1, S)≈55MB/层，完全可物化，
-      3 个大 kernel 一次成型——零 slice/cat/clone（旧分块的 slice_backward +
-      copy_ + fill_ 零化家族占 CUDA 时间 ~36%，一并消失）。
-      公式与旧 _sdpa math 路径逐位一致（q@kᵀ 无 scale），训练动力学零变化。
-
-    返回 (M, Hh, 1, d)。
-    """
-    attn = (qw @ kw.transpose(-2, -1)).softmax(dim=-1)   # (M, Hh, 1, S)
-    if dropout_p > 0.0:
-        attn = torch.nn.functional.dropout(attn, p=dropout_p)
-    return attn @ vw                                     # (M, Hh, 1, d)
 
 
 # 模块级开关：是否将 window/sparse 注意力排除出 torch.compile 图。
@@ -242,6 +220,7 @@ class MultiHeadSelfAttention(nn.Module):
         pad = ws // 2
         tp = F.pad(t.reshape(B, Hh * d, H, W), (pad, pad, pad, pad))
         tv = tp.unfold(2, ws, 1).unfold(3, ws, 1)           # (B,C,H,W,kh,kw) 纯 view
+        del tp  # unfold view 已建立，padded 输入不再需要，提前释放 ~460MB
         tv = tv.reshape(B, Hh, d, H, W, ws, ws) \
                .permute(0, 3, 4, 1, 5, 6, 2)                # (B,H,W,Hh,kh,kw,d)
         return tv.reshape(B, N, Hh, ws * ws, d)             # 满带宽拷贝
@@ -307,8 +286,8 @@ class MultiHeadSelfAttention(nn.Module):
             消除 F.unfold im2col（profiler 占 27.6%）与二次重排；全链零 slice
             分块节点；q 只取窗口中心（= 自身位置，O(N·d) 小拷贝，不再为它做
             O(N·ws²·d) 的全量 unfold）。
-          - 不再分块：query 只有中心 1 个 token，注意力矩阵
-            (B*N, Hh, 1, ws²+ng) 极小，单次成型即可。
+          - 显存优化：全局 key/value 不做 expand().reshape()（省 ~426MB/层），
+            改用 einsum 广播计算注意力 logits，值聚合也用 einsum 避免物化 expanded tensor。
 
         q,k,v: (B, Hh, N, head_dim)，N = H*W。返回 (B, N, Hh*d)。
         """
@@ -321,10 +300,9 @@ class MultiHeadSelfAttention(nn.Module):
         vw = self._local_windows(v, H, W).reshape(B * N, Hh, ws * ws, d)
 
         # ---- 2) q 即窗口中心（= 自身位置）：纯 head 主序重排，一次小拷贝 ----
-        # 注意不可经纠缠 reshape(B,Hh*d,H,W) 取中心——纠缠空间的中心槽并非自身 token。
-        qc = q.permute(0, 2, 1, 3).reshape(B * N, Hh, 1, d)   # (B*N, Hh, 1, d) 小拷贝
+        qc = q.permute(0, 2, 1, 3).reshape(B * N, Hh, 1, d)   # (B*N, Hh, 1, d)
 
-        # ---- 4) 全局代表 token：块中心（pattern 与旧实现一致）----
+        # ---- 3) 全局代表 token：块中心 ----
         gh, gw = H // stride, W // stride
         ng = gh * gw
         kg = k.reshape(B, Hh, H, W, d)[:, :, :gh * stride, :gw * stride, :]
@@ -334,16 +312,28 @@ class MultiHeadSelfAttention(nn.Module):
         vg = vg.view(B, Hh, gh, stride, gw, stride, d)[:, :, :, stride // 2, :, stride // 2, :]
         vg = vg.reshape(B, Hh, ng, d)
 
-        # ---- 5) 广播到每个 token：expand 纯 view + 一次 reshape 拷贝 ----
-        k_glob = kg.unsqueeze(1).expand(B, N, Hh, ng, d).reshape(B * N, Hh, ng, d)
-        v_glob = vg.unsqueeze(1).expand(B, N, Hh, ng, d).reshape(B * N, Hh, ng, d)
+        # ---- 4) 注意力 logits：全局 key 用 einsum 广播，避免 expand().reshape() 拷贝 ----
+        local_logits = qc @ kw.transpose(-2, -1)             # (B*N, Hh, 1, ws²)
+        qc_5d = qc.view(B, N, Hh, 1, d)
+        global_logits = torch.einsum('bnhid,bnhgd->bnhig',
+                                     qc_5d, kg.unsqueeze(1))  # (B, N, Hh, 1, ng)
+        global_logits = global_logits.reshape(B * N, Hh, 1, ng)
+        all_logits = torch.cat([local_logits, global_logits], dim=-1)  # (B*N, Hh, 1, ws²+ng)
+        attn = all_logits.softmax(dim=-1)
+        if self.attn_drop > 0.0:
+            attn = torch.nn.functional.dropout(attn, p=self.attn_drop)
 
-        # ---- 6) 拼接 + 单次成型注意力（A100 走 varlen flash，V100 math 一次成型）----
-        k_all = torch.cat([kw, k_glob], dim=2)              # (B*N, Hh, ws²+ng, d)
-        v_all = torch.cat([vw, v_glob], dim=2)
-        oc = _window_sdpa(qc, k_all, v_all, dropout_p=self.attn_drop)  # (B*N, Hh, 1, d)
+        # ---- 5) 值聚合：local 用 bmm，global 用 einsum 广播（避免 expand vg）----
+        local_attn = attn[:, :, :, :ws * ws]                 # (B*N, Hh, 1, ws²)
+        global_attn = attn[:, :, :, ws * ws:]                # (B*N, Hh, 1, ng)
+        local_out = local_attn @ vw                           # (B*N, Hh, 1, d)
+        global_out = torch.einsum('bnhig,bhgd->bnhid',
+                                 global_attn.reshape(B, N, Hh, 1, ng),
+                                 vg)                          # (B, N, Hh, 1, d)
+        global_out = global_out.reshape(B * N, Hh, 1, d)
+        oc = local_out + global_out
 
-        # ---- 7) 回到 (B, N, Hh*d)：head 主序展平，纯 view 无拷贝 ----
+        # ---- 6) 回到 (B, N, Hh*d)：head 主序展平 ----
         return oc.view(B, N, Hh, d).reshape(B, N, Hh * d)
 
     def _axial_attn(self, q, k, v, H, W):

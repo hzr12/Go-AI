@@ -81,7 +81,9 @@ class AlphaGoNet(nn.Module):
         return policy, value
 
     def get_policy(self, observation: torch.Tensor) -> torch.Tensor:
+        """⚠ 若同时需要 policy 和 value，请用 forward() 避免 backbone 重复计算。"""
         return self.policy(self.backbone(observation))
 
     def get_value(self, observation: torch.Tensor) -> torch.Tensor:
+        """⚠ 若同时需要 policy 和 value，请用 forward() 避免 backbone 重复计算。"""
         return self.value(self.backbone(observation))

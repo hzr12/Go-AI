@@ -71,18 +71,25 @@ class SupervisedDataset:
         # 批量构造 12 通道特征（B,12,H,W）
         states = GoBoard.feature_planes_batched(boards, my_h, op_h, to_play, ko)
 
-        # 向量化对称增强：rot90(k=t%4) 旋转 (H,W) 平面；t>=4 时翻转 H 轴。
-        # 注意: 旧逐样本版用 np.fliplr(plane) 对 (12,H,W) 翻转的是 H 轴(axis=1)，
-        # 这里用显式切片 x[:, :, ::-1, :] 精确复刻，避免 np.fliplr 在 4D 上的隐式轴歧义。
-        rot_k = tforms % 4
-        for k in range(1, 4):  # k=0 无需旋转
-            mask = rot_k == k
-            if mask.any():
-                states[mask] = np.rot90(states[mask], k=k, axes=(2, 3))
-        for t in range(4, 8):
+        # 向量化对称增强：8 种变换（4 旋转 × 2 镜像），与 SYMMETRIES 坐标变换严格对齐。
+        # np.rot90 是逆时针旋转，SYMMETRIES 是顺时针，故用 k=-k；
+        # _FLIP 翻转列 (W/axis=3)，不是行 (H/axis=2)；
+        # _FLIP_ROTxx = _ROTxx ∘ _FLIP，即先翻转再旋转。
+        # 注意: np.fliplr 对2D数组翻转 axis=1(W)是正确的，但对4D数组翻转 axis=2(H)
+        # 是错误的——此处用显式切片 [:, :, :, ::-1] 精确指定 W 轴。
+        out = np.empty_like(states)
+        for t in range(8):
             mask = tforms == t
-            if mask.any():
-                states[mask] = states[mask][:, :, ::-1, :]
+            if not mask.any():
+                continue
+            arr = states[mask]
+            if t >= 4:
+                arr = arr[:, :, :, ::-1]            # flip W (axis=3)
+            k = t % 4
+            if k > 0:
+                arr = np.rot90(arr, k=-k, axes=(2, 3))  # CW rotation
+            out[mask] = arr
+        states = out
 
         # 向量化坐标对称变换（move）
         moves_out = np.full(B, bs * bs, dtype=np.int64)  # 默认 pass/越界 -> 专用类别

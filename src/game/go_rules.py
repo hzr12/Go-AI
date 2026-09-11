@@ -457,18 +457,16 @@ class GoBoard:
         planes[:, 0] = (boards == to_play)
         planes[:, 4] = (boards == opp)
 
-        # 通道 1-3 / 5-7: 历史手（高级索引 scatter）
+        # 通道 1-3 / 5-7: 历史手（向量化 scatter，一次高级索引完成 3 个通道）
         my_hist = np.asarray(my_hist).reshape(B, 3)
         op_hist = np.asarray(op_hist).reshape(B, 3)
-        for k in range(3):
-            mv = my_hist[:, k]
-            valid = mv >= 0
-            r, c = np.divmod(np.where(valid, mv, 0), n)
-            planes[np.arange(B)[valid], 1 + k, r[valid], c[valid]] = 1.0
-            mv = op_hist[:, k]
-            valid = mv >= 0
-            r, c = np.divmod(np.where(valid, mv, 0), n)
-            planes[np.arange(B)[valid], 5 + k, r[valid], c[valid]] = 1.0
+        _bidx = np.arange(B)[:, None]          # (B, 1) 广播用
+        _ch3 = np.arange(3)[None, :]           # (1, 3) 广播用
+        for hist, ch_base in ((my_hist, 1), (op_hist, 5)):
+            valid = hist >= 0                   # (B, 3) bool
+            if valid.any():
+                r, c = np.divmod(np.where(valid, hist, 0), n)
+                planes[_bidx[valid], ch_base + _ch3[valid], r[valid], c[valid]] = 1.0
 
         # 通道 8: 合法点掩码（空点，劫禁着点排除）—— 与单图 get_legal_moves 一致
         legal = (boards == 0).astype(np.float32)
@@ -491,7 +489,7 @@ class GoBoard:
         # 每个棋子点的 4 邻域空点坐标数（整数 0-4），整批一次算，与单图
         # _group_liberty_count 逐点计数语义一致（每个空邻域坐标各算 1 气）。
         empty = (boards == 0)
-        neigh_empty = np.zeros((B, n, n), dtype=np.int64)
+        neigh_empty = np.zeros((B, n, n), dtype=np.int8)
         neigh_empty[:, :-1, :] += empty[:, 1:, :]
         neigh_empty[:, 1:, :]  += empty[:, :-1, :]
         neigh_empty[:, :, :-1] += empty[:, :, 1:]
@@ -505,20 +503,28 @@ class GoBoard:
         struct3 = np.zeros((3, 3, 3), dtype=bool)
         struct3[1] = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
 
-        # to_play 已 reshape 为 (B,1,1)，按样本广播出「己方/对手」颜色
-        for mask, lib_plane in ((boards == to_play, my_lib1),
-                                (boards == -to_play, op_lib1)):
+        # 并行标注：scipy.ndimage.label 释放 GIL，两个颜色的标注可真正并行
+        import threading
+
+        def _label_and_mark(mask, lib_plane, to_play_val):
             if not mask.any():
-                continue
+                return
             labelled, num = _scipy_label(mask, structure=struct3)
             if num == 0:
-                continue
-            # 每个 group 的邻空数 = 组内棋子点邻域空点坐标总数（不去重空块）。
-            # 背景权重置 0，只累加棋子点；bincount 比逐样本 np.add.at 快一个量级。
+                return
             w = np.where(mask, neigh_empty, 0).ravel()
             lib_counts = np.bincount(labelled.ravel(), weights=w,
                                      minlength=num + 1).astype(np.int64)
             lib_plane[(lib_counts[labelled] == 1) & mask] = 1.0
+
+        t_my = threading.Thread(target=_label_and_mark,
+                                args=(boards == to_play, my_lib1, to_play))
+        t_op = threading.Thread(target=_label_and_mark,
+                                args=(boards == -to_play, op_lib1, -to_play))
+        t_my.start()
+        t_op.start()
+        t_my.join()
+        t_op.join()
 
         planes[:, 10] = my_lib1
         planes[:, 11] = op_lib1
@@ -527,10 +533,12 @@ class GoBoard:
     @staticmethod
     def apply_symmetry(state_12ch, move, transform_id, board_size):
         planes = np.array(state_12ch)
+        k = transform_id % 4
         for ch in range(planes.shape[0]):
-            planes[ch] = np.rot90(planes[ch], k=transform_id % 4)
             if transform_id >= 4:
-                planes[ch] = np.fliplr(planes[ch])
+                planes[ch] = np.fliplr(planes[ch])       # flip W (axis=1 on 2D)
+            if k > 0:
+                planes[ch] = np.rot90(planes[ch], k=-k)  # CW rotation
         if move >= 0:
             r, c = divmod(move, board_size)
             rr, cc = SYMMETRIES[transform_id % 8](r, c, board_size)

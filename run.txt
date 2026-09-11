@@ -1,1 +1,10 @@
 python scripts/webui.py --port 7860 --device cpu --priors-leaf --mode hybrid --hybrid-sims 24 --hybrid-blend 0.5 --expand-topk 12 --expand-chunk 8 --leaf-ab-depth 2 --policy-depth 3 --num-threads 1 --onnx --policy-topk 12 --policy-width 6
+torchrun --nproc_per_node=2 scripts/train_sft.py \
+  --data data/sgf_19x19_all.npz --device npu --board-size 19 \
+  --backbone-channels 192 --backbone-res-blocks 17 \
+  --batch-size 512 --epochs 8 --lr 0.002 --weight-decay 0.0001 \
+  --attention-mode mix --num-attention-layers 4 --num-heads 4 \
+  --attn-mode window --attn-window 7 --window-chunk 64 \
+  --use-amp --resume models/ft_init.pth \
+  --log-every 50 --eval-every 500 --save-every 500 \
+  --out models/sft_19x19_v5.pth

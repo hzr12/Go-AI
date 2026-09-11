@@ -226,6 +226,29 @@ def load_dataset(path):
     return SupervisedDataset({k: d[k] for k in d.files})
 
 
+def evaluate_top1(model, dataset, idxs, bs, device, amp_dtype, max_batches=50):
+    """验证集 top-1 着法准确率。返回 (accuracy, num_samples)。"""
+    model.eval()
+    correct = 0
+    total = 0
+    n_batches = min((len(idxs) + bs - 1) // bs, max_batches)
+    with torch.no_grad():
+        for b in range(n_batches):
+            sel = idxs[b * bs:(b + 1) * bs]
+            if len(sel) == 0:
+                break
+            states_np, moves_np, _ = dataset.sample_batch_numpy(sel)
+            state = torch.from_numpy(states_np).to(device)
+            move_t = torch.from_numpy(moves_np).to(device)
+            with maybe_autocast(device, amp_dtype):
+                policy_logits, _ = model(state)
+            pred = policy_logits.argmax(dim=-1)
+            correct += int((pred == move_t).sum())
+            total += len(sel)
+    model.train()
+    return correct / max(total, 1), total
+
+
 def _concat_dicts(dicts):
     """按相同 key 沿第 0 轴拼接多个数据 dict（字段形状一致）。"""
     out = {}
@@ -334,12 +357,15 @@ class _BatchPrefetcher:
         """投递一个 batch 的下标（队列满时阻塞，提供背压）。"""
         step = self._step
         self._step += 1
-        chunks = np.array_split(np.asarray(idxs), self.k)
-        for pos, sub in enumerate(chunks):
+        n = len(idxs)
+        for wi in range(self.k):
+            start = wi * n // self.k
+            end = (wi + 1) * n // self.k
+            sub = idxs[start:end]
             if len(sub) == 0:
-                self._res_q.put((step, pos, None, None, None, None))
+                self._res_q.put((step, wi, None, None, None, None))
             else:
-                self._task_q.put((step, pos, sub))
+                self._task_q.put((step, wi, sub))
 
     def next(self):
         """取回下一个 batch，返回 (states_np, moves_np, values_np)。"""
@@ -396,8 +422,6 @@ def main():
                     choices=['global', 'window', 'axial', 'sparse'],
                     help='注意力计算模式: global=全配对, window=滑动窗口, axial=轴向')
     ap.add_argument('--attn-window', type=int, default=7, help='window 模式窗口边长')
-    ap.add_argument('--window-chunk', type=int, default=128,
-                    help='window 注意力沿窗口维分块大小（越小越省显存，过大易 OOM）')
     ap.add_argument('--eval-every', type=int, default=5000)
     ap.add_argument('--log-every', type=int, default=50,
                     help='每隔多少 step 打印一次训练日志（loss/lr/吞吐/显存）')
@@ -436,10 +460,9 @@ def main():
     logger.info("配置: data=%s board=%d batch=%d epochs=%d lr=%s wd=%s",
                 args.data, args.board_size, args.batch_size, args.epochs,
                 args.lr, args.weight_decay)
-    logger.info("注意力: mode=%s attn_mode=%s window=%d heads=%d layers=%d dropout=%s compile=%s chunk=%d",
+    logger.info("注意力: mode=%s attn_mode=%s window=%d heads=%d layers=%d dropout=%s compile=%s",
                 args.attention_mode, args.attn_mode, args.attn_window,
-                args.num_heads, args.num_attention_layers, args.attention_dropout, args.compile,
-                args.window_chunk)
+                args.num_heads, args.num_attention_layers, args.attention_dropout, args.compile)
     logger.info("日志: log_every=%d eval_every=%d save_every=%d out=%s",
                 args.log_every, args.eval_every, args.save_every, args.out)
     logger.info("=" * 60)
@@ -625,13 +648,6 @@ def main():
         model = model.to(memory_format=torch.channels_last)  # type: ignore[call-overload]
         logger.info("[model] 已启用 channels_last (NHWC) 内存格式（A100 卷积加速）")
 
-    # 将 window_chunk（分块大小）透传到所有 window 注意力层，控制显存峰值
-    if args.window_chunk > 0:
-        for _m in model.modules():
-            if hasattr(_m, 'window_chunk'):
-                _m.window_chunk = args.window_chunk
-        logger.info("[model] window_chunk=%d（滑动窗口注意力分块大小）", args.window_chunk)
-
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     # BF16 后端（A100/NPU）下 use_scaler=False（BF16 不下溢，省去 loss scaling 的额外同步）；
     # V100/FP16 下开启 GradScaler。按设备选择 GradScaler 实现。
@@ -779,6 +795,7 @@ def main():
         _prof_ctx = None
         for i in range(n_batches):
             try:
+                optimizer.zero_grad(set_to_none=True)
                 if _prof_at > 0 and step == _prof_at and _prof_ctx is None:
                     try:
                         from torch.profiler import (profile, ProfilerActivity)
@@ -792,17 +809,22 @@ def main():
                         _prof_at = 0
                 if pf is not None:
                     states_np, moves_np, values_np = pf.next()
-                    state = torch.from_numpy(states_np)
-                    move_t = torch.from_numpy(moves_np)
-                    value_t = torch.from_numpy(values_np)
-                    # A100：转 NHWC 后用 pinned + 非阻塞 H2D，拷贝与后续计算重叠
-                    if use_channels_last:
-                        state = state.to(memory_format=torch.channels_last)
+                    # 直接分配 pinned memory 并拷贝，省去 from_numpy 共享内存再 copy 的中间步骤
                     if _backend == 'cuda':
-                        state = state.pin_memory().to(device, non_blocking=True)
-                        move_t = move_t.pin_memory().to(device, non_blocking=True)
-                        value_t = value_t.pin_memory().to(device, non_blocking=True)
+                        state = torch.tensor(states_np, dtype=torch.float32, pin_memory=True)
+                        move_t = torch.tensor(moves_np, dtype=torch.int64, pin_memory=True)
+                        value_t = torch.tensor(values_np, dtype=torch.float32, pin_memory=True)
+                        if use_channels_last:
+                            state = state.to(memory_format=torch.channels_last)
+                        state = state.to(device, non_blocking=True)
+                        move_t = move_t.to(device, non_blocking=True)
+                        value_t = value_t.to(device, non_blocking=True)
                     else:
+                        state = torch.from_numpy(states_np)
+                        move_t = torch.from_numpy(moves_np)
+                        value_t = torch.from_numpy(values_np)
+                        if use_channels_last:
+                            state = state.to(memory_format=torch.channels_last)
                         state = state.to(device)
                         move_t = move_t.to(device)
                         value_t = value_t.to(device)
@@ -820,8 +842,6 @@ def main():
                     policy_loss = F.cross_entropy(policy_logits.float(), move_t)
                     value_loss = F.mse_loss(value_pred.float().squeeze(), value_t.squeeze())
                     loss = policy_loss + value_loss
-                # set_to_none=True：直接释放梯度张量而非 memset 置零，省一次全参清零
-                optimizer.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
@@ -886,4 +906,16 @@ def main():
                             sort_by='cuda_time_total', row_limit=18)
                         logger.info("[profile] 内核耗时 top-18（CUDA 时间排序）:\n%s",
                                     table)
-          
+                    except Exception as e:
+                        logger.warning("[profile] 打印内核耗时表失败: %s", e)
+
+            # 定期评估：top-1 着法准确率（仅主进程，避免 DDP 重复计算）
+            if is_main and args.eval_every > 0 and step % args.eval_every == 0 and len(eval_idx) > 0:
+                eval_acc, eval_n = evaluate_top1(
+                    model, dataset, eval_idx, bs, device, amp_dtype)
+                logger.info("[eval] step=%d top1_acc=%.4f (n=%d)%s",
+                            step, eval_acc, eval_n,
+                            " ★ new best" if eval_acc > best_eval_acc else "")
+                if eval_acc > best_eval_acc:
+                    best_eval_acc = eval_acc
+                    save_model(model, args.out + '.best')
