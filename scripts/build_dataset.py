@@ -58,9 +58,10 @@ def parse_result_to_value(result_str):
 
 
 def pad3(seq):
+    """补齐到 3 个元素，最近一手在索引 0（channel 最小），不足的在尾部填 -1。"""
     seq = list(seq[-3:])
     while len(seq) < 3:
-        seq.insert(0, -1)
+        seq.append(-1)
     return seq
 
 
@@ -68,9 +69,10 @@ def split_hist(recent, to_play):
     """
     把 recent（扁平坐标序列，最近一手在末尾）拆成 my/op 各 3 手。
     recent 是按落子顺序排列的；最后一步的执子方是 to_play，往前交替。
+    注意：recent[-1] 是上一手（由 -to_play 下的），所以从 -to_play 开始。
     """
     my, op = [], []
-    cur = to_play
+    cur = -to_play  # 最近一手由对手（-to_play）下的
     for mv in reversed(recent):
         if cur == to_play:
             my.append(mv)

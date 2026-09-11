@@ -100,8 +100,11 @@ class SupervisedDataset:
             mask = tforms == t
             if not mask.any():
                 continue
-            rr, cc = SYMMETRIES[t](r[mask], c[mask], bs)
-            moves_out[mask] = rr * bs + cc
+            # 只对有效走法做对称变换，pass/越界保留默认标签
+            vmask = mask & valid
+            if vmask.any():
+                rr, cc = SYMMETRIES[t](r[vmask], c[vmask], bs)
+                moves_out[vmask] = rr * bs + cc
 
         values = self.values[idxs].astype(np.float32).reshape(-1, 1)
         return states, moves_out, values
