@@ -171,6 +171,7 @@ def save_model(model, path):
         sd = {k.replace('module.', '', 1): v for k, v in sd.items()}
     if any(k.startswith('_orig_mod.') for k in sd.keys()):
         sd = {k.replace('_orig_mod.', '', 1): v for k, v in sd.items()}
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     torch.save(sd, path)
 
 
