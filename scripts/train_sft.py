@@ -475,6 +475,7 @@ def main():
                          if args.device not in ('auto', '') else
                          ('npu' if npu_is_available() else 'cuda'))
         if _dist_backend == 'npu':
+            import torch_npu  # noqa: F401 — 注册 HCCL 后端
             dist.init_process_group('hccl')
             torch.npu.set_device(local_rank)
         else:
