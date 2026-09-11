@@ -29,7 +29,7 @@ class ResBlock(nn.Module):
 _FLASH_BATCH_LIMIT = 32768
 
 
-def _sdpa(q, k, v, dropout_p=0.0, use_math=False):
+def _sdpa(q, k, v, dropout_p=0.0, use_math=False, scale=None):
     """注意力计算。
 
     q,k,v: (B, Hh, N, head_dim)。q 已在调用处预乘 scale。
@@ -73,12 +73,15 @@ def _sdpa(q, k, v, dropout_p=0.0, use_math=False):
             dropout_p=dropout_p, causal=False)
         return out.transpose(1, 2)
     if use_math or not hasattr(F, "scaled_dot_product_attention"):
-        # 手写注意力（q 已预乘 scale）
+        # 手写注意力：math 路径需手动缩放 q
+        if scale is not None:
+            q = q * scale
         attn = (q @ k.transpose(-2, -1))
         attn = attn.softmax(dim=-1)
         if dropout_p > 0.0:
             attn = torch.nn.functional.dropout(attn, p=dropout_p)
         return attn @ v
+    # SDPA 路径：内部自带 1/sqrt(d) 缩放，q 不能预乘 scale，否则双重缩放
     return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
 
 
@@ -177,6 +180,8 @@ class MultiHeadSelfAttention(nn.Module):
                  mode="global", window_size=7):
         super(MultiHeadSelfAttention, self).__init__()
         assert channels % num_heads == 0, "channels 必须能被 num_heads 整除"
+        if mode in ('window', 'sparse'):
+            assert window_size % 2 == 1, f"window_size 必须为奇数，收到 {window_size}"
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
         self.scale = self.head_dim ** -0.5
@@ -200,7 +205,7 @@ class MultiHeadSelfAttention(nn.Module):
         return t.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
 
     def _global_attn(self, q, k, v):
-        return _sdpa(q, k, v, dropout_p=self.attn_drop)
+        return _sdpa(q, k, v, dropout_p=self.attn_drop, scale=self.scale)
 
     def _local_windows(self, t, H, W):
         """真 2D 局部窗口提取（2026-09 语义修正版）。
@@ -267,7 +272,7 @@ class MultiHeadSelfAttention(nn.Module):
                 x = x[:, :, :H, :W, :]               # 裁掉 pad（零化仅 ~40MB）
             return x.permute(0, 2, 3, 1, 4).reshape(B, N, Hh * d)
 
-        return unpart(_sdpa(part(q), part(k), part(v), dropout_p=self.attn_drop))
+        return unpart(_sdpa(part(q), part(k), part(v), dropout_p=self.attn_drop, scale=self.scale))
 
     def _sparse_attn(self, q, k, v, H, W):
         """稀疏注意力（固定稀疏模式）：局部滑动窗口 + 跨步长全局 token。
@@ -302,15 +307,22 @@ class MultiHeadSelfAttention(nn.Module):
         # ---- 2) q 即窗口中心（= 自身位置）：纯 head 主序重排，一次小拷贝 ----
         qc = q.permute(0, 2, 1, 3).reshape(B * N, Hh, 1, d)   # (B*N, Hh, 1, d)
 
-        # ---- 3) 全局代表 token：块中心 ----
-        gh, gw = H // stride, W // stride
+        # ---- 3) 全局代表 token：每 stride×stride 块取中心，覆盖完整棋盘 ----
+        # 余数块（底部/右侧不足 stride 的行/列）也取中心，确保无盲区
+        gh = (H + stride - 1) // stride  # 向上取整，覆盖所有行
+        gw = (W + stride - 1) // stride
         ng = gh * gw
-        kg = k.reshape(B, Hh, H, W, d)[:, :, :gh * stride, :gw * stride, :]
-        kg = kg.view(B, Hh, gh, stride, gw, stride, d)[:, :, :, stride // 2, :, stride // 2, :]
-        kg = kg.reshape(B, Hh, ng, d)                       # (B,Hh,ng,d)
-        vg = v.reshape(B, Hh, H, W, d)[:, :, :gh * stride, :gw * stride, :]
-        vg = vg.view(B, Hh, gh, stride, gw, stride, d)[:, :, :, stride // 2, :, stride // 2, :]
-        vg = vg.reshape(B, Hh, ng, d)
+        kg = k.reshape(B, Hh, H, W, d)                       # (B,Hh,H,W,d)
+        vg = v.reshape(B, Hh, H, W, d)
+        # 为每个块计算中心坐标（clamp 到有效范围）
+        row_centers = torch.arange(gh, device=k.device) * stride + stride // 2
+        row_centers = row_centers.clamp(max=H - 1)
+        col_centers = torch.arange(gw, device=k.device) * stride + stride // 2
+        col_centers = col_centers.clamp(max=W - 1)
+        # 用 meshgrid 构建 (gh, gw) 索引网格，advanced indexing 取出所有全局 token
+        r_idx, c_idx = torch.meshgrid(row_centers, col_centers, indexing='ij')
+        kg = kg[:, :, r_idx, c_idx].reshape(B, Hh, ng, d)    # (B,Hh,ng,d)
+        vg = vg[:, :, r_idx, c_idx].reshape(B, Hh, ng, d)
 
         # ---- 4) 注意力 logits：全局 key 用 einsum 广播，避免 expand().reshape() 拷贝 ----
         local_logits = qc @ kw.transpose(-2, -1)             # (B*N, Hh, 1, ws²)
@@ -347,7 +359,7 @@ class MultiHeadSelfAttention(nn.Module):
         def attn_1d(tokens):
             # tokens: (B*Hh*L, S, d) -> 把 Hh 融进 batch 做标准 MHA
             t = tokens.view(-1, Hh, tokens.shape[1], d)
-            return _sdpa(t, t, t, dropout_p=self.attn_drop).view(-1, tokens.shape[1], d)
+            return _sdpa(t, t, t, dropout_p=self.attn_drop, scale=self.scale).view(-1, tokens.shape[1], d)
 
         # 行注意力：每行 H 个 token 互相看，把 (B,Hh,H,W,d) 重排为 (B*Hh*H, W, d)
         qr = q.view(B, Hh, H, W, d).reshape(B * Hh * H, W, d)
@@ -377,8 +389,8 @@ class MultiHeadSelfAttention(nn.Module):
         q = self._to_heads(q, B, N)
         k = self._to_heads(k, B, N)
         v = self._to_heads(v, B, N)
-        # 预乘 scale 到 q，便于 _sdpa / 手写统一
-        q = q * self.scale
+        # 注意：不对 q 预乘 scale。_sdpa 的 math 路径内部处理缩放，
+        # SDPA/flash 路径自带 1/sqrt(d)，预乘会导致双重缩放。
 
         if self.mode == "window":
             out = _run_with_optional_disable(self._window_attn, q, k, v, H, W)

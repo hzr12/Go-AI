@@ -380,7 +380,7 @@ class GoBoard:
     #   10     : 己方气数=1 的块掩码
     #   11     : 对手气数=1 的块掩码
     #
-    # my_hist / op_hist: 长度均为 3 的扁平坐标序列（不足补 -1），最近一手在最后。
+    # my_hist / op_hist: 长度均为 3 的扁平坐标序列（不足补 -1），最近一手在 index 0。
 
     def feature_planes(self, my_hist, op_hist, to_play=None):
         n = self.board_size

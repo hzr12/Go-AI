@@ -288,8 +288,10 @@ def build(src, board_size, max_games, chunk_size=0, out=None, tmp_root=None):
             cur['values'].append(value)
             cur['to_plays'].append(to_play)
 
-            play_move = -1 if (r, c) == (-1, -1) else (r + off) * board_size + (c + off)
-            board.play(play_move)
+            play_move = target  # 与 target 相同，无需重复计算
+            if not board.play(play_move):
+                # 非法走法（占位/劫/自杀/越界），跳过整局
+                return 0, 1
             history.append(play_move)
 
         return len(game.moves), 0

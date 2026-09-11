@@ -31,7 +31,7 @@ class GameRecord:
     black_player: str = ""
     white_player: str = ""
     date: str = ""
-    komi: float = 6.5
+    komi: float = 7.5
     properties: Dict[str, str] = field(default_factory=dict)
 
 
@@ -130,6 +130,11 @@ class SGFParser:
             if j < 0:
                 out.append(sgf_string[i:])
                 break
+            # 排除 GC[ 等属性名中包含 C[ 的情况（C 前有大写字母则非注释）
+            if j > 0 and sgf_string[j - 1].isupper():
+                out.append(sgf_string[i:j + 1])
+                i = j + 1
+                continue
             out.append(sgf_string[i:j])
             k = j + 1          # 指向注释开头的 '['
             depth = 0

@@ -212,14 +212,15 @@ def setup_logging(log_file, level: int = logging.INFO, rank: int = 0) -> logging
 
 def maybe_autocast(device, dtype=torch.float16):
     """在 CUDA/NPU 上开启 autocast，dtype 由设备能力决定（A100/BF16、V100/FP16、NPU/BF16）。
-    CPU 或 amp 关闭时返回 nullcontext。device 字符串 'cuda'/'npu' 直接传给 torch.amp.autocast。"""
-    if device in ('cuda', 'npu'):
+    CPU 或 amp 关闭时返回 nullcontext。device 字符串支持 'cuda'/'cuda:0'/'npu'/'npu:0' 等。"""
+    dev = device.split(':')[0] if isinstance(device, str) else str(device)
+    if dev in ('cuda', 'npu'):
         if hasattr(torch, 'amp') and hasattr(torch.amp, 'autocast'):
             try:
-                return torch.amp.autocast(device, dtype=dtype)
+                return torch.amp.autocast(dev, dtype=dtype)
             except TypeError:
                 # 老接口回退
-                if device == 'cuda':
+                if dev == 'cuda':
                     return torch.cuda.amp.autocast(enabled=True, dtype=dtype)
                 return torch.npu.amp.autocast(enabled=True, dtype=dtype)
     return nullcontext()
@@ -231,7 +232,8 @@ def load_dataset(path):
     return SupervisedDataset({k: d[k] for k in d.files})
 
 
-def evaluate_top1(model, dataset, idxs, bs, device, amp_dtype, max_batches=50):
+def evaluate_top1(model, dataset, idxs, bs, device, amp_dtype, max_batches=50,
+                  use_channels_last=False):
     """验证集 top-1 着法准确率。返回 (accuracy, num_samples)。"""
     model.eval()
     correct = 0
@@ -244,6 +246,8 @@ def evaluate_top1(model, dataset, idxs, bs, device, amp_dtype, max_batches=50):
                 break
             states_np, moves_np, _ = dataset.sample_batch_numpy(sel)
             state = torch.from_numpy(states_np).to(device)
+            if use_channels_last:
+                state = state.to(memory_format=torch.channels_last)
             move_t = torch.from_numpy(moves_np).to(device)
             with maybe_autocast(device, amp_dtype):
                 policy_logits, _ = model(state)
@@ -285,13 +289,14 @@ def load_from_path(path, board_size, max_games_per_tgz=0):
 
         def _try_build(src):
             """build 可能对单个分片返回 0 有效局并抛 RuntimeError，这里吞掉并跳过。"""
+            _log = logging.getLogger('train')
             try:
                 d, n_games, skip = build(src, board_size, max_games_per_tgz)
             except RuntimeError as e:
-                logger.warning("[data] 跳过分片 %s：%s", src, e)
+                _log.warning("[data] 跳过分片 %s：%s", src, e)
                 return None, 0, 0
             if n_games == 0:
-                logger.warning("[data] 跳过分片 %s：0 有效局（与 --board-size %d 不匹配或空）",
+                _log.warning("[data] 跳过分片 %s：0 有效局（与 --board-size %d 不匹配或空）",
                                src, board_size)
                 return None, 0, 0
             return d, n_games, skip
@@ -916,15 +921,23 @@ def main():
                         logger.warning("[profile] 打印内核耗时表失败: %s", e)
 
             # 定期评估：top-1 着法准确率（仅主进程，避免 DDP 重复计算）
-            if is_main and args.eval_every > 0 and step % args.eval_every == 0 and len(eval_idx) > 0:
-                eval_acc, eval_n = evaluate_top1(
-                    model, dataset, eval_idx, bs, device, amp_dtype)
-                logger.info("[eval] step=%d top1_acc=%.4f (n=%d)%s",
-                            step, eval_acc, eval_n,
-                            " ★ new best" if eval_acc > best_eval_acc else "")
-                if eval_acc > best_eval_acc:
-                    best_eval_acc = eval_acc
-                    save_model(model, args.out + '.best')
+            # DDP 同步：eval 前后加 barrier，防止其他 rank 在 rank 0 eval 时
+            # 继续训练并触发 all-reduce 死锁
+            if args.eval_every > 0 and step % args.eval_every == 0 and len(eval_idx) > 0:
+                if is_dist:
+                    dist.barrier()
+                if is_main:
+                    eval_acc, eval_n = evaluate_top1(
+                        model, dataset, eval_idx, bs, device, amp_dtype,
+                        use_channels_last=use_channels_last)
+                    logger.info("[eval] step=%d top1_acc=%.4f (n=%d)%s",
+                                step, eval_acc, eval_n,
+                                " ★ new best" if eval_acc > best_eval_acc else "")
+                    if eval_acc > best_eval_acc:
+                        best_eval_acc = eval_acc
+                        save_model(model, args.out + '.best')
+                if is_dist:
+                    dist.barrier()
 
 if __name__ == "__main__":
     main()
