@@ -919,3 +919,6 @@ def main():
                 if eval_acc > best_eval_acc:
                     best_eval_acc = eval_acc
                     save_model(model, args.out + '.best')
+
+if __name__ == "__main__":
+    main()

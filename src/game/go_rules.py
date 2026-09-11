@@ -457,16 +457,23 @@ class GoBoard:
         planes[:, 0] = (boards == to_play)
         planes[:, 4] = (boards == opp)
 
-        # 通道 1-3 / 5-7: 历史手（向量化 scatter，一次高级索引完成 3 个通道）
+        # 通道 1-3 / 5-7: 历史手（向量化 scatter）
         my_hist = np.asarray(my_hist).reshape(B, 3)
         op_hist = np.asarray(op_hist).reshape(B, 3)
-        _bidx = np.arange(B)[:, None]          # (B, 1) 广播用
-        _ch3 = np.arange(3)[None, :]           # (1, 3) 广播用
+        
         for hist, ch_base in ((my_hist, 1), (op_hist, 5)):
-            valid = hist >= 0                   # (B, 3) bool
+            valid = hist >= 0 # (B, 3) bool
             if valid.any():
-                r, c = np.divmod(np.where(valid, hist, 0), n)
-                planes[_bidx[valid], ch_base + _ch3[valid], r[valid], c[valid]] = 1.0
+                # 【修复】获取所有有效位置的扁平化索引
+                valid_flat_indices = np.flatnonzero(valid)
+                
+                # 【修复】根据扁平化索引，分别获取对应的 batch、channel 和棋盘坐标
+                b_idx = valid_flat_indices // 3          # 对应的 batch 索引
+                c_idx = valid_flat_indices % 3           # 对应的 history 索引 (0, 1, 2)
+                r, c = np.divmod(hist[valid], n)         # 对应的棋盘坐标
+                
+                # 【修复】使用对齐后的索引进行赋值
+                planes[b_idx, ch_base + c_idx, r, c] = 1.0
 
         # 通道 8: 合法点掩码（空点，劫禁着点排除）—— 与单图 get_legal_moves 一致
         legal = (boards == 0).astype(np.float32)
