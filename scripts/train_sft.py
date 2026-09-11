@@ -142,6 +142,10 @@ def _check_training_env(logger):
     else:
         comp_status = "不可用（torch<2.0）"
     # 3) 混合精度（按后端能力）
+    try:
+        import torch_npu  # noqa: F401 — 确保 torch.npu 可用
+    except Exception:
+        pass
     if torch.cuda.is_available():
         p = torch.cuda.get_device_properties(0)
         cap = (p.major, p.minor)
