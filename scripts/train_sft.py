@@ -920,24 +920,19 @@ def main():
                     except Exception as e:
                         logger.warning("[profile] 打印内核耗时表失败: %s", e)
 
-            # 定期评估：top-1 着法准确率（仅主进程，避免 DDP 重复计算）
-            # DDP 同步：eval 前后加 barrier，防止其他 rank 在 rank 0 eval 时
-            # 继续训练并触发 all-reduce 死锁
+            # 定期评估：top-1 着法准确率（所有 rank 都做 eval，避免 barrier 死锁）
             if args.eval_every > 0 and step % args.eval_every == 0 and len(eval_idx) > 0:
-                if is_dist:
-                    dist.barrier()
+                eval_acc, eval_n = evaluate_top1(
+                    model, dataset, eval_idx, bs, device, amp_dtype,
+                    use_channels_last=use_channels_last)
                 if is_main:
-                    eval_acc, eval_n = evaluate_top1(
-                        model, dataset, eval_idx, bs, device, amp_dtype,
-                        use_channels_last=use_channels_last)
                     logger.info("[eval] step=%d top1_acc=%.4f (n=%d)%s",
                                 step, eval_acc, eval_n,
                                 " ★ new best" if eval_acc > best_eval_acc else "")
-                    if eval_acc > best_eval_acc:
-                        best_eval_acc = eval_acc
+                if eval_acc > best_eval_acc:
+                    best_eval_acc = eval_acc
+                    if is_main:
                         save_model(model, args.out + '.best')
-                if is_dist:
-                    dist.barrier()
 
 if __name__ == "__main__":
     main()
