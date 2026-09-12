@@ -399,18 +399,21 @@ class GoAI:
                     self.model, dummy, quant_path,
                     input_names=["x"], output_names=["policy", "value"],
                     opset_version=17, dynamo=False)
+                quantized = False
                 try:
                     from onnxruntime.quantization import quantize_dynamic, QuantType
                     quantize_dynamic(
                         model_input=quant_path,
                         model_output=onnx_path,
                         weight_type=QuantType.QInt8)
+                    quantized = True
                     print(f"[GoAI] 已应用 ONNX int8 动态量化: {onnx_path}")
                 except Exception as e:  # noqa: BLE001
                     print(f"[GoAI] int8 量化失败，使用 FP32 模型: {e}")
-                    quant_path = None
-                # 清理静态模型文件
-                if quant_path and os.path.exists(quant_path):
+                    # 量化失败：用静态 FP32 模型代替
+                    os.replace(quant_path, onnx_path)
+                # 清理残留静态模型文件
+                if os.path.exists(quant_path):
                     try:
                         os.remove(quant_path)
                     except OSError:
@@ -447,15 +450,22 @@ class GoAI:
 
         导出捕获的是模型原始输出（policy 为 logits），此处补 softmax 与
         torch 后端（_forward_batch 内 softmax）对齐。
+        量化模型导出为固定 batch=1，此处自动逐样本推理。
         """
         xnp = x.detach().cpu().numpy().astype(np.float32)
-        pol, val = self._ort.run(None, {"x": xnp})
-        pol = np.asarray(pol, dtype=np.float32)
+        B = xnp.shape[0]
+        all_pol, all_val = [], []
+        for i in range(B):
+            pol, val = self._ort.run(None, {"x": xnp[i:i+1]})
+            all_pol.append(pol[0])
+            all_val.append(val[0])
+        pol = np.stack(all_pol, axis=0).astype(np.float32)
+        val = np.stack(all_val, axis=0).astype(np.float32)
         # numerically stable softmax (avoid torch dependency in ONNX path)
         pol -= pol.max(axis=-1, keepdims=True)
         np.exp(pol, out=pol)
         pol /= pol.sum(axis=-1, keepdims=True)
-        return torch.from_numpy(pol), torch.from_numpy(np.asarray(val, dtype=np.float32)).reshape(-1, 1)
+        return torch.from_numpy(pol), torch.from_numpy(val.reshape(-1, 1))
 
     def choose_move(self, board, my_hist, op_hist, to_play, legal_mask, temperature=1.0, topk=10):
         """根据策略分布与合法着法掩码，采样一个着法。
