@@ -390,13 +390,15 @@ class GoAI:
             self.model = self.model.cpu().eval()
             dummy = torch.zeros(1, 12, self.board_size, self.board_size)
             if quantize_int8:
-                # int8 量化要求固定形状（动态 batch 导致 ShapeInferenceError）
-                # 先导出静态 batch=1，量化后再加载
+                # int8 量化必须用 legacy exporter（dynamo=False）：
+                # 新 torch.export-based 导出器产生的图结构导致 onnxruntime
+                # quantizer 的 ShapeInference 失败（32 vs 361）。
+                # 固定 batch=1 + opset=17，量化后加载到 ORT。
                 quant_path = onnx_path.replace(".onnx", "_static.onnx")
                 torch.onnx.export(
                     self.model, dummy, quant_path,
                     input_names=["x"], output_names=["policy", "value"],
-                    opset_version=18)
+                    opset_version=17, dynamo=False)
                 try:
                     from onnxruntime.quantization import quantize_dynamic, QuantType
                     quantize_dynamic(
