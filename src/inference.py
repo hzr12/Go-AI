@@ -132,13 +132,43 @@ class GoAI:
             # 兼容直接保存的 state_dict 或 {"model": state_dict}
             if isinstance(state, dict) and "model" in state:
                 state = state["model"]
-            # 从 policy 头输出层形状推断训练棋盘大小，防止 19 路权重载入
-            # 9 路网络时 strict=False 静默留下随机 policy 头
-            inferred = self._infer_board_size(state)
-            if inferred is not None and inferred != self.board_size:
-                print(f"[GoAI] 权重按 {inferred} 路训练（当前 board_size={self.board_size}），"
+            # 从权重形状自动推断架构参数，防止 mismatch
+            inferred_bs = self._infer_board_size(state)
+            inferred_arch = self._infer_architecture(state)
+            needs_rebuild = False
+            if inferred_bs is not None and inferred_bs != self.board_size:
+                print(f"[GoAI] 权重按 {inferred_bs} 路训练（当前 board_size={self.board_size}），"
                       f"已按权重自动调整棋盘大小")
-                self.board_size = inferred
+                self.board_size = inferred_bs
+                needs_rebuild = True
+            # 检查 backbone_channels 等是否匹配
+            if inferred_arch.get("backbone_channels") and \
+                    inferred_arch["backbone_channels"] != backbone_channels:
+                print(f"[GoAI] 权重 backbone_channels={inferred_arch['backbone_channels']}"
+                      f"（默认 {backbone_channels}），已自动调整")
+                backbone_channels = inferred_arch["backbone_channels"]
+                needs_rebuild = True
+            if inferred_arch.get("backbone_res_blocks") and \
+                    inferred_arch["backbone_res_blocks"] != backbone_res_blocks:
+                print(f"[GoAI] 权重 res_blocks={inferred_arch['backbone_res_blocks']}"
+                      f"（默认 {backbone_res_blocks}），已自动调整")
+                backbone_res_blocks = inferred_arch["backbone_res_blocks"]
+                needs_rebuild = True
+            if inferred_arch.get("num_attention_layers") and \
+                    inferred_arch["num_attention_layers"] != num_attention_layers:
+                print(f"[GoAI] 权重 attention_layers={inferred_arch['num_attention_layers']}"
+                      f"（默认 {num_attention_layers}），已自动调整")
+                num_attention_layers = inferred_arch["num_attention_layers"]
+                needs_rebuild = True
+            if inferred_arch.get("policy_channels") and \
+                    inferred_arch["policy_channels"] != policy_channels:
+                policy_channels = inferred_arch["policy_channels"]
+                needs_rebuild = True
+            if inferred_arch.get("value_channels") and \
+                    inferred_arch["value_channels"] != value_channels:
+                value_channels = inferred_arch["value_channels"]
+                needs_rebuild = True
+            if needs_rebuild:
                 self.model = AlphaGoNet(
                     in_channels=12,
                     backbone_channels=backbone_channels,
@@ -151,7 +181,7 @@ class GoAI:
                     attn_window=attn_window,
                     policy_channels=policy_channels,
                     value_channels=value_channels,
-                    action_size=inferred * inferred + 1,
+                    action_size=self.board_size * self.board_size + 1,
                 ).to(self.device)
                 if self.channels_last:
                     self.model = self.model.to(memory_format=torch.channels_last)
@@ -194,6 +224,41 @@ class GoAI:
                 if n >= 5 and n * n + 1 == n1:
                     best = n
         return best
+
+    def _infer_architecture(self, state):
+        """从 state_dict 推断 backbone_channels / res_blocks / attention_layers / heads。"""
+        info = {}
+        # backbone_channels: backbone.conv1.weight shape = [C, 12, 3, 3]
+        for k, v in state.items():
+            if k == "backbone.conv1.weight" and isinstance(v, torch.Tensor):
+                info["backbone_channels"] = v.shape[0]
+                break
+        # res_blocks: backbone.blocks.{i} 存在的最大 i + 1
+        block_ids = set()
+        for k in state:
+            if k.startswith("backbone.blocks.") and ".conv" in k:
+                try:
+                    block_ids.add(int(k.split(".")[2]))
+                except (ValueError, IndexError):
+                    pass
+        if block_ids:
+            info["backbone_res_blocks"] = max(block_ids) + 1
+        # attention_layers: backbone.blocks.{i}.attn.qkv.weight 存在的数量
+        attn_count = sum(1 for k in state if k.endswith("attn.qkv.weight"))
+        if attn_count:
+            info["num_attention_layers"] = attn_count
+        # num_heads: backbone.blocks.{i}.attn.qkv.weight shape = [3*C, C] → heads 由 C 推断
+        # policy_channels: policy.policy_head.0.weight shape = [P, C, 1, 1]
+        for k, v in state.items():
+            if k == "policy.policy_head.0.weight" and isinstance(v, torch.Tensor):
+                info["policy_channels"] = v.shape[0]
+                break
+        # value_channels: value.value_head.0.weight shape = [V, C, 1, 1]
+        for k, v in state.items():
+            if k == "value.value_head.0.weight" and isinstance(v, torch.Tensor):
+                info["value_channels"] = v.shape[0]
+                break
+        return info
 
     # ------------------------------------------------------------------ #
     # 特征构造
