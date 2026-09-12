@@ -389,24 +389,38 @@ class GoAI:
         try:
             self.model = self.model.cpu().eval()
             dummy = torch.zeros(1, 12, self.board_size, self.board_size)
-            torch.onnx.export(
-                self.model, dummy, onnx_path,
-                input_names=["x"], output_names=["policy", "value"],
-                dynamic_axes={"x": {0: "batch"},
-                              "policy": {0: "batch"},
-                              "value": {0: "batch"}},
-                opset_version=18)
-            # int8 动态量化（可选）
             if quantize_int8:
+                # int8 量化要求固定形状（动态 batch 导致 ShapeInferenceError）
+                # 先导出静态 batch=1，量化后再加载
+                quant_path = onnx_path.replace(".onnx", "_static.onnx")
+                torch.onnx.export(
+                    self.model, dummy, quant_path,
+                    input_names=["x"], output_names=["policy", "value"],
+                    opset_version=18)
                 try:
                     from onnxruntime.quantization import quantize_dynamic, QuantType
                     quantize_dynamic(
-                        model_input=onnx_path,
+                        model_input=quant_path,
                         model_output=onnx_path,
                         weight_type=QuantType.QInt8)
                     print(f"[GoAI] 已应用 ONNX int8 动态量化: {onnx_path}")
                 except Exception as e:  # noqa: BLE001
                     print(f"[GoAI] int8 量化失败，使用 FP32 模型: {e}")
+                    quant_path = None
+                # 清理静态模型文件
+                if quant_path and os.path.exists(quant_path):
+                    try:
+                        os.remove(quant_path)
+                    except OSError:
+                        pass
+            else:
+                torch.onnx.export(
+                    self.model, dummy, onnx_path,
+                    input_names=["x"], output_names=["policy", "value"],
+                    dynamic_axes={"x": {0: "batch"},
+                                  "policy": {0: "batch"},
+                                  "value": {0: "batch"}},
+                    opset_version=18)
             so = ort.SessionOptions()
             so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
