@@ -827,29 +827,20 @@ def main():
                         logger.warning("[profile] 不可用: %s", pe)
                         _prof_at = 0
                 if pf is not None:
-                    states_np, moves_np, values_np = pf.next()
-                    # 直接分配 pinned memory 并拷贝，省去 from_numpy 共享内存再 copy 的中间步骤
-                    if _backend == 'cuda':
-                        state = torch.tensor(states_np, dtype=torch.float32, pin_memory=True)
-                        move_t = torch.tensor(moves_np, dtype=torch.int64, pin_memory=True)
-                        value_t = torch.tensor(values_np, dtype=torch.float32, pin_memory=True)
-                        if use_channels_last:
-                            state = state.to(memory_format=torch.channels_last)
-                        state = state.to(device, non_blocking=True)
-                        move_t = move_t.to(device, non_blocking=True)
-                        value_t = value_t.to(device, non_blocking=True)
-                    else:
-                        state = torch.from_numpy(states_np)
-                        move_t = torch.from_numpy(moves_np)
-                        value_t = torch.from_numpy(values_np)
-                        if use_channels_last:
-                            state = state.to(memory_format=torch.channels_last)
-                        state = state.to(device)
-                        move_t = move_t.to(device)
-                        value_t = value_t.to(device)
+                    # P0: 先提交下一个 batch，再取当前 batch（给 worker 更多预计算时间）
                     nxt = i + args.prefetch_depth
                     if nxt < n_batches:
                         pf.submit(perm[nxt * bs:(nxt + 1) * bs])
+                    states_np, moves_np, values_np = pf.next()
+                    # NPU/CUDA 都用 pin_memory + non_blocking 异步传输
+                    state = torch.tensor(states_np, dtype=torch.float32, pin_memory=True)
+                    move_t = torch.tensor(moves_np, dtype=torch.int64, pin_memory=True)
+                    value_t = torch.tensor(values_np, dtype=torch.float32, pin_memory=True)
+                    if use_channels_last:
+                        state = state.to(memory_format=torch.channels_last)
+                    state = state.to(device, non_blocking=True)
+                    move_t = move_t.to(device, non_blocking=True)
+                    value_t = value_t.to(device, non_blocking=True)
                 else:
                     sel = perm[i * bs:(i + 1) * bs]
                     state, move_t, value_t = dataset.sample_batch(sel, device)
@@ -900,7 +891,11 @@ def main():
                 sys.exit(1)
             scheduler.step()   # 每个 step 推进一步（warmup+cosine 调度依赖逐 step）
             step += 1
-            epoch_loss += loss.item()
+            # P1: 每 log_every 步才 sync NPU 取 loss 值，其余步用 None 占位
+            if step % args.log_every == 0:
+                epoch_loss += loss.item()
+            else:
+                epoch_loss += 0.0  # 占位，避免 NPU 同步
 
             if step % args.log_every == 0:
                 lr = optimizer.param_groups[0]['lr']
