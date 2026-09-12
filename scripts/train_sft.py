@@ -844,10 +844,14 @@ def main():
                     if nxt < n_batches:
                         pf.submit(perm[nxt * bs:(nxt + 1) * bs])
                     states_np, moves_np, values_np = pf.next()
-                    # NPU/CUDA 都用 pin_memory + non_blocking 异步传输
-                    state = torch.tensor(states_np, dtype=torch.float32, pin_memory=True)
-                    move_t = torch.tensor(moves_np, dtype=torch.int64, pin_memory=True)
-                    value_t = torch.tensor(values_np, dtype=torch.float32, pin_memory=True)
+                    if _backend == 'cuda':
+                        state = torch.tensor(states_np, dtype=torch.float32, pin_memory=True)
+                        move_t = torch.tensor(moves_np, dtype=torch.int64, pin_memory=True)
+                        value_t = torch.tensor(values_np, dtype=torch.float32, pin_memory=True)
+                    else:
+                        state = torch.from_numpy(states_np.copy())
+                        move_t = torch.from_numpy(moves_np.copy())
+                        value_t = torch.from_numpy(values_np.copy())
                     if use_channels_last:
                         state = state.to(memory_format=torch.channels_last)
                     state = state.to(device, non_blocking=True)
