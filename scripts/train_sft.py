@@ -330,7 +330,7 @@ def _prefetch_worker_init(dataset):
     _worker_dataset = dataset
 
 
-def _prefetch_worker(wi, task_q, res_q, seed):
+def _prefetch_worker(wi, task_q, res_q, seed, dataset):
     """multiprocessing worker：从 task_q 取任务，计算后放 res_q。"""
     rng = np.random.default_rng(seed + wi)
     while True:
@@ -339,7 +339,7 @@ def _prefetch_worker(wi, task_q, res_q, seed):
             return
         step, pos, sub_idx = item
         try:
-            s, m, v = _worker_dataset.sample_batch_numpy(sub_idx, rng=rng)
+            s, m, v = dataset.sample_batch_numpy(sub_idx, rng=rng)
             res_q.put((step, pos, s, m, v, None))
         except Exception as e:  # noqa: BLE001
             res_q.put((step, pos, None, None, None, e))
@@ -370,9 +370,7 @@ class _BatchPrefetcher:
         for wi in range(self.k):
             p = mp.Process(
                 target=_prefetch_worker,
-                args=(wi, self._task_q, self._res_q, seed),
-                initializer=_prefetch_worker_init,
-                initargs=(dataset,),
+                args=(wi, self._task_q, self._res_q, seed, dataset),
                 daemon=True,
             )
             p.start()
