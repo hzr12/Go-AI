@@ -29,7 +29,7 @@ class AlphaGoNet(nn.Module):
                  attn_mode: str = "global",
                  attn_window: int = 7,
                  policy_channels: int = 32,
-                 value_channels: int = 16,
+                 value_channels: int = 64,
                  action_size: int = 361):
         """
         Args:

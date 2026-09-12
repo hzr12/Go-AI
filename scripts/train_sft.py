@@ -465,6 +465,10 @@ def main():
     ap.add_argument('--resume', default='',
                     help='断点续训：指定已保存的 .pth 模型路径，会从该权重 + 同目录 '
                          '.train_state.pt 恢复 optimizer/scheduler/step 计数继续训练')
+    ap.add_argument('--value-loss-weight', type=float, default=2.0,
+                    help='value loss 权重（policy loss 量级 3-6x > value，需加权平衡）')
+    ap.add_argument('--value-lr-mult', type=float, default=2.0,
+                    help='value head 学习率倍数（相对主干 LR，补偿参数量小的梯度不足）')
     ap.add_argument('--compile', action='store_true',
                     help='用 torch.compile 融合算子（GPU 上约 20-40%% 提速，首次迭代较慢）')
     ap.add_argument('--compile-mode', default='default',
@@ -680,7 +684,13 @@ def main():
         model = model.to(memory_format=torch.channels_last)  # type: ignore[call-overload]
         logger.info("[model] 已启用 channels_last (NHWC) 内存格式（A100 卷积加速）")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # 参数组：value head 独立 LR（参数量小，需要更高学习率补偿梯度不足）
+    value_params = list(model.value.parameters())
+    other_params = [p for n, p in model.named_parameters() if 'value' not in n]
+    optimizer = torch.optim.AdamW([
+        {'params': other_params, 'lr': args.lr},
+        {'params': value_params, 'lr': args.lr * args.value_lr_mult},
+    ], weight_decay=args.weight_decay)
     # BF16 后端（A100/NPU）下 use_scaler=False（BF16 不下溢，省去 loss scaling 的额外同步）；
     # V100/FP16 下开启 GradScaler。按设备选择 GradScaler 实现。
     if _backend == 'npu':
@@ -871,7 +881,7 @@ def main():
                     policy_logits, value_pred = model(state)
                     policy_loss = F.cross_entropy(policy_logits.float(), move_t)
                     value_loss = F.mse_loss(value_pred.float().squeeze(), value_t.squeeze())
-                    loss = policy_loss + value_loss
+                    loss = policy_loss + args.value_loss_weight * value_loss
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
