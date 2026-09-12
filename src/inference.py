@@ -103,7 +103,7 @@ class GoAI:
         elif compile and hasattr(torch, "compile"):
             try:
                 self.model = torch.compile(self.model, dynamic=False)
-                with torch.no_grad():
+                with torch.inference_mode():
                     dummy = torch.zeros(1, 12, self.board_size, self.board_size,
                                         device=self.device)
                     if self.channels_last:
@@ -206,7 +206,7 @@ class GoAI:
             max_warmup_batch = 16
             for nb in [b for b in self._NPU_BATCH_BUCKETS if b <= max_warmup_batch]:
                 states = [(board, list(my_hist[0]), list(my_hist[1]), 1)] * nb
-                with torch.no_grad():
+                with torch.inference_mode():
                     self.predict_batch(states)
                 print(f"  [warmup] batch={nb} 编译完成 ({time.time() - t0:.1f}s)",
                       flush=True)
@@ -323,7 +323,7 @@ class GoAI:
             policies, values = self._forward_batch_onnx_numpy(xnp)
             return policies, values
         x = torch.from_numpy(np.stack(planes_list, axis=0))
-        x = x.to(self.device)
+        x = x.to(self.device, non_blocking=True)
         if self.channels_last:
             x = x.to(memory_format=torch.channels_last)
         policies, values = self._forward_batch(x)
@@ -359,7 +359,7 @@ class GoAI:
             bucket = next((b for b in self._NPU_BATCH_BUCKETS if b >= B), None)
             if bucket is not None and bucket > B:
                 x = torch.cat([x, x.new_zeros(bucket - B, *x.shape[1:])], 0)
-        with torch.no_grad():
+        with torch.inference_mode():
             if self.use_amp:
                 if self.is_npu:
                     # 兼容老 torch_npu：新 torch.autocast("npu") API 不可用时
@@ -394,6 +394,25 @@ class GoAI:
             return True
         except Exception as e:  # noqa: BLE001
             print(f"[GoAI] 动态量化失败，保持 fp32: {e}")
+            return False
+
+    def quantize_int4_torchao(self):
+        """GPU weight-only INT4 量化（torchao，需 pip install torchao）。
+
+        对 CUDA 推理有效，模型体积 ~1/8，显存带宽受限场景提速 1.5-3x。
+        须在 torch.compile 之前调用。失败时保持原始精度。
+        """
+        try:
+            from torchao.quantization import quantize_, int4_weight_only
+            quantize_(self.model, int4_weight_only())
+            self.model.eval()
+            print("[GoAI] 已启用 GPU weight-only INT4 量化 (torchao)")
+            return True
+        except ImportError:
+            print("[GoAI] torchao 未安装（pip install torchao），跳过 INT4 量化")
+            return False
+        except Exception as e:  # noqa: BLE001
+            print(f"[GoAI] INT4 量化失败，保持原始精度: {e}")
             return False
 
     def export_onnx(self, onnx_path, ort_intra_threads=None, quantize_int8=False):
@@ -471,7 +490,6 @@ class GoAI:
                     self._ort_dynamic_batch = True
             except Exception:  # noqa: BLE001
                 pass
-            self._forward_batch = self._forward_batch_onnx  # 实例属性遮蔽方法
             print(f"[GoAI] 已切换 ONNX Runtime 推理后端: {onnx_path} "
                   f"(intra_threads={so.intra_op_num_threads}, "
                   f"dynamic_batch={self._ort_dynamic_batch})")
@@ -479,33 +497,6 @@ class GoAI:
         except Exception as e:  # noqa: BLE001
             print(f"[GoAI] ONNX 导出失败，保持 torch 后端: {e}")
             return False
-
-    def _forward_batch_onnx(self, x):
-        """onnxruntime 后端。输入 (B,12,H,W)，返回值形状与 _forward_batch 对齐。
-
-        导出捕获的是模型原始输出（policy 为 logits），此处补 softmax 与
-        torch 后端（_forward_batch 内 softmax）对齐。
-        量化模型为固定 batch=1，自动分批推理减少 ort.run 开销。
-        """
-        xnp = x.detach().cpu().numpy().astype(np.float32)
-        B = xnp.shape[0]
-        if self._ort_dynamic_batch:
-            pol, val = self._ort.run(None, {"x": xnp})
-        else:
-            batch_size = min(8, B)
-            all_pol, all_val = [], []
-            for i in range(0, B, batch_size):
-                chunk = xnp[i:i+batch_size]
-                pol, val = self._ort.run(None, {"x": chunk})
-                all_pol.append(np.asarray(pol, dtype=np.float32))
-                all_val.append(np.asarray(val, dtype=np.float32))
-            pol = np.concatenate(all_pol, axis=0)
-            val = np.concatenate(all_val, axis=0)
-        # numerically stable softmax (avoid torch dependency in ONNX path)
-        pol -= pol.max(axis=-1, keepdims=True)
-        np.exp(pol, out=pol)
-        pol /= pol.sum(axis=-1, keepdims=True)
-        return torch.from_numpy(pol), torch.from_numpy(val.reshape(-1, 1))
 
     def choose_move(self, board, my_hist, op_hist, to_play, legal_mask, temperature=1.0, topk=10):
         """根据策略分布与合法着法掩码，采样一个着法。

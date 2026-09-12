@@ -18,7 +18,10 @@
 """
 
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 from scipy.ndimage import label as _scipy_label
+
+_label_pool = ThreadPoolExecutor(max_workers=2)
 
 # scipy.ndimage.label 的 4 邻域 3D 结构元素（模块级常量，避免每次调用重建）
 _STRUCT3 = np.zeros((3, 3, 3), dtype=bool)
@@ -549,8 +552,6 @@ class GoBoard:
         neigh_empty[:, :, 1:]  += empty[:, :, :-1]
 
         # 并行标注：scipy.ndimage.label 释放 GIL，两个颜色的标注可真正并行
-        import threading
-
         def _label_and_mark(mask, lib_plane, to_play_val):
             if not mask.any():
                 return
@@ -562,14 +563,12 @@ class GoBoard:
                                      minlength=num + 1).astype(np.int64)
             lib_plane[(lib_counts[labelled] == 1) & mask] = 1.0
 
-        t_my = threading.Thread(target=_label_and_mark,
-                                args=(boards == to_play, my_lib1, to_play))
-        t_op = threading.Thread(target=_label_and_mark,
-                                args=(boards == -to_play, op_lib1, -to_play))
-        t_my.start()
-        t_op.start()
-        t_my.join()
-        t_op.join()
+        future_my = _label_pool.submit(_label_and_mark,
+                                       boards == to_play, my_lib1, to_play)
+        future_op = _label_pool.submit(_label_and_mark,
+                                       boards == -to_play, op_lib1, -to_play)
+        future_my.result()
+        future_op.result()
 
         planes[:, 10] = my_lib1
         planes[:, 11] = op_lib1

@@ -5,6 +5,8 @@ torchrun --nproc_per_node=2 scripts/train_sft.py \
   --batch-size 700 --epochs 8 --lr 0.002 --weight-decay 0.0001 \
   --attention-mode mix --num-attention-layers 4 --num-heads 4 \
   --attn-mode window --attn-window 7 \
-  --use-amp \
+  --attention-dropout 0.1 --label-smoothing 0.1 \
+  --gradient-accumulation-steps 1 \
+  --use-amp --use-ema \
   --log-every 50 --eval-every 500 --save-every 500 \
   --out models/sft_19x19_v5.pth
