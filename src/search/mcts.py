@@ -733,9 +733,32 @@ class MCTS:
                     batch.append(leaf_q.get_nowait())
                 except _queue.Empty:
                     break
+            # 批量叶子前向：预先计算所有 leaf 的 feature + predict，避免逐条 batch=1
+            if self.expand_topk:
+                leaf_batch = []
+                for pth in batch:
+                    leaf = pth[-1]
+                    if leaf.prefetch is None and not leaf.expanded:
+                        leaf_batch.append((pth, leaf))
+                if leaf_batch:
+                    # 批量计算 feature planes
+                    plane_list = []
+                    for pth, leaf in leaf_batch:
+                        replay_board = self._replay_path(pth)
+                        leaf.board = replay_board
+                        planes = self._planes1(replay_board, leaf.my_hist,
+                                               leaf.op_hist, leaf.to_play)
+                        plane_list.append((None, list(leaf.my_hist),
+                                           list(leaf.op_hist), leaf.to_play, planes))
+                    # 一次 predict_batch 处理所有 leaf
+                    all_pols, all_vals = self.ai.predict_batch(plane_list)
+                    for i, (pth, leaf) in enumerate(leaf_batch):
+                        leaf.prefetch = (np.asarray(all_pols[i]).reshape(-1),
+                                         float(np.asarray(all_vals[i]).reshape(-1)[0]))
             for pth in batch:
                 leaf = pth[-1]
-                leaf.board = self._replay_path(pth)
+                if leaf.board is None:
+                    leaf.board = self._replay_path(pth)
                 self._expand(leaf)
                 leaf.board = None  # 展开完成即释放盘面
                 self._backup(pth, v_leaf=-leaf.value_sum)  # leaf 我方视角

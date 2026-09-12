@@ -20,6 +20,10 @@
 import numpy as np
 from scipy.ndimage import label as _scipy_label
 
+# scipy.ndimage.label 的 4 邻域 3D 结构元素（模块级常量，避免每次调用重建）
+_STRUCT3 = np.zeros((3, 3, 3), dtype=bool)
+_STRUCT3[1] = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
+
 
 # 对称变换：8 种（4 旋转 × 2 翻转）。用于数据增强时的坐标重映射。
 # 每个变换是一个函数 (r, c) -> (r, c)，作用在 (board_size, board_size) 的平面上。
@@ -503,16 +507,13 @@ class GoBoard:
         neigh_empty[:, :, :-1] += empty[:, :, 1:]
         neigh_empty[:, :, 1:]  += empty[:, :, :-1]
 
-        struct3 = np.zeros((3, 3, 3), dtype=bool)
-        struct3[1] = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
-
         # 并行标注：scipy.ndimage.label 释放 GIL，两个颜色的标注可真正并行
         import threading
 
         def _label_and_mark(mask, lib_plane, to_play_val):
             if not mask.any():
                 return
-            labelled, num = _scipy_label(mask, structure=struct3)
+            labelled, num = _scipy_label(mask, structure=_STRUCT3)
             if num == 0:
                 return
             w = np.where(mask, neigh_empty, 0).ravel()
