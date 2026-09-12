@@ -357,15 +357,15 @@ class GoAI:
     # CPU 推理加速：int8 动态量化 / ONNX Runtime 后端
     # ------------------------------------------------------------------ #
     def quantize_dynamic(self):
-        """CPU int8 动态量化（Linear 层，x86 VNNI 收益明显）。
+        """CPU int8 动态量化（Linear + Conv2d 层，x86 VNNI 收益明显）。
 
         须在 torch.compile 之前调用（量化编译后模型无意义）。失败时保持 fp32。
         """
         try:
             self.model = torch.ao.quantization.quantize_dynamic(
-                self.model, {torch.nn.Linear}, dtype=torch.qint8)
+                self.model, {torch.nn.Linear, torch.nn.Conv2d}, dtype=torch.qint8)
             self.model.eval()
-            print("[GoAI] 已启用 CPU int8 动态量化 (Linear)")
+            print("[GoAI] 已启用 CPU int8 动态量化 (Linear + Conv2d)")
             return True
         except Exception as e:  # noqa: BLE001
             print(f"[GoAI] 动态量化失败，保持 fp32: {e}")
@@ -377,8 +377,8 @@ class GoAI:
         需 `pip install onnx onnxruntime`。失败时保持 torch 后端并返回 False。
         仅支持 CPU 推理（use_amp 自动失效）。
 
-        ort_intra_threads: 每个 ort.run 的内部线程数。None 时取满核；MCTS 多线程
-            并发调用 predict 时建议传入 max(1, ncpu // num_threads) 以避免超线程争抢。
+        ort_intra_threads: 每个 ort.run 的内部线程数。None 时取满物理核；
+            MCTS 多线程并发调用时建议传入 max(1, ncpu // num_threads) 避免超线程争抢。
         """
         try:
             import onnxruntime as ort
@@ -395,9 +395,6 @@ class GoAI:
                               "policy": {0: "batch"},
                               "value": {0: "batch"}},
                 opset_version=18)
-            # 图优化 + 线程设置：ORT_ENABLE_ALL 打开常量折叠/算子融合/布局优化；
-            # intra_op 用满物理核（单次大 batch 吞吐最高），inter_op=1（本引擎
-            # 已自行多线程调度，避免 ort 内部再开并行导致超线程争抢）。
             so = ort.SessionOptions()
             so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
@@ -405,10 +402,13 @@ class GoAI:
             so.intra_op_num_threads = ort_intra_threads or _ncpu
             so.inter_op_num_threads = 1
             so.enable_mem_pattern = True
+            # 启用 CPU 内存优化：减少峰值内存占用
+            so.enable_cpu_mem_arena = True
             self._ort = ort.InferenceSession(
                 onnx_path, sess_options=so, providers=["CPUExecutionProvider"])
             self._forward_batch = self._forward_batch_onnx  # 实例属性遮蔽方法
-            print(f"[GoAI] 已切换 ONNX Runtime 推理后端: {onnx_path}")
+            print(f"[GoAI] 已切换 ONNX Runtime 推理后端: {onnx_path} "
+                  f"(intra_threads={so.intra_op_num_threads})")
             return True
         except Exception as e:  # noqa: BLE001
             print(f"[GoAI] ONNX 导出失败，保持 torch 后端: {e}")

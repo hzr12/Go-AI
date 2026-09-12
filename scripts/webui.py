@@ -976,7 +976,7 @@ document.getElementById('sims').disabled =
 
 def main():
     ap = argparse.ArgumentParser(description="Go-AI WebUI（19 路人机对弈 + MCTS 可视化）")
-    ap.add_argument("--model", default="models/sft_19x19_v4.pth")
+    ap.add_argument("--model", default="models/sft_19x19_v6.pth")
     ap.add_argument("--board-size", type=int, default=19)
     ap.add_argument("--device", default="auto")
     ap.add_argument("--port", type=int, default=7860)
@@ -1049,13 +1049,15 @@ def main():
               channels_last=(args.device.split(":")[0] == "cuda"))
     if args.quantize:
         ai.quantize_dynamic()
-    # MCTS worker 线程数收敛到物理核数：超过核数只会空耗/争抢，无收益。
+    # MCTS worker 线程数：必须 >1 才能启用 spec_prefetch 流水线
     _ncpu = max(1, (os.cpu_count() or 1))
     _nt = min(args.num_threads, _ncpu) if args.num_threads > 0 else _ncpu
+    if _nt <= 1 and not args.onnx:
+        print(f"[webui] 警告: --num-threads={_nt} 会禁用 spec_prefetch，推理显著变慢。"
+              f"建议 --num-threads {_ncpu}")
     if args.onnx:
-        # 单次 ort.run 内部线程数取「核数的一半、至少 2」：既保证大 batch 单调用
-        # 并行度，又给多个并发 predict 留出余量（避免超线程争抢）。
-        _ort_intra = max(2, _ncpu // 2)
+        # ONNX intra_op 用满物理核（单次大 batch 吞吐最高）
+        _ort_intra = max(2, _ncpu)
         ai.export_onnx(args.onnx, ort_intra_threads=_ort_intra)
     session = Session(ai, board_size=ai.board_size, num_threads=_nt,
                       default_mode=args.mode, expand_topk=args.expand_topk,
