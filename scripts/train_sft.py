@@ -525,7 +525,8 @@ def main():
 
     # ---- 多后端自适应路径（CUDA / NPU / CPU）----
     # 各后端能力差异很大，逐后端决定：
-    #   - amp_dtype:       A100/A800/H100(sm_80+) 与 Ascend 910B -> bfloat16（原生支持）
+    #   - amp_dtype:       A100/A800/H100(sm_80+) -> bfloat16（原生支持）
+    #                     Ascend 910B/910A -> float16（NPU autocast 仅支持 FP16）
     #                     V100(sm_70, Volta) -> float16（无 bf16）
     #   - use_scaler:      BF16 下关闭 GradScaler（不下溢）；FP16 下开启
     #   - use_channels_last: A100 卷积走 NHWC 更快；NPU/CPU 收益有限默认关
@@ -586,10 +587,10 @@ def main():
         # 强制手写 math 注意力；channels_last 对 NPU 卷积无明确收益，关闭；
         # torch.compile(inductor) 在 NPU 不可用，禁用。
         if '910B' in gpu_name or '910Pro' in gpu_name or '910-2' in gpu_name:
-            amp_dtype = torch.bfloat16
-            use_scaler = False  # BF16 不下溢
-            logger.info("[device] %s (NPU/CANN) | 910B 路径: BF16 + 手写 math 注意力 + "
-                        "禁用 torch.compile(inductor)", gpu_name)
+            amp_dtype = torch.float16  # NPU autocast 仅支持 FP16
+            use_scaler = True  # FP16 需要 GradScaler 防下溢
+            logger.info("[device] %s (NPU/CANN) | 910B 路径: FP16 + GradScaler + 手写 math "
+                        "注意力 + 禁用 torch.compile(inductor)", gpu_name)
         else:
             amp_dtype = torch.float16
             use_scaler = use_amp  # 910A 无 BF16，FP16 必须开 GradScaler
