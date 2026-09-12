@@ -428,7 +428,7 @@ def main():
     ap.add_argument('--device', default='auto')
     ap.add_argument('--use-amp', action='store_true')
     ap.add_argument('--batch-size', type=int, default=512)
-    ap.add_argument('--epochs', type=int, default=5)
+    ap.add_argument('--epochs', type=int, default=4)
     ap.add_argument('--lr', type=float, default=2e-3)
     ap.add_argument('--weight-decay', type=float, default=1e-4)
     ap.add_argument('--board-size', type=int, default=19)
@@ -968,7 +968,7 @@ def main():
                 if eval_acc > best_eval_acc:
                     best_eval_acc = eval_acc
                     if is_main:
-                        save_model(model, args.out + '.best')
+                        save_model(model, args.out)
 
 if __name__ == "__main__":
     main()
