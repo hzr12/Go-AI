@@ -11,6 +11,7 @@
 
 import argparse
 import logging
+import multiprocessing as mp
 import os
 import queue
 import random
@@ -320,18 +321,36 @@ def load_from_path(path, board_size, max_games_per_tgz=0):
     return load_dataset(path)
 
 
-class _BatchPrefetcher:
-    """后台多线程并行构造训练 batch，与 GPU 前向/反向重叠。
+def _prefetch_worker_init(dataset):
+    """multiprocessing worker 初始化：在子进程中保存 dataset 引用。"""
+    global _worker_dataset
+    _worker_dataset = dataset
 
-    把每个 batch 的样本下标切成 num_workers 个子块，由 num_workers 个后台线程
-    并行调用 dataset.sample_batch_numpy()（scipy.ndimage 释放 GIL，可真正并行），
-    主线程按序拼回整批。这样「CPU 造特征」与「GPU 计算」重叠，消除训练循环里
-    GPU 等 CPU 造数据的空转；同时把 feature_planes_batched 的逐样本循环按线程
-    拆开并行。
+
+def _prefetch_worker(wi, task_q, res_q, seed):
+    """multiprocessing worker：从 task_q 取任务，计算后放 res_q。"""
+    rng = np.random.default_rng(seed + wi)
+    while True:
+        item = task_q.get()
+        if item is None:
+            return
+        step, pos, sub_idx = item
+        try:
+            s, m, v = _worker_dataset.sample_batch_numpy(sub_idx, rng=rng)
+            res_q.put((step, pos, s, m, v, None))
+        except Exception as e:  # noqa: BLE001
+            res_q.put((step, pos, None, None, None, e))
+
+
+class _BatchPrefetcher:
+    """后台多进程并行构造训练 batch，与 NPU 前向/反向重叠。
+
+    把每个 batch 的样本下标切成 num_workers 个子块，由 num_workers 个后台进程
+    并行调用 dataset.sample_batch_numpy()（绕过 GIL，numpy 操作真正并行），
+    主进程按序拼回整批。
 
     两步流水：submit() 投递一个 batch 的下标，next() 取回构造好的 numpy 数组。
-    两个有界队列提供背压，避免无限预取吃内存。各线程用独立 np.random.Generator，
-    避免争抢全局随机源。
+    两个有界队列提供背压，避免无限预取吃内存。各进程用独立 np.random.Generator。
     """
 
     def __init__(self, dataset, num_workers=4, prefetch=2, seed=1234):
@@ -339,30 +358,20 @@ class _BatchPrefetcher:
         self.k = max(1, int(num_workers))
         self.prefetch = max(1, int(prefetch))
         cap = self.k * self.prefetch
-        self._task_q: queue.Queue = queue.Queue(maxsize=cap)
-        self._res_q: queue.Queue = queue.Queue(maxsize=cap)
+        self._task_q: mp.Queue = mp.Queue(maxsize=cap)
+        self._res_q: mp.Queue = mp.Queue(maxsize=cap)
         self._step = 0     # 下一个待投递 batch 的编号
         self._expect = 0   # 下一个待取回 batch 的编号
-        self._rngs = [np.random.default_rng(seed + i) for i in range(self.k)]
-        self._threads = []
         self._pending: dict = {}  # step -> [(pos, s, m, v, err)] 已收到但还没收集完的
+        self._processes = []
         for wi in range(self.k):
-            t = threading.Thread(target=self._worker, args=(wi,), daemon=True)
-            t.start()
-            self._threads.append(t)
-
-    def _worker(self, wi):
-        rng = self._rngs[wi]
-        while True:
-            item = self._task_q.get()
-            if item is None:
-                return
-            step, pos, sub_idx = item
-            try:
-                s, m, v = self.dataset.sample_batch_numpy(sub_idx, rng=rng)
-                self._res_q.put((step, pos, s, m, v, None))
-            except Exception as e:  # noqa: BLE001
-                self._res_q.put((step, pos, None, None, None, e))
+            p = mp.Process(
+                target=_prefetch_worker,
+                args=(wi, self._task_q, self._res_q, seed),
+                daemon=True,
+            )
+            p.start()
+            self._processes.append(p)
 
     def submit(self, idxs):
         """投递一个 batch 的下标（队列满时阻塞，提供背压）。"""

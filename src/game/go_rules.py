@@ -20,6 +20,7 @@
 import numpy as np
 from scipy.ndimage import label as _scipy_label
 
+
 # 对称变换：8 种（4 旋转 × 2 翻转）。用于数据增强时的坐标重映射。
 # 每个变换是一个函数 (r, c) -> (r, c)，作用在 (board_size, board_size) 的平面上。
 _ROT0 = lambda r, c, n: (r, c)
@@ -444,8 +445,8 @@ class GoBoard:
         返回: (B, 12, n, n) float32
 
         性能: 用 scipy.ndimage.label 一次性标注连通块并向量化计算气数，
-            避免单图版的双层 Python for 循环（每个非空点一次 flood fill），
-            在 B 较大时（训练 batch）提速数倍。
+            scipy 释放 GIL，两个颜色的标注线程可真正并行。
+            multiprocessing prefetcher 提供跨 worker 的真正 CPU 并行。
         """
         boards = np.asarray(boards)
         B, n, _ = boards.shape
@@ -502,11 +503,6 @@ class GoBoard:
         neigh_empty[:, :, :-1] += empty[:, :, 1:]
         neigh_empty[:, :, 1:]  += empty[:, :, :-1]
 
-        # 关键提速：scipy.ndimage.label 支持 n-D。用 (3,3,3) 结构（仅中间 z 面有
-        # 4 邻域十字，跨 batch 不连通）对整批 (B,H,W) 做 **一次** 标注，各样本
-        # 仍互不连通。旧实现在 for b in range(B) 里逐样本调用 2 次 label
-        #（B=1800 → 3600 次 Python 级调用 + 数万次小数组分配），是特征构造的
-        # 主要 CPU 热点。
         struct3 = np.zeros((3, 3, 3), dtype=bool)
         struct3[1] = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
 
