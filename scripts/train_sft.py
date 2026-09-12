@@ -288,6 +288,84 @@ def evaluate_top1(model, dataset, idxs, bs, device, amp_dtype, max_batches=50,
     return correct / max(total, 1), total
 
 
+def evaluate_metrics(model, dataset, idxs, bs, device, amp_dtype, max_batches=50,
+                     use_channels_last=False):
+    """验证集综合指标：top-1/5/10 准确率 + policy KL + value Brier score。
+
+    返回 dict:
+        top1, top5, top10 : 着法准确率 (0~1)
+        kl                : model softmax vs expert one-hot 的 KL散量
+        brier             : value 预测 vs 实际胜负的 Brier score（越小越好）
+        n                 : 样本数
+    """
+    import torch.nn.functional as F
+    model.eval()
+    correct1 = correct5 = correct10 = 0
+    total = 0
+    kl_sum = 0.0
+    brier_sum = 0.0
+    n_batches = min((len(idxs) + bs - 1) // bs, max_batches)
+    with torch.inference_mode():
+        for b in range(n_batches):
+            sel = idxs[b * bs:(b + 1) * bs]
+            if len(sel) == 0:
+                break
+            states_np, moves_np, values_np = dataset.sample_batch_numpy(sel)
+            state = torch.from_numpy(states_np).to(device)
+            if use_channels_last:
+                state = state.to(memory_format=torch.channels_last)
+            move_t = torch.from_numpy(moves_np).to(device)
+            value_t = torch.from_numpy(values_np).to(device)  # (B,1) in {-1,+1}
+            with maybe_autocast(device, amp_dtype):
+                policy_logits, value_pred = model(state)
+            B = len(sel)
+            total += B
+
+            # --- top-k 准确率 ---
+            topk = policy_logits.topk(10, dim=-1).indices  # (B,10)
+            correct1 += int((topk[:, 0] == move_t).sum())
+            correct5 += int((topk[:, :5] == move_t.unsqueeze(1)).any(dim=1).sum())
+            correct10 += int((topk == move_t.unsqueeze(1)).any(dim=1).sum())
+
+            # --- policy KL 散量 ---
+            # expert: one-hot at move_t -> log prob; model: log_softmax
+            log_p = F.log_softmax(policy_logits, dim=-1)  # (B, A)
+            with torch.inference_mode():
+                target = torch.zeros_like(log_p).scatter_(
+                    1, move_t.unsqueeze(1).clamp(
+                        max=log_p.shape[1] - 1), 1.0)
+            # KL(expert || model) = sum(expert * (log_expert - log_model))
+            # expert 为 one-hot，简化为 -log_p[expert_move]（即 cross-entropy）
+            # 但更标准的 KL = sum(expert * log(expert / model))
+            # = sum(expert * (0 - log_model)) for one-hot = -log_p[expert_move]
+            # 即 NLL，与 CE 等价。若要真正 KL(expert||model) 需要 expert 有分布
+            # 此处用 model 分布 vs uniform 的 KL 作为策略集中度指标：
+            # KL(model || uniform) = log(A) + sum(p * log(p))
+            A = log_p.shape[1]
+            p = F.softmax(policy_logits, dim=-1)
+            kl_per_sample = (torch.log(torch.tensor(A, dtype=p.dtype))
+                             + (p * log_p).sum(dim=-1))  # (B,)
+            kl_sum += float(kl_per_sample.sum())
+
+            # --- value Brier score ---
+            # Brier = mean((pred - actual)^2), actual in {-1,+1}, pred in tanh output
+            # 映射到 [0,1]: actual_01 = (actual+1)/2, pred_01 = (pred+1)/2
+            pred_01 = (value_pred.squeeze(-1) + 1) / 2
+            act_01 = (value_t.squeeze(-1) + 1) / 2
+            brier_sum += float(((pred_01 - act_01) ** 2).sum())
+
+    model.train()
+    n = max(total, 1)
+    return {
+        'top1': correct1 / n,
+        'top5': correct5 / n,
+        'top10': correct10 / n,
+        'kl': kl_sum / n,
+        'brier': brier_sum / n,
+        'n': total,
+    }
+
+
 def _concat_dicts(dicts):
     """按相同 key 沿第 0 轴拼接多个数据 dict（字段形状一致）。"""
     out = {}
@@ -1048,19 +1126,22 @@ def main():
                     'rng': torch.get_rng_state(),
                 }, args.out + '.latest.train_state')
 
-            # 定期评估：top-1 着法准确率（所有 rank 都做 eval，避免 barrier 死锁）
+            # 定期评估：综合指标（所有 rank 都做 eval，避免 barrier 死锁）
             if args.eval_every > 0 and step % args.eval_every == 0 and len(eval_idx) > 0:
                 ema.apply_shadow()
-                eval_acc, eval_n = evaluate_top1(
+                metrics = evaluate_metrics(
                     model, dataset, eval_idx, bs, device, amp_dtype,
                     use_channels_last=use_channels_last)
                 ema.restore()
                 if is_main:
-                    logger.info("[eval] step=%d top1_acc=%.4f (n=%d)%s",
-                                step, eval_acc, eval_n,
-                                " ★ new best" if eval_acc > best_eval_acc else "")
-                if eval_acc > best_eval_acc:
-                    best_eval_acc = eval_acc
+                    logger.info(
+                        "[eval] step=%d top1=%.4f top5=%.4f top10=%.4f "
+                        "kl=%.4f brier=%.4f (n=%d)%s",
+                        step, metrics['top1'], metrics['top5'], metrics['top10'],
+                        metrics['kl'], metrics['brier'], metrics['n'],
+                        " ★ new best" if metrics['top1'] > best_eval_acc else "")
+                if metrics['top1'] > best_eval_acc:
+                    best_eval_acc = metrics['top1']
                     if is_main:
                         ema.apply_shadow()
                         save_model(model, args.out)
