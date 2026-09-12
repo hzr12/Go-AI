@@ -321,6 +321,9 @@ def load_from_path(path, board_size, max_games_per_tgz=0):
     return load_dataset(path)
 
 
+_worker_dataset = None  # multiprocessing worker 进程中由 initializer 设置
+
+
 def _prefetch_worker_init(dataset):
     """multiprocessing worker 初始化：在子进程中保存 dataset 引用。"""
     global _worker_dataset
@@ -368,6 +371,8 @@ class _BatchPrefetcher:
             p = mp.Process(
                 target=_prefetch_worker,
                 args=(wi, self._task_q, self._res_q, seed),
+                initializer=_prefetch_worker_init,
+                initargs=(dataset,),
                 daemon=True,
             )
             p.start()
