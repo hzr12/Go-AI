@@ -939,6 +939,19 @@ def main():
                     except Exception as e:
                         logger.warning("[profile] 打印内核耗时表失败: %s", e)
 
+            # 定期保存快照（仅主进程写盘）
+            if is_main and args.save_every > 0 and step % args.save_every == 0:
+                save_model(model, args.out + '.latest')
+                torch.save({
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                    'scaler': scaler.state_dict(),
+                    'step': step,
+                    'epoch': epoch,
+                    'best_eval_acc': best_eval_acc,
+                    'rng': torch.get_rng_state(),
+                }, args.out + '.latest.train_state')
+
             # 定期评估：top-1 着法准确率（所有 rank 都做 eval，避免 barrier 死锁）
             if args.eval_every > 0 and step % args.eval_every == 0 and len(eval_idx) > 0:
                 eval_acc, eval_n = evaluate_top1(
