@@ -38,7 +38,7 @@ class MCTSNode:
     prior: float = 0.0              # 父节点给出的先验 P(a)
     visit: int = 0
     value_sum: float = 0.0          # 累加（对手视角）价值，取负即我方
-    virtual_loss: int = 0           # 并行模拟占位的虚拟损失
+    virtual_loss: float = 0.0         # 并行模拟占位的虚拟损失
     expanded: bool = False
     proved: int = 0                 # MCTS-Solver：+1=to_play 必胜, -1=to_play 必败, 0=未知
     prefetch: Optional[tuple] = None  # worker 推测性预评估缓存 (policy_np, value_float)
@@ -63,7 +63,7 @@ class MCTS:
     def __init__(self, ai, board_size, c_puct=1.4, virtual_loss=4.0,
                  num_threads=4, temperature=1.0, temperature_decay=0.0,
                  use_rollout=False, rollout_lambda=0.25, rollout_steps=None,
-                 rollout_threads=None, expand_topk=0, expand_chunk=0,
+                 rollout_threads=None, expand_topk=32, expand_chunk=0,
                  solver_thresh=0.9, spec_prefetch=True,
                  leaf_ab_depth=0, leaf_ab_width=4, leaf_ab_weight=0.5,
                  leaf_ab_uncertain=0.85, priors_leaf=False,
@@ -765,7 +765,7 @@ class MCTS:
                             return
                     else:
                         for node in path:
-                            node.virtual_loss += int(self.virtual_loss)
+                            node.virtual_loss += self.virtual_loss
                         leaf.expanded = True  # 逻辑占位，真正展开在主线程
                         produced += 1
                         pending += 1

@@ -3,6 +3,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class RMSNorm(nn.Module):
+    """RMSNorm（兼容 PyTorch 2.1，不依赖 nn.RMSNorm）。"""
+
+    def __init__(self, channels, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(channels))
+        self.eps = eps
+
+    def forward(self, x):
+        rms = x.float().pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+        return (x.float() * rms).type_as(x) * self.weight
+
+
 class ResBlock(nn.Module):
     """纯卷积残差块（保持原有结构，用于浅层局部特征提取）。"""
 
@@ -182,7 +195,7 @@ class MultiHeadSelfAttention(nn.Module):
                  mode="global", window_size=7):
         super(MultiHeadSelfAttention, self).__init__()
         assert channels % num_heads == 0, "channels 必须能被 num_heads 整除"
-        if mode in ('window', 'sparse'):
+        if mode in ('window', 'sparse', 'window_global'):
             assert window_size % 2 == 1, f"window_size 必须为奇数，收到 {window_size}"
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
@@ -190,11 +203,11 @@ class MultiHeadSelfAttention(nn.Module):
         self.mode = mode
         self.window_size = window_size
 
-        self.ln1 = nn.LayerNorm(channels)
+        self.ln1 = RMSNorm(channels)
         self.qkv = nn.Linear(channels, channels * 3, bias=False)
         self.attn_drop = dropout
 
-        self.ln2 = nn.LayerNorm(channels)
+        self.ln2 = RMSNorm(channels)
         self.ffn = nn.Sequential(
             nn.Linear(channels, channels * 2),
             nn.GELU(),
@@ -350,6 +363,105 @@ class MultiHeadSelfAttention(nn.Module):
         # ---- 6) 回到 (B, N, Hh*d)：head 主序展平 ----
         return oc.view(B, N, Hh, d).reshape(B, N, Hh * d)
 
+    def _window_global_attn(self, q, k, v, H, W):
+        """窗口注意力 + 全局 token，手写 math 加速版。
+
+        融合 window（高效块状分区）+ sparse（全局 token 长程通路），
+        手写 math 避免 cat/expand 开销，为非方阵 shape (ws², ws²+ng) 量身定制。
+
+        每个 query 只与两类 key 交互：
+          1) 同块内 ws² 个局部 key（块状窗口，走 bmm）；
+          2) 棋盘均匀采样的 ng 个全局 key（einsum 广播，零 expand）。
+
+        两路 logits 联合 softmax 后分别聚合再相加。
+
+        q,k,v: (B, Hh, N, head_dim)，N = H*W。返回 (B, N, Hh*d)。
+        """
+        ws = self.window_size
+        B, Hh, N, d = q.shape
+        sc = self.scale  # d ** -0.5
+
+        # ---- 1) grid 参数 ----
+        H2 = ((H + ws - 1) // ws) * ws
+        W2 = ((W + ws - 1) // ws) * ws
+        ph, pw = H2 - H, W2 - W
+        nwH, nwW = H2 // ws, W2 // ws
+        nW = nwH * nwW
+
+        # ---- 2) window partition ----
+        def part(t):  # (B,Hh,N,d) -> (B*nW, Hh, ws², d)
+            x = t.view(B, Hh, H, W, d)
+            if ph or pw:
+                x = F.pad(x, (0, 0, 0, pw, 0, ph))
+            x = x.view(B, Hh, nwH, ws, nwW, ws, d)
+            return x.permute(0, 2, 4, 1, 3, 5, 6).reshape(B * nW, Hh, ws * ws, d)
+
+        q_p = part(q)  # (BnW, Hh, ws², d)
+        k_p = part(k)
+        v_p = part(v)
+
+        # ---- 3) 全局 token 采样（均匀网格，ng ≈ (H/ws)×(W/ws)）----
+        stride = ws
+        gh = (H + stride - 1) // stride
+        gw = (W + stride - 1) // stride
+        ng = gh * gw
+        row_c = (torch.arange(gh, device=q.device) * stride + stride // 2).clamp(max=H - 1)
+        col_c = (torch.arange(gw, device=q.device) * stride + stride // 2).clamp(max=W - 1)
+        ri, ci = torch.meshgrid(row_c, col_c, indexing='ij')
+        k4 = k.view(B, Hh, H, W, d)
+        v4 = v.view(B, Hh, H, W, d)
+        kg = k4[:, :, ri, ci].reshape(B, Hh, ng, d)  # (B, Hh, ng, d)
+        vg = v4[:, :, ri, ci].reshape(B, Hh, ng, d)
+
+        # ---- 4) 手写 math：分两路计算 logits，联合 softmax ----
+        BnW = B * nW
+        ws2 = ws * ws
+
+        # 路 1：局部窗口 bmm — (BnW·Hh, ws², d) × (BnW·Hh, d, ws²)
+        local_logits = torch.bmm(
+            q_p.reshape(BnW * Hh, ws2, d),
+            k_p.reshape(BnW * Hh, ws2, d).transpose(1, 2)
+        ).view(BnW, Hh, ws2, ws2) * sc  # (BnW, Hh, ws², ws²)
+
+        # 路 2：全局 einsum 广播 — 零 expand，kg 广播到 nW 维
+        q5 = q_p.view(B, nW, Hh, ws2, d).permute(0, 2, 1, 3, 4)  # (B, Hh, nW, ws², d)
+        kg5 = kg.unsqueeze(2)  # (B, Hh, 1, ng, d) — 广播到 nW
+        global_logits = torch.einsum('bhnqd,bhngd->bhnqg', q5 * sc, kg5)
+        # (B, Hh, nW, ws², ng) → (BnW, Hh, ws², ng)
+        global_logits = global_logits.permute(0, 2, 1, 3, 4).reshape(BnW, Hh, ws2, ng)
+
+        # 联合 softmax
+        all_logits = torch.cat([local_logits, global_logits], dim=-1)  # (BnW, Hh, ws², ws²+ng)
+        attn = torch.softmax(all_logits, dim=-1)
+        if self.attn_drop > 0.0:
+            attn = torch.nn.functional.dropout(attn, p=self.attn_drop)
+
+        # ---- 5) 聚合：分两路后相加 ----
+        local_attn = attn[:, :, :, :ws2]     # (BnW, Hh, ws², ws²)
+        global_attn = attn[:, :, :, ws2:]    # (BnW, Hh, ws², ng)
+
+        # 路 1：局部 bmm
+        local_out = torch.bmm(
+            local_attn.reshape(BnW * Hh, ws2, ws2),
+            v_p.reshape(BnW * Hh, ws2, d)
+        ).view(BnW, Hh, ws2, d)
+
+        # 路 2：全局 einsum 广播
+        vg5 = vg.unsqueeze(2)  # (B, Hh, 1, ng, d)
+        ga5 = global_attn.reshape(B, nW, Hh, ws2, ng)  # (B, nW, Hh, ws², ng)
+        ga5 = ga5.permute(0, 2, 1, 3, 4)  # (B, Hh, nW, ws², ng)
+        global_out = torch.einsum('bhnqg,bhngd->bhnqd', ga5, vg5)
+        global_out = global_out.permute(0, 2, 1, 3, 4).reshape(BnW, Hh, ws2, d)
+
+        out = local_out + global_out  # (BnW, Hh, ws², d)
+
+        # ---- 6) unpartition ----
+        x = out.view(B, nwH, nwW, Hh, ws, ws, d)
+        x = x.permute(0, 3, 1, 4, 2, 5, 6).reshape(B, Hh, H2, W2, d)
+        if ph or pw:
+            x = x[:, :, :H, :W, :]
+        return x.permute(0, 2, 3, 1, 4).reshape(B, N, Hh * d)
+
     def _axial_attn(self, q, k, v, H, W):
         """轴向注意力：先按行、再按列做 1D 自注意力。
 
@@ -387,15 +499,14 @@ class MultiHeadSelfAttention(nn.Module):
         residual = seq
         h = self.ln1(seq)
         qkv = self.qkv(h)  # (B, N, 3C)
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = self._to_heads(q, B, N)
-        k = self._to_heads(k, B, N)
-        v = self._to_heads(v, B, N)
+        q, k, v = qkv.view(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4).unbind(0)
         # 注意：不对 q 预乘 scale。_sdpa 的 math 路径内部处理缩放，
         # SDPA/flash 路径自带 1/sqrt(d)，预乘会导致双重缩放。
 
         if self.mode == "window":
             out = _run_with_optional_disable(self._window_attn, q, k, v, H, W)
+        elif self.mode == "window_global":
+            out = _run_with_optional_disable(self._window_global_attn, q, k, v, H, W)
         elif self.mode == "axial":
             out = self._axial_attn(q, k, v, H, W)
         elif self.mode == "sparse":
@@ -450,7 +561,8 @@ class SharedBackbone(nn.Module):
     def __init__(self, in_channels=12, channels=128, num_res_blocks=12,
                  attention_mode="mix", num_attention_layers=4,
                  num_heads=4, attention_dropout=0.0,
-                 attn_mode="global", attn_window=7):
+                 attn_mode="global", attn_window=7,
+                 use_checkpoint=False):
         """
         Args:
             attention_mode:   主干堆叠模式 "none"|"mix"|"all"
@@ -463,6 +575,7 @@ class SharedBackbone(nn.Module):
         super(SharedBackbone, self).__init__()
         self.channels = channels
         self.attention_mode = attention_mode
+        self.use_checkpoint = use_checkpoint
 
         self.conv1 = nn.Conv2d(in_channels, channels, 3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(channels)
@@ -500,6 +613,10 @@ class SharedBackbone(nn.Module):
 
     def forward(self, x):
         out = F.relu(self.bn1(self.conv1(x)))
-        out = self.blocks(out)
+        if self.training and self.use_checkpoint:
+            out = torch.utils.checkpoint.checkpoint_sequential(
+                self.blocks, len(self.blocks), out, use_reentrant=False)
+        else:
+            out = self.blocks(out)
         out = F.relu(self.bn_out(self.conv_out(out)))
         return out

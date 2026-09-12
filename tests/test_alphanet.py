@@ -33,7 +33,7 @@ class TestSharedBackbone:
         out = backbone(x)
         assert out.shape == (2, 64, 9, 9)
 
-    @pytest.mark.parametrize("attn_mode", ["global", "window", "axial"])
+    @pytest.mark.parametrize("attn_mode", ["global", "window", "axial", "sparse", "window_global"])
     def test_attention_compute_modes(self, attn_mode):
         """验证三种注意力计算模式（全局/窗口/轴向）前向形状正确。"""
         backbone = SharedBackbone(in_channels=12, channels=64, num_res_blocks=4,

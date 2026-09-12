@@ -153,7 +153,7 @@ def main():
     ap.add_argument('--res-blocks', type=int, default=12)
     ap.add_argument('--attn-layers', type=int, default=2)
     ap.add_argument('--heads', type=int, default=4)
-    ap.add_argument('--attn-mode', default='sparse', choices=['sparse', 'window', 'global', 'none'])
+    ap.add_argument('--attn-mode', default='sparse', choices=['sparse', 'window', 'global', 'none', 'window_global'])
     ap.add_argument('--attn-window', type=int, default=7)
     args = ap.parse_args()
 

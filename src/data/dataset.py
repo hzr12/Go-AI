@@ -25,6 +25,7 @@ class SupervisedDataset:
         """
         data 必须含：boards(int8), my_hist(int16), op_hist(int16),
                        ko(int16), moves(int16), values(int8), to_play(int8)
+        可选含：game_ids(int32) — 每个样本所属棋局 ID，用于 stratified split。
         均为 shape=(N, ...) 的 numpy 数组，N 相同。
         """
         self.boards = data['boards']
@@ -34,6 +35,7 @@ class SupervisedDataset:
         self.moves = data['moves']
         self.values = data['values']
         self.to_play = data['to_play']
+        self.game_ids = data.get('game_ids', None)
         self.N = self.boards.shape[0]
         self.board_size = self.boards.shape[1]
         self._board = GoBoard(self.board_size)  # 复用实例，避免重复分配

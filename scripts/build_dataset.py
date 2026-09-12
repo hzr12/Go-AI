@@ -92,13 +92,14 @@ def _flush_chunk(chunk, tmp_dir, idx):
              ko=np.array(chunk['kos'], dtype=np.int16),
              moves=np.array(chunk['moves'], dtype=np.int16),
              values=np.array(chunk['values'], dtype=np.int8),
-             to_play=np.array(chunk['to_plays'], dtype=np.int8))
+             to_play=np.array(chunk['to_plays'], dtype=np.int8),
+             game_ids=np.array(chunk['game_ids'], dtype=np.int32))
     return path
 
 
 def _merge_chunks(tmp_files, out):
     """把若干 npz 分片按字段 concatenate，压缩合并成单个 npz。"""
-    keys = ['boards', 'my_hist', 'op_hist', 'ko', 'moves', 'values', 'to_play']
+    keys = ['boards', 'my_hist', 'op_hist', 'ko', 'moves', 'values', 'to_play', 'game_ids']
     merged = {k: [] for k in keys}
     for f in tmp_files:
         d = np.load(f, allow_pickle=False)
@@ -132,7 +133,7 @@ def merge_shards(src_dir, out, group=8, clean=False):
     """
     import glob as _glob
     import shutil as _shutil
-    keys = ['boards', 'my_hist', 'op_hist', 'ko', 'moves', 'values', 'to_play']
+    keys = ['boards', 'my_hist', 'op_hist', 'ko', 'moves', 'values', 'to_play', 'game_ids']
     out_base = os.path.basename(out)
     done_marker = out + '.done'
     if os.path.isfile(done_marker) and os.path.isfile(out):
@@ -242,10 +243,12 @@ def build(src, board_size, max_games, chunk_size=0, out=None, tmp_root=None):
     tmp_files = []
     chunk_idx = 0
     total_flushed = 0   # 已落盘样本累计（避免每落一片就重读所有分片计数，O(n²)）
-    cur = {'boards': [], 'my_hists': [], 'op_hists': [], 'kos': [], 'moves': [], 'values': [], 'to_plays': []}
+    cur = {'boards': [], 'my_hists': [], 'op_hists': [], 'kos': [], 'moves': [], 'values': [], 'to_plays': [], 'game_ids': []}
+    game_id_counter = 0
 
     def _emit(name, raw):
         """解析单局并产出样本；返回 (n_samples, skip_increment)。"""
+        nonlocal game_id_counter
         text = raw.decode('utf-8', 'ignore')
         game = parser.parse_string(text)
         # 只跳过「大于目标尺寸」的棋谱（无法放进小棋盘）。
@@ -291,6 +294,7 @@ def build(src, board_size, max_games, chunk_size=0, out=None, tmp_root=None):
             cur['moves'].append(target)
             cur['values'].append(pos_value)
             cur['to_plays'].append(to_play)
+            cur['game_ids'].append(game_id_counter)
 
             play_move = target  # 与 target 相同，无需重复计算
             if not board.play(play_move):
@@ -321,13 +325,14 @@ def build(src, board_size, max_games, chunk_size=0, out=None, tmp_root=None):
                 skip += sk
             else:
                 n_games += 1
+                game_id_counter += 1
             # 流式模式：累计够一个 chunk 就 flush，清空当前 chunk 释放内存
             if streaming and len(cur['boards']) >= chunk_size:
                 total_flushed += len(cur['boards'])
                 tmp_files.append(_flush_chunk(cur, tmp_dir, chunk_idx))
                 chunk_idx += 1
                 print(f"[build] 已落盘分片 #{chunk_idx}（累计样本 {total_flushed}）", flush=True)
-                cur = {'boards': [], 'my_hists': [], 'op_hists': [], 'kos': [], 'moves': [], 'values': [], 'to_plays': []}
+                cur = {'boards': [], 'my_hists': [], 'op_hists': [], 'kos': [], 'moves': [], 'values': [], 'to_plays': [], 'game_ids': []}
 
     if streaming:
         # flush 残余样本并合并
@@ -353,6 +358,7 @@ def build(src, board_size, max_games, chunk_size=0, out=None, tmp_root=None):
         'moves': np.array(cur['moves'], dtype=np.int16),
         'values': np.array(cur['values'], dtype=np.int8),
         'to_play': np.array(cur['to_plays'], dtype=np.int8),
+        'game_ids': np.array(cur['game_ids'], dtype=np.int32),
     }
     return data, n_games, skip
 

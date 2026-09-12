@@ -64,6 +64,8 @@ class GoBoard:
         self.passes = 0          # 连续 pass 计数
         self.move_history = []   # 记录每步落子扁平坐标，pass 记为 -1
         self._undo_stack = []    # 撤销栈：每项 (move, captured|None, prev_ko, prev_passes, prev_player)
+        self._legal_cache = None
+        self._legal_cache_suicide = None
 
     def clone(self) -> "GoBoard":
         """轻量克隆：只复制推演所需状态（盘面/执子方/劫/连续 pass 计数），
@@ -96,7 +98,13 @@ class GoBoard:
         """返回长度为 size*size 的 bool 掩码，True 表示该点可落子。
 
         check_suicide=True 时额外过滤自杀手（需模拟落子，较慢但更准确）。
+        结果会被缓存，直到下次 play()/undo()/reset() 时失效。
         """
+        if not check_suicide and self._legal_cache is not None:
+            return self._legal_cache
+        if check_suicide and self._legal_cache_suicide is not None:
+            return self._legal_cache_suicide
+
         n = self.board_size
         legal = (self.board == 0).reshape(-1).copy()
         if self.ko_point >= 0:
@@ -121,6 +129,10 @@ class GoBoard:
                 self.board[r, c] = 0
                 if not has_liberty:
                     legal[i] = False
+        if not check_suicide:
+            self._legal_cache = legal.copy()
+        else:
+            self._legal_cache_suicide = legal.copy()
         return legal
 
     # ---- 连通块 / 气 -------------------------------------------------------
@@ -218,6 +230,8 @@ class GoBoard:
             self.ko_point = -1
             self.move_history.append(-1)
             self.current_player = -self.current_player
+            self._legal_cache = None
+            self._legal_cache_suicide = None
             return True
 
         if move < 0 or move >= n * n:
@@ -264,6 +278,8 @@ class GoBoard:
         self.passes = 0
         self.move_history.append(move)
         self.current_player = -self.current_player
+        self._legal_cache = None
+        self._legal_cache_suicide = None
         return True
 
     def undo(self) -> bool:
@@ -287,6 +303,8 @@ class GoBoard:
         self.ko_point = ko
         self.passes = passes
         self.current_player = player
+        self._legal_cache = None
+        self._legal_cache_suicide = None
         return True
 
     # ---- 终局与计分 --------------------------------------------------------

@@ -48,7 +48,7 @@ def evaluate_vs_random(ai, board_size, num_games=100, use_mcts=False, simulation
         while passes < 2 and mc < 400:
             to_play = board.current_player
             legal = board.get_legal_moves()
-            if len(legal) == 0:
+            if not legal.any():
                 board.play(-1); passes += 1; mc += 1; path_moves.append(-1); continue
             if to_play == 1:  # 模型执黑
                 if use_mcts:
@@ -127,9 +127,9 @@ def main():
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--policy-channels", type=int, default=32,
                         help="policy 头隐层通道（须与训练时一致，训练默认 32）")
-    parser.add_argument("--value-channels", type=int, default=16,
-                        help="value 头隐层通道（须与训练时一致，训练默认 16）")
-    parser.add_argument("--attn-mode", default="window", choices=["global", "window", "axial"])
+    parser.add_argument("--value-channels", type=int, default=64,
+                        help="value 头隐层通道（须与训练时一致，训练默认 64）")
+    parser.add_argument("--attn-mode", default="window", choices=["global", "window", "axial", "sparse", "window_global"])
     parser.add_argument("--attn-window", type=int, default=7)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--mode", type=str, default="random",

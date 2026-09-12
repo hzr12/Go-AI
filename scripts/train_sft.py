@@ -211,6 +211,35 @@ def setup_logging(log_file, level: int = logging.INFO, rank: int = 0) -> logging
     return logger
 
 
+class EMA:
+    """指数移动平均（Exponential Moving Average）权重。
+
+    维护模型参数的 shadow copy，eval/save 时用 EMA 权重可提升 1-3% accuracy。
+    """
+
+    def __init__(self, model, decay=0.999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {name: param.clone().detach()
+                       for name, param in model.named_parameters()}
+
+    @torch.no_grad()
+    def update(self):
+        for name, param in self.model.named_parameters():
+            self.shadow[name].data.mul_(self.decay).add_(param.data, alpha=1 - self.decay)
+
+    def apply_shadow(self):
+        self.backup = {name: param.clone()
+                       for name, param in self.model.named_parameters()}
+        for name, param in self.model.named_parameters():
+            param.data = self.shadow[name].data
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            param.data = self.backup[name].data
+        del self.backup
+
+
 def maybe_autocast(device, dtype=torch.float16):
     """在 CUDA/NPU 上开启 autocast，dtype 由设备能力决定（A100/BF16、V100/FP16、NPU/BF16）。
     CPU 或 amp 关闭时返回 nullcontext。device 字符串支持 'cuda'/'cuda:0'/'npu'/'npu:0' 等。"""
@@ -447,10 +476,11 @@ def main():
     ap.add_argument('--num-attention-layers', type=int, default=4,
                     help='mix 模式下注意力块数量')
     ap.add_argument('--num-heads', type=int, default=4, help='多头注意力头数')
-    ap.add_argument('--attention-dropout', type=float, default=0.0)
+    ap.add_argument('--attention-dropout', type=float, default=0.1)
     ap.add_argument('--attn-mode', default='global',
-                    choices=['global', 'window', 'axial', 'sparse'],
-                    help='注意力计算模式: global=全配对, window=滑动窗口, axial=轴向')
+                    choices=['global', 'window', 'axial', 'sparse', 'window_global'],
+                    help='注意力计算模式: global=全配对, window=块状窗口, '
+                         'sparse=窗口+全局token, window_global=块状窗口+全局token(手写math)')
     ap.add_argument('--attn-window', type=int, default=7, help='window 模式窗口边长')
     ap.add_argument('--eval-every', type=int, default=5000)
     ap.add_argument('--log-every', type=int, default=50,
@@ -469,6 +499,12 @@ def main():
                     help='value loss 权重（BCE loss 下需更大权重平衡 policy/value 梯度）')
     ap.add_argument('--value-lr-mult', type=float, default=5.0,
                     help='value head 学习率倍数（相对主干 LR，补偿参数量小的梯度不足）')
+    ap.add_argument('--label-smoothing', type=float, default=0.1,
+                    help='policy loss label smoothing（0=不平滑，0.1=标准值）')
+    ap.add_argument('--use-checkpoint', action='store_true',
+                    help='用 gradient checkpointing 减少显存占用（约省 50%%，训练慢 ~30%%）')
+    ap.add_argument('--gradient-accumulation-steps', type=int, default=1,
+                    help='梯度累积步数（模拟更大 batch size，效果等同于 batch_size * N）')
     ap.add_argument('--compile', action='store_true',
                     help='用 torch.compile 融合算子（GPU 上约 20-40%% 提速，首次迭代较慢）')
     ap.add_argument('--compile-mode', default='default',
@@ -646,14 +682,25 @@ def main():
 
     dataset = load_from_path(args.data, args.board_size, args.max_games_per_tgz)
     n = len(dataset)
-    logger.info("[data] 总样本数=%d | 训练=%d | 验证=%d", n, int(n * 0.98), n - int(n * 0.98))
-    # 留出 held-out 集用于 top-1 准确率监控
-    n_train = int(n * 0.98)
-    idx_all = np.arange(n)
-    rng = np.random.default_rng(0)
-    rng.shuffle(idx_all)
-    train_idx = idx_all[:n_train]
-    eval_idx = idx_all[n_train:]
+    # 按棋局分割 train/eval（避免同一棋局的相邻位置同时出现在 train 和 eval）
+    if dataset.game_ids is not None:
+        unique_games = np.unique(dataset.game_ids)
+        rng = np.random.default_rng(0)
+        rng.shuffle(unique_games)
+        n_train_games = int(len(unique_games) * 0.98)
+        train_game_set = set(unique_games[:n_train_games])
+        train_idx = np.array([i for i in range(n) if dataset.game_ids[i] in train_game_set])
+        eval_idx = np.array([i for i in range(n) if dataset.game_ids[i] not in train_game_set])
+        logger.info("[data] 按棋局分割：总棋局=%d 训练棋局=%d 验证棋局=%d",
+                    len(unique_games), n_train_games, len(unique_games) - n_train_games)
+    else:
+        n_train = int(n * 0.98)
+        idx_all = np.arange(n)
+        rng = np.random.default_rng(0)
+        rng.shuffle(idx_all)
+        train_idx = idx_all[:n_train]
+        eval_idx = idx_all[n_train:]
+    logger.info("[data] 总样本数=%d | 训练=%d | 验证=%d", n, len(train_idx), len(eval_idx))
 
     # 分布式：每张卡用 DistributedSampler 取到不相交的训练分片（会自动 pad 到
     # 能被 world_size 整除），各卡步数因此一致，避免 DDP 在 barrier 处互相等待。
@@ -674,6 +721,7 @@ def main():
         attn_mode=args.attn_mode,
         attn_window=args.attn_window,
         action_size=args.board_size * args.board_size + 1,  # +1 为 pass 类别
+        use_checkpoint=args.use_checkpoint,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     logger.info("[model] 参数量=%.2fM | 设备=%s", n_params / 1e6, device)
@@ -716,6 +764,9 @@ def main():
     else:
         scaler = torch.amp.GradScaler(_backend, enabled=use_scaler)
 
+    # EMA（指数移动平均）：eval/save 时用 shadow 权重，提升 1-3% accuracy
+    ema = EMA(model, decay=0.999)
+
     # ---- 学习率调度：基于“总 step 数”而非 epoch 数 ----
     # 旧版用 T_max=args.epochs 导致余弦在第 1 个 epoch 结束就被砍到 ~0，
     # 后续 epoch 在 lr≈0 附近横盘。这里用真实总 step 数，并加前 5% step 线性 warmup。
@@ -727,7 +778,7 @@ def main():
     else:
         n_batches = (n_train + args.batch_size - 1) // args.batch_size
     total_steps = max(1, args.epochs * n_batches)
-    warmup_steps = max(1, int(total_steps * 0.05))
+    warmup_steps = max(1, int(total_steps * 0.10))
     after_warmup = max(1, total_steps - warmup_steps)
     warmup_sched = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
@@ -857,9 +908,11 @@ def main():
         # step，结束打印 top CUDA kernel 耗时表，用于定位 740ms/step 的去向。
         _prof_at = int(os.environ.get('GOAI_PROFILE', '0') or 0)
         _prof_ctx = None
+        _accum_steps = args.gradient_accumulation_steps
         for i in range(n_batches):
             try:
-                optimizer.zero_grad(set_to_none=True)
+                if i % _accum_steps == 0:
+                    optimizer.zero_grad(set_to_none=True)
                 if _prof_at > 0 and step == _prof_at and _prof_ctx is None:
                     try:
                         from torch.profiler import (profile, ProfilerActivity)
@@ -898,15 +951,21 @@ def main():
                         state = state.to(memory_format=torch.channels_last)
                 with maybe_autocast(device, amp_dtype):
                     policy_logits, value_logit = model(state)
-                    policy_loss = F.cross_entropy(policy_logits.float(), move_t)
+                    policy_loss = F.cross_entropy(policy_logits.float(), move_t,
+                                                  label_smoothing=args.label_smoothing)
                     # BCEWithLogitsLoss: target ±1 → 0/1，logit 直接输入无 Tanh
                     value_target = (value_t.squeeze().float() + 1) / 2  # ±1 → 0/1
                     value_loss = F.binary_cross_entropy_with_logits(
                         value_logit.float().squeeze(), value_target)
                     loss = policy_loss + args.value_loss_weight * value_loss
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+                (loss / _accum_steps).backward()
+                if (i + 1) % _accum_steps == 0 or (i + 1) == n_batches:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    ema.update()
             except Exception as oom_exc:
                 # 同时捕获 CUDA 与 NPU 的 OOM（两后端异常类型不同）
                 _oom_types = [torch.cuda.OutOfMemoryError]
@@ -941,7 +1000,8 @@ def main():
                 logger.error("已清理显存并退出，请调整参数后重跑。")
                 logger.error("=" * 60)
                 sys.exit(1)
-            scheduler.step()   # 每个 step 推进一步（warmup+cosine 调度依赖逐 step）
+            if (i + 1) % _accum_steps == 0 or (i + 1) == n_batches:
+                scheduler.step()   # 每个 optimizer step 推进一步
             step += 1
             # P1: 每 log_every 步才 sync NPU 取 loss 值，其余步用 None 占位
             if step % args.log_every == 0:
@@ -990,9 +1050,11 @@ def main():
 
             # 定期评估：top-1 着法准确率（所有 rank 都做 eval，避免 barrier 死锁）
             if args.eval_every > 0 and step % args.eval_every == 0 and len(eval_idx) > 0:
+                ema.apply_shadow()
                 eval_acc, eval_n = evaluate_top1(
                     model, dataset, eval_idx, bs, device, amp_dtype,
                     use_channels_last=use_channels_last)
+                ema.restore()
                 if is_main:
                     logger.info("[eval] step=%d top1_acc=%.4f (n=%d)%s",
                                 step, eval_acc, eval_n,
@@ -1000,7 +1062,9 @@ def main():
                 if eval_acc > best_eval_acc:
                     best_eval_acc = eval_acc
                     if is_main:
+                        ema.apply_shadow()
                         save_model(model, args.out)
+                        ema.restore()
 
 if __name__ == "__main__":
     main()

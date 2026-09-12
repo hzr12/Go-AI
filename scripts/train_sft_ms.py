@@ -115,7 +115,7 @@ def main():
     ap.add_argument("--num-heads", type=int, default=4)
     ap.add_argument("--attention-dropout", type=float, default=0.0)
     ap.add_argument("--attn-mode", default="global",
-                    choices=["global", "window", "axial", "sparse"])
+                    choices=["global", "window", "axial", "sparse", "window_global"])
     ap.add_argument("--attn-window", type=int, default=7)
     ap.add_argument("--batch-size", type=int, default=512)
     ap.add_argument("--epochs", type=int, default=8)

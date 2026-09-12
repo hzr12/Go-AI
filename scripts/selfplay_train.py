@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from src.inference import GoAI
 from src.game.go_rules import GoBoard
@@ -74,9 +75,12 @@ def self_play_game(ai, board_size, sims, max_moves, temperature,
             vt[:n_actions - 1] = visits[:n_actions - 1] / vs
             vt[n_actions - 1] = visits[n_actions - 1] / vs
         data.append((planes, vt, to_play))
-        # 按温度分布采样落子（探索）
+        # 按温度分布采样落子：前 30 手 temperature=1.0（探索），之后 temperature=0（贪心）
+        temp = temperature if mc < 30 else 0.0
         p = np.asarray(probs).reshape(-1).astype(np.float64)
         p[-1] = max(p[-1], 0.0)  # pass 概率
+        if temp > 0 and temp != 1.0:
+            p = p ** (1.0 / temp)
         s = p.sum()
         if s <= 0:
             mv = n_actions - 1
@@ -129,7 +133,7 @@ def train_epochs(ai, buffer, args, device):
     """在 replay buffer 上训练若干遍。返回平均 loss。"""
     model = ai.model
     model.train()
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     losses = []
     if not buffer:
         return 0.0
@@ -146,7 +150,8 @@ def train_epochs(ai, buffer, args, device):
             policy, value = model(planes)
             logq = torch.log_softmax(policy, dim=-1) + 1e-10
             loss_pi = -(pi_t * logq).sum(dim=1).mean()
-            loss_v = ((value.squeeze(-1) - z) ** 2).mean()
+            value_target = (z + 1) / 2  # ±1 → 0/1
+            loss_v = F.binary_cross_entropy_with_logits(value.squeeze(-1), value_target)
             loss = loss_pi + loss_v
             opt.zero_grad()
             loss.backward()

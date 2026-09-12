@@ -30,7 +30,8 @@ class AlphaGoNet(nn.Module):
                  attn_window: int = 7,
                  policy_channels: int = 32,
                  value_channels: int = 64,
-                 action_size: int = 362):
+                 action_size: int = 362,
+                 use_checkpoint: bool = False):
         """
         Args:
             attention_mode:      主干中注意力的使用方式
@@ -54,6 +55,7 @@ class AlphaGoNet(nn.Module):
             attention_dropout=attention_dropout,
             attn_mode=attn_mode,
             attn_window=attn_window,
+            use_checkpoint=use_checkpoint,
         )
 
         self.policy = PolicyNetwork(
