@@ -345,6 +345,7 @@ class _BatchPrefetcher:
         self._expect = 0   # 下一个待取回 batch 的编号
         self._rngs = [np.random.default_rng(seed + i) for i in range(self.k)]
         self._threads = []
+        self._pending: dict = {}  # step -> [(pos, s, m, v, err)] 已收到但还没收集完的
         for wi in range(self.k):
             t = threading.Thread(target=self._worker, args=(wi,), daemon=True)
             t.start()
@@ -381,21 +382,28 @@ class _BatchPrefetcher:
         """取回下一个 batch，返回 (states_np, moves_np, values_np)。"""
         step = self._expect
         self._expect += 1
-        parts = [None] * self.k
-        got = 0
-        while got < self.k:
+        # 从 _pending 中取出之前缓存的该 step 结果
+        parts = self._pending.pop(step, [])
+        # 如果不够 k 个，从队列中继续收
+        while len(parts) < self.k:
             r_step, pos, s, m, v, err = self._res_q.get()
-            if r_step != step:
-                raise RuntimeError(f"预取器步序错乱: 期望 {step} 收到 {r_step}")
+            if r_step == step:
+                parts.append((pos, s, m, v, err))
+            else:
+                # 缓存未来 step 的结果
+                self._pending.setdefault(r_step, []).append((pos, s, m, v, err))
+        # 检查错误
+        for pos, s, m, v, err in parts:
             if err is not None:
                 raise err
-            if s is not None:
-                parts[pos] = (s, m, v)
-            got += 1
-        parts = [p for p in parts if p is not None]
-        states = np.concatenate([p[0] for p in parts], axis=0)
-        moves = np.concatenate([p[1] for p in parts], axis=0)
-        values = np.concatenate([p[2] for p in parts], axis=0)
+        # 按 pos 排序并拼接
+        parts = [(pos, s, m, v) for pos, s, m, v, _ in parts if s is not None]
+        parts.sort(key=lambda x: x[0])
+        if not parts:
+            raise RuntimeError(f"step {step}: 所有子块为空")
+        states = np.concatenate([p[1] for p in parts], axis=0)
+        moves = np.concatenate([p[2] for p in parts], axis=0)
+        values = np.concatenate([p[3] for p in parts], axis=0)
         return states, moves, values
 
 
