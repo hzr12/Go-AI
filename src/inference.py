@@ -50,7 +50,7 @@ class GoAI:
     _NPU_BATCH_BUCKETS = (1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 192, 256)
 
     def __init__(self, model_path=None, board_size=19, device="auto", use_amp=False,
-                 backbone_channels=128, backbone_res_blocks=12, policy_channels=32, value_channels=16,
+                 backbone_channels=128, backbone_res_blocks=12, policy_channels=32, value_channels=64,
                  attention_mode="mix", num_attention_layers=4, num_heads=4, attention_dropout=0.0,
                  attn_mode="global", attn_window=7, compile=False, tf32=False,
                  channels_last=True):

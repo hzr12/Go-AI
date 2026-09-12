@@ -73,7 +73,7 @@ class AlphaGoNet(nn.Module):
             observation: (batch, in_channels, H, W)
         Returns:
             policy: (batch, action_size) logits
-            value:  (batch, 1) 黑方视角胜率（Tanh 输出 [-1,1]）
+            value:  (batch, 1) 黑方视角胜率 logit（经 sigmoid 映射到 [0,1]，0=白胜 1=黑胜）
         """
         shared_state = self.backbone(observation)
         policy = self.policy(shared_state)

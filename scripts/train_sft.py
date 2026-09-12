@@ -465,8 +465,8 @@ def main():
     ap.add_argument('--resume', default='',
                     help='断点续训：指定已保存的 .pth 模型路径，会从该权重 + 同目录 '
                          '.train_state.pt 恢复 optimizer/scheduler/step 计数继续训练')
-    ap.add_argument('--value-loss-weight', type=float, default=2.0,
-                    help='value loss 权重（policy loss 量级 3-6x > value，需加权平衡）')
+    ap.add_argument('--value-loss-weight', type=float, default=5.0,
+                    help='value loss 权重（BCE loss 下需更大权重平衡 policy/value 梯度）')
     ap.add_argument('--value-lr-mult', type=float, default=2.0,
                     help='value head 学习率倍数（相对主干 LR，补偿参数量小的梯度不足）')
     ap.add_argument('--compile', action='store_true',
@@ -878,9 +878,12 @@ def main():
                     if use_channels_last:
                         state = state.to(memory_format=torch.channels_last)
                 with maybe_autocast(device, amp_dtype):
-                    policy_logits, value_pred = model(state)
+                    policy_logits, value_logit = model(state)
                     policy_loss = F.cross_entropy(policy_logits.float(), move_t)
-                    value_loss = F.mse_loss(value_pred.float().squeeze(), value_t.squeeze())
+                    # BCEWithLogitsLoss: target ±1 → 0/1，logit 直接输入无 Tanh
+                    value_target = (value_t.squeeze().float() + 1) / 2  # ±1 → 0/1
+                    value_loss = F.binary_cross_entropy_with_logits(
+                        value_logit.float().squeeze(), value_target)
                     loss = policy_loss + args.value_loss_weight * value_loss
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)

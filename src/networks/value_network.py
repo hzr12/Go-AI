@@ -13,7 +13,6 @@ class ValueNetwork(nn.Module):
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
             nn.Linear(hidden_channels, 1),
-            nn.Tanh()
         )
     
     def forward(self, x):

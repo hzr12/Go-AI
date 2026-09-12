@@ -338,18 +338,16 @@ class PolicyNetwork(nn.Cell):
 
 
 class ValueNetwork(nn.Cell):
-    """价值头（0=Conv,1=BN,5=Linear,6=Tanh）。"""
+    """价值头（Conv→ReLU→Pool→Dense，输出 raw logit）。"""
 
-    def __init__(self, in_channels=64, hidden_channels=16):
+    def __init__(self, in_channels=64, hidden_channels=64):
         super(ValueNetwork, self).__init__()
         self.value_head = nn.SequentialCell(
             nn.Conv2d(in_channels, hidden_channels, 1, has_bias=False),
-            nn.BatchNorm2d(hidden_channels),
             nn.ReLU(),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
             nn.Dense(hidden_channels, 1),
-            nn.Tanh(),
         )
 
     def construct(self, x):
@@ -370,7 +368,7 @@ class AlphaGoNet(nn.Cell):
                  attn_mode: str = "global",
                  attn_window: int = 7,
                  policy_channels: int = 32,
-                 value_channels: int = 16,
+                 value_channels: int = 64,
                  action_size: int = 361):
         super(AlphaGoNet, self).__init__()
         self.action_size = action_size
