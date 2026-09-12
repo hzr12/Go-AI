@@ -69,6 +69,8 @@ class GoAI:
                   "math 注意力，勿开 --compile。若每次启动 warmup 都超过 1 分钟，"
                   "先执行 export ASCEND_CACHE_PATH=~/ascend_cache 持久化算子编译缓存")
         self.board_size = board_size
+        self._ort = None
+        self._ort_dynamic_batch = False
         # 网络侧压：tf32 让 V100/Amp 上的 fp32 matmul 走 TensorFloat-32（约 2-4x 提速，
         # 精度损失对推理可忽略）；channels_last 让 conv 走 NHWC 内存布局（conv 友好）。
         self.tf32 = tf32 and self.device.startswith("cuda")
@@ -307,7 +309,6 @@ class GoAI:
         planes_list = []
         for st in states:
             if len(st) == 5:
-                # 增量特征：第 5 项为预计算 12 通道 planes
                 b, mh, oh, tp, planes = st
             else:
                 b, mh, oh, tp = st
@@ -316,15 +317,39 @@ class GoAI:
                 planes = b.feature_planes_batched(
                     b.board[None], [list(mh)], [list(oh)], [tp], [b.ko_point])[0]
             planes_list.append(np.ascontiguousarray(planes, dtype=np.float32))
-        # 整批一次 stack + 一次 H2D。旧实现逐样本走 _build_state().to(device)，
-        # 会产生 B 次小拷贝 + B 次 np.ascontiguousarray，批越小越吃亏（MCTS 叶子
-        # 批普遍偏小，放大明显）。
-        x = torch.from_numpy(np.stack(planes_list, axis=0))  # (B,12,H,W)，零拷贝
+        # ONNX 快速路径：全程 numpy，避免 numpy→torch→numpy 往返
+        if self._ort is not None:
+            xnp = np.stack(planes_list, axis=0)  # (B,12,H,W)
+            policies, values = self._forward_batch_onnx_numpy(xnp)
+            return policies, values
+        x = torch.from_numpy(np.stack(planes_list, axis=0))
         x = x.to(self.device)
         if self.channels_last:
             x = x.to(memory_format=torch.channels_last)
         policies, values = self._forward_batch(x)
         return policies, values.squeeze(-1).cpu().numpy().astype(np.float32)
+
+    def _forward_batch_onnx_numpy(self, xnp):
+        """ONNX 快速路径：直接接受 numpy 数组，跳过 torch 转换。"""
+        if self._ort_dynamic_batch:
+            pol, val = self._ort.run(None, {"x": xnp})
+        else:
+            batch_size = min(8, xnp.shape[0])
+            all_pol, all_val = [], []
+            for i in range(0, xnp.shape[0], batch_size):
+                chunk = xnp[i:i+batch_size]
+                p, v = self._ort.run(None, {"x": chunk})
+                all_pol.append(np.asarray(p, dtype=np.float32))
+                all_val.append(np.asarray(v, dtype=np.float32))
+            pol = np.concatenate(all_pol, axis=0)
+            val = np.concatenate(all_val, axis=0)
+        pol = np.asarray(pol, dtype=np.float32)
+        val = np.asarray(val, dtype=np.float32)
+        # softmax
+        pol -= pol.max(axis=-1, keepdims=True)
+        np.exp(pol, out=pol)
+        pol /= pol.sum(axis=-1, keepdims=True)
+        return pol, val.reshape(-1)
 
     def _forward_batch(self, x):
         """输入 (B,12,H,W)，输出 (policies_np(B,A), values(B,1))。"""
@@ -437,9 +462,19 @@ class GoAI:
             so.enable_cpu_mem_arena = True
             self._ort = ort.InferenceSession(
                 onnx_path, sess_options=so, providers=["CPUExecutionProvider"])
+            # 检测 ONNX 模型是否支持动态 batch（一次性检测，缓存结果）
+            self._ort_dynamic_batch = False
+            try:
+                inp = self._ort.get_inputs()[0]
+                dims = inp.shape
+                if len(dims) > 0 and isinstance(dims[0], str):
+                    self._ort_dynamic_batch = True
+            except Exception:  # noqa: BLE001
+                pass
             self._forward_batch = self._forward_batch_onnx  # 实例属性遮蔽方法
             print(f"[GoAI] 已切换 ONNX Runtime 推理后端: {onnx_path} "
-                  f"(intra_threads={so.intra_op_num_threads})")
+                  f"(intra_threads={so.intra_op_num_threads}, "
+                  f"dynamic_batch={self._ort_dynamic_batch})")
             return True
         except Exception as e:  # noqa: BLE001
             print(f"[GoAI] ONNX 导出失败，保持 torch 后端: {e}")
@@ -454,13 +489,9 @@ class GoAI:
         """
         xnp = x.detach().cpu().numpy().astype(np.float32)
         B = xnp.shape[0]
-        # 尝试一次性推理（动态 batch 模型）；失败则逐批（静态 batch=1 量化模型）
-        try:
+        if self._ort_dynamic_batch:
             pol, val = self._ort.run(None, {"x": xnp})
-            pol = np.asarray(pol, dtype=np.float32)
-            val = np.asarray(val, dtype=np.float32)
-        except Exception:
-            # 静态 batch 模型：分批推理，每批 8 样本（减少 ort.run 开销）
+        else:
             batch_size = min(8, B)
             all_pol, all_val = [], []
             for i in range(0, B, batch_size):
@@ -486,8 +517,7 @@ class GoAI:
         n_actions = bs * bs + 1
 
         illegal = np.ones(n_actions, dtype=bool)
-        for m in legal_mask:
-            illegal[m] = False
+        illegal[:len(legal_mask)] = ~legal_mask
         # 始终允许虚着
         illegal[n_actions - 1] = False
         masked = policy.copy()
@@ -535,7 +565,7 @@ class GoAI:
             board, my_hist, op_hist, to_play, simulations=simulations,
             temperature=temperature, return_value=True, path_moves=path_moves)
         # 若 MCTS 选了非法着法（极端情况下），回退到纯策略
-        if move_int not in legal_mask and move_int != self.board_size * self.board_size:
+        if not legal_mask[move_int] and move_int != self.board_size * self.board_size:
             return self.choose_move(board, my_hist, op_hist, to_play, legal_mask,
                                     temperature=temperature)
         return move_int, is_pass, value
@@ -579,28 +609,44 @@ class GoAI:
                     move_count += 1
                     continue
                 if use_mcts:
-                    move_int, is_pass, value = self.choose_move_mcts(
-                        board, my_hist[0], my_hist[1], to_play, legal,
-                        simulations=simulations, temperature=temperature, mcts=mcts,
-                        num_threads=num_threads, use_rollout=use_rollout,
-                        rollout_lambda=rollout_lambda, path_moves=path_moves)
+                    if to_play == 1:
+                        move_int, is_pass, value = self.choose_move_mcts(
+                            board, my_hist[0], my_hist[1], to_play, legal,
+                            simulations=simulations, temperature=temperature, mcts=mcts,
+                            num_threads=num_threads, use_rollout=use_rollout,
+                            rollout_lambda=rollout_lambda, path_moves=path_moves)
+                    else:
+                        move_int, is_pass, value = self.choose_move_mcts(
+                            board, my_hist[1], my_hist[0], to_play, legal,
+                            simulations=simulations, temperature=temperature, mcts=mcts,
+                            num_threads=num_threads, use_rollout=use_rollout,
+                            rollout_lambda=rollout_lambda, path_moves=path_moves)
                 else:
-                    move_int, is_pass, value = self.choose_move(
-                        board, my_hist[0], my_hist[1], to_play, legal,
-                        temperature=temperature, topk=topk)
+                    if to_play == 1:
+                        move_int, is_pass, value = self.choose_move(
+                            board, my_hist[0], my_hist[1], to_play, legal,
+                            temperature=temperature, topk=topk)
+                    else:
+                        move_int, is_pass, value = self.choose_move(
+                            board, my_hist[1], my_hist[0], to_play, legal,
+                            temperature=temperature, topk=topk)
                 if is_pass:
                     board.play(-1)
                     passes += 1
                     path_moves.append(-1)
                 else:
                     r, c = self._move_int_to_coord(move_int)
-                    board.play(r * self.board_size + c)
-                    passes = 0
-                    path_moves.append(r * self.board_size + c)
-                    # 更新历史（最近3手，最新在末尾）
-                    hist = my_hist[0] if to_play == 1 else my_hist[1]
-                    hist.pop(0)
-                    hist.append(r * self.board_size + c)
+                    mv_flat = r * self.board_size + c
+                    if not board.play(mv_flat):
+                        board.play(-1); passes += 1
+                        path_moves.append(-1)
+                    else:
+                        passes = 0
+                        path_moves.append(mv_flat)
+                        # 更新历史（最近3手，最新在末尾）
+                        hist = my_hist[0] if to_play == 1 else my_hist[1]
+                        hist.pop(0)
+                        hist.append(mv_flat)
                 move_count += 1
                 if verbose and (move_count % 10 == 0):
                     print(f"  game {g} move {move_count} to_play={to_play} "
@@ -643,7 +689,7 @@ class GoAI:
                     break
                 else:
                     ok, mv = board.parse_move_str(inp, human_color)
-                    if not ok or mv not in legal:
+                    if not ok or not legal[mv]:
                         print("非法着法，请重试。")
                         continue
                     board.play(mv)
@@ -657,15 +703,27 @@ class GoAI:
                     path_moves.append(-1)
                 else:
                     if use_mcts:
-                        move_int, is_pass, value = self.choose_move_mcts(
-                            board, my_hist[0], my_hist[1], to_play, legal,
-                            simulations=simulations, temperature=temperature, mcts=mcts,
-                            num_threads=num_threads, use_rollout=use_rollout,
-                            rollout_lambda=rollout_lambda, path_moves=path_moves)
+                        if to_play == 1:
+                            move_int, is_pass, value = self.choose_move_mcts(
+                                board, my_hist[0], my_hist[1], to_play, legal,
+                                simulations=simulations, temperature=temperature, mcts=mcts,
+                                num_threads=num_threads, use_rollout=use_rollout,
+                                rollout_lambda=rollout_lambda, path_moves=path_moves)
+                        else:
+                            move_int, is_pass, value = self.choose_move_mcts(
+                                board, my_hist[1], my_hist[0], to_play, legal,
+                                simulations=simulations, temperature=temperature, mcts=mcts,
+                                num_threads=num_threads, use_rollout=use_rollout,
+                                rollout_lambda=rollout_lambda, path_moves=path_moves)
                     else:
-                        move_int, is_pass, value = self.choose_move(
-                            board, my_hist[0], my_hist[1], to_play, legal,
-                            temperature=temperature)
+                        if to_play == 1:
+                            move_int, is_pass, value = self.choose_move(
+                                board, my_hist[0], my_hist[1], to_play, legal,
+                                temperature=temperature)
+                        else:
+                            move_int, is_pass, value = self.choose_move(
+                                board, my_hist[1], my_hist[0], to_play, legal,
+                                temperature=temperature)
                     if is_pass:
                         board.play(-1); passes += 1
                         path_moves.append(-1)
@@ -673,11 +731,16 @@ class GoAI:
                     else:
                         r, c = self._move_int_to_coord(move_int)
                         mv = r * self.board_size + c
-                        board.play(mv); passes = 0
-                        path_moves.append(mv)
-                        hist = my_hist[0] if to_play == 1 else my_hist[1]
-                        hist.pop(0); hist.append(mv)
-                        print(f"AI 落子 {chr(ord('a')+c)}{chr(ord('a')+r)} (value={value:+.3f})")
+                        if not board.play(mv):
+                            board.play(-1); passes += 1
+                            path_moves.append(-1)
+                            print(f"AI 虚着 (value={value:+.3f})")
+                        else:
+                            passes = 0
+                            path_moves.append(mv)
+                            hist = my_hist[0] if to_play == 1 else my_hist[1]
+                            hist.pop(0); hist.append(mv)
+                            print(f"AI 落子 {chr(ord('a')+c)}{chr(ord('a')+r)} (value={value:+.3f})")
             move_count += 1
         print(board.to_string())
         score = board.score()
@@ -695,8 +758,8 @@ class GoAI:
             policy, value = self.predict(board, my_hist[0], my_hist[1], to_play)
             bs = self.board_size
             ranked = []
-            for m in legal:
-                ranked.append((m, float(policy[m])))
+            for m in np.where(legal)[0]:
+                ranked.append((int(m), float(policy[m])))
             ranked.append((bs * bs, float(policy[bs * bs])))  # pass
             ranked.sort(key=lambda t: t[1], reverse=True)
             print(f"当前 to_play={to_play}  value={value:+.3f}")
@@ -721,7 +784,7 @@ class GoAI:
             if inp in ("pass", ""):
                 board.play(-1); continue
             ok, mv = board.parse_move_str(inp, to_play)
-            if not ok or int(mv) not in legal.tolist():
+            if not ok or not legal[int(mv)]:
                 print("非法，重试。"); continue
             board.play(mv)
             hist = my_hist[0] if to_play == 1 else my_hist[1]

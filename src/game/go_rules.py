@@ -92,12 +92,35 @@ class GoBoard:
     def is_on_board(self, r, c):
         return 0 <= r < self.board_size and 0 <= c < self.board_size
 
-    def get_legal_moves(self) -> np.ndarray:
-        """返回长度为 size*size 的 bool 掩码，True 表示该点可落子。"""
+    def get_legal_moves(self, check_suicide: bool = False) -> np.ndarray:
+        """返回长度为 size*size 的 bool 掩码，True 表示该点可落子。
+
+        check_suicide=True 时额外过滤自杀手（需模拟落子，较慢但更准确）。
+        """
         n = self.board_size
         legal = (self.board == 0).reshape(-1).copy()
         if self.ko_point >= 0:
             legal[self.ko_point] = False
+        if check_suicide:
+            color = self.current_player
+            for i in range(n * n):
+                if not legal[i]:
+                    continue
+                r, c = divmod(i, n)
+                # 模拟落子检查是否为自杀
+                self.board[r, c] = color
+                has_liberty = self._group_has_liberty(r, c)
+                # 检查是否提掉对手子（非自杀）
+                if not has_liberty:
+                    opponent = -color
+                    for nb_r, nb_c in ((r-1,c),(r+1,c),(r,c-1),(r,c+1)):
+                        if self.is_on_board(nb_r, nb_c) and self.board[nb_r, nb_c] == opponent:
+                            if not self._group_has_liberty(nb_r, nb_c):
+                                has_liberty = True
+                                break
+                self.board[r, c] = 0
+                if not has_liberty:
+                    legal[i] = False
         return legal
 
     # ---- 连通块 / 气 -------------------------------------------------------
@@ -161,7 +184,7 @@ class GoBoard:
         color = self.board[seed_r, seed_c]
         stack = [(seed_r, seed_c)]
         seen = {(seed_r, seed_c)}
-        libs = 0
+        libs = set()
         while stack:
             r, c = stack.pop()
             for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
@@ -170,11 +193,11 @@ class GoBoard:
                     continue
                 v = self.board[nr, nc]
                 if v == 0:
-                    libs += 1
+                    libs.add((nr, nc))
                 elif v == color and (nr, nc) not in seen:
                     seen.add((nr, nc))
                     stack.append((nr, nc))
-        return libs
+        return len(libs)
 
     # ---- 落子 --------------------------------------------------------------
 

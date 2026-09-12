@@ -467,7 +467,7 @@ def main():
                          '.train_state.pt 恢复 optimizer/scheduler/step 计数继续训练')
     ap.add_argument('--value-loss-weight', type=float, default=5.0,
                     help='value loss 权重（BCE loss 下需更大权重平衡 policy/value 梯度）')
-    ap.add_argument('--value-lr-mult', type=float, default=2.0,
+    ap.add_argument('--value-lr-mult', type=float, default=5.0,
                     help='value head 学习率倍数（相对主干 LR，补偿参数量小的梯度不足）')
     ap.add_argument('--compile', action='store_true',
                     help='用 torch.compile 融合算子（GPU 上约 20-40%% 提速，首次迭代较慢）')
@@ -685,18 +685,36 @@ def main():
         logger.info("[model] 已启用 channels_last (NHWC) 内存格式（A100 卷积加速）")
 
     # 参数组：value head 独立 LR（参数量小，需要更高学习率补偿梯度不足）
-    value_params = list(model.value.parameters())
-    other_params = [p for n, p in model.named_parameters() if 'value' not in n]
+    # 排除 bias / BatchNorm / LayerNorm 参数的 weight decay（标准做法）
+    no_decay_params = set()
+    for name, param in model.named_parameters():
+        if param.ndim == 1:  # bias, BN/LN weight, BN/LN bias
+            no_decay_params.add(name)
+
+    value_decay = [p for n, p in model.value.named_parameters()
+                   if n not in no_decay_params]
+    value_no_decay = [p for n, p in model.value.named_parameters()
+                      if n in no_decay_params]
+    other_decay = [p for n, p in model.named_parameters()
+                   if 'value' not in n and n not in no_decay_params]
+    other_no_decay = [p for n, p in model.named_parameters()
+                      if 'value' not in n and n in no_decay_params]
+
     optimizer = torch.optim.AdamW([
-        {'params': other_params, 'lr': args.lr},
-        {'params': value_params, 'lr': args.lr * args.value_lr_mult},
-    ], weight_decay=args.weight_decay)
+        {'params': other_decay, 'lr': args.lr,
+         'weight_decay': args.weight_decay},
+        {'params': other_no_decay, 'lr': args.lr, 'weight_decay': 0.0},
+        {'params': value_decay, 'lr': args.lr * args.value_lr_mult,
+         'weight_decay': args.weight_decay},
+        {'params': value_no_decay, 'lr': args.lr * args.value_lr_mult,
+         'weight_decay': 0.0},
+    ])
     # BF16 后端（A100/NPU）下 use_scaler=False（BF16 不下溢，省去 loss scaling 的额外同步）；
     # V100/FP16 下开启 GradScaler。按设备选择 GradScaler 实现。
     if _backend == 'npu':
         scaler = npu_grad_scaler(enabled=use_scaler)
     else:
-        scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+        scaler = torch.amp.GradScaler(_backend, enabled=use_scaler)
 
     # ---- 学习率调度：基于“总 step 数”而非 epoch 数 ----
     # 旧版用 T_max=args.epochs 导致余弦在第 1 个 epoch 结束就被砍到 ~0，
@@ -716,6 +734,7 @@ def main():
     cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=after_warmup)
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_steps])
+    scheduler.step()  # 初始化 LR 为 warmup 起始值（0.1 * base_lr），避免第一步用满 lr
 
     bs = args.batch_size
     step = 0

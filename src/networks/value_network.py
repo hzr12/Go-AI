@@ -9,6 +9,7 @@ class ValueNetwork(nn.Module):
 
         self.value_head = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, 1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
             nn.ReLU(),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),

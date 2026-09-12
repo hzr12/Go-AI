@@ -142,8 +142,9 @@ class MCTS:
     def _planes1(self, board, my_hist, op_hist, to_play):
         """单局面 12 通道特征，带 LRU 缓存（相同局面复用）。"""
         # 缓存 key: 棋盘 hash + to_play（哈希 numpy 数组的 bytes）
-        cache_key = (board.board.tobytes(), int(to_play),
-                     tuple(my_hist), tuple(op_hist), board.ko_point)
+        h_key = tuple(my_hist) if not my_hist or isinstance(my_hist[0], int) else tuple(tuple(h) for h in my_hist)
+        oh_key = tuple(op_hist) if not op_hist or isinstance(op_hist[0], int) else tuple(tuple(h) for h in op_hist)
+        cache_key = (board.board.tobytes(), int(to_play), h_key, oh_key, board.ko_point)
         cached = self._plane_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -467,6 +468,87 @@ class MCTS:
         # 根价值 = max over 根的直接子节点 of -child 值
         return max((-cv for cv in node_val[0]), default=0.0)
 
+    def _batch_leaf_ab(self, leaf_data):
+        """跨叶子批量 leaf_ab：N 叶子只用 depth+1 次 predict（而非 N×(depth+1) 次）。
+
+        leaf_data: [(board, to_play, my_hist, op_hist), ...]  长度 N
+        Returns: [ab_v1, ab_v2, ...]（to_play 视角）
+        """
+        depth = self.leaf_ab_depth
+        width = self.leaf_ab_width
+        N = len(leaf_data)
+        if N == 0:
+            return []
+
+        # ---- Level 0：所有叶子根状态一次前向 ----
+        level0 = [(d[0], list(d[2]), list(d[3]), d[1]) for d in leaf_data]
+        rpol, _ = self._forward_level(level0)
+
+        # 为每个叶子取 top-width 候选，生成 level-1 子局面（play/undo，无前向）
+        # leaf_l1[i] = [(board_copy, child_to_play, my_hist, op_hist), ...]
+        leaf_l1 = []
+        for i, (board, to_play, my_hist, op_hist) in enumerate(leaf_data):
+            p = np.asarray(rpol[i]).reshape(-1)
+            legal = [int(m) for m in np.where(board.get_legal_moves())[0]] + [self.n_actions - 1]
+            order = sorted(legal, key=lambda m: -p[m])[:width]
+            leaf_l1.append(self._child_states(board, order, my_hist, op_hist, to_play))
+
+        # Level-1 一次前向
+        all_l1 = []
+        l1_map = []  # (leaf_idx, child_idx_in_leaf)
+        for i, children in enumerate(leaf_l1):
+            for j, cs in enumerate(children):
+                all_l1.append(cs)
+                l1_map.append((i, j))
+        if not all_l1:
+            return [0.0] * N
+        l1_pols, l1_vals = self._forward_level(all_l1)
+
+        # Level 2（depth>1）：为每个 level-1 节点生成子局面，一次前向
+        if depth > 1:
+            all_l2 = []
+            l2_parent = []  # index into all_l1
+            for idx, (cb, cmy, cop, cto) in enumerate(all_l1):
+                pp = np.asarray(l1_pols[idx]).reshape(-1)
+                lleg = [int(m) for m in np.where(cb.get_legal_moves())[0]] + [self.n_actions - 1]
+                porder = sorted(lleg, key=lambda m: -pp[m])[:width]
+                l2_children = self._child_states(cb, porder, cmy, cop, cto)
+                for gc in l2_children:
+                    all_l2.append(gc)
+                    l2_parent.append(idx)
+            if all_l2:
+                _, l2_vals = self._forward_level(all_l2)
+            else:
+                l2_vals = np.zeros(0)
+        else:
+            all_l2 = []
+            l2_parent = []
+            l2_vals = np.zeros(0)
+
+        # ---- 自底向上传播 minimax ----
+        # l2 → l1：每个 l1 节点取 max(-child_value)
+        l1_merged = np.array([float(l1_vals[k]) for k in range(len(all_l1))])
+        if len(all_l2) > 0:
+            from collections import defaultdict
+            l2_groups = defaultdict(list)
+            for gi, pi in enumerate(l2_parent):
+                l2_groups[pi].append(-float(l2_vals[gi]))
+            for pi, cvs in l2_groups.items():
+                l1_merged[pi] = max(cvs)
+
+        # l1 → root（每个叶子取 max(-l1_value)）
+        results = []
+        offset = 0
+        for i in range(N):
+            n_children = len(leaf_l1[i])
+            if n_children == 0:
+                results.append(0.0)
+            else:
+                leaf_vals = [-float(l1_merged[offset + j]) for j in range(n_children)]
+                results.append(max(leaf_vals))
+            offset += n_children
+        return results
+
     def lookahead(self, board, my_hist, op_hist, to_play, topk=12, width=4,
                   depth=2):
         """策略 N 步批量推演（minimax 展开 top-K/width 着法树，价值回传）。
@@ -775,9 +857,37 @@ class MCTS:
                 leaf = pth[-1]
                 if leaf.board is None:
                     leaf.board = self._replay_path(pth)
+            # ---- 批量 leaf_ab：所有叶子的 _leaf_ab 合并为 depth+1 次 predict ----
+            if self.leaf_ab_depth > 0:
+                ab_data = []
+                ab_indices = []
+                for bi, pth in enumerate(batch):
+                    leaf = pth[-1]
+                    if leaf.prefetch is not None and abs(leaf.prefetch[1]) < self.leaf_ab_uncertain:
+                        board = leaf.board
+                        ab_data.append((board, leaf.to_play,
+                                        list(leaf.my_hist), list(leaf.op_hist)))
+                        ab_indices.append(bi)
+                if ab_data:
+                    ab_vs = self._batch_leaf_ab(ab_data)
+                    for j, bi in enumerate(ab_indices):
+                        leaf = batch[bi][-1]
+                        lp, leaf_v = leaf.prefetch
+                        ab_v = ab_vs[j]
+                        new_v = (1.0 - self.leaf_ab_weight) * leaf_v + self.leaf_ab_weight * ab_v
+                        leaf.prefetch = (lp, new_v)
+                        if ab_v >= self.solver_thresh:
+                            leaf.proved = 1
+                        elif ab_v <= -self.solver_thresh:
+                            leaf.proved = -1
+            # ---- 展开所有叶子（leaf_ab 已完成，临时关闭避免重复） ----
+            saved_lab = self.leaf_ab_depth
+            self.leaf_ab_depth = 0
+            for pth in batch:
+                leaf = pth[-1]
                 self._expand(leaf)
-                leaf.board = None  # 展开完成即释放盘面
-                self._backup(pth, v_leaf=-leaf.value_sum)  # leaf 我方视角
+                leaf.board = None
+                self._backup(pth, v_leaf=-leaf.value_sum)
                 expanded_count += 1
                 pending -= 1
                 if progress_cb is not None:
@@ -785,6 +895,7 @@ class MCTS:
                         progress_cb(expanded_count, root)
                     except Exception:  # noqa: BLE001
                         pass
+            self.leaf_ab_depth = saved_lab
             batch = []
         finished.set()
         for t in threads:

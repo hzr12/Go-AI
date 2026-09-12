@@ -271,7 +271,8 @@ def build(src, board_size, max_games, chunk_size=0, out=None, tmp_root=None):
 
         board = GoBoard(board_size, komi=game.komi)
         history = []  # 扁平坐标序列（pass 记为 -1）
-        for mv in game.moves:
+        n_moves = len(game.moves)
+        for i, mv in enumerate(game.moves):
             to_play = board.current_player
             recent = history[-3:] if len(history) >= 3 else history
             my_h, op_h = split_hist(recent, to_play)
@@ -280,12 +281,15 @@ def build(src, board_size, max_games, chunk_size=0, out=None, tmp_root=None):
             # 落子坐标：pass 记 -1；否则把小棋盘坐标居中映射到大棋盘
             target = -1 if (r, c) == (-1, -1) else (r + off) * board_size + (c + off)
 
+            # position-specific value: 开局→0, 终局→game_result（线性插值）
+            pos_value = int(value * (i + 1) / n_moves)
+
             cur['boards'].append(board.board.copy())
             cur['my_hists'].append(pad3(my_h))
             cur['op_hists'].append(pad3(op_h))
             cur['kos'].append(ko)
             cur['moves'].append(target)
-            cur['values'].append(value)
+            cur['values'].append(pos_value)
             cur['to_plays'].append(to_play)
 
             play_move = target  # 与 target 相同，无需重复计算

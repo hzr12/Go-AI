@@ -12,6 +12,8 @@ class ResBlock(nn.Module):
         self.bn1 = nn.BatchNorm2d(channels)
         self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(channels)
+        # Zero-init bn2 gamma 使残差块初始为恒等映射（He et al. 2016）
+        nn.init.zeros_(self.bn2.weight)
 
     def forward(self, x):
         residual = x
@@ -325,10 +327,10 @@ class MultiHeadSelfAttention(nn.Module):
         vg = vg[:, :, r_idx, c_idx].reshape(B, Hh, ng, d)
 
         # ---- 4) 注意力 logits：全局 key 用 einsum 广播，避免 expand().reshape() 拷贝 ----
-        local_logits = qc @ kw.transpose(-2, -1)             # (B*N, Hh, 1, ws²)
+        local_logits = (qc * self.scale) @ kw.transpose(-2, -1)             # (B*N, Hh, 1, ws²)
         qc_5d = qc.view(B, N, Hh, 1, d)
         global_logits = torch.einsum('bnhid,bnhgd->bnhig',
-                                     qc_5d, kg.unsqueeze(1))  # (B, N, Hh, 1, ng)
+                                     qc_5d * self.scale, kg.unsqueeze(1))  # (B, N, Hh, 1, ng)
         global_logits = global_logits.reshape(B * N, Hh, 1, ng)
         all_logits = torch.cat([local_logits, global_logits], dim=-1)  # (B*N, Hh, 1, ws²+ng)
         attn = all_logits.softmax(dim=-1)

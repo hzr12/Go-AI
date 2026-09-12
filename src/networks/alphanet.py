@@ -30,7 +30,7 @@ class AlphaGoNet(nn.Module):
                  attn_window: int = 7,
                  policy_channels: int = 32,
                  value_channels: int = 64,
-                 action_size: int = 361):
+                 action_size: int = 362):
         """
         Args:
             attention_mode:      主干中注意力的使用方式
