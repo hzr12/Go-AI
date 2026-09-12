@@ -739,7 +739,10 @@ def main():
             tstate = torch.load(state_path, map_location=device)
             optimizer.load_state_dict(tstate['optimizer'])
             scheduler.load_state_dict(tstate['scheduler'])
-            scaler.load_state_dict(tstate['scaler'])
+            try:
+                scaler.load_state_dict(tstate['scaler'])
+            except (RuntimeError, KeyError):
+                logger.warning("[resume] scaler 状态不兼容（可能是 BF16→FP16 切换），从头开始")
             step = tstate.get('step', 0)
             best_eval_acc = tstate.get('best_eval_acc', -1.0)
             start_epoch = tstate.get('epoch', 0)
