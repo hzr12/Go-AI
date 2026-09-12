@@ -131,17 +131,32 @@ class MCTS:
         self.dir_eps = float(dirichlet_eps)
         self._fast_policy = FastPolicy(board_size) if use_rollout else None
         self._rng = np.random.default_rng(1234)
+        # 特征缓存：避免相同局面重复计算 feature_planes_batched
+        self._plane_cache = {}
+        self._plane_cache_max = 2048
 
     # ------------------------------------------------------------------ #
     def _clone_hist(self, h):
         return list(h)
 
-    @staticmethod
-    def _planes1(board, my_hist, op_hist, to_play):
-        """单局面 12 通道特征，但走向量化批量接口（B=1），与 feature_planes 语义一致。"""
-        return board.feature_planes_batched(
+    def _planes1(self, board, my_hist, op_hist, to_play):
+        """单局面 12 通道特征，带 LRU 缓存（相同局面复用）。"""
+        # 缓存 key: 棋盘 hash + to_play（哈希 numpy 数组的 bytes）
+        cache_key = (board.board.tobytes(), int(to_play),
+                     tuple(my_hist), tuple(op_hist), board.ko_point)
+        cached = self._plane_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        planes = board.feature_planes_batched(
             board.board[None], [list(my_hist)], [list(op_hist)],
             [to_play], [board.ko_point])[0]
+        # LRU: 超过上限时淘汰一半最早的条目
+        if len(self._plane_cache) >= self._plane_cache_max:
+            keys = list(self._plane_cache.keys())
+            for k in keys[:len(keys) // 2]:
+                del self._plane_cache[k]
+        self._plane_cache[cache_key] = planes
+        return planes
 
     def _child_states(self, board, moves, my_hist, op_hist, to_play):
         """给定局面与候选着法，返回各子局面的 (GoBoard, my_h, op_h, to_play)。
@@ -642,6 +657,7 @@ class MCTS:
         leaf_q: _queue.Queue = _queue.Queue()
         finished = threading.Event()
         produced = 0
+        self._plane_cache.clear()  # 每次搜索开始时清空特征缓存
         pending = 0   # 已入队、主线程尚未展开完成的路径数
         expanded_count = 0
         total = simulations

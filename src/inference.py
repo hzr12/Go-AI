@@ -371,7 +371,7 @@ class GoAI:
             print(f"[GoAI] 动态量化失败，保持 fp32: {e}")
             return False
 
-    def export_onnx(self, onnx_path, ort_intra_threads=None):
+    def export_onnx(self, onnx_path, ort_intra_threads=None, quantize_int8=False):
         """导出 ONNX 并把推理后端切换到 onnxruntime（CPU 提速约 1.5-3x）。
 
         需 `pip install onnx onnxruntime`。失败时保持 torch 后端并返回 False。
@@ -379,6 +379,7 @@ class GoAI:
 
         ort_intra_threads: 每个 ort.run 的内部线程数。None 时取满物理核；
             MCTS 多线程并发调用时建议传入 max(1, ncpu // num_threads) 避免超线程争抢。
+        quantize_int8: True 时导出后应用 int8 动态量化（模型体积 ~1/4，CPU 推理 ~2x）。
         """
         try:
             import onnxruntime as ort
@@ -395,6 +396,17 @@ class GoAI:
                               "policy": {0: "batch"},
                               "value": {0: "batch"}},
                 opset_version=18)
+            # int8 动态量化（可选）
+            if quantize_int8:
+                try:
+                    from onnxruntime.quantization import quantize_dynamic, QuantType
+                    quantize_dynamic(
+                        model_input=onnx_path,
+                        model_output=onnx_path,
+                        weight_type=QuantType.QInt8)
+                    print(f"[GoAI] 已应用 ONNX int8 动态量化: {onnx_path}")
+                except Exception as e:  # noqa: BLE001
+                    print(f"[GoAI] int8 量化失败，使用 FP32 模型: {e}")
             so = ort.SessionOptions()
             so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL

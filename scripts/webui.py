@@ -976,7 +976,7 @@ document.getElementById('sims').disabled =
 
 def main():
     ap = argparse.ArgumentParser(description="Go-AI WebUI（19 路人机对弈 + MCTS 可视化）")
-    ap.add_argument("--model", default="models/sft_19x19_v6.pth")
+    ap.add_argument("--model", default="models/sft_19x19_v7.pth")
     ap.add_argument("--board-size", type=int, default=19)
     ap.add_argument("--device", default="auto")
     ap.add_argument("--port", type=int, default=7860)
@@ -1021,6 +1021,8 @@ def main():
                     help="CPU int8 动态量化 Linear 层（与 --compile 互斥）")
     ap.add_argument("--onnx", nargs="?", const="models/goai_cpu.onnx", default=None,
                     help="导出 ONNX 并用 onnxruntime 推理（CPU 提速 1.5-3x，需 pip install onnx onnxruntime）")
+    ap.add_argument("--onnx-int8", action="store_true",
+                    help="导出 ONNX 时应用 int8 动态量化（模型体积 ~1/4，CPU 推理 ~2x）")
     ap.add_argument("--use-rollout", action="store_true", help="启用 LightPLS 价值融合")
     ap.add_argument("--rollout-lambda", type=float, default=0.25)
     ap.add_argument("--rollout-steps", type=int, default=None,
@@ -1058,7 +1060,7 @@ def main():
     if args.onnx:
         # ONNX intra_op 用满物理核（单次大 batch 吞吐最高）
         _ort_intra = max(2, _ncpu)
-        ai.export_onnx(args.onnx, ort_intra_threads=_ort_intra)
+        ai.export_onnx(args.onnx, ort_intra_threads=_ort_intra, quantize_int8=args.onnx_int8)
     session = Session(ai, board_size=ai.board_size, num_threads=_nt,
                       default_mode=args.mode, expand_topk=args.expand_topk,
                       expand_chunk=args.expand_chunk,
