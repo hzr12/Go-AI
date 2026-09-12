@@ -450,17 +450,26 @@ class GoAI:
 
         导出捕获的是模型原始输出（policy 为 logits），此处补 softmax 与
         torch 后端（_forward_batch 内 softmax）对齐。
-        量化模型导出为固定 batch=1，此处自动逐样本推理。
+        量化模型为固定 batch=1，自动分批推理减少 ort.run 开销。
         """
         xnp = x.detach().cpu().numpy().astype(np.float32)
         B = xnp.shape[0]
-        all_pol, all_val = [], []
-        for i in range(B):
-            pol, val = self._ort.run(None, {"x": xnp[i:i+1]})
-            all_pol.append(pol[0])
-            all_val.append(val[0])
-        pol = np.stack(all_pol, axis=0).astype(np.float32)
-        val = np.stack(all_val, axis=0).astype(np.float32)
+        # 尝试一次性推理（动态 batch 模型）；失败则逐批（静态 batch=1 量化模型）
+        try:
+            pol, val = self._ort.run(None, {"x": xnp})
+            pol = np.asarray(pol, dtype=np.float32)
+            val = np.asarray(val, dtype=np.float32)
+        except Exception:
+            # 静态 batch 模型：分批推理，每批 8 样本（减少 ort.run 开销）
+            batch_size = min(8, B)
+            all_pol, all_val = [], []
+            for i in range(0, B, batch_size):
+                chunk = xnp[i:i+batch_size]
+                pol, val = self._ort.run(None, {"x": chunk})
+                all_pol.append(np.asarray(pol, dtype=np.float32))
+                all_val.append(np.asarray(val, dtype=np.float32))
+            pol = np.concatenate(all_pol, axis=0)
+            val = np.concatenate(all_val, axis=0)
         # numerically stable softmax (avoid torch dependency in ONNX path)
         pol -= pol.max(axis=-1, keepdims=True)
         np.exp(pol, out=pol)
