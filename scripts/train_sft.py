@@ -1039,7 +1039,7 @@ def main():
                     value_loss = F.binary_cross_entropy_with_logits(
                         value_logit.float().squeeze(), value_target)
                     loss = policy_loss + args.value_loss_weight * value_loss
-                (loss / _accum_steps).backward()
+                scaler.scale(loss / _accum_steps).backward()
                 if (i + 1) % _accum_steps == 0 or (i + 1) == n_batches:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
