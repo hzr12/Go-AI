@@ -87,6 +87,8 @@ class GoBoard:
         nb.passes = self.passes
         nb.move_history = []
         nb._undo_stack = []
+        nb._legal_cache = None
+        nb._legal_cache_suicide = None
         return nb
 
     # ---- 基础查询 ----------------------------------------------------------

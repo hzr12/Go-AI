@@ -9,10 +9,15 @@ class ValueNetwork(nn.Module):
 
         self.value_head = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, 1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(),
+            nn.Dropout2d(0.1),
+            nn.Conv2d(hidden_channels, hidden_channels // 2, 1, bias=False),
+            nn.BatchNorm2d(hidden_channels // 2),
             nn.ReLU(),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(hidden_channels, 1),
+            nn.Linear(hidden_channels // 2, 1),
         )
 
     def forward(self, x):

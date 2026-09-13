@@ -1056,8 +1056,8 @@ def main():
                     policy_logits, value_logit = model(state)
                     policy_loss = F.cross_entropy(policy_logits.float(), move_t,
                                                   label_smoothing=args.label_smoothing)
-                    # BCEWithLogitsLoss: target ±1 → 0/1，logit 直接输入无 Tanh
-                    value_target = (value_t.squeeze().float() + 1) / 2  # ±1 → 0/1
+                    # BCEWithLogitsLoss: target ±1 → 0.1/0.9（软标签，防止过拟合）
+                    value_target = (value_t.squeeze().float() + 1) / 2 * 0.8 + 0.1  # ±1 → 0.1/0.9
                     value_loss = F.binary_cross_entropy_with_logits(
                         value_logit.float().squeeze(), value_target)
                     loss = policy_loss + args.value_loss_weight * value_loss
