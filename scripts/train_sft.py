@@ -573,6 +573,9 @@ def main():
     ap.add_argument('--resume', default='',
                     help='断点续训：指定已保存的 .pth 模型路径，会从该权重 + 同目录 '
                          '.train_state.pt 恢复 optimizer/scheduler/step 计数继续训练')
+    ap.add_argument('--model', default='',
+                    help='加载预训练权重（仅权重，optimizer/scheduler/step 从头开始）。'
+                         '用于迁移学习或微调，不加载优化器状态')
     ap.add_argument('--value-loss-weight', type=float, default=5.0,
                     help='value loss 权重（BCE loss 下需更大权重平衡 policy/value 梯度）')
     ap.add_argument('--value-lr-mult', type=float, default=5.0,
@@ -909,11 +912,30 @@ def main():
             start_epoch = tstate.get('epoch', 0)
             if 'rng' in tstate:
                 torch.set_rng_state(tstate['rng'].cpu())
+            # 恢复 EMA shadow 状态
+            if ema is not None and 'ema_shadow' in tstate:
+                ema.shadow = tstate['ema_shadow']
+                logger.info("[resume] 恢复 EMA shadow 状态")
+            elif ema is not None:
+                logger.warning("[resume] 未找到 EMA shadow 状态，EMA 从头开始")
             logger.info("[resume] 恢复训练状态 | step=%d best_eval_acc=%.4f epoch=%d",
                         step, best_eval_acc, start_epoch)
         else:
             logger.warning("[resume] 未找到 %s（仅恢复模型权重，optimizer/scheduler 从头开始）",
                            state_path)
+
+    # ---- 仅加载模型权重（不加载 optimizer/scheduler/step）----
+    if args.model:
+        if not os.path.isfile(args.model):
+            raise FileNotFoundError(f"--model 指定的模型不存在: {args.model}")
+        logger.info("[model] 仅加载模型权重: %s（optimizer/scheduler 从头开始）", args.model)
+        ckpt = torch.load(args.model, map_location=device)
+        # 统一前缀：checkpoint 可能带（来自 compile 存档）或不带 "_orig_mod." 前缀
+        ckpt = {k.replace('_orig_mod.', '', 1): v for k, v in ckpt.items()}
+        target = getattr(model, '_orig_mod', model)
+        if hasattr(model, '_orig_mod'):
+            ckpt = {'_orig_mod.' + k: v for k, v in ckpt.items()}
+        target.load_state_dict(ckpt)
 
     # torch.compile 融合算子（GPU 上约 20-40%% 提速）。必须在 resume 加载之后再做，
     # 否则模型会被包成 OptimizedModule，其 state_dict 带 "_orig_mod." 前缀，与
@@ -1120,7 +1142,7 @@ def main():
             # 定期保存快照（仅主进程写盘）
             if is_main and args.save_every > 0 and step % args.save_every == 0:
                 save_model(model, args.out + '.latest')
-                torch.save({
+                _state = {
                     'optimizer': optimizer.state_dict(),
                     'scheduler': scheduler.state_dict(),
                     'scaler': scaler.state_dict(),
@@ -1128,7 +1150,10 @@ def main():
                     'epoch': epoch,
                     'best_eval_acc': best_eval_acc,
                     'rng': torch.get_rng_state(),
-                }, args.out + '.latest.train_state')
+                }
+                if ema is not None:
+                    _state['ema_shadow'] = ema.shadow
+                torch.save(_state, args.out + '.latest.train_state')
 
             # 定期评估：综合指标（所有 rank 都做 eval，避免 barrier 死锁）
             if args.eval_every > 0 and step % args.eval_every == 0 and len(eval_idx) > 0:
@@ -1152,6 +1177,19 @@ def main():
                         if ema is not None:
                             ema.apply_shadow()
                         save_model(model, args.out)
+                        # 保存 train_state 到最佳模型路径，确保 --resume 最佳模型时状态一致
+                        _state = {
+                            'optimizer': optimizer.state_dict(),
+                            'scheduler': scheduler.state_dict(),
+                            'scaler': scaler.state_dict(),
+                            'step': step,
+                            'epoch': epoch,
+                            'best_eval_acc': best_eval_acc,
+                            'rng': torch.get_rng_state(),
+                        }
+                        if ema is not None:
+                            _state['ema_shadow'] = ema.shadow
+                        torch.save(_state, args.out + '.train_state')
                         if ema is not None:
                             ema.restore()
 
