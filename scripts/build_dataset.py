@@ -255,6 +255,13 @@ def build(src, board_size, max_games, chunk_size=0, out=None, tmp_root=None):
         # 小于目标的（如 9x9 棋谱喂到 19x19）做居中 pad，见下方 off。
         if game is None or game.board_size > board_size:
             return 0, 1
+        # 过滤让子棋：AB/AW 会导致 board.play() 颜色交替错误，整局数据损坏
+        if game.moves and game.moves[0].color == 'B':
+            # 检查前 N 手是否全是黑棋（让子棋特征）
+            n_handicap = sum(1 for mv in game.moves
+                            if mv.color == game.moves[0].color)
+            if n_handicap > 1:
+                return 0, 1
         # 小棋盘居中到大棋盘的偏移量（9x9->19x19 时 off=5，棋形居中不偏）
         off = (board_size - game.board_size) // 2 if game.board_size != board_size else 0
         # 校验所有坐标在原始棋谱尺寸范围内（pass 为 -1 合法），超出则整局丢弃。
