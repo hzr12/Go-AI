@@ -186,7 +186,7 @@ SharedBackbone(in_ch=12, ch=128, res_blocks=12, 注意力模式)
 - `forward(x)` → `(policy_logits, value)`；`policy_logits` 在推理时经 `softmax` 得概率。
 - `action_size = n*n + 1`，**多出的 1 类是 pass**。
 - 注意力（可选，默认 `mix`）：`global`（全配对）/ `window`（滑动窗口，`--attn-window`）/
-  `window_global`（窗口 + 全局 token，`--attn-global-tokens 25`）/ `axial`（轴向）；
+  `window_global`（窗口 + 全局 token）/ `axial`（轴向）；
   `attention_mode`：`none`（纯卷积）/ `mix`（卷积+注意力混合）/ `all`（全注意力）。
   V100 上推荐 `--attn-mode window --attn-window 7`（注意力约 7× 提速）；
   `window_global` 比 `sparse` 快约 35%，比 `global` 快约 14%，综合最优。
@@ -335,7 +335,6 @@ python scripts/train_sft.py --data data/sgf_19x19.npz --out models/sft_19x19.pth
 | `--attention-dropout` | `0.1` | 注意力 dropout（默认 0.1，防过拟合）|
 | `--attn-mode` | `global` | `global`/`window`/`axial`/`window_global` |
 | `--attn-window` | `7` | window 模式窗口边长 |
-| `--attn-global-tokens` | `25` | window_global 模式全局 token 数 |
 | `--value-loss-weight` | `5.0` | 价值损失权重（推荐 5.0，平衡策略/价值梯度量级）|
 | `--value-lr-mult` | `2.0` | 价值网络头学习率倍率（推荐 2.0，价值头收敛更慢需更大 LR）|
 | `--label-smoothing` | `0.1` | 标签平滑（0=关闭，推荐 0.1）|
@@ -426,7 +425,7 @@ python src/inference.py --model models/sft_19x19.pth --board-size 19 \
 
 CLI 参数（`--mode` ∈ {selfplay, human, analyze}）：`--model`、`--board-size`、`--device`、`--use-amp`、
 `--compile`、`--tf32`、`--attention-mode`、`--num-attention-layers`、`--num-heads`、`--attention-dropout`、
-`--attn-mode`（含 `window_global`）、`--attn-window`、`--attn-global-tokens`、
+`--attn-mode`（含 `window_global`）、`--attn-window`、
 `--temperature`、`--topk`、`--games`、`--use-mcts`、`--simulations`、
 `--num-threads`、`--use-rollout`、`--rollout-lambda`、`--human-color`、`--onnx`、`--onnx-int8`。
 

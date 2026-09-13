@@ -173,8 +173,8 @@ class SGFParser:
         return properties
     
     def _coord_from(self, pos_str: str):
-        """SGF 坐标 -> (row, col)。空串或超范围（`tt` 等）表示 pass，返回 (-1, -1)。"""
-        if not pos_str:
+        """SGF 坐标 -> (row, col)。空串、单字符或超范围（`tt` 等）表示 pass，返回 (-1, -1)。"""
+        if not pos_str or len(pos_str) < 2:
             return (-1, -1)
         col = ord(pos_str[0]) - ord('a')
         row = ord(pos_str[1]) - ord('a')

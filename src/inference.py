@@ -250,9 +250,9 @@ class GoAI:
         if attn_count:
             info["num_attention_layers"] = attn_count
         # num_heads: backbone.blocks.{i}.attn.qkv.weight shape = [3*C, C] → heads 由 C 推断
-        # policy_channels: policy.policy_head.0.weight shape = [P, C, 1, 1]
+        # policy_channels: policy.conv1.weight shape = [P, C, 1, 1]
         for k, v in state.items():
-            if k == "policy.policy_head.0.weight" and isinstance(v, torch.Tensor):
+            if k == "policy.conv1.weight" and isinstance(v, torch.Tensor):
                 info["policy_channels"] = v.shape[0]
                 break
         # value_channels: value.value_head.0.weight shape = [V, C, 1, 1]
@@ -801,11 +801,12 @@ def main():
     parser.add_argument("--attention-dropout", type=float, default=0.0)
     parser.add_argument("--policy-channels", type=int, default=32,
                         help="policy 头隐层通道（须与训练时一致，训练默认 32）")
-    parser.add_argument("--value-channels", type=int, default=16,
-                        help="value 头隐层通道（须与训练时一致，训练默认 16）")
+    parser.add_argument("--value-channels", type=int, default=64,
+                        help="value 头隐层通道（须与训练时一致，训练默认 64）")
     parser.add_argument("--attn-mode", default="global",
-                        choices=["global", "window", "axial"],
-                        help="注意力计算模式: global=全配对, window=滑动窗口, axial=轴向")
+                        choices=["global", "window", "axial", "sparse", "window_global"],
+                        help="注意力计算模式: global=全配对, window=滑动窗口, axial=轴向, "
+                             "sparse=窗口+全局token, window_global=块状窗口+全局token")
     parser.add_argument("--attn-window", type=int, default=7, help="window 模式窗口边长")
     parser.add_argument("--compile", action="store_true", help="用 torch.compile 融合算子（GPU 提速）")
     parser.add_argument("--tf32", action="store_true",
