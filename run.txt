@@ -13,39 +13,47 @@ python scripts/build_dataset.py \
 # ---- ② 验证 npz 包含 game_ids（必须输出 True）----
 python -c "import numpy as np; d=np.load('data/sgf_19x19_full.npz'); print('game_ids' in d)"
 
-# ---- ③ 4卡 NPU 训练 ----
+# ---- ③ 4卡 NPU 训练（实测命令）----
 torchrun --nproc_per_node=4 scripts/train_sft.py \
   --data data/sgf_19x19_full.npz \
   --device npu --board-size 19 \
   --backbone-channels 192 --backbone-res-blocks 17 \
-  --batch-size 400 --epochs 8 \
+  --batch-size 2400 --epochs 2 \
   --lr 0.002 --weight-decay 0.0001 \
-  --attention-mode mix --num-attention-layers 4 --num-heads 4 \
-  --attn-mode window --attn-window 7 \
+  --attention-mode mix --num-attention-layers 6 --num-heads 4 \
+  --attn-mode window_global --attn-window 7 \
   --attention-dropout 0.1 --label-smoothing 0.1 \
-  --gradient-accumulation-steps 1 \
+  --gradient-accumulation-steps 2 \
   --use-amp --use-ema \
   --log-every 50 --eval-every 500 --save-every 500 \
-  --out models/sft_19x19_v6.pth
+  --prefetch-depth 5 --use-checkpoint \
+  --out models/sft_19x19_v8.pth
+
+# ---- 实测性能（4卡 910A）----
+# batch=2400/卡, accum=2, 等效全局 batch=2400*4*2=19200
+# step 50:  168 samples/s (含编译预热)
+# step 100: 251 samples/s (稳态)
+# 显存: 26.52 GB/卡
+# 估算总耗时: 5114 steps / 251 s/s ≈ 20.4 小时 (2 epochs)
 
 # ---- ④ 评估棋力（vs 随机）----
 python scripts/evaluate.py \
-  --model models/sft_19x19_v6.pth \
+  --model models/sft_19x19_v8.pth \
   --board-size 19 --device npu \
   --mode random --num-games 100 \
   --use-mcts --simulations 400 --num-threads 4
 
 # ---- ⑤ ELO 评分 ----
 python scripts/eval_elo.py \
-  --model models/sft_19x19_v6.pth \
+  --model models/sft_19x19_v8.pth \
   --board-size 19 --device npu \
   --num-games 50 --simulations 400
 
 # ---- ⑥ 自对弈测试 ----
 python src/inference.py \
-  --model models/sft_19x19_v6.pth \
+  --model models/sft_19x19_v8.pth \
   --board-size 19 --device npu --use-amp \
-  --attn-mode window --attn-window 7 \
+  --attn-mode window_global --attn-window 7 \
   --mode selfplay --games 10 \
   --use-mcts --simulations 400 --num-threads 4
 
