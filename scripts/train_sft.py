@@ -866,7 +866,7 @@ def main():
     cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=after_warmup)
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_steps])
-    scheduler.step()  # 初始化 LR 为 warmup 起始值（0.1 * base_lr），避免第一步用满 lr
+    # scheduler 首次 step 在第一个 optimizer.step() 之后执行，避免 PyTorch 警告
 
     bs = args.batch_size
     step = 0
