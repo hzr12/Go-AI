@@ -581,6 +581,8 @@ def main():
                     help='policy loss label smoothing（0=不平滑，0.1=标准值）')
     ap.add_argument('--use-checkpoint', action='store_true',
                     help='用 gradient checkpointing 减少显存占用（约省 50%%，训练慢 ~30%%）')
+    ap.add_argument('--use-ema', action='store_true',
+                    help='启用 EMA（指数移动平均）权重，eval/save 时用 shadow 权重，提升 1-3%% accuracy')
     ap.add_argument('--gradient-accumulation-steps', type=int, default=1,
                     help='梯度累积步数（模拟更大 batch size，效果等同于 batch_size * N）')
     ap.add_argument('--compile', action='store_true',
@@ -771,6 +773,7 @@ def main():
         eval_idx = np.array([i for i in range(n) if dataset.game_ids[i] not in train_game_set])
         logger.info("[data] 按棋局分割：总棋局=%d 训练棋局=%d 验证棋局=%d",
                     len(unique_games), n_train_games, len(unique_games) - n_train_games)
+        n_train = len(train_idx)
     else:
         n_train = int(n * 0.98)
         idx_all = np.arange(n)
@@ -843,7 +846,7 @@ def main():
         scaler = torch.amp.GradScaler(_backend, enabled=use_scaler)
 
     # EMA（指数移动平均）：eval/save 时用 shadow 权重，提升 1-3% accuracy
-    ema = EMA(model, decay=0.999)
+    ema = EMA(model, decay=0.999) if args.use_ema else None
 
     # ---- 学习率调度：基于“总 step 数”而非 epoch 数 ----
     # 旧版用 T_max=args.epochs 导致余弦在第 1 个 epoch 结束就被砍到 ~0，
@@ -1043,7 +1046,8 @@ def main():
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)
-                    ema.update()
+                    if ema is not None:
+                        ema.update()
             except Exception as oom_exc:
                 # 同时捕获 CUDA 与 NPU 的 OOM（两后端异常类型不同）
                 _oom_types = [torch.cuda.OutOfMemoryError]
@@ -1128,11 +1132,13 @@ def main():
 
             # 定期评估：综合指标（所有 rank 都做 eval，避免 barrier 死锁）
             if args.eval_every > 0 and step % args.eval_every == 0 and len(eval_idx) > 0:
-                ema.apply_shadow()
+                if ema is not None:
+                    ema.apply_shadow()
                 metrics = evaluate_metrics(
                     model, dataset, eval_idx, bs, device, amp_dtype,
                     use_channels_last=use_channels_last)
-                ema.restore()
+                if ema is not None:
+                    ema.restore()
                 if is_main:
                     logger.info(
                         "[eval] step=%d top1=%.4f top5=%.4f top10=%.4f "
@@ -1143,9 +1149,11 @@ def main():
                 if metrics['top1'] > best_eval_acc:
                     best_eval_acc = metrics['top1']
                     if is_main:
-                        ema.apply_shadow()
+                        if ema is not None:
+                            ema.apply_shadow()
                         save_model(model, args.out)
-                        ema.restore()
+                        if ema is not None:
+                            ema.restore()
 
 if __name__ == "__main__":
     main()
