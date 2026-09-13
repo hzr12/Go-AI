@@ -288,9 +288,18 @@ def build(src, board_size, max_games, chunk_size=0, out=None, tmp_root=None):
             # 落子坐标：pass 记 -1；否则把小棋盘坐标居中映射到大棋盘
             target = -1 if (r, c) == (-1, -1) else (r + off) * board_size + (c + off)
 
-            # position-specific value: 开局→0, 终局→game_result（线性插值）
-            # 注意：必须用 round() 而非 int()，int() 截断会导致 99.5% 的 value target 为 0
-            pos_value = round(value * (i + 1) / n_moves)
+            # position-specific value（当前执子方视角）：
+            #   前 30%：0（开局不确定）
+            #   中 50%：0 → game_result 线性过渡
+            #   后 20%：game_result（终局确定）
+            fv = value * to_play  # 当前执子方视角
+            frac = (i + 1) / n_moves
+            if frac <= 0.3:
+                pos_value = 0
+            elif frac <= 0.8:
+                pos_value = round(fv * (frac - 0.3) / 0.5)
+            else:
+                pos_value = round(fv)
 
             cur['boards'].append(board.board.copy())
             cur['my_hists'].append(pad3(my_h))

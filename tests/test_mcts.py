@@ -66,7 +66,7 @@ def test_mcts_prefers_capture_over_random():
     move_int, is_pass = mcts.best_move(
         board, hist[0], hist[1], to_play=1, simulations=30)
     legal = board.get_legal_moves()
-    assert move_int in legal or move_int == 9 * 9
+    assert legal[move_int] or move_int == 9 * 9
 
 
 def test_light_rollout_runs():
