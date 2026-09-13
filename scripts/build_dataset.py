@@ -285,7 +285,8 @@ def build(src, board_size, max_games, chunk_size=0, out=None, tmp_root=None):
             target = -1 if (r, c) == (-1, -1) else (r + off) * board_size + (c + off)
 
             # position-specific value: 开局→0, 终局→game_result（线性插值）
-            pos_value = int(value * (i + 1) / n_moves)
+            # 注意：必须用 round() 而非 int()，int() 截断会导致 99.5% 的 value target 为 0
+            pos_value = round(value * (i + 1) / n_moves)
 
             cur['boards'].append(board.board.copy())
             cur['my_hists'].append(pad3(my_h))
