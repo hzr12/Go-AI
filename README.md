@@ -16,23 +16,20 @@
 - [2. 安装](#2-安装)
 - [3. 项目结构](#3-项目结构)
 - [4. 核心概念](#4-核心概念)
-  - [4.1 棋盘与规则引擎 `GoBoard`](#41-棋盘与规则引擎-goboard)
+  - [4.1 棋盘与规则引擎 GoBoard](#41-棋盘与规则引擎-goboard)
   - [4.2 特征平面（12 通道）](#42-特征平面12-通道)
-  - [4.3 网络架构 `AlphaGoNet`](#43-网络架构-alphagonet)
+  - [4.3 网络架构 AlphaGoNet](#43-网络架构-alphagonet)
   - [4.4 MCTS 搜索](#44-mcts-搜索)
   - [4.5 LightPLS 轻量 rollout](#45-lightpls-轻量-rollout)
 - [5. 数据准备](#5-数据准备)
-  - [5.1 SGF 解析规则](#51-sgf-解析规则)
-  - [5.2 构建训练集 `build_dataset.py`](#52-构建训练集-build_datasetpy)
-  - [5.3 训练集内存布局](#53-训练集内存布局)
-- [6. 训练 `train_sft.py`](#6-训练-train_sftpy)
-- [7. 推理与对弈 `inference.py`](#7-推理与对弈-inferencepy)
-- [8. 评估 `evaluate.py`](#8-评估-evaluatepy)
+- [6. 训练](#6-训练)
+- [7. 推理与对弈](#7-推理与对弈)
+- [8. 评估](#8-评估)
 - [9. 加速手段总览](#9-加速手段总览)
-- [10. 完整工作流示例（云端 V100S）](#10-完整工作流示例云端-v100s)
-- [11. API 速查](#11-api-速查)
-- [12. 常见问题与排错](#12-常见问题与排错)
-- [13. 已知死代码 / 待办](#13-已知死代码--待办)
+- [10. 自对弈训练（AlphaZero）](#10-自对弈训练alphazero)
+- [11. 完整工作流示例（4 卡 NPU 910A）](#11-完整工作流示例4-卡-npu-910a)
+- [12. API 速查](#12-api-速查)
+- [13. 常见问题与排错](#13-常见问题与排错)
 
 ---
 
@@ -90,6 +87,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121
 Go-AI/
 ├── README.md                     # 本文件
 ├── requirements.txt              # 依赖
+├── run.txt                       # 训练/推理/评估命令（4 卡 NPU 910A 优化版）
 ├── data/
 │   └── games/games/              # SGF 棋谱（36648 个 .sgf，多层目录）
 │       └── Aizu/01/1.sgf ...
@@ -98,12 +96,12 @@ Go-AI/
 │   ├── __main__.py
 │   ├── inference.py              # GoAI 推理入口 + CLI（selfplay / human / analyze / ONNX 导出）
 │   ├── game/
-│   │   └── go_rules.py           # GoBoard 规则引擎 + 12 通道 feature_planes（ThreadPool 并行标注）|
+│   │   └── go_rules.py           # GoBoard 规则引擎 + 12 通道 feature_planes（ThreadPool 并行标注）
 │   ├── networks/
 │   │   ├── alphanet.py           # AlphaGoNet（策略+价值双头）
 │   │   ├── backbone.py           # SharedBackbone（ResBlock + 注意力）
 │   │   ├── policy_network.py     # PolicyNetwork 头
-│   │   └── value_network.py      # ValueNetwork 头
+│   │   └── value_network.py      # ValueNetwork 头（3 层残差）
 │   ├── search/
 │   │   ├── mcts.py               # MCTS（批量叶子评估 + 跨叶子批量 leaf_ab + 虚拟损失 + 特征缓存）
 │   │   └── light_rollout.py      # FastPolicy + light_rollout（Tromp-Taylor 数子）
@@ -113,11 +111,11 @@ Go-AI/
 │   └── utils/
 │       └── helpers.py            # print_board 等
 ├── scripts/
-│   ├── train_sft.py              # 监督学习训练（CE + MSE）
+│   ├── train_sft.py              # 监督学习训练（CE + BCE，支持 DDP / NPU）
 │   ├── build_dataset.py          # SGF 目录/tgz -> npz 训练集
 │   ├── evaluate.py               # 评估（vs 随机 / 自对弈 / 速度基准）
 │   ├── eval_elo.py               # ELO 评分
-│   ├── selfplay_train.py         # 自对弈训练
+│   ├── selfplay_train.py         # AlphaZero 自对弈训练（并行生成 + 流式训练 + DDP）
 │   ├── webui.py                  # Web UI（Flask，浏览器对弈 + 实时 MCTS 可视化）
 │   ├── cli_play.py               # 终端人机对弈
 │   ├── fetch_games.py            # 从在线平台抓取棋谱
@@ -133,7 +131,7 @@ Go-AI/
 
 ## 4. 核心概念
 
-### 4.1 棋盘与规则引擎 `GoBoard`
+### 4.1 棋盘与规则引擎 GoBoard
 
 文件：`src/game/go_rules.py`
 
@@ -170,17 +168,17 @@ Go-AI/
 
 > 历史手用「最近 3 手」环形填充（不足 3 手用 `-1` 表示无）。`my_hist`/`op_hist` 为长度 3 的扁平坐标列表。
 
-### 4.3 网络架构 `AlphaGoNet`
+### 4.3 网络架构 AlphaGoNet
 
 文件：`src/networks/alphanet.py`
 
 ```
 输入 (B, 12, H, W)
       │
-SharedBackbone(in_ch=12, ch=128, res_blocks=12, 注意力模式)
-      │  -> (B, 128, H, W) 共享表征
-      ├─ PolicyNetwork(ch=128 -> 64, action_size) -> (B, A) logits
-      └─ ValueNetwork(ch=128 -> 32, 1)             -> (B, 1) Tanh[-1,1]（黑方视角胜率）
+SharedBackbone(in_ch=12, ch=192, res_blocks=17, 注意力模式)
+      │  -> (B, 192, H, W) 共享表征
+      ├─ PolicyNetwork(ch=192 -> 64, action_size) -> (B, A) logits
+      └─ ValueNetwork(ch=192 -> 32, 3 res_blocks, 1)  -> (B, 1) Tanh[-1,1]（黑方视角胜率）
 ```
 
 - `forward(x)` → `(policy_logits, value)`；`policy_logits` 在推理时经 `softmax` 得概率。
@@ -190,7 +188,7 @@ SharedBackbone(in_ch=12, ch=128, res_blocks=12, 注意力模式)
   `attention_mode`：`none`（纯卷积）/ `mix`（卷积+注意力混合）/ `all`（全注意力）。
   V100 上推荐 `--attn-mode window --attn-window 7`（注意力约 7× 提速）；
   `window_global` 比 `sparse` 快约 35%，比 `global` 快约 14%，综合最优。
-- 相比原版：已删除 `fast_policy` 头（9x9 占 ~48% 算力却未被使用）；输入从 19 通道降到 12（原 19 通道里 13 个恒为 0）。
+- Value Head：3 层残差块（`res1`, `res2`, `res3`），预训练权重 `res3` 为随机初始化（norm=4.6 vs 其他层=77.4），自对弈训练会自动校准。
 - RMSNorm 替代 LayerNorm（手写实现，兼容 PyTorch 2.1）；Policy head 改为 1x1 conv + pass_bias。
 
 ### 4.4 MCTS 搜索
@@ -206,8 +204,10 @@ SharedBackbone(in_ch=12, ch=128, res_blocks=12, 注意力模式)
   每个叶子只构造一次特征、只前向一次。`--num-threads 4` 即可。
 - **加速（跨叶子批量 leaf_ab）**：`_batch_leaf_ab` 将 N 个叶子的浅层 negamax 合并为 depth+1 次 predict（而非 N×(depth+1) 次），
   CPU/ONNX 场景下 predict 调用降低约 3×。
-- **加速（特征平面 LRU 缓存）**：`_planes1` 缓存 2048 个局面的 12 通道特征（key = board bytes + to_play + history + ko），
-  MCTS 同一叶子深度路径中相同局面可复用，避免重复 flood-fill 计算。
+- **加速（特征平面 LRU 缓存）**：`_planes1` 缓存 16384 个局面的 12 通道特征（key = board bytes + to_play + history + ko），
+  带 30 秒 TTL，MCTS 同一叶子深度路径中相同局面可复用，避免重复 flood-fill 计算。
+- **spec_prefetch 加速**：仅 `num_threads >= 4` 时启用，worker 线程异步预评估疑似叶子。
+- **leaf_ab 智能降级**：`sims < 64` 时自动 `leaf_ab_depth = 1`，避免低模拟数下过度展开。
 - 虚拟损失（virtual loss）：并行模拟时对路径占位，避免多线程反复选同一条路径。
 - 输出：`best_move(...)` → `(move_int, is_pass, root_value)`；或 `search(...)` → `(visits, probs, root_value)`。
 - 选点：温度 `temperature>0` 按访问次数分布采样；`temperature=0` 贪心取访问最高。
@@ -262,25 +262,6 @@ python scripts/build_dataset.py --src <目录或 .tgz> --out data/sgf_19x19.npz 
 | `--max-games` | `None`（全部）| 最多处理的棋局数（先小批量跑通用）|
 | `--chunk-size` | `50000` | **流式分片落盘阈值**：每攒够这么多样本就 flush 成一个临时 npz 分片，最后合并成单个 npz。峰值内存仅约一个 chunk（几十 MB），避免全量常驻内存 OOM。设为 `0` 退回旧的全量内存模式 |
 
-行为：
-- 对每局：解析 → 校验 `board_size` 与 `RE`（无效则 `skip`）→ 逐手重放（用 `GoBoard.play`）得到局面 + 监督目标。
-- 每个落子位置产生 **1 个样本**；监督目标 `move` = 该手扁平坐标，`value` = 该局 `RE` 的胜负标签（全样本同值）。
-- 历史 `my_hist`/`op_hist` 用 `split_hist` 从「最近落子序列」拆成各 3 手。
-- **流式模式（`--chunk-size > 0`，默认开启）**：不把全部样本常驻内存，而是每满一个 chunk 就写入临时分片（落盘到系统临时目录），全部解析完成后 `np.concatenate` 各分片再 `np.savez_compressed` 合并输出、并清理临时文件。运行时打印每个分片进度。
-- 输出统计：`有效局 / 跳过` 与最终样本数。
-
-```bash
-# 示例：先用 200 局跑通，看 有效/跳过 比例
-python scripts/build_dataset.py --src data/games/games/ --out data/sgf_9x9.npz \
-    --board-size 9 --max-games 200
-
-# 全量 19 路
-python scripts/build_dataset.py --src data/games/games/ --out data/sgf_19x19.npz --board-size 19
-```
-
-> 注意：你的数据目录是 `data/games/games/`（双层 games），sgf 实际就在这下面。直接传该目录即可。
-> 9 路/19 路棋谱混在一起时，脚本按 `--board-size` 自动过滤。
-
 ### 5.3 训练集内存布局
 
 `SupervisedDataset`（`src/data/dataset.py`）以紧凑 numpy 保存，**运行时**才展开 12 通道 + 随机对称增广（等效 8× 静态增强，内存仅 1/8）：
@@ -296,11 +277,14 @@ python scripts/build_dataset.py --src data/games/games/ --out data/sgf_19x19.npz
 | `to_play` | int8 | (N,) | 该样本轮到谁（1 黑 / -1 白）|
 
 - `sample_batch(idxs, device)` → `(state(B,12,H,W) fp32, move(B,) int64, value(B,1) fp32)`。
+  CUDA/NPU 自动 `pin_memory` + `non_blocking=True`，加速传输。
 - 对称增广：每样本随机选 8 种变换之一（旋转 0/90/180/270 × 翻转），同时作用于特征平面与着法坐标（`SYMMETRIES`）。
 
 ---
 
-## 6. 训练 `train_sft.py`
+## 6. 训练
+
+### 6.1 监督训练 `train_sft.py`
 
 ```bash
 python scripts/train_sft.py --data data/sgf_19x19.npz --out models/sft_19x19.pth \
@@ -311,87 +295,59 @@ python scripts/train_sft.py --data data/sgf_19x19.npz --out models/sft_19x19.pth
     --value-loss-weight 5.0 --value-lr-mult 2.0
 ```
 
-参数表：
+**NPU 4 卡训练**（推荐）：
+
+```bash
+torchrun --nproc_per_node=4 scripts/train_sft.py \
+  --data data/sgf_19x19_full.npz \
+  --device npu --board-size 19 \
+  --backbone-channels 192 --backbone-res-blocks 17 \
+  --batch-size 800 --epochs 2 \
+  --lr 0.002 --weight-decay 0.0001 \
+  --attention-mode mix --num-attention-layers 4 --num-heads 4 \
+  --attn-mode window_global --attn-window 7 \
+  --attention-dropout 0.1 --label-smoothing 0.1 \
+  --gradient-accumulation-steps 2 \
+  --use-amp --use-ema \
+  --prefetch-depth 4 \
+  --resume models/sft_19x19_v9.pth \
+  --out models/sft_19x19_v12.pth
+```
+
+关键参数：
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
-| `--data` | 必填 | **单个 `.npz` 训练集，或包含多个 `.tgz`/`.tar.gz`/`.npz` 的目录**（目录模式自动递归扫描并合并所有分片，无需先 `build_dataset` 成单个 npz）|
-| `--max-games-per-tgz` | `0`（全部）| 仅目录模式生效：每个 tgz 最多解析的棋局数，用于子采样控制内存 |
+| `--data` | 必填 | 单个 `.npz` 或包含多个 `.npz` 的目录 |
 | `--out` | `models/sft.pt` | 权重输出路径（父目录自动建）|
 | `--device` | `auto` | `cuda` / `npu` / `cpu`；`auto`=有 GPU 用 cuda |
-| `--use-amp` | 关 | **在 cuda/npu 上默认强制开启**（fp16，V100 无 bf16；NPU 走 fp16）|
+| `--use-amp` | 关 | 在 cuda/npu 上默认强制开启（fp16）|
 | `--batch-size` | `512` | 每步批量 |
 | `--epochs` | `5` | 训练轮数 |
 | `--lr` | `2e-3` | 学习率（AdamW）|
 | `--weight-decay` | `1e-4` | 权重衰减 |
-| `--board-size` | `19` | 棋盘大小（必须与数据一致）|
-| `--save-every` | `2000` | 每 N 步存 `.latest` |
-| `--eval-every` | `5000` | 每 N 步在 2% 留出集上打印 `eval_top1` |
 | `--backbone-channels` | `128` | 主干通道数（推荐 192，13.4M 参数）|
 | `--backbone-res-blocks` | `12` | ResBlock 层数（推荐 17）|
-| `--attention-mode` | `mix` | `none`/`mix`/`all` |
-| `--num-attention-layers` | `4` | mix 模式注意力块数 |
-| `--num-heads` | `4` | 多头头数 |
-| `--attention-dropout` | `0.1` | 注意力 dropout（默认 0.1，防过拟合）|
-| `--attn-mode` | `global` | `global`/`window`/`axial`/`window_global` |
-| `--attn-window` | `7` | window 模式窗口边长 |
-| `--value-loss-weight` | `5.0` | 价值损失权重（推荐 5.0，平衡策略/价值梯度量级）|
-| `--value-lr-mult` | `2.0` | 价值网络头学习率倍率（推荐 2.0，价值头收敛更慢需更大 LR）|
-| `--label-smoothing` | `0.1` | 标签平滑（0=关闭，推荐 0.1）|
+| `--use-ema` | 关 | 指数移动平均权重 |
 | `--gradient-accumulation-steps` | `1` | 梯度累积步数（等效 batch = batch_size × steps）|
-| `--use-ema` | 关 | 指数移动平均权重（评估/保存用 EMA 参数）|
-| `--use-checkpoint` | 关 | 梯度检查点（显存减半，速度降 ~10%）|
-| `--prefetch-workers` | `4` | 数据预取 multiprocessing 工作进程数 |
-| `--prefetch-depth` | `2` | 预取队列深度（倍数 × batch_size）|
-| `--compile` | 关 | `torch.compile` 算子融合（GPU +20~40%，首次迭代较慢）|
+| `--prefetch-depth` | `4` | 预取流水深度（提前造好数据，控制内存/吞吐）|
+| `--compile` | 关 | `torch.compile` 算子融合（GPU +20~40%）|
 
 训练细节：
-- 损失：`L = CrossEntropy(policy_logits, move, label_smoothing) + value_loss_weight × MSELoss(value, z)`，其中 `z` 为棋谱胜负标签。
-- 价值网络：enlarged head（policy_channels → 64 hidden → 1），无 Tanh，BCEWithLogitsLoss（logit 直传，数值更稳定）。
-- 优化器：AdamW + `CosineAnnealingLR`；warmup 10%（前 10% 步数线性升 LR）；价值网络头用 `value_lr_mult × base_lr`。
-- 正则化：标签平滑（`--label-smoothing`，默认 0.1）、注意力 dropout（`--attention-dropout`，默认 0.1）、梯度裁剪（`max_norm=1.0`）。
-- 数据划分：按棋局分层（`game_ids`），98% 训练 / 2% 留出（`eval_top1` 监控泛化），避免同一局跨 train/eval。
+- 损失：`L = CrossEntropy(policy_logits, move, label_smoothing) + value_loss_weight × BCEWithLogitsLoss(value, z)`
+- 优化器：AdamW + `CosineAnnealingLR`；warmup 10%；价值网络头用 `value_lr_mult × base_lr`。
 - EMA（`--use-ema`）：指数移动平均权重，评估/保存时自动使用 EMA 参数。
-- 梯度累积（`--gradient-accumulation-steps`）：等效 `batch_size × steps`，显存受限时可增大等效批量。
-- NPU 训练：`torch_npu` + HCCL 后端，fp16 autocast（910B 无 bf16），`--prefetch-workers` 控制数据加载并行度。
-- `cudnn.benchmark=True`；CPU 线程数限制 `min(8, cpu_count)`。
-- 最佳模型自动覆盖 `--out`；定期存 `.latest` 便于续训/回滚。
+- NPU：`torch_npu` + HCCL 后端，fp16 autocast。
 
-> 先小跑通：`--device cpu --epochs 1 --batch-size 128 --board-size 9`，确认 `eval_top1` 有输出、模型能存盘。
+### 6.2 自对弈训练 `selfplay_train.py`（AlphaZero 风格）
+
+详见 [§10 自对弈训练](#10-自对弈训练alphazero)。
 
 ---
 
-## 7. 推理与对弈 `inference.py`
+## 7. 推理与对弈
 
 `GoAI` 类（`src/inference.py`）封装模型加载、单/批量前向、MCTS 选点、自对弈、人机对弈，并提供 CLI。
-
-构造参数（节选）：
-
-| 参数 | 默认 | 说明 |
-|------|------|------|
-| `model_path` | `None` | 权重路径；`None` 时随机初始化（未训练，仅测管线）|
-| `board_size` | `19` | 棋盘大小 |
-| `device` | `auto` | `cuda`/`npu`/`cpu` |
-| `use_amp` | `False` | fp16（cuda/npu 生效）|
-| `compile` | `False` | torch.compile |
-| `tf32` | `False` | CUDA TF32 matmul（V100/Amp 上 fp32 约 2~4×）|
-| `channels_last` | `True`(cuda) | conv 走 NHWC 内存布局 |
-| `attention_mode` / `attn_mode` / `attn_window` 等 | 同训练 | 必须与训练时一致，否则权重形状不匹配 |
-
-关键方法：
-- `predict(board, my_hist, op_hist, to_play)` → `(policy(B,A), value(B,1))` 单样本。
-- `predict_batch(states)` → 批量；`states` 为 `[(board, my_hist, op_hist, to_play)]`，**或** `[(None, my_hist, op_hist, to_play, planes)]`（第 5 项预计算 12 通道 planes，省去重复 `feature_planes`）。
-- `choose_move(...)` → 纯策略 argmax（无搜索）。
-- `choose_move_mcts(..., simulations, num_threads, use_rollout, rollout_lambda)` → MCTS 选点。
-- `self_play(...)` / `play_against_human(...)` → 对弈。
-- `export_onnx(path, board_size, quantize_int8=False)` → 导出 ONNX 模型（自动检测动态 batch；int8 量化可选）。
-- `quantize_int4_torchao()` → GPU weight-only INT4 量化（需 `torchao`，1.5-3x 加速）。
-
-CLI：
-
-```bash
-python -m src.inference --help
-```
 
 常用模式：
 
@@ -414,28 +370,18 @@ python src/inference.py --model models/sft_19x19.pth --board-size 19 \
     --mode selfplay --use-mcts --simulations 800 --num-threads 4 \
     --use-rollout --rollout-lambda 0.25
 
-# ONNX 导出（动态 batch，推荐用于 CPU 推理）
+# ONNX 导出
 python src/inference.py --model models/sft_19x19.pth --board-size 19 \
     --mode analyze --onnx models/sft_19x19.onnx
-
-# ONNX 导出 + int8 动态量化（更小更快，需 legacy exporter）
-python src/inference.py --model models/sft_19x19.pth --board-size 19 \
-    --mode analyze --onnx models/sft_19x19_int8.onnx --onnx-int8
 ```
-
-CLI 参数（`--mode` ∈ {selfplay, human, analyze}）：`--model`、`--board-size`、`--device`、`--use-amp`、
-`--compile`、`--tf32`、`--attention-mode`、`--num-attention-layers`、`--num-heads`、`--attention-dropout`、
-`--attn-mode`（含 `window_global`）、`--attn-window`、
-`--temperature`、`--topk`、`--games`、`--use-mcts`、`--simulations`、
-`--num-threads`、`--use-rollout`、`--rollout-lambda`、`--human-color`、`--onnx`、`--onnx-int8`。
 
 ---
 
-## 8. 评估 `evaluate.py`
+## 8. 评估
 
 ```bash
-python scripts/evaluate.py --model models/sft_9x9.pth --board-size 9 \
-    --mode random --num-games 100 --use-mcts --simulations 200
+python scripts/evaluate.py --model models/sft_19x19.pth --board-size 19 \
+    --mode random --num-games 100 --use-mcts --simulations 400
 ```
 
 `--mode`：
@@ -446,10 +392,6 @@ python scripts/evaluate.py --model models/sft_9x9.pth --board-size 9 \
 | `benchmark` | 推理速度基准：单样本 vs 批量 32 前向吞吐 |
 | `selfplay` | 模型自对弈，输出黑方胜率 |
 
-其他参数：`--device`、`--use-amp`、`--compile`、`--attention-*`、`--attn-*`、`--use-mcts`、`--simulations`、`--num-threads`、`--topk`、`--num-games`。
-
-> `evaluate_vs_random` 里模型执黑；`benchmark` 用 32 批量模拟 MCTS 叶子评估吞吐。
-
 ---
 
 ## 9. 加速手段总览
@@ -457,96 +399,124 @@ python scripts/evaluate.py --model models/sft_9x9.pth --board-size 9 \
 | 加速项 | 状态 | 说明 / 开启方式 |
 |--------|------|----------------|
 | 批量叶子评估 | ✅ | `GoAI.predict_batch` 同层拼 batch 一次前向（GPU 吞吐 ×10+）|
-| 跨线程合并 batch（生产者-消费者）| ✅ | worker 只选路径，主线程统一 `deepcopy`+`feature_planes`+`predict_batch`，每个叶子只算一次特征 |
+| 跨线程合并 batch（生产者-消费者）| ✅ | worker 只选路径，主线程统一 `deepcopy`+`feature_planes`+`predict_batch` |
 | 增量特征 | ✅ | `predict_batch` 接受预计算 planes，省重复计算 |
-| **跨叶子批量 leaf_ab** | ✅ | `_batch_leaf_ab`：N 个叶子的浅层 negamax 合并为 depth+1 次 predict（而非 N×(depth+1) 次），CPU/ONNX 下 predict 调用降低 ~3× |
-| **特征平面 LRU 缓存** | ✅ | `_planes1` 缓存 2048 个局面的 12 通道特征，相同局面复用（MCTS 同一叶子深度路径命中）|
-| **ONNX Runtime 推理后端** | ✅ | `--onnx models/xxx.onnx`，自动检测动态 batch；含 int8 动态量化（`--onnx-int8`）|
-| **ONNX 纯 numpy 快速路径** | ✅ | ONNX 后端下 `predict_batch` 全程 numpy，跳过 numpy→torch→numpy 转换 |
-| **ONNX 动态 batch 检测缓存** | ✅ | 导出时一次性检测是否支持动态 batch，避免每次 `ort.run()` 的 try/except 开销 |
-| TF32 matmul | ✅ | `--tf32`，V100/Amp 上 fp32 约 2~4×，精度损失可忽略 |
+| **跨叶子批量 leaf_ab** | ✅ | N 个叶子浅层 negamax 合并为 depth+1 次 predict |
+| **特征平面 LRU 缓存** | ✅ | 16384 局面缓存（19 路），30 秒 TTL |
+| **spec_prefetch** | ✅ | `num_threads >= 4` 时自动启用，worker 异步预评估 |
+| **leaf_ab 智能降级** | ✅ | `sims < 64` 时自动 `depth=1`，避免低模拟数过度展开 |
+| ONNX Runtime | ✅ | `--onnx models/xxx.onnx`，含 int8 动态量化 |
+| TF32 matmul | ✅ | `--tf32`，V100/Amp 上 fp32 约 2~4× |
 | `channels_last` | ✅ | CUDA 上 conv 走 NHWC（默认开）|
-| 虚拟损失 + 多线程 | ✅ | `--num-threads 4`，并行选路径利用多核 |
+| 虚拟损失 + 多线程 | ✅ | `--num-threads 4`，并行选路径 |
 | `torch.compile` | ✅ | `--compile`，GPU 上约 20~40% |
-| `--use-amp` fp16 | ✅ | cuda/npu 上默认开（V100 走 fp16，无 bf16；NPU 走 fp16）|
-| `window`/`axial`/`window_global` 注意力 | ✅ | `--attn-mode window --attn-window 7`，GPU 上约 7× 注意力提速 |
-| LightPLS 轻量 rollout | ✅ | `--use-rollout --rollout-lambda`，叶子价值融合 Tromp-Taylor 快数子 |
-| `torch.inference_mode()` | ✅ | 替代 `no_grad()`，禁用 autograd 原版追踪，推理 5-15% 加速（自动生效）|
-| 非阻塞 GPU 传输 | ✅ | `predict_batch` 使用 `non_blocking=True`，GPU 传输与 CPU 计算重叠（自动生效）|
-| ThreadPool 复用 | ✅ | `feature_planes_batched` 使用 `ThreadPoolExecutor(max_workers=2)` 复用线程池（自动生效）|
-| GPU weight-only INT4 量化 | ✅ | `ai.quantize_int4_torchao()`，需 `pip install torchao`，显存带宽受限场景 1.5-3x |
+| `--use-amp` fp16 | ✅ | cuda/npu 上默认开 |
+| `window_global` 注意力 | ✅ | `--attn-mode window_global --attn-window 7` |
+| LightPLS rollout | ✅ | `--use-rollout --rollout-lambda` |
+| pin_memory + non_blocking | ✅ | CUDA/NPU 数据传输自动重叠 |
+| GPU weight-only INT4 | ✅ | `ai.quantize_int4_torchao()` |
+| **并行自对弈** | ✅ | `--parallel-games N`，多进程并行生成 |
+| **流式训练** | ✅ | `--streaming`，不写临时文件，内存队列传递 |
+| **多 GPU DDP** | ✅ | `--ddp` + `torchrun --nproc_per_node=N` |
 
-**V100S 全加速组合（推荐）**：
+---
 
-```bash
-python src/inference.py --model models/sft_19x19.pth --board-size 19 \
-    --device cuda --use-amp --compile --tf32 \
-    --attention-mode mix --attn-mode window --attn-window 7 \
-    --mode selfplay --use-mcts --simulations 400 --num-threads 4
+## 10. 自对弈训练（AlphaZero）
+
+`scripts/selfplay_train.py`：纯自我对弈生成数据 → 训练 → 循环（无外部棋谱）。
+
+### 流程
+
+```
+自对弈 N 局 → 8 对称增强 → replay buffer → 训练 → 保存最佳权重 → 下一轮
 ```
 
-**ONNX CPU 推理（推荐用于无 GPU 环境）**：
+- **数据标签**：MCTS visit 分布 → policy 标签；终局胜负 → value 标签
+- **探索**：根先验混 Dirichlet 噪声 + 温度采样
+- **价值软化**：按手数位置 tanh 软化（开局弱信号、终局强信号），z = tanh(z_raw × α)，α∈[0.3, 1.0]
+
+### 50GB 磁盘约束优化
+
+- **流式处理**：自对弈数据不写临时 npz，用共享内存队列传递
+- **只保存最佳权重**：只保留 `latest` + `best` 两个文件
+- **紧凑 buffer**：内存中最多保留 500 局数据（~80MB）
+
+### 快速开始
 
 ```bash
-# 先导出 ONNX 模型
-python src/inference.py --model models/sft_19x19.pth --board-size 19 \
-    --mode analyze --onnx models/sft_19x19.onnx
+# CPU 9 路验证
+python scripts/selfplay_train.py --board-size 9 --iters 5 --games 4 --sims 64
 
-# 再用 ONNX Runtime 推理
-python src/inference.py --board-size 19 \
-    --mode selfplay --onnx models/sft_19x19.onnx \
-    --use-mcts --simulations 400 --num-threads 8
+# NPU 19 路正式训练（4 进程并行 + 流式 + rollout）
+python scripts/selfplay_train.py \
+  --board-size 19 --iters 20 --games 16 --sims 400 \
+  --parallel-games 4 --streaming \
+  --model models/sft_19x19_v12.pth \
+  --out models/az_best.pth \
+  --use-rollout --leaf-ab-depth 2 --num-threads 8 \
+  --c-puct 2.0 --virtual-loss 8.0
+
+# NPU 4 卡 DDP 训练
+torchrun --nproc_per_node=4 scripts/selfplay_train.py \
+  --board-size 19 --iters 20 --games 16 --sims 400 \
+  --parallel-games 4 --ddp --streaming \
+  --model models/sft_19x19_v12.pth --out models/az_best.pth
+```
+
+关键参数：
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--sims` | `400` | 每步 MCTS 模拟数（越高越强，越慢）|
+| `--parallel-games` | `1` | 并行自对弈局数（多进程，推荐 4-8）|
+| `--c-puct` | `2.0` | PUCT 探索系数 |
+| `--num-threads` | `8` | MCTS 多线程数 |
+| `--use-rollout` | 关 | LightPLS rollout 价值融合 |
+| `--leaf-ab-depth` | `2` | 叶内 α-β 搜索深度 |
+| `--buffer-size` | `500` | replay buffer 容量（局数）|
+| `--streaming` | 关 | 流式训练（不写临时文件）|
+| `--ddp` | 关 | 多 GPU 数据并行（torchrun 启动）|
+| `--temperature` | `1.0` | 自对弈采样温度 |
+| `--use-ema` | 关 | EMA 权重 |
+
+---
+
+## 11. 完整工作流示例（4 卡 NPU 910A）
+
+详见 `run.txt`。
+
+```bash
+# ① 构建数据集
+python scripts/build_dataset.py \
+  --src data/games/games/ --out data/sgf_19x19_full.npz \
+  --board-size 19 --chunk-size 50000 --tmp-dir data/tmp
+
+# ② 监督训练（4 卡 NPU）
+torchrun --nproc_per_node=4 scripts/train_sft.py \
+  --data data/sgf_19x19_full.npz --device npu --board-size 19 \
+  --backbone-channels 192 --backbone-res-blocks 17 \
+  --batch-size 800 --epochs 2 --use-amp --use-ema \
+  --out models/sft_19x19_v12.pth
+
+# ③ 自对弈训练（AlphaZero）
+python scripts/selfplay_train.py \
+  --board-size 19 --iters 20 --games 16 --sims 400 \
+  --parallel-games 4 --streaming \
+  --model models/sft_19x19_v12.pth --out models/az_best.pth
+
+# ④ 评估
+python scripts/evaluate.py --model models/sft_19x19_v12.pth \
+  --board-size 19 --mode random --num-games 100
+
+# ⑤ WebUI
+python scripts/webui.py --port 7860 --device cpu --priors-leaf \
+    --mode hybrid --hybrid-sims 32 --hybrid-blend 0.5 \
+    --expand-topk 16 --num-threads 8
 ```
 
 ---
 
-## 10. 完整工作流示例（云端 V100S）
-
-```bash
-# ① 造数据（9 路先小批量跑通）
-python scripts/build_dataset.py --src data/games/games/ \
-    --out data/sgf_9x9.npz --board-size 9 --max-games 5000
-
-# ② 训练（9 路 CPU 验证 -> 19 路 V100S）
-python scripts/train_sft.py --device cpu --board-size 9 \
-    --batch-size 128 --epochs 3 --data data/sgf_9x9.npz --out models/sft_9x9.pth
-
-python scripts/train_sft.py --device cuda --use-amp --compile \
-    --board-size 19 --batch-size 512 --epochs 5 \
-    --backbone-channels 192 --backbone-res-blocks 17 \
-    --attention-mode mix --attn-mode window --attn-window 7 \
-    --label-smoothing 0.1 --attention-dropout 0.1 \
-    --data data/sgf_19x19.npz --out models/sft_19x19.pth
-
-# ②' 直接喂「装着多个分片 tgz 的文件夹」（无需先 build_dataset 成单个 npz）
-#    自动递归扫描 data/games/games/ 下所有 .tgz 解析并合并成一个训练集
-python scripts/train_sft.py --device cuda --use-amp --compile \
-    --board-size 19 --batch-size 512 --epochs 5 \
-    --attention-mode mix --attn-mode window --attn-window 7 \
-    --data data/games/games/ --out models/sft_19x19.pth
-#    子采样控制内存：每个 tgz 最多 3000 局
-# python scripts/train_sft.py --device cuda --board-size 19 --data data/games/games/ \
-#     --max-games-per-tgz 3000 --out models/sft_19x19.pth
-
-# ③ 评估棋力信号（对随机策略胜率）
-python scripts/evaluate.py --model models/sft_9x9.pth --board-size 9 \
-    --mode random --use-mcts --simulations 200
-
-# ④ 推理 / 对弈（加 LightPLS 提棋力）
-python src/inference.py --model models/sft_19x19.pth --board-size 19 \
-    --device cuda --use-amp --compile --tf32 \
-    --attn-mode window --attn-window 7 \
-    --mode selfplay --use-mcts --simulations 800 --num-threads 4 \
-    --use-rollout --rollout-lambda 0.25
-```
-
-> 数据规模提醒：19 路全量 36648 局可能很大（npz 内存/磁盘），先 `--max-games 30000` 试产出体积。
-> 提升棋力上限需「MCTS 自我对弈 + 策略迭代」（AlphaGo 式），当前 `self_play` 只产出胜率、不存数据；
-> 若要真正变强，可加「selfplay 产出 npz → 再训练」迭代脚本（待办，见 §13）。
-
----
-
-## 11. API 速查
+## 12. API 速查
 
 ```python
 from src.inference import GoAI
@@ -555,66 +525,46 @@ from src.game.go_rules import GoBoard
 from src.search.light_rollout import FastPolicy, light_rollout
 
 # 推理
-ai = GoAI(board_size=9, device="cpu", compile=False)        # model_path=None 即随机权重
-board = GoBoard(9)
-h = [-1, -1, -1]                                             # 己方最近 3 手（扁平坐标，-1 为空）
-oh = [-1, -1, -1]                                             # 对手最近 3 手
-to_play = 1                                                  # 1 黑 / -1 白
+ai = GoAI(model_path="models/sft_19x19_v12.pth", board_size=19, device="npu")
+board = GoBoard(19)
+h = [-1, -1, -1]
+oh = [-1, -1, -1]
+to_play = 1
 policy, value = ai.predict(board, h, oh, to_play)            # 单样本
 states = [(board, list(h), list(oh), to_play)] * 32
 pol_batch, val_batch = ai.predict_batch(states)              # 批量
 
 # MCTS
-mcts = MCTS(ai, board_size=9, num_threads=4, temperature=0.0,
+mcts = MCTS(ai, board_size=19, num_threads=4, temperature=0.0,
             use_rollout=True, rollout_lambda=0.25)
 move_int, is_pass, root_value = mcts.best_move(
     board, h, oh, to_play, simulations=400, return_value=True)
 
 # ONNX 导出
-ai.export_onnx("model.onnx", board_size=9, quantize_int8=False)
+ai.export_onnx("model.onnx", board_size=19, quantize_int8=False)
 
 # LightPLS
-fp = FastPolicy(9)
-v = light_rollout(board, fp, max_steps=60, rng=np.random.default_rng(0))   # 发起方视角 [-1,1]
+fp = FastPolicy(19)
+v = light_rollout(board, fp, max_steps=60, rng=np.random.default_rng(0))
 ```
 
 ---
 
-## 12. 常见问题与排错
+## 13. 常见问题与排错
 
 | 现象 | 原因 / 解决 |
 |------|------------|
-| `ImportError: src.xxx` | 必须在**仓库根目录**运行（`sys.path` 以根为基准）；`cd f:/AI/Go-AI` 后执行 |
-| 权重加载形状不匹配 | `attention_mode`/`attn_mode`/`board_size` 必须与训练时一致；`action_size=n*n+1` |
-| `torch.compile` 首次很慢 | 正常（编译开销）；CPU 也支持，需 MSVC（`vcvars64.bat`/`cl.exe`）|
-| `play()` 返回 `False` | 着法非法（落子撞禁着/自杀/劫）；调用方需判断返回值，不要假设成功 |
-| `board` 无 `to_play` | 引擎用 `current_player`（1/-1），MCTS 内部 `to_play`（1/2）仅用于特征构造，二者不等价 |
-| 数据 `有效/跳过` 比例低 | 棋谱 `RE` 缺失或为和棋、坐标越界；检查 `--board-size` 是否匹配；先 `--max-games 100` 看统计 |
-| npz 太大 / 内存不足 | 用 `--chunk-size`（默认 50000）流式分片落盘，峰值内存仅约一个 chunk；或减小 `--max-games` 分批生成多个 npz 再用 `train_sft.py --data <目录>` 合并训练 |
-| V100 上 bf16 报错 | V100 是 Volta，**无 bf16**，已默认走 fp16（`--use-amp`）|
-| MCTS 选到非法着法 | 极端情况下回退到 `choose_move`（纯策略 argmax）；见 `choose_move_mcts` |
-| ONNX 导出 ShapeInferenceError | PyTorch ≥ 2.x 默认用 `torch.export` ONNX，与旧 opset 不兼容；`export_onnx` 已自动回退 legacy exporter（`dynamo=False, opset=17`）|
-| ONNX int8 量化模型推理报错 | int8 量化模型输出为固定 batch=1；`predict_batch` 会自动分批推理（每批 8 样本）|
-| ONNX 推理比 torch 还慢 | 检查是否安装了 `onnxruntime`（而非 GPU 版本）；CPU 推理推荐 `onnxruntime`（非 `onnxruntime-gpu`）|
-
----
-
-## 13. 已知死代码 / 待办
-
-- ⚠️ **`scripts/demo.py` 是死代码**：调用 `GoAI(search_depth=...)`、`ai.search`、`ai.get_move()`、
-  `ai.suggest_moves()`、`ai.make_move()`、`ai.evaluate_position()` 等**旧 API**，与当前 `inference.py`
-  （`choose_move` / `choose_move_mcts` / `predict` / `predict_batch`）不匹配。**不要运行**，也不要据此理解接口。
-- 已删除旧 19 通道死代码：`src/networks/resnet.py`、`src/search/minimax.py`、
-  `src/evaluation/evaluator.py`、`src/evaluation/alpha_evaluator.py`、`src/evaluation/__init__.py`、
-  `src/config/config.py`、`src/config/__init__.py`（与 12 通道 SFT 冲突）。
-- 待办：去 `deepcopy` 用增量 `play`（需给 `GoBoard` 加 `undo` 接口）；
-  「selfplay 产出 npz → 再训练」迭代脚本（策略提升级路径）；
-  跨叶子批量 children eval（当前每个叶子独立调用 `_eval_children`，可进一步合并为单次 predict_batch）。
+| `ImportError: src.xxx` | 必须在**仓库根目录**运行（`sys.path` 以根为基准）|
+| 权重加载形状不匹配 | `attention_mode`/`attn_mode`/`board_size` 必须与训练时一致 |
+| `play()` 返回 `False` | 着法非法（落子撞禁着/自杀/劫）|
+| MCTS 选到非法着法 | 极端情况下回退到 `choose_move`（纯策略 argmax）|
+| V100 上 bf16 报错 | V100 无 bf16，已默认走 fp16 |
+| ONNX 导出 ShapeInferenceError | `export_onnx` 已自动回退 legacy exporter |
+| 自对弈 res3 未加载 | 预训练 v12 无 `value.res3`，`strict=False` 自动跳过，随机初始化 |
+| NPU 训练报错 | 确认 `torch_npu` 已安装，`torch.npu.is_available()` 返回 `True` |
 
 ---
 
 ## 许可 / 参考
 
 监督学习路线参考 AlphaGoZero 的 12 通道特征与策略-价值网络设计；规则引擎为自建中国规则基础实现。
-```
-

@@ -42,6 +42,7 @@ class ValueNetwork(nn.Module):
         # 残差块：在缩小后的特征图上提取全局特征
         self.res1 = _ValueResBlock(hidden_channels)
         self.res2 = _ValueResBlock(hidden_channels)
+        self.res3 = _ValueResBlock(hidden_channels)
         # 全局池化 + 输出
         self.gap = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Linear(hidden_channels, 1)
@@ -50,6 +51,7 @@ class ValueNetwork(nn.Module):
         x = self.downsample(x)
         x = self.res1(x)
         x = self.res2(x)
+        x = self.res3(x)
         x = self.gap(x).flatten(1)
         x = self.fc(x)
         return x

@@ -212,8 +212,6 @@ class GoAI:
                       flush=True)
             print(f"[GoAI] NPU warmup 完成: {time.time() - t0:.1f}s（仅首次，后续为毫秒级）",
                   flush=True)
-        else:
-            print(f"[GoAI] 未加载权重（随机初始化），仅用于流程验证。device={device}")
 
     def _infer_board_size(self, state):
         """从 policy 头输出层权重形状推断训练棋盘大小（输出维 = n²+1）。"""

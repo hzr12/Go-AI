@@ -79,6 +79,7 @@ class Session:
         self.last_move = None                      # (r, c) 或 ('pass',)
         self.candidates = []                       # AI 最近一次搜索的 top 候选
         self.ai_info = None                        # 最近一次 AI 步的搜索信息
+        self.analysis = None                       # AI 局势分析结果（供前端展示）
         self.log = []                              # AI 步日志
         self.game_over = False
         self.final_score = None
@@ -104,7 +105,7 @@ class Session:
                 "mv": mv, "r": mv // bs, "c": mv % bs,
                 "visits": int(child.visit),
                 "prior": round(float(child.prior), 4),
-                "ai_winrate": round(0.5 - q_child / 2.0, 3),
+                "ai_winrate": round(max(0.0, min(1.0, 0.5 - q_child / 2.0)), 3),
             })
         cands.sort(key=lambda x: -x["visits"])
         snap = {"sims": sims_done, "candidates": cands[:10]}
@@ -136,6 +137,7 @@ class Session:
             "lead": self.lead,   # 缓存的形势分（中国规则数子估分，含 7.5 贴目）
             "candidates": self.candidates,
             "ai_info": self.ai_info,
+            "analysis": self.analysis,
             "log": self.log[-40:],
             "wr_hist": self.wr_hist,
         }
@@ -180,6 +182,7 @@ class Session:
         self.last_move = last_move
         self.move_count = len(self.board.move_history)
         self.candidates = []
+        self.analysis = None
         self.ai_info = None
         self.wr_hist = [e for e in self.wr_hist if e["mc"] <= self.move_count]
         if self.board.passes >= 2:
@@ -255,7 +258,7 @@ class Session:
                 "mv": m, "r": m // bs, "c": m % bs,
                 "visits": max(1, int(round(float(masked[m]) * 1000))),
                 "prior": round(float(masked[m]), 4),
-                "ai_winrate": round((v + 1) / 2.0, 3),
+                "ai_winrate": round(max(0.0, min(1.0, (v + 1) / 2.0)), 3),
             } for m, v in ranked]
         else:
             # top 候选（policy 概率；visits 字段放概率×1000 供棋盘热力渲染）
@@ -265,12 +268,12 @@ class Session:
             self.candidates = [{
                 "mv": m, "r": m // bs, "c": m % bs,
                 "visits": max(1, int(round(p * 1000))), "prior": round(p, 4),
-                "ai_winrate": round((value + 1) / 2.0, 3),
+                "ai_winrate": round(max(0.0, min(1.0, (value + 1) / 2.0)), 3),
             } for m, p in ranked]
 
         is_pass = (move_int == n_actions - 1)
         self._apply_move(PASS if is_pass else move_int, "ai")
-        ai_winrate = round((value + 1) / 2.0, 3)
+        ai_winrate = round(max(0.0, min(1.0, (value + 1) / 2.0)), 3)
         mv_str = "pass" if is_pass else f"{chr(ord('a') + self.last_move[1])}{chr(ord('a') + self.last_move[0])}"
         info = {
             "move": mv_str,
@@ -342,7 +345,7 @@ class Session:
                     "mv": mv, "r": mv // bs, "c": mv % bs,
                     "visits": int(child.visit),
                     "prior": round(float(pol_n[mv]), 4),
-                    "ai_winrate": round(0.5 - child.q() / 2.0, 3),
+                    "ai_winrate": round(max(0.0, min(1.0, 0.5 - child.q() / 2.0)), 3),
                     "score": round(float(score[mv]), 4),
                 })
             cands.sort(key=lambda x: -x["score"])
@@ -350,7 +353,7 @@ class Session:
 
         is_pass = (move_int == n_actions - 1)
         self._apply_move(PASS if is_pass else move_int, "ai")
-        ai_winrate = round((root_value + 1) / 2.0, 3)
+        ai_winrate = round(max(0.0, min(1.0, (root_value + 1) / 2.0)), 3)
         mv_str = "pass" if is_pass else f"{chr(ord('a') + self.last_move[1])}{chr(ord('a') + self.last_move[0])}"
         info = {
             "move": mv_str,
@@ -362,6 +365,7 @@ class Session:
             "mode": "hybrid",
         }
         self.ai_info = info
+        self.analysis = self._build_analysis(info, self.candidates)
         self.log.append(info)
         self.wr_hist.append({"mc": self.move_count, "wr": ai_winrate})
         return self.state()
@@ -402,7 +406,7 @@ class Session:
                 for mv, child in root.children.items():
                     r, c = divmod(mv, self.size)
                     q_child = child.q()          # child.to_play（=人类）视角
-                    ai_winrate = 0.5 - q_child / 2.0
+                    ai_winrate = max(0.0, min(1.0, 0.5 - q_child / 2.0))
                     cands.append({
                         "mv": mv, "r": r, "c": c,
                         "visits": int(child.visit),
@@ -416,7 +420,7 @@ class Session:
             mv_play = PASS if is_pass else move_int
             self._apply_move(mv_play, "ai")
             # AI（白）视角胜率
-            ai_winrate = round((root_value + 1) / 2.0, 3)
+            ai_winrate = round(max(0.0, min(1.0, (root_value + 1) / 2.0)), 3)
             mv_str = "pass" if is_pass else f"{chr(ord('a') + self.last_move[1])}{chr(ord('a') + self.last_move[0])}"
             info = {
                 "move": mv_str,
@@ -427,10 +431,78 @@ class Session:
                 "sps": int(simulations / max(elapsed, 1e-6)),
                 "mode": "mcts",
             }
-            self.ai_info = info
-            self.log.append(info)
-            self.wr_hist.append({"mc": self.move_count, "wr": ai_winrate})
-            return self.state()
+        self.ai_info = info
+        self.analysis = self._build_analysis(info, self.candidates)
+        self.log.append(info)
+        self.wr_hist.append({"mc": self.move_count, "wr": ai_winrate})
+        return self.state()
+
+    def _mv_to_str(self, mv):
+        """扁平坐标转坐标字符串，如 305 -> 'o10'。"""
+        if mv < 0:
+            return "pass"
+        r, c = divmod(mv, self.size)
+        return f"{chr(ord('a') + c)}{self.size - r}"
+
+    def _build_analysis(self, ai_info, candidates):
+        """根据 AI 落子和候选着法，生成局势分析文本。"""
+        if not ai_info or not candidates:
+            return None
+        mv = ai_info["move"]
+        wr = ai_info.get("ai_winrate", 0.5)
+        human_color = self.human_color
+        my_color_name = "黑" if human_color == 1 else "白"
+        ai_color_name = "白" if human_color == 1 else "黑"
+
+        # 胜率解读
+        if wr >= 0.75:
+            wr_text = f"【形势大优】{ai_color_name}胜率 {wr*100:.0f}%，优势明显"
+        elif wr >= 0.60:
+            wr_text = f"【形势略优】{ai_color_name}胜率 {wr*100:.0f}%，局面主动"
+        elif wr >= 0.45:
+            wr_text = f"【局势均衡】双方胜率接近，{wr*100:.0f}% vs {(1-wr)*100:.0f}%"
+        elif wr >= 0.25:
+            wr_text = f"【形势略劣】{ai_color_name}胜率 {wr*100:.0f}%，注意防守"
+        else:
+            wr_text = f"【形势不利】{ai_color_name}胜率 {wr*100:.0f}%，需寻找机会"
+
+        # 推荐着法
+        if candidates:
+            top = candidates[0]
+            top_mv_str = f"{chr(ord('a') + top['c'])}{self.size - top['r']}"
+            top_wr = top.get('ai_winrate', wr)
+            rec_text = f"推荐着法：{top_mv_str}（胜率 {top_wr*100:.0f}%）"
+            if len(candidates) >= 2:
+                sec = candidates[1]
+                sec_mv_str = f"{chr(ord('a') + sec['c'])}{self.size - sec['r']}"
+                rec_text += f"，备选 {sec_mv_str}（{sec.get('ai_winrate', 0)*100:.0f}%）"
+        else:
+            rec_text = "暂无推荐着法"
+
+        # 形势判断
+        lead = self.lead
+        if lead is not None:
+            if lead > 3:
+                lead_text = f"黑领先 {lead:.1f} 子"
+            elif lead < -3:
+                lead_text = f"白领先 {abs(lead):.1f} 子"
+            else:
+                lead_text = "形势接近"
+        else:
+            lead_text = "形势未知"
+
+        return {
+            "winrate_text": wr_text,
+            "recommendation": rec_text,
+            "lead_text": lead_text,
+            "ai_move": mv,
+            "top_candidates": [
+                {"mv": f"{chr(ord('a') + c)}{self.size - r}", "visits": cd.get('visits', 0),
+                 "winrate": cd.get('ai_winrate', 0)}
+                for cd in candidates[:5]
+                for r, c in [(cd['r'], cd['c'])]
+            ],
+        }
 
 
 def build_handler(session, html_page=None):
@@ -500,67 +572,77 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<title>Go-AI MCTS WebUI</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Go-AI 围棋对弈</title>
 <style>
   :root {
-    --bg:#14171d; --card:#1f242d; --card2:#262c38; --line:#323947;
-    --txt:#d7dae0; --dim:#9aa0a6; --accent:#8ab4f8; --green:#5bb974; --warn:#fbbc64; --red:#f28b82;
+    --bg:#f4f1eb; --card:#fff; --card-border:#e2ddd5;
+    --txt:#2c2c2c; --dim:#777; --accent:#4a6fa5; --green:#3a9a5a;
+    --warn:#d4920b; --red:#c0392b; --board-line:#8b6914;
+    --shadow:0 2px 12px rgba(0,0,0,.08);
   }
   * { box-sizing: border-box; }
   body { background:var(--bg); color:var(--txt); font-family:"Segoe UI","Microsoft YaHei",sans-serif;
-         margin:0; padding:16px; display:flex; flex-wrap:wrap; gap:18px; align-items:flex-start; }
-  #boardWrap { position:relative; background:var(--card); padding:10px; border-radius:14px;
-               box-shadow:0 4px 18px rgba(0,0,0,.45); }
-  canvas { cursor:pointer; display:block; border-radius:8px; }
-  #overlay { position:absolute; inset:10px; border-radius:8px; background:rgba(10,12,16,.72);
+         margin:0; padding:20px; display:flex; flex-wrap:wrap; gap:20px; align-items:flex-start; }
+  #boardWrap { position:relative; background:#e8c96a; padding:12px; border-radius:12px;
+               box-shadow:0 6px 24px rgba(0,0,0,.18); }
+  canvas { cursor:pointer; display:block; border-radius:4px; }
+  #overlay { position:absolute; inset:12px; border-radius:8px;
+             background:rgba(244,241,235,.88); backdrop-filter:blur(4px);
              display:flex; align-items:center; justify-content:center; }
   #overlay.hidden { display:none; }
-  .over-card { background:var(--card2); border:1px solid var(--line); border-radius:12px;
-               padding:22px 32px; text-align:center; box-shadow:0 6px 24px rgba(0,0,0,.5); }
-  #overTitle { font-size:22px; font-weight:bold; color:var(--accent); margin-bottom:6px; }
-  #overSub { font-size:13px; color:var(--dim); margin-bottom:14px; }
-  #panel { width:390px; display:flex; flex-direction:column; gap:12px; }
-  #side { width:330px; display:flex; flex-direction:column; gap:12px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:12px;
-          padding:12px 14px; box-shadow:0 2px 8px rgba(0,0,0,.3); }
-  h2 { margin:0 0 8px; font-size:13px; color:var(--accent); letter-spacing:.06em; }
+  .over-card { text-align:center; }
+  #overTitle { font-size:24px; font-weight:bold; color:var(--accent); margin-bottom:6px; }
+  #overSub { font-size:13px; color:var(--dim); margin-bottom:16px; }
+  #panel { width:380px; display:flex; flex-direction:column; gap:12px; }
+  #side { width:320px; display:flex; flex-direction:column; gap:12px; }
+  .card { background:var(--card); border:1px solid var(--card-border); border-radius:12px;
+          padding:14px 16px; box-shadow:var(--shadow); }
+  h2 { margin:0 0 10px; font-size:12px; color:var(--dim); letter-spacing:.08em; text-transform:uppercase; }
   .status-card { display:flex; justify-content:space-between; align-items:center;
                  font-size:13px; padding:10px 14px; }
   #turn b { color:var(--accent); }
   #mvcount { color:var(--dim); font-variant-numeric:tabular-nums; }
-  table { width:100%; border-collapse:collapse; font-size:13px; font-variant-numeric:tabular-nums; }
-  td, th { padding:3px 6px; text-align:left; border-bottom:1px solid var(--line); }
-  th { color:var(--dim); font-weight:normal; }
+  table { width:100%; border-collapse:collapse; font-size:12px; font-variant-numeric:tabular-nums; }
+  td, th { padding:4px 6px; text-align:left; border-bottom:1px solid var(--card-border); }
+  th { color:var(--dim); font-weight:500; }
   tr:last-child td { border-bottom:none; }
   .mv { font-family:Consolas,monospace; color:var(--accent); }
-  .bar { height:14px; background:#3a4150; border-radius:7px; overflow:hidden; margin:6px 0 2px; }
-  .bar > div { height:100%; background:linear-gradient(90deg,#4a9e63,#5bb974); text-align:center;
-               font-size:11px; color:#0d1a10; line-height:14px; transition:width .4s; }
-  select, button { background:#2c3340; color:var(--txt); border:1px solid #3d4655;
-                   border-radius:8px; padding:6px 12px; font-size:13px; cursor:pointer;
-                   transition:background .15s, transform .05s; }
-  button:hover:not(:disabled) { background:#38414f; }
+  .bar { height:10px; background:#e8e4dc; border-radius:5px; overflow:hidden; margin:5px 0; }
+  .bar > div { height:100%; background:linear-gradient(90deg,#4a6fa5,#5bb974);
+               text-align:center; font-size:10px; color:#fff; line-height:10px; transition:width .4s; }
+  input, select, button {
+    background:#fff; color:var(--txt); border:1px solid var(--card-border);
+    border-radius:8px; padding:7px 12px; font-size:13px; cursor:pointer;
+    transition:border-color .15s, background .15s; outline:none;
+  }
+  input:focus, select:focus { border-color:var(--accent); }
+  button:hover:not(:disabled) { background:#f8f6f0; }
   button:active:not(:disabled) { transform:translateY(1px); }
-  button.primary { background:var(--accent); color:#0e1420; border:none; font-weight:bold; }
-  button.primary:hover:not(:disabled) { background:#9cc1fa; }
-  button:disabled { opacity:.35; cursor:default; }
+  button.primary { background:var(--accent); color:#fff; border:none; font-weight:600; }
+  button.primary:hover:not(:disabled) { background:#3d5f91; }
+  button:disabled { opacity:.4; cursor:default; }
+  #coordRow { display:flex; gap:8px; margin-bottom:10px; }
+  #coordInput { flex:1; font-family:Consolas,monospace; letter-spacing:.06em; text-transform:uppercase; }
   #thinking { color:var(--warn); font-size:13px; min-height:20px; display:flex;
               align-items:center; gap:6px; }
-  #thinking.busy::before { content:''; width:9px; height:9px; border-radius:50%; flex:none;
+  #thinking.busy::before { content:''; width:8px; height:8px; border-radius:50%; flex:none;
                            background:var(--warn); animation:pulse 1s ease-in-out infinite; }
   @keyframes pulse { 0%,100% { opacity:.25; transform:scale(.75); }
                      50% { opacity:1; transform:scale(1.1); } }
-  #log { font-size:12px; color:var(--dim); max-height:200px; overflow-y:auto;
+  #log { font-size:11px; color:var(--dim); max-height:180px; overflow-y:auto;
          font-family:Consolas,monospace; white-space:pre-wrap; font-variant-numeric:tabular-nums; }
-  .stat { display:flex; justify-content:space-between; font-size:13px; padding:2px 0;
+  .stat { display:flex; justify-content:space-between; font-size:13px; padding:3px 0;
           font-variant-numeric:tabular-nums; }
   .stat b { color:var(--accent); font-weight:600; }
-  #err { color:var(--red); font-size:13px; min-height:16px; }
-  #toast { position:absolute; left:50%; bottom:26px; transform:translateX(-50%);
-           background:rgba(20,24,32,.92); border:1px solid var(--line); color:var(--txt);
-           padding:6px 16px; border-radius:20px; font-size:13px; transition:opacity .3s;
-           pointer-events:none; }
+  #err { color:var(--red); font-size:12px; min-height:16px; }
+  #toast { position:absolute; left:50%; bottom:24px; transform:translateX(-50%);
+           background:rgba(44,44,44,.88); color:#fff;
+           padding:6px 16px; border-radius:20px; font-size:12px; transition:opacity .3s;
+           pointer-events:none; white-space:nowrap; }
   #toast.hidden { opacity:0; }
+  #ctrlRow { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  #ctrlRow label { font-size:13px; display:flex; align-items:center; gap:4px; }
 </style>
 </head>
 <body>
@@ -576,22 +658,39 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 </div>
 <div id="panel">
-  <div class="card status-card"><span id="turn">—</span><span id="lead"></span><span id="mvcount"></span></div>
+  <div class="card status-card">
+    <span id="turn">—</span>
+    <span id="lead"></span>
+    <span id="mvcount"></span>
+  </div>
   <div class="card">
-    <h2>控制</h2>
-    <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-      <label>模式 <select id="mode">
-        <option value="hybrid" __SEL_HYBRID__>策略+少量MCTS</option>
-        <option value="mcts" __SEL_MCTS__>MCTS 搜索</option>
-        <option value="policy" __SEL_POLICY__>纯策略（无搜索）</option>
-      </select></label>
-      <label>先后手 <select id="color">
-        <option value="black">你执黑</option>
-        <option value="white">你执白</option>
-      </select></label>
-      <label>模拟数 <select id="sims">
-        <option selected>50</option><option>400</option><option>800</option><option>1600</option>
-      </select></label>
+    <h2>落子坐标</h2>
+    <div id="coordRow">
+      <input id="coordInput" type="text" placeholder="例如 16O 或 O16" maxlength="4">
+      <button id="btnCoord" class="primary">落子</button>
+    </div>
+    <h2 style="margin-top:14px">控制</h2>
+    <div id="ctrlRow">
+      <label>模式
+        <select id="mode">
+          <option value="hybrid" __SEL_HYBRID__>策略+少量MCTS</option>
+          <option value="mcts" __SEL_MCTS__>MCTS 搜索</option>
+          <option value="policy" __SEL_POLICY__>纯策略（无搜索）</option>
+        </select>
+      </label>
+      <label>先后手
+        <select id="color">
+          <option value="black">你执黑</option>
+          <option value="white">你执白</option>
+        </select>
+      </label>
+      <label>模拟数
+        <select id="sims">
+          <option selected>50</option><option>400</option><option>800</option><option>1600</option>
+        </select>
+      </label>
+    </div>
+    <div style="display:flex; gap:8px; margin-top:12px; flex-wrap:wrap;">
       <button class="primary" id="btnAI">AI 落子</button>
       <button id="btnPass">停一手</button>
       <button id="btnUndo">悔棋</button>
@@ -611,16 +710,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
   <div class="card">
     <h2>胜率曲线（你方视角）</h2>
-    <canvas id="wrChart" width="360" height="110" style="width:100%; display:block;"></canvas>
+    <canvas id="wrChart" width="348" height="100" style="width:100%; display:block;"></canvas>
   </div>
 </div>
-<div id="side">
-  <div class="card">
-    <h2>候选着法</h2>
-    <table><thead id="candHead"></thead><tbody id="cand"></tbody></table>
+  <div id="side">
+    <div class="card">
+      <h2>AI 局势分析</h2>
+      <div id="analysisBox" style="font-size:13px; line-height:1.6; color:var(--txt);">
+        <span style="color:var(--dim);">等待 AI 落子后显示分析…</span>
+      </div>
+    </div>
+    <div class="card">
+      <h2>候选着法</h2>
+      <table><thead id="candHead"></thead><tbody id="cand"></tbody></table>
+    </div>
+    <div class="card"><h2>日志</h2><div id="log"></div></div>
   </div>
-  <div class="card"><h2>日志</h2><div id="log"></div></div>
-</div>
 <script>
 const N = 19, PAD = 34, CS = (660 - PAD * 2) / (N - 1);
 const cv = document.getElementById('bd'), ctx = cv.getContext('2d');
@@ -633,33 +738,39 @@ const STARS = [[3,3],[3,9],[3,15],[9,3],[9,9],[9,15],[15,3],[15,9],[15,15]].filt
 function modeSel(){ return document.getElementById('mode').value; }
 function xy(rc){ return {x: PAD + rc*CS, y: PAD + rc*CS}; }
 
-// ---- 木纹底图（离屏预渲染一次，避免每帧重绘） ----
+// ---- 棋盘底图（离屏预渲染一次） ----
 const wood = document.createElement('canvas'); wood.width = wood.height = 660;
 (function(){
   const w = wood.getContext('2d');
+  // 浅木纹底色
   const g = w.createLinearGradient(0, 0, 660, 660);
-  g.addColorStop(0, '#e2b96f'); g.addColorStop(0.55, '#d7ac5c'); g.addColorStop(1, '#c89d4f');
+  g.addColorStop(0, '#e8c96a'); g.addColorStop(0.5, '#dfb855'); g.addColorStop(1, '#d4a843');
   w.fillStyle = g; w.fillRect(0, 0, 660, 660);
-  w.strokeStyle = 'rgba(122,84,26,.09)';
-  for (let y = 4; y < 664; y += 6){
+  // 细微木纹
+  w.strokeStyle = 'rgba(160,110,30,.07)';
+  for (let y = 3; y < 664; y += 5){
     w.beginPath();
-    for (let x = 0; x <= 660; x += 22){
-      const yy = y + Math.sin((x + y * 7) * 0.021) * 2.2;
+    for (let x = 0; x <= 660; x += 18){
+      const yy = y + Math.sin((x + y * 7) * 0.022) * 1.8;
       x === 0 ? w.moveTo(x, yy) : w.lineTo(x, yy);
     }
     w.stroke();
   }
-  const v = w.createRadialGradient(330, 330, 230, 330, 330, 480);
-  v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, 'rgba(60,35,5,.16)');
+  // 边缘暗角
+  const v = w.createRadialGradient(330, 330, 200, 330, 330, 490);
+  v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, 'rgba(80,50,10,.12)');
   w.fillStyle = v; w.fillRect(0, 0, 660, 660);
 })();
 
 function drawStone(v, p, q, R){
   ctx.save();
-  ctx.shadowColor = 'rgba(0,0,0,.4)'; ctx.shadowBlur = 4; ctx.shadowOffsetY = 2;
-  const g = ctx.createRadialGradient(p.x - R*0.32, q.y - R*0.36, R*0.1, p.x, q.y, R);
-  if (v === 1){ g.addColorStop(0, '#585858'); g.addColorStop(1, '#060606'); }
-  else { g.addColorStop(0, '#ffffff'); g.addColorStop(1, '#c4c4c4'); }
+  ctx.shadowColor = 'rgba(0,0,0,.35)'; ctx.shadowBlur = 5; ctx.shadowOffsetY = 2;
+  const g = ctx.createRadialGradient(p.x - R*0.3, q.y - R*0.35, R*0.08, p.x, q.y, R);
+  if (v === 1){ // 黑子
+    g.addColorStop(0, '#555'); g.addColorStop(0.6, '#1a1a1a'); g.addColorStop(1, '#080808');
+  } else { // 白子
+    g.addColorStop(0, '#ffffff'); g.addColorStop(0.7, '#f0f0f0'); g.addColorStop(1, '#d8d8d8');
+  }
   ctx.fillStyle = g;
   ctx.beginPath(); ctx.arc(p.x, q.y, R, 0, 2*Math.PI); ctx.fill();
   ctx.restore();
@@ -667,19 +778,27 @@ function drawStone(v, p, q, R){
 
 function draw(){
   ctx.drawImage(wood, 0, 0);
-  ctx.strokeStyle = '#6d4f1f'; ctx.lineWidth = 1;
+  // 网格线
+  ctx.strokeStyle = '#7a5c1a'; ctx.lineWidth = 0.8;
   for (let i=0;i<N;i++){
     const p = xy(i);
     ctx.beginPath(); ctx.moveTo(PAD, p.y); ctx.lineTo(660-PAD, p.y); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(p.x, PAD); ctx.lineTo(p.x, 660-PAD); ctx.stroke();
   }
-  ctx.fillStyle = '#3a2a10';
+  // 边框加粗
+  ctx.strokeStyle = '#5a4210'; ctx.lineWidth = 2;
+  ctx.strokeRect(PAD, PAD, 660-PAD*2, 660-PAD*2);
+  // 星位
+  ctx.fillStyle = '#5a3e08';
   for (const [r,c] of STARS){ const p = xy(c), q = xy(r);
-    ctx.beginPath(); ctx.arc(p.x, q.y, 3.4, 0, 2*Math.PI); ctx.fill(); }
-  ctx.fillStyle = 'rgba(50,32,6,.75)'; ctx.font = '12px Consolas,monospace';
-  for (let i=0;i<N;i++){ const p = xy(i);
-    ctx.fillText(String.fromCharCode(65+i), p.x-4, 16);
-    ctx.fillText(String(N-i), 8, p.y+4); }
+    ctx.beginPath(); ctx.arc(p.x, q.y, 3.2, 0, 2*Math.PI); ctx.fill(); }
+  // 坐标标注
+  ctx.fillStyle = '#6b4f12'; ctx.font = '11px "Segoe UI",sans-serif';
+  for (let i=0;i<N;i++){
+    const p = xy(i);
+    ctx.fillText(String.fromCharCode(65+i), p.x - 4, 14);
+    ctx.fillText(String(N-i), 7, p.y + 4);
+  }
   if (!S) return;
   const B = S.board, R = CS*0.46;
   for (let i=0;i<N*N;i++){
@@ -687,42 +806,48 @@ function draw(){
     const r = Math.floor(i/N), c = i%N;
     drawStone(v, xy(c), xy(r), R);
   }
-  // 最后一手：落子涟漪 + 红圈标记
+  // 最后一手红圈
   if (S.last_move && S.last_move !== 'pass'){
     const p = xy(S.last_move[1]), q = xy(S.last_move[0]);
     if (ripple){
       const k = Math.min(1, (performance.now() - ripple.t0) / 380);
-      ctx.beginPath(); ctx.arc(p.x, q.y, R*(1 + 0.6*k), 0, 2*Math.PI);
-      ctx.strokeStyle = 'rgba(229,68,60,' + ((1-k)*0.8).toFixed(3) + ')';
-      ctx.lineWidth = 2.5; ctx.stroke(); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(p.x, q.y, R*(1 + 0.5*k), 0, 2*Math.PI);
+      ctx.strokeStyle = 'rgba(192,57,43,' + ((1-k)*0.7).toFixed(3) + ')';
+      ctx.lineWidth = 2.2; ctx.stroke(); ctx.lineWidth = 1;
       if (k < 1) requestAnimationFrame(draw);
     }
-    ctx.beginPath(); ctx.arc(p.x, q.y, R-2.5, 0, 2*Math.PI);
-    ctx.strokeStyle = '#e5443c'; ctx.lineWidth = 2; ctx.stroke(); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(p.x, q.y, R-2, 0, 2*Math.PI);
+    ctx.strokeStyle = '#c0392b'; ctx.lineWidth = 2; ctx.stroke(); ctx.lineWidth = 1;
   }
-  // 候选热力：数字按模式区分（MCTS/hybrid=visits，纯策略=策略概率%）
-  const mode = modeSel(), candsList = S.candidates || [];
+  // ---- 美化后的候选热力 ----
+  const candsList = S.candidates || [];
   if (candsList.length){
-    const mx = Math.max(...candsList.map(x => x.visits));
+    const mx = Math.max(...candsList.map(x => x.visits), 1);
     for (const cd of candsList){
       if (B[cd.r*N+cd.c] !== 0) continue;
       const p = xy(cd.c), q = xy(cd.r);
-      const rad = CS*0.22 + CS*0.3*(cd.visits/mx);
+      const ratio = cd.visits / mx;
+      const rad = CS * (0.14 + 0.22 * ratio);
+      // 半透明圆圈，颜色随 visits 深浅变化
+      const alpha = 0.18 + 0.42 * ratio;
       ctx.beginPath(); ctx.arc(p.x, q.y, rad, 0, 2*Math.PI);
-      ctx.fillStyle = 'rgba(91,185,116,.55)'; ctx.fill();
-      ctx.strokeStyle = '#2e7d4f'; ctx.stroke();
-      ctx.fillStyle = '#12331d'; ctx.textAlign = 'center';
-      ctx.font = 'bold ' + (mode==='policy' ? '10px' : '11px') + ' Consolas,monospace';
-      ctx.fillText(mode==='policy' ? (cd.prior*100).toFixed(0)+'%' : cd.visits, p.x, q.y+4);
-      ctx.textAlign = 'left';
+      ctx.fillStyle = `rgba(58,154,90,${alpha.toFixed(2)})`;
+      ctx.fill();
+      // 小数字
+      ctx.fillStyle = `rgba(20,60,30,${(0.5 + 0.4*ratio).toFixed(2)})`;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.font = `${Math.round(9 + 3*ratio)}px Consolas,monospace`;
+      const label = modeSel()==='policy' ? (cd.prior*100).toFixed(0)+'%' : cd.visits;
+      ctx.fillText(label, p.x, q.y);
+      ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
     }
   }
 }
 
 function candHeader(mode){
   const cols = { mcts:   ['着法','visits','prior','AI胜率'],
-                 hybrid: ['着法','visits','策略%','得分','胜率'],
-                 policy: ['着法','策略%','AI胜率'] }[mode];
+                  hybrid: ['着法','visits','策略%','得分','胜率'],
+                  policy: ['着法','策略%','AI胜率'] }[mode];
   document.getElementById('candHead').innerHTML =
     '<tr>' + cols.map(c => `<th>${c}</th>`).join('') + '</tr>';
 }
@@ -765,7 +890,6 @@ function updateStatus(){
   if (S.over){ turn.innerHTML = '对局结束'; lead.textContent = ''; return; }
   if (thinking){ turn.innerHTML = `AI（${ai}）思考中…`; }
   else { turn.innerHTML = S.to_play === 1 ? `轮到你 <b>执${you}</b>` : `轮到 AI <b>执${ai}</b>`; }
-  // 目差（中国规则数子估分，含 7.5 贴目；中盘仅供形势参考）
   const L = S.lead;
   if (L === undefined || L === null) lead.textContent = '';
   else if (L > 0) lead.textContent = `形势 黑+${L.toFixed(1)}`;
@@ -794,8 +918,8 @@ function render(){
   updateStatus();
   updateOverlay();
   document.getElementById('stMove').textContent = S.ai_info ? S.ai_info.move : '-';
-  document.getElementById('stWin').textContent = S.ai_info ? (S.ai_info.ai_winrate*100).toFixed(1)+'%' : '-';
-  const wr = S.ai_info ? S.ai_info.ai_winrate : 0.5;
+  document.getElementById('stWin').textContent = S.ai_info ? (Math.max(0, Math.min(1, S.ai_info.ai_winrate))*100).toFixed(1)+'%' : '-';
+  const wr = S.ai_info ? Math.max(0, Math.min(1, S.ai_info.ai_winrate)) : 0.5;
   const bar = document.getElementById('winBar');
   bar.style.width = (wr*100).toFixed(0)+'%'; bar.textContent = (wr*100).toFixed(0)+'%';
   document.getElementById('stVisitsLabel').textContent =
@@ -813,6 +937,25 @@ function render(){
   document.getElementById('log').textContent = (S.log||[]).map(l =>
     `[${l.move}] ${l.mode==='policy' ? '前向' : 'visits '+l.visits+'/'+l.simulations} ` +
     `win ${(l.ai_winrate*100).toFixed(0)}% ${l.elapsed}s`).join('\n');
+  // 渲染 AI 分析面板
+  const ab = document.getElementById('analysisBox');
+  if (S.analysis) {
+    const a = S.analysis;
+    let html = `<div style="margin-bottom:8px;">${a.winrate_text}</div>`;
+    html += `<div style="margin-bottom:8px; color:var(--accent); font-weight:600;">${a.recommendation}</div>`;
+    html += `<div style="margin-bottom:8px; font-size:12px; color:var(--dim);">${a.lead_text}</div>`;
+    if (a.top_candidates && a.top_candidates.length > 0) {
+      html += `<div style="font-size:12px; color:var(--dim); margin-top:6px;">AI 思考要点：</div>`;
+      html += `<div style="font-size:12px; font-family:Consolas,monospace;">`;
+      a.top_candidates.forEach((c, i) => {
+        html += `<div style="color:${i===0?'var(--green)':'var(--dim)'};">${i+1}. ${c.mv} — ${(c.winrate*100).toFixed(0)}% 胜率 · ${c.visits} 次访问</div>`;
+      });
+      html += `</div>`;
+    }
+    ab.innerHTML = html;
+  } else {
+    ab.innerHTML = '<span style="color:var(--dim);">等待 AI 落子后显示分析…</span>';
+  }
   document.getElementById('btnUndo').disabled = thinking || !(S.move_count > 0);
   draw();
   drawWr();
@@ -822,7 +965,7 @@ function drawWr(){
   const c = document.getElementById('wrChart'), g = c.getContext('2d');
   const W = c.width, H = c.height, Lft = 34, Rt = 8, Tp = 8, Bt = 16;
   g.clearRect(0, 0, W, H);
-  g.strokeStyle = '#323947'; g.fillStyle = '#9aa0a6';
+  g.strokeStyle = '#d8d3cb'; g.fillStyle = '#999';
   g.font = '10px Consolas,monospace'; g.lineWidth = 1;
   for (const [v, lab] of [[1, '100%'], [0.5, '50%'], [0, '0%']]){
     const y = Tp + (H - Tp - Bt) * (1 - v);
@@ -831,33 +974,31 @@ function drawWr(){
   }
   const pts = S ? (S.wr_hist || []) : [];
   if (!pts.length){
-    g.textAlign = 'center'; g.fillStyle = '#565e6d';
+    g.textAlign = 'center'; g.fillStyle = '#bbb';
     g.fillText('AI 每落一手记录一次你方胜率', W / 2, H / 2 + 3);
     return;
   }
   const maxX = Math.max(pts[pts.length - 1].mc, 20);
   const X = mc => Lft + (W - Lft - Rt) * mc / maxX;
-  const Y = wr => Tp + (H - Tp - Bt) * (1 - wr);
-  const hp = pts.map(p => ({x: X(p.mc), y: Y(1 - p.wr)}));  // 你方胜率 = 1 - AI视角
+  const Y = wr => Tp + (H - Tp - Bt) * (1 - Math.max(0, Math.min(1, wr)));
+  const hp = pts.map(p => ({x: X(p.mc), y: Y(Math.max(0, Math.min(1, 1 - p.wr)))}));
   g.beginPath(); g.moveTo(hp[0].x, Y(0.5));
   hp.forEach(p => g.lineTo(p.x, p.y));
   g.lineTo(hp[hp.length - 1].x, Y(0.5)); g.closePath();
-  g.fillStyle = 'rgba(138,180,248,.15)'; g.fill();
+  g.fillStyle = 'rgba(74,111,165,.12)'; g.fill();
   g.beginPath(); hp.forEach((p, i) => i ? g.lineTo(p.x, p.y) : g.moveTo(p.x, p.y));
-  g.strokeStyle = '#8ab4f8'; g.lineWidth = 2; g.stroke(); g.lineWidth = 1;
-  // AI 自认失误标记：相邻两手胜率跳变 >20% 画小红点
+  g.strokeStyle = '#4a6fa5'; g.lineWidth = 2; g.stroke(); g.lineWidth = 1;
   for (let i = 1; i < pts.length; i++){
     const wrPrev = 1 - pts[i-1].wr, wrCur = 1 - pts[i].wr;
     if (Math.abs(wrCur - wrPrev) > 0.2){
       g.beginPath(); g.arc(hp[i].x, hp[i].y, 3.2, 0, 2*Math.PI);
-      g.fillStyle = '#f28b82'; g.fill();
-      g.strokeStyle = '#7a2f2a'; g.lineWidth = 1; g.stroke();
+      g.fillStyle = '#c0392b'; g.fill();
     }
   }
   const last = hp[hp.length - 1];
-  g.beginPath(); g.arc(last.x, last.y, 3, 0, 2*Math.PI); g.fillStyle = '#8ab4f8'; g.fill();
-  g.textAlign = 'left'; g.fillStyle = '#d7dae0';
-  g.fillText((pts[pts.length-1].mc) + '手', W - Rt - 26, H - 4);
+  g.beginPath(); g.arc(last.x, last.y, 3, 0, 2*Math.PI); g.fillStyle = '#4a6fa5'; g.fill();
+  g.textAlign = 'left'; g.fillStyle = '#555';
+  g.fillText(pts[pts.length-1].mc + '手', W - Rt - 26, H - 4);
   const wrNow = 1 - pts[pts.length - 1].wr;
   g.fillText((wrNow*100).toFixed(0) + '%', Math.min(last.x + 5, W - 32), Math.max(12, last.y + 3));
 }
@@ -884,6 +1025,26 @@ async function post(url, body){
   S = j; render(); return j;
 }
 
+// ---- 坐标解析：支持 16O, O16, p16, P16, 16,o 等格式 ----
+const ordA = 'a'.charCodeAt(0);
+function parseCoord(s){
+  s = s.trim().toLowerCase().replace(/[\s,]/g, '');
+  if (!s || s === 'pass' || s === 'resign') return null;
+  if (s.length < 2 || s.length > 3) return null;
+  // 提取字母部分和数字部分
+  const letters = s.replace(/[0-9]/g, '');
+  const digits = s.replace(/[a-t]/g, '');
+  if (!letters || !digits) return null;
+  const col = letters.charCodeAt(0) - ordA;
+  const rowNum = parseInt(digits, 10);
+  // 支持两种顺序：数字先行(16O → row=16, col=O) 或 字母先行(O16 → col=O, row=16)
+  // 统一：字母代表列，数字代表行号（从1开始），返回扁平坐标
+  const r = N - rowNum;  // 行号 1=顶部(行0)，19=底部(行18)
+  const c = col;
+  if (r < 0 || r >= N || c < 0 || c >= N) return null;
+  return r * N + c;
+}
+
 cv.addEventListener('click', async (e) => {
   if (thinking || !S || S.over || S.to_play !== S.human_color) return;
   const rect = cv.getBoundingClientRect();
@@ -899,6 +1060,27 @@ cv.addEventListener('click', async (e) => {
   setBusy(false);
 });
 
+// 坐标输入落子
+document.getElementById('btnCoord').onclick = async () => {
+  if (thinking) return;
+  const raw = document.getElementById('coordInput').value.trim();
+  if (!raw) return;
+  const mv = parseCoord(raw);
+  if (mv === null){ showToast('无效坐标，格式如 16O 或 O16'); return; }
+  setBusy(true);
+  const st = await post('/api/human_move', {move: mv});
+  document.getElementById('coordInput').value = '';
+  if (st && st.error){ showToast(st.error); setBusy(false); return; }
+  if (st && !st.over && st.to_play !== S.human_color) await aiTurn();
+  setBusy(false);
+};
+document.getElementById('coordInput').addEventListener('keydown', async (e) => {
+  if (e.key === 'Enter'){
+    e.preventDefault();
+    document.getElementById('btnCoord').click();
+  }
+});
+
 let pollTimer = null;
 function stopProgressPoll(){
   if (pollTimer){ clearInterval(pollTimer); pollTimer = null; }
@@ -909,7 +1091,7 @@ function startProgressPoll(){
     try {
       const j = await fetch('/api/search_progress').then(r => r.json());
       if (j.progress && S && thinking){
-        S.candidates = j.progress.candidates;   // 实时 visits 热力直接替换候选
+        S.candidates = j.progress.candidates;
         document.getElementById('thinking').textContent =
           `AI 搜索中… ${j.progress.sims} 模拟`;
         draw();
@@ -951,7 +1133,6 @@ async function newGame(){
   const color = document.getElementById('color').value;
   const st = await post('/api/reset', {color: color});
   setBusy(false);
-  // AI 执黑先手时立即落子
   if (st && !st.over && st.to_play !== st.human_color){ setBusy(true); await aiTurn(); setBusy(false); }
 }
 document.getElementById('color').addEventListener('change', async function(){
@@ -976,7 +1157,7 @@ document.getElementById('sims').disabled =
 
 def main():
     ap = argparse.ArgumentParser(description="Go-AI WebUI（19 路人机对弈 + MCTS 可视化）")
-    ap.add_argument("--model", default="models/sft_19x19_v7.pth")
+    ap.add_argument("--model", default="models/sft_19x19_v12.pth")
     ap.add_argument("--board-size", type=int, default=19)
     ap.add_argument("--device", default="auto")
     ap.add_argument("--port", type=int, default=7860)
