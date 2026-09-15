@@ -79,12 +79,13 @@ class SupervisedDataset:
         # _FLIP_ROTxx = _ROTxx ∘ _FLIP，即先翻转再旋转。
         # 注意: np.fliplr 对2D数组翻转 axis=1(W)是正确的，但对4D数组翻转 axis=2(H)
         # 是错误的——此处用显式切片 [:, :, :, ::-1] 精确指定 W 轴。
+        # 优化：一次性分配输出数组，避免重复分配
         out = np.empty_like(states)
         for t in range(8):
             mask = tforms == t
             if not mask.any():
                 continue
-            arr = states[mask]
+            arr = states[mask].copy()  # copy 避免视图问题
             if t >= 4:
                 arr = arr[:, :, :, ::-1]            # flip W (axis=3)
             k = t % 4
@@ -114,6 +115,14 @@ class SupervisedDataset:
     def sample_batch(self, idxs, device='cpu'):
         """numpy 取批 + 转 torch 张量（等价于 sample_batch_numpy 后再 to(device)）。"""
         states, moves_out, values = self.sample_batch_numpy(idxs)
+        dev_prefix = device.split(':')[0] if isinstance(device, str) else str(device)
+        if dev_prefix in ('cuda', 'npu'):
+            # pin_memory 加速 CPU→GPU/NPU 传输，non_blocking 重叠传输与计算
+            return (
+                torch.from_numpy(states).pin_memory().to(device, non_blocking=True),
+                torch.from_numpy(moves_out).pin_memory().to(device, non_blocking=True),
+                torch.from_numpy(values).pin_memory().to(device, non_blocking=True),
+            )
         return (
             torch.from_numpy(states).to(device),
             torch.from_numpy(moves_out).to(device),

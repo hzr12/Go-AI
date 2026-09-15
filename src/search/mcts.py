@@ -115,11 +115,11 @@ class MCTS:
         self.expand_topk = max(0, int(expand_topk))
         self.expand_chunk = max(0, int(expand_chunk))
         self.solver_thresh = float(solver_thresh)
-        # 推测性预评估只在多 worker 下有收益：worker 持锁做 batch=1 前向，
-        # 与主线程的批量前向争抢 CPU/GIL；num_threads<=1 时主线程本来就要做
-        # 这一次叶子前向，prefetch 只是把它挪到 worker 线程再跟主线程抢核，
-        # 净亏。故单 worker 时自动关闭（--no-prefetch 仍可显式控制）。
-        self.spec_prefetch = bool(spec_prefetch) and self.num_threads > 1
+        # 推测性预评估只在多 worker 且有显式开关时启用：
+        # worker 做 predict_batch 会抢 GIL，与主线程争核；NPU 上前向不占 GIL 但
+        # worker 的 deepcopy/特征构造仍是 CPU 开销。故默认关闭，仅 CPU 多核且
+        # 显式 --spec-prefetch 时才启用。
+        self.spec_prefetch = bool(spec_prefetch) and self.num_threads >= 4
         self.leaf_ab_depth = max(0, int(leaf_ab_depth))
         self.leaf_ab_width = max(1, int(leaf_ab_width))
         self.leaf_ab_weight = float(leaf_ab_weight)
@@ -132,31 +132,43 @@ class MCTS:
         self._fast_policy = FastPolicy(board_size) if use_rollout else None
         self._rng = np.random.default_rng(1234)
         # 特征缓存：避免相同局面重复计算 feature_planes_batched
+        # 19路状态空间大，缓存 16384 条；9路 4096 条。
         self._plane_cache = {}
-        self._plane_cache_max = 2048
+        self._plane_cache_max = 16384 if board_size == 19 else 4096
+        self._plane_cache_ts = {}  # key -> timestamp
+        self._plane_cache_ttl = 30.0  # 秒
 
     # ------------------------------------------------------------------ #
     def _clone_hist(self, h):
         return list(h)
 
     def _planes1(self, board, my_hist, op_hist, to_play):
-        """单局面 12 通道特征，带 LRU 缓存（相同局面复用）。"""
+        """单局面 12 通道特征，带 LRU + TTL 缓存（相同局面复用）。"""
         # 缓存 key: 棋盘 hash + to_play（哈希 numpy 数组的 bytes）
         h_key = tuple(my_hist) if not my_hist or isinstance(my_hist[0], int) else tuple(tuple(h) for h in my_hist)
         oh_key = tuple(op_hist) if not op_hist or isinstance(op_hist[0], int) else tuple(tuple(h) for h in op_hist)
         cache_key = (board.board.tobytes(), int(to_play), h_key, oh_key, board.ko_point)
-        cached = self._plane_cache.get(cache_key)
-        if cached is not None:
-            return cached
+        now = time.time()
+        # 检查缓存（含 TTL）
+        if cache_key in self._plane_cache:
+            cached, ts = self._plane_cache[cache_key], self._plane_cache_ts.get(cache_key, 0)
+            if now - ts < self._plane_cache_ttl:
+                self._plane_cache_ts[cache_key] = now
+                return cached
+            else:
+                self._plane_cache.pop(cache_key, None)
+                self._plane_cache_ts.pop(cache_key, None)
         planes = board.feature_planes_batched(
             board.board[None], [list(my_hist)], [list(op_hist)],
             [to_play], [board.ko_point])[0]
-        # LRU: 超过上限时淘汰一半最早的条目
+        # LRU: 超过上限时淘汰一半
         if len(self._plane_cache) >= self._plane_cache_max:
             keys = list(self._plane_cache.keys())
             for k in keys[:len(keys) // 2]:
-                del self._plane_cache[k]
+                self._plane_cache.pop(k, None)
+                self._plane_cache_ts.pop(k, None)
         self._plane_cache[cache_key] = planes
+        self._plane_cache_ts[cache_key] = now
         return planes
 
     def _child_states(self, board, moves, my_hist, op_hist, to_play):
@@ -287,9 +299,13 @@ class MCTS:
                       if self.priors_leaf else None)
 
             # speculative 叶内 α-β（可选）：净价值不确定时深化
-            if self.leaf_ab_depth > 0 and abs(leaf_v) < self.leaf_ab_uncertain:
+            # 低 sims 时自动降级 leaf_ab_depth，节省开销
+            _eff_lab_depth = self.leaf_ab_depth
+            if _eff_lab_depth > 0 and getattr(self, '_sims', 0) < 64:
+                _eff_lab_depth = min(1, self.leaf_ab_depth)
+            if _eff_lab_depth > 0 and abs(leaf_v) < self.leaf_ab_uncertain:
                 ab_v = self._leaf_ab(board, to_play, leaf.my_hist, leaf.op_hist,
-                                     self.leaf_ab_depth, self.leaf_ab_width)
+                                     _eff_lab_depth, self.leaf_ab_width)
                 leaf_v = (1.0 - self.leaf_ab_weight) * leaf_v + self.leaf_ab_weight * ab_v
                 if ab_v >= self.solver_thresh:
                     leaf.proved = 1
@@ -704,6 +720,7 @@ class MCTS:
             root_value: float 根节点我方视角价值估计
         """
         self._cur_root_board = root_board.clone()
+        self._sims = simulations  # 用于 leaf_ab_depth 智能降级
 
         # ---- 树复用：沿 path_moves 下潜到上次搜索的子树 ----
         root = self._reuse_root(path_moves)
@@ -816,7 +833,7 @@ class MCTS:
         batch: List[list] = []
         # 攒批上限与 num_threads 解耦：num_threads=1 时也要能一次吞下 worker
         # 超前产出的多条路径，否则退化成「产出1→展开1」的完全串行（卡死根因）。
-        batch_cap = max(self.num_threads, 8)
+        batch_cap = max(self.num_threads * 4, 32)
         while expanded_count < total:
             try:
                 path = leaf_q.get(timeout=0.2)
@@ -858,7 +875,10 @@ class MCTS:
                 if leaf.board is None:
                     leaf.board = self._replay_path(pth)
             # ---- 批量 leaf_ab：所有叶子的 _leaf_ab 合并为 depth+1 次 predict ----
-            if self.leaf_ab_depth > 0:
+            _eff_lab = self.leaf_ab_depth
+            if _eff_lab > 0 and getattr(self, '_sims', 0) < 64:
+                _eff_lab = min(1, self.leaf_ab_depth)
+            if _eff_lab > 0:
                 ab_data = []
                 ab_indices = []
                 for bi, pth in enumerate(batch):
