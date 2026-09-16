@@ -26,6 +26,8 @@ class SupervisedDataset:
         data 必须含：boards(int8), my_hist(int16), op_hist(int16),
                        ko(int16), moves(int16), values(int8), to_play(int8)
         可选含：game_ids(int32) — 每个样本所属棋局 ID，用于 stratified split。
+               winrates(float32) — 连续胜率标签（手数比例软标签 D），优先于 values。
+               game_weights(float32) — 每样本的游戏权重（SGF 元数据加权），用于加权采样。
         均为 shape=(N, ...) 的 numpy 数组，N 相同。
         """
         self.boards = data['boards']
@@ -36,6 +38,8 @@ class SupervisedDataset:
         self.values = data['values']
         self.to_play = data['to_play']
         self.game_ids = data.get('game_ids', None)
+        self.winrates = data.get('winrates', None)  # 可选：连续胜率
+        self.game_weights = data.get('game_weights', None)  # 可选：游戏权重
         self.N = self.boards.shape[0]
         self.board_size = self.boards.shape[1]
         self._board = GoBoard(self.board_size)  # 复用实例，避免重复分配
@@ -110,6 +114,9 @@ class SupervisedDataset:
                 moves_out[vmask] = rr * bs + cc
 
         values = self.values[idxs].astype(np.float32).reshape(-1, 1)
+        # 优先使用 winrates（连续胜率），缺失则回退到 values
+        if self.winrates is not None:
+            values = self.winrates[idxs].astype(np.float32).reshape(-1, 1)
         return states, moves_out, values
 
     def sample_batch(self, idxs, device='cpu'):

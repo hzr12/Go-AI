@@ -16,6 +16,49 @@ class RMSNorm(nn.Module):
         return (x.float() * rms).type_as(x) * self.weight
 
 
+class LayerNorm2d(nn.Module):
+    """Channel-wise Layer Normalization (ConvNeXt style)。"""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.norm = nn.LayerNorm(channels)
+
+    def forward(self, x):
+        # x: (B, C, H, W) -> (B, H, W, C) -> LN -> (B, C, H, W)
+        return self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+
+class ConvNeXtBlock(nn.Module):
+    """ConvNeXt 风格残差块：深度卷积 (5x5) + LayerNorm + PWConv (1x1) + GELU。
+
+    相比原有 ResBlock：
+      - 5x5 深度卷积代替 3x3 逐点卷积，扩大感受野
+      - LayerNorm 代替 BatchNorm，训练更稳定
+      - GELU 代替 ReLU，非线性更平滑
+      - 参数量相近（~4× 因 expand factor=4）
+    """
+
+    def __init__(self, channels):
+        super().__init__()
+        # Depthwise Conv (5x5 大核，扩大感受野)
+        self.dwconv = nn.Conv2d(channels, channels, 5, padding=2,
+                                groups=channels, bias=False)
+        self.norm = LayerNorm2d(channels)
+        # Pointwise Conv 1 (expand)
+        self.pwconv1 = nn.Conv2d(channels, channels * 4, 1, bias=False)
+        # Pointwise Conv 2 (contract)
+        self.pwconv2 = nn.Conv2d(channels * 4, channels, 1, bias=False)
+
+    def forward(self, x):
+        residual = x
+        x = self.dwconv(x)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = F.gelu(x)
+        x = self.pwconv2(x)
+        return x + residual
+
+
 class ResBlock(nn.Module):
     """纯卷积残差块（保持原有结构，用于浅层局部特征提取）。"""
 
@@ -559,10 +602,10 @@ class SharedBackbone(nn.Module):
     """
 
     def __init__(self, in_channels=12, channels=128, num_res_blocks=12,
-                 attention_mode="mix", num_attention_layers=4,
-                 num_heads=4, attention_dropout=0.0,
-                 attn_mode="global", attn_window=7,
-                 use_checkpoint=False):
+                  attention_mode="mix", num_attention_layers=4,
+                  num_heads=4, attention_dropout=0.0,
+                  attn_mode="global", attn_window=7,
+                  use_checkpoint=False, arch="convnext"):
         """
         Args:
             attention_mode:   主干堆叠模式 "none"|"mix"|"all"
@@ -571,27 +614,42 @@ class SharedBackbone(nn.Module):
             attention_dropout: 注意力 dropout
             attn_mode:         注意力计算模式 "global"|"window"|"axial"
             attn_window:       window 模式的窗口边长
+            use_checkpoint:    是否启用梯度检查点（显存优化）
+            arch:              网络架构风格 "resnet" (默认，向后兼容) | "convnext"
         """
         super(SharedBackbone, self).__init__()
         self.channels = channels
         self.attention_mode = attention_mode
         self.use_checkpoint = use_checkpoint
+        self.arch = arch
 
-        self.conv1 = nn.Conv2d(in_channels, channels, 3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(channels)
+        # 输入卷积
+        if arch == "convnext":
+            self.conv1 = nn.Conv2d(in_channels, channels, 7, stride=1, padding=3, bias=False)
+            self.norm = LayerNorm2d(channels)
+        else:
+            self.conv1 = nn.Conv2d(in_channels, channels, 3, padding=1, bias=False)
+            self.bn1 = nn.BatchNorm2d(channels)
 
         blocks = self._build_blocks(
             num_res_blocks, attention_mode, num_attention_layers,
-            channels, num_heads, attention_dropout, attn_mode, attn_window)
+            channels, num_heads, attention_dropout, attn_mode, attn_window, arch)
         self.blocks = nn.Sequential(*blocks)
 
-        self.conv_out = nn.Conv2d(channels, channels, 1, bias=False)
-        self.bn_out = nn.BatchNorm2d(channels)
+        # 输出层
+        if arch == "convnext":
+            self.norm_out = LayerNorm2d(channels)
+            self.conv_out = nn.Conv2d(channels, channels, 1, bias=False)
+        else:
+            self.conv_out = nn.Conv2d(channels, channels, 1, bias=False)
+            self.bn_out = nn.BatchNorm2d(channels)
 
     @staticmethod
     def _build_blocks(num_res_blocks, mode, num_attn, channels, num_heads,
-                      dropout, attn_mode, attn_window):
+                      dropout, attn_mode, attn_window, arch="resnet"):
         if mode == "none" or num_attn <= 0:
+            if arch == "convnext":
+                return [ConvNeXtBlock(channels) for _ in range(num_res_blocks)]
             return [ResBlock(channels) for _ in range(num_res_blocks)]
         if mode == "all":
             return [AttentionResBlock(channels, num_heads, dropout, attn_mode, attn_window)
@@ -608,15 +666,24 @@ class SharedBackbone(nn.Module):
                 blocks.append(AttentionResBlock(
                     channels, num_heads, dropout, attn_mode, attn_window))
             else:
-                blocks.append(ResBlock(channels))
+                if arch == "convnext":
+                    blocks.append(ConvNeXtBlock(channels))
+                else:
+                    blocks.append(ResBlock(channels))
         return blocks
 
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
+        if self.arch == "convnext":
+            out = self.norm(self.conv1(x))
+        else:
+            out = F.relu(self.bn1(self.conv1(x)))
         if self.training and self.use_checkpoint:
             out = torch.utils.checkpoint.checkpoint_sequential(
                 self.blocks, len(self.blocks), out, use_reentrant=False)
         else:
             out = self.blocks(out)
-        out = F.relu(self.bn_out(self.conv_out(out)))
+        if self.arch == "convnext":
+            out = self.norm_out(self.conv_out(out))
+        else:
+            out = F.relu(self.bn_out(self.conv_out(out)))
         return out

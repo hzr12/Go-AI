@@ -16,6 +16,7 @@ import os
 import sys
 import tarfile
 import tempfile
+import re
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -38,6 +39,40 @@ def iter_sgf_bytes(src):
     else:
         with open(src, 'rb') as f:
             yield os.path.basename(src), f.read()
+
+
+def parse_player_rating(player_str):
+    """从 SGF 的 PB/PW 字段提取等级评分。
+
+    支持格式：
+      - "PlayerName 9d" / "PlayerName 3k"  → 职业/业余等级
+      - "PlayerName(KGS:9)"                 → KGS 评级
+      - 其他                                → 默认权重 10
+    """
+    if not player_str:
+        return 10
+    s = player_str.strip()
+    # KGS 评级: "(KGS:9)" 或 "(KGS:15d)"
+    m = re.search(r'[Kk][Gg][Ss]:\s*(\d+)([dkDK]?)', s)
+    if m:
+        rating = int(m.group(1))
+        typ = m.group(2).lower()
+        return rating * 2 if not typ else (20 + rating * 10)
+    # 数字 + d/k 后缀: "9d", "3k", "15k"
+    m = re.search(r'(\d+)([dkDK])', s)
+    if m:
+        rating = int(m.group(1))
+        typ = m.group(2).lower()
+        if typ == 'k':
+            return max(1, 20 - rating * 2)   # 业余级数越大越弱
+        return 20 + rating * 10             # 职业级数越大越强
+    return 10  # 默认中等权重
+
+
+def compute_game_weight(black_rating, white_rating):
+    """根据双方等级计算对局权重（几何平均 + log 压缩）。"""
+    avg = (black_rating + white_rating) / 2.0
+    return float(np.exp(avg / 20.0))  # exp(10)≈2.2, exp(20)≈4.9, exp(30)≈10.1
 
 
 def parse_result_to_value(result_str):
@@ -85,28 +120,42 @@ def split_hist(recent, to_play):
 def _flush_chunk(chunk, tmp_dir, idx):
     """把一个 chunk（dict of list）stack 后存成临时 npz 分片，释放内存。"""
     path = os.path.join(tmp_dir, f"chunk_{idx:05d}.npz")
-    np.savez(path,
-             boards=np.stack(chunk['boards']).astype(np.int8),
-             my_hist=np.stack(chunk['my_hists']).astype(np.int16),
-             op_hist=np.stack(chunk['op_hists']).astype(np.int16),
-             ko=np.array(chunk['kos'], dtype=np.int16),
-             moves=np.array(chunk['moves'], dtype=np.int16),
-             values=np.array(chunk['values'], dtype=np.int8),
-             to_play=np.array(chunk['to_plays'], dtype=np.int8),
-             game_ids=np.array(chunk['game_ids'], dtype=np.int32))
+    save_dict = {}
+    for k, v in chunk.items():
+        if k == 'boards':
+            save_dict[k] = np.stack(v).astype(np.int8)
+        elif k in ('my_hists', 'op_hists'):
+            save_dict['my_hist' if k == 'my_hists' else 'op_hist'] = np.stack(v).astype(np.int16)
+        elif k == 'kos':
+            save_dict[k] = np.array(v, dtype=np.int16)
+        elif k == 'moves':
+            save_dict[k] = np.array(v, dtype=np.int16)
+        elif k == 'values':
+            save_dict[k] = np.array(v, dtype=np.int8)
+        elif k == 'winrates':
+            save_dict[k] = np.array(v, dtype=np.float32)
+        elif k == 'to_plays':
+            save_dict['to_play'] = np.array(v, dtype=np.int8)
+        elif k == 'game_ids':
+            save_dict[k] = np.array(v, dtype=np.int32)
+        elif k == 'game_weights':
+            save_dict[k] = np.array(v, dtype=np.float32)
+    np.savez(path, **save_dict)
     return path
 
 
 def _merge_chunks(tmp_files, out):
     """把若干 npz 分片按字段 concatenate，压缩合并成单个 npz。"""
-    keys = ['boards', 'my_hist', 'op_hist', 'ko', 'moves', 'values', 'to_play', 'game_ids']
+    keys = ['boards', 'my_hist', 'op_hist', 'ko', 'moves', 'values', 'winrates',
+            'to_play', 'game_ids', 'game_weights']
     merged = {k: [] for k in keys}
     for f in tmp_files:
         d = np.load(f, allow_pickle=False)
         for k in keys:
-            merged[k].append(d[k])
+            if k in d:
+                merged[k].append(d[k])
         d.close()
-    merged = {k: np.concatenate(v, axis=0) for k, v in merged.items()}
+    merged = {k: np.concatenate(v, axis=0) for k, v in merged.items() if v}
     np.savez_compressed(out, **merged)
     for f in tmp_files:
         try:
@@ -276,6 +325,11 @@ def build(src, board_size, max_games, chunk_size=0, out=None, tmp_root=None):
         if value is None:
             return 0, 1
 
+        # SGF 元数据加权：解析双方等级，计算对局权重
+        black_rating = parse_player_rating(game.black_player)
+        white_rating = parse_player_rating(game.white_player)
+        game_weight = compute_game_weight(black_rating, white_rating)
+
         board = GoBoard(board_size, komi=game.komi)
         history = []  # 扁平坐标序列（pass 记为 -1）
         n_moves = len(game.moves)
@@ -288,27 +342,23 @@ def build(src, board_size, max_games, chunk_size=0, out=None, tmp_root=None):
             # 落子坐标：pass 记 -1；否则把小棋盘坐标居中映射到大棋盘
             target = -1 if (r, c) == (-1, -1) else (r + off) * board_size + (c + off)
 
-            # position-specific value（当前执子方视角）：
-            #   前 30%：0（开局不确定）
-            #   中 50%：0 → game_result 线性过渡
-            #   后 20%：game_result（终局确定）
+            # position-specific value（手数比例软标签 D）：
+            # alpha 从 0.3 线性增长到 1.0，终局时价值信号最强
             fv = value * to_play  # 当前执子方视角
             frac = (i + 1) / n_moves
-            if frac <= 0.3:
-                pos_value = 0
-            elif frac <= 0.8:
-                pos_value = round(fv * (frac - 0.3) / 0.5)
-            else:
-                pos_value = round(fv)
+            alpha = 0.3 + 0.7 * frac
+            soft_value = np.tanh(fv * alpha)  # 连续值 ∈ [-1, 1]
 
             cur['boards'].append(board.board.copy())
             cur['my_hists'].append(pad3(my_h))
             cur['op_hists'].append(pad3(op_h))
             cur['kos'].append(ko)
             cur['moves'].append(target)
-            cur['values'].append(pos_value)
+            cur['values'].append(round(soft_value))  # int8 兼容
+            cur['winrates'].append(float(soft_value))  # float32 连续胜率
             cur['to_plays'].append(to_play)
             cur['game_ids'].append(game_id_counter)
+            cur['game_weights'].append(game_weight)  # 每样本共享同一游戏的权重
 
             play_move = target  # 与 target 相同，无需重复计算
             if not board.play(play_move):
@@ -346,7 +396,7 @@ def build(src, board_size, max_games, chunk_size=0, out=None, tmp_root=None):
                 tmp_files.append(_flush_chunk(cur, tmp_dir, chunk_idx))
                 chunk_idx += 1
                 print(f"[build] 已落盘分片 #{chunk_idx}（累计样本 {total_flushed}）", flush=True)
-                cur = {'boards': [], 'my_hists': [], 'op_hists': [], 'kos': [], 'moves': [], 'values': [], 'to_plays': [], 'game_ids': []}
+    cur = {'boards': [], 'my_hists': [], 'op_hists': [], 'kos': [], 'moves': [], 'values': [], 'to_plays': [], 'game_ids': [], 'game_weights': []}
 
     if streaming:
         # flush 残余样本并合并
@@ -371,8 +421,10 @@ def build(src, board_size, max_games, chunk_size=0, out=None, tmp_root=None):
         'ko': np.array(cur['kos'], dtype=np.int16),
         'moves': np.array(cur['moves'], dtype=np.int16),
         'values': np.array(cur['values'], dtype=np.int8),
+        'winrates': np.array(cur['winrates'], dtype=np.float32),
         'to_play': np.array(cur['to_plays'], dtype=np.int8),
         'game_ids': np.array(cur['game_ids'], dtype=np.int32),
+        'game_weights': np.array(cur['game_weights'], dtype=np.float32),
     }
     return data, n_games, skip
 

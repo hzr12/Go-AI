@@ -31,7 +31,8 @@ class AlphaGoNet(nn.Module):
                  policy_channels: int = 32,
                  value_channels: int = 64,
                  action_size: int = 362,
-                 use_checkpoint: bool = False):
+                 use_checkpoint: bool = False,
+                 arch: str = "resnet"):
         """
         Args:
             attention_mode:      主干中注意力的使用方式
@@ -41,6 +42,7 @@ class AlphaGoNet(nn.Module):
             attention_dropout:   注意力 dropout
             attn_mode:           注意力计算模式 "global"|"window"|"axial"
             attn_window:         window 模式的窗口边长
+            arch:                网络架构风格 "resnet" (默认) | "convnext"
         """
         super(AlphaGoNet, self).__init__()
         self.action_size = action_size
@@ -56,6 +58,7 @@ class AlphaGoNet(nn.Module):
             attn_mode=attn_mode,
             attn_window=attn_window,
             use_checkpoint=use_checkpoint,
+            arch=arch,
         )
 
         self.policy = PolicyNetwork(
@@ -67,6 +70,7 @@ class AlphaGoNet(nn.Module):
         self.value = ValueNetwork(
             in_channels=backbone_channels,
             hidden_channels=value_channels,
+            arch=arch,
         )
 
     def forward(self, observation: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

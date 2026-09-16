@@ -594,6 +594,9 @@ def main():
                     choices=['default', 'max-autotune', 'reduce-overhead'],
                     help='torch.compile 模式: default=常规融合, max-autotune=A100 上进一步 '
                          '自动调优提速（编译更久）, reduce-overhead=小 batch 低开销')
+    ap.add_argument('--arch', default='resnet',
+                    choices=['resnet', 'convnext'],
+                    help='网络架构风格: resnet=传统 ResBlock (默认，兼容旧权重) | convnext=ConvNeXt 风格 (5x5 深度卷积 + LayerNorm + GELU)')
     args = ap.parse_args()
 
     # ---- 分布式训练环境变量（由 torchrun / mp.spawn 注入）----
@@ -806,6 +809,7 @@ def main():
         attn_window=args.attn_window,
         action_size=args.board_size * args.board_size + 1,  # +1 为 pass 类别
         use_checkpoint=args.use_checkpoint,
+        arch=args.arch,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     logger.info("[model] 参数量=%.2fM | 设备=%s", n_params / 1e6, device)
@@ -1056,10 +1060,16 @@ def main():
                     policy_logits, value_logit = model(state)
                     policy_loss = F.cross_entropy(policy_logits.float(), move_t,
                                                   label_smoothing=args.label_smoothing)
-                    # BCEWithLogitsLoss: target ±1 → 0.1/0.9（软标签，防止过拟合）
-                    value_target = (value_t.squeeze().float() + 1) / 2 * 0.8 + 0.1  # ±1 → 0.1/0.9
-                    value_loss = F.binary_cross_entropy_with_logits(
-                        value_logit.float().squeeze(), value_target)
+                    # 价值损失：根据数据是否含 winrates 字段选择 MSE 或 BCE
+                    if dataset.winrates is not None:
+                        # 使用连续胜率标签 (D) + MSE loss
+                        value_target = value_t.squeeze().float()  # 已经是 [-1, 1]
+                        value_loss = F.mse_loss(value_logit.float().squeeze(), value_target)
+                    else:
+                        # 回退到原有 BCE 逻辑
+                        value_target = (value_t.squeeze().float() + 1) / 2 * 0.8 + 0.1  # ±1 → 0.1/0.9
+                        value_loss = F.binary_cross_entropy_with_logits(
+                            value_logit.float().squeeze(), value_target)
                     loss = policy_loss + args.value_loss_weight * value_loss
                 scaler.scale(loss / _accum_steps).backward()
                 if (i + 1) % _accum_steps == 0 or (i + 1) == n_batches:
