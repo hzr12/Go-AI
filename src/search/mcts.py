@@ -67,7 +67,9 @@ class MCTS:
                  solver_thresh=0.9, spec_prefetch=True,
                  leaf_ab_depth=0, leaf_ab_width=4, leaf_ab_weight=0.5,
                  leaf_ab_uncertain=0.85, priors_leaf=False,
-                 dirichlet_alpha=0.0, dirichlet_eps=0.0):
+                 dirichlet_alpha=0.0, dirichlet_eps=0.0,
+                 dynamic_topk=True, dynamic_virtual_loss=True,
+                 policy_pruning_thresh=0.01):
         """
         Args:
             ai:            GoAI 实例（需支持 predict_batch）
@@ -137,6 +139,47 @@ class MCTS:
         self._plane_cache_max = 16384 if board_size == 19 else 4096
         self._plane_cache_ts = {}  # key -> timestamp
         self._plane_cache_ttl = 30.0  # 秒
+        # Phase 1 优化：动态参数
+        self.dynamic_topk = dynamic_topk
+        self.dynamic_virtual_loss = dynamic_virtual_loss
+        self.policy_pruning_thresh = policy_pruning_thresh
+        self._current_sim = 0  # 当前模拟计数（用于动态调整）
+
+    # ------------------------------------------------------------------ #
+    def _dynamic_topk(self, sim_count, total_sims):
+        """根据模拟进度动态调整 topk。
+
+        早期快速探索 (topk=8) → 中期平衡 (topk=16) → 后期精细 (topk=32)。
+        """
+        if not self.dynamic_topk or self.expand_topk == 0:
+            return self.expand_topk
+        progress = sim_count / max(total_sims, 1)
+        if progress < 0.3:
+            return min(8, self.expand_topk)
+        elif progress < 0.7:
+            return min(16, self.expand_topk)
+        else:
+            return min(32, self.expand_topk)
+
+    def _dynamic_virtual_loss(self, sim_count, total_sims):
+        """根据搜索进度动态调整 virtual_loss。
+
+        早期少占位 (vl=2) → 中期平衡 (vl=6) → 后期多占位 (vl=12)。
+        """
+        if not self.dynamic_virtual_loss:
+            return self.virtual_loss
+        progress = sim_count / max(total_sims, 1)
+        return 2.0 + 10.0 * progress
+
+    def _prune_low_prior(self, masked, candidates, thresh=None):
+        """策略剪枝：跳过 policy 概率 < thresh 的候选。"""
+        if thresh is None:
+            thresh = self.policy_pruning_thresh
+        if thresh <= 0:
+            return candidates
+        # 只保留 prior > thresh 的候选
+        pruned = [m for m in candidates if masked[m] > thresh]
+        return pruned if pruned else candidates[:1]  # 至少保留 1 个
 
     # ------------------------------------------------------------------ #
     def _clone_hist(self, h):
@@ -280,6 +323,9 @@ class MCTS:
 
         leaf_v = None  # leaf.to_play 视角
         if self.expand_topk and self.expand_topk < len(candidates):
+            # 动态 topk：根据模拟进度调整
+            eff_topk = self._dynamic_topk(self._current_sim, getattr(self, '_sims', 64))
+            
             # 叶子前向：优先复用 worker 推测性预评估（已与主线程 batch 重叠）
             if leaf.prefetch is not None:
                 lp, leaf_v = leaf.prefetch
@@ -292,8 +338,11 @@ class MCTS:
 
             masked = np.zeros(self.n_actions, dtype=np.float64)
             masked[candidates] = np.asarray(lp).reshape(-1)[candidates]
-            # prior 降序 = α-β 的走法排序
-            order = [int(m) for m in np.argsort(-masked)[:self.expand_topk]]
+            
+            # 策略剪枝：跳过 low-prior 候选
+            order_raw = [int(m) for m in np.argsort(-masked)]
+            order = self._prune_low_prior(masked, order_raw[:eff_topk])
+            
             # priors_leaf：叶子自身 policy 作子节点先验（标准 AlphaZero 方案）
             priors = ({int(m): float(masked[m]) for m in order}
                       if self.priors_leaf else None)
@@ -721,6 +770,7 @@ class MCTS:
         """
         self._cur_root_board = root_board.clone()
         self._sims = simulations  # 用于 leaf_ab_depth 智能降级
+        self._current_sim = 0  # 重置模拟计数
 
         # ---- 树复用：沿 path_moves 下潜到上次搜索的子树 ----
         root = self._reuse_root(path_moves)
@@ -781,8 +831,10 @@ class MCTS:
                         if pending <= 0 and leaf_q.empty():
                             return
                     else:
+                        # 动态 virtual loss
+                        eff_vl = self._dynamic_virtual_loss(self._current_sim, total)
                         for node in path:
-                            node.virtual_loss += self.virtual_loss
+                            node.virtual_loss += eff_vl
                         leaf.expanded = True  # 逻辑占位，真正展开在主线程
                         produced += 1
                         pending += 1
@@ -910,6 +962,7 @@ class MCTS:
                 self._backup(pth, v_leaf=-leaf.value_sum)
                 expanded_count += 1
                 pending -= 1
+                self._current_sim = expanded_count  # 更新模拟计数
                 if progress_cb is not None:
                     try:
                         progress_cb(expanded_count, root)
@@ -937,7 +990,8 @@ class MCTS:
 
         visits = np.zeros(self.n_actions, dtype=np.int64)
         for mv, child in root.children.items():
-            visits[mv] = child.visit
+            if 0 <= mv < self.n_actions:  # 防止越界
+                visits[mv] = child.visit
 
         root_value = 0.0
         if root.children:
@@ -947,6 +1001,8 @@ class MCTS:
         if temp <= 0:
             probs = np.zeros(self.n_actions)
             best_mv = int(np.argmax(visits))
+            # 确保 best_mv 在合法范围内
+            best_mv = min(max(best_mv, 0), self.n_actions - 1)
             probs[best_mv] = 1.0
         else:
             vis = visits.astype(np.float64) ** (1.0 / temp)
@@ -992,6 +1048,8 @@ class MCTS:
         if temperature is not None:
             self.temperature = old_temp
         move_int = int(np.argmax(visits)) if visits.sum() > 0 else self.n_actions - 1
+        # 确保 move_int 在合法范围内 [0, n_actions-1]
+        move_int = min(move_int, self.n_actions - 1)
         is_pass = (move_int == self.n_actions - 1)
         if return_value:
             return move_int, is_pass, float(root_value)

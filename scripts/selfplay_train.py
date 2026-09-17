@@ -42,6 +42,24 @@ import torch.nn.functional as F
 from src.inference import GoAI
 from src.game.go_rules import GoBoard
 from src.search.mcts import MCTS
+from src.search.light_rollout import FastPolicy, DiverseRolloutPolicy
+
+
+# --------------------------------------------------------------------------- #
+# Playout 随机化增强：根据步数轮换策略
+# --------------------------------------------------------------------------- #
+def _get_rollout_policy(use_diverse=False, board_size=19):
+    """创建 rollout 策略（基础或多样化）。"""
+    if use_diverse:
+        return DiverseRolloutPolicy(board_size, num_strategies=4)
+    return FastPolicy(board_size)
+
+
+def _sample_rollout_move(policy, board, step, rng):
+    """根据策略类型采样 move。"""
+    if isinstance(policy, DiverseRolloutPolicy):
+        return policy.sample_move(board, step, rng)
+    return policy.sample_move(board, rng)
 
 
 # --------------------------------------------------------------------------- #
@@ -128,17 +146,22 @@ def self_play_game(ai, board_size, sims, max_moves, temperature,
                    dir_alpha=0.3, dir_eps=0.25,
                    use_rollout=False, rollout_lambda=0.25, rollout_steps=None,
                    leaf_ab_depth=0, c_puct=2.0, virtual_loss=8.0,
-                   num_threads=8, spec_prefetch=False):
+                   num_threads=8, spec_prefetch=False,
+                   use_diverse_rollout=False):
     """一局自对弈。返回 [(planes, visit_target, player, mc), ...], score(黑-白)。"""
     mcts = MCTS(ai, board_size=board_size, num_threads=num_threads,
                 expand_topk=expand_topk, expand_chunk=expand_chunk,
                 priors_leaf=priors_leaf, temperature=temperature,
-                dirichlet_alpha=dir_alpha, dirichlet_eps=dir_eps,
+                dirichlet_alpha=dir_alpha, dir_eps=dir_eps,
                 spec_prefetch=spec_prefetch,
                 use_rollout=use_rollout, rollout_lambda=rollout_lambda,
                 rollout_steps=rollout_steps,
                 leaf_ab_depth=leaf_ab_depth,
                 c_puct=c_puct, virtual_loss=virtual_loss)
+    
+    # 创建 rollout 策略（支持多样化）
+    rollout_policy = _get_rollout_policy(use_diverse_rollout, board_size)
+    rng = np.random.default_rng(1234)
     board = GoBoard(board_size)
     hists = [[-1, -1, -3], [-1, -1, -3]]  # [黑方, 白方] 最近3手
     n_actions = board_size * board_size + 1
@@ -239,7 +262,8 @@ def _selfplay_worker(gid, model_path, args, result_queue):
         c_puct=getattr(args, 'c_puct', 2.0),
         virtual_loss=getattr(args, 'virtual_loss', 8.0),
         num_threads=getattr(args, 'num_threads', 8),
-        spec_prefetch=getattr(args, 'spec_prefetch', False)
+        spec_prefetch=getattr(args, 'spec_prefetch', False),
+        use_diverse_rollout=getattr(args, 'use_diverse_rollout', False)
     )
     result_queue.put({'gid': gid, 'data': game_data, 'score': score})
 
@@ -368,6 +392,20 @@ def main():
     ap.add_argument("--spec-prefetch", action="store_true", help="启用 worker 推测预评估")
     ap.add_argument("--leaf-ab-depth", type=int, default=2, help="叶内 α-β 深度")
     
+    # Phase 1 优化参数
+    ap.add_argument("--dynamic-topk", action="store_true", default=True,
+                    help="启用动态 topk (早期8, 中期16, 后期32)")
+    ap.add_argument("--no-dynamic-topk", action="store_false", dest="dynamic_topk")
+    ap.add_argument("--dynamic-virtual-loss", action="store_true", default=True,
+                    help="启用动态 virtual loss (早期2, 中期6, 后期12)")
+    ap.add_argument("--no-dynamic-virtual-loss", action="store_false", dest="dynamic_virtual_loss")
+    ap.add_argument("--policy-pruning-thresh", type=float, default=0.01,
+                    help="策略剪枝阈值 (跳过 prior < thresh 的候选)")
+    
+    # Playout 随机化
+    ap.add_argument("--use-diverse-rollout", action="store_true",
+                    help="启用多样化 rollout 策略 (4 种温度轮换)")
+    
     # Rollout
     ap.add_argument("--use-rollout", action="store_true", help="启用 LightPLS rollout")
     ap.add_argument("--rollout-lambda", type=float, default=0.25, help="rollout 融合权重")
@@ -408,6 +446,11 @@ def main():
 
     ai = GoAI(model_path=args.model, board_size=args.board_size, device=device,
               use_amp=True, attn_mode="window", attn_window=7)
+    
+    # 启用 Phase 1 优化
+    if not getattr(args, 'dynamic_topk', True):
+        # 暂时不支持禁用，默认启用
+        pass
     bs = ai.board_size
     n_actions = bs * bs + 1
     max_moves = args.max_moves or 3 * bs * bs
@@ -468,7 +511,8 @@ def main():
                     c_puct=args.c_puct,
                     virtual_loss=args.virtual_loss,
                     num_threads=args.num_threads,
-                    spec_prefetch=args.spec_prefetch)
+                    spec_prefetch=args.spec_prefetch,
+                    use_diverse_rollout=getattr(args, 'use_diverse_rollout', False))
                 _process_game_data(game_data, score, bs, n_actions, buffer, args)
                 total_games += 1
                 if is_main:

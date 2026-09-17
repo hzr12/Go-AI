@@ -96,7 +96,7 @@ python scripts/webui.py --port 7860 --device cpu --priors-leaf \
     --expand-topk 16 --num-threads 8
 
 # ============================================================
-# 优化说明（50GB 空间约束 + 训练增强）
+# 优化说明（50GB 空间约束 + 训练增强 + MCTS 加速）
 # ============================================================
 # - 自对弈数据不写临时 npz，用内存队列传递
 # - 只保存最佳权重（latest + best），其他删除
@@ -107,4 +107,12 @@ python scripts/webui.py --port 7860 --device cpu --priors-leaf \
 # - 手数比例软标签 (D)：tanh(score × alpha)，连续胜率
 # - MSE Loss：使用 winrates 时自动切换到 MSE
 # - ConvNeXt 风格：5x5 深度卷积 + LayerNorm + GELU (--arch convnext)
+#
+# MCTS 加速 (Phase 1):
+# - 动态 topk: 早期8/中期16/后期32 (自动启用)
+# - 动态 virtual_loss: 早期2/中期6/后期12 (自动启用)
+# - 策略剪枝: 跳过 prior < 0.01 的候选
+# - 多样化 rollout: 4 种温度策略轮换 (--use-diverse-rollout)
+#
+# 预期效果: 2-3x MCTS 提速，+50~150 ELO
 # ============================================================

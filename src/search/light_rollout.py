@@ -151,6 +151,64 @@ def light_rollout(board: GoBoard, policy: "FastPolicy",
     return _tt_value(score, initiator)
 
 
+# --------------------------------------------------------------------------- #
+# Playout 随机化增强：多种策略轮换
+# --------------------------------------------------------------------------- #
+class DiverseRolloutPolicy:
+    """多种 rollout 策略轮换，增加价值估计的多样性。"""
+
+    def __init__(self, board_size: int, num_strategies: int = 4):
+        self.n = board_size
+        self.strategies = [
+            FastPolicy(board_size, temperature=1.0),           # 基础策略
+            FastPolicy(board_size, temperature=0.5),           # 保守（更贪婪）
+            FastPolicy(board_size, temperature=2.0),           # 激进（更随机）
+            FastPolicy(board_size, temperature=5.0),           # 非常随机（探索）
+        ]
+        self.num_strategies = len(self.strategies)
+        self._rng = np.random.default_rng()
+
+    def sample_move(self, board: GoBoard, step: int, rng: np.random.Generator) -> int:
+        """根据步数轮换策略。"""
+        strategy_idx = (step // 5) % self.num_strategies
+        return self.strategies[strategy_idx].sample_move(board, rng)
+
+
+def light_rollout_diverse(board: GoBoard, diverse_policy: "DiverseRolloutPolicy",
+                          max_steps: int = None,
+                          rng: np.random.Generator = None) -> float:
+    """使用多样化策略的 rollout，返回发起方视角胜率。"""
+    if rng is None:
+        rng = np.random.default_rng()
+    n = board.board_size
+    if max_steps is None:
+        max_steps = n * n * 2
+    cur = GoBoard(n)
+    cur.board = board.board.copy()
+    cur.current_player = board.current_player
+    cur.ko_point = board.ko_point
+    cur.passes = board.passes
+    cur.move_history = list(board.move_history)
+    initiator = cur.current_player
+    passes = 0
+    steps = 0
+    while steps < max_steps and passes < 2:
+        mv = diverse_policy.sample_move(cur, steps, rng)
+        if mv == n * n:
+            cur.play(-1)
+            passes += 1
+        else:
+            ok = cur.play(mv)
+            if not ok:
+                cur.play(-1)
+                passes += 1
+            else:
+                passes = 0
+        steps += 1
+    score = cur.score()
+    return _tt_value(score, initiator)
+
+
 def _tt_value(score: float, initiator: int) -> float:
     """Tromp-Taylor 数子结果（黑-白目数）转为发起方视角胜率。"""
     if score > 0:
