@@ -1000,7 +1000,11 @@ class MCTS:
         temp = self.temperature
         if temp <= 0:
             probs = np.zeros(self.n_actions)
-            best_mv = int(np.argmax(visits))
+            # 确保 visits.sum() > 0 再取 argmax，避免全零时的意外行为
+            if visits.sum() > 0:
+                best_mv = int(np.argmax(visits))
+            else:
+                best_mv = self.n_actions - 1  # fallback to pass
             # 确保 best_mv 在合法范围内
             best_mv = min(max(best_mv, 0), self.n_actions - 1)
             probs[best_mv] = 1.0
@@ -1050,7 +1054,19 @@ class MCTS:
         move_int = int(np.argmax(visits)) if visits.sum() > 0 else self.n_actions - 1
         # 确保 move_int 在合法范围内 [0, n_actions-1]
         move_int = min(move_int, self.n_actions - 1)
+        # 安全检查：确保不超过 legal mask 范围
+        if move_int >= self.n_actions - 1:
+            move_int = self.n_actions - 1  # pass
         is_pass = (move_int == self.n_actions - 1)
+        
+        # 额外保障：如果 move_int 指向 pass，但实际有合法着法，优先选择最高 visit 的合法着法
+        if is_pass and visits.sum() > 0:
+            # 找第一个有 visit 的合法着法
+            for mv in range(self.n_actions - 1):  # 排除 pass
+                if visits[mv] > 0:
+                    move_int = mv
+                    is_pass = False
+                    break
         if return_value:
             return move_int, is_pass, float(root_value)
         return move_int, is_pass

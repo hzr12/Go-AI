@@ -14,21 +14,26 @@ python scripts/build_dataset.py \
 python -c "import numpy as np; d=np.load('data/sgf_19x19_full.npz'); print('game_ids' in d)"
 
 # ---- ③ 4卡 NPU 监督训练（SFT）----
+# 推荐配置：大 Batch + 深度预取
 torchrun --nproc_per_node=4 scripts/train_sft.py \
   --data data/sgf_19x19_full.npz \
   --device npu --board-size 19 \
   --backbone-channels 192 --backbone-res-blocks 17 \
-  --batch-size 800 --epochs 2 \
+  --batch-size 3200 --epochs 2 \
   --lr 0.002 --weight-decay 0.0001 \
   --attention-mode mix --num-attention-layers 4 --num-heads 4 \
   --attn-mode window_global --attn-window 7 \
   --attention-dropout 0.1 --label-smoothing 0.1 \
-  --gradient-accumulation-steps 2 \
+  --gradient-accumulation-steps 1 \
   --use-amp --use-ema \
-  --prefetch-depth 4 \
+  --prefetch-workers 8 --prefetch-depth 8 \
   --log-every 50 --eval-every 500 --save-every 500 \
-  --resume models/sft_19x19_v9.pth\
-  --out models/sft_19x19_v12.pth
+  --resume models/sft_19x19_v12.pth \
+  --out models/sft_19x19_v15.pth \
+  --export-onnx  # 训练后自动导出 ONNX
+
+# 备用配置：如果显存不足，减小 batch
+# --batch-size 1600 --gradient-accumulation-steps 2
 
 # ---- ③' ConvNeXt 风格训练（可选，需重新训练）----
 torchrun --nproc_per_node=4 scripts/train_sft.py \
@@ -80,10 +85,10 @@ python scripts/selfplay_train.py \
   --board-size 19 --iters 20 --games 16 --sims 64 \
   --parallel-games 8 \
   --mcts-threads 3 \
-  --onnx-model models/sft_19x19_v14.onnx \
+  --onnx-model models/sft_19x19_v15.onnx \
   --batch-cap 64 \
   --streaming \
-  --model models/sft_19x19_v12.pth \
+  --model models/sft_19x19_v15.pth \
   --out models/az_best.pth \
   --use-rollout --leaf-ab-depth 2 \
   --c-puct 2.0 --virtual-loss 8.0 \
@@ -98,7 +103,7 @@ python scripts/selfplay_train.py \
 torchrun --nproc_per_node=4 scripts/selfplay_train.py \
   --board-size 19 --iters 20 --games 16 --sims 400 \
   --parallel-games 4 --ddp --streaming \
-  --model models/sft_19x19_v12.pth --out models/az_best.pth
+  --model models/sft_19x19_v15.pth --out models/az_best.pth
 
 # ---- ⑥' ONNX 导出（训练后执行）----
 python scripts/train_sft.py \
@@ -111,9 +116,16 @@ python scripts/train_sft.py \
   --onnx-quantize  # 可选：int8 量化（模型体积 ~1/4）
 
 # ---- ⑦ WebUI----
+# 推荐配置：ONNX + 多线程
 python scripts/webui.py --port 7860 --device cpu --priors-leaf \
-    --mode hybrid --hybrid-sims 32 --hybrid-blend 0.5 \
-    --expand-topk 16 --num-threads 8
+    --onnx models/sft_19x19_v15.onnx \
+    --mode hybrid --hybrid-sims 16 --hybrid-blend 0.5 \
+    --expand-topk 16 --num-threads 4
+
+# 备用配置：使用 PyTorch 后端
+# python scripts/webui.py --port 7860 --device cpu --priors-leaf \
+#     --mode hybrid --hybrid-sims 32 --hybrid-blend 0.5 \
+#     --expand-topk 16 --num-threads 4
 
 # ============================================================
 # 优化说明（50GB 空间约束 + 训练增强 + MCTS 加速）

@@ -546,7 +546,7 @@ def main():
         if len(buffer) > max_samples:
             del buffer[:len(buffer) - max_samples]
 
-        # 训练
+        # 训练（异步模式下，训练与生成并行）
         if is_main:
             avg_loss = train_epochs(ai, buffer, args, device)
             dt = time.perf_counter() - t0

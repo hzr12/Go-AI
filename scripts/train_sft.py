@@ -565,10 +565,10 @@ def main():
                     help='每隔多少 step 打印一次训练日志（loss/lr/吞吐/显存）')
     ap.add_argument('--log-file', default='training.log',
                     help='训练日志文件路径（同时输出到控制台），设为空字符串可关闭文件日志')
-    ap.add_argument('--prefetch-workers', type=int, default=4,
+    ap.add_argument('--prefetch-workers', type=int, default=8,
                     help='数据预取线程数：每个 batch 切块并行造特征并与 GPU 计算重叠；'
                          '<=1 关闭预取（回退同步取样）。')
-    ap.add_argument('--prefetch-depth', type=int, default=4,
+    ap.add_argument('--prefetch-depth', type=int, default=8,
                     help='预取流水深度（提前多少个 batch 造好数据，控制内存/吞吐平衡）')
     ap.add_argument('--resume', default='',
                     help='断点续训：指定已保存的 .pth 模型路径，会从该权重 + 同目录 '
