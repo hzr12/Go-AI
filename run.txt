@@ -127,16 +127,23 @@ python scripts/train_sft.py \
   --onnx-quantize  # 可选：int8 量化（模型体积 ~1/4）
 
 # ---- ⑦ WebUI----
-# 推荐配置：ONNX + 多线程
+# 推荐配置：ONNX + 多线程 + 策略深度2
 python scripts/webui.py --port 7860 --device cpu --priors-leaf \
     --onnx models/sft_19x19_v15.onnx \
     --mode hybrid --hybrid-sims 16 --hybrid-blend 0.5 \
-    --expand-topk 16 --num-threads 4
+    --expand-topk 16 --num-threads 4 \
+    --policy-depth 2 --policy-width 4 --policy-topk 12
+
+# 备用配置：纯 MCTS（更高质量，较慢）
+# python scripts/webui.py --port 7860 --device cpu --priors-leaf \
+#     --onnx models/sft_19x19_v15.onnx \
+#     --mode mcts --simulations 64 --num-threads 4
 
 # 备用配置：使用 PyTorch 后端
 # python scripts/webui.py --port 7860 --device cpu --priors-leaf \
-#     --mode hybrid --hybrid-sims 32 --hybrid-blend 0.5 \
-#     --expand-topk 16 --num-threads 4
+#     --mode hybrid --hybrid-sims 16 --hybrid-blend 0.5 \
+#     --expand-topk 16 --num-threads 4 \
+#     --policy-depth 2
 
 # ============================================================
 # 优化说明（50GB 空间约束 + 训练增强 + MCTS 加速）
