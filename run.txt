@@ -94,6 +94,17 @@ python scripts/selfplay_train.py \
   --c-puct 2.0 --virtual-loss 8.0 \
   --expand-topk 16 --buffer-size 500
 
+# 异步流水线模式（生成与训练完全并行）
+GOAI_ASYNC=1 python scripts/selfplay_train.py \
+  --board-size 19 --iters 20 --sims 64 \
+  --parallel-games 8 \
+  --mcts-threads 3 \
+  --onnx-model models/sft_19x19_v15.onnx \
+  --batch-cap 64 \
+  --games-per-iter 20 \
+  --model models/sft_19x19_v15.pth \
+  --out models/az_best.pth
+
 # 环境变量（启动前设置）
 # export OMP_NUM_THREADS=3
 # export MKL_NUM_THREADS=3
