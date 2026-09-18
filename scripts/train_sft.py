@@ -597,6 +597,10 @@ def main():
     ap.add_argument('--arch', default='resnet',
                     choices=['resnet', 'convnext'],
                     help='网络架构风格: resnet=传统 ResBlock (默认，兼容旧权重) | convnext=ConvNeXt 风格 (5x5 深度卷积 + LayerNorm + GELU)')
+    ap.add_argument('--export-onnx', action='store_true',
+                    help='训练结束后导出 ONNX 模型（用于 CPU 推理加速）')
+    ap.add_argument('--onnx-quantize', action='store_true',
+                    help='ONNX int8 量化（模型体积 ~1/4，CPU 推理 ~2x）')
     args = ap.parse_args()
 
     # ---- 分布式训练环境变量（由 torchrun / mp.spawn 注入）----
@@ -1202,6 +1206,15 @@ def main():
                         torch.save(_state, args.out + '.train_state')
                         if ema is not None:
                             ema.restore()
+
+    # 训练结束后导出 ONNX（可选）
+    if args.export_onnx and is_main:
+        logger.info("[train] 开始导出 ONNX 模型...")
+        from src.inference import GoAI
+        ai = GoAI(model_path=args.out, board_size=args.board_size, device='cpu')
+        onnx_path = args.out.replace('.pth', '.onnx')
+        ai.export_onnx(onnx_path, quantize_int8=args.onnx_quantize)
+        logger.info("[train] ONNX 导出完成: %s", onnx_path)
 
 if __name__ == "__main__":
     main()

@@ -885,7 +885,7 @@ class MCTS:
         batch: List[list] = []
         # 攒批上限与 num_threads 解耦：num_threads=1 时也要能一次吞下 worker
         # 超前产出的多条路径，否则退化成「产出1→展开1」的完全串行（卡死根因）。
-        batch_cap = max(self.num_threads * 4, 32)
+        batch_cap = max(self.num_threads * 4, 32)  # 保持原有值避免回归
         while expanded_count < total:
             try:
                 path = leaf_q.get(timeout=0.2)

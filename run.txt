@@ -74,21 +74,41 @@ python scripts/selfplay_train.py \
   --board-size 9 --iters 5 --games 4 --sims 64 \
   --parallel-games 2
 
-# NPU 正式训练（19路，4进程并行，流式）
+# NPU 正式训练（19路，8进程并行，ONNX 推理）
+# 24核环境配置: 8进程 × 3线程 = 24核
 python scripts/selfplay_train.py \
-  --board-size 19 --iters 20 --games 16 --sims 400 \
-  --parallel-games 4 --streaming \
+  --board-size 19 --iters 20 --games 16 --sims 64 \
+  --parallel-games 8 \
+  --mcts-threads 3 \
+  --onnx-model models/sft_19x19_v14.onnx \
+  --batch-cap 64 \
+  --streaming \
   --model models/sft_19x19_v12.pth \
   --out models/az_best.pth \
-  --use-rollout --leaf-ab-depth 2 --num-threads 8 \
+  --use-rollout --leaf-ab-depth 2 \
   --c-puct 2.0 --virtual-loss 8.0 \
-  --expand-topk 64 --buffer-size 500
+  --expand-topk 16 --buffer-size 500
+
+# 环境变量（启动前设置）
+# export OMP_NUM_THREADS=3
+# export MKL_NUM_THREADS=3
+# export OPENBLAS_NUM_THREADS=3
 
 # NPU 4卡 DDP 训练
 torchrun --nproc_per_node=4 scripts/selfplay_train.py \
   --board-size 19 --iters 20 --games 16 --sims 400 \
   --parallel-games 4 --ddp --streaming \
   --model models/sft_19x19_v12.pth --out models/az_best.pth
+
+# ---- ⑥' ONNX 导出（训练后执行）----
+python scripts/train_sft.py \
+  --data data/sgf_19x19_full.npz \
+  --device npu --board-size 19 \
+  --backbone-channels 192 --backbone-res-blocks 17 \
+  --batch-size 800 --epochs 2 \
+  --out models/sft_19x19_v14.pth \
+  --export-onnx \
+  --onnx-quantize  # 可选：int8 量化（模型体积 ~1/4）
 
 # ---- ⑦ WebUI----
 python scripts/webui.py --port 7860 --device cpu --priors-leaf \

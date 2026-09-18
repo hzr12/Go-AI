@@ -249,8 +249,13 @@ def _selfplay_worker(gid, model_path, args, result_queue):
     if device == 'auto':
         device = _auto_select_device()
     
-    ai = GoAI(model_path=model_path, board_size=args.board_size, device=device,
-              use_amp=True, attn_mode='window', attn_window=7)
+    # 每个进程独立加载模型（绕过 GIL）
+    if args.onnx_model:
+        ai = GoAI(model_path=args.onnx_model, board_size=args.board_size, 
+                  device='cpu', use_amp=False)
+    else:
+        ai = GoAI(model_path=model_path, board_size=args.board_size, device=device,
+                  use_amp=True, attn_mode='window', attn_window=7)
     
     game_data, score = self_play_game(
         ai, args.board_size, args.sims,
@@ -261,7 +266,7 @@ def _selfplay_worker(gid, model_path, args, result_queue):
         leaf_ab_depth=getattr(args, 'leaf_ab_depth', 2),
         c_puct=getattr(args, 'c_puct', 2.0),
         virtual_loss=getattr(args, 'virtual_loss', 8.0),
-        num_threads=getattr(args, 'num_threads', 8),
+        num_threads=getattr(args, 'mcts_threads', 3),  # 使用新的参数名
         spec_prefetch=getattr(args, 'spec_prefetch', False),
         use_diverse_rollout=getattr(args, 'use_diverse_rollout', False)
     )
@@ -433,6 +438,17 @@ def main():
     ap.add_argument("--clip-grad", type=float, default=1.0, help="梯度裁剪范数（0=关闭）")
     ap.add_argument("--out", type=str, default="models/az", help="权重输出路径")
     ap.add_argument("--save-every", type=int, default=1, help="每隔几轮保存最佳权重")
+    
+    # Phase 2: 并行优化参数
+    ap.add_argument("--parallel-games", type=int, default=8,
+                    help="并行自对弈进程数（建议: CPU cores / 3，24核建议 8）")
+    ap.add_argument("--mcts-threads", type=int, default=3,
+                    help="每个进程的 MCTS 线程数（建议: cores / parallel_games）")
+    ap.add_argument("--onnx-model", type=str, default=None,
+                    help="ONNX 模型路径（CPU 推理加速 3-5x）")
+    ap.add_argument("--batch-cap", type=int, default=64,
+                    help="MCTS 批量展开上限（默认 64）")
+    
     args = ap.parse_args()
 
     # 设备选择
@@ -446,6 +462,13 @@ def main():
 
     ai = GoAI(model_path=args.model, board_size=args.board_size, device=device,
               use_amp=True, attn_mode="window", attn_window=7)
+    
+    # 如果指定了 ONNX 模型，切换后端
+    if args.onnx_model:
+        if is_main:
+            print(f"[selfplay] 使用 ONNX 后端: {args.onnx_model}", flush=True)
+        ai = GoAI(model_path=args.onnx_model, board_size=args.board_size, 
+                  device='cpu', use_amp=False)
     
     # 启用 Phase 1 优化
     if not getattr(args, 'dynamic_topk', True):
@@ -474,17 +497,16 @@ def main():
         if is_main:
             print(f"\n[iter {it}/{args.iters}] 开始自对弈...", flush=True)
 
-        # 并行或串行自对弈
-        if args.parallel_games > 1 and not args.ddp:
-            # 多进程并行生成
-            result_queue = Queue(maxsize=args.result_queue_max)
-            processes = []
-            for g in range(args.parallel_games):
-                p = Process(target=_selfplay_worker,
-                           args=(g, args.model, args, result_queue))
-                p.start()
-                processes.append(p)
-            
+    # 并行或串行自对弈
+    if args.parallel_games > 1 and not args.ddp:
+        # 多进程并行生成
+        result_queue = Queue(maxsize=args.result_queue_max)
+        processes = []
+        for g in range(args.parallel_games):
+            p = Process(target=_selfplay_worker,
+                       args=(g, args.model, args, result_queue))
+            p.start()
+            processes.append(p)
             # 收集结果
             for _ in range(args.parallel_games):
                 result = result_queue.get()
