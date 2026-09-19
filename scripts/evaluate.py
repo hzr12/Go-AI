@@ -23,10 +23,10 @@ def load_ai(args):
     # （GoAI 的 auto 分支只在收到 "auto" 时触发）。
     ai = GoAI(
         model_path=args.model, board_size=args.board_size, device=args.device,
-        use_amp=args.use_amp, attention_mode=args.attention_mode,
+        use_amp=bool(args.use_amp), attention_mode=args.attention_mode,
         num_attention_layers=args.num_attention_layers, num_heads=args.num_heads,
         policy_channels=args.policy_channels, value_channels=args.value_channels,
-        attn_mode=args.attn_mode, attn_window=args.attn_window, compile=args.compile,
+        attn_mode=args.attn_mode, attn_window=args.attn_window, compile=bool(args.compile),
     )
     return ai, ai.device
 
@@ -121,7 +121,8 @@ def main():
     parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--board-size", type=int, default=9)
     parser.add_argument("--device", type=str, default="auto")
-    parser.add_argument("--use-amp", action="store_true")
+    parser.add_argument("--use-amp", type=int, default=0, choices=[0, 1],
+                        help='启用混合精度 (0=关闭, 1=开启)')
     parser.add_argument("--attention-mode", default="mix", choices=["none", "mix", "all"])
     parser.add_argument("--num-attention-layers", type=int, default=4)
     parser.add_argument("--num-heads", type=int, default=4)
@@ -131,11 +132,13 @@ def main():
                         help="value 头隐层通道（须与训练时一致，训练默认 64）")
     parser.add_argument("--attn-mode", default="global", choices=["global", "window", "axial", "sparse", "window_global"])
     parser.add_argument("--attn-window", type=int, default=7)
-    parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--compile", type=int, default=0, choices=[0, 1],
+                        help='启用 torch.compile (0=关闭, 1=开启)')
     parser.add_argument("--mode", type=str, default="random",
                         choices=["random", "benchmark", "selfplay"])
     parser.add_argument("--num-games", type=int, default=100)
-    parser.add_argument("--use-mcts", action="store_true")
+    parser.add_argument("--use-mcts", type=int, default=0, choices=[0, 1],
+                        help='启用 MCTS 评估 (0=关闭, 1=开启)')
     parser.add_argument("--simulations", type=int, default=400)
     parser.add_argument("--num-threads", type=int, default=1)
     parser.add_argument("--topk", type=int, default=10)
@@ -144,9 +147,9 @@ def main():
     ai, device = load_ai(p)
     if p.mode == "random":
         res = evaluate_vs_random(ai, p.board_size, num_games=p.num_games,
-                                 use_mcts=p.use_mcts, simulations=p.simulations,
+                                 use_mcts=bool(p.use_mcts), simulations=p.simulations,
                                  num_threads=p.num_threads, topk=p.topk)
-        tag = "MCTS" if p.use_mcts else "policy-argmax"
+        tag = "MCTS" if bool(p.use_mcts) else "policy-argmax"
         print(f"[{tag}] vs 随机 {p.num_games} 局: 胜 {res['wins']} 负 {res['losses']} 平 {res['draws']} "
               f"胜率 {res['win_rate']:.1%}")
     elif p.mode == "benchmark":
@@ -158,7 +161,7 @@ def main():
                   f"({res[f'throughput_batch{nb}']:.1f} pos/s)"
                   + ("  [MCTS 叶子评估]" if nb == 32 else ""))
     elif p.mode == "selfplay":
-        res = ai.self_play(num_games=p.num_games, use_mcts=p.use_mcts,
+        res = ai.self_play(num_games=p.num_games, use_mcts=bool(p.use_mcts),
                            simulations=p.simulations, num_threads=p.num_threads)
         wr = sum(1 for r in res if r > 0) / max(len(res), 1)
         print(f"自对弈 {len(res)} 局 黑方胜率 {wr:.2%}")

@@ -533,7 +533,8 @@ def main():
     ap.add_argument('--max-games-per-tgz', type=int, default=0,
                     help="目录模式下每个 tgz 最多解析的棋局数（0=全部），用于子采样控制内存")
     ap.add_argument('--device', default='auto')
-    ap.add_argument('--use-amp', action='store_true')
+    ap.add_argument('--use-amp', type=int, default=0, choices=[0, 1],
+                    help='启用混合精度训练 (0=关闭, 1=开启)')
     ap.add_argument('--batch-size', type=int, default=512)
     ap.add_argument('--epochs', type=int, default=4)
     ap.add_argument('--lr', type=float, default=2e-3)
@@ -599,31 +600,31 @@ def main():
                     help='value head 学习率倍数（相对主干 LR，补偿参数量小的梯度不足）')
     ap.add_argument('--label-smoothing', type=float, default=0.1,
                     help='policy loss label smoothing（0=不平滑，0.1=标准值）')
-    ap.add_argument('--use-checkpoint', action='store_true',
-                    help='用 gradient checkpointing 减少显存占用（约省 50%%，训练慢 ~30%%）')
-    ap.add_argument('--use-ema', action='store_true',
-                    help='启用 EMA（指数移动平均）权重，eval/save 时用 shadow 权重，提升 1-3%% accuracy')
+    ap.add_argument('--use-checkpoint', type=int, default=0, choices=[0, 1],
+                    help='用 gradient checkpointing 减少显存占用（约省 50%%，训练慢 ~30%%）(0=关闭, 1=开启)')
+    ap.add_argument('--use-ema', type=int, default=0, choices=[0, 1],
+                    help='启用 EMA（指数移动平均）权重，eval/save 时用 shadow 权重，提升 1-3%% accuracy (0=关闭, 1=开启)')
     ap.add_argument('--gradient-accumulation-steps', type=int, default=1,
                     help='梯度累积步数（模拟更大 batch size，效果等同于 batch_size * N）')
-    ap.add_argument('--compile', action='store_true',
-                    help='用 torch.compile 融合算子（GPU 上约 20-40%% 提速，首次迭代较慢）')
+    ap.add_argument('--compile', type=int, default=0, choices=[0, 1],
+                    help='用 torch.compile 融合算子（GPU 上约 20-40%% 提速，首次迭代较慢）(0=关闭, 1=开启)')
     ap.add_argument('--compile-mode', default='default',
                     choices=['default', 'max-autotune', 'reduce-overhead'],
                     help='torch.compile 模式: default=常规融合, max-autotune=A100 上进一步 '
                          '自动调优提速（编译更久）, reduce-overhead=小 batch 低开销')
-    ap.add_argument('--flash-attn', action='store_true',
-                    help='启用 flash-attn 独立库（A100 上最快，需 pip install flash-attn）')
+    ap.add_argument('--flash-attn', type=int, default=0, choices=[0, 1],
+                    help='启用 flash-attn 独立库（A100 上最快，需 pip install flash-attn）(0=关闭, 1=开启)')
     ap.add_argument('--arch', default='resnet',
                     choices=['resnet', 'convnext'],
                     help='网络架构风格: resnet=传统 ResBlock (默认，兼容旧权重) | convnext=ConvNeXt 风格 (5x5 深度卷积 + LayerNorm + GELU)')
-    ap.add_argument('--export-onnx', action='store_true',
-                    help='训练结束后导出 ONNX 模型（用于 CPU 推理加速）')
-    ap.add_argument('--onnx-quantize', action='store_true',
-                    help='ONNX int8 量化（模型体积 ~1/4，CPU 推理 ~2x）')
-    ap.add_argument('--swanlab', action='store_true',
-                    help='启用 SwanLab 实验跟踪（需设置 SWANLAB_API_KEY 环境变量）')
-    ap.add_argument('--early-stop', action='store_true',
-                    help='启用早停机制：当验证集指标连续 N 次无改善时自动停止训练')
+    ap.add_argument('--export-onnx', type=int, default=0, choices=[0, 1],
+                    help='训练结束后导出 ONNX 模型（用于 CPU 推理加速）(0=关闭, 1=开启)')
+    ap.add_argument('--onnx-quantize', type=int, default=0, choices=[0, 1],
+                    help='ONNX int8 量化（模型体积 ~1/4，CPU 推理 ~2x）(0=关闭, 1=开启)')
+    ap.add_argument('--swanlab', type=int, default=0, choices=[0, 1],
+                    help='启用 SwanLab 实验跟踪（需设置 SWANLAB_API_KEY 环境变量）(0=关闭, 1=开启)')
+    ap.add_argument('--early-stop', type=int, default=0, choices=[0, 1],
+                    help='启用早停机制：当验证集指标连续 N 次无改善时自动停止训练 (0=关闭, 1=开启)')
     ap.add_argument('--early-stop-patience', type=int, default=3,
                     help='早停耐心值：连续 N 次 eval 无改善则停止（默认 3）')
     ap.add_argument('--early-stop-metric', default='top1',
@@ -658,7 +659,7 @@ def main():
     logger.info("=" * 60)
 
     # SwanLab 实验跟踪（可选，通过 --swanlab 启用）
-    use_swanlab = args.swanlab or os.environ.get('SWANLAB_API_KEY')
+    use_swanlab = args.swanlab == 1 or os.environ.get('SWANLAB_API_KEY')
     swanlab_logger = None
     if use_swanlab and is_main:
         try:
@@ -709,7 +710,7 @@ def main():
         else:
             device = args.device
 
-    use_amp = args.use_amp or (device.split(':')[0] in ('cuda', 'npu'))
+    use_amp = args.use_amp == 1 or (device.split(':')[0] in ('cuda', 'npu'))
 
     # ---- 多后端自适应路径（CUDA / NPU / CPU）----
     # 各后端能力差异很大，逐后端决定：
@@ -758,7 +759,7 @@ def main():
             logger.info("[device] %s (sm_%d%d) | 启用 A100 路径: BF16 + FlashAttn + "
                         "channels_last + compile(卷积/线性/FFN)", gpu_name, *compute_cap)
             # 尝试加载 flash-attn
-            if args.flash_attn:
+            if args.flash_attn == 1:
                 from src.networks import backbone as _backbone
                 fa_ok, fa_msg = _backbone.set_flash_attn(True)
                 if fa_ok:
@@ -795,7 +796,7 @@ def main():
         use_channels_last = False
         sdpa_force_math = True
         compile_disable_sparse = True
-        if args.compile:
+        if args.compile == 1:
             logger.warning("[device] NPU 上 torch.compile(inductor) 不可用，已忽略 --compile；"
                            "如需图编译请用 torchair (torch_npu.experimental_config)。")
             args.compile = False
@@ -878,7 +879,7 @@ def main():
         attn_mode=args.attn_mode,
         attn_window=args.attn_window,
         action_size=args.board_size * args.board_size + 1,  # +1 为 pass 类别
-        use_checkpoint=args.use_checkpoint,
+        use_checkpoint=args.use_checkpoint == 1,
         arch=args.arch,
         res_blocks=args.res_blocks,
         convnext_blocks=args.convnext_blocks,
@@ -932,7 +933,7 @@ def main():
             scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
 
     # EMA（指数移动平均）：eval/save 时用 shadow 权重，提升 1-3% accuracy
-    ema = EMA(model, decay=0.999) if args.use_ema else None
+    ema = EMA(model, decay=0.999) if args.use_ema == 1 else None
 
     # ---- 学习率调度：基于“总 step 数”而非 epoch 数 ----
     # 旧版用 T_max=args.epochs 导致余弦在第 1 个 epoch 结束就被砍到 ~0，
@@ -1027,7 +1028,7 @@ def main():
     # torch.compile 融合算子（GPU 上约 20-40%% 提速）。必须在 resume 加载之后再做，
     # 否则模型会被包成 OptimizedModule，其 state_dict 带 "_orig_mod." 前缀，与
     # checkpoint 的 "backbone.xxx" 不匹配导致 load 失败。
-    if args.compile:
+    if args.compile == 1:
         if hasattr(torch, 'compile'):
             try:
                 # 4 个注意力块实例 × window/sparse 两个禁用点 × train/eval 两态，
@@ -1324,7 +1325,7 @@ def main():
                             ema.restore()
 
                 # 早停检查
-                if args.early_stop and is_main:
+                if args.early_stop == 1 and is_main:
                     if args.early_stop_metric == 'loss':
                         current_metric = metrics.get('brier', metrics['kl'])
                         if current_metric < best_eval_metric:
@@ -1348,12 +1349,12 @@ def main():
                         break
 
     # 训练结束后导出 ONNX（可选）
-    if args.export_onnx and is_main:
+    if args.export_onnx == 1 and is_main:
         logger.info("[train] 开始导出 ONNX 模型...")
         from src.inference import GoAI
         ai = GoAI(model_path=args.out, board_size=args.board_size, device='cpu')
         onnx_path = args.out.replace('.pth', '.onnx')
-        ai.export_onnx(onnx_path, quantize_int8=args.onnx_quantize)
+        ai.export_onnx(onnx_path, quantize_int8=args.onnx_quantize == 1)
         logger.info("[train] ONNX 导出完成: %s", onnx_path)
 
     # 最后一步评估：使用 EMA 权重（如果启用）

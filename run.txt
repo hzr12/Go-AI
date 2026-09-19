@@ -46,13 +46,13 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
   --attn-mode window_global --attn-window 5 \
   --attention-dropout 0.1 --label-smoothing 0.1 \
   --gradient-accumulation-steps 1 \
-  --use-amp --use-ema \
+  --use-amp 1 --use-ema 1 \
   --prefetch-workers 16 --prefetch-depth 16 \
   --log-every 50 --eval-every 500 --save-every 500 \
-  --early-stop --early-stop-patience 3 \
+  --early-stop 1 --early-stop-patience 3 \
   --out models/sft_19x19_v17.pth \
-  --export-onnx --use-checkpoint \
-  --swanlab --project go-ai --name sft_v17_npu4
+  --export-onnx 1 --use-checkpoint 1 \
+  --swanlab 1 --project go-ai --name sft_v17_npu4
 
 # 方案 B: 单卡 A100 40G (更快)
 # pip install flash-attn --no-build-isolation
@@ -69,15 +69,15 @@ torchrun --nproc_per_node=1 scripts/train_sft.py \
   --attn-mode window_global --attn-window 5 \
   --attention-dropout 0.1 --label-smoothing 0.1 \
   --gradient-accumulation-steps 1 \
-  --use-amp --use-ema \
-  --compile --compile-mode max-autotune \
-  --flash-attn \
+  --use-amp 1 --use-ema 1 \
+  --compile 1 --compile-mode max-autotune \
+  --flash-attn 1 \
   --prefetch-workers 32 --prefetch-depth 32 \
   --log-every 50 --eval-every 500 --save-every 500 \
-  --early-stop --early-stop-patience 3 \
+  --early-stop 1 --early-stop-patience 3 \
   --out models/sft_19x19_v17.pth \
-  --export-onnx --use-checkpoint \
-  --swanlab --project go-ai --name sft_v17_a100
+  --export-onnx 1 --use-checkpoint 1 \
+  --swanlab 1 --project go-ai --name sft_v17_a100
 
 # 方案 C: 4卡 A100 (最快)
 torchrun --nproc_per_node=4 scripts/train_sft.py \
@@ -93,15 +93,15 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
   --attn-mode window_global --attn-window 5 \
   --attention-dropout 0.1 --label-smoothing 0.1 \
   --gradient-accumulation-steps 1 \
-  --use-amp --use-ema \
-  --compile --compile-mode max-autotune \
-  --flash-attn \
+  --use-amp 1 --use-ema 1 \
+  --compile 1 --compile-mode max-autotune \
+  --flash-attn 1 \
   --prefetch-workers 32 --prefetch-depth 32 \
   --log-every 50 --eval-every 500 --save-every 500 \
-  --early-stop --early-stop-patience 3 \
+  --early-stop 1 --early-stop-patience 3 \
   --out models/sft_19x19_v17.pth \
-  --export-onnx --use-checkpoint \
-  --swanlab --project go-ai --name sft_v17_a100_4card
+  --export-onnx 1 --use-checkpoint 1 \
+  --swanlab 1 --project go-ai --name sft_v17_a100_4card
 
 # 备用：显存不足时减小 batch
 # --batch-size 1600 --gradient-accumulation-steps 2
@@ -118,14 +118,14 @@ python scripts/selfplay_train.py \
   --batch-cap 64 \
   --expand-topk 16 \
   --buffer-size 500 \
-  --use-rollout --leaf-ab-depth 2 \
+  --use-rollout 1 --leaf-ab-depth 2 \
   --c-puct 2.0 --virtual-loss 8.0 \
   --model models/sft_19x19_v17.pth \
   --out models/az_best.pth
 
 # 异步模式：生成与训练完全并行（额外 1.5-2x 提速）
 python scripts/selfplay_train.py \
-  --async-pipeline \
+  --async-pipeline 1 \
   --board-size 19 --iters 20 --sims 48 \
   --parallel-games 8 \
   --mcts-threads 3 \
@@ -139,14 +139,14 @@ python scripts/selfplay_train.py \
 # ④ WebUI 人机对弈
 # ============================================================
 # 推荐配置：ONNX + 多线程 + 策略深度2
-python scripts/webui.py --port 7860 --device cpu --priors-leaf \
+python scripts/webui.py --port 7860 --device cpu --priors-leaf 1 \
     --onnx models/sft_19x19_v17.onnx \
     --mode hybrid --hybrid-sims 32 --hybrid-blend 0.5 \
     --expand-topk 8 --num-threads 4 \
     --policy-depth 2 --policy-width 4 --policy-topk 12
 
 # 高质量模式：纯 MCTS（较慢但更强）
-python scripts/webui.py --port 7860 --device cpu --priors-leaf \
+python scripts/webui.py --port 7860 --device cpu --priors-leaf 1 \
     --onnx models/sft_19x19_v17.onnx \
     --mode mcts --simulations 64 --num-threads 4
 
@@ -157,7 +157,7 @@ python scripts/evaluate.py \
   --model models/sft_19x19_v17.pth \
   --board-size 19 --device npu \
   --mode random --num-games 100 \
-  --use-mcts --simulations 400 --num-threads 4
+  --use-mcts 1 --simulations 400 --num-threads 4
 
 python scripts/eval_elo.py \
   --model models/sft_19x19_v17.pth \

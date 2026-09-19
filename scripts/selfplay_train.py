@@ -312,7 +312,7 @@ def train_epochs(ai, buffer, args, device):
         opt, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_steps])
 
     # EMA
-    ema = EMA(model, decay=0.999) if args.use_ema else None
+    ema = EMA(model, decay=0.999) if args.use_ema == 1 else None
 
     losses = []
     if not buffer:
@@ -394,25 +394,25 @@ def main():
     ap.add_argument("--c-puct", type=float, default=2.0, help="PUCT 探索系数")
     ap.add_argument("--virtual-loss", type=float, default=8.0, help="虚拟损失系数")
     ap.add_argument("--num-threads", type=int, default=8, help="MCTS 多线程数")
-    ap.add_argument("--spec-prefetch", action="store_true", help="启用 worker 推测预评估")
+    ap.add_argument("--spec-prefetch", type=int, default=0, choices=[0, 1],
+                    help="启用 worker 推测预评估 (0=关闭, 1=开启)")
     ap.add_argument("--leaf-ab-depth", type=int, default=2, help="叶内 α-β 深度")
     
     # Phase 1 优化参数
-    ap.add_argument("--dynamic-topk", action="store_true", default=True,
-                    help="启用动态 topk (早期8, 中期16, 后期32)")
-    ap.add_argument("--no-dynamic-topk", action="store_false", dest="dynamic_topk")
-    ap.add_argument("--dynamic-virtual-loss", action="store_true", default=True,
-                    help="启用动态 virtual loss (早期2, 中期6, 后期12)")
-    ap.add_argument("--no-dynamic-virtual-loss", action="store_false", dest="dynamic_virtual_loss")
+    ap.add_argument("--dynamic-topk", type=int, default=0, choices=[0, 1],
+                    help="启用动态 topk (早期8, 中期16, 后期32) (0=关闭, 1=开启)")
+    ap.add_argument("--dynamic-virtual-loss", type=int, default=0, choices=[0, 1],
+                    help="启用动态 virtual loss (早期2, 中期6, 后期12) (0=关闭, 1=开启)")
     ap.add_argument("--policy-pruning-thresh", type=float, default=0.01,
                     help="策略剪枝阈值 (跳过 prior < thresh 的候选)")
     
     # Playout 随机化
-    ap.add_argument("--use-diverse-rollout", action="store_true",
-                    help="启用多样化 rollout 策略 (4 种温度轮换)")
+    ap.add_argument("--use-diverse-rollout", type=int, default=0, choices=[0, 1],
+                    help="启用多样化 rollout 策略 (4 种温度轮换) (0=关闭, 1=开启)")
     
     # Rollout
-    ap.add_argument("--use-rollout", action="store_true", help="启用 LightPLS rollout")
+    ap.add_argument("--use-rollout", type=int, default=0, choices=[0, 1],
+                    help="启用 LightPLS rollout (0=关闭, 1=开启)")
     ap.add_argument("--rollout-lambda", type=float, default=0.25, help="rollout 融合权重")
     ap.add_argument("--rollout-steps", type=int, default=60, help="rollout 最大步数")
     
@@ -423,18 +423,23 @@ def main():
                     help="结果队列最大容量")
     
     # 流式训练
-    ap.add_argument("--streaming", action="store_true", help="启用流式训练（默认）")
-    ap.add_argument("--no-persist", action="store_true", help="不写临时 npz 文件")
+    ap.add_argument("--streaming", type=int, default=0, choices=[0, 1],
+                    help="启用流式训练（默认）(0=关闭, 1=开启)")
+    ap.add_argument("--no-persist", type=int, default=0, choices=[0, 1],
+                    help="不写临时 npz 文件 (0=写入, 1=不写入)")
     
     # DDP
-    ap.add_argument("--ddp", action="store_true", help="启用 DDP 多卡训练（需 torchrun）")
+    ap.add_argument("--ddp", type=int, default=0, choices=[0, 1],
+                    help="启用 DDP 多卡训练（需 torchrun）(0=关闭, 1=开启)")
     
     # 设备
     ap.add_argument("--device", default="auto",
                     help="设备选择：auto/cuda/npu/cpu")
     
-    ap.add_argument("--no-augment", action="store_true", help="关闭 8 对称增强")
-    ap.add_argument("--use-ema", action="store_true", help="启用 EMA 权重")
+    ap.add_argument("--no-augment", type=int, default=0, choices=[0, 1],
+                    help="关闭 8 对称增强 (0=开启, 1=关闭)")
+    ap.add_argument("--use-ema", type=int, default=0, choices=[0, 1],
+                    help="启用 EMA 权重 (0=关闭, 1=开启)")
     ap.add_argument("--clip-grad", type=float, default=1.0, help="梯度裁剪范数（0=关闭）")
     ap.add_argument("--out", type=str, default="models/az", help="权重输出路径")
     ap.add_argument("--save-every", type=int, default=1, help="每隔几轮保存最佳权重")
@@ -450,17 +455,17 @@ def main():
                     help="MCTS 批量展开上限（默认 64）")
     
     # 异步流水线
-    ap.add_argument("--async-pipeline", action="store_true",
-                    help="启用异步流水线（生成与训练并行，需配合 --games-per-iter）")
+    ap.add_argument("--async-pipeline", type=int, default=0, choices=[0, 1],
+                    help="启用异步流水线（生成与训练并行，需配合 --games-per-iter）(0=关闭, 1=开启)")
     ap.add_argument("--games-per-iter", type=int, default=10,
                     help="异步模式下每轮迭代生成的局数")
-    ap.add_argument("--swanlab", action="store_true",
-                    help="启用 SwanLab 实验跟踪（需设置 SWANLAB_API_KEY 环境变量）")
+    ap.add_argument("--swanlab", type=int, default=0, choices=[0, 1],
+                    help="启用 SwanLab 实验跟踪（需设置 SWANLAB_API_KEY 环境变量）(0=关闭, 1=开启)")
     
     args = ap.parse_args()
 
     # SwanLab 实验跟踪（可选）
-    use_swanlab = args.swanlab or os.environ.get('SWANLAB_API_KEY')
+    use_swanlab = args.swanlab == 1 or os.environ.get('SWANLAB_API_KEY')
     swanlab_logger = None
     if use_swanlab and is_main:
         try:
@@ -510,7 +515,7 @@ def main():
                   device='cpu', use_amp=False)
     
     # 启用 Phase 1 优化
-    if not getattr(args, 'dynamic_topk', True):
+    if args.dynamic_topk == 0:
         # 暂时不支持禁用，默认启用
         pass
     bs = ai.board_size
@@ -541,7 +546,7 @@ def main():
             swanlab.log({"iter_start": it}, step=it)
 
     # 检查是否启用异步流水线
-    if args.async_pipeline:
+    if args.async_pipeline == 1:
         from scripts.async_pipeline import AsyncSelfPlayPipeline
         # 异步模式：生成与训练并行
         if is_main:
@@ -591,7 +596,7 @@ def main():
                 pipeline.stop()
         else:
             # 同步模式：原有逻辑
-            if args.parallel_games > 1 and not args.ddp:
+            if args.parallel_games > 1 and args.ddp == 0:
                 # 多进程并行生成
                 result_queue = Queue(maxsize=args.result_queue_max)
                 processes = []
@@ -626,8 +631,8 @@ def main():
                         c_puct=args.c_puct,
                         virtual_loss=args.virtual_loss,
                         num_threads=getattr(args, 'mcts_threads', 3),
-                        spec_prefetch=args.spec_prefetch,
-                        use_diverse_rollout=getattr(args, 'use_diverse_rollout', False))
+                         spec_prefetch=args.spec_prefetch == 1,
+                         use_diverse_rollout=args.use_diverse_rollout == 1)
                     _process_game_data(game_data, score, bs, n_actions, buffer, args)
                     total_games += 1
                     if is_main:
@@ -691,7 +696,7 @@ def _process_game_data(game_data, score, bs, n_actions, buffer, args):
         alpha = 0.3 + 0.7 * (mc_idx / max(n_total - 1, 1))
         z_soft = float(np.tanh(z_raw * alpha))
         
-        if args.no_augment:
+        if args.no_augment == 1:
             buffer.append((planes, vt, z_soft))
         else:
             for pl, tv in augment8(planes, vt, bs):
