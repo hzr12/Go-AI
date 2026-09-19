@@ -1228,6 +1228,7 @@ def main():
                 if swanlab_logger is not None:
                     try:
                         swanlab.log({
+                            "step": step,
                             "loss": loss.item(),
                             "policy_loss": policy_loss.item(),
                             "value_loss": value_loss.item(),
@@ -1237,7 +1238,7 @@ def main():
                             "epoch": epoch,
                             "step_pct": step / total_steps,
                             "scaler_scale": scaler.get_scale() if use_scaler else 1.0,
-                        }, step=step)
+                        })
                     except Exception as e:
                         logger.warning("[swanlab] log 失败: %s", e)
 
@@ -1288,6 +1289,7 @@ def main():
                     if swanlab_logger is not None:
                         try:
                             swanlab.log({
+                                "step": step,
                                 "eval_top1": metrics['top1'],
                                 "eval_top5": metrics['top5'],
                                 "eval_top10": metrics['top10'],
@@ -1295,7 +1297,7 @@ def main():
                                 "eval_brier": metrics['brier'],
                                 "eval_n": metrics['n'],
                                 "best_eval_acc": best_eval_acc,
-                            }, step=step)
+                            })
                         except Exception as e:
                             logger.warning("[swanlab] eval log 失败: %s", e)
                 if metrics['top1'] > best_eval_acc:
@@ -1375,12 +1377,13 @@ def main():
             if swanlab_logger is not None:
                 try:
                     swanlab.log({
+                        "step": total_steps,
                         "final_top1": final_metrics['top1'],
                         "final_top5": final_metrics['top5'],
                         "final_top10": final_metrics['top10'],
                         "final_kl": final_metrics['kl'],
                         "final_brier": final_metrics['brier'],
-                    }, step=total_steps)
+                    })
                     swanlab.finish()
                     logger.info("[swanlab] 实验跟踪已完成")
                 except Exception as e:
