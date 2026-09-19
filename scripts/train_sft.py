@@ -1226,17 +1226,20 @@ def main():
 
                 # SwanLab 日志
                 if swanlab_logger is not None:
-                    swanlab.log({
-                        "loss": loss.item(),
-                        "policy_loss": policy_loss.item(),
-                        "value_loss": value_loss.item(),
-                        "lr": lr,
-                        "memory_gb": mem,
-                        "speed": speed,
-                        "epoch": epoch,
-                        "step_pct": step / total_steps,
-                        "scaler_scale": scaler.get_scale() if use_scaler else 1.0,
-                    }, step=step)
+                    try:
+                        swanlab.log({
+                            "loss": loss.item(),
+                            "policy_loss": policy_loss.item(),
+                            "value_loss": value_loss.item(),
+                            "lr": lr,
+                            "memory_gb": mem,
+                            "speed": speed,
+                            "epoch": epoch,
+                            "step_pct": step / total_steps,
+                            "scaler_scale": scaler.get_scale() if use_scaler else 1.0,
+                        }, step=step)
+                    except Exception as e:
+                        logger.warning("[swanlab] log 失败: %s", e)
 
                 # 内核剖析结束：打印 top CUDA kernel 耗时表
                 if _prof_ctx is not None and step >= _prof_at + 50:
@@ -1283,15 +1286,18 @@ def main():
                         " ★ new best" if metrics['top1'] > best_eval_acc else "")
                     # SwanLab 记录评估指标
                     if swanlab_logger is not None:
-                        swanlab.log({
-                            "eval_top1": metrics['top1'],
-                            "eval_top5": metrics['top5'],
-                            "eval_top10": metrics['top10'],
-                            "eval_kl": metrics['kl'],
-                            "eval_brier": metrics['brier'],
-                            "eval_n": metrics['n'],
-                            "best_eval_acc": best_eval_acc,
-                        }, step=step)
+                        try:
+                            swanlab.log({
+                                "eval_top1": metrics['top1'],
+                                "eval_top5": metrics['top5'],
+                                "eval_top10": metrics['top10'],
+                                "eval_kl": metrics['kl'],
+                                "eval_brier": metrics['brier'],
+                                "eval_n": metrics['n'],
+                                "best_eval_acc": best_eval_acc,
+                            }, step=step)
+                        except Exception as e:
+                            logger.warning("[swanlab] eval log 失败: %s", e)
                 if metrics['top1'] > best_eval_acc:
                     best_eval_acc = metrics['top1']
                     early_stop_counter = 0  # 重置早停计数器
@@ -1367,14 +1373,18 @@ def main():
                 final_metrics['kl'], final_metrics['brier'], final_metrics['n'])
             # SwanLab 记录最终评估结果
             if swanlab_logger is not None:
-                swanlab.log({
-                    "eval_top1": final_metrics['top1'],
-                    "eval_top5": final_metrics['top5'],
-                    "eval_top10": final_metrics['top10'],
-                    "eval_kl": final_metrics['kl'],
-                    "eval_brier": final_metrics['brier'],
-                }, step=total_steps)
-                swanlab.finish()
+                try:
+                    swanlab.log({
+                        "final_top1": final_metrics['top1'],
+                        "final_top5": final_metrics['top5'],
+                        "final_top10": final_metrics['top10'],
+                        "final_kl": final_metrics['kl'],
+                        "final_brier": final_metrics['brier'],
+                    }, step=total_steps)
+                    swanlab.finish()
+                    logger.info("[swanlab] 实验跟踪已完成")
+                except Exception as e:
+                    logger.warning("[swanlab] finish 失败: %s", e)
 
 if __name__ == "__main__":
     main()
