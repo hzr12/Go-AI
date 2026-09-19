@@ -1119,6 +1119,10 @@ def main():
                         pf.submit(perm[nxt * bs:(nxt + 1) * bs])
                     states_np, moves_np, values_np = pf.next()
                     if _backend == 'cuda':
+                        # pin_memory 需要 contiguous 内存
+                        states_np = np.ascontiguousarray(states_np)
+                        moves_np = np.ascontiguousarray(moves_np)
+                        values_np = np.ascontiguousarray(values_np)
                         state = torch.tensor(states_np, dtype=torch.float32, pin_memory=True)
                         move_t = torch.tensor(moves_np, dtype=torch.int64, pin_memory=True)
                         value_t = torch.tensor(values_np, dtype=torch.float32, pin_memory=True)
