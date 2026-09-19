@@ -62,13 +62,13 @@ python scripts/selfplay_train.py \
   --board-size 19 --iters 20 --sims 64 \
   --parallel-games 8 \
   --mcts-threads 3 \
-  --onnx-model models/sft_new.onnx \
+  --onnx-model models/sft_19x19_v16.onnx \
   --batch-cap 64 \
   --expand-topk 16 \
   --buffer-size 500 \
   --use-rollout --leaf-ab-depth 2 \
   --c-puct 2.0 --virtual-loss 8.0 \
-  --model models/sft_new.pth \
+  --model models/sft_19x19_v16.pth \
   --out models/az_best.pth
 
 # 异步模式：生成与训练完全并行（额外 1.5-2x 提速）
@@ -77,10 +77,10 @@ python scripts/selfplay_train.py \
   --board-size 19 --iters 20 --sims 64 \
   --parallel-games 8 \
   --mcts-threads 3 \
-  --onnx-model models/sft_new.onnx \
+  --onnx-model models/sft_19x19_v16.onnx \
   --batch-cap 64 \
   --games-per-iter 20 \
-  --model models/sft_new.pth \
+  --model models/sft_19x19_v16.pth \
   --out models/az_best.pth
 
 # ============================================================
@@ -88,27 +88,27 @@ python scripts/selfplay_train.py \
 # ============================================================
 # 推荐配置：ONNX + 多线程 + 策略深度2
 python scripts/webui.py --port 7860 --device cpu --priors-leaf \
-    --onnx models/sft_new.onnx \
+    --onnx models/sft_19x19_v16.onnx \
     --mode hybrid --hybrid-sims 16 --hybrid-blend 0.5 \
     --expand-topk 16 --num-threads 4 \
     --policy-depth 2 --policy-width 4 --policy-topk 12
 
 # 高质量模式：纯 MCTS（较慢但更强）
 python scripts/webui.py --port 7860 --device cpu --priors-leaf \
-    --onnx models/sft_new.onnx \
+    --onnx models/sft_19x19_v16.onnx \
     --mode mcts --simulations 64 --num-threads 4
 
 # ============================================================
 # ⑤ 评估棋力
 # ============================================================
 python scripts/evaluate.py \
-  --model models/sft_new.pth \
+  --model models/sft_19x19_v16.pth \
   --board-size 19 --device npu \
   --mode random --num-games 100 \
   --use-mcts --simulations 400 --num-threads 4
 
 python scripts/eval_elo.py \
-  --model models/sft_new.pth \
+  --model models/sft_19x19_v16.pth \
   --board-size 19 --device npu \
   --num-games 50 --simulations 400
 
