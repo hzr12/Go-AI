@@ -644,8 +644,8 @@ def main():
                 args.log_every, args.eval_every, args.save_every, args.out)
     logger.info("=" * 60)
 
-    # SwanLab 实验跟踪（可选）
-    use_swanlab = os.environ.get('SWANLAB_API_KEY') or args.swanlab
+    # SwanLab 实验跟踪（可选，通过 --swanlab 启用）
+    use_swanlab = args.swanlab and os.environ.get('SWANLAB_API_KEY')
     swanlab_logger = None
     if use_swanlab and is_main:
         try:
