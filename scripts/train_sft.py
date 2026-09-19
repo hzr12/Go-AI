@@ -923,7 +923,11 @@ def main():
     if _backend == 'npu':
         scaler = npu_grad_scaler(enabled=use_scaler)
     else:
-        scaler = torch.amp.GradScaler(_backend, enabled=use_scaler)
+        # torch.amp.GradScaler 在 torch 2.4+ 可用，旧版本用 torch.cuda.amp.GradScaler
+        if hasattr(torch.amp, 'GradScaler'):
+            scaler = torch.amp.GradScaler(_backend, enabled=use_scaler)
+        else:
+            scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
 
     # EMA（指数移动平均）：eval/save 时用 shadow 权重，提升 1-3% accuracy
     ema = EMA(model, decay=0.999) if args.use_ema else None
