@@ -616,6 +616,8 @@ def main():
                     help='训练结束后导出 ONNX 模型（用于 CPU 推理加速）')
     ap.add_argument('--onnx-quantize', action='store_true',
                     help='ONNX int8 量化（模型体积 ~1/4，CPU 推理 ~2x）')
+    ap.add_argument('--swanlab', action='store_true',
+                    help='启用 SwanLab 实验跟踪（需设置 SWANLAB_API_KEY 环境变量）')
     args = ap.parse_args()
 
     # ---- 分布式训练环境变量（由 torchrun / mp.spawn 注入）----
@@ -641,6 +643,34 @@ def main():
     logger.info("日志: log_every=%d eval_every=%d save_every=%d out=%s",
                 args.log_every, args.eval_every, args.save_every, args.out)
     logger.info("=" * 60)
+
+    # SwanLab 实验跟踪（可选）
+    use_swanlab = os.environ.get('SWANLAB_API_KEY') or args.swanlab
+    swanlab_logger = None
+    if use_swanlab and is_main:
+        try:
+            import swanlab
+            swanlab.init(
+                project="go-ai",
+                name=f"sft_{args.board_size}x{args.board_size}_v16",
+                config={
+                    "backbone_channels": args.backbone_channels,
+                    "backbone_res_blocks": args.backbone_res_blocks,
+                    "res_blocks": args.res_blocks,
+                    "convnext_blocks": args.convnext_blocks,
+                    "attn_blocks": args.attn_blocks,
+                    "value_channels": args.value_channels,
+                    "value_res_blocks": args.value_res_blocks,
+                    "policy_channels": args.policy_channels,
+                    "policy_layers": args.policy_layers,
+                    "batch_size": args.batch_size,
+                    "lr": args.lr,
+                    "epochs": args.epochs,
+                },
+            )
+            logger.info("[swanlab] 实验跟踪已启用")
+        except Exception as e:
+            logger.warning("[swanlab] 初始化失败: %s", e)
 
     # ---- 分布式训练：设备由 LOCAL_RANK 决定，忽略 --device 卡号 ----
     # 后端选择：NPU 走 hccl，CUDA 走 nccl。多卡前必须 init_process_group，
@@ -1162,6 +1192,17 @@ def main():
                             loss.item(), policy_loss.item(), value_loss.item(),
                             lr, scaler.get_scale(), mem, speed, time.time() - t0)
 
+                # SwanLab 日志
+                if swanlab_logger is not None:
+                    swanlab.log({
+                        "loss": loss.item(),
+                        "policy_loss": policy_loss.item(),
+                        "value_loss": value_loss.item(),
+                        "lr": lr,
+                        "memory_gb": mem,
+                        "speed": speed,
+                    }, step=step)
+
                 # 内核剖析结束：打印 top CUDA kernel 耗时表
                 if _prof_ctx is not None and step >= _prof_at + 50:
                     _prof_ctx.__exit__(None, None, None)
@@ -1253,6 +1294,16 @@ def main():
                 "kl=%.4f brier=%.4f (n=%d)",
                 final_metrics['top1'], final_metrics['top5'], final_metrics['top10'],
                 final_metrics['kl'], final_metrics['brier'], final_metrics['n'])
+            # SwanLab 记录最终评估结果
+            if swanlab_logger is not None:
+                swanlab.log({
+                    "eval_top1": final_metrics['top1'],
+                    "eval_top5": final_metrics['top5'],
+                    "eval_top10": final_metrics['top10'],
+                    "eval_kl": final_metrics['kl'],
+                    "eval_brier": final_metrics['brier'],
+                }, step=total_steps)
+                swanlab.finish()
 
 if __name__ == "__main__":
     main()
