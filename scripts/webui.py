@@ -1194,6 +1194,8 @@ def main():
                     help="策略分量推演层数（minimax 展开深度）：1=关闭推演，直接用根策略概率；"
                          "2=根候选→对手最佳应手→评估（3 次批量前向）；3+=再深挖一层我方应手，"
                          "以此类推。policy/hybrid 模式的策略分量生效。逐层批量前向，层数越大越慢。")
+    ap.add_argument("--policy-layers", type=int, default=2,
+                    help="Policy head 层数（2=原始 1x1->1x1，3=1x1->3x3->1x1）")
     ap.add_argument("--policy-width", type=int, default=4,
                     help="N 步推演中非根层每节点考察的应手数（top-W）")
     ap.add_argument("--policy-topk", type=int, default=12,
