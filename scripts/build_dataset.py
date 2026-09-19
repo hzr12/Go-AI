@@ -99,9 +99,11 @@ def _flush_chunk(chunk, tmp_dir, idx):
     for k, v in chunk.items():
         if k == 'boards':
             save_dict[k] = np.stack(v).astype(np.int8)
-        elif k in ('my_hists', 'op_hists'):
-            save_dict['my_hist' if k == 'my_hists' else 'op_hist'] = np.stack(v).astype(np.int16)
-        elif k == 'kos':
+        elif k == 'my_hist':
+            save_dict[k] = np.stack(v).astype(np.int16)
+        elif k == 'op_hist':
+            save_dict[k] = np.stack(v).astype(np.int16)
+        elif k == 'ko':
             save_dict[k] = np.array(v, dtype=np.int16)
         elif k == 'moves':
             save_dict[k] = np.array(v, dtype=np.int16)
@@ -109,8 +111,8 @@ def _flush_chunk(chunk, tmp_dir, idx):
             save_dict[k] = np.array(v, dtype=np.int8)
         elif k == 'winrates':
             save_dict[k] = np.array(v, dtype=np.float32)
-        elif k == 'to_plays':
-            save_dict['to_play'] = np.array(v, dtype=np.int8)
+        elif k == 'to_play':
+            save_dict[k] = np.array(v, dtype=np.int8)
         elif k == 'game_ids':
             save_dict[k] = np.array(v, dtype=np.int32)
         elif k == 'game_weights':
