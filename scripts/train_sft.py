@@ -1236,5 +1236,23 @@ def main():
         ai.export_onnx(onnx_path, quantize_int8=args.onnx_quantize)
         logger.info("[train] ONNX 导出完成: %s", onnx_path)
 
+    # 最后一步评估：使用 EMA 权重（如果启用）
+    if len(eval_idx) > 0:
+        if is_main:
+            logger.info("[train] 开始最终评估...")
+        if ema is not None:
+            ema.apply_shadow()
+        final_metrics = evaluate_metrics(
+            model, dataset, eval_idx, bs, device, amp_dtype,
+            use_channels_last=use_channels_last)
+        if ema is not None:
+            ema.restore()
+        if is_main:
+            logger.info(
+                "[eval] FINAL top1=%.4f top5=%.4f top10=%.4f "
+                "kl=%.4f brier=%.4f (n=%d)",
+                final_metrics['top1'], final_metrics['top5'], final_metrics['top10'],
+                final_metrics['kl'], final_metrics['brier'], final_metrics['n'])
+
 if __name__ == "__main__":
     main()
