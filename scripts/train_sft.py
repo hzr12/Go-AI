@@ -574,6 +574,8 @@ def main():
                     help='AttentionResBlock 数量（深层全局关系），0 表示使用默认 mix 模式')
     ap.add_argument('--value-res-blocks', type=int, default=3,
                     help='Value head 残差块数量（默认 3，增加到 8-11 可达 1.5-2M 参数）')
+    ap.add_argument('--value-channels', type=int, default=64,
+                    help='Value head 通道数（默认 64，增加到 96-128 可达 1-2M 参数）')
     ap.add_argument('--policy-channels', type=int, default=32,
                     help='Policy head 隐藏层通道数（默认 32，增加到 128-176 可达 200-300k 参数）')
     ap.add_argument('--policy-layers', type=int, default=2,
