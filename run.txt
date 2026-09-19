@@ -32,6 +32,7 @@ python -c "import numpy as np; d=np.load('data/sgf_19x19_full.npz'); print('game
 # ② SFT 监督训练
 # ============================================================
 # 方案 A: 4卡 NPU (当前环境)
+# 注意: --swanlab 需已登录 swanlab.cn，训练结束后云端查看图表
 torchrun --nproc_per_node=4 scripts/train_sft.py \
   --data data/sgf_19x19_full.npz \
   --device npu --board-size 19 \
@@ -50,7 +51,8 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
   --log-every 50 --eval-every 500 --save-every 500 \
   --early-stop --early-stop-patience 3 \
   --out models/sft_19x19_v17.pth \
-  --export-onnx --use-checkpoint
+  --export-onnx --use-checkpoint \
+  --swanlab --project go-ai --name sft_v17_npu4
 
 # 方案 B: 单卡 A100 40G (更快)
 # pip install flash-attn --no-build-isolation
@@ -74,7 +76,8 @@ torchrun --nproc_per_node=1 scripts/train_sft.py \
   --log-every 50 --eval-every 500 --save-every 500 \
   --early-stop --early-stop-patience 3 \
   --out models/sft_19x19_v17.pth \
-  --export-onnx --use-checkpoint
+  --export-onnx --use-checkpoint \
+  --swanlab --project go-ai --name sft_v17_a100
 
 # 方案 C: 4卡 A100 (最快)
 torchrun --nproc_per_node=4 scripts/train_sft.py \
@@ -97,7 +100,8 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
   --log-every 50 --eval-every 500 --save-every 500 \
   --early-stop --early-stop-patience 3 \
   --out models/sft_19x19_v17.pth \
-  --export-onnx --use-checkpoint
+  --export-onnx --use-checkpoint \
+  --swanlab --project go-ai --name sft_v17_a100_4card
 
 # 备用：显存不足时减小 batch
 # --batch-size 1600 --gradient-accumulation-steps 2
@@ -193,6 +197,21 @@ python scripts/eval_elo.py \
 #   - WebUI 响应: <3s
 #   - 每日数据生成: ~500-1000局
 #   - 端到端训练周期: 缩短 10-20x
+#
+# ============================================================
+# SwanLab 实验跟踪（2026-09-19 修复）
+# ============================================================
+# 修复内容: step 参数从字典内部移到 keyword argument
+#   错误: swanlab.log({"step": step, "loss": ...})
+#   正确: swanlab.log({"loss": ...}, step=step)
+#
+# 使用方式:
+#   1. 本地登录: swanlab login
+#   2. 训练命令加: --swanlab --project go-ai --name sft_v17_npu4
+#   3. 云端查看: https://swanlab.cn/@huangzr/go-ai
+#   4. 本地模式备用: export SWANLAB_MODE=local（不上传云端）
+#
+# 验证测试: https://swanlab.cn/@huangzr/go-ai-test/runs/iiyn4iso（有图表）
 
 # ============================================================
 # 关键优化总结
