@@ -609,6 +609,8 @@ def main():
                     choices=['default', 'max-autotune', 'reduce-overhead'],
                     help='torch.compile 模式: default=常规融合, max-autotune=A100 上进一步 '
                          '自动调优提速（编译更久）, reduce-overhead=小 batch 低开销')
+    ap.add_argument('--flash-attn', action='store_true',
+                    help='启用 flash-attn 独立库（A100 上最快，需 pip install flash-attn）')
     ap.add_argument('--arch', default='resnet',
                     choices=['resnet', 'convnext'],
                     help='网络架构风格: resnet=传统 ResBlock (默认，兼容旧权重) | convnext=ConvNeXt 风格 (5x5 深度卷积 + LayerNorm + GELU)')
@@ -625,6 +627,8 @@ def main():
     ap.add_argument('--early-stop-metric', default='top1',
                     choices=['loss', 'top1'],
                     help='早停监控指标：loss=验证集损失（越小越好），top1=Top-1准确率（越大越好）')
+    ap.add_argument('--max-gpu-memory', type=float, default=0.9,
+                    help='GPU 显存使用上限比例（默认 0.9，防止 OOM）')
     args = ap.parse_args()
 
     # ---- 分布式训练环境变量（由 torchrun / mp.spawn 注入）----
@@ -751,6 +755,13 @@ def main():
             compile_disable_sparse = True
             logger.info("[device] %s (sm_%d%d) | 启用 A100 路径: BF16 + FlashAttn + "
                         "channels_last + compile(卷积/线性/FFN)", gpu_name, *compute_cap)
+            # 尝试加载 flash-attn
+            if args.flash_attn:
+                fa_ok, fa_msg = _backbone.set_flash_attn(True)
+                if fa_ok:
+                    logger.info("[env] flash-attn %s", fa_msg)
+                else:
+                    logger.warning("[env] flash-attn %s，回退内置 SDPA", fa_msg)
         else:
             # V100 等老卡：保守路径（与原行为一致）
             amp_dtype = torch.float16
