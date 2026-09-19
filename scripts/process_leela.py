@@ -106,6 +106,7 @@ def split_sgf_to_games(sgf_path, out_dir):
 def filter_and_save(games, out_dir, max_games=50000):
     """筛选并保存最近的 max_games 局。"""
     out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)  # 确保目录存在
 
     # 解析每局棋谱
     parsed_games = []
