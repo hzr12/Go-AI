@@ -55,12 +55,12 @@ def extract_game(text):
 def process_xz_to_sgf(xz_path, sgf_path):
     """解压 xz 文件到 sgf。"""
     print(f"解压 {xz_path.name} -> {sgf_path.name}")
-    subprocess.run(['xz', '-d', '-k', str(xz_path)], check=True)
-    # xz -d 会生成不带 .xz 后缀的文件
-    original = xz_path.with_suffix('')
-    if original.exists():
-        shutil.move(str(original), str(sgf_path))
-        print(f"  解压完成: {sgf_path} ({sgf_path.stat().st_size / 1e9:.1f} GB)")
+    # 尝试使用 Python 内置 lzma 模块解压
+    import lzma
+    with lzma.open(xz_path, 'rb') as f_in:
+        with open(sgf_path, 'wb') as f_out:
+            shutil.copyfileobj(f_in, f_out)
+    print(f"  解压完成: {sgf_path} ({sgf_path.stat().st_size / 1e9:.1f} GB)")
     return sgf_path
 
 
