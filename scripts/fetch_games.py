@@ -54,6 +54,11 @@ SOURCES = {
     "agz": {
         "github_dir": "AI/AlphaGo Zero",
     },
+    "foxwq": {
+        # Fox Go Server 9d vs 9d 数据
+        "url": "https://github.com/CamWagner/go-dataset/archive/refs/heads/master.zip",
+        "subdir": "go-dataset-master/Foxwq/18k-9d",
+    },
 }
 
 # SGF 着法：;B[pd] / ;W[dd] ；pass 为空坐标 ;B[]
@@ -233,6 +238,34 @@ def fetch_github_dir(subdir, name, tmp):
     return files
 
 
+def fetch_zip_source(spec, name, tmp):
+    """下载 GitHub 仓库 ZIP 并提取指定子目录。"""
+    url = spec["url"]
+    subdir = spec["subdir"]
+    archive = tmp / f"{name}_repo.zip"
+    download(url, archive)
+    exdir = tmp / f"{name}_extracted"
+    if not any(exdir.rglob("*.sgf")):
+        extract(archive, exdir)
+    # 查找指定子目录
+    target_dir = None
+    for root, dirs, files in os.walk(exdir):
+        if subdir.replace("/", os.sep) in str(root):
+            target_dir = Path(root)
+            break
+    if target_dir is None:
+        # 尝试直接匹配
+        for p in exdir.rglob("*"):
+            if p.name == "18k-9d" or "Foxwq" in str(p):
+                target_dir = p
+                break
+    if target_dir and target_dir.is_dir():
+        files = collect_sgf(target_dir)
+        print(f"  从 {target_dir} 收集到 {len(files)} 局", flush=True)
+        return files
+    return []
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="data/games/games",
@@ -262,8 +295,13 @@ def main():
         print(f"\n=== {name} ===", flush=True)
         if "archives" in spec:
             files = fetch_archives(spec["archives"], name, tmp)
-        else:
+        elif "github_dir" in spec:
             files = fetch_github_dir(spec["github_dir"], name, tmp)
+        elif "url" in spec:
+            files = fetch_zip_source(spec, name, tmp)
+        else:
+            print(f"  未知数据源类型: {name}", flush=True)
+            continue
         print(f"  合计收集到 {len(files)} 个 .sgf", flush=True)
 
         rng.shuffle(files)
