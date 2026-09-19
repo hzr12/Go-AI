@@ -618,6 +618,13 @@ def main():
                     help='ONNX int8 量化（模型体积 ~1/4，CPU 推理 ~2x）')
     ap.add_argument('--swanlab', action='store_true',
                     help='启用 SwanLab 实验跟踪（需设置 SWANLAB_API_KEY 环境变量）')
+    ap.add_argument('--early-stop', action='store_true',
+                    help='启用早停机制：当验证集指标连续 N 次无改善时自动停止训练')
+    ap.add_argument('--early-stop-patience', type=int, default=3,
+                    help='早停耐心值：连续 N 次 eval 无改善则停止（默认 3）')
+    ap.add_argument('--early-stop-metric', default='top1',
+                    choices=['loss', 'top1'],
+                    help='早停监控指标：loss=验证集损失（越小越好），top1=Top-1准确率（越大越好）')
     args = ap.parse_args()
 
     # ---- 分布式训练环境变量（由 torchrun / mp.spawn 注入）----
@@ -934,6 +941,10 @@ def main():
     best_eval_acc = -1.0
     start_epoch = 0
     t0 = time.time()
+
+    # 早停机制初始化
+    early_stop_counter = 0
+    best_eval_metric = float('inf') if args.early_stop_metric == 'loss' else -1.0
 
     # ---- 断点续训：从 --resume 指定的模型权重 + 同目录 .train_state.pt 恢复 ----
     if args.resume:
@@ -1262,6 +1273,7 @@ def main():
                         }, step=step)
                 if metrics['top1'] > best_eval_acc:
                     best_eval_acc = metrics['top1']
+                    early_stop_counter = 0  # 重置早停计数器
                     if is_main:
                         if ema is not None:
                             ema.apply_shadow()
@@ -1281,6 +1293,30 @@ def main():
                         torch.save(_state, args.out + '.train_state')
                         if ema is not None:
                             ema.restore()
+
+                # 早停检查
+                if args.early_stop and is_main:
+                    if args.early_stop_metric == 'loss':
+                        current_metric = metrics.get('brier', metrics['kl'])
+                        if current_metric < best_eval_metric:
+                            best_eval_metric = current_metric
+                            early_stop_counter = 0
+                        else:
+                            early_stop_counter += 1
+                    else:  # top1
+                        current_metric = metrics['top1']
+                        if current_metric > best_eval_metric:
+                            best_eval_metric = current_metric
+                            early_stop_counter = 0
+                        else:
+                            early_stop_counter += 1
+
+                    if early_stop_counter >= args.early_stop_patience:
+                        logger.info("[early_stop] 连续 %d 次 eval 无改善，触发早停",
+                                   args.early_stop_patience)
+                        if swanlab_logger is not None:
+                            swanlab.log({"early_stop": True, "final_step": step}, step=step)
+                        break
 
     # 训练结束后导出 ONNX（可选）
     if args.export_onnx and is_main:
