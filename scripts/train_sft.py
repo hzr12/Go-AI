@@ -645,7 +645,7 @@ def main():
     logger.info("=" * 60)
 
     # SwanLab 实验跟踪（可选，通过 --swanlab 启用）
-    use_swanlab = args.swanlab and os.environ.get('SWANLAB_API_KEY')
+    use_swanlab = args.swanlab or os.environ.get('SWANLAB_API_KEY')
     swanlab_logger = None
     if use_swanlab and is_main:
         try:
@@ -1201,6 +1201,9 @@ def main():
                         "lr": lr,
                         "memory_gb": mem,
                         "speed": speed,
+                        "epoch": epoch,
+                        "step_pct": step / total_steps,
+                        "scaler_scale": scaler.get_scale() if use_scaler else 1.0,
                     }, step=step)
 
                 # 内核剖析结束：打印 top CUDA kernel 耗时表
@@ -1246,6 +1249,17 @@ def main():
                         step, metrics['top1'], metrics['top5'], metrics['top10'],
                         metrics['kl'], metrics['brier'], metrics['n'],
                         " ★ new best" if metrics['top1'] > best_eval_acc else "")
+                    # SwanLab 记录评估指标
+                    if swanlab_logger is not None:
+                        swanlab.log({
+                            "eval_top1": metrics['top1'],
+                            "eval_top5": metrics['top5'],
+                            "eval_top10": metrics['top10'],
+                            "eval_kl": metrics['kl'],
+                            "eval_brier": metrics['brier'],
+                            "eval_n": metrics['n'],
+                            "best_eval_acc": best_eval_acc,
+                        }, step=step)
                 if metrics['top1'] > best_eval_acc:
                     best_eval_acc = metrics['top1']
                     if is_main:
