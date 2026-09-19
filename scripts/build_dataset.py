@@ -299,13 +299,13 @@ def build(src, board_size, max_games, chunk_size=0, out=None, tmp_root=None):
             alpha = 0.3 + 0.7 * frac
             soft_value = np.tanh(fv * alpha)
             cur['boards'].append(board.board.copy())
-            cur['my_hists'].append(pad3(my_h))
-            cur['op_hists'].append(pad3(op_h))
-            cur['kos'].append(ko)
+            cur['my_hist'].append(pad3(my_h))
+            cur['op_hist'].append(pad3(op_h))
+            cur['ko'].append(ko)
             cur['moves'].append(target)
             cur['values'].append(round(soft_value))
             cur['winrates'].append(float(soft_value))
-            cur['to_plays'].append(to_play)
+            cur['to_play'].append(to_play)
             cur['game_ids'].append(game_id_counter)
             cur['game_weights'].append(game_weight)
             play_move = target
@@ -319,8 +319,9 @@ def build(src, board_size, max_games, chunk_size=0, out=None, tmp_root=None):
     skip = 0
     # 初始化 cur
     cur = {
-        'boards': [], 'my_hists': [], 'op_hists': [], 'kos': [], 'moves': [],
-        'values': [], 'winrates': [], 'to_plays': [], 'game_ids': [], 'game_weights': []
+        'boards': [], 'my_hist': [], 'op_hist': [], 'ko': [],
+        'moves': [], 'values': [], 'winrates': [], 'to_play': [],
+        'game_ids': [], 'game_weights': []
     }
     if streaming:
         if tmp_root:
@@ -364,13 +365,13 @@ def build(src, board_size, max_games, chunk_size=0, out=None, tmp_root=None):
         raise RuntimeError("未解析到任何有效棋谱，请检查 --src 与 --board-size")
     data = {
         'boards': np.stack(cur['boards']).astype(np.int8),
-        'my_hist': np.stack(cur['my_hists']).astype(np.int16),
-        'op_hist': np.stack(cur['op_hists']).astype(np.int16),
-        'ko': np.array(cur['kos'], dtype=np.int16),
+        'my_hist': np.stack(cur['my_hist']).astype(np.int16),
+        'op_hist': np.stack(cur['op_hist']).astype(np.int16),
+        'ko': np.array(cur['ko'], dtype=np.int16),
         'moves': np.array(cur['moves'], dtype=np.int16),
         'values': np.array(cur['values'], dtype=np.int8),
         'winrates': np.array(cur['winrates'], dtype=np.float32),
-        'to_play': np.array(cur['to_plays'], dtype=np.int8),
+        'to_play': np.array(cur['to_play'], dtype=np.int8),
         'game_ids': np.array(cur['game_ids'], dtype=np.int32),
         'game_weights': np.array(cur['game_weights'], dtype=np.float32),
     }
