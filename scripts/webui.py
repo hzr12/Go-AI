@@ -1157,7 +1157,7 @@ document.getElementById('sims').disabled =
 
 def main():
     ap = argparse.ArgumentParser(description="Go-AI WebUI（19 路人机对弈 + MCTS 可视化）")
-    ap.add_argument("--model", default="models/sft_19x19_v12.pth")
+    ap.add_argument("--model", default="models/sft_19x19_v16.pth")
     ap.add_argument("--board-size", type=int, default=19)
     ap.add_argument("--device", default="auto")
     ap.add_argument("--port", type=int, default=7860)
@@ -1229,7 +1229,8 @@ def main():
     ai = GoAI(model_path=model_path, board_size=args.board_size, device=args.device,
               use_amp=True, attn_mode="window", attn_window=7,
               compile=use_compile, tf32=args.tf32,
-              channels_last=(args.device.split(":")[0] == "cuda"))
+              channels_last=(args.device.split(":")[0] == "cuda"),
+              policy_layers=args.policy_layers)
     if args.quantize:
         ai.quantize_dynamic()
     # MCTS worker 线程数：必须 >1 才能启用 spec_prefetch 流水线

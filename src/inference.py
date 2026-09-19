@@ -53,7 +53,7 @@ class GoAI:
                  backbone_channels=128, backbone_res_blocks=12, policy_channels=32, value_channels=64,
                  attention_mode="mix", num_attention_layers=4, num_heads=4, attention_dropout=0.0,
                  attn_mode="global", attn_window=7, compile=False, tf32=False,
-                 channels_last=True):
+                 channels_last=True, policy_layers=2):
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else (
                 "npu" if _ensure_torch_npu() and torch.npu.is_available() else "cpu")
@@ -92,6 +92,7 @@ class GoAI:
             policy_channels=policy_channels,
             value_channels=value_channels,
             action_size=board_size * board_size + 1,  # +1 = 虚着
+            policy_layers=policy_layers,
         ).to(self.device)
         # torch.compile 融合算子（GPU 上约 20-40% 提速），不支持时回退 eager。
         # 注意：torch.compile 是惰性的，错误在首次前向才抛出，因此编译后用
@@ -170,6 +171,12 @@ class GoAI:
                     inferred_arch["value_channels"] != value_channels:
                 value_channels = inferred_arch["value_channels"]
                 needs_rebuild = True
+            if inferred_arch.get("policy_layers") and \
+                    inferred_arch["policy_layers"] != policy_layers:
+                print(f"[GoAI] 权重 policy_layers={inferred_arch['policy_layers']}"
+                      f"（默认 {policy_layers}），已自动调整")
+                policy_layers = inferred_arch["policy_layers"]
+                needs_rebuild = True
             if needs_rebuild:
                 self.model = AlphaGoNet(
                     in_channels=12,
@@ -184,6 +191,7 @@ class GoAI:
                     policy_channels=policy_channels,
                     value_channels=value_channels,
                     action_size=self.board_size * self.board_size + 1,
+                    policy_layers=policy_layers,
                 ).to(self.device)
                 if self.channels_last:
                     self.model = self.model.to(memory_format=torch.channels_last)
@@ -258,6 +266,13 @@ class GoAI:
             if k == "value.value_head.0.weight" and isinstance(v, torch.Tensor):
                 info["value_channels"] = v.shape[0]
                 break
+        # policy_layers: 检查是否有 conv3 和 bn2
+        has_conv3 = any(k == "policy.conv3.weight" for k in state)
+        has_bn2 = any(k == "policy.bn2.weight" for k in state)
+        if has_conv3 and has_bn2:
+            info["policy_layers"] = 3
+        elif not has_conv3 and not has_bn2:
+            info["policy_layers"] = 2
         return info
 
     # ------------------------------------------------------------------ #
