@@ -467,7 +467,7 @@ def main():
             import swanlab
             swanlab.init(
                 project="go-ai-rl",
-                name=f"selfplay_v17",
+                name=f"selfplay_{args.ver}",
                 config={
                     "board_size": args.board_size,
                     "iters": args.iters,

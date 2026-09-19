@@ -1157,7 +1157,13 @@ document.getElementById('sims').disabled =
 
 def main():
     ap = argparse.ArgumentParser(description="Go-AI WebUI（19 路人机对弈 + MCTS 可视化）")
-    ap.add_argument("--model", default="models/sft_19x19_v16.pth")
+    ap.add_argument("--model", default="models/sft_19x19_v17.pth")
+    ap.add_argument("--ver", default="v17",
+                    help="模型版本号 (用于 --model 默认值)")
+    # 兼容旧版 --model 参数，如果指定了 --model 则覆盖默认值
+    args = ap.parse_args()
+    if not args.model or args.model == "models/sft_19x19_v17.pth":
+        args.model = f"models/sft_19x19_{args.ver}.pth"
     ap.add_argument("--board-size", type=int, default=19)
     ap.add_argument("--device", default="auto")
     ap.add_argument("--port", type=int, default=7860)

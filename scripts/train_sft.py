@@ -541,6 +541,8 @@ def main():
     ap.add_argument('--board-size', type=int, default=19)
     ap.add_argument('--save-every', type=int, default=2000)
     ap.add_argument('--out', default='models/sft.pt')
+    ap.add_argument('--ver', default='v17',
+                    help='模型版本号 (用于 swanlab name 和 --out 默认值，如 v17, c2net-v1)')
     # 注意力相关
     ap.add_argument('--backbone-channels', type=int, default=128,
                     help='主干卷积通道数。容量主开关，实测（19路, mix/window'
@@ -663,7 +665,7 @@ def main():
             import swanlab
             swanlab.init(
                 project="go-ai",
-                name=f"sft_{args.board_size}x{args.board_size}_v16",
+                name=f"sft_{args.board_size}x{args.board_size}_{args.ver}",
                 config={
                     "backbone_channels": args.backbone_channels,
                     "backbone_res_blocks": args.backbone_res_blocks,
