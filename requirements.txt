@@ -2,3 +2,11 @@ torch>=1.9.0
 numpy>=1.19.0
 pytest>=6.0.0
 torchao>=0.1.0         # 可选，GPU weight-only INT4 量化
+
+# ---- 可选依赖 ----
+# 实验跟踪
+swanlab>=0.10.0         # pip install .[tracking]
+# NPU 支持 (Ascend 910A/910B)
+torch-npu>=2.0.0        # pip install .[npu]
+# 快速注意力 (仅 Linux/CUDA)
+flash-attn>=2.0.0       # pip install .[attention]
