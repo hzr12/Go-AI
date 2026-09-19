@@ -757,6 +757,7 @@ def main():
                         "channels_last + compile(卷积/线性/FFN)", gpu_name, *compute_cap)
             # 尝试加载 flash-attn
             if args.flash_attn:
+                from src.networks import backbone as _backbone
                 fa_ok, fa_msg = _backbone.set_flash_attn(True)
                 if fa_ok:
                     logger.info("[env] flash-attn %s", fa_msg)
