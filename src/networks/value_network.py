@@ -62,9 +62,10 @@ class ValueNetwork(nn.Module):
     残差块提取厚势/死子等全局特征，最后 GAP + Linear 输出 value。
     """
 
-    def __init__(self, in_channels=64, hidden_channels=32, arch="resnet"):
+    def __init__(self, in_channels=64, hidden_channels=32, num_res_blocks=3, arch="resnet"):
         super(ValueNetwork, self).__init__()
         self.arch = arch
+        self.num_res_blocks = num_res_blocks
 
         # 下采样：19×19 → 10×10（stride=2, padding=1, kernel=3）
         self.downsample = nn.Sequential(
@@ -75,14 +76,14 @@ class ValueNetwork(nn.Module):
 
         # 残差块
         if arch == "convnext":
-            self.res1 = ConvNeXtValueBlock(hidden_channels)
-            self.res2 = ConvNeXtValueBlock(hidden_channels)
-            self.res3 = ConvNeXtValueBlock(hidden_channels)
+            self.res_blocks = nn.ModuleList([
+                ConvNeXtValueBlock(hidden_channels) for _ in range(num_res_blocks)
+            ])
             self.norm_out = LayerNorm2d(hidden_channels)
         else:
-            self.res1 = _ValueResBlock(hidden_channels)
-            self.res2 = _ValueResBlock(hidden_channels)
-            self.res3 = _ValueResBlock(hidden_channels)
+            self.res_blocks = nn.ModuleList([
+                _ValueResBlock(hidden_channels) for _ in range(num_res_blocks)
+            ])
 
         # 全局池化 + 输出
         self.gap = nn.AdaptiveAvgPool2d(1)
@@ -90,9 +91,8 @@ class ValueNetwork(nn.Module):
 
     def forward(self, x):
         x = self.downsample(x)
-        x = self.res1(x)
-        x = self.res2(x)
-        x = self.res3(x)
+        for block in self.res_blocks:
+            x = block(x)
         if self.arch == "convnext":
             x = self.norm_out(x)
         x = self.gap(x).flatten(1)

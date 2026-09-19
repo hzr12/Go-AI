@@ -32,7 +32,12 @@ class AlphaGoNet(nn.Module):
                  value_channels: int = 64,
                  action_size: int = 362,
                  use_checkpoint: bool = False,
-                 arch: str = "resnet"):
+                 arch: str = "resnet",
+                 res_blocks: int = 0,
+                 convnext_blocks: int = 0,
+                 attn_blocks: int = 0,
+                 value_res_blocks: int = 3,
+                 policy_layers: int = 2):
         """
         Args:
             attention_mode:      主干中注意力的使用方式
@@ -59,17 +64,22 @@ class AlphaGoNet(nn.Module):
             attn_window=attn_window,
             use_checkpoint=use_checkpoint,
             arch=arch,
+            res_blocks=res_blocks,
+            convnext_blocks=convnext_blocks,
+            attn_blocks=attn_blocks,
         )
 
         self.policy = PolicyNetwork(
             in_channels=backbone_channels,
             hidden_channels=policy_channels,
             action_size=action_size,
+            num_layers=policy_layers,
         )
 
         self.value = ValueNetwork(
             in_channels=backbone_channels,
             hidden_channels=value_channels,
+            num_res_blocks=value_res_blocks,
             arch=arch,
         )
 

@@ -602,10 +602,11 @@ class SharedBackbone(nn.Module):
     """
 
     def __init__(self, in_channels=12, channels=128, num_res_blocks=12,
-                  attention_mode="mix", num_attention_layers=4,
-                  num_heads=4, attention_dropout=0.0,
-                  attn_mode="global", attn_window=7,
-                  use_checkpoint=False, arch="convnext"):
+                 attention_mode="mix", num_attention_layers=4,
+                 num_heads=4, attention_dropout=0.0,
+                 attn_mode="global", attn_window=7,
+                 use_checkpoint=False, arch="convnext",
+                 res_blocks=0, convnext_blocks=0, attn_blocks=0):
         """
         Args:
             attention_mode:   主干堆叠模式 "none"|"mix"|"all"
@@ -616,6 +617,9 @@ class SharedBackbone(nn.Module):
             attn_window:       window 模式的窗口边长
             use_checkpoint:    是否启用梯度检查点（显存优化）
             arch:              网络架构风格 "resnet" (默认，向后兼容) | "convnext"
+            res_blocks:        ResBlock 数量（浅层，局部细节），0 表示使用默认模式
+            convnext_blocks:   ConvNeXtBlock 数量（中层，大感受野），0 表示使用默认模式
+            attn_blocks:       AttentionResBlock 数量（深层，全局关系），0 表示使用默认模式
         """
         super(SharedBackbone, self).__init__()
         self.channels = channels
@@ -631,9 +635,16 @@ class SharedBackbone(nn.Module):
             self.conv1 = nn.Conv2d(in_channels, channels, 3, padding=1, bias=False)
             self.bn1 = nn.BatchNorm2d(channels)
 
-        blocks = self._build_blocks(
-            num_res_blocks, attention_mode, num_attention_layers,
-            channels, num_heads, attention_dropout, attn_mode, attn_window, arch)
+        # 三段式架构优先级：分段配置 > 默认 mix 模式
+        if res_blocks > 0 or convnext_blocks > 0 or attn_blocks > 0:
+            total_blocks = num_res_blocks
+            blocks = self._build_segmented_blocks(
+                total_blocks, res_blocks, convnext_blocks, attn_blocks,
+                channels, num_heads, attention_dropout, attn_mode, attn_window)
+        else:
+            blocks = self._build_blocks(
+                num_res_blocks, attention_mode, num_attention_layers,
+                channels, num_heads, attention_dropout, attn_mode, attn_window, arch)
         self.blocks = nn.Sequential(*blocks)
 
         # 输出层
@@ -670,6 +681,27 @@ class SharedBackbone(nn.Module):
                     blocks.append(ConvNeXtBlock(channels))
                 else:
                     blocks.append(ResBlock(channels))
+        return blocks
+
+    @staticmethod
+    def _build_segmented_blocks(total_blocks, res_count, convnext_count, attn_count,
+                                 channels, num_heads, dropout, attn_mode, attn_window):
+        """三段式架构：浅层 ResNet + 中层 ConvNeXt + 深层 Attention"""
+        blocks = []
+
+        # 浅层：ResBlock (局部细节)
+        for _ in range(res_count):
+            blocks.append(ResBlock(channels))
+
+        # 中层：ConvNeXtBlock (大感受野)
+        for _ in range(convnext_count):
+            blocks.append(ConvNeXtBlock(channels))
+
+        # 深层：AttentionResBlock (全局关系)
+        for _ in range(attn_count):
+            blocks.append(AttentionResBlock(
+                channels, num_heads, dropout, attn_mode, attn_window))
+
         return blocks
 
     def forward(self, x):

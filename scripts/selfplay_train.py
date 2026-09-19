@@ -33,11 +33,6 @@ import struct
 import argparse
 from multiprocessing import Queue, Process, Event
 
-# 异步流水线支持
-ASYNC_PIPELINE = os.environ.get('GOAI_ASYNC', '0') == '1'
-if ASYNC_PIPELINE:
-    from scripts.async_pipeline import AsyncSelfPlayPipeline
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
@@ -454,6 +449,12 @@ def main():
     ap.add_argument("--batch-cap", type=int, default=64,
                     help="MCTS 批量展开上限（默认 64）")
     
+    # 异步流水线
+    ap.add_argument("--async-pipeline", action="store_true",
+                    help="启用异步流水线（生成与训练并行，需配合 --games-per-iter）")
+    ap.add_argument("--games-per-iter", type=int, default=10,
+                    help="异步模式下每轮迭代生成的局数")
+    
     args = ap.parse_args()
 
     # 设备选择
@@ -502,11 +503,12 @@ def main():
         if is_main:
             print(f"\n[iter {it}/{args.iters}] 开始自对弈...", flush=True)
 
-        # 检查是否启用异步流水线
-        if ASYNC_PIPELINE:
-            # 异步模式：生成与训练并行
-            if is_main:
-                print(f"[async] 使用异步流水线模式", flush=True)
+    # 检查是否启用异步流水线
+    if args.async_pipeline:
+        from scripts.async_pipeline import AsyncSelfPlayPipeline
+        # 异步模式：生成与训练并行
+        if is_main:
+            print(f"[async] 使用异步流水线模式", flush=True)
             
             # 启动异步流水线（如果尚未启动）
             if not hasattr(main, '_pipeline') or main._pipeline is None:

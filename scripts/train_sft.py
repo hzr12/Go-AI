@@ -565,6 +565,19 @@ def main():
                     help='每隔多少 step 打印一次训练日志（loss/lr/吞吐/显存）')
     ap.add_argument('--log-file', default='training.log',
                     help='训练日志文件路径（同时输出到控制台），设为空字符串可关闭文件日志')
+    # 三段式架构参数
+    ap.add_argument('--res-blocks', type=int, default=0,
+                    help='ResBlock 数量（浅层局部细节），0 表示使用默认 mix 模式')
+    ap.add_argument('--convnext-blocks', type=int, default=0,
+                    help='ConvNeXtBlock 数量（中层大感受野），0 表示使用默认 mix 模式')
+    ap.add_argument('--attn-blocks', type=int, default=0,
+                    help='AttentionResBlock 数量（深层全局关系），0 表示使用默认 mix 模式')
+    ap.add_argument('--value-res-blocks', type=int, default=3,
+                    help='Value head 残差块数量（默认 3，增加到 8-11 可达 1.5-2M 参数）')
+    ap.add_argument('--policy-channels', type=int, default=32,
+                    help='Policy head 隐藏层通道数（默认 32，增加到 128-176 可达 200-300k 参数）')
+    ap.add_argument('--policy-layers', type=int, default=2,
+                    help='Policy head 层数（2=原始 1x1->1x1，3=1x1->3x3->1x1）')
     ap.add_argument('--prefetch-workers', type=int, default=8,
                     help='数据预取线程数：每个 batch 切块并行造特征并与 GPU 计算重叠；'
                          '<=1 关闭预取（回退同步取样）。')
@@ -814,6 +827,11 @@ def main():
         action_size=args.board_size * args.board_size + 1,  # +1 为 pass 类别
         use_checkpoint=args.use_checkpoint,
         arch=args.arch,
+        res_blocks=args.res_blocks,
+        convnext_blocks=args.convnext_blocks,
+        attn_blocks=args.attn_blocks,
+        value_res_blocks=args.value_res_blocks,
+        policy_layers=args.policy_layers,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     logger.info("[model] 参数量=%.2fM | 设备=%s", n_params / 1e6, device)
