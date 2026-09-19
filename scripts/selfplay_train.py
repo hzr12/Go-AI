@@ -454,8 +454,41 @@ def main():
                     help="启用异步流水线（生成与训练并行，需配合 --games-per-iter）")
     ap.add_argument("--games-per-iter", type=int, default=10,
                     help="异步模式下每轮迭代生成的局数")
+    ap.add_argument("--swanlab", action="store_true",
+                    help="启用 SwanLab 实验跟踪（需设置 SWANLAB_API_KEY 环境变量）")
     
     args = ap.parse_args()
+
+    # SwanLab 实验跟踪（可选）
+    use_swanlab = args.swanlab or os.environ.get('SWANLAB_API_KEY')
+    swanlab_logger = None
+    if use_swanlab and is_main:
+        try:
+            import swanlab
+            swanlab.init(
+                project="go-ai-rl",
+                name=f"selfplay_v17",
+                config={
+                    "board_size": args.board_size,
+                    "iters": args.iters,
+                    "sims": args.sims,
+                    "parallel_games": args.parallel_games,
+                    "mcts_threads": getattr(args, 'mcts_threads', 3),
+                    "c_puct": args.c_puct,
+                    "virtual_loss": args.virtual_loss,
+                    "buffer_size": args.buffer_size,
+                    "batch_size": args.batch_size,
+                    "epochs": args.epochs,
+                    "lr": args.lr,
+                    "expand_topk": args.expand_topk,
+                    "async_pipeline": args.async_pipeline,
+                },
+            )
+            if is_main:
+                print(f"[swanlab] 实验跟踪已启用", flush=True)
+        except Exception as e:
+            if is_main:
+                print(f"[swanlab] 初始化失败: {e}", flush=True)
 
     # 设备选择
     if args.device == "auto":
@@ -502,6 +535,10 @@ def main():
         
         if is_main:
             print(f"\n[iter {it}/{args.iters}] 开始自对弈...", flush=True)
+        
+        # SwanLab 记录迭代开始
+        if swanlab_logger is not None:
+            swanlab.log({"iter_start": it}, step=it)
 
     # 检查是否启用异步流水线
     if args.async_pipeline:
@@ -620,10 +657,24 @@ def main():
                 if is_main:
                     print(f"[iter {it}/{args.iters}] loss={avg_loss:.4f} buffer={len(buffer)} "
                           f"games={total_games} {dt:.0f}s", flush=True)
+                    # SwanLab 记录迭代指标
+                    if swanlab_logger is not None:
+                        swanlab.log({
+                            "iter_loss": avg_loss,
+                            "iter_games": total_games,
+                            "buffer_size": len(buffer),
+                            "iter_time_s": dt,
+                            "games_per_iter": collected if 'collected' in locals() else 0,
+                        }, step=it)
+                        swanlab_logger.flush()
 
     if is_main:
         print(f"训练完成。共 {total_games} 局，最佳权重: {best_path}")
         print("用 scripts/eval_elo.py 对比不同迭代权重棋力。")
+        # SwanLab 结束
+        if swanlab_logger is not None:
+            swanlab.log({"total_games": total_games, "final_iter": args.iters}, step=args.iters)
+            swanlab.finish()
 
 
 def _process_game_data(game_data, score, bs, n_actions, buffer, args):
