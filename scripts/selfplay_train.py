@@ -417,11 +417,9 @@ def main():
     ap.add_argument("--rollout-steps", type=int, default=60, help="rollout 最大步数")
     
     # 并行生成
-    ap.add_argument("--parallel-games", type=int, default=1,
-                    help="并行自对弈局数（多进程）")
     ap.add_argument("--result-queue-max", type=int, default=100,
                     help="结果队列最大容量")
-    
+
     # 流式训练
     ap.add_argument("--streaming", type=int, default=0, choices=[0, 1],
                     help="启用流式训练（默认）(0=关闭, 1=开启)")
