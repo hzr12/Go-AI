@@ -460,7 +460,9 @@ def main():
     ap.add_argument("--games-per-iter", type=int, default=10,
                     help="异步模式下每轮迭代生成的局数")
     ap.add_argument("--swanlab", type=int, default=0, choices=[0, 1],
-                    help="启用 SwanLab 实验跟踪（需设置 SWANLAB_API_KEY 环境变量）(0=关闭, 1=开启)")
+                    help="启用 SwanLab 实验跟踪 (0=关闭, 1=开启)")
+    ap.add_argument("--swanlab-api-key", type=str, default="",
+                    help="SwanLab API key（可选，未设置则读取 SWANLAB_API_KEY 环境变量）")
     
     args = ap.parse_args()
 
@@ -470,6 +472,11 @@ def main():
     if use_swanlab and is_main:
         try:
             import swanlab
+            # 登录：优先用 --swanlab-api-key，其次环境变量，最后交互式
+            api_key = args.swanlab_api_key or os.environ.get('SWANLAB_API_KEY')
+            if api_key:
+                swanlab.login(api_key=api_key, save=True)
+                print(f"[swanlab] API key 已设置，自动登录", flush=True)
             swanlab.init(
                 project="go-ai-rl",
                 name=f"selfplay_{args.ver}",
