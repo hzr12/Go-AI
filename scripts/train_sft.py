@@ -695,7 +695,13 @@ def main():
     if use_swanlab and is_main:
         try:
             import swanlab
-            # 登录：优先用 --swanlab-api-key，其次环境变量，最后交互式
+        except ImportError:
+            logger.info("[swanlab] 未安装，正在自动安装...")
+            import subprocess
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'swanlab', '-q'])
+            import swanlab
+            logger.info("[swanlab] 安装完成")
+        # 登录：优先用 --swanlab-api-key，其次环境变量，最后交互式
             api_key = args.swanlab_api_key or os.environ.get('SWANLAB_API_KEY')
             if api_key:
                 swanlab.login(api_key=api_key, save=True)
