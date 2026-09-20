@@ -288,7 +288,7 @@ python scripts/build_dataset.py --src <目录或 .tgz> --out data/sgf_19x19.npz 
 
 ```bash
 python scripts/train_sft.py --data data/sgf_19x19.npz --out models/sft_19x19.pth \
-    --device cuda --use-amp --compile \
+    --device cuda --use-amp 1 --compile 1 \
     --board-size 19 --batch-size 512 --epochs 5 \
     --backbone-channels 192 --backbone-res-blocks 17 \
     --attention-mode mix --attn-mode window --attn-window 7 \
@@ -302,41 +302,69 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
   --data data/sgf_19x19_full.npz \
   --device npu --board-size 19 \
   --backbone-channels 192 --backbone-res-blocks 17 \
-  --batch-size 800 --epochs 2 \
+  --res-blocks 8 --convnext-blocks 4 --attn-blocks 5 \
+  --value-channels 96 --value-res-blocks 11 \
+  --policy-channels 128 --policy-layers 3 \
+  --batch-size 3200 --epochs 1 \
   --lr 0.002 --weight-decay 0.0001 \
   --attention-mode mix --num-attention-layers 4 --num-heads 4 \
-  --attn-mode window_global --attn-window 7 \
+  --attn-mode window_global --attn-window 5 \
   --attention-dropout 0.1 --label-smoothing 0.1 \
-  --gradient-accumulation-steps 2 \
-  --use-amp --use-ema \
-  --prefetch-depth 4 \
-  --resume models/sft_19x19_v9.pth \
-  --out models/sft_19x19_v12.pth
+  --gradient-accumulation-steps 1 \
+  --use-amp 1 --use-ema 1 \
+  --prefetch-workers 16 --prefetch-depth 16 \
+  --log-every 50 --eval-every 500 --save-every 500 \
+  --early-stop 1 --early-stop-patience 3 \
+  --out models/sft_19x19_v17.pth \
+  --swanlab 1 --project go-ai --name sft_v17_npu4
 ```
 
-关键参数：
+> **纯 Python 调用**（无需命令行环境）：
+> ```bash
+> python run.py                    # 默认 SFT 训练
+> python run.py sft                # 同上
+> python run.py sft -- --epochs 2 --batch-size 64  # 覆盖参数
+> python run.py selfplay           # 自对弈训练
+> ```
+> 详见 `run.py`。
+
+关键参数（**所有布尔开关使用 0/1**）：
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
 | `--data` | 必填 | 单个 `.npz` 或包含多个 `.npz` 的目录 |
 | `--out` | `models/sft.pt` | 权重输出路径（父目录自动建）|
 | `--device` | `auto` | `cuda` / `npu` / `cpu`；`auto`=有 GPU 用 cuda |
-| `--use-amp` | 关 | 在 cuda/npu 上默认强制开启（fp16）|
+| `--use-amp` | `0` | 启用混合精度训练（0=关闭, 1=开启）|
 | `--batch-size` | `512` | 每步批量 |
 | `--epochs` | `5` | 训练轮数 |
 | `--lr` | `2e-3` | 学习率（AdamW）|
 | `--weight-decay` | `1e-4` | 权重衰减 |
-| `--backbone-channels` | `128` | 主干通道数（推荐 192，13.4M 参数）|
-| `--backbone-res-blocks` | `12` | ResBlock 层数（推荐 17）|
-| `--use-ema` | 关 | 指数移动平均权重 |
+| `--backbone-channels` | `128` | 主干通道数（推荐 192，12.4M 参数）|
+| `--backbone-res-blocks` | `12` | 主干残差块数（推荐 17）|
+| `--res-blocks` | `0` | ResBlock 数量（0=使用默认 mix 模式）|
+| `--convnext-blocks` | `0` | ConvNeXtBlock 数量 |
+| `--attn-blocks` | `0` | AttentionResBlock 数量 |
+| `--value-channels` | `64` | Value head 通道数（推荐 96）|
+| `--value-res-blocks` | `3` | Value head 残差块数（推荐 11）|
+| `--policy-channels` | `32` | Policy head 通道数（推荐 128）|
+| `--policy-layers` | `2` | Policy head 层数（推荐 3）|
+| `--use-ema` | `0` | 指数移动平均权重（0=关闭, 1=开启）|
+| `--compile` | `0` | `torch.compile` 算子融合（GPU +20~40%）|
+| `--flash-attn` | `0` | 启用 flash-attn（A100 最快，需 pip install）|
+| `--export-onnx` | `0` | 训练结束后导出 ONNX |
+| `--swanlab` | `0` | 启用 SwanLab 实验跟踪 |
+| `--early-stop` | `0` | 启用早停机制 |
+| `--early-stop-patience` | `3` | 早停耐心值 |
 | `--gradient-accumulation-steps` | `1` | 梯度累积步数（等效 batch = batch_size × steps）|
 | `--prefetch-depth` | `4` | 预取流水深度（提前造好数据，控制内存/吞吐）|
-| `--compile` | 关 | `torch.compile` 算子融合（GPU +20~40%）|
+| `--ver` | `v17` | 模型版本号（用于 swanlab name 和 --out 默认值）|
+| `--c2net` | `0` | 启用 C2NET（OpenI 启智平台）支持 |
 
 训练细节：
 - 损失：`L = CrossEntropy(policy_logits, move, label_smoothing) + value_loss_weight × BCEWithLogitsLoss(value, z)`
 - 优化器：AdamW + `CosineAnnealingLR`；warmup 10%；价值网络头用 `value_lr_mult × base_lr`。
-- EMA（`--use-ema`）：指数移动平均权重，评估/保存时自动使用 EMA 参数。
+- EMA（`--use-ema 1`）：指数移动平均权重，评估/保存时自动使用 EMA 参数。
 - NPU：`torch_npu` + HCCL 后端，fp16 autocast。
 
 ### 6.2 自对弈训练 `selfplay_train.py`（AlphaZero 风格）
@@ -354,21 +382,21 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
 ```bash
 # 自对弈（MCTS）
 python src/inference.py --model models/sft_19x19.pth --board-size 19 \
-    --device cuda --use-amp --compile --tf32 \
+    --device cuda --use-amp 1 --compile 1 --tf32 1 \
     --attn-mode window --attn-window 7 \
-    --mode selfplay --games 10 --use-mcts --simulations 400 --num-threads 4
+    --mode selfplay --games 10 --use-mcts 1 --simulations 400 --num-threads 4
 
 # 人机对弈（终端输入坐标，如 ce；pass/resign）
 python src/inference.py --model models/sft_19x19.pth --board-size 19 \
-    --device cuda --use-amp --compile --tf32 \
-    --mode human --human-color 1 --use-mcts --simulations 400
+    --device cuda --use-amp 1 --compile 1 --tf32 1 \
+    --mode human --human-color 1 --use-mcts 1 --simulations 400
 
 # 开启 LightPLS 轻量 rollout
 python src/inference.py --model models/sft_19x19.pth --board-size 19 \
-    --device cuda --use-amp --compile --tf32 \
+    --device cuda --use-amp 1 --compile 1 --tf32 1 \
     --attn-mode window --attn-window 7 \
-    --mode selfplay --use-mcts --simulations 800 --num-threads 4 \
-    --use-rollout --rollout-lambda 0.25
+    --mode selfplay --use-mcts 1 --simulations 800 --num-threads 4 \
+    --use-rollout 1 --rollout-lambda 0.25
 
 # ONNX 导出
 python src/inference.py --model models/sft_19x19.pth --board-size 19 \
@@ -381,7 +409,7 @@ python src/inference.py --model models/sft_19x19.pth --board-size 19 \
 
 ```bash
 python scripts/evaluate.py --model models/sft_19x19.pth --board-size 19 \
-    --mode random --num-games 100 --use-mcts --simulations 400
+    --mode random --num-games 100 --use-mcts 1 --simulations 400
 ```
 
 `--mode`：
@@ -409,10 +437,10 @@ python scripts/evaluate.py --model models/sft_19x19.pth --board-size 19 \
 | TF32 matmul | ✅ | `--tf32`，V100/Amp 上 fp32 约 2~4× |
 | `channels_last` | ✅ | CUDA 上 conv 走 NHWC（默认开）|
 | 虚拟损失 + 多线程 | ✅ | `--num-threads 4`，并行选路径 |
-| `torch.compile` | ✅ | `--compile`，GPU 上约 20~40% |
-| `--use-amp` fp16 | ✅ | cuda/npu 上默认开 |
+| `torch.compile` | ✅ | `--compile 1`，GPU 上约 20~40% |
+| `--use-amp` fp16 | ✅ | cuda/npu 上 `--use-amp 1` |
 | `window_global` 注意力 | ✅ | `--attn-mode window_global --attn-window 7` |
-| LightPLS rollout | ✅ | `--use-rollout --rollout-lambda` |
+| LightPLS rollout | ✅ | `--use-rollout 1 --rollout-lambda` |
 | pin_memory + non_blocking | ✅ | CUDA/NPU 数据传输自动重叠 |
 | GPU weight-only INT4 | ✅ | `ai.quantize_int4_torchao()` |
 | **并行自对弈** | ✅ | `--parallel-games N`，多进程并行生成 |
@@ -450,20 +478,20 @@ python scripts/selfplay_train.py --board-size 9 --iters 5 --games 4 --sims 64
 # NPU 19 路正式训练（4 进程并行 + 流式 + rollout）
 python scripts/selfplay_train.py \
   --board-size 19 --iters 20 --games 16 --sims 400 \
-  --parallel-games 4 --streaming \
-  --model models/sft_19x19_v12.pth \
+  --parallel-games 4 --streaming 1 \
+  --model models/sft_19x19_v17.pth \
   --out models/az_best.pth \
-  --use-rollout --leaf-ab-depth 2 --num-threads 8 \
+  --use-rollout 1 --leaf-ab-depth 2 --num-threads 8 \
   --c-puct 2.0 --virtual-loss 8.0
 
 # NPU 4 卡 DDP 训练
 torchrun --nproc_per_node=4 scripts/selfplay_train.py \
   --board-size 19 --iters 20 --games 16 --sims 400 \
-  --parallel-games 4 --ddp --streaming \
-  --model models/sft_19x19_v12.pth --out models/az_best.pth
+  --parallel-games 4 --ddp 1 --streaming 1 \
+  --model models/sft_19x19_v17.pth --out models/az_best.pth
 ```
 
-关键参数：
+关键参数（**所有布尔开关使用 0/1**）：
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
@@ -471,13 +499,17 @@ torchrun --nproc_per_node=4 scripts/selfplay_train.py \
 | `--parallel-games` | `1` | 并行自对弈局数（多进程，推荐 4-8）|
 | `--c-puct` | `2.0` | PUCT 探索系数 |
 | `--num-threads` | `8` | MCTS 多线程数 |
-| `--use-rollout` | 关 | LightPLS rollout 价值融合 |
+| `--use-rollout` | `0` | LightPLS rollout 价值融合（0=关闭, 1=开启）|
 | `--leaf-ab-depth` | `2` | 叶内 α-β 搜索深度 |
 | `--buffer-size` | `500` | replay buffer 容量（局数）|
-| `--streaming` | 关 | 流式训练（不写临时文件）|
-| `--ddp` | 关 | 多 GPU 数据并行（torchrun 启动）|
+| `--streaming` | `0` | 流式训练（不写临时文件，0=关闭, 1=开启）|
+| `--ddp` | `0` | 多 GPU 数据并行（torchrun 启动，0=关闭, 1=开启）|
 | `--temperature` | `1.0` | 自对弈采样温度 |
-| `--use-ema` | 关 | EMA 权重 |
+| `--use-ema` | `0` | EMA 权重（0=关闭, 1=开启）|
+| `--async-pipeline` | `0` | 异步流水线（生成与训练并行，0=关闭, 1=开启）|
+| `--swanlab` | `0` | 启用 SwanLab 实验跟踪 |
+| `--c2net` | `0` | 启用 C2NET（OpenI 启智平台）支持 |
+| `--ver` | `v17` | 模型版本号 |
 
 ---
 
@@ -495,21 +527,24 @@ python scripts/build_dataset.py \
 torchrun --nproc_per_node=4 scripts/train_sft.py \
   --data data/sgf_19x19_full.npz --device npu --board-size 19 \
   --backbone-channels 192 --backbone-res-blocks 17 \
-  --batch-size 800 --epochs 2 --use-amp --use-ema \
-  --out models/sft_19x19_v12.pth
+  --res-blocks 8 --convnext-blocks 4 --attn-blocks 5 \
+  --value-channels 96 --value-res-blocks 11 \
+  --policy-channels 128 --policy-layers 3 \
+  --batch-size 3200 --epochs 1 --use-amp 1 --use-ema 1 \
+  --early-stop 1 --out models/sft_19x19_v17.pth
 
 # ③ 自对弈训练（AlphaZero）
 python scripts/selfplay_train.py \
-  --board-size 19 --iters 20 --games 16 --sims 400 \
-  --parallel-games 4 --streaming \
-  --model models/sft_19x19_v12.pth --out models/az_best.pth
+  --board-size 19 --iters 20 --sims 48 \
+  --parallel-games 8 --streaming 1 \
+  --model models/sft_19x19_v17.pth --out models/az_best.pth
 
 # ④ 评估
-python scripts/evaluate.py --model models/sft_19x19_v12.pth \
-  --board-size 19 --mode random --num-games 100
+python scripts/evaluate.py --model models/sft_19x19_v17.pth \
+  --board-size 19 --mode random --num-games 100 --use-mcts 1
 
 # ⑤ WebUI
-python scripts/webui.py --port 7860 --device cpu --priors-leaf \
+python scripts/webui.py --port 7860 --device cpu --priors-leaf 1 \
     --mode hybrid --hybrid-sims 32 --hybrid-blend 0.5 \
     --expand-topk 16 --num-threads 8
 ```
@@ -525,7 +560,7 @@ from src.game.go_rules import GoBoard
 from src.search.light_rollout import FastPolicy, light_rollout
 
 # 推理
-ai = GoAI(model_path="models/sft_19x19_v12.pth", board_size=19, device="npu")
+ai = GoAI(model_path="models/sft_19x19_v17.pth", board_size=19, device="npu")
 board = GoBoard(19)
 h = [-1, -1, -1]
 oh = [-1, -1, -1]
@@ -550,7 +585,32 @@ v = light_rollout(board, fp, max_steps=60, rng=np.random.default_rng(0))
 
 ---
 
-## 13. 常见问题与排错
+## 13. 纯 Python 调用（`run.py`）
+
+无需命令行环境，直接通过 Python 调用训练脚本：
+
+```python
+# 方式一：命令行风格
+import subprocess
+subprocess.run(["python", "run.py", "sft", "--", "--epochs", "2"])
+
+# 方式二：直接 import（适合测试/Jupyter）
+import sys
+sys.argv = ["train_sft.py", "--data", "data/test.npz", "--epochs", "1", "--device", "cpu"]
+from scripts.train_sft import main
+main()
+```
+
+```bash
+python run.py                    # 默认 SFT 训练
+python run.py sft                # 同上
+python run.py sft -- --epochs 2  # 覆盖参数
+python run.py selfplay           # 自对弈训练
+```
+
+---
+
+## 14. 常见问题与排错
 
 | 现象 | 原因 / 解决 |
 |------|------------|
