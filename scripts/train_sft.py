@@ -634,7 +634,30 @@ def main():
                     help='早停监控指标：loss=验证集损失（越小越好），top1=Top-1准确率（越大越好）')
     ap.add_argument('--max-gpu-memory', type=float, default=0.9,
                     help='GPU 显存使用上限比例（默认 0.9，防止 OOM）')
+    ap.add_argument('--c2net', type=int, default=0, choices=[0, 1],
+                    help='启用 C2NET (OpenI 启智平台) 支持 (0=关闭, 1=开启)')
     args = ap.parse_args()
+
+    # ---- C2NET 支持（OpenI 启智平台）----
+    _c2net_ctx = None
+    if args.c2net == 1:
+        try:
+            from c2net.context import prepare, upload_output as _c2net_upload
+            _c2net_ctx = prepare()
+            if is_main:
+                logger.info("[c2net] 已初始化 C2NET 上下文")
+                logger.info("[c2net] dataset_path=%s", _c2net_ctx.dataset_path)
+                logger.info("[c2net] output_path=%s", _c2net_ctx.output_path)
+            # 覆盖 --data：从 c2net 数据集目录加载
+            if _c2net_ctx.dataset_path:
+                import glob
+                npz_files = glob.glob(os.path.join(_c2net_ctx.dataset_path, '*.npz'))
+                if npz_files:
+                    args.data = npz_files[0]
+                    logger.info("[c2net] 使用数据集: %s", args.data)
+        except ImportError:
+            if is_main:
+                logger.warning("[c2net] c2net 未安装，--c2net 已忽略")
 
     # ---- 分布式训练环境变量（由 torchrun / mp.spawn 注入）----
     # RANK/WORLD_SIZE/LOCAL_RANK 同时存在且 WORLD_SIZE>1 时进入 DDP 模式。
@@ -658,6 +681,12 @@ def main():
                 args.num_heads, args.num_attention_layers, args.attention_dropout, args.compile)
     logger.info("日志: log_every=%d eval_every=%d save_every=%d out=%s",
                 args.log_every, args.eval_every, args.save_every, args.out)
+    # C2NET 输出路径重定向
+    if _c2net_ctx is not None and is_main:
+        _c2net_out = os.path.join(_c2net_ctx.output_path, os.path.basename(args.out))
+        logger.info("[c2net] 输出路径已重定向: %s -> %s", args.out, _c2net_out)
+        args._c2net_orig_out = args.out
+        args.out = _c2net_out
     logger.info("=" * 60)
 
     # SwanLab 实验跟踪（可选，通过 --swanlab 启用）
@@ -1395,6 +1424,15 @@ def main():
                     logger.info("[swanlab] 实验跟踪已完成")
                 except Exception as e:
                     logger.warning("[swanlab] finish 失败: %s", e)
+
+    # C2NET 回传结果
+    if _c2net_ctx is not None and is_main:
+        try:
+            from c2net.context import upload_output as _c2net_upload
+            _c2net_upload()
+            logger.info("[c2net] 结果已回传到 OpenI 平台")
+        except Exception as e:
+            logger.warning("[c2net] 回传失败: %s", e)
 
 if __name__ == "__main__":
     main()

@@ -463,8 +463,31 @@ def main():
                     help="启用 SwanLab 实验跟踪 (0=关闭, 1=开启)")
     ap.add_argument("--swanlab-api-key", type=str, default="",
                     help="SwanLab API key（可选，未设置则读取 SWANLAB_API_KEY 环境变量）")
-    
+    ap.add_argument("--c2net", type=int, default=0, choices=[0, 1],
+                    help="启用 C2NET (OpenI 启智平台) 支持 (0=关闭, 1=开启)")
+
     args = ap.parse_args()
+
+    # ---- C2NET 支持（OpenI 启智平台）----
+    _c2net_ctx = None
+    if args.c2net == 1:
+        try:
+            from c2net.context import prepare, upload_output as _c2net_upload
+            _c2net_ctx = prepare()
+            if is_main:
+                print("[c2net] 已初始化 C2NET 上下文", flush=True)
+                print(f"[c2net] output_path={_c2net_ctx.output_path}", flush=True)
+                print(f"[c2net] pretrain_model_path={_c2net_ctx.pretrain_model_path}", flush=True)
+            # 覆盖 --model：从 c2net 预训练模型目录加载
+            if _c2net_ctx.pretrain_model_path and not args.model:
+                import glob
+                pth_files = glob.glob(os.path.join(_c2net_ctx.pretrain_model_path, '*.pth'))
+                if pth_files:
+                    args.model = pth_files[0]
+                    print(f"[c2net] 使用预训练模型: {args.model}", flush=True)
+        except ImportError:
+            if is_main:
+                print("[c2net] c2net 未安装，--c2net 已忽略", flush=True)
 
     # SwanLab 实验跟踪（可选）
     use_swanlab = args.swanlab == 1 or os.environ.get('SWANLAB_API_KEY')
@@ -510,6 +533,13 @@ def main():
     
     torch.manual_seed(42)
     np.random.seed(42)
+
+    # C2NET 输出路径重定向
+    if _c2net_ctx is not None and is_main:
+        _c2net_out = os.path.join(_c2net_ctx.output_path, os.path.basename(args.out))
+        print(f"[c2net] 输出路径已重定向: {args.out} -> {_c2net_out}", flush=True)
+        args._c2net_orig_out = args.out
+        args.out = _c2net_out
 
     ai = GoAI(model_path=args.model, board_size=args.board_size, device=device,
               use_amp=True, attn_mode="window", attn_window=7)
@@ -687,6 +717,15 @@ def main():
         if swanlab_logger is not None:
             swanlab.log({"total_games": total_games, "final_iter": args.iters}, step=args.iters)
             swanlab.finish()
+
+    # C2NET 回传结果
+    if _c2net_ctx is not None and is_main:
+        try:
+            from c2net.context import upload_output as _c2net_upload
+            _c2net_upload()
+            print("[c2net] 结果已回传到 OpenI 平台", flush=True)
+        except Exception as e:
+            print(f"[c2net] 回传失败: {e}", flush=True)
 
 
 def _process_game_data(game_data, score, bs, n_actions, buffer, args):
