@@ -577,16 +577,60 @@ class GoBoard:
         return planes
 
     @staticmethod
+    def apply_symmetry_batch(states, moves, transform_ids, board_size):
+        """批量对称增强（全向量化，无逐样本 Python 循环）。
+
+        states: (B, C, H, W)；moves: (B,) 扁平坐标（-1=pass 不变换）；
+        transform_ids: (B,)，取值 0..7。
+        变换顺序与单样本版一致：先 flip W（transform>=4），
+        再顺时针旋转 k=transform%4 次（k=1/2/3 对应 90°/180°/270°）。
+        """
+        x = np.asarray(states)
+        transform_ids = np.asarray(transform_ids)
+        out = np.empty_like(x)
+        flip_mask = transform_ids >= 4
+        if flip_mask.any():
+            out[flip_mask] = x[flip_mask][..., :, ::-1]
+        keep = ~flip_mask
+        if keep.any():
+            out[keep] = x[keep]
+        # 旋转：按 k 分组，每组一次向量化变换（无逐样本循环）
+        # CW90 = 转置后翻转新 W 轴；180 = 双轴翻转；CW270 = 转置后翻转新 H 轴
+        for k in (1, 2, 3):
+            mask = (transform_ids % 4) == k
+            if not mask.any():
+                continue
+            if k == 1:
+                out[mask] = out[mask].transpose(0, 1, 3, 2)[..., :, ::-1]
+            elif k == 2:
+                out[mask] = out[mask][..., ::-1, ::-1]
+            else:
+                out[mask] = out[mask].transpose(0, 1, 3, 2)[..., ::-1, :]
+        # moves 变换：SYMMETRIES 为纯算术 lambda，天然支持 numpy 数组
+        moves_out = np.array(moves, copy=True)
+        idxs = np.flatnonzero(moves_out >= 0)
+        if idxs.size:
+            n = board_size
+            mv = moves_out[idxs]
+            r = mv // n
+            c = mv % n
+            ids = transform_ids[idxs]
+            for t in range(8):
+                m = ids == t
+                if not m.any():
+                    continue
+                rr, cc = SYMMETRIES[t](r[m], c[m], n)
+                mv[m] = rr * n + cc
+            moves_out[idxs] = mv
+        return out, moves_out
+
+    @staticmethod
     def apply_symmetry(state_12ch, move, transform_id, board_size):
-        planes = np.array(state_12ch)
-        k = transform_id % 4
-        for ch in range(planes.shape[0]):
-            if transform_id >= 4:
-                planes[ch] = np.fliplr(planes[ch])       # flip W (axis=1 on 2D)
-            if k > 0:
-                planes[ch] = np.rot90(planes[ch], k=-k)  # CW rotation
-        if move >= 0:
-            r, c = divmod(move, board_size)
-            rr, cc = SYMMETRIES[transform_id % 8](r, c, board_size)
-            move = rr * board_size + cc
-        return planes, move
+        """单样本对称增强（内部走批量实现，保持旧接口兼容）。"""
+        planes, moves = GoBoard.apply_symmetry_batch(
+            np.asarray(state_12ch)[None],
+            np.asarray([move]),
+            np.asarray([transform_id]),
+            board_size,
+        )
+        return planes[0], int(moves[0])

@@ -1189,18 +1189,18 @@ def main():
                         state = state.to(memory_format=torch.channels_last)
                 with maybe_autocast(device, amp_dtype):
                     policy_logits, value_logit = model(state)
-                    policy_loss = F.cross_entropy(policy_logits.float(), move_t,
+                    policy_loss = F.cross_entropy(policy_logits, move_t,
                                                   label_smoothing=args.label_smoothing)
                     # 价值损失：根据数据是否含 winrates 字段选择 MSE 或 BCE
                     if dataset.winrates is not None:
                         # 使用连续胜率标签 (D) + MSE loss
-                        value_target = value_t.squeeze().float()  # 已经是 [-1, 1]
-                        value_loss = F.mse_loss(value_logit.float().squeeze(), value_target)
+                        value_target = value_t.squeeze()  # BF16
+                        value_loss = F.mse_loss(value_logit.squeeze(), value_target)
                     else:
                         # 回退到原有 BCE 逻辑
-                        value_target = (value_t.squeeze().float() + 1) / 2 * 0.8 + 0.1  # ±1 → 0.1/0.9
+                        value_target = (value_t.squeeze() + 1) / 2 * 0.8 + 0.1  # BF16
                         value_loss = F.binary_cross_entropy_with_logits(
-                            value_logit.float().squeeze(), value_target)
+                            value_logit.squeeze(), value_target)
                     loss = policy_loss + args.value_loss_weight * value_loss
                 scaler.scale(loss / _accum_steps).backward()
                 if (i + 1) % _accum_steps == 0 or (i + 1) == n_batches:

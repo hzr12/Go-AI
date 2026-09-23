@@ -12,8 +12,9 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
-        rms = x.float().pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
-        return (x.float() * rms).type_as(x) * self.weight
+        # 保持原有精度，不强制转 FP32（BF16 下减少转换开销）
+        rms = (x.pow(2).mean(dim=-1, keepdim=True) + self.eps).rsqrt()
+        return x * rms * self.weight
 
 
 class LayerNorm2d(nn.Module):
@@ -82,9 +83,10 @@ class ResBlock(nn.Module):
 
 # flash-attn 内核的 batch 维参与 CUDA grid 坐标，受 grid y/z 维上限 65535 约束。
 # window/sparse 注意力把 batch 展开为 B*G（如 512*128=65536，恰好超限 1），会报
-# "CUDA error: invalid configuration argument"。取保守阈值 32768：超过则强制回退
+# "CUDA error: invalid configuration argument"。阈值需低于 flash 内核 grid 上限 65535：
+# 取 60000，使 ws=7、B=4800 时 B*nW=43200 可走 flash；超过则强制回退
 # 手写 math——这些分块调用的 seq 仅 ~50（49 窗口 + 全局 token），math 成本可忽略。
-_FLASH_BATCH_LIMIT = 32768
+_FLASH_BATCH_LIMIT = 60000  # ws=7, B=4800 -> B*nW=43200 < 60000
 
 
 def _sdpa(q, k, v, dropout_p=0.0, use_math=False, scale=None):
@@ -407,22 +409,23 @@ class MultiHeadSelfAttention(nn.Module):
         return oc.view(B, N, Hh, d).reshape(B, N, Hh * d)
 
     def _window_global_attn(self, q, k, v, H, W):
-        """窗口注意力 + 全局 token，手写 math 加速版。
+        """窗口注意力 + 全局 token，SDPA 联合注意力加速版。
 
-        融合 window（高效块状分区）+ sparse（全局 token 长程通路），
-        手写 math 避免 cat/expand 开销，为非方阵 shape (ws², ws²+ng) 量身定制。
+        融合 window（高效块状分区）+ sparse（全局 token 长程通路）。
 
         每个 query 只与两类 key 交互：
-          1) 同块内 ws² 个局部 key（块状窗口，走 bmm）；
-          2) 棋盘均匀采样的 ng 个全局 key（einsum 广播，零 expand）。
+          1) 同块内 ws² 个局部 key；
+          2) 棋盘均匀采样的 ng 个全局 key。
 
-        两路 logits 联合 softmax 后分别聚合再相加。
+        两类 key 沿序列维拼接后做一次注意力——数学上等价于
+        「两路 logits 拼接 → 联合 softmax → 分路聚合再相加」，但
+        softmax + 聚合融合进单个内核（CUDA 上自动走 flash / mem-efficient
+        后端），不再物化 (BnW, Hh, ws², ws²+ng) 注意力矩阵。
 
         q,k,v: (B, Hh, N, head_dim)，N = H*W。返回 (B, N, Hh*d)。
         """
         ws = self.window_size
         B, Hh, N, d = q.shape
-        sc = self.scale  # d ** -0.5
 
         # ---- 1) grid 参数 ----
         H2 = ((H + ws - 1) // ws) * ws
@@ -456,49 +459,20 @@ class MultiHeadSelfAttention(nn.Module):
         kg = k4[:, :, ri, ci].reshape(B, Hh, ng, d)  # (B, Hh, ng, d)
         vg = v4[:, :, ri, ci].reshape(B, Hh, ng, d)
 
-        # ---- 4) 手写 math：分两路计算 logits，联合 softmax ----
+        # ---- 4) 联合注意力：key 序列 = [局部 ws² 个；全局 ng 个]，一次 SDPA ----
         BnW = B * nW
         ws2 = ws * ws
+        # 全局 token 广播到每个窗口（与原「两路 logits 联合 softmax」语义一致）。
+        # 注意先 permute 把 nW 挪到第 1 维再 reshape——(B,Hh,nW,...) 直接
+        # reshape 成 (BnW,...) 会因 Hh 夹在中间而错位。
+        kg_w = kg.unsqueeze(2).permute(0, 2, 1, 3, 4).expand(B, nW, Hh, ng, d).reshape(BnW, Hh, ng, d)
+        vg_w = vg.unsqueeze(2).permute(0, 2, 1, 3, 4).expand(B, nW, Hh, ng, d).reshape(BnW, Hh, ng, d)
+        k_full = torch.cat([k_p, kg_w], dim=2)  # (BnW, Hh, ws²+ng, d)
+        v_full = torch.cat([v_p, vg_w], dim=2)
+        out = _sdpa(q_p, k_full, v_full, dropout_p=self.attn_drop,
+                    scale=self.scale)  # (BnW, Hh, ws², d)
 
-        # 路 1：局部窗口 bmm — (BnW·Hh, ws², d) × (BnW·Hh, d, ws²)
-        local_logits = torch.bmm(
-            q_p.reshape(BnW * Hh, ws2, d),
-            k_p.reshape(BnW * Hh, ws2, d).transpose(1, 2)
-        ).view(BnW, Hh, ws2, ws2) * sc  # (BnW, Hh, ws², ws²)
-
-        # 路 2：全局 einsum 广播 — 零 expand，kg 广播到 nW 维
-        q5 = q_p.view(B, nW, Hh, ws2, d).permute(0, 2, 1, 3, 4)  # (B, Hh, nW, ws², d)
-        kg5 = kg.unsqueeze(2)  # (B, Hh, 1, ng, d) — 广播到 nW
-        global_logits = torch.einsum('bhnqd,bhngd->bhnqg', q5 * sc, kg5)
-        # (B, Hh, nW, ws², ng) → (BnW, Hh, ws², ng)
-        global_logits = global_logits.permute(0, 2, 1, 3, 4).reshape(BnW, Hh, ws2, ng)
-
-        # 联合 softmax
-        all_logits = torch.cat([local_logits, global_logits], dim=-1)  # (BnW, Hh, ws², ws²+ng)
-        attn = torch.softmax(all_logits, dim=-1)
-        if self.attn_drop > 0.0:
-            attn = torch.nn.functional.dropout(attn, p=self.attn_drop)
-
-        # ---- 5) 聚合：分两路后相加 ----
-        local_attn = attn[:, :, :, :ws2]     # (BnW, Hh, ws², ws²)
-        global_attn = attn[:, :, :, ws2:]    # (BnW, Hh, ws², ng)
-
-        # 路 1：局部 bmm
-        local_out = torch.bmm(
-            local_attn.reshape(BnW * Hh, ws2, ws2),
-            v_p.reshape(BnW * Hh, ws2, d)
-        ).view(BnW, Hh, ws2, d)
-
-        # 路 2：全局 einsum 广播
-        vg5 = vg.unsqueeze(2)  # (B, Hh, 1, ng, d)
-        ga5 = global_attn.reshape(B, nW, Hh, ws2, ng)  # (B, nW, Hh, ws², ng)
-        ga5 = ga5.permute(0, 2, 1, 3, 4)  # (B, Hh, nW, ws², ng)
-        global_out = torch.einsum('bhnqg,bhngd->bhnqd', ga5, vg5)
-        global_out = global_out.permute(0, 2, 1, 3, 4).reshape(BnW, Hh, ws2, d)
-
-        out = local_out + global_out  # (BnW, Hh, ws², d)
-
-        # ---- 6) unpartition ----
+        # ---- 5) unpartition ----
         x = out.view(B, nwH, nwW, Hh, ws, ws, d)
         x = x.permute(0, 3, 1, 4, 2, 5, 6).reshape(B, Hh, H2, W2, d)
         if ph or pw:
