@@ -13,6 +13,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# ---- SwanLab（可选依赖）----
+# 云端环境不保证已装 swanlab，这里统一装一次。
+# 装不上也不能中断训练：脚本有 set -euo pipefail，故用 || 兜底降级；
+# 失败时指标仍可从 stdout 看（每 --log-every 步一行）。
+python -m pip install swanlab -q || \
+  echo "[warn] swanlab 安装失败（多为无外网），将仅用 stdout 记录指标"
+
 # ---- 可调参数（OOM 时优先降 BATCH，并同步按平方根律降 LR）----
 WORLD_SIZE=1
 BATCH=3500            # 实测 3500 可跑（40G）

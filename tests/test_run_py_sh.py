@@ -267,6 +267,38 @@ def test_rl_script_omits_onnx_model():
 
 
 # --------------------------------------------------------------------------- #
+# SwanLab 依赖自动安装
+# --------------------------------------------------------------------------- #
+@pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
+def test_shell_scripts_install_swanlab():
+    """每个 .sh 在训练前安装 swanlab（云端环境不保证已装）。"""
+    for f in _existing_sh():
+        txt = open(os.path.join(SHELL_DIR, f), encoding='utf-8').read()
+        assert re.search(r'-m\s+pip\s+install\s+swanlab', txt), \
+            f"{f} 缺少 `python -m pip install swanlab`"
+
+
+@pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
+def test_swanlab_install_failure_does_not_abort_training():
+    """安装失败不得中断训练（脚本有 set -euo pipefail，需显式兜底）。
+
+    云端无外网时 pip 会失败；swanlab 只是可选的指标上报，训练必须照常进行。
+    """
+    for f in _existing_sh():
+        txt = open(os.path.join(SHELL_DIR, f), encoding='utf-8').read()
+        for line in txt.splitlines():
+            if re.search(r'-m\s+pip\s+install\s+swanlab', line) \
+                    and not line.strip().startswith('#'):
+                assert '||' in line, \
+                    f"{f} 的 swanlab 安装未兜底：网络失败会因 set -e 中断整个训练"
+                assert 'python' in line and '-m' in line, \
+                    f"{f} 应用 python -m pip（保证与训练同一解释器）"
+                break
+        else:
+            pytest.fail(f"{f} 未找到 swanlab 安装命令")
+
+
+# --------------------------------------------------------------------------- #
 # .sh 里的参数必须真能被对应训练脚本解析
 # --------------------------------------------------------------------------- #
 def _script_args(txt):

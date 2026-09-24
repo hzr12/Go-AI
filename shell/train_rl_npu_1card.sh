@@ -12,6 +12,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# ---- SwanLab（可选依赖）----
+# 云端环境不保证已装 swanlab。装不上也不中断训练（set -e 下用 || 兜底），
+# 此时指标仅从 stdout 查看（每轮迭代一行）。
+python -m pip install swanlab -q || \
+  echo "[warn] swanlab 安装失败（多为无外网），将仅用 stdout 记录指标"
+
 # ---- 可调参数 ----
 PARALLEL_GAMES=8      # 自对弈进程数
 MCTS_THREADS=3        # 每进程 MCTS 线程；8×3≈24，正好对上 24 核

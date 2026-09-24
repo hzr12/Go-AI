@@ -11,11 +11,21 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# ---- SwanLab（可选依赖）----
+# 云端环境不保证已装 swanlab。装不上也不中断训练（set -e 下用 || 兜底），
+# 此时指标仅从 stdout 查看（每 --log-every 步一行）。
+python -m pip install swanlab -q || \
+  echo "[warn] swanlab 安装失败（多为无外网），将仅用 stdout 记录指标"
+
 # ---- 可调参数 ----
-# 每卡 batch 取 1/4，使「有效 batch」≈ 单卡的 3200，LR 曲线可比。
+# 每卡 batch 保持较高（3200）以榨干单卡算力，有效 batch = BATCH × WORLD_SIZE。
+# ⚠ 注意：这样有效 batch 是单卡的 4 倍（12800），LR 不再与单卡可比。
+#   若想与单卡 910A 得到可比的曲线，应把 BATCH 改为 800（有效 3200）。
+#   下面 LR 0.00403 是按「有效 batch 3200」标定的；有效 batch 变成 12800 后
+#   它明显偏小，如需大批量训练请按平方根律上调（0.00403×√(12800/3200)≈0.00806）。
 WORLD_SIZE=4
-BATCH=800             # 800 × 4 = 3200
-LR=0.00403            # 与单卡同有效 batch，故 lr 相同
+BATCH=3200             # 每卡 3200 × 4 卡 = 有效 12800
+LR=0.00403            # 按有效 batch 3200 标定；有效 12800 时明显偏小，见上
 PREFETCH_W=16         # 每 rank 16 个子进程，4 卡共 64 个，注意别超订 CPU
 PREFETCH_D=16
 DATA=data/sgf_19x19_full.npz
