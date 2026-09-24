@@ -28,6 +28,7 @@ PREFETCH_W=32
 PREFETCH_D=32
 DATA=data/sgf_19x19_full.npz
 OUT=models/sft_19x19_v18.pth
+C2NET=1               # 1=启用 OpenI 启智平台对接；平台已自带数据/输出时改 0
 
 # ---- 为什么以前 OOM、现在能到 3500 ----
 # 根因不是 batch 本身，而是 --compile-mode reduce-overhead：它走 CUDA Graphs，
@@ -60,4 +61,5 @@ torchrun --nproc_per_node="$WORLD_SIZE" scripts/train_sft.py \
   --out "$OUT" \
   --export-onnx 1 --use-checkpoint 1 \
   --swanlab 1 --ver v18 \
+  --c2net "$C2NET" \
   "$@"

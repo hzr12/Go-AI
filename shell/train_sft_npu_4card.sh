@@ -31,6 +31,7 @@ PREFETCH_W=16         # 每 rank 16 个子进程，4 卡共 64 个，注意别�
 PREFETCH_D=16
 DATA=data/sgf_19x19_full.npz
 OUT=models/sft_19x19_v18_npu4.pth
+C2NET=1               # 1=启用 OpenI 启智平台对接；平台已自带数据/输出时改 0
 
 # ---- ⚠ 4 卡 DDP 风险提示（重要）----
 # 此前记录过 4×910A 卡间网络不稳。DDP 的梯度 allreduce 是**每步硬同步**，
@@ -42,6 +43,10 @@ OUT=models/sft_19x19_v18_npu4.pth
 #
 # 其它：每 rank 独立加载全量数据集，主机内存约为单卡的 4 倍；
 # 不传 --compile / --flash-attn（NPU 自动禁用）；降显存不要动 --attn-window。
+# C2NET 注意：prepare() 与 --data 覆盖**故意**在所有 rank 上执行（每个 rank 都要
+#   独立加载数据集，而 --data 是 required=True，非 rank 0 拿不到路径会直接退出）。
+#   日志已按 is_main 过滤，不会刷重复行。若 c2net 的 prepare() 有写盘副作用，
+#   正确修法是挪到 init_process_group 之后由 rank 0 调用再广播路径。
 
 torchrun --nproc_per_node="$WORLD_SIZE" scripts/train_sft.py \
   --data "$DATA" \
@@ -63,4 +68,5 @@ torchrun --nproc_per_node="$WORLD_SIZE" scripts/train_sft.py \
   --out "$OUT" \
   --export-onnx 1 --use-checkpoint 1 \
   --swanlab 1 --ver v18_npu4 \
+  --c2net "$C2NET" \
   "$@"

@@ -25,6 +25,7 @@ PREFETCH_W=32
 PREFETCH_D=32
 DATA=data/sgf_19x19_full.npz
 OUT=models/sft_19x19_v18_npu1.pth
+C2NET=1               # 1=启用 OpenI 启智平台对接；平台已自带数据/输出时改 0
 
 # ---- NPU 注意事项 ----
 # · 910A 无 BF16 → 代码自动走 FP16 + GradScaler，无需手改
@@ -54,4 +55,5 @@ torchrun --nproc_per_node="$WORLD_SIZE" scripts/train_sft.py \
   --out "$OUT" \
   --export-onnx 1 --use-checkpoint 1 \
   --swanlab 1 --ver v18_npu1 \
+  --c2net "$C2NET" \
   "$@"

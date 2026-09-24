@@ -649,6 +649,11 @@ def main():
     is_main = (rank == 0)
 
     # ---- C2NET 支持（OpenI 启智平台）----
+    # 关于 rank 守卫：prepare() 与 --model 覆盖**必须**在所有 rank 上执行——
+    # 每个 rank（含各 _selfplay_worker 子进程所在的 rank）都要独立解析初始权重路径。
+    # 故这里只对「日志打印」做 is_main 过滤（避免 N 卡刷出 N 份重复日志）。
+    # 若 c2net 的 prepare() 未来被发现有写盘/建连副作用，正确做法是挪到
+    # init_process_group 之后由 rank 0 调用再广播路径，而非简单加 if is_main。
     _c2net_ctx = None
     if args.c2net == 1:
         try:

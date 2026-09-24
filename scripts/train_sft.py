@@ -737,6 +737,13 @@ def main():
     logger = setup_logging(log_file, rank=rank)
 
     # ---- C2NET 支持（OpenI 启智平台）----
+    # 关于 rank 守卫：prepare() 与 --data 覆盖**必须**在所有 rank 上执行——
+    # 每个 rank 都要独立加载数据集，而 --data 是 required=True，非 rank 0 若拿不到
+    # c2net 给的 dataset_path 会直接 argparse 报错退出。因此这里只对「日志打印」
+    # 做 is_main 过滤（否则 N 卡会刷出 N 份重复日志），prepare() 本身保持全 rank 调用。
+    # 若 c2net 的 prepare() 将来被发现有写盘/建连副作用，正确做法是把它挪到
+    # init_process_group 之后、由 rank 0 调用再用 dist.broadcast_object_list 广播
+    # 路径，而不是简单地加 if is_main（那会丢掉非 rank 0 的数据集路径）。
     _c2net_ctx = None
     if args.c2net == 1:
         try:
@@ -749,14 +756,15 @@ def main():
             # 覆盖 --data：目录原样传入，让 --data 的目录模式合并**全部** npz/tgz 分片
             if _c2net_ctx.dataset_path:
                 args.data = resolve_c2net_data(_c2net_ctx.dataset_path)
-                if os.path.isdir(args.data):
-                    import glob
-                    _n_npz = len(glob.glob(os.path.join(args.data, '**', '*.npz'),
-                                           recursive=True))
-                    logger.info("[c2net] 使用数据集目录（合并全部分片）: %s（npz 分片 %d 个）",
-                                args.data, _n_npz)
-                else:
-                    logger.info("[c2net] 使用数据集: %s", args.data)
+                if is_main:
+                    if os.path.isdir(args.data):
+                        import glob
+                        _n_npz = len(glob.glob(os.path.join(args.data, '**', '*.npz'),
+                                               recursive=True))
+                        logger.info("[c2net] 使用数据集目录（合并全部分片）: %s"
+                                    "（npz 分片 %d 个）", args.data, _n_npz)
+                    else:
+                        logger.info("[c2net] 使用数据集: %s", args.data)
         except ImportError:
             if is_main:
                 logger.warning("[c2net] c2net 未安装，--c2net 已忽略")

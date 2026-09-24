@@ -32,6 +32,7 @@ PREFETCH_W=16         # 每 rank 各自起 PREFETCH_W 个子进程，2 卡共 32
 PREFETCH_D=16
 DATA=data/sgf_19x19_full.npz
 OUT=models/sft_19x19_v18_npu2.pth
+C2NET=1               # 1=启用 OpenI 启智平台对接；平台已自带数据/输出时改 0
 
 # ---- 2 卡 DDP 注意事项 ----
 # · 每个子进程会**独立加载全量数据集**（34M 样本），主机内存约为单卡的 2 倍
@@ -39,6 +40,10 @@ OUT=models/sft_19x19_v18_npu2.pth
 #   （此前记录过 4×910A 网络不稳）。若卡间通信有问题，把 WORLD_SIZE 改回 1。
 # · MASTER_ADDR/MASTER_PORT 由 torchrun 自动注入，无需手动设置
 # · 不传 --compile / --flash-attn：NPU 上自动禁用
+# · C2NET 注意：prepare() 与 --data 覆盖**故意**在所有 rank 上执行（每个 rank 都要
+#   独立加载数据集，而 --data 是 required=True，非 rank 0 拿不到路径会直接退出）。
+#   日志已按 is_main 过滤，不会刷重复行。若 c2net 的 prepare() 有写盘副作用，
+#   正确修法是挪到 init_process_group 之后由 rank 0 调用再广播路径。
 # ⚠ 降显存不要动 --attn-window：要往大调而不是往小调。
 
 torchrun --nproc_per_node="$WORLD_SIZE" scripts/train_sft.py \
@@ -61,4 +66,5 @@ torchrun --nproc_per_node="$WORLD_SIZE" scripts/train_sft.py \
   --out "$OUT" \
   --export-onnx 1 --use-checkpoint 1 \
   --swanlab 1 --ver v18_npu2 \
+  --c2net "$C2NET" \
   "$@"

@@ -332,6 +332,55 @@ def test_sft_scripts_lr_follows_sqrt_scaling_of_effective_batch():
 
 
 # --------------------------------------------------------------------------- #
+# C2NET（OpenI 启智平台）
+# --------------------------------------------------------------------------- #
+@pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
+def test_sft_scripts_enable_c2net():
+    """SFT 脚本需带 --c2net（走 OpenI 启智平台的数据/输出对接）。"""
+    sft = [f for f in _existing_sh() if f.startswith('train_sft')]
+    assert sft, '未找到 SFT 脚本'
+    for f in sft:
+        txt = open(os.path.join(SHELL_DIR, f), encoding='utf-8').read()
+        m = re.search(r'--c2net\s+"\$C2NET"', txt)
+        assert m, f"{f} 缺少 --c2net \"$C2NET\""
+
+
+@pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
+def test_sft_scripts_c2net_flag_is_zero_or_one():
+    """C2NET 必须是 0/1 开关（train_sft.py 的 --c2net 是 type=int choices=[0,1]）。
+
+    平台只接受 --参数名 参数值，故用变量传递；取值越界会在 argparse 报错。
+    """
+    sft = [f for f in _existing_sh() if f.startswith('train_sft')]
+    for f in sft:
+        txt = open(os.path.join(SHELL_DIR, f), encoding='utf-8').read()
+        m = re.search(r'(?m)^C2NET=(\d+)\s*(?:#.*)?$', txt)
+        assert m, f"{f} 缺少 C2NET 变量"
+        assert m.group(1) in ('0', '1'), \
+            f"{f} C2NET={m.group(1)} 非法（--c2net 只接受 0/1）"
+
+
+@pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
+def test_multicard_sft_scripts_warn_c2net_prepare_all_ranks():
+    """多卡 SFT 脚本需提示 c2net 的 prepare() 会被所有 rank 调用。
+
+    train_sft.py 的 c2net 初始化没有 is_main 守卫，DDP 下每个 rank 都会
+    prepare()；若该函数有写盘/建连副作用，多卡并发调用可能互相干扰。
+    """
+    for f in _existing_sh():
+        txt = open(os.path.join(SHELL_DIR, f), encoding='utf-8').read()
+        if not f.startswith('train_sft'):
+            continue
+        m = re.search(r'(?m)^WORLD_SIZE=(\d+)', txt)
+        if not m or int(m.group(1)) < 2:
+            continue
+        comments = '\n'.join(l for l in txt.splitlines()
+                             if l.strip().startswith('#'))
+        assert 'prepare' in comments or 'rank' in comments.lower(), \
+            f"{f} 是多卡脚本，需注释说明 c2net prepare() 会被所有 rank 调用"
+
+
+# --------------------------------------------------------------------------- #
 # .sh 里的参数必须真能被对应训练脚本解析
 # --------------------------------------------------------------------------- #
 def _script_args(txt):
