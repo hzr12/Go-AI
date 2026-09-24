@@ -31,7 +31,7 @@ import os
 import time
 import struct
 import argparse
-from multiprocessing import Queue, Process, Event
+import multiprocessing as mp
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -148,11 +148,15 @@ def self_play_game(ai, board_size, sims, max_moves, temperature,
                    leaf_ab_depth=0, c_puct=2.0, virtual_loss=8.0,
                    num_threads=8, spec_prefetch=False,
                    use_diverse_rollout=False):
-    """一局自对弈。返回 [(planes, visit_target, player, mc), ...], score(黑-白)。"""
+    """一局自对弈。返回 [(planes, visit_target, player, mc, root_value), ...], score(黑-白)。
+
+    root_value: 该步 MCTS 根节点价值（当前 to_play 视角, [-1,1]，见 mcts.search 返回
+    第 3 项），供 TD 价值标签做 n-step bootstrap（越界时回退终局值）。
+    """
     mcts = MCTS(ai, board_size=board_size, num_threads=num_threads,
                 expand_topk=expand_topk, expand_chunk=expand_chunk,
                 priors_leaf=priors_leaf, temperature=temperature,
-                dirichlet_alpha=dir_alpha, dir_eps=dir_eps,
+                dirichlet_alpha=dir_alpha, dirichlet_eps=dir_eps,
                 spec_prefetch=spec_prefetch,
                 use_rollout=use_rollout, rollout_lambda=rollout_lambda,
                 rollout_steps=rollout_steps,
@@ -178,7 +182,7 @@ def self_play_game(ai, board_size, sims, max_moves, temperature,
             passes += 1
             mc += 1
             continue
-        visits, probs, _rv = mcts.search(
+        visits, probs, root_value = mcts.search(
             board, hists[0], hists[1], to_play,
             simulations=sims, path_moves=path_moves)
         # 记录训练样本
@@ -190,7 +194,7 @@ def self_play_game(ai, board_size, sims, max_moves, temperature,
         if vs > 0:
             vt[:n_actions - 1] = visits[:n_actions - 1] / vs
             vt[n_actions - 1] = visits[n_actions - 1] / vs
-        data.append((planes, vt, to_play, mc))
+        data.append((planes, vt, to_play, mc, float(root_value)))
         # 温度线性衰减
         progress = min(1.0, mc / max(30, 1))
         temp = 1.0 - progress * (1.0 - 0.1)
@@ -221,23 +225,73 @@ def self_play_game(ai, board_size, sims, max_moves, temperature,
 
 
 def augment8(plane, target, n):
-    """8 对称增强：4 旋转 × 2 镜像（棋盘特征与 visit 目标同步变换）。"""
-    board_t = target[:n * n].reshape(n, n)
+    """8 对称增强：4 旋转 × 2 镜像（全向量化，复用 GoBoard.apply_symmetry_batch）。
+
+    旧版逐 t 8 次 np.rot90 + 8 次 Python 循环；新版把平面与目标棋盘各走一次
+    分组向量化变换，尾部一次批量构造 target，消除全部逐样本循环。
+    返回 8 个 (plane, target) 元组（顺序与旧版 t=0..7 一致）。
+    """
+    plane = np.asarray(plane)
+    ids = np.arange(8, dtype=np.int64)
+    tfs = np.full(8, -1, dtype=np.int64)  # 着法索引不用（pass），仅驱动 transform_ids
+    planes_in = np.broadcast_to(plane, (8, plane.shape[0], n, n))
+    planes_out, _ = GoBoard.apply_symmetry_batch(planes_in, tfs, ids, n)
+
+    board_t = np.asarray(target[:n * n]).reshape(n, n)
+    tb_in = np.broadcast_to(board_t, (8, 1, n, n))
+    tb_out, _ = GoBoard.apply_symmetry_batch(tb_in, tfs, ids, n)  # (8,1,n,n)
     pass_t = target[n * n]
-    out = []
-    for t in range(8):
-        k = t % 4
-        pl = plane.copy()
-        tb = board_t.copy()
-        if t >= 4:
-            pl = pl[:, :, ::-1]
-            tb = tb[:, ::-1]
-        if k > 0:
-            pl = np.rot90(pl, k=-k, axes=(1, 2))
-            tb = np.rot90(tb, k=-k)
-        tv = np.concatenate([tb.reshape(-1), [pass_t]])
-        out.append((np.ascontiguousarray(pl), np.ascontiguousarray(tv)))
-    return out
+
+    # 一次批量构造 target：(8, n²+1) = 棋盘部分 flatten + 末尾 pass 列
+    tv = np.concatenate(
+        [tb_out[:, 0].reshape(8, n * n),
+         np.full((8, 1), pass_t, dtype=tb_out.dtype)], axis=1)
+    return [(np.ascontiguousarray(planes_out[i]), np.ascontiguousarray(tv[i]))
+            for i in range(8)]
+
+
+# --------------------------------------------------------------------------- #
+# TD (C+E) 价值标签
+# --------------------------------------------------------------------------- #
+def compute_td_target(players, root_values, score, t,
+                      td, td_steps, td_alpha_init, td_alpha_end):
+    """计算数据下标 t 处的价值标签 z（纯函数，selfplay/async 两处共享）。
+
+    players:     (n_total,) 每个数据位置执子方（±1）
+    root_values: (n_total,) 每个数据位置 MCTS 根价值（该位置 to_play 视角）
+    score:       终局分（黑-白，>0 黑胜）
+    t:           当前数据下标
+
+    返回 (z, z_raw, alpha)：
+      z_raw  = 终局胜负（t 处 player 视角, ±1/0）
+      r_soft = 旧位置软化标签 tanh(z_raw·(0.3+0.7·t/T))
+      td 关闭 → z = r_soft（与旧公式逐位一致，回归保证）
+      td 开启 → v_td = sign·root_values[t+td_steps]（越界回退 z_raw；sign 按
+                 players[t] vs players[t+td_steps]，兼容被跳过的无气 pass）
+                 alpha = td_alpha_init + (td_alpha_end-td_alpha_init)·t/T
+                 z = clip(alpha·v_td + (1-alpha)·r_soft, -1, 1)
+    """
+    player = players[t]
+    n_total = len(players)
+    if score > 0:
+        z_raw = 1.0 if player == 1 else -1.0
+    elif score < 0:
+        z_raw = -1.0 if player == 1 else 1.0
+    else:
+        z_raw = 0.0
+    T = max(n_total - 1, 1)
+    r_soft = float(np.tanh(z_raw * (0.3 + 0.7 * (t / T))))
+    if not td:
+        return r_soft, z_raw, 0.0
+    t2 = t + td_steps
+    if t2 >= n_total:
+        v_td = z_raw
+    else:
+        sign = 1.0 if players[t2] == player else -1.0
+        v_td = sign * float(root_values[t2])
+    alpha = td_alpha_init + (td_alpha_end - td_alpha_init) * (t / T)
+    z = float(np.clip(alpha * v_td + (1.0 - alpha) * r_soft, -1.0, 1.0))
+    return z, z_raw, alpha
 
 
 # --------------------------------------------------------------------------- #
@@ -277,29 +331,58 @@ def _selfplay_worker(gid, model_path, args, result_queue):
 # 训练
 # --------------------------------------------------------------------------- #
 def train_epochs(ai, buffer, args, device):
-    """在 replay buffer 上训练若干遍。返回平均 loss。"""
+    """在 replay buffer 上训练若干遍。返回平均 loss。
+
+    N1: 910A 无 BF16，FP16 autocast 配 GradScaler 防下溢（对齐 train_sft 的
+        npu_grad_scaler）；CUDA 旧卡 FP16 同样需要。
+    C3: optimizer/EMA/GradScaler 跨迭代挂在 ai 上复用（保留 Adam 动量与 EMA
+        shadow 轨迹），LR scheduler 每轮按当前 buffer 大小重建。
+    N4: pin_memory 收窄为仅 CUDA（NPU 直传，对齐 train_sft）。
+    """
     model = ai.model
     model.train()
+
+    device_prefix = device.split(':')[0] if isinstance(device, str) else str(device)
 
     # AdamW 参数分组：value head 用独立学习率
     no_decay = ['bias', 'bn', 'Norm']
     value_decay = [p for n, p in model.named_parameters()
                    if 'value' in n and not any(k in n for k in no_decay)]
     value_no_decay = [p for n, p in model.named_parameters()
-                      if 'value' in n and any(k in n for k in no_decay)]
+                     if 'value' in n and any(k in n for k in no_decay)]
     other_decay = [p for n, p in model.named_parameters()
                    if 'value' not in n and not any(k in n for k in no_decay)]
     other_no_decay = [p for n, p in model.named_parameters()
-                      if 'value' not in n and any(k in n for k in no_decay)]
-    opt = torch.optim.AdamW([
+                     if 'value' not in n and any(k in n for k in no_decay)]
+    opt_groups = [
         {'params': other_decay, 'lr': args.lr, 'weight_decay': args.weight_decay},
         {'params': other_no_decay, 'lr': args.lr, 'weight_decay': 0.0},
         {'params': value_decay, 'lr': args.lr * args.value_lr_mult,
          'weight_decay': args.weight_decay},
         {'params': value_no_decay, 'lr': args.lr * args.value_lr_mult, 'weight_decay': 0.0},
-    ])
+    ]
+    # C3: 首轮创建 optimizer/scaler/EMA 并缓存到 ai，后续迭代复用
+    if getattr(ai, '_opt', None) is None:
+        ai._opt = torch.optim.AdamW(opt_groups)
+        if device_prefix == 'npu' and hasattr(torch, 'npu'):
+            try:
+                ai._scaler = torch.npu.amp.GradScaler(enabled=True)
+            except Exception:
+                ai._scaler = None
+        elif device_prefix == 'cuda':
+            if hasattr(torch.amp, 'GradScaler'):
+                ai._scaler = torch.amp.GradScaler('cuda', enabled=True)
+            else:
+                ai._scaler = torch.cuda.amp.GradScaler(enabled=True)
+        else:
+            ai._scaler = None
+        if args.use_ema == 1:
+            ai._ema = EMA(model, decay=0.999)
+    opt = ai._opt
+    scaler = getattr(ai, '_scaler', None)
+    ema = getattr(ai, '_ema', None) if args.use_ema == 1 else None
 
-    # Cosine LR Schedule with Warmup
+    # Cosine LR Schedule with Warmup（每轮按 buffer 重建）
     n = len(buffer)
     steps_per_epoch = max(1, n // args.batch_size)
     total_steps = steps_per_epoch * args.epochs
@@ -311,47 +394,54 @@ def train_epochs(ai, buffer, args, device):
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         opt, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_steps])
 
-    # EMA
-    ema = EMA(model, decay=0.999) if args.use_ema == 1 else None
-
     losses = []
     if not buffer:
         return 0.0
-    
-    # 预分配张量避免重复分配
-    device_prefix = device.split(':')[0] if isinstance(device, str) else str(device)
-    pin_mem = device_prefix in ('cuda', 'npu')
-    
+
+    # N4: pin_memory 仅 CUDA（NPU 直传，对齐 train_sft 的 cuda-only pin 策略）
+    pin_mem = device_prefix == 'cuda'
+
     for _ in range(args.epochs):
         for _ in range(steps_per_epoch):
-            idx = np.random.randint(0, n, size=args.batch_size)
+            idx = np.random.randint(0, n, size=min(args.batch_size, n))
             batch = [buffer[i] for i in idx]
+            batch = [b for b in batch if b is not None]
+            if not batch:
+                continue
             planes = torch.from_numpy(np.stack([b[0] for b in batch])).float()
             pi_t = torch.from_numpy(np.stack([b[1] for b in batch])).float()
             z = torch.from_numpy(np.stack([b[2] for b in batch])).float().unsqueeze(1)
-            
+
             if pin_mem:
                 planes = planes.pin_memory()
                 pi_t = pi_t.pin_memory()
                 z = z.pin_memory()
-            
+
             planes = planes.to(device, non_blocking=pin_mem)
             pi_t = pi_t.to(device, non_blocking=pin_mem)
             z = z.to(device, non_blocking=pin_mem)
-            
+
             with maybe_autocast(device):
                 policy, value = model(planes)
                 logq = torch.log_softmax(policy, dim=-1) + 1e-10
                 loss_pi = -(pi_t * logq).sum(dim=1).mean()
-                value_target = (z + 1) / 2
+                value_target = (z.squeeze(-1) + 1) / 2
                 loss_v = F.binary_cross_entropy_with_logits(value.squeeze(-1), value_target)
                 loss = loss_pi + loss_v
-            
+
             opt.zero_grad()
-            loss.backward()
-            if args.clip_grad > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
-            opt.step()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                if args.clip_grad > 0:
+                    scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                if args.clip_grad > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+                opt.step()
             scheduler.step()
             if ema is not None:
                 ema.update()
@@ -379,7 +469,8 @@ def main():
     ap.add_argument("--max-moves", type=int, default=None, help="单局手数上限（默认 3×点数）")
     ap.add_argument("--temperature", type=float, default=1.0, help="自对弈初始采样温度")
     ap.add_argument("--buffer-size", type=int, default=500, help="replay buffer 容量（局数，非样本数）")
-    ap.add_argument("--batch-size", type=int, default=64)
+    ap.add_argument("--batch-size", type=int, default=256,
+                    help="训练 batch（C2: NPU 甜点 256，显存约 2-3x 旧 64）")
     ap.add_argument("--epochs", type=int, default=2, help="每轮迭代训练遍数")
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
@@ -394,8 +485,8 @@ def main():
     ap.add_argument("--c-puct", type=float, default=2.0, help="PUCT 探索系数")
     ap.add_argument("--virtual-loss", type=float, default=8.0, help="虚拟损失系数")
     ap.add_argument("--num-threads", type=int, default=8, help="MCTS 多线程数")
-    ap.add_argument("--spec-prefetch", type=int, default=0, choices=[0, 1],
-                    help="启用 worker 推测预评估 (0=关闭, 1=开启)")
+    ap.add_argument("--spec-prefetch", type=int, default=1, choices=[0, 1],
+                    help="启用 worker 推测预评估 (0=关闭, 1=开启；C7 默认 1)")
     ap.add_argument("--leaf-ab-depth", type=int, default=2, help="叶内 α-β 深度")
     
     # Phase 1 优化参数
@@ -461,10 +552,26 @@ def main():
                     help="启用 SwanLab 实验跟踪 (0=关闭, 1=开启)")
     ap.add_argument("--swanlab-api-key", type=str, default="",
                     help="SwanLab API key（可选，未设置则读取 SWANLAB_API_KEY 环境变量）")
+    ap.add_argument("--ver", default="rl",
+                    help="模型版本号（SwanLab name 后缀）")
+    # TD Learning（C+E 混合价值标签）
+    ap.add_argument("--td", type=int, default=1, choices=[0, 1],
+                    help="TD 价值标签 (0=旧 tanh 软化, 1=开启)")
+    ap.add_argument("--td-steps", type=int, default=3,
+                    help="TD n-step 前看步数（数据下标空间）")
+    ap.add_argument("--td-alpha-init", type=float, default=0.2,
+                    help="TD α 调度初值（开局，偏 r_soft）")
+    ap.add_argument("--td-alpha-end", type=float, default=0.9,
+                    help="TD α 调度终值（残局，偏 v_td）")
     ap.add_argument("--c2net", type=int, default=0, choices=[0, 1],
                     help="启用 C2NET (OpenI 启智平台) 支持 (0=关闭, 1=开启)")
 
     args = ap.parse_args()
+
+    # DDP/多卡：rank/world_size/is_main（c2net、swanlab 块均引用 is_main，须先定义）
+    rank = int(os.environ.get('RANK', '0'))
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    is_main = (rank == 0)
 
     # ---- C2NET 支持（OpenI 启智平台）----
     _c2net_ctx = None
@@ -492,14 +599,15 @@ def main():
     swanlab_logger = None
     if use_swanlab and is_main:
         try:
-            import swanlab
-        except ImportError:
-            print("[swanlab] 未安装，正在自动安装...", flush=True)
-            import subprocess
-            subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'swanlab', '-q'])
-            import swanlab
-            print("[swanlab] 安装完成", flush=True)
-        # 登录：优先用 --swanlab-api-key，其次环境变量，最后交互式
+            try:
+                import swanlab
+            except ImportError:
+                print("[swanlab] 未安装，正在自动安装...", flush=True)
+                import subprocess
+                subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'swanlab', '-q'])
+                import swanlab
+                print("[swanlab] 安装完成", flush=True)
+            # 登录：优先用 --swanlab-api-key，其次环境变量，最后交互式
             api_key = args.swanlab_api_key or os.environ.get('SWANLAB_API_KEY')
             if api_key:
                 swanlab.login(api_key=api_key, save=True)
@@ -521,13 +629,16 @@ def main():
                     "lr": args.lr,
                     "expand_topk": args.expand_topk,
                     "async_pipeline": args.async_pipeline,
+                    "td": args.td,
+                    "td_steps": args.td_steps,
+                    "td_alpha_init": args.td_alpha_init,
+                    "td_alpha_end": args.td_alpha_end,
                 },
             )
-            if is_main:
-                print(f"[swanlab] 实验跟踪已启用", flush=True)
+            swanlab_logger = swanlab
+            print(f"[swanlab] 实验跟踪已启用", flush=True)
         except Exception as e:
-            if is_main:
-                print(f"[swanlab] 初始化失败: {e}", flush=True)
+            print(f"[swanlab] 初始化失败: {e}", flush=True)
 
     # 设备选择
     if args.device == "auto":
@@ -568,97 +679,95 @@ def main():
     best_loss = float('inf')
     best_path = args.out
 
-    buffer = []   # [(planes(12,n,n), target(n²+1), z_soft)]
+    buffer = []   # [(planes(12,n,n), target(n²+1), z)]
     total_games = 0
-    
-    # DDP：获取 rank/world_size
-    rank = int(os.environ.get('RANK', '0'))
-    world_size = int(os.environ.get('WORLD_SIZE', '1'))
-    is_main = (rank == 0)
 
     for it in range(1, args.iters + 1):
         t0 = time.perf_counter()
-        
+
         if is_main:
             print(f"\n[iter {it}/{args.iters}] 开始自对弈...", flush=True)
-        
+
         # SwanLab 记录迭代开始
         if swanlab_logger is not None:
             swanlab.log({"iter_start": it}, step=it)
 
-    # 检查是否启用异步流水线
-    if args.async_pipeline == 1:
-        from scripts.async_pipeline import AsyncSelfPlayPipeline
-        # 异步模式：生成与训练并行
-        if is_main:
-            print(f"[async] 使用异步流水线模式", flush=True)
-            
-            # 启动异步流水线（如果尚未启动）
-            if not hasattr(main, '_pipeline') or main._pipeline is None:
-                main._pipeline = AsyncSelfPlayPipeline(
-                    args, model_path=args.model, onnx_model=args.onnx_model
-                )
-                main._pipeline.start()
-            
-            # 持续收集数据并训练
-            for _ in range(args.games_per_iter or 10):
-                # 收集数据
-                collected = 0
-                while len(buffer) < args.batch_size * 20:
-                    item = pipeline.data_queue.get(timeout=0.5)
-                    if item:
-                        game_data = item['data']
-                        score = item['score']
-                        _process_game_data(game_data, score, bs, n_actions, buffer, args)
-                        collected += 1
-                        total_games += 1
-                
-                if collected > 0 and is_main:
-                    print(f"  收集 {collected} 局，buffer={len(buffer)}", flush=True)
-                
-                # 训练（如果有足够数据）
-                if len(buffer) >= args.batch_size * 5:
-                    avg_loss = train_epochs(ai, buffer, args, device)
-                    
-                    # 保存最佳
-                    if avg_loss < best_loss:
-                        best_loss = avg_loss
-                        out_path = args.out if args.out.endswith('.pth') else args.out + '.pth'
-                        torch.save({"model": ai.model.state_dict(), "iter": it,
-                                   "board_size": bs, "args": vars(args)}, out_path)
-                        if is_main:
-                            print(f"[iter {it}] NEW BEST loss={avg_loss:.4f}", flush=True)
-                    
-                    # 清空 buffer
-                    buffer = []
-            
-            # 停止流水线
+        # 检查是否启用异步流水线（块必须在 for it 循环体内逐迭代执行；
+        # 旧版此块在循环外只跑一轮且 buffer 不清空，是"共 0 局"的根因之一）
+        if args.async_pipeline == 1:
+            from scripts.async_pipeline import AsyncSelfPlayPipeline
+            # 异步模式：生成与训练并行（仅主进程驱动流水线；非主进程等待）
             if is_main:
-                pipeline.stop()
+                print(f"[async] 使用异步流水线模式", flush=True)
+
+                # 启动异步流水线（如果尚未启动）
+                if not hasattr(main, '_pipeline') or main._pipeline is None:
+                    main._pipeline = AsyncSelfPlayPipeline(
+                        args, model_path=args.model, onnx_model=args.onnx_model
+                    )
+                    main._pipeline.start()
+
+                # 持续收集数据并训练
+                for _ in range(args.games_per_iter or 10):
+                    # 收集数据
+                    collected = 0
+                    while len(buffer) < args.batch_size * 20:
+                        item = main._pipeline.data_queue.get(timeout=0.5)
+                        if item:
+                            game_data = item['data']
+                            score = item['score']
+                            _process_game_data(game_data, score, bs, n_actions, buffer, args)
+                            collected += 1
+                            total_games += 1
+
+                    if collected > 0 and is_main:
+                        print(f"  收集 {collected} 局，buffer={len(buffer)}", flush=True)
+
+                    # 训练（如果有足够数据）
+                    if len(buffer) >= args.batch_size * 5:
+                        avg_loss = train_epochs(ai, buffer, args, device)
+
+                        # 保存最佳
+                        if avg_loss < best_loss:
+                            best_loss = avg_loss
+                            out_path = args.out if args.out.endswith('.pth') else args.out + '.pth'
+                            torch.save({"model": ai.model.state_dict(), "iter": it,
+                                       "board_size": bs, "args": vars(args)}, out_path)
+                            if is_main:
+                                print(f"[iter {it}] NEW BEST loss={avg_loss:.4f}", flush=True)
+
+                        # 清空 buffer
+                        buffer = []
+
+                # 停止流水线（本轮内停止，下轮迭代重新按需启动）
+                main._pipeline.stop()
         else:
             # 同步模式：原有逻辑
             if args.parallel_games > 1 and args.ddp == 0:
-                # 多进程并行生成
-                result_queue = Queue(maxsize=args.result_queue_max)
-                processes = []
-                for g in range(args.parallel_games):
-                    p = Process(target=_selfplay_worker,
-                               args=(g, args.model, args, result_queue))
-                    p.start()
-                    processes.append(p)
-                # 收集结果
-                for _ in range(args.parallel_games):
-                    result = result_queue.get()
-                    game_data = result['data']
-                    score = result['score']
-                    _process_game_data(game_data, score, bs, n_actions, buffer, args)
-                    total_games += 1
-                    if is_main:
-                        print(f"  [game {result['gid']+1}] score={score:+.1f} "
-                              f"moves={len(game_data)} buffer={len(buffer)}", flush=True)
-                
-                for p in processes:
-                    p.join()
+                    # 多进程并行生成
+                    # N2: Linux 下 fork 会复制主进程已初始化的 NPU/CUDA 上下文导致挂死，
+                    # 显式用 spawn context（Windows 本就是 spawn，无行为变化）
+                    ctx = mp.get_context('spawn')
+                    result_queue = ctx.Queue(maxsize=args.result_queue_max)
+                    processes = []
+                    for g in range(args.parallel_games):
+                        p = ctx.Process(target=_selfplay_worker,
+                                        args=(g, args.model, args, result_queue))
+                        p.start()
+                        processes.append(p)
+                    # 收集结果
+                    for _ in range(args.parallel_games):
+                        result = result_queue.get()
+                        game_data = result['data']
+                        score = result['score']
+                        _process_game_data(game_data, score, bs, n_actions, buffer, args)
+                        total_games += 1
+                        if is_main:
+                            print(f"  [game {result['gid']+1}] score={score:+.1f} "
+                                  f"moves={len(game_data)} buffer={len(buffer)}", flush=True)
+
+                    for p in processes:
+                        p.join()
             else:
                 # 串行生成
                 for g in range(args.games):
@@ -672,8 +781,8 @@ def main():
                         c_puct=args.c_puct,
                         virtual_loss=args.virtual_loss,
                         num_threads=getattr(args, 'mcts_threads', 3),
-                         spec_prefetch=args.spec_prefetch == 1,
-                         use_diverse_rollout=args.use_diverse_rollout == 1)
+                        spec_prefetch=args.spec_prefetch == 1,
+                        use_diverse_rollout=args.use_diverse_rollout == 1)
                     _process_game_data(game_data, score, bs, n_actions, buffer, args)
                     total_games += 1
                     if is_main:
@@ -689,7 +798,7 @@ def main():
             if is_main:
                 avg_loss = train_epochs(ai, buffer, args, device)
                 dt = time.perf_counter() - t0
-                
+
                 # 只保存最佳权重（节省空间）
                 if avg_loss < best_loss:
                     best_loss = avg_loss
@@ -699,20 +808,27 @@ def main():
                     if is_main:
                         print(f"[iter {it}/{args.iters}] NEW BEST loss={avg_loss:.4f} "
                               f"-> {out_path}", flush=True)
-                
+
                 if is_main:
                     print(f"[iter {it}/{args.iters}] loss={avg_loss:.4f} buffer={len(buffer)} "
                           f"games={total_games} {dt:.0f}s", flush=True)
                     # SwanLab 记录迭代指标
                     if swanlab_logger is not None:
+                        z_arr = np.asarray([b[2] for b in buffer[:min(len(buffer), 4096)]])
                         swanlab.log({
                             "iter_loss": avg_loss,
                             "iter_games": total_games,
                             "buffer_size": len(buffer),
                             "iter_time_s": dt,
                             "games_per_iter": collected if 'collected' in locals() else 0,
+                            "td/z_mean": float(z_arr.mean()),
+                            "td/z_std": float(z_arr.std()),
+                            "td/enabled": args.td,
                         }, step=it)
-                        swanlab_logger.flush()
+
+                # 同步模式：每轮训练完成后重置 buffer（训完即清，避免旧局
+                # 与新网络视角的 TD 标签混用；与 async 分支清空语义一致）
+                buffer.clear()
 
     if is_main:
         print(f"训练完成。共 {total_games} 局，最佳权重: {best_path}")
@@ -733,24 +849,25 @@ def main():
 
 
 def _process_game_data(game_data, score, bs, n_actions, buffer, args):
-    """处理一局自对弈数据，加入 buffer。"""
-    n_total = len(game_data)
-    for mc_idx, (planes, vt, player, mc_orig) in enumerate(game_data):
-        # z_soft: 价值标签软化
-        if score > 0:
-            z_raw = 1.0 if player == 1 else -1.0
-        elif score < 0:
-            z_raw = -1.0 if player == 1 else 1.0
-        else:
-            z_raw = 0.0
-        alpha = 0.3 + 0.7 * (mc_idx / max(n_total - 1, 1))
-        z_soft = float(np.tanh(z_raw * alpha))
-        
+    """处理一局自对弈数据（TD 价值标签 + 8 对称增强），加入 buffer。"""
+    td = getattr(args, 'td', 0) == 1
+    td_steps = getattr(args, 'td_steps', 3)
+    td_ai = getattr(args, 'td_alpha_init', 0.2)
+    td_ae = getattr(args, 'td_alpha_end', 0.9)
+    players = np.asarray([row[2] for row in game_data])
+    # 兼容旧 4 元组数据（无 root_value）：缺省 0.0
+    root_values = np.asarray([row[4] if len(row) > 4 else 0.0
+                              for row in game_data])
+    for mc_idx, row in enumerate(game_data):
+        planes, vt = row[0], row[1]
+        z, _z_raw, _alpha = compute_td_target(
+            players, root_values, score, mc_idx,
+            td, td_steps, td_ai, td_ae)
         if args.no_augment == 1:
-            buffer.append((planes, vt, z_soft))
+            buffer.append((planes, vt, z))
         else:
             for pl, tv in augment8(planes, vt, bs):
-                buffer.append((pl, tv, z_soft))
+                buffer.append((pl, tv, z))
 
 
 if __name__ == "__main__":

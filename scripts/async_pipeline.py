@@ -159,7 +159,7 @@ class SelfPlayWorker(Process):
             temperature=self.args.temperature,
             dirichlet_alpha=self.args.dir_alpha if hasattr(self.args, 'dir_alpha') else 0.3,
             dirichlet_eps=self.args.dir_eps if hasattr(self.args, 'dir_eps') else 0.25,
-            spec_prefetch=getattr(self.args, 'spec_prefetch', False),
+            spec_prefetch=bool(getattr(self.args, 'spec_prefetch', False)),
             use_rollout=getattr(self.args, 'use_rollout', False),
             rollout_lambda=getattr(self.args, 'rollout_lambda', 0.25),
             leaf_ab_depth=getattr(self.args, 'leaf_ab_depth', 2),
@@ -187,7 +187,7 @@ class SelfPlayWorker(Process):
                 mc += 1
                 continue
             
-            visits, probs, _rv = mcts.search(
+            visits, probs, root_value = mcts.search(
                 board, hists[0], hists[1], to_play,
                 simulations=self.args.sims,
                 path_moves=path_moves
@@ -204,7 +204,7 @@ class SelfPlayWorker(Process):
                 vt[:n_actions - 1] = visits[:n_actions - 1] / vs
                 vt[n_actions - 1] = visits[n_actions - 1] / vs
             
-            data.append((planes, vt, to_play, mc))
+            data.append((planes, vt, to_play, mc, float(root_value)))
             
             # 温度衰减
             progress = min(1.0, mc / max(30, 1))
@@ -312,26 +312,25 @@ class AsyncSelfPlayPipeline:
         return collected
     
     def _process_game_data(self, game_data, score, bs, n_actions):
-        """处理一局游戏数据。"""
-        n_total = len(game_data)
-        for mc_idx, (planes, vt, player, mc_orig) in enumerate(game_data):
-            # z_soft: 价值标签软化
-            if score > 0:
-                z_raw = 1.0 if player == 1 else -1.0
-            elif score < 0:
-                z_raw = -1.0 if player == 1 else 1.0
-            else:
-                z_raw = 0.0
-            alpha = 0.3 + 0.7 * (mc_idx / max(n_total - 1, 1))
-            z_soft = float(np.tanh(z_raw * alpha))
-            
+        """处理一局游戏数据（TD 价值标签 + 8 对称增强，与 selfplay_train 共享逻辑）。"""
+        from scripts.selfplay_train import compute_td_target, augment8
+        td = getattr(self.args, 'td', 0) == 1
+        td_steps = getattr(self.args, 'td_steps', 3)
+        td_ai = getattr(self.args, 'td_alpha_init', 0.2)
+        td_ae = getattr(self.args, 'td_alpha_end', 0.9)
+        players = np.asarray([row[2] for row in game_data])
+        root_values = np.asarray([row[4] if len(row) > 4 else 0.0
+                                  for row in game_data])
+        for mc_idx, row in enumerate(game_data):
+            planes, vt = row[0], row[1]
+            z, _z_raw, _alpha = compute_td_target(
+                players, root_values, score, mc_idx,
+                td, td_steps, td_ai, td_ae)
             if getattr(self.args, 'no_augment', False):
-                self.buffer.append((planes, vt, z_soft))
+                self.buffer.append((planes, vt, z))
             else:
-                # 8 对称增强
-                from scripts.selfplay_train import augment8
                 for pl, tv in augment8(planes, vt, bs):
-                    self.buffer.append((pl, tv, z_soft))
+                    self.buffer.append((pl, tv, z))
     
     def get_batch(self, batch_size):
         """获取一个训练 batch。"""

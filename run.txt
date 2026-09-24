@@ -63,17 +63,17 @@ torchrun --nproc_per_node=1 scripts/train_sft.py \
   --res-blocks 8 --convnext-blocks 4 --attn-blocks 5 \
   --value-channels 96 --value-res-blocks 11 \
   --policy-channels 128 --policy-layers 3 \
-  --batch-size 4800 --epochs 1 \
-  --lr 0.002 --weight-decay 0.0001 \
+  --batch-size 4096 --epochs 1 \
+  --lr 0.00256 --weight-decay 0.0001 \
   --attention-mode mix --num-attention-layers 4 --num-heads 4 \
   --attn-mode window_global --attn-window 5 \
   --attention-dropout 0.1 --label-smoothing 0.1 \
   --gradient-accumulation-steps 1 \
   --use-amp 1 --use-ema 1 \
-  --compile 1 --compile-mode max-autotune \
+  --compile 1 --compile-mode reduce-overhead \
   --flash-attn 1 \
   --prefetch-workers 32 --prefetch-depth 32 \
-  --log-every 50 --eval-every 500 --save-every 500 \
+  --log-every 50 --eval-every 2000 --save-every 1000 \
   --early-stop 1 --early-stop-patience 3 \
   --out models/sft_19x19_v17.pth \
   --export-onnx 1 --use-checkpoint 1 \
@@ -87,17 +87,17 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
   --res-blocks 8 --convnext-blocks 4 --attn-blocks 5 \
   --value-channels 96 --value-res-blocks 11 \
   --policy-channels 128 --policy-layers 3 \
-  --batch-size 3200 --epochs 1 \
-  --lr 0.002 --weight-decay 0.0001 \
+  --batch-size 4096 --epochs 1 \
+  --lr 0.00256 --weight-decay 0.0001 \
   --attention-mode mix --num-attention-layers 4 --num-heads 4 \
   --attn-mode window_global --attn-window 5 \
   --attention-dropout 0.1 --label-smoothing 0.1 \
   --gradient-accumulation-steps 1 \
   --use-amp 1 --use-ema 1 \
-  --compile 1 --compile-mode max-autotune \
+  --compile 1 --compile-mode reduce-overhead \
   --flash-attn 1 \
   --prefetch-workers 32 --prefetch-depth 32 \
-  --log-every 50 --eval-every 500 --save-every 500 \
+  --log-every 50 --eval-every 2000 --save-every 1000 \
   --early-stop 1 --early-stop-patience 3 \
   --out models/sft_19x19_v17.pth \
   --export-onnx 1 --use-checkpoint 1 \
@@ -109,6 +109,9 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
 # ============================================================
 # ③ RL 自对弈训练（1卡 NPU + 8进程 CPU）
 # ============================================================
+# 注意：--td 默认 1（TD C+E 价值标签，--td 0 为旧 tanh 软化基线）；
+#       --batch-size 默认 256（NPU 甜点，显存 ~2-3x 旧 64）；
+#       --spec-prefetch 默认 1（worker 推测预评估）。
 # 标准模式：8进程并行
 python scripts/selfplay_train.py \
   --board-size 19 --iters 20 --sims 48 \
@@ -117,6 +120,7 @@ python scripts/selfplay_train.py \
   --onnx-model models/sft_19x19_v17.onnx \
   --batch-cap 64 \
   --expand-topk 16 \
+  --td 1 \
   --buffer-size 500 \
   --use-rollout 1 --leaf-ab-depth 2 \
   --c-puct 2.0 --virtual-loss 8.0 \
@@ -131,6 +135,7 @@ python scripts/selfplay_train.py \
   --mcts-threads 3 \
   --onnx-model models/sft_19x19_v17.onnx \
   --batch-cap 64 \
+  --td 1 \
   --games-per-iter 20 \
   --model models/sft_19x19_v17.pth \
   --out models/az_best.pth

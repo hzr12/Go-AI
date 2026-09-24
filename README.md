@@ -462,6 +462,7 @@ python scripts/evaluate.py --model models/sft_19x19.pth --board-size 19 \
 - **数据标签**：MCTS visit 分布 → policy 标签；终局胜负 → value 标签
 - **探索**：根先验混 Dirichlet 噪声 + 温度采样
 - **价值软化**：按手数位置 tanh 软化（开局弱信号、终局强信号），z = tanh(z_raw × α)，α∈[0.3, 1.0]
+- **TD 学习（C+E 混合，`--td 1` 默认开启）**：v_td = sign·root_values[t+td_steps]（sign 按执子方奇偶，越界回退终局值），z = clip(α_td·v_td + (1-α_td)·r_soft, -1, 1)，α_td 从 `--td-alpha-init`（0.2）线性升到 `--td-alpha-end`（0.9）；`--td 0` 时逐位退回旧 tanh 软化（回归保证）
 
 ### 50GB 磁盘约束优化
 
@@ -509,7 +510,13 @@ torchrun --nproc_per_node=4 scripts/selfplay_train.py \
 | `--async-pipeline` | `0` | 异步流水线（生成与训练并行，0=关闭, 1=开启）|
 | `--swanlab` | `0` | 启用 SwanLab 实验跟踪 |
 | `--c2net` | `0` | 启用 C2NET（OpenI 启智平台）支持 |
-| `--ver` | `v17` | 模型版本号 |
+| `--ver` | `rl` | 模型版本号（SwanLab name 后缀）|
+| `--td` | `1` | TD (C+E) 价值标签（0=旧 tanh 软化, 1=开启）|
+| `--td-steps` | `3` | TD n-step 前看步数（数据下标空间）|
+| `--td-alpha-init` | `0.2` | TD α 调度初值（开局偏 r_soft）|
+| `--td-alpha-end` | `0.9` | TD α 调度终值（残局偏 v_td）|
+| `--batch-size` | `256` | 训练 batch（NPU 甜点）|
+| `--spec-prefetch` | `1` | worker 推测预评估（0=关闭, 1=开启）|
 
 ---
 

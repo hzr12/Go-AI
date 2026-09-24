@@ -638,6 +638,18 @@ def main():
                     help='启用 C2NET (OpenI 启智平台) 支持 (0=关闭, 1=开启)')
     args = ap.parse_args()
 
+    # ---- 分布式训练环境变量（由 torchrun / mp.spawn 注入）----
+    # RANK/WORLD_SIZE/LOCAL_RANK 同时存在且 WORLD_SIZE>1 时进入 DDP 模式。
+    # B1: rank/is_main/logger 必须在 C2NET 初始化前求值——下方 c2net 分支
+    # 会用 is_main 过滤打印、用 logger 输出。
+    rank = int(os.environ.get('RANK', '0'))
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+    is_dist = world_size > 1
+    is_main = (rank == 0)
+    log_file = args.log_file if args.log_file else None
+    logger = setup_logging(log_file, rank=rank)
+
     # ---- C2NET 支持（OpenI 启智平台）----
     _c2net_ctx = None
     if args.c2net == 1:
@@ -659,17 +671,6 @@ def main():
             if is_main:
                 logger.warning("[c2net] c2net 未安装，--c2net 已忽略")
 
-    # ---- 分布式训练环境变量（由 torchrun / mp.spawn 注入）----
-    # RANK/WORLD_SIZE/LOCAL_RANK 同时存在且 WORLD_SIZE>1 时进入 DDP 模式。
-    rank = int(os.environ.get('RANK', '0'))
-    world_size = int(os.environ.get('WORLD_SIZE', '1'))
-    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
-    is_dist = world_size > 1
-    is_main = (rank == 0)
-
-    # 配置日志（控制台 + 文件），统一用 logger 输出便于事后排查
-    log_file = args.log_file if args.log_file else None
-    logger = setup_logging(log_file, rank=rank)
     logger.info("=" * 60)
     _check_training_env(logger)
     logger.info("=" * 60)
@@ -694,14 +695,15 @@ def main():
     swanlab_logger = None
     if use_swanlab and is_main:
         try:
-            import swanlab
-        except ImportError:
-            logger.info("[swanlab] 未安装，正在自动安装...")
-            import subprocess
-            subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'swanlab', '-q'])
-            import swanlab
-            logger.info("[swanlab] 安装完成")
-        # 登录：优先用 --swanlab-api-key，其次环境变量，最后交互式
+            try:
+                import swanlab
+            except ImportError:
+                logger.info("[swanlab] 未安装，正在自动安装...")
+                import subprocess
+                subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'swanlab', '-q'])
+                import swanlab
+                logger.info("[swanlab] 安装完成")
+            # 登录：优先用 --swanlab-api-key，其次环境变量，最后交互式
             api_key = args.swanlab_api_key or os.environ.get('SWANLAB_API_KEY')
             if api_key:
                 swanlab.login(api_key=api_key, save=True)
@@ -724,6 +726,7 @@ def main():
                     "epochs": args.epochs,
                 },
             )
+            swanlab_logger = swanlab
             logger.info("[swanlab] 实验跟踪已启用")
         except Exception as e:
             logger.warning("[swanlab] 初始化失败: %s", e)
@@ -954,15 +957,24 @@ def main():
     other_no_decay = [p for n, p in model.named_parameters()
                       if 'value' not in n and n in no_decay_params]
 
-    optimizer = torch.optim.AdamW([
+    _opt_groups = [
         {'params': other_decay, 'lr': args.lr,
          'weight_decay': args.weight_decay},
         {'params': other_no_decay, 'lr': args.lr, 'weight_decay': 0.0},
         {'params': value_decay, 'lr': args.lr * args.value_lr_mult,
          'weight_decay': args.weight_decay},
-        {'params': value_no_decay, 'lr': args.lr * args.value_lr_mult,
-         'weight_decay': 0.0},
-    ])
+        {'params': value_no_decay, 'lr': args.lr * args.value_lr_mult, 'weight_decay': 0.0},
+    ]
+    # A1: CUDA(A100) 启用 fused AdamW（单 kernel 融合 param 更新，省启动开销）；
+    # NPU/CPU 走默认实现（910A 不支持 fused）
+    if _backend == 'cuda':
+        try:
+            optimizer = torch.optim.AdamW(_opt_groups, fused=True)
+            logger.info("[train] 已启用 fused AdamW (CUDA)")
+        except (TypeError, RuntimeError):
+            optimizer = torch.optim.AdamW(_opt_groups)
+    else:
+        optimizer = torch.optim.AdamW(_opt_groups)
     # BF16 后端（A100/NPU）下 use_scaler=False（BF16 不下溢，省去 loss scaling 的额外同步）；
     # V100/FP16 下开启 GradScaler。按设备选择 GradScaler 实现。
     if _backend == 'npu':
@@ -1165,19 +1177,24 @@ def main():
                     states_np, moves_np, values_np = pf.next()
                     if _backend == 'cuda':
                         # pin_memory 需要 contiguous 且为 CPU 内存
-                        states_np = np.ascontiguousarray(states_np)
                         moves_np = np.ascontiguousarray(moves_np)
                         values_np = np.ascontiguousarray(values_np)
-                        # 先创建 CPU tensor，再 pin_memory
-                        state = torch.from_numpy(states_np).float().pin_memory()
+                        if use_channels_last:
+                            # A3: NHWC 物理布局——numpy 端一次性转置（比 torch
+                            # .to(memory_format) 的主线程重排 memcpy 快），permute
+                            # 得 channels_last 视图；pin 后异步 H2D，免每 step 重排
+                            state = (torch.from_numpy(np.ascontiguousarray(
+                                        states_np.transpose(0, 2, 3, 1)))
+                                     .float().pin_memory().permute(0, 3, 1, 2))
+                        else:
+                            states_np = np.ascontiguousarray(states_np)
+                            state = torch.from_numpy(states_np).float().pin_memory()
                         move_t = torch.from_numpy(moves_np).long().pin_memory()
                         value_t = torch.from_numpy(values_np).float().pin_memory()
                     else:
                         state = torch.from_numpy(states_np.copy())
                         move_t = torch.from_numpy(moves_np.copy())
                         value_t = torch.from_numpy(values_np.copy())
-                    if use_channels_last:
-                        state = state.to(memory_format=torch.channels_last)
                     state = state.to(device, non_blocking=True)
                     move_t = move_t.to(device, non_blocking=True)
                     value_t = value_t.to(device, non_blocking=True)
