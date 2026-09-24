@@ -166,7 +166,8 @@ class SelfPlayWorker(Process):
             c_puct=getattr(self.args, 'c_puct', 2.0),
             virtual_loss=getattr(self.args, 'virtual_loss', 8.0),
             dynamic_topk=getattr(self.args, 'dynamic_topk', True),
-            dynamic_virtual_loss=getattr(self.args, 'dynamic_virtual_loss', True)
+            dynamic_virtual_loss=getattr(self.args, 'dynamic_virtual_loss', True),
+            vector_backup=getattr(self.args, 'mcts_vector_backup', 1) == 1
         )
         
         board = GoBoard(self.args.board_size)

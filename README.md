@@ -517,6 +517,26 @@ torchrun --nproc_per_node=4 scripts/selfplay_train.py \
 | `--td-alpha-end` | `0.9` | TD α 调度终值（残局偏 v_td）|
 | `--batch-size` | `256` | 训练 batch（NPU 甜点）|
 | `--spec-prefetch` | `1` | worker 推测预评估（0=关闭, 1=开启）|
+| `--grad-accum-steps` | `1` | 梯度累积 micro-batch 数（1=每批即更新，保持现状；>1 时等效 batch×N、step÷N，建议同时把 `--lr` 调高 1.4~2 倍）|
+| `--mcts-vector-backup` | `1` | MCTS 回传 visit/value_sum 走 numpy 批量更新（1=默认，与逐层循环数值等价；0=回退原实现）|
+
+### 11.1 新一轮训练加速（三项，不触碰数据集）
+
+以下三项只改训练循环与 MCTS 回传，**不改** `src/data/dataset.py` /
+`src/game/go_rules.py` 特征与增强路径，因此自对弈数据生成速度不受影响。
+
+1. **梯度累积 `--grad-accum-steps`**（默认 `1` = 现状）
+   摊薄 NPU/CUDA 的优化器步与 kernel 启动开销。`>1` 时每 N 个 micro-batch 才
+   `opt.step()`，等效 batch 变大、优化步数变少，loss 曲线右移但更平滑；
+   建议同步把 `--lr` 调高 1.4~2 倍以补偿。尾部不足一个累积周期的梯度被丢弃。
+2. **双缓冲 H2D 预取**（CUDA 自动启用，NPU/CPU 走原路径）
+   训练循环预分配两个 pinned 槽交替填充，上一批异步搬运与本批 CPU 侧构造重叠。
+   纯搬运时机优化，数值不变；`pin_memory` 仍仅 CUDA 开启（NPU 直传）。
+3. **MCTS 回传向量化 `--mcts-vector-backup`**（默认 `1`）
+   `_backup` 的 `visit += 1` / `value_sum += ±v` 由逐层 Python 循环改为 numpy
+   批量（符号按深度交替，数值与原实现完全等价）。MCTS-Solver 的 `proved ±1`
+   传播与 `virtual_loss` 回收仍在 Python（正确性敏感），`_select` 未改动。
+   `--mcts-vector-backup 0` 可随时回退原逐层实现。
 
 ---
 

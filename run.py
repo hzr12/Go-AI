@@ -86,6 +86,8 @@ def run_selfplay(argv=None):
         '--c-puct', '2.0',
         '--virtual-loss', '8.0',
         '--td', '1',
+        '--grad-accum-steps', '1',
+        '--mcts-vector-backup', '1',
         '--model', 'models/sft_19x19_v17.pth',
         '--out', 'models/az_best.pth',
         '--swanlab', '0',

@@ -111,7 +111,10 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
 # ============================================================
 # 注意：--td 默认 1（TD C+E 价值标签，--td 0 为旧 tanh 软化基线）；
 #       --batch-size 默认 256（NPU 甜点，显存 ~2-3x 旧 64）；
-#       --spec-prefetch 默认 1（worker 推测预评估）。
+#       --spec-prefetch 默认 1（worker 推测预评估）；
+#       --mcts-vector-backup 默认 1（MCTS 回传 numpy 批量，数值等价原实现）。
+# 提速选项：--grad-accum-steps 4（梯度累积，等效 batch×4、step÷4，
+#            启用时建议同时 --lr 0.0015 ~ 0.002）；默认 1 保持现状。
 # 标准模式：8进程并行
 python scripts/selfplay_train.py \
   --board-size 19 --iters 20 --sims 48 \

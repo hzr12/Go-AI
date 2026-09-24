@@ -69,7 +69,7 @@ class MCTS:
                  leaf_ab_uncertain=0.85, priors_leaf=False,
                  dirichlet_alpha=0.0, dirichlet_eps=0.0,
                  dynamic_topk=True, dynamic_virtual_loss=True,
-                 policy_pruning_thresh=0.01):
+                 policy_pruning_thresh=0.01, vector_backup=True):
         """
         Args:
             ai:            GoAI 实例（需支持 predict_batch）
@@ -100,7 +100,9 @@ class MCTS:
             priors_leaf: 子节点先验改用叶子自身 policy 在该着法上的值（标准
                 AlphaZero 方案）。默认 False=沿用旧方案（子局面自身 policy 在
                 同一着法上的值，非标准、少模拟时偏离策略网络）；True 时少量
-                模拟的 visits 分布更贴近策略网络（策略+少量MCTS 的基础）。
+                 模拟的 visits 分布更贴近策略网络（策略+少量MCTS 的基础）。
+            vector_backup: _backup 的 visit/value_sum 批量更新（numpy）路径。
+                True=向量化（默认，数值与原逐层循环等价）；False=原逐层循环。
         """
         self.ai = ai
         self.bs = board_size
@@ -143,6 +145,7 @@ class MCTS:
         self.dynamic_topk = dynamic_topk
         self.dynamic_virtual_loss = dynamic_virtual_loss
         self.policy_pruning_thresh = policy_pruning_thresh
+        self.vector_backup = bool(vector_backup)
         self._current_sim = 0  # 当前模拟计数（用于动态调整）
 
     # ------------------------------------------------------------------ #
@@ -734,15 +737,43 @@ class MCTS:
             网络评估设置（visit=1），此处只更新祖先并逐层清虚拟损失。
         """
         v = v_leaf if v_leaf is not None else 0.0
+        if self.vector_backup and len(path) > 1:
+            # G2: visit / value_sum 批量更新——数值与下方逐层循环完全等价
+            # （符号按深度交替翻转），proven 传播与 virtual_loss 回收仍走 Python。
+            n_upd = len(path) - 1  # 叶子 visit 已由 _expand 设置，不在此更新
+            # 原循环自最深向根推进，每层 v 先取反再 `value_sum += -v`，故自根向
+            # 叶（path[0..n_upd-1]）的增量符号为 -v, +v, -v, +v … 即按 (n_upd-1-i)
+            # 奇偶决定：n_upd-1-i 为偶 → +v。
+            signs = np.where((n_upd - 1 - np.arange(n_upd)) % 2 == 0,
+                             1.0, -1.0).astype(np.float64)
+            deltas = signs * v
+            base_v = np.asarray([path[i].value_sum for i in range(n_upd)],
+                                dtype=np.float64)
+            np.add(base_v, deltas, out=base_v)
+            for i in range(n_upd):
+                path[i].value_sum = float(base_v[i])
+                path[i].visit += 1
+        else:
+            for idx in range(len(path) - 1, -1, -1):
+                node = path[idx]
+                if idx != len(path) - 1:
+                    v = -v                    # 逐层翻转视角（父节点=对手）
+                    node.visit += 1
+                    node.value_sum += -v      # value_sum 存对手视角，q() 取负即我方
+                    # MCTS-Solver 证明回传：
+                    #   子节点 proven loss（其 to_play 必败）→ 本方有必胜着 → 本节点 proven win
+                    #   本节点全部子节点均 proven win（对手到哪都赢）→ 本节点 proven loss
+                    if node.proved == 0:
+                        if path[idx + 1].proved == -1:
+                            node.proved = 1
+                        elif node.children and all(
+                                c.proved == 1 for c in node.children.values()):
+                            node.proved = -1
+                node.virtual_loss = 0
+            return
         for idx in range(len(path) - 1, -1, -1):
             node = path[idx]
             if idx != len(path) - 1:
-                v = -v                    # 逐层翻转视角（父节点=对手）
-                node.visit += 1
-                node.value_sum += -v      # value_sum 存对手视角，q() 取负即我方
-                # MCTS-Solver 证明回传：
-                #   子节点 proven loss（其 to_play 必败）→ 本方有必胜着 → 本节点 proven win
-                #   本节点全部子节点均 proven win（对手到哪都赢）→ 本节点 proven loss
                 if node.proved == 0:
                     if path[idx + 1].proved == -1:
                         node.proved = 1

@@ -147,7 +147,7 @@ def self_play_game(ai, board_size, sims, max_moves, temperature,
                    use_rollout=False, rollout_lambda=0.25, rollout_steps=None,
                    leaf_ab_depth=0, c_puct=2.0, virtual_loss=8.0,
                    num_threads=8, spec_prefetch=False,
-                   use_diverse_rollout=False):
+                   use_diverse_rollout=False, vector_backup=True):
     """一局自对弈。返回 [(planes, visit_target, player, mc, root_value), ...], score(黑-白)。
 
     root_value: 该步 MCTS 根节点价值（当前 to_play 视角, [-1,1]，见 mcts.search 返回
@@ -161,7 +161,8 @@ def self_play_game(ai, board_size, sims, max_moves, temperature,
                 use_rollout=use_rollout, rollout_lambda=rollout_lambda,
                 rollout_steps=rollout_steps,
                 leaf_ab_depth=leaf_ab_depth,
-                c_puct=c_puct, virtual_loss=virtual_loss)
+                c_puct=c_puct, virtual_loss=virtual_loss,
+                vector_backup=vector_backup)
     
     # 创建 rollout 策略（支持多样化）
     rollout_policy = _get_rollout_policy(use_diverse_rollout, board_size)
@@ -322,7 +323,8 @@ def _selfplay_worker(gid, model_path, args, result_queue):
         virtual_loss=getattr(args, 'virtual_loss', 8.0),
         num_threads=getattr(args, 'mcts_threads', 3),  # 使用新的参数名
         spec_prefetch=getattr(args, 'spec_prefetch', False),
-        use_diverse_rollout=getattr(args, 'use_diverse_rollout', False)
+        use_diverse_rollout=getattr(args, 'use_diverse_rollout', False),
+        vector_backup=getattr(args, 'mcts_vector_backup', 1) == 1
     )
     result_queue.put({'gid': gid, 'data': game_data, 'score': score})
 
@@ -384,7 +386,9 @@ def train_epochs(ai, buffer, args, device):
 
     # Cosine LR Schedule with Warmup（每轮按 buffer 重建）
     n = len(buffer)
-    steps_per_epoch = max(1, n // args.batch_size)
+    # 梯度累积：accum 个 micro-batch 才做一次 opt.step，有效 step 数相应变少
+    accum = max(1, int(getattr(args, 'grad_accum_steps', 1) or 1))
+    steps_per_epoch = max(1, n // (args.batch_size * accum))
     total_steps = steps_per_epoch * args.epochs
     warmup_steps = max(1, int(total_steps * 0.10))
     after_warmup = max(1, total_steps - warmup_steps)
@@ -401,25 +405,63 @@ def train_epochs(ai, buffer, args, device):
     # N4: pin_memory 仅 CUDA（NPU 直传，对齐 train_sft 的 cuda-only pin 策略）
     pin_mem = device_prefix == 'cuda'
 
+    # G1: 双缓冲 H2D —— 两个预分配 pinned 槽交替使用：槽 A 异步搬运到 device 期间，
+    # CPU 侧填充槽 B。覆写某槽前**无条件**等待该槽自己的 CUDA Event——它是「本槽
+    # H2D 拷贝已完成」的唯一可靠信号。
+    #   · 不能用 current_stream().synchronize()：那会连同计算一起等，重叠收益归零；
+    #   · 不能用「计算是否已消费」之类的标志短路：device 张量被 forward/backward
+    #     读完后，pinned 源的 H2D 拷贝仍可能在途，短路会导致覆写仍在搬运的源缓冲。
+    # 仅动训练循环的数据搬运，不触碰 self-play 数据生成 / 数据集。
+    _bs = min(args.batch_size, n) if n > 0 else 0
+    _slots = []
+    if pin_mem and _bs > 0:
+        _n = int(np.asarray(buffer[0][0]).shape[-1])
+        _acts = int(np.asarray(buffer[0][1]).shape[0])
+        for _k in range(2):
+            _ev = torch.cuda.Event()
+            _ev.record()   # 显式置为已完成，首次复用该槽时等待立即返回
+            _slots.append((
+                torch.empty((_bs, 12, _n, _n), dtype=torch.float32, pin_memory=True),
+                torch.empty((_bs, _acts), dtype=torch.float32, pin_memory=True),
+                torch.empty((_bs, 1), dtype=torch.float32, pin_memory=True),
+                _ev,
+            ))
+    _slot_i = 0
+
+    accum_counter = 0
     for _ in range(args.epochs):
-        for _ in range(steps_per_epoch):
+        opt.zero_grad()  # 每轮开始清零（原先每 batch 清零，会丢弃首 batch 梯度）
+        for _ in range(steps_per_epoch * accum):
             idx = np.random.randint(0, n, size=min(args.batch_size, n))
             batch = [buffer[i] for i in idx]
             batch = [b for b in batch if b is not None]
             if not batch:
                 continue
-            planes = torch.from_numpy(np.stack([b[0] for b in batch])).float()
-            pi_t = torch.from_numpy(np.stack([b[1] for b in batch])).float()
-            z = torch.from_numpy(np.stack([b[2] for b in batch])).float().unsqueeze(1)
 
-            if pin_mem:
-                planes = planes.pin_memory()
-                pi_t = pi_t.pin_memory()
-                z = z.pin_memory()
-
-            planes = planes.to(device, non_blocking=pin_mem)
-            pi_t = pi_t.to(device, non_blocking=pin_mem)
-            z = z.to(device, non_blocking=pin_mem)
+            if _slots:
+                m = len(batch)
+                sp, spi, sz, ev = _slots[_slot_i]
+                ev.synchronize()   # 只等本槽 H2D，不阻塞计算
+                torch.from_numpy(np.stack([b[0] for b in batch])).copy_(sp[:m])
+                torch.from_numpy(np.stack([b[1] for b in batch])).copy_(spi[:m])
+                torch.from_numpy(np.stack([b[2] for b in batch])
+                                .reshape(m, 1)).copy_(sz[:m])
+                planes = sp[:m].to(device, non_blocking=True)
+                pi_t = spi[:m].to(device, non_blocking=True)
+                z = sz[:m].to(device, non_blocking=True)
+                ev.record()
+                _slot_i ^= 1
+            else:
+                planes = torch.from_numpy(np.stack([b[0] for b in batch])).float()
+                pi_t = torch.from_numpy(np.stack([b[1] for b in batch])).float()
+                z = torch.from_numpy(np.stack([b[2] for b in batch])).float().unsqueeze(1)
+                if pin_mem:
+                    planes = planes.pin_memory()
+                    pi_t = pi_t.pin_memory()
+                    z = z.pin_memory()
+                planes = planes.to(device, non_blocking=pin_mem)
+                pi_t = pi_t.to(device, non_blocking=pin_mem)
+                z = z.to(device, non_blocking=pin_mem)
 
             with maybe_autocast(device):
                 policy, value = model(planes)
@@ -427,25 +469,38 @@ def train_epochs(ai, buffer, args, device):
                 loss_pi = -(pi_t * logq).sum(dim=1).mean()
                 value_target = (z.squeeze(-1) + 1) / 2
                 loss_v = F.binary_cross_entropy_with_logits(value.squeeze(-1), value_target)
-                loss = loss_pi + loss_v
+                loss_raw = loss_pi + loss_v
 
-            opt.zero_grad()
+            # 梯度累积：仅 backward，累积满 accum 才 step
+            loss = loss_raw / accum if accum > 1 else loss_raw
             if scaler is not None:
                 scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            accum_counter += 1
+            if accum_counter < accum:
+                continue
+
+            accum_counter = 0
+            if scaler is not None:
                 if args.clip_grad > 0:
                     scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                 scaler.step(opt)
                 scaler.update()
             else:
-                loss.backward()
                 if args.clip_grad > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                 opt.step()
             scheduler.step()
             if ema is not None:
                 ema.update()
-            losses.append(loss.item())
+            losses.append(float(loss_raw.item()))
+
+    # 尾部不足一个累积周期的残留梯度：丢弃（不 step），避免半成品梯度污染权重
+    if accum_counter > 0:
+        opt.zero_grad()
 
     # eval 时用 EMA 权重
     if ema is not None:
@@ -530,6 +585,9 @@ def main():
     ap.add_argument("--use-ema", type=int, default=0, choices=[0, 1],
                     help="启用 EMA 权重 (0=关闭, 1=开启)")
     ap.add_argument("--clip-grad", type=float, default=1.0, help="梯度裁剪范数（0=关闭）")
+    ap.add_argument("--grad-accum-steps", type=int, default=1,
+                    help="梯度累积 micro-batch 数（1=每批即更新，默认 1 保持现状；"
+                         ">1 时等效 batch×N、step÷N，建议同时把 --lr 调高 1.4~2 倍）")
     ap.add_argument("--out", type=str, default="models/az", help="权重输出路径")
     ap.add_argument("--save-every", type=int, default=1, help="每隔几轮保存最佳权重")
     
@@ -542,6 +600,9 @@ def main():
                     help="ONNX 模型路径（CPU 推理加速 3-5x）")
     ap.add_argument("--batch-cap", type=int, default=64,
                     help="MCTS 批量展开上限（默认 64）")
+    ap.add_argument("--mcts-vector-backup", type=int, default=1, choices=[0, 1],
+                    help="MCTS 回传 visit/value_sum 走 numpy 批量更新"
+                         "(1=默认，与逐层循环数值等价；0=回退原实现)")
     
     # 异步流水线
     ap.add_argument("--async-pipeline", type=int, default=0, choices=[0, 1],
@@ -782,7 +843,8 @@ def main():
                         virtual_loss=args.virtual_loss,
                         num_threads=getattr(args, 'mcts_threads', 3),
                         spec_prefetch=args.spec_prefetch == 1,
-                        use_diverse_rollout=args.use_diverse_rollout == 1)
+                        use_diverse_rollout=args.use_diverse_rollout == 1,
+                        vector_backup=args.mcts_vector_backup == 1)
                     _process_game_data(game_data, score, bs, n_actions, buffer, args)
                     total_games += 1
                     if is_main:
