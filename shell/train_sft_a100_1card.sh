@@ -24,8 +24,8 @@ python -m pip install swanlab -q || \
 WORLD_SIZE=1
 BATCH=3500            # 实测 3500 可跑（40G）
 LR=0.00421            # 0.00356 × √(3500/2500)，平方根缩放律
-PREFETCH_W=32
-PREFETCH_D=32
+PREFETCH_W=24         # 预取进程数（单卡即全部）。24 核机器留 0 余量刚好铺满。
+PREFETCH_D=16         # 在途 batch 数；每个约 58MB(float32 12x19x19xB)，16→约0.9GB
 DATA=data/sgf_19x19_full.npz
 OUT=models/sft_19x19_v18.pth
 C2NET=1               # 1=启用 OpenI 启智平台对接；平台已自带数据/输出时改 0

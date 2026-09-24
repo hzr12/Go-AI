@@ -28,8 +28,8 @@ python -m pip install swanlab -q || \
 WORLD_SIZE=2
 BATCH=3200            # 每卡 3200 × 2 卡 = 有效 6400
 LR=0.00570            # 按有效 batch 6400 标定：0.00356×√(6400/2500)
-PREFETCH_W=16         # 每 rank 各自起 PREFETCH_W 个子进程，2 卡共 32 个
-PREFETCH_D=16
+PREFETCH_W=12         # 每 rank 12 个，2 卡合计 24（对齐 24 核，避免进程超订）
+PREFETCH_D=16         # 在途 batch 数；每个约 53MB(B=3200)，16→约0.85GB/rank
 DATA=data/sgf_19x19_full.npz
 OUT=models/sft_19x19_v18_npu2.pth
 C2NET=1               # 1=启用 OpenI 启智平台对接；平台已自带数据/输出时改 0

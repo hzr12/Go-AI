@@ -345,6 +345,45 @@ def test_sft_scripts_enable_c2net():
         assert m, f"{f} 缺少 --c2net \"$C2NET\""
 
 
+# --------------------------------------------------------------------------- #
+# 预取进程总数：按 rank 摊薄，避免 24 核上超订
+# --------------------------------------------------------------------------- #
+@pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
+def test_total_prefetch_workers_fit_machine_cores():
+    """所有 rank 的预取进程总数不得超过 32（机器 24 核，留少量余量）。
+
+    --prefetch-workers 是**每个 rank** 各起这么多进程。4 卡 × 32 = 128 个数据
+    构造进程挤 24 核会造成严重上下文切换、反而拖慢训练。注意这与内存无关：
+    数据集为 int8 紧凑存储（391 B/样本，34.2M 样本 ≈ 12.5 GB/rank），
+    4 卡合计约 56 GB，相对 1024 GB 机器并不吃紧——瓶颈是 CPU 超订。
+    """
+    sft = [f for f in _existing_sh() if f.startswith('train_sft')]
+    assert sft, '未找到 SFT 脚本'
+    for f in sft:
+        txt = open(os.path.join(SHELL_DIR, f), encoding='utf-8').read()
+        env = _sft_env(txt)
+        pw = int(re.search(r'(?m)^PREFETCH_W=(\d+)', txt).group(1))
+        total = int(env['WORLD_SIZE']) * pw
+        assert total <= 32, \
+            f"{f}: 预取进程总数 = WORLD_SIZE({env['WORLD_SIZE']}) x PREFETCH_W({pw}) " \
+            f"= {total}，超过 24 核机器的合理上限 32"
+
+
+@pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
+def test_prefetch_depth_reasonable():
+    """--prefetch-depth 决定在途 batch 数（内存），不宜过大。
+
+    每个在途 batch 是 float32 12×19×19×B（B=3200 时约 53 MB），depth=32 即
+    1.65 GB/rank。depth>16 收益递减（流水线早已覆盖一步计算），徒增内存。
+    """
+    sft = [f for f in _existing_sh() if f.startswith('train_sft')]
+    for f in sft:
+        txt = open(os.path.join(SHELL_DIR, f), encoding='utf-8').read()
+        d = int(re.search(r'(?m)^PREFETCH_D=(\d+)', txt).group(1))
+        assert d <= 16, f"{f} PREFETCH_D={d} 过大（在途 batch 内存线性增长）"
+        assert d >= 2, f"{f} PREFETCH_D={d} 过小，预取失去意义"
+
+
 @pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
 def test_sft_scripts_c2net_flag_is_zero_or_one():
     """C2NET 必须是 0/1 开关（train_sft.py 的 --c2net 是 type=int choices=[0,1]）。

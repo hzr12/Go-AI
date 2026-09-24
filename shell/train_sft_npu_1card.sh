@@ -21,8 +21,8 @@ python -m pip install swanlab -q || \
 WORLD_SIZE=1
 BATCH=3200            # 910A 实测可用；有效 batch = BATCH × WORLD_SIZE
 LR=0.00403            # 0.00356 × √(3200/2500)，平方根缩放律
-PREFETCH_W=32
-PREFETCH_D=32
+PREFETCH_W=24         # 预取进程数（单卡即全部），24 核机器铺满
+PREFETCH_D=16         # 在途 batch 数；每个约 53MB(B=3200)，16→约0.85GB
 DATA=data/sgf_19x19_full.npz
 OUT=models/sft_19x19_v18_npu1.pth
 C2NET=1               # 1=启用 OpenI 启智平台对接；平台已自带数据/输出时改 0
