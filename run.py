@@ -7,12 +7,73 @@
     python run.py selfplay         # 运行自对弈训练
     python run.py sft --epochs 2   # 覆盖参数
     python run.py sft --help       # 查看 SFT 帮助
+    python run.py --sh shell/train_npu_2card.sh --epochs 3   # 运行 shell 脚本
+
+--sh 说明（云端平台适配）:
+    平台只接受 `--参数名 参数值`、不能设环境变量、启动文件必须是 .py。
+    因此多卡不用 `torchrun run.py ...`，而是把整条训练命令（含 torchrun）
+    放进 shell/*.sh，再由本入口以 `--sh <路径>` 拉起——入口仍是 .py、参数仍是
+    `--名 值`，bash 由 run.py 内部调用。脚本末尾的 "$@" 会让追加参数覆盖默认值。
 """
+import subprocess
+import shutil
 import sys
 import os
 
 # 确保项目根目录在 path 中
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT)
+
+
+def _list_shell_scripts():
+    """列出仓库内可用的 shell 脚本（相对仓库根的路径）。"""
+    d = os.path.join(ROOT, 'shell')
+    if not os.path.isdir(d):
+        return []
+    return sorted('shell/' + f for f in os.listdir(d) if f.endswith('.sh'))
+
+
+def run_sh(argv=None):
+    """运行 shell 脚本，并把后续参数原样透传给脚本。
+
+    - 不捕获 stdout/stderr：训练日志实时可见（依赖这个行为）
+    - 退出码原样传出，供 CI/平台感知失败
+    - 脚本路径相对仓库根解析，cwd 固定为仓库根（相对数据路径处处一致）
+    """
+    argv = list(argv or [])
+    if not argv:
+        print(__doc__.strip())
+        print("\n用法: python run.py --sh shell/<脚本>.sh [传给脚本的参数...]")
+        sys.exit(1)
+
+    script = argv[0]
+    passthrough = argv[1:]
+    spath = script if os.path.isabs(script) else os.path.join(ROOT, script)
+    spath = os.path.normpath(spath)
+
+    if not os.path.isfile(spath):
+        print(f"[run] 找不到脚本: {script}")
+        avail = _list_shell_scripts()
+        if avail:
+            print("[run] 可用脚本（用 python run.py --sh <路径> 调用）:")
+            for a in avail:
+                print("   ", a)
+        else:
+            print("[run] shell/ 目录下暂无 .sh 脚本")
+        sys.exit(1)
+
+    bash = shutil.which('bash') or shutil.which('sh')
+    if not bash:
+        print("[run] 未找到 bash/sh，无法执行 .sh 脚本。")
+        print("[run] Windows 可安装 Git Bash；或直接用 python run.py sft <参数>。")
+        sys.exit(1)
+
+    shown = ' '.join(passthrough) if passthrough else '(无额外参数)'
+    # 注意：这里刻意显示用户传入的原路径，而不是 relpath(spath, ROOT)——
+    # 传入绝对路径且位于另一个盘符时，Windows 的 relpath 会抛 ValueError。
+    print(f"[run] 执行 {script}  透传: {shown}", flush=True)
+    proc = subprocess.run([bash, spath] + passthrough, cwd=ROOT)
+    sys.exit(proc.returncode)
 
 
 def run_sft(argv=None):
@@ -100,20 +161,40 @@ def run_selfplay(argv=None):
     main()
 
 
+COMMANDS = {
+    'sft': run_sft,
+    'selfplay': run_selfplay,
+    'sp': run_selfplay,
+    'sh': run_sh,
+    'shell': run_sh,
+}
+
+
 def main():
     """入口：根据子命令路由到对应训练脚本。"""
-    commands = {
-        'sft': run_sft,
-        'selfplay': run_selfplay,
-        'sp': run_selfplay,
-    }
+    commands = COMMANDS
 
     if len(sys.argv) < 2 or sys.argv[1] in ('--help', '-h', 'help'):
         print(__doc__.strip())
-        print("\n可用命令: sft, selfplay (或 sp)")
+        print("\n可用命令: sft, selfplay (或 sp), sh")
         sys.exit(0)
 
-    cmd = sys.argv[1]
+    # --sh <路径> [透传参数...] / --sh=<路径> [透传参数...]
+    # 必须放在子命令校验之前：否则 "--sh" 会落进"未知命令"分支。
+    a1 = sys.argv[1]
+    if a1 == '--sh' or a1.startswith('--sh='):
+        rest = sys.argv[2:]
+        if a1.startswith('--sh='):
+            # 等号写法：脚本路径就是 a1 去掉 "--sh=" 后的部分
+            if not a1[len('--sh='):]:
+                print("[run] --sh= 需要给出脚本路径")
+                sys.exit(1)
+            run_sh([a1[len('--sh='):]] + rest)
+        else:
+            run_sh(rest)
+        return
+
+    cmd = a1
     if cmd not in commands:
         print(f"未知命令: {cmd}")
         print("可用命令: " + ", ".join(commands.keys()))

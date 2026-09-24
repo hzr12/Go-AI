@@ -1,0 +1,6 @@
+# .sh 必须强制 LF：core.autocrlf=true 时 Windows checkout 会把 .sh 转成 CRLF，
+# Linux 上执行 bash xxx.sh 会报 $'\r': command not found。
+*.sh text eol=lf
+
+# shell 脚本一律按文本处理，避免其它文本文件被误当二进制
+*.txt text eol=lf
