@@ -160,6 +160,48 @@ def test_recommended_rl_section_exists():
     assert '⓪ 推荐训练参数' in txt, "run.txt 缺少 ⓪ 推荐参数节"
 
 
+def test_sft_recommended_batch_matches_scheme_b():
+    """⓪ 节的 SFT batch/lr 必须与方案 B 实际命令一致（防注释与命令脱节）。
+
+    回归：曾出现命令写 --batch-size 3000、而注释与 ⓪ 节都写 2500 的矛盾，
+    且 3000 恰是已确认 OOM 的值。
+    """
+    txt = open(RUN_TXT, encoding='utf-8').read()
+
+    # ⓪ 节声明的 batch
+    m = re.search(r'--batch-size (\d+)\s+与 --lr ([\d.]+) 配套', txt)
+    assert m, '⓪ 节未声明 SFT batch/lr 配套关系'
+    rec_batch, rec_lr = m.group(1), m.group(2)
+
+    # 方案 B 实际命令（锚点用注释头 "# 方案 B"，避免匹配到 ⓪ 节里的引用文字）
+    b0 = txt.find('# 方案 B')
+    assert b0 != -1, 'run.txt 缺少方案 B'
+    b1 = txt.find('# 方案 C')
+    assert b1 != -1 and b1 > b0, 'run.txt 方案 B/C 顺序异常'
+    block = txt[b0:b1]
+    cm = re.search(r'--batch-size (\d+)\s+--epochs', block)
+    lm = re.search(r'--lr ([\d.]+)', block)
+    assert cm and lm, '方案 B 命令缺少 --batch-size/--lr'
+    cmd_batch, cmd_lr = cm.group(1), lm.group(1)
+
+    assert rec_batch == cmd_batch, \
+        f"⓪ 节 batch={rec_batch} 与方案 B 命令 batch={cmd_batch} 不一致"
+    assert rec_lr == cmd_lr, \
+        f"⓪ 节 lr={rec_lr} 与方案 B 命令 lr={cmd_lr} 不一致"
+
+
+def test_sft_recommended_lr_follows_sqrt_scaling():
+    """⓪ 节的 lr 必须符合从 (2500, 0.00356) 出发的平方根缩放律。"""
+    import math
+    txt = open(RUN_TXT, encoding='utf-8').read()
+    m = re.search(r'--batch-size (\d+)\s+与 --lr ([\d.]+) 配套', txt)
+    assert m, '⓪ 节未声明 SFT batch/lr 配套关系'
+    batch, lr = int(m.group(1)), float(m.group(2))
+    expect = 0.00356 * math.sqrt(batch / 2500)
+    assert abs(lr - expect) < 5e-5, \
+        f"lr={lr} 与平方根缩放预期 {expect:.5f}（batch={batch}）不符"
+
+
 @pytest.mark.parametrize('opt,expect', [
     # 这些就是代码默认值 —— 推荐"不传也是这个值"
     ('--td', '1'),

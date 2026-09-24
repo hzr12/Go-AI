@@ -537,6 +537,77 @@ def resolve_c2net_data(dataset_path):
     return dataset_path
 
 
+def _init_swanlab(args, logger):
+    """初始化 SwanLab 跟踪，返回 swanlab 模块；失败返回 None（训练照常进行）。
+
+    单独抽出来是为了让 main() 保持扁平：main 只负责"是否启用 + 能否连通"的
+    决策，本函数只负责"装/登录/init"。任何异常都吞掉并降级为 None。
+    """
+    try:
+        try:
+            import swanlab
+        except ImportError:
+            logger.info("[swanlab] 未安装，正在自动安装...")
+            import subprocess
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'swanlab', '-q'])
+            import swanlab
+            logger.info("[swanlab] 安装完成")
+        # 登录：优先用 --swanlab-api-key，其次环境变量，最后交互式
+        api_key = args.swanlab_api_key or os.environ.get('SWANLAB_API_KEY')
+        if api_key:
+            swanlab.login(api_key=api_key, save=True)
+            logger.info("[swanlab] API key 已设置，自动登录")
+        swanlab.init(
+            project="go-ai",
+            name=f"sft_{args.board_size}x{args.board_size}_{args.ver}",
+            config={
+                "backbone_channels": args.backbone_channels,
+                "backbone_res_blocks": args.backbone_res_blocks,
+                "res_blocks": args.res_blocks,
+                "convnext_blocks": args.convnext_blocks,
+                "attn_blocks": args.attn_blocks,
+                "value_channels": args.value_channels,
+                "value_res_blocks": args.value_res_blocks,
+                "policy_channels": args.policy_channels,
+                "policy_layers": args.policy_layers,
+                "batch_size": args.batch_size,
+                "lr": args.lr,
+                "epochs": args.epochs,
+            },
+        )
+        logger.info("[swanlab] 实验跟踪已启用")
+        return swanlab
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[swanlab] 初始化失败: %s（指标请看 stdout 日志）", e)
+        return None
+
+
+def _should_log(step, log_every, swanlab_every, swanlab_on):
+    """决定本步是否打 stdout、是否上报 SwanLab。
+
+    ``swanlab_every <= 0`` 表示跟随 ``log_every``（默认值 0 = 与旧行为一致）。
+    两者解耦的目的：stdout 是给人看的（保持 ``log_every``，避免刷屏），
+    swanlab 是给曲线用的（可独立加密，``--swanlab-every 5`` 比 50 密 10 倍）。
+
+    ``swanlab_on`` 为 False（如 swanlab 不可用）时第二项恒为 False，
+    确保不产生任何额外同步。
+    """
+    le = max(1, int(log_every))
+    se = int(swanlab_every) if swanlab_every and swanlab_every > 0 else le
+    se = max(1, se)
+    return (step % le == 0, bool(swanlab_on) and (step % se == 0))
+
+
+def _read_log_scalars(loss, policy_loss, value_loss):
+    """日志的**单一同步点**：三个 loss 张量各取一次标量。
+
+    旧实现在同一打点里取了两遍（一次给 stdout、一次给 swanlab），共 6 次设备
+    同步，其中 3 次完全重复。这里只取一次并返回给两处复用——数值逐位不变，
+    同步次数减半。
+    """
+    return loss.item(), policy_loss.item(), value_loss.item()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--data', required=True,
@@ -636,6 +707,10 @@ def main():
                     help='启用 SwanLab 实验跟踪 (0=关闭, 1=开启)')
     ap.add_argument('--swanlab-api-key', type=str, default='',
                     help='SwanLab API key（可选，未设置则读取 SWANLAB_API_KEY 环境变量）')
+    ap.add_argument('--swanlab-every', type=int, default=0,
+                    help='SwanLab 上报频率（每 N 步上报一次）。0=跟随 --log-every（默认，'
+                         '与旧行为一致）；曲线太稀时设 5~10，例：--log-every 50 '
+                         '--swanlab-every 10 可让曲线密度提升 5 倍而 stdout 不刷屏')
     ap.add_argument('--early-stop', type=int, default=0, choices=[0, 1],
                     help='启用早停机制：当验证集指标连续 N 次无改善时自动停止训练 (0=关闭, 1=开启)')
     ap.add_argument('--early-stop-patience', type=int, default=3,
@@ -709,42 +784,16 @@ def main():
     use_swanlab = args.swanlab == 1 or os.environ.get('SWANLAB_API_KEY')
     swanlab_logger = None
     if use_swanlab and is_main:
-        try:
-            try:
-                import swanlab
-            except ImportError:
-                logger.info("[swanlab] 未安装，正在自动安装...")
-                import subprocess
-                subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'swanlab', '-q'])
-                import swanlab
-                logger.info("[swanlab] 安装完成")
-            # 登录：优先用 --swanlab-api-key，其次环境变量，最后交互式
-            api_key = args.swanlab_api_key or os.environ.get('SWANLAB_API_KEY')
-            if api_key:
-                swanlab.login(api_key=api_key, save=True)
-                logger.info("[swanlab] API key 已设置，自动登录")
-            swanlab.init(
-                project="go-ai",
-                name=f"sft_{args.board_size}x{args.board_size}_{args.ver}",
-                config={
-                    "backbone_channels": args.backbone_channels,
-                    "backbone_res_blocks": args.backbone_res_blocks,
-                    "res_blocks": args.res_blocks,
-                    "convnext_blocks": args.convnext_blocks,
-                    "attn_blocks": args.attn_blocks,
-                    "value_channels": args.value_channels,
-                    "value_res_blocks": args.value_res_blocks,
-                    "policy_channels": args.policy_channels,
-                    "policy_layers": args.policy_layers,
-                    "batch_size": args.batch_size,
-                    "lr": args.lr,
-                    "epochs": args.epochs,
-                },
-            )
-            swanlab_logger = swanlab
-            logger.info("[swanlab] 实验跟踪已启用")
-        except Exception as e:
-            logger.warning("[swanlab] 初始化失败: %s", e)
+        swanlab_logger = _init_swanlab(args, logger)
+        if swanlab_logger is None:
+            logger.warning("[swanlab] 已降级为关闭；指标请看 stdout 日志"
+                           "（每 --log-every 步一行：loss / p / v / lr / mem / spd）")
+    if is_main:
+        _se_eff = args.swanlab_every if args.swanlab_every > 0 else args.log_every
+        logger.info("SwanLab: 启用=%s 已初始化=%s 上报频率=每 %d 步（--swanlab-every=%d，"
+                    "0 表示跟随 --log-every=%d）",
+                    bool(use_swanlab), swanlab_logger is not None,
+                    _se_eff, args.swanlab_every, args.log_every)
 
     # ---- 分布式训练：设备由 LOCAL_RANK 决定，忽略 --device 卡号 ----
     # 后端选择：NPU 走 hccl，CUDA 走 nccl。多卡前必须 init_process_group，
@@ -1158,7 +1207,6 @@ def main():
             rng.shuffle(train_idx)
             perm = train_idx
         model.train()
-        epoch_loss = 0.0
         n_batches = (len(perm) + bs - 1) // bs
         # 预取器：每 epoch 先灌满流水线（提前 depth 个 batch 造好数据）
         if pf is not None:
@@ -1280,13 +1328,15 @@ def main():
             if (i + 1) % _accum_steps == 0 or (i + 1) == n_batches:
                 scheduler.step()   # 每个 optimizer step 推进一步
             step += 1
-            # P1: 每 log_every 步才 sync NPU 取 loss 值，其余步用 None 占位
-            if step % args.log_every == 0:
-                epoch_loss += loss.item()
-            else:
-                epoch_loss += 0.0  # 占位，避免 NPU 同步
 
-            if step % args.log_every == 0:
+            # 打点：stdout 与 SwanLab 频率解耦，且共用同一次设备同步。
+            # 旧实现里 log_every 同时控制两者，且把三个 loss 张量各取两遍
+            # （stdout 一次、swanlab 一次），共 6 次同步、其中 3 次重复。
+            _do_stdout, _do_swanlab = _should_log(
+                step, args.log_every, args.swanlab_every,
+                swanlab_logger is not None)
+            if _do_stdout or _do_swanlab:
+                _lv, _pv, _vv = _read_log_scalars(loss, policy_loss, value_loss)
                 lr = optimizer.param_groups[0]['lr']
                 if _backend == 'cuda':
                     mem = torch.cuda.memory_reserved(device) / 1e9
@@ -1295,29 +1345,31 @@ def main():
                 else:
                     mem = 0.0
                 speed = step * bs / max(1e-6, time.time() - t0)
+                _scale = scaler.get_scale()
+
+            if _do_stdout:
                 logger.info("[step %d/%d] loss=%.4f (p=%.4f v=%.4f) lr=%.2e "
                             "scale=%.0f mem=%.2fGB spd=%.0f s/s elapsed=%.0fs",
-                            step, total_steps,
-                            loss.item(), policy_loss.item(), value_loss.item(),
-                            lr, scaler.get_scale(), mem, speed, time.time() - t0)
+                            step, total_steps, _lv, _pv, _vv,
+                            lr, _scale, mem, speed, time.time() - t0)
 
-                # SwanLab 日志
-                if swanlab_logger is not None:
-                    try:
-                        swanlab.log({
-                            "loss": loss.item(),
-                            "policy_loss": policy_loss.item(),
-                            "value_loss": value_loss.item(),
-                            "lr": lr,
-                            "memory_gb": mem,
-                            "speed": speed,
-                            "epoch": epoch,
-                            "step_pct": step / total_steps,
-                            "scaler_scale": scaler.get_scale() if use_scaler else 1.0,
-                        }, step=step)
-                    except Exception as e:
-                        logger.warning("[swanlab] log 失败: %s", e)
+            if _do_swanlab:
+                try:
+                    swanlab_logger.log({
+                        "loss": _lv,
+                        "policy_loss": _pv,
+                        "value_loss": _vv,
+                        "lr": lr,
+                        "memory_gb": mem,
+                        "speed": speed,
+                        "epoch": epoch,
+                        "step_pct": step / total_steps,
+                        "scaler_scale": _scale if use_scaler else 1.0,
+                    }, step=step)
+                except Exception as e:
+                    logger.warning("[swanlab] log 失败: %s", e)
 
+            if _do_stdout:
                 # 内核剖析结束：打印 top CUDA kernel 耗时表
                 if _prof_ctx is not None and step >= _prof_at + 50:
                     _prof_ctx.__exit__(None, None, None)
@@ -1364,7 +1416,7 @@ def main():
                     # SwanLab 记录评估指标
                     if swanlab_logger is not None:
                         try:
-                            swanlab.log({
+                            swanlab_logger.log({
                                 "eval_top1": metrics['top1'],
                                 "eval_top5": metrics['top5'],
                                 "eval_top10": metrics['top10'],
@@ -1419,7 +1471,7 @@ def main():
                         logger.info("[early_stop] 连续 %d 次 eval 无改善，触发早停",
                                    args.early_stop_patience)
                         if swanlab_logger is not None:
-                            swanlab.log({"early_stop": True, "final_step": step}, step=step)
+                            swanlab_logger.log({"early_stop": True, "final_step": step}, step=step)
                         break
 
     # 训练结束后导出 ONNX（可选）
@@ -1451,14 +1503,14 @@ def main():
             # SwanLab 记录最终评估结果
             if swanlab_logger is not None:
                 try:
-                    swanlab.log({
+                    swanlab_logger.log({
                         "final_top1": final_metrics['top1'],
                         "final_top5": final_metrics['top5'],
                         "final_top10": final_metrics['top10'],
                         "final_kl": final_metrics['kl'],
                         "final_brier": final_metrics['brier'],
                     }, step=total_steps)
-                    swanlab.finish()
+                    swanlab_logger.finish()
                     logger.info("[swanlab] 实验跟踪已完成")
                 except Exception as e:
                     logger.warning("[swanlab] finish 失败: %s", e)

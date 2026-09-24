@@ -20,18 +20,29 @@
 #   · NPU 注意力走手写 math（sdpa_force_math=True），CANN 的 Flash 后端不稳
 #   · NPU 的 pin_memory 关闭 → 双缓冲 H2D 只在 CUDA 生效
 #
-# 【SFT 推荐（单卡 A100 40G，BF16 + flash-attn）】
-#   --batch-size 4096          与 lr 0.00256 配套（平方根缩放律），显存不足
-#                              按 1600 + --gradient-accumulation-steps 2 降
-#   --lr 0.00256               勿单独改 batch 或 lr，否则线性缩放失效
-#   --epochs 2                 配合 --early-stop 1 --early-stop-patience 3
+# 【SFT 推荐（单卡 A100 40G，BF16 + flash-attn）= 下方方案 B】
+#   以下即 A100 40G 上实测可跑的配置（--batch-size 3500 实测通过）：
+#   --batch-size 3500          与 --lr 0.00421 配套（由 2500/0.00356 按平方根
+#                              缩放律换算：0.00356×√(3500/2500)=0.00421）。
+#                              显存不足再降 batch 时须同步降 lr，或用
+#                              --gradient-accumulation-steps 补回等效 batch
+#   --lr 0.00421               勿单独改 batch 或 lr
+#   --value-res-blocks 8       ⚠ ValueNetwork 的 ResBlock **不受
+#                              --use-checkpoint 保护**，是最大一块常驻激活，
+#                              11→8 是降显存的关键之一
+#   --compile 1（不加 --compile-mode）  默认 default 模式。**不要**用
+#                              reduce-overhead：它走 CUDA Graphs，会维持一个
+#                              不归还的私有内存池，临界 batch 下直接 OOM
 #   --attn-mode window_global --attn-window 7
-#   --compile 1 --compile-mode reduce-overhead   算子融合
-#   --use-amp 1 --use-ema 1
+#   ⚠ 降显存不要动 --attn-window（要往**大**调，详见方案 B 的说明）
+#   --use-amp 1 --use-ema 1 --use-checkpoint 1 --flash-attn 1
 #   --prefetch-workers 32 --prefetch-depth 32    数据预取
-#   --eval-every 2000 --save-every 1000          省时间与磁盘
-#   注意：--attn-window 5（下方方案 A）与本推荐 7 不一致；window_global 模式
-#         统一用 7，方案 A 的 5 是 4 卡 NPU 场景的旧取值。
+#   --eval-every 2000 --save-every 500           省时间与磁盘
+#   --swanlab-every 10         SwanLab 上报频率与 --log-every 解耦：stdout 仍
+#                              每 50 步一行（不刷屏），曲线每 10 步一个点。
+#                              默认 0 = 跟随 --log-every（旧行为）
+#   注意：方案 A（4 卡 NPU）与方案 C（4 卡 A100）仍是早期 batch 较大的旧配置，
+#         换硬件前请按 ⓪ 节的显存结论重新标定。
 #
 # 【RL 推荐（1 卡 910A 训练 + 8 进程 CPU 搜索）】
 #   标注 [默认] 的即代码默认值，不传也是这个值；标注 [刻意下调] 的需要显式传，
@@ -100,32 +111,51 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
   --early-stop 1 --early-stop-patience 3 \
   --out models/sft_19x19_v17.pth \
   --export-onnx 1 --use-checkpoint 1 \
-  --swanlab 1 --project go-ai --name sft_v17_npu4
+  --swanlab 1
 
-# 方案 B: 单卡 A100 40G (更快)
+# 方案 B: 单卡 A100 40G (当前实跑配置)
 # pip install flash-attn --no-build-isolation
+#
+# 【为什么以前 OOM、现在能到 3500】根因不是 batch 本身，而是
+#   --compile-mode reduce-overhead：它走 CUDA Graphs，会维持一个**不归还**的
+#   私有内存池，在临界 batch 上直接把显存吃光。去掉该参数（只留 --compile 1）
+#   后，40G 卡上 3500 实测通过。同期另外两处调整：
+#     · --value-res-blocks 11 → 8
+#       ValueNetwork 的 ResBlock **不受 --use-checkpoint 保护**
+#       （backbone 有 checkpoint，value head 没有），是最大一块常驻激活。
+#     · --attn-window 5 → 7（见下）
+#
+# ⚠ 不要靠调小 --attn-window 省显存：window_global 的显存正比于
+#   nW×(ws²+ng)，而 ng=ceil(19/ws)² 在 ws 变小时暴涨。实测相对倍数：
+#   ws=3 → 5.4× 更差 | ws=5 → 1.26× 更差 | ws=7 → 基准 | ws=11 → 略好
+#   所以 ws 要往**大**调（ws=11 或 19），不是往小调。
+#
+# 【SwanLab】上报频率与 stdout 解耦：--log-every 50 控制 stdout（不刷屏），
+#   --swanlab-every 10 控制曲线密度（每 epoch 约 958 点而非 192 点）。
+#   认证：平台只能传 `--swanlab-api-key <值>`，**环境变量不可用**。
+#   切勿把真实 key 写进本文件或贴到聊天里；贴出过就去 swanlab.cn 吊销重发。
 torchrun --nproc_per_node=1 scripts/train_sft.py \
   --data data/sgf_19x19_full.npz \
   --device cuda --board-size 19 \
   --backbone-channels 192 --backbone-res-blocks 17 \
   --res-blocks 8 --convnext-blocks 4 --attn-blocks 5 \
-  --value-channels 96 --value-res-blocks 11 \
+  --value-channels 96 --value-res-blocks 8 \
   --policy-channels 128 --policy-layers 3 \
-  --batch-size 4096 --epochs 1 \
-  --lr 0.00256 --weight-decay 0.0001 \
+  --batch-size 3500 --epochs 1 \
+  --lr 0.00421 --weight-decay 0.0001 \
   --attention-mode mix --num-attention-layers 4 --num-heads 4 \
-  --attn-mode window_global --attn-window 5 \
+  --attn-mode window_global --attn-window 7 \
   --attention-dropout 0.1 --label-smoothing 0.1 \
   --gradient-accumulation-steps 1 \
   --use-amp 1 --use-ema 1 \
-  --compile 1 --compile-mode reduce-overhead \
+  --compile 1 \
   --flash-attn 1 \
   --prefetch-workers 32 --prefetch-depth 32 \
-  --log-every 50 --eval-every 2000 --save-every 1000 \
+  --log-every 50 --swanlab-every 10 --eval-every 2000 --save-every 500 \
   --early-stop 1 --early-stop-patience 3 \
-  --out models/sft_19x19_v17.pth \
+  --out models/sft_19x19_v18.pth \
   --export-onnx 1 --use-checkpoint 1 \
-  --swanlab 1 --project go-ai --name sft_v17_a100
+  --swanlab 1 --ver v18
 
 # 方案 C: 4卡 A100 (最快)
 torchrun --nproc_per_node=4 scripts/train_sft.py \
@@ -149,7 +179,7 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
   --early-stop 1 --early-stop-patience 3 \
   --out models/sft_19x19_v17.pth \
   --export-onnx 1 --use-checkpoint 1 \
-  --swanlab 1 --project go-ai --name sft_v17_a100_4card
+  --swanlab 1
 
 # 备用：显存不足时减小 batch
 # --batch-size 1600 --gradient-accumulation-steps 2
