@@ -228,5 +228,129 @@ def test_dns_precheck_removed():
     """DNS 预检已按决策移除（不再有 socket 依赖与 getaddrinfo 探测）。"""
     src = open(os.path.join(ROOT, 'scripts', 'train_sft.py'), encoding='utf-8').read()
     assert '_swanlab_reachable' not in src, 'swanlab DNS 预检仍未移除'
+
+
+# --------------------------------------------------------------------------- #
+# 禁止在训练进程内 pip install swanlab
+# --------------------------------------------------------------------------- #
+_TRAIN_SCRIPTS = ('train_sft.py', 'selfplay_train.py')
+
+
+@pytest.mark.parametrize('fname', _TRAIN_SCRIPTS)
+def test_no_inprocess_pip_install(fname):
+    """训练脚本不得在进程内 `pip install swanlab`。
+
+    原因：调用点位于 torch / torch_npu **已加载之后**，此时改动 site-packages
+    可能破坏后续惰性导入；且 shell/*.sh 在启动 python 前已装过一次，那次失败
+    的话这里必然也失败，只是白等一轮。手动装（进程启动前）没问题正是此因。
+    """
+    src = open(os.path.join(ROOT, 'scripts', fname), encoding='utf-8').read()
+    # 只匹配真正调用 pip 的 argv 形式，不误伤「请执行 pip install swanlab」这类提示文本
+    assert "'-m', 'pip'" not in src, f'{fname} 仍在训练进程内 pip install swanlab'
+    assert '"-m", "pip"' not in src, f'{fname} 仍在训练进程内 pip install swanlab'
+    assert 'check_call' not in src, f'{fname} 仍在训练进程内 pip install swanlab'
+
+
+def _swanlab_present(spec_result):
+    """把 importlib.util.find_spec('swanlab') 固定为指定返回值。"""
+    import importlib.util
+    return lambda name: spec_result
+
+
+def test_absent_swanlab_degrades_with_actionable_message(caplog):
+    """swanlab 真的没装时：返回 None，且提示如何安装（而不是自己装）。"""
+    import logging
+    import types as _types
+    import scripts.train_sft as t
+
+    class _Args:
+        swanlab_api_key = ''
+        board_size = 19
+        ver = 'v1'
+        backbone_channels = backbone_res_blocks = res_blocks = 1
+        convnext_blocks = attn_blocks = value_channels = 1
+        value_res_blocks = policy_channels = policy_layers = 1
+        batch_size = 1
+        lr = 1.0
+        epochs = 1
+
+    saved = {m: sys.modules.pop(m) for m in list(sys.modules) if m == 'swanlab'}
+    import importlib.util
+    real_find_spec = importlib.util.find_spec
+    importlib.util.find_spec = lambda name: None
+    logger = logging.getLogger('test_absent')
+    try:
+        with caplog.at_level(logging.DEBUG, logger='test_absent'):
+            assert t._init_swanlab(_Args(), logger) is None
+    finally:
+        importlib.util.find_spec = real_find_spec
+        for m in saved:
+            sys.modules[m] = saved[m]
+        assert not [m for m in sys.modules if m == 'swanlab']
+
+    text = caplog.text
+    assert 'pip install swanlab' in text, f'未给出安装指引: {text!r}'
+    assert '自动安装' not in text, f'不应再声称会自动安装: {text!r}'
+
+
+def test_broken_swanlab_reports_real_cause_not_missing(tmp_path, caplog):
+    """装了但坏（pydantic 1.x 缺 TypeAdapter）时，要报真实原因而非「未安装」。
+
+    这是云端实际踩到的坑：swanlab 依赖 pydantic>=2，而 MindSpore / torch_npu
+    常把 pydantic 钉在 1.x，于是 `import swanlab` 抛 ImportError。旧代码把
+    任何 ImportError 都当成「没装」而误触发 pip install。
+    """
+    import logging
+    import scripts.train_sft as t
+
+    class _Args:
+        swanlab_api_key = ''
+        board_size = 19
+        ver = 'v1'
+        backbone_channels = backbone_res_blocks = res_blocks = 1
+        convnext_blocks = attn_blocks = value_channels = 1
+        value_res_blocks = policy_channels = policy_layers = 1
+        batch_size = 1
+        lr = 1.0
+        epochs = 1
+
+    # 造一个「存在但 import 就炸」的 swanlab
+    pkg = tmp_path / 'swanlab'
+    pkg.mkdir()
+    (pkg / '__init__.py').write_text(
+        "raise ImportError(\"cannot import name 'TypeAdapter' from 'pydantic'\")\n",
+        encoding='utf-8')
+
+    saved = sys.modules.pop('swanlab', None)
+    sys.path.insert(0, str(tmp_path))
+    import subprocess
+    pip_calls = []
+    real_check_call = subprocess.check_call
+    subprocess.check_call = lambda *a, **k: pip_calls.append(a)
+    logger = logging.getLogger('test_broken')
+    try:
+        with caplog.at_level(logging.DEBUG, logger='test_broken'):
+            assert t._init_swanlab(_Args(), logger) is None
+    finally:
+        subprocess.check_call = real_check_call
+        sys.path.remove(str(tmp_path))
+        sys.modules.pop('swanlab', None)
+        if saved is not None:
+            sys.modules['swanlab'] = saved
+
+    assert not pip_calls, f'不该在进程内 pip install，实际调用了: {pip_calls}'
+    text = caplog.text
+    assert 'TypeAdapter' in text, f'未报出真实原因，实际日志: {text!r}'
+    assert '未安装' not in text, f'把「装了但坏」误报成「未安装」: {text!r}'
+
+
+@pytest.mark.parametrize('fname', _TRAIN_SCRIPTS)
+def test_import_error_never_triggers_autoinstall(fname):
+    """结构性不变量：两个训练脚本都不得在 import 失败分支里调 pip。"""
+    src = open(os.path.join(ROOT, 'scripts', fname), encoding='utf-8').read()
+    assert 'except ImportError:' in src or 'ImportError' in src
+    # find_spec 存在 => 能区分「没装」与「装了但坏」
+    assert 'find_spec' in src, \
+        f'{fname} 未用 find_spec 区分「未安装」与「安装损坏」'
     assert 'getaddrinfo' not in src, '仍残留 DNS 探测调用'
     assert '\nimport socket' not in src, 'socket import 仍未移除'

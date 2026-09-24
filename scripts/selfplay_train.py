@@ -680,47 +680,67 @@ def main():
     use_swanlab = args.swanlab == 1 or os.environ.get('SWANLAB_API_KEY')
     swanlab_logger = None
     if use_swanlab and is_main:
-        try:
+        # 刻意**不在训练进程内** pip install swanlab：调用点在 torch / torch_npu
+        # 已加载之后，此时改动 site-packages 可能破坏后续惰性导入；且 shell/*.sh
+        # 在启动 python 之前已装过一次，那次失败的话这里必然也失败，只是白等一轮。
+        # 「手动安装没问题」正是这个差别：装在解释器启动前，依赖已就位。
+        #
+        # 用 find_spec 区分「没装」与「装了但坏」：后者是云端常见坑——swanlab 依赖
+        # pydantic>=2，而 MindSpore / torch_npu 常把 pydantic 钉在 1.x，于是
+        # `import swanlab` 抛 "cannot import name 'TypeAdapter' from 'pydantic'"。
+        # 旧代码把任何 ImportError 都当成「未安装」而误触发自动安装，掩盖了真因。
+        _mod = sys.modules.get('swanlab')
+        _have = _mod is not None
+        if not _have:
+            import importlib.util
+            try:
+                _have = importlib.util.find_spec('swanlab') is not None
+            except (ImportError, ValueError):
+                _have = False
+        if not _have:
+            print("[swanlab] 未安装，已跳过跟踪（指标请看 stdout 日志）。"
+                  "请在启动训练前安装: pip install swanlab", flush=True)
+        else:
             try:
                 import swanlab
-            except ImportError:
-                print("[swanlab] 未安装，正在自动安装...", flush=True)
-                import subprocess
-                subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'swanlab', '-q'])
-                import swanlab
-                print("[swanlab] 安装完成", flush=True)
-            # 登录：优先用 --swanlab-api-key，其次环境变量，最后交互式
-            api_key = args.swanlab_api_key or os.environ.get('SWANLAB_API_KEY')
-            if api_key:
-                swanlab.login(api_key=api_key, save=True)
-                print(f"[swanlab] API key 已设置，自动登录", flush=True)
-            swanlab.init(
-                project="go-ai-rl",
-                name=f"selfplay_{args.ver}",
-                config={
-                    "board_size": args.board_size,
-                    "iters": args.iters,
-                    "sims": args.sims,
-                    "parallel_games": args.parallel_games,
-                    "mcts_threads": getattr(args, 'mcts_threads', 3),
-                    "c_puct": args.c_puct,
-                    "virtual_loss": args.virtual_loss,
-                    "buffer_size": args.buffer_size,
-                    "batch_size": args.batch_size,
-                    "epochs": args.epochs,
-                    "lr": args.lr,
-                    "expand_topk": args.expand_topk,
-                    "async_pipeline": args.async_pipeline,
-                    "td": args.td,
-                    "td_steps": args.td_steps,
-                    "td_alpha_init": args.td_alpha_init,
-                    "td_alpha_end": args.td_alpha_end,
-                },
-            )
-            swanlab_logger = swanlab
-            print(f"[swanlab] 实验跟踪已启用", flush=True)
-        except Exception as e:
-            print(f"[swanlab] 初始化失败: {e}", flush=True)
+                # 登录：优先用 --swanlab-api-key，其次环境变量，最后交互式
+                api_key = args.swanlab_api_key or os.environ.get('SWANLAB_API_KEY')
+                if api_key:
+                    swanlab.login(api_key=api_key, save=True)
+                    print("[swanlab] API key 已设置，自动登录", flush=True)
+                swanlab.init(
+                    project="go-ai-rl",
+                    name=f"selfplay_{args.ver}",
+                    config={
+                        "board_size": args.board_size,
+                        "iters": args.iters,
+                        "sims": args.sims,
+                        "parallel_games": args.parallel_games,
+                        "mcts_threads": getattr(args, 'mcts_threads', 3),
+                        "c_puct": args.c_puct,
+                        "virtual_loss": args.virtual_loss,
+                        "buffer_size": args.buffer_size,
+                        "batch_size": args.batch_size,
+                        "epochs": args.epochs,
+                        "lr": args.lr,
+                        "expand_topk": args.expand_topk,
+                        "async_pipeline": args.async_pipeline,
+                        "td": args.td,
+                        "td_steps": args.td_steps,
+                        "td_alpha_init": args.td_alpha_init,
+                        "td_alpha_end": args.td_alpha_end,
+                    },
+                )
+                swanlab_logger = swanlab
+                print("[swanlab] 实验跟踪已启用", flush=True)
+            except Exception as e:
+                print(f"[swanlab] 初始化失败: {e}", flush=True)
+                _emsg = str(e)
+                if 'pydantic' in _emsg or 'TypeAdapter' in _emsg:
+                    print("[swanlab] 疑似 pydantic 版本冲突：swanlab 需要 pydantic>=2，"
+                          "而 MindSpore / torch_npu 常钉 pydantic<2。"
+                          "请在启动训练前解决版本冲突（如在独立环境装 swanlab），"
+                          "不要依赖训练进程内自动安装。", flush=True)
 
     # 设备选择
     if args.device == "auto":

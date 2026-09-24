@@ -544,14 +544,27 @@ def _init_swanlab(args, logger):
     决策，本函数只负责"装/登录/init"。任何异常都吞掉并降级为 None。
     """
     try:
-        try:
-            import swanlab
-        except ImportError:
-            logger.info("[swanlab] 未安装，正在自动安装...")
-            import subprocess
-            subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'swanlab', '-q'])
-            import swanlab
-            logger.info("[swanlab] 安装完成")
+        # 刻意**不在训练进程内** pip install swanlab。调用点在 torch / torch_npu
+        # 已加载之后，此时改动 site-packages 可能破坏后续惰性导入；而 shell/*.sh
+        # 在启动 python 之前已装过一次，那次失败的话这里必然也失败，只是白等一轮。
+        # 「手动安装没问题」正是这个差别：装在解释器启动前，依赖已就位。
+        #
+        # 用 find_spec 区分「没装」与「装了但坏」：后者是云端常见坑——swanlab 依赖
+        # pydantic>=2，而 MindSpore / torch_npu 常把 pydantic 钉在 1.x，于是
+        # `import swanlab` 抛 "cannot import name 'TypeAdapter' from 'pydantic'"。
+        # 旧代码把任何 ImportError 都当成「未安装」而误触发自动安装，掩盖了真因。
+        _mod = sys.modules.get('swanlab')
+        if _mod is None:
+            import importlib.util
+            try:
+                _spec = importlib.util.find_spec('swanlab')
+            except (ImportError, ValueError):
+                _spec = None
+            if _spec is None:
+                logger.warning("[swanlab] 未安装，已跳过跟踪（指标请看 stdout 日志）。"
+                               "请在启动训练前安装: pip install swanlab")
+                return None
+        import swanlab
         # 登录：优先用 --swanlab-api-key，其次环境变量，最后交互式
         api_key = args.swanlab_api_key or os.environ.get('SWANLAB_API_KEY')
         if api_key:
@@ -579,6 +592,12 @@ def _init_swanlab(args, logger):
         return swanlab
     except Exception as e:  # noqa: BLE001
         logger.warning("[swanlab] 初始化失败: %s（指标请看 stdout 日志）", e)
+        _emsg = str(e)
+        if 'pydantic' in _emsg or 'TypeAdapter' in _emsg:
+            logger.warning("[swanlab] 疑似 pydantic 版本冲突：swanlab 需要 pydantic>=2，"
+                           "而 MindSpore / torch_npu 常钉 pydantic<2。"
+                           "请在启动训练前解决版本冲突（如在独立环境装 swanlab），"
+                           "不要依赖训练进程内自动安装。")
         return None
 
 
