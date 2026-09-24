@@ -514,6 +514,20 @@ def train_epochs(ai, buffer, args, device):
     return ret
 
 
+def resolve_c2net_model(pretrain_model_path):
+    """从 C2NET 上下文的预训练目录确定性地挑一个 ``.pth`` 权重。
+
+    必须 ``sorted`` 后再取第一个：glob 的返回顺序依赖文件系统，直接取
+    ``[0]`` 会导致同一目录多次运行可能选中不同权重。目录为空 / 无 ``.pth`` /
+    路径为假值时返回 None（调用方据此不覆盖 --model）。
+    """
+    if not pretrain_model_path:
+        return None
+    import glob
+    pth_files = sorted(glob.glob(os.path.join(pretrain_model_path, '*.pth')))
+    return pth_files[0] if pth_files else None
+
+
 def main():
     ap = argparse.ArgumentParser(description="AlphaZero 式自对弈无监督训练（50GB 约束优化版）")
     ap.add_argument("--model", type=str, default=None, help="初始权重（如 SFT 预训练）")
@@ -644,13 +658,15 @@ def main():
                 print("[c2net] 已初始化 C2NET 上下文", flush=True)
                 print(f"[c2net] output_path={_c2net_ctx.output_path}", flush=True)
                 print(f"[c2net] pretrain_model_path={_c2net_ctx.pretrain_model_path}", flush=True)
-            # 覆盖 --model：从 c2net 预训练模型目录加载
-            if _c2net_ctx.pretrain_model_path and not args.model:
-                import glob
-                pth_files = glob.glob(os.path.join(_c2net_ctx.pretrain_model_path, '*.pth'))
-                if pth_files:
-                    args.model = pth_files[0]
-                    print(f"[c2net] 使用预训练模型: {args.model}", flush=True)
+            # 覆盖 --model：从 c2net 预训练模型目录加载（仅在未显式指定 --model 时）
+            # 直接运行 selfplay_train.py 时 --model 默认为 None，此分支会生效，
+            # 故必须用 resolve_c2net_model 做确定性选择。
+            if not args.model:
+                _c2net_model = resolve_c2net_model(_c2net_ctx.pretrain_model_path)
+                if _c2net_model:
+                    args.model = _c2net_model
+                    if is_main:
+                        print(f"[c2net] 使用预训练模型: {args.model}", flush=True)
         except ImportError:
             if is_main:
                 print("[c2net] c2net 未安装，--c2net 已忽略", flush=True)

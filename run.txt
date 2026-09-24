@@ -144,19 +144,120 @@ python scripts/selfplay_train.py \
   --out models/az_best.pth
 
 # ============================================================
+# ③' RL 完整参数表（selfplay_train.py，53 项；默认值均取自 --help/源码）
+# ============================================================
+# 用法：完整命令加 --help；下表为默认值，命令行显式传入即覆盖。
+#
+# --- 初始权重 / 对局规模 ---
+#   --model PATH            初始权重（如 SFT 预训练）；默认 None
+#   --board-size N          棋盘大小；默认 9
+#   --iters N               迭代轮数；默认 5
+#   --games N               每轮自对弈局数（串行模式）；默认 4
+#   --sims N                每步 MCTS 模拟数；默认 400
+#   --max-moves N           单局手数上限；默认 None = 3×点数
+#   --temperature F         初始采样温度；默认 1.0
+#   --buffer-size N         replay buffer 容量（局数，非样本数）；默认 500
+#
+# --- 训练优化 ---
+#   --batch-size N          训练 batch（NPU 甜点）；默认 256
+#   --epochs N              每轮训练遍数；默认 2
+#   --lr F                  学习率；默认 1e-3
+#   --weight-decay F        权重衰减；默认 1e-4
+#   --value-lr-mult F       value head 学习率倍率；默认 0.5
+#   --clip-grad F           梯度裁剪范数（0=关闭）；默认 1.0
+#   --grad-accum-steps N    梯度累积 micro-batch 数；默认 1（>1 时等效
+#                           batch×N、step÷N，建议 --lr 调高 1.4~2 倍）
+#   --use-ema {0,1}         EMA 权重；默认 0
+#   --no-augment {0,1}      关闭 8 对称增强；默认 0（开启）
+#
+# --- MCTS 搜索质量 ---
+#   --expand-topk N         展开候选截断（CPU 推荐 32-64）；默认 64
+#   --expand-chunk N        展开期 α-β 界截断块（0=关闭）；默认 0
+#   --c-puct F              PUCT 探索系数；默认 2.0
+#   --virtual-loss F        虚拟损失系数；默认 8.0
+#   --num-threads N         MCTS 多线程数（进程内）；默认 8
+#   --leaf-ab-depth N       叶内 α-β 深度；默认 2
+#   --policy-pruning-thresh F  跳过 prior < 阈值的候选；默认 0.01
+#   --dynamic-topk {0,1}    动态 topk（早8/中16/晚32）；默认 0
+#   --dynamic-virtual-loss {0,1}  动态 virtual loss（2/6/12）；默认 0
+#
+# --- 并行 / 吞吐 ---
+#   --parallel-games N      并行自对弈进程数（建议 cores/3，24核→8）；默认 8
+#   --mcts-threads N        每进程 MCTS 线程（建议 cores/parallel_games）；默认 3
+#   --onnx-model PATH       ONNX 权重（CPU 推理 3-5x）；默认 None
+#   --batch-cap N           MCTS 批量展开上限；默认 64
+#   --result-queue-max N    结果队列容量；默认 100
+#   --mcts-vector-backup {0,1}  回传 visit/value_sum 走 numpy 批量；默认 1
+#   --spec-prefetch {0,1}   worker 推测预评估（num_threads>=4 才生效）；默认 1
+#
+# --- Rollout ---
+#   --use-rollout {0,1}     LightPLS rollout；默认 0
+#   --rollout-lambda F      rollout 融合权重；默认 0.25
+#   --rollout-steps N       rollout 最大步数；默认 60
+#   --use-diverse-rollout {0,1}  4 种温度轮换；默认 0
+#
+# --- 异步流水线（生成与训练并行）---
+#   --async-pipeline {0,1}  启用异步（须配 --games-per-iter）；默认 0
+#   --games-per-iter N      异步模式每轮生成局数；默认 10
+#
+# --- TD 价值标签（C+E 混合）---
+#   --td {0,1}              TD 标签（0=旧 tanh 软化基线）；默认 1
+#   --td-steps N            n-step 前看步数（数据下标空间）；默认 3
+#   --td-alpha-init F       α 调度初值（开局偏 r_soft）；默认 0.2
+#   --td-alpha-end F        α 调度终值（残局偏 v_td）；默认 0.9
+#
+# --- 设备 / 分布式 ---
+#   --device DEV            auto/cuda/npu/cpu；默认 auto
+#   --ddp {0,1}             DDP 多卡（需 torchrun）；默认 0
+#   --streaming {0,1}       流式训练；默认 0
+#   --no-persist {0,1}      不写临时 npz；默认 0
+#
+# --- 输出 / 跟踪 / 平台 ---
+#   --out PATH              权重输出路径；默认 models/az
+#   --save-every N          每隔几轮保存最佳；默认 1
+#   --ver STR               模型版本号（SwanLab name 后缀）；默认 rl
+#   --swanlab {0,1}         SwanLab 跟踪；默认 0
+#   --swanlab-api-key STR   API key（缺省读 SWANLAB_API_KEY）；默认 ""
+#   --c2net {0,1}           C2NET（OpenI 启智平台）；默认 0，详见 ④'
+
+# ============================================================
 # ④ WebUI 人机对弈
 # ============================================================
+# 注意：--priors-leaf 是 store_true 开关，不能写成 "--priors-leaf 1"（多余的 1
+#       会被当成位置参数而报错）。模拟数在界面「模拟数」下拉里选，没有
+#       --simulations 这个选项。
 # 推荐配置：ONNX + 多线程 + 策略深度2
-python scripts/webui.py --port 7860 --device cpu --priors-leaf 1 \
+python scripts/webui.py --port 7860 --device cpu --priors-leaf \
     --onnx models/sft_19x19_v17.onnx \
     --mode hybrid --hybrid-sims 32 --hybrid-blend 0.5 \
     --expand-topk 8 --num-threads 4 \
     --policy-depth 2 --policy-width 4 --policy-topk 12
 
-# 高质量模式：纯 MCTS（较慢但更强）
-python scripts/webui.py --port 7860 --device cpu --priors-leaf 1 \
+# 高质量模式：纯 MCTS（较慢但更强；模拟数在界面选 400/800/1600）
+python scripts/webui.py --port 7860 --device cpu --priors-leaf \
     --onnx models/sft_19x19_v17.onnx \
-    --mode mcts --simulations 64 --num-threads 4
+    --mode mcts --expand-topk 8 --num-threads 4
+
+# ============================================================
+# ④' C2NET（OpenI 启智平台）
+# ============================================================
+# 加 --c2net 1 后，三个挂钩点生效（需已 pip install c2net，未安装则静默跳过）：
+#
+#   1) 数据集：ctx.dataset_path 原样交给 --data
+#      · 给的是目录 → 走 --data 的目录模式，递归扫描并合并**全部** .npz/.tgz
+#        分片（不再只取 glob 的第一个）
+#      · 给的是文件 → 直接使用
+#   2) 初始权重（仅 RL，且未显式传 --model 时生效）：
+#      从 ctx.pretrain_model_path 下 sorted 后取字典序第一个 *.pth
+#      （直接跑 selfplay_train.py 时 --model 默认 None，此分支会生效）
+#   3) 输出重定向：args.out = ctx.output_path / basename(args.out)
+#      只换目录、保留文件名；原路径存进 args._c2net_orig_out
+#
+# 训练结束（仅 rank 0）自动 upload_output() 回传结果。
+#
+# 用法（不传 --data 时 SFT 会因 required=True 直接退出，故须显式给一个）：
+#   python scripts/train_sft.py --data data/sgf_19x19_full.npz --c2net 1 ...
+#   python scripts/selfplay_train.py --c2net 1 ...   # 不传 --model 则用平台预训练权重
 
 # ============================================================
 # ⑤ 评估棋力
@@ -237,3 +338,8 @@ python scripts/eval_elo.py \
 # 11. 进程级并行：8进程绕过 GIL
 # 12. 异步流水线：生成与训练完全并行 (--async-pipeline)
 # 13. SwanLab 实验跟踪：实时可视化训练指标 (--swanlab)
+# 14. 梯度累积 (--grad-accum-steps)：摊薄优化器步开销；配 --lr 1.4~2 倍
+# 15. 双缓冲 H2D（CUDA）：pinned 槽交替 + 每槽 CUDA Event，搬运与计算重叠
+# 16. MCTS 回传向量化 (--mcts-vector-backup，默认 1)：visit/value_sum 走 numpy 批量
+# 17. 落子虚影（WebUI）：鼠标悬停显示半透明棋子，判定与点击共用 hitTest
+

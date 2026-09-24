@@ -526,6 +526,17 @@ class _BatchPrefetcher:
         return states, moves, values
 
 
+def resolve_c2net_data(dataset_path):
+    """把 C2NET 上下文的数据集路径转成 ``--data`` 可直接使用的值。
+
+    目录 → 原样返回，让 ``--data`` 的目录模式（load_from_path）递归扫描并
+    **合并全部** .npz/.tgz 分片；文件 → 原样返回。
+    不可直接把目录展开成 glob 再取 [0]：那只会加载一个分片，且 glob 顺序依赖
+    文件系统，未排序时选中哪个不确定。
+    """
+    return dataset_path
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--data', required=True,
@@ -660,12 +671,16 @@ def main():
                 logger.info("[c2net] 已初始化 C2NET 上下文")
                 logger.info("[c2net] dataset_path=%s", _c2net_ctx.dataset_path)
                 logger.info("[c2net] output_path=%s", _c2net_ctx.output_path)
-            # 覆盖 --data：从 c2net 数据集目录加载
+            # 覆盖 --data：目录原样传入，让 --data 的目录模式合并**全部** npz/tgz 分片
             if _c2net_ctx.dataset_path:
-                import glob
-                npz_files = glob.glob(os.path.join(_c2net_ctx.dataset_path, '*.npz'))
-                if npz_files:
-                    args.data = npz_files[0]
+                args.data = resolve_c2net_data(_c2net_ctx.dataset_path)
+                if os.path.isdir(args.data):
+                    import glob
+                    _n_npz = len(glob.glob(os.path.join(args.data, '**', '*.npz'),
+                                           recursive=True))
+                    logger.info("[c2net] 使用数据集目录（合并全部分片）: %s（npz 分片 %d 个）",
+                                args.data, _n_npz)
+                else:
                     logger.info("[c2net] 使用数据集: %s", args.data)
         except ImportError:
             if is_main:
