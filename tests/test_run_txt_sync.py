@@ -149,3 +149,96 @@ def test_run_txt_webui_commands_are_valid():
         except SystemExit:
             bad.append(' '.join(toks) + ' => ' + err.getvalue().strip().splitlines()[-1])
     assert not bad, "以下 webui 命令无法解析:\n  " + "\n  ".join(bad)
+
+
+# --------------------------------------------------------------------------- #
+# ⓪ 推荐参数节必须与代码默认值一致
+# --------------------------------------------------------------------------- #
+def test_recommended_rl_section_exists():
+    """run.txt 必须有 ⓪ 推荐参数节。"""
+    txt = open(RUN_TXT, encoding='utf-8').read()
+    assert '⓪ 推荐训练参数' in txt, "run.txt 缺少 ⓪ 推荐参数节"
+
+
+@pytest.mark.parametrize('opt,expect', [
+    # 这些就是代码默认值 —— 推荐"不传也是这个值"
+    ('--td', '1'),
+    ('--batch-size', '256'),
+    ('--mcts-vector-backup', '1'),
+    ('--grad-accum-steps', '1'),
+])
+def test_recommended_defaults_match_code(opt, expect):
+    """⓪ 节标 [默认] 的 RL 取值必须等于 selfplay_train.py 的真实默认值。"""
+    import inspect
+    import scripts.selfplay_train as st
+    src = inspect.getsource(st.main)
+    m = re.search(r'ap\.add_argument\(\s*[\'"]' + re.escape(opt) +
+                  r'[\'"].*?default=([^\n,]+)', src, re.S)
+    assert m, f"源码中找不到 {opt} 的默认值"
+    code_val = m.group(1).strip().rstrip(')')
+    assert code_val == expect, f"{opt} 代码默认={code_val}，⓪ 节推荐={expect}"
+
+
+@pytest.mark.parametrize('opt,override', [
+    ('--sims', '48'),
+    ('--expand-topk', '16'),
+])
+def test_recommended_overrides_are_flagged_in_doc(opt, override):
+    """刻意偏离默认值的推荐项，⓪ 节必须显式标注 [刻意下调] 并写出真实默认值。
+
+    这些值不是代码默认（如 --sims 默认 400），靠"不传"是拿不到的，必须显式传。
+    若有人误把它们"修正"回默认值，测试会失败。
+    """
+    import inspect
+    import scripts.selfplay_train as st
+    src = inspect.getsource(st.main)
+    m = re.search(r'ap\.add_argument\(\s*[\'"]' + re.escape(opt) +
+                  r'[\'"].*?default=([^\n,]+)', src, re.S)
+    code_val = m.group(1).strip().rstrip(')')
+    assert code_val != override, \
+        f"{opt} 现在默认值就是 {override}，⓪ 节不应再标 [刻意下调]"
+
+    txt = open(RUN_TXT, encoding='utf-8').read()
+    start = txt.find('⓪ 推荐训练参数')
+    end = txt.find('① 构建数据集')
+    sec = txt[start:end if end != -1 else len(txt)]
+    line = next((l for l in sec.splitlines() if opt in l), None)
+    assert line, f"⓪ 节缺少 {opt} 的说明行"
+    assert '[刻意下调]' in line, f"{opt} 是刻意覆盖默认值，必须标注 [刻意下调]"
+    assert override in line, f"{opt} 说明行未写出推荐值 {override}"
+    assert f'默认 {code_val}' in line, \
+        f"{opt} 说明行未写出真实默认值（默认 {code_val}），读者无法分辨"
+
+
+def test_rl_commands_do_not_use_onnx_model():
+    """run.txt 的 RL 命令不得再出现 --onnx-model（当前实现会启动即崩）。
+
+    selfplay_train.py 把 --onnx-model 的值当 torch 权重 torch.load，而 ONNX 是
+    protobuf 格式 → UnpicklingError。已在 ⓪ 与 ③ 两处标注。
+    """
+    txt = open(RUN_TXT, encoding='utf-8').read()
+    bs = chr(92)
+    joined = txt.replace(bs + chr(10), ' ')
+    blocks = re.findall(r'python scripts/selfplay_train\.py[^\n#]*', joined)
+    assert blocks, "run.txt 未找到 selfplay_train 命令"
+    bad = [b for b in blocks if '--onnx-model' in b]
+    assert not bad, "以下 RL 命令仍带 --onnx-model（会崩溃）:\n  " + "\n  ".join(bad)
+
+
+def test_rl_commands_are_parseable():
+    """run.txt 里的 selfplay_train 命令必须真能解析（防止又写出无效参数）。"""
+    import subprocess
+    txt = open(RUN_TXT, encoding='utf-8').read()
+    bs = chr(92)
+    joined = txt.replace(bs + chr(10), ' ')
+    blocks = re.findall(r'python scripts/selfplay_train\.py[^\n#]*', joined)
+    assert blocks, "run.txt 未找到 selfplay_train 命令"
+    env = dict(os.environ, PYTHONUTF8='1')
+    for b in blocks:
+        toks = [t.rstrip(bs) for t in b.split()[2:]]
+        r = subprocess.run([sys.executable, SFT_SRC] + toks + ['--help'],
+                           capture_output=True, text=True, env=env, cwd=ROOT)
+        # --help 会在参数校验后立即退出；非 0 且含 unrecognized 即为无效参数
+        assert 'unrecognized arguments' not in r.stderr, \
+            f"以下 RL 命令含无效参数:\n  {' '.join(toks)}\n  {r.stderr.strip()[-200:]}"
+

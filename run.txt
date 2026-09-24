@@ -9,6 +9,54 @@
 # ============================================================
 
 # ============================================================
+# ⓪ 推荐训练参数（与 run.py 内置配置一致）
+# ============================================================
+# 下表是"当前推荐"，与 run.py 的 default_argv 保持一致（run.py 是代码入口，
+# 以它为准）。下方 ②③④ 的方案 A/B/C 是不同硬件配置的变体，不是推荐值。
+#
+# 【硬件前提，务必先看】
+#   · 910A 无 BF16  → NPU 一律 FP16 + GradScaler（代码已自动处理，勿手改）
+#   · NPU 上 torch.compile(inductor) 不可用 → SFT 的 --compile 对 NPU 无效
+#   · NPU 注意力走手写 math（sdpa_force_math=True），CANN 的 Flash 后端不稳
+#   · NPU 的 pin_memory 关闭 → 双缓冲 H2D 只在 CUDA 生效
+#
+# 【SFT 推荐（单卡 A100 40G，BF16 + flash-attn）】
+#   --batch-size 4096          与 lr 0.00256 配套（平方根缩放律），显存不足
+#                              按 1600 + --gradient-accumulation-steps 2 降
+#   --lr 0.00256               勿单独改 batch 或 lr，否则线性缩放失效
+#   --epochs 2                 配合 --early-stop 1 --early-stop-patience 3
+#   --attn-mode window_global --attn-window 7
+#   --compile 1 --compile-mode reduce-overhead   算子融合
+#   --use-amp 1 --use-ema 1
+#   --prefetch-workers 32 --prefetch-depth 32    数据预取
+#   --eval-every 2000 --save-every 1000          省时间与磁盘
+#   注意：--attn-window 5（下方方案 A）与本推荐 7 不一致；window_global 模式
+#         统一用 7，方案 A 的 5 是 4 卡 NPU 场景的旧取值。
+#
+# 【RL 推荐（1 卡 910A 训练 + 8 进程 CPU 搜索）】
+#   标注 [默认] 的即代码默认值，不传也是这个值；标注 [刻意下调] 的需要显式传，
+#   是为 19 路 + 8 进程 CPU 预算主动压低的（改了会显著变慢）。
+#   --td 1 [默认]                TD C+E 价值标签；--td 0 为旧 tanh 基线
+#   --batch-size 256 [默认]      NPU 甜点（显存约 2-3x 旧 64）
+#   --mcts-vector-backup 1 [默认] 回传 numpy 批量（数值等价原实现）
+#   --grad-accum-steps 1 [默认]  保持现状；开 4 需同时 --lr 0.0015~0.002
+#   --sims 48 [刻意下调]         默认 400。19 路每步模拟数，直接用默认会慢到
+#                               不可用；48 是 8 进程 CPU 上的可用档
+#   --expand-topk 16 [刻意下调]  默认 64。展开候选截断，16 已足够且省 4x 前向
+#   --parallel-games 8 --mcts-threads 3           24 核：8×3≈24
+#   ⚠ --spec-prefetch 1 是默认值，但只有 --mcts-threads>=4 时才真正生效；
+#     当前 3 线程下不启用，想用要调到 4 以上（注意会挤占 CPU 给 8 进程）
+#   ⚠ 不要传 --onnx-model：当前实现把 .onnx 路径当 torch 权重 torch.load，
+#     而 ONNX 是 protobuf 格式，启动即抛 UnpicklingError（已实测）。
+#     自对弈推理目前与训练共用同一个 torch 模型（MCTS 推理也在 NPU 上跑），
+#     功能可用但不是 CPU/ONNX 加速路径。
+#
+# 【验证状态】
+#   已在本机（CPU）9x9 冒烟验证：TD 0/1、grad-accum 1/4、vector-backup 0/1
+#   全部跑通且 loss 正常收敛；mcts-vector-backup 0/1 结果逐位一致。
+#   未在 910A/A100 实测：所有耗时与吞吐数字（见文末"性能基准"）均为估算。
+
+# ============================================================
 # 环境变量（启动前设置）
 # ============================================================
 export OMP_NUM_THREADS=3
@@ -115,12 +163,14 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
 #       --mcts-vector-backup 默认 1（MCTS 回传 numpy 批量，数值等价原实现）。
 # 提速选项：--grad-accum-steps 4（梯度累积，等效 batch×4、step÷4，
 #            启用时建议同时 --lr 0.0015 ~ 0.002）；默认 1 保持现状。
+# ⚠ 下面命令**不要**加 --onnx-model：当前实现用 torch.load 读 .onnx 会直接
+#   抛 UnpicklingError（ONNX 是 protobuf 格式）。自对弈推理与训练共用同一个
+#   torch 模型，功能可用，但没有 CPU/ONNX 加速。详见 ⓪ 节说明。
 # 标准模式：8进程并行
 python scripts/selfplay_train.py \
   --board-size 19 --iters 20 --sims 48 \
   --parallel-games 8 \
   --mcts-threads 3 \
-  --onnx-model models/sft_19x19_v17.onnx \
   --batch-cap 64 \
   --expand-topk 16 \
   --td 1 \
@@ -136,7 +186,6 @@ python scripts/selfplay_train.py \
   --board-size 19 --iters 20 --sims 48 \
   --parallel-games 8 \
   --mcts-threads 3 \
-  --onnx-model models/sft_19x19_v17.onnx \
   --batch-cap 64 \
   --td 1 \
   --games-per-iter 20 \
