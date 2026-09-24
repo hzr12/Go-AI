@@ -299,6 +299,39 @@ def test_swanlab_install_failure_does_not_abort_training():
 
 
 # --------------------------------------------------------------------------- #
+# 学习率标定：统一按平方根缩放律，从「有效 batch」推导
+# --------------------------------------------------------------------------- #
+def _sft_env(txt):
+    """从 SFT 脚本抽出 (WORLD_SIZE, BATCH, LR) 三个变量。"""
+    env = {}
+    for m in re.finditer(r'^(WORLD_SIZE|BATCH|LR)=([0-9.]+)', txt, re.M):
+        env[m.group(1)] = m.group(2)
+    return env
+
+
+@pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
+def test_sft_scripts_lr_follows_sqrt_scaling_of_effective_batch():
+    """每个 SFT 脚本的 LR 必须等于 0.00356×√(有效batch/2500)。
+
+    有效 batch = BATCH × WORLD_SIZE。改变卡数或每卡 batch 时 LR 必须同步调整，
+    否则等效学习率漂移（多卡尤其明显：2 卡有效 6400、4 卡有效 12800）。
+    """
+    import math
+    sft = [f for f in _existing_sh() if f.startswith('train_sft')]
+    assert sft, '未找到 SFT 脚本'
+    for f in sft:
+        txt = open(os.path.join(SHELL_DIR, f), encoding='utf-8').read()
+        env = _sft_env(txt)
+        assert set(env) == {'WORLD_SIZE', 'BATCH', 'LR'}, \
+            f"{f} 缺少 WORLD_SIZE/BATCH/LR 变量定义（实得 {sorted(env)}）"
+        ws, batch, lr = int(env['WORLD_SIZE']), int(env['BATCH']), float(env['LR'])
+        eff = batch * ws
+        expect = 0.00356 * math.sqrt(eff / 2500)
+        assert abs(lr - expect) < 5e-5, \
+            f"{f} LR={lr} 与有效 batch={eff} 的平方根缩放预期 {expect:.5f} 不符"
+
+
+# --------------------------------------------------------------------------- #
 # .sh 里的参数必须真能被对应训练脚本解析
 # --------------------------------------------------------------------------- #
 def _script_args(txt):
