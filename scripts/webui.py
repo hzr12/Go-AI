@@ -731,6 +731,7 @@ const N = 19, PAD = 34, CS = (660 - PAD * 2) / (N - 1);
 const cv = document.getElementById('bd'), ctx = cv.getContext('2d');
 let S = null, thinking = false;
 let ripple = null, lastStateKey = null, toastTimer = null;
+let hover = null;   // 鼠标悬停交叉点（落子虚影），{r,c} 或 null
 
 const STARS = [[3,3],[3,9],[3,15],[9,3],[9,9],[9,15],[15,3],[15,9],[15,15]].filter(
   (v,i,a) => a.findIndex(x => x[0]===v[0]&&x[1]===v[1]) === i);
@@ -841,6 +842,16 @@ function draw(){
       ctx.fillText(label, p.x, q.y);
       ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
     }
+  }
+  // ---- 鼠标落子虚影：半透明棋子提示「点这里会落在此处」 ----
+  if (hover && S.board[hover.r*N+hover.c] === 0){
+    // 该点若为候选着法（上面画了 visits 数字），虚影更淡以免遮挡读数
+    const isCand = candsList.some(cd => cd.r === hover.r && cd.c === hover.c);
+    ctx.save();
+    ctx.globalAlpha = isCand ? 0.28 : 0.45;
+    drawStone(S.human_color, xy(hover.c), xy(hover.r), R);
+    ctx.restore();
+    ctx.globalAlpha = 1;
   }
 }
 
@@ -1045,19 +1056,48 @@ function parseCoord(s){
   return r * N + c;
 }
 
-cv.addEventListener('click', async (e) => {
-  if (thinking || !S || S.over || S.to_play !== S.human_color) return;
+// 鼠标事件坐标 → 画布 660 内部坐标（click 与 mousemove 共用）
+function canvasPoint(e){
   const rect = cv.getBoundingClientRect();
-  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  return {mx: e.clientX - rect.left, my: e.clientY - rect.top};
+}
+
+// 命中交叉点判定：click 与 mousemove 共用，保证「看得见虚影就点得中」
+function hitTest(mx, my){
   const c = Math.round((mx - PAD)/CS), r = Math.round((my - PAD)/CS);
-  if (r<0||r>=N||c<0||c>=N) return;
+  if (r<0||r>=N||c<0||c>=N) return null;
   const p = xy(c), q = xy(r);
-  if (Math.hypot(mx-p.x, my-q.y) > CS*0.45) return;
-  if (S.board[r*N+c] !== 0) return;
+  if (Math.hypot(mx-p.x, my-q.y) > CS*0.45) return null;
+  if (!S || S.board[r*N+c] !== 0) return null;
+  return {r, c};
+}
+
+// 当前是否处于「人可落子」状态（虚影与点击的共同前置条件）
+function humanCanPlay(){
+  return !thinking && S && !S.over && S.to_play === S.human_color;
+}
+
+cv.addEventListener('click', async (e) => {
+  if (!humanCanPlay()) return;
+  const {mx, my} = canvasPoint(e);
+  const hit = hitTest(mx, my);
+  if (!hit) return;
   setBusy(true);
-  const st = await post('/api/human_move', {move: r*N+c});
+  const st = await post('/api/human_move', {move: hit.r*N+hit.c});
   if (st && !st.over && st.to_play !== S.human_color) await aiTurn();
   setBusy(false);
+});
+
+// ---- 鼠标落子虚影：仅在「轮到人走 + 该交叉点为空」时显示半透明棋子 ----
+cv.addEventListener('mousemove', (e) => {
+  const {mx, my} = canvasPoint(e);
+  const hit = humanCanPlay() ? hitTest(mx, my) : null;
+  const changed = (!!hit !== !!hover) || (hit && hover && (hit.r !== hover.r || hit.c !== hover.c));
+  hover = hit;
+  if (changed) draw();
+});
+cv.addEventListener('mouseleave', () => {
+  if (hover){ hover = null; draw(); }
 });
 
 // 坐标输入落子
@@ -1155,15 +1195,17 @@ document.getElementById('sims').disabled =
 """
 
 
-def main():
+def build_parser():
+    """构建 webui 的完整参数解析器。
+
+    修复：原先 main() 在只注册完 --model/--ver 后就调用 ap.parse_args()，导致其后
+    注册的 --port/--num-threads/--mode/... 全部报 "unrecognized arguments"。
+    现在所有 add_argument 都在返回前完成，main() 只负责解析。
+    """
     ap = argparse.ArgumentParser(description="Go-AI WebUI（19 路人机对弈 + MCTS 可视化）")
     ap.add_argument("--model", default="models/sft_19x19_v17.pth")
     ap.add_argument("--ver", default="v17",
                     help="模型版本号 (用于 --model 默认值)")
-    # 兼容旧版 --model 参数，如果指定了 --model 则覆盖默认值
-    args = ap.parse_args()
-    if not args.model or args.model == "models/sft_19x19_v17.pth":
-        args.model = f"models/sft_19x19_{args.ver}.pth"
     ap.add_argument("--board-size", type=int, default=19)
     ap.add_argument("--device", default="auto")
     ap.add_argument("--port", type=int, default=7860)
@@ -1216,7 +1258,14 @@ def main():
     ap.add_argument("--rollout-lambda", type=float, default=0.25)
     ap.add_argument("--rollout-steps", type=int, default=None,
                     help="单次 rollout 最大步数（默认 2×N²；CPU 19 路建议 60-120 控制耗时）")
-    args = ap.parse_args()
+    return ap
+
+
+def main():
+    args = build_parser().parse_args()
+    # 兼容旧版 --model：未显式指定时按 --ver 推导默认权重路径
+    if not args.model or args.model == "models/sft_19x19_v17.pth":
+        args.model = f"models/sft_19x19_{args.ver}.pth"
 
     model_path = args.model
     if not os.path.isfile(model_path):
