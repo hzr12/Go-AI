@@ -363,6 +363,26 @@ def build(src, board_size, max_games, chunk_size=0, out=None, tmp_root=None):
                 pass
             print(f"[build] 流式合并完成：{chunk_idx} 个分片 -> {out}（{n_samples} 样本）", flush=True)
             return out, n_games, skip
+    else:
+        # 全量模式（chunk_size=0）：把全部样本攒在内存里，一次性返回 dict。
+        # 这段循环原先被错放在 `if streaming:` 里面，而 main() 的全量分支
+        # 不传 chunk_size（默认 0），导致一个 source 都不遍历，随后抛出
+        # 误导性的「未解析到任何有效棋谱，请检查 --src 与 --board-size」。
+        for s in sources:
+            try:
+                stream = iter_sgf_bytes(s)
+            except Exception as e:
+                print(f"[build] 跳过分片 {s}：{e}")
+                continue
+            for name, raw in stream:
+                if max_games and n_games >= max_games:
+                    break
+                n_samp, sk = _emit(name, raw)
+                if sk:
+                    skip += sk
+                else:
+                    n_games += 1
+                    game_id_counter += 1
     if n_games == 0:
         raise RuntimeError("未解析到任何有效棋谱，请检查 --src 与 --board-size")
     data = {
