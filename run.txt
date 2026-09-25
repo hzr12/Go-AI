@@ -383,8 +383,28 @@ python scripts/eval_elo.py \
 # policy head（19路 action=362）:
 #   128ch 3层=172,673 | 128ch 2层=24,961 | 64ch 3层=49,473
 #
-# 旧记录里的 V12/V16 数字已无法复现（对应配置未留存），不再作为对照基准。
-# 若要重新建立基线，请用实际实例化测量，不要手算或沿用旧值。
+# 旧记录里的 V17 数字无法复现（对应配置未留存），不再作为对照基准。
+# V12 已从 models/sft_19x19_v12.pth 反推确证（见下），可直接复核：
+#   python scripts/inspect_ckpt.py models/sft_19x19_v12.pth --emit-flags
+#
+# V12 实测架构（从 checkpoint 反推 + 重建后 strict 加载完全一致）:
+#   - Backbone: 192ch，17 块 mix 模式，块序列 A R R R R A R R R R R A R R R R A
+#     （4 个 AttentionResBlock 穿插在 13 个 ResBlock 之间）
+#   - Value:    64ch × 2 blocks
+#   - Policy:   32ch × 2 层（1x1 -> 1x1）
+#   - Total:    12,652,834 (12.65M)
+#   注意 V12 的 value 头用旧版键名 value.res1/res2，当前代码是
+#   value.res_blocks.0/1；inspect_ckpt.py 会自动重映射。
+#
+# V12 与 v18 的 backbone 块数相同（都是 17），但构成不同:
+#                V12                     v18
+#   Attention   4 块                    5 块
+#   ResBlock    13 块                   8 块
+#   ConvNeXt    0 块                    4 块
+#   backbone    12.40M                  11.19M
+#   value       0.26M (64ch×2)           1.50M (96ch×8)
+#   policy      0.006M (32ch×2)          0.173M (128ch×3)
+#   合计        12.65M                  12.86M
 #
 # SFT 训练:
 #   - batch=2800（每卡）× 4 卡 = 有效 11200，LR 0.00754
