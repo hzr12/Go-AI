@@ -29,6 +29,12 @@ PREFETCH_D=16         # 在途 batch 数；每个约 49MB(B=2800)，16→约0.78
 DATA=data/sgf_19x19_full.npz
 OUT=models/sft_19x19_v18_npu1.pth
 C2NET=1               # 1=启用 OpenI 启智平台对接；平台已自带数据/输出时改 0
+
+# NPU TorchAir 图编译（受控实验，默认关）。1=开启，失败自动回退 eager。
+# 开启前请注意：常驻显存已 26.7~31.1GB/32GB，图模式的 workspace 可能再炸；
+# 且本环境为 torch 2.1.0 / torch_npu 2.1.0.post3 / CANN 8.0.RC1（2023 年代），
+# 图编译功能成熟度存疑。**建议先短跑几十步验证再决定是否长训。**
+NPU_GRAPH_COMPILE=0
 # GradScaler 策略。910A 走 FP16 + GradScaler，默认从 65536 起步要靠减半
 # 向下搜平衡点（每次溢出白扔一个 batch），实测本模型平衡于 512~2048。
 # 直接给 1024 起步并把回涨间隔设成 100000（约等于关闭），避免缩放值在平衡点
@@ -62,6 +68,7 @@ torchrun --nproc_per_node="$WORLD_SIZE" scripts/train_sft.py \
   --attention-dropout 0.1 --label-smoothing 0.1 \
   --gradient-accumulation-steps 1 \
   --use-amp 1 --use-ema 1 \
+  --npu-graph-compile "$NPU_GRAPH_COMPILE" \
   --scaler-init-scale "$SCALER_INIT" --scaler-growth-interval "$SCALER_GROWTH" \
   --prefetch-workers "$PREFETCH_W" --prefetch-depth "$PREFETCH_D" \
   --log-every 50 --swanlab-every 10 --eval-every 2000 --save-every 500 \

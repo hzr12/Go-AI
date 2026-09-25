@@ -786,6 +786,16 @@ def main():
                     help='连续多少个无溢出 step 后把缩放值翻倍'
                          '（0=用 PyTorch 默认 2000；设一个大值如 100000 即'
                          '相当于关闭回涨，让缩放值稳定在 init-scale 附近）')
+    ap.add_argument('--npu-graph-compile', type=int, default=0, choices=[0, 1],
+                    help='NPU 上用 TorchAir 图编译替代 eager（受控实验）。'
+                         'NPU 上 inductor 不可用，必须显式传 torchair backend；'
+                         'torch_npu 须先于 torchair 导入，否则图模式会静默降级为'
+                         'eager 而不报错。失败自动回退 eager。'
+                         '⚠ 显存风险：本项目 4 卡 910A 常驻已达 26.7~31.1GB/32GB，'
+                         '图模式的 workspace 与图缓冲可能再炸；且实测环境为 '
+                         'torch 2.1.0 / torch_npu 2.1.0.post3 / CANN 8.0.RC1，'
+                         '属 2023 年代组合，功能成熟度存疑。故默认关闭，'
+                         '建议先短跑验证(0=关闭, 1=开启)')
     ap.add_argument('--compile', type=int, default=0, choices=[0, 1],
                     help='用 torch.compile 融合算子（GPU 上约 20-40%% 提速，首次迭代较慢）(0=关闭, 1=开启)')
     ap.add_argument('--compile-mode', default='default',
@@ -1013,7 +1023,7 @@ def main():
         compile_disable_sparse = True
         if args.compile == 1:
             logger.warning("[device] NPU 上 torch.compile(inductor) 不可用，已忽略 --compile；"
-                           "如需图编译请用 torchair (torch_npu.experimental_config)。")
+                           "如需图编译请改用 --npu-graph-compile 1（TorchAir 后端）。")
             args.compile = False
     else:
         # CPU 或其他：纯 FP32，无 AMP、无 channels_last
@@ -1023,6 +1033,13 @@ def main():
         sdpa_force_math = True
         compile_disable_sparse = True
         logger.info("[device] CPU | 走 FP32 路径（无 AMP/编译）")
+
+    # NPU 图编译（TorchAir）开关。与 --compile 互斥：NPU 上 inductor 不可用，
+    # 两条路径都需要显式指定 backend，不能同时开。
+    _npu_graph = (args.npu_graph_compile == 1 and _backend == 'npu')
+    if args.npu_graph_compile == 1 and _backend != 'npu':
+        logger.warning("[device] --npu-graph-compile 仅对 NPU 生效，当前后端为 %s，"
+                       "已忽略。", _backend)
 
     # 把注意力后端/编译开关透传给 backbone 模块（所有分支统一设置）
     from src.networks import backbone as _backbone
@@ -1278,7 +1295,46 @@ def main():
     # torch.compile 融合算子（GPU 上约 20-40%% 提速）。必须在 resume 加载之后再做，
     # 否则模型会被包成 OptimizedModule，其 state_dict 带 "_orig_mod." 前缀，与
     # checkpoint 的 "backbone.xxx" 不匹配导致 load 失败。
-    if args.compile == 1:
+    # NPU TorchAir 图编译（受控实验）。与 --compile 互斥：NPU 上 inductor 不可用，
+    # 两条路径都必须显式指定 backend，不能同时开。位置同样在 resume 加载之后——
+    # 图编译会把模型包起来，state_dict 带 "_orig_mod." 前缀，先编译再加载权重
+    # 会因键名不匹配而失败。
+    #
+    # 背景：4 卡 910A 实测 NPU 报 Aicore Usage Rate 85~100%，而实际只有
+    # 659 samples/s/卡。AICore 一直「忙」但产出极低，是 eager 小算子的典型形态。
+    # 图编译是唯一可能带来量级提升的路径。
+    #
+    # 三条硬约束（都有测试守护）：
+    #   1. torch_npu 必须先于 torchair 导入——否则图模式**静默降级为 eager**
+    #      且不报错，等于白开还白付预热代价；
+    #   2. 不传 mode/options——昇腾 NPU 不支持，且 reduce-overhead 正是 A100
+    #      上 OOM 的元凶（CUDA Graphs 私有内存池不归还），NPU 上同样避开；
+    #   3. 任何失败都回退 eager——常驻已 26.7~31.1GB/32GB，图模式的 workspace
+    #      与图缓冲极易再炸，绝不能让整个训练崩掉。
+    if _npu_graph:
+        try:
+            import torch_npu  # noqa: F401  顺序要求：必须先于 torchair
+            import torchair
+            _tacfg = torchair.CompilerConfig()
+            _npui = torchair.get_npu_backend(compiler_config=_tacfg)
+            model = torch.compile(model, backend=_npui, dynamic=False)
+            # 预热前向必须与真实训练一致地包 autocast：FP32 输入干灌会报
+            # flash-attn 只接受 fp16/bf16，导致图编译被误判为不可用而回退 eager，
+            # 且这个误判极难排查。
+            with torch.no_grad(), maybe_autocast(device, amp_dtype):
+                _dummy = torch.zeros(1, 12, args.board_size, args.board_size,
+                                    device=device)
+                model(_dummy)
+            logger.info("[train] NPU TorchAir 图编译已启用")
+        except Exception as e:  # noqa: BLE001
+            # 真正回退 eager：剥离 OptimizedModule 包装，恢复原始模块引用
+            model = getattr(model, '_orig_mod', model)
+            logger.warning("[train] NPU TorchAir 图编译失败，回退 eager: %s", e)
+            if isinstance(e, ImportError):
+                logger.warning("[train] 常见原因：torchair 随 torch_npu 附带，"
+                               "不可单独 pip install；同时需确认 CANN 的 ATC/ACL "
+                               "路径可见（镜像内通常已 source set_env.sh）")
+    elif args.compile == 1:
         if hasattr(torch, 'compile'):
             try:
                 # 4 个注意力块实例 × window/sparse 两个禁用点 × train/eval 两态，

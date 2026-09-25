@@ -33,6 +33,12 @@ DATA=data/sgf_19x19_full.npz
 OUT=models/sft_19x19_v19_npu4.pth
 C2NET=1
 
+# NPU TorchAir 图编译（受控实验，默认关）。1=开启，失败自动回退 eager。
+# 开启前请注意：常驻显存已 26.7~31.1GB/32GB，图模式的 workspace 可能再炸；
+# 且本环境为 torch 2.1.0 / torch_npu 2.1.0.post3 / CANN 8.0.RC1（2023 年代），
+# 图编译功能成熟度存疑。**建议先短跑几十步验证再决定是否长训。**
+NPU_GRAPH_COMPILE=0
+
 # ---- 为什么是这一档 ----
 # v18 是 12.86M / 8.49G FLOPs / 31.2G 显存（32GB 卡的 97.3%，已在悬崖边）。
 # 本档 8.77M / 5.97G / 26.7G，吞吐约 4012 samples/s（v18 的 1.52×）。
@@ -82,6 +88,7 @@ torchrun --nproc_per_node="$WORLD_SIZE" scripts/train_sft.py \
   --attention-dropout 0.1 --label-smoothing 0.1 \
   --gradient-accumulation-steps 1 \
   --use-amp 1 --use-ema 1 \
+  --npu-graph-compile "$NPU_GRAPH_COMPILE" \
   --scaler-init-scale "$SCALER_INIT" --scaler-growth-interval "$SCALER_GROWTH" \
   --prefetch-workers "$PREFETCH_W" --prefetch-depth "$PREFETCH_D" \
   --log-every 50 --swanlab-every 10 --eval-every 500 --save-every 250 \
