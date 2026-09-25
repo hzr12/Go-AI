@@ -406,6 +406,44 @@ python scripts/eval_elo.py \
 #   policy      0.006M (32ch×2)          0.173M (128ch×3)
 #   合计        12.65M                  12.86M
 #
+# ============================================================
+# v19：约 8.77M 参数的精简档（shell/train_sft_npu_4card_v19.sh）
+# ============================================================
+# 动机：v18 是 12.86M / 8.49G FLOPs / 31.12GB（32GB 卡的 97.3%），已在悬崖边。
+#
+# 实测（scripts/search_arch.py，激活显存用 saved_tensors_hooks 精确计量
+#       反向真正保留的底层 storage，已用 v18 的 31.12GB 标定，误差 0.0%）:
+#   配置        参数      FLOPs   显存@B3000  最大B  samples/s
+#   v18 原样    12.86M    8.49G    31.2G(B2800)  2819   2635
+#   v19         8.77M     5.97G    26.7G       3232   4012   (1.52x)
+#
+# 保留了什么（有意为之）:
+#   · backbone_channels 192 —— V12 唯一验证过 top1≈50% 的宽度
+#   · attn_blocks 5         —— 与 v18 相同，Go 更吃全局关系
+#   · attn_window 5         —— 实测显存最优（ws=3 因 nW=49 暴涨到 38.5G）
+# 砍了什么:
+#   · res_blocks      8 -> 4
+#   · convnext_blocks 4 -> 2
+#   · value_res_blocks 8 -> 3（value head 不受 --use-checkpoint 保护，
+#     每块约 0.46GB 线性吃显存；且它是二分类输出，缩小近乎不损准确率）
+#   · batch 2800 -> 3000（用省下的显存换吞吐）
+#   · LR 0.00754 -> 0.00780（0.00356×√(12000/2500)，平方根缩放律）
+#
+# ⚠ 容量比 v18 少 32%，**这是有代价的取舍**。准确率无法本地测量，
+#   首次跑务必与 v18 的 step-1800 快照（top1=0.2820）对比 loss / top1 轨迹。
+#
+# 9M 参数带内的其他候选（吞吐差异仅约 6%，故应按准确率因素而非速度选）:
+#   160ch 16块 r4c4a8   8.66M  4577 s/s   注意力最多
+#   192ch 11块 r4c2a5   8.77M  4322 s/s   **保 192 宽 + 5 注意力（推荐）**
+#   192ch 10块 r0c1a8   8.58M  4647 s/s   最快但一个 ResBlock 都没有，不推荐
+#   176ch 14块 r7c3a4   8.64M  4416 s/s
+#
+# 工具:
+#   python scripts/search_arch.py --calibrate
+#   python scripts/search_arch.py --curve
+#   python scripts/search_arch.py --sweep value_res_blocks
+#   python scripts/inspect_ckpt.py <ckpt.pth> --emit-flags
+#
 # SFT 训练:
 #   - batch=2800（每卡）× 4 卡 = 有效 11200，LR 0.00754
 #   - 910A 是 32GB 卡：batch=3200 实测 OOM，2800 可用

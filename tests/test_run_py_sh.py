@@ -393,20 +393,76 @@ def _npu_sft():
 
 
 @pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
-def test_npu_scripts_batch_within_proven_limit():
-    """NPU 每卡 BATCH 不得超过 2800。
+def test_npu_scripts_fit_memory_budget():
+    """NPU 每卡脚本的预测显存必须低于 32GB 卡的上限。
 
-    910A 是 32GB 卡，实测 batch=3200 在 backward 的 BatchMatMul 申请
-    1.46GB 时 rtMalloc 失败（driver error:out of memory），2800 可用。
-    每卡显存与卡数无关，故 1/2/4 卡同一条上界。
+    这里**不再**用「BATCH <= 某个数」这种硬编码上限：那个 2800 是从 v18 结构
+    （value 96x8 + attn-window 5 + 12.86M 参数）推出来的，对别的结构并不成立。
+    改为用 scripts/search_arch.py 的实测显存模型判断——该模型已用 v18 的
+    实测占用 31.12GB 标定过（误差 0.0%）。
+
+    保留的实证事实：同一 v18 结构下 B=3200 确实 OOM 过（backward 的
+    BatchMatMul 申请 1.46GB 时 rtMalloc 失败），模型外推 35.7G > 32G，与之相符。
+    """
+    import sys as _sys
+    _sys.path.insert(0, ROOT)
+    _sys.path.insert(0, os.path.join(ROOT, 'scripts'))
+    import search_arch as _sa
+
+    got = _npu_sft()
+    assert got, '未找到 NPU SFT 脚本'
+    for f in got:
+        txt = open(os.path.join(SHELL_DIR, f), encoding='utf-8').read()
+        code = '\n'.join(l for l in txt.splitlines()
+                         if not l.lstrip().startswith('#'))
+
+        def _int(flag, default=None):
+            m = re.search(r'--' + flag + r'\s+(\d+)', code)
+            if m:
+                return int(m.group(1))
+            m = re.search(r'(?m)^' + flag.upper().replace('-', '_')
+                          + r'=(\d+)', code)
+            if m:
+                return int(m.group(1))
+            if default is not None:
+                return default
+            raise AssertionError('{} 缺少 {}'.format(f, '--' + flag))
+
+        cfg = dict(_sa.ANCHOR['cfg'],
+                   backbone_channels=_int('backbone-channels'),
+                   res_blocks=_int('res-blocks', 0),
+                   convnext_blocks=_int('convnext-blocks', 0),
+                   attn_blocks=_int('attn-blocks', 0),
+                   value_channels=_int('value-channels', 64),
+                   value_res_blocks=_int('value-res-blocks', 3),
+                   policy_channels=_int('policy-channels', 32),
+                   policy_layers=_int('policy-layers', 2),
+                   attn_window=_int('attn-window', 5))
+        batch = int(re.search(r'(?m)^BATCH=(\d+)', txt).group(1))
+        r = _sa.project(cfg, batch)
+        assert r['total_gb'] < 32.0, \
+            '{}: B={} 预测显存 {:.1f}GB 超过 32GB 卡上限'.format(
+                f, batch, r['total_gb'])
+
+
+@pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
+def test_value_head_depth_is_memory_bounded():
+    """value head 深度必须受显存约束。
+
+    ValueNetwork 的 ResBlock **不受 --use-checkpoint 保护**（只有 backbone 有），
+    每块约 0.46GB 线性吃显存。实测 96ch x 11 blocks = 32.7G，已越过 32GB 上限。
+    上限取 8：那是 v18 跑得动的深度（31.12G），不是推荐值——新配置应取 3。
     """
     got = _npu_sft()
     assert got, '未找到 NPU SFT 脚本'
     for f in got:
         txt = open(os.path.join(SHELL_DIR, f), encoding='utf-8').read()
-        b = int(re.search(r'(?m)^BATCH=(\d+)', txt).group(1))
-        assert b <= 2800, \
-            f'{f} BATCH={b} 超出 910A 32GB 实测安全值 2800'
+        m = re.search(r'--value-res-blocks\s+(\d+)', txt)
+        if m:
+            v = int(m.group(1))
+            assert v <= 8, \
+                '{} --value-res-blocks={} 过大（96ch x 11 实测 32.7G 越界）'.format(
+                    f, v)
 
 
 @pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
@@ -453,17 +509,27 @@ def test_sft_scripts_attn_window_is_5():
 
 
 @pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
-def test_sft_scripts_value_res_blocks_8():
-    """--value-res-blocks 必须是 8。
+def test_sft_scripts_value_res_blocks_bounded():
+    """NPU 脚本的 --value-res-blocks 不得超过 8（32GB 卡的显存约束）。
 
+    早期版本把这条写成「所有 SFT 脚本必须为 8」，那是两处问题：
+      1. 从 v18 单点配置推出的，不适用于别的结构——v19 用 3 块；
+      2. 误伤了 A100——它是 40GB 卡，11 块本来就没问题。
     ValueNetwork 的 ResBlock **不受 --use-checkpoint 保护**（只有 backbone 有），
-    是最大一块常驻激活，11→8 约省 1.2~1.8GB。910A 只有 32GB，这点很关键。
+    每块约 0.46GB 线性吃显存；96ch x 11 实测 32.7G，已越过 32GB 上限。
+    真正的判据是显存，见 test_npu_scripts_fit_memory_budget。
     """
-    sft = [f for f in _existing_sh() if f.startswith('train_sft')]
-    for f in sft:
+    got = _npu_sft()
+    assert got, '未找到 NPU SFT 脚本'
+    for f in got:
         txt = open(os.path.join(SHELL_DIR, f), encoding='utf-8').read()
-        assert re.search(r'--value-res-blocks\s+8\b', txt), \
-            f'{f} 应使用 --value-res-blocks 8（value head 不受 checkpoint 保护）'
+        # 必须剥注释：说明文字里会出现「11→8」这类对照，会被误当成实际取值
+        code = '\n'.join(l for l in txt.splitlines()
+                         if not l.lstrip().startswith('#'))
+        m = re.search(r'--value-res-blocks\s+(\d+)', code)
+        assert m, f'{f} 未指定 --value-res-blocks'
+        assert int(m.group(1)) <= 8, \
+            f'{f} --value-res-blocks={m.group(1)} 过大（96ch x 11 实测 32.7G 越界）'
 
 
 @pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
