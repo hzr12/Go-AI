@@ -52,11 +52,18 @@
 #   --mcts-vector-backup 1 [默认] 回传 numpy 批量（数值等价原实现）
 #   --grad-accum-steps 1 [默认]  保持现状；开 4 需同时 --lr 0.0015~0.002
 #   --sims 48 [刻意下调]         默认 400。19 路每步模拟数，直接用默认会慢到
-#                               不可用；48 是 8 进程 CPU 上的可用档
-#   --expand-topk 16 [刻意下调]  默认 64。展开候选截断，16 已足够且省 4x 前向
-#   --parallel-games 8 --mcts-threads 3           24 核：8×3≈24
+#                               不可用；48 是多进程 CPU 上的可用档
+#   --expand-topk 16 [刻意上调]  默认 8。展开候选数直接乘在每模拟成本上（每个
+#                               候选各跑一次 rollout）。9 路实测 sims/s：
+#                               topk=8 约 7.9、16 约 5.7、32 约 4.6；旧默认 64
+#                               仅约 2.7。嫌慢就保持默认 8，棋力换速度
+#   ⚠ dynamic-topk 生效时实际取 min(阶段上限, --expand-topk)，阶段上限为
+#     8→16→32。默认 8 时全程恒为 8，搜索后期不再精细化；设 16 可得 8→16→16
+#   --parallel-games 24 --mcts-threads 1        24 核：进程数取物理核数、每进程
+#     1 线程。MCTS 是"多线程选路径 + 单线程做全部重活"的结构，实测加线程几乎
+#     无收益（threads=1/2/3 在噪声内），8×3 明显不如 24×1 或 12×2
 #   ⚠ --spec-prefetch 1 是默认值，但只有 --mcts-threads>=4 时才真正生效；
-#     当前 3 线程下不启用，想用要调到 4 以上（注意会挤占 CPU 给 8 进程）
+#     按上面的推荐（1 线程）它不会启用，这是有意的取舍
 #   ⚠ 不要传 --onnx-model：当前实现把 .onnx 路径当 torch 权重 torch.load，
 #     而 ONNX 是 protobuf 格式，启动即抛 UnpicklingError（已实测）。
 #     自对弈推理目前与训练共用同一个 torch 模型（MCTS 推理也在 NPU 上跑），
@@ -250,7 +257,8 @@ python scripts/selfplay_train.py \
 #   --no-augment {0,1}      关闭 8 对称增强；默认 0（开启）
 #
 # --- MCTS 搜索质量 ---
-#   --expand-topk N         展开候选截断（CPU 推荐 32-64）；默认 64
+#   --expand-topk N         展开候选截断；默认 8。该值乘在每模拟成本上，
+#                          调大显著变慢（旧默认 64 时 9 路仅 2.7 sims/s）
 #   --expand-chunk N        展开期 α-β 界截断块（0=关闭）；默认 0
 #   --c-puct F              PUCT 探索系数；默认 2.0
 #   --virtual-loss F        虚拟损失系数；默认 8.0
@@ -272,7 +280,8 @@ python scripts/selfplay_train.py \
 # --- Rollout ---
 #   --use-rollout {0,1}     LightPLS rollout；默认 0
 #   --rollout-lambda F      rollout 融合权重；默认 0.25
-#   --rollout-steps N       rollout 最大步数；默认 60
+#   --rollout-steps N       rollout 最大步数；默认 30。不传时 MCTS 会退化为
+#                          2*N*N（19 路 722 步），故 worker 路径必须显式传值
 #   --use-diverse-rollout {0,1}  4 种温度轮换；默认 0
 #
 # --- 异步流水线（生成与训练并行）---

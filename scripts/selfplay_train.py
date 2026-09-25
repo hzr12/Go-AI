@@ -563,8 +563,13 @@ def main():
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--value-lr-mult", type=float, default=0.5,
                     help="value head 学习率倍率")
-    ap.add_argument("--expand-topk", type=int, default=64,
-                    help="MCTS 展开候选截断（CPU 推荐 32-64）")
+    ap.add_argument("--expand-topk", type=int, default=8,
+                    help="MCTS 展开候选截断。默认 8（实测工作点）：每次模拟要为"
+                         "每个候选各跑一次 rollout，该值直接乘在每模拟成本上。"
+                         "注意 dynamic-topk 生效时实际取 min(阶段上限, 本值)，"
+                         "故本值为 8 时全程恒为 8，搜索后期的精细化阶段被取消；"
+                         "若要保留部分后期爬升可设 16（8→16→16）。"
+                         "调大会显著变慢：64 时 9 路实测仅 2.72 sims/s")
     ap.add_argument("--expand-chunk", type=int, default=0,
                     help="展开期 α-β 界截断块大小（0=关闭）")
     
@@ -592,7 +597,11 @@ def main():
     ap.add_argument("--use-rollout", type=int, default=0, choices=[0, 1],
                     help="启用 LightPLS rollout (0=关闭, 1=开启)")
     ap.add_argument("--rollout-lambda", type=float, default=0.25, help="rollout 融合权重")
-    ap.add_argument("--rollout-steps", type=int, default=60, help="rollout 最大步数")
+    ap.add_argument("--rollout-steps", type=int, default=30,
+                    help="rollout 最大步数。默认 30（实测工作点）：rollout 是纯 "
+                         "Python 规则推演，开销随步数线性增长，且与 expand-topk "
+                         "相乘。旧默认 60；不传时 MCTS 会退化为 2*N*N"
+                         "（19 路 722 步，超支约 12 倍）")
     
     # 并行生成
     ap.add_argument("--result-queue-max", type=int, default=100,

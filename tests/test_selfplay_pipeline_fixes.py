@@ -632,3 +632,85 @@ def test_sample_move_only_returns_legal_range():
     for _ in range(200):
         mv = policy.sample_move(b, rng)
         assert 0 <= mv <= 81, '非法下标 {}'.format(mv)
+
+
+# --------------------------------------------------------------------------- #
+# 10. 自对弈工作点默认值（实测驱动）
+# --------------------------------------------------------------------------- #
+
+def _argparse_defaults():
+    import ast
+    path = os.path.join(ROOT, 'scripts', 'selfplay_train.py')
+    with open(path, encoding='utf-8') as fh:
+        tree = ast.parse(fh.read())
+    out = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        if not (isinstance(fn, ast.Attribute) and fn.attr == 'add_argument'):
+            continue
+        if not node.args or not isinstance(node.args[0], ast.Constant):
+            continue
+        for kw in node.keywords:
+            if kw.arg == 'default' and isinstance(kw.value, ast.Constant):
+                out[node.args[0].value] = kw.value.value
+    return out
+
+
+def test_selfplay_workload_defaults_are_reasonable():
+    """工作点默认值必须反映实测，而不是拍脑袋。
+
+    旧默认 expand_topk=64 + rollout_steps=60：每次模拟要为 64 个子节点各跑
+    60 步 rollout。实测 9 路 sims/s 仅 2.72；而 topk=8 + rollout 30 可达约
+    3 倍。该值直接乘在每模拟成本上，是当前最大的单一杠杆。
+    """
+    d = _argparse_defaults()
+    assert d.get('--expand-topk') == 8, \
+        '--expand-topk 默认应为 8（实测工作点），实际 {}'.format(
+            d.get('--expand-topk'))
+    assert d.get('--rollout-steps') == 30, \
+        '--rollout-steps 默认应为 30，实际 {}'.format(
+            d.get('--rollout-steps'))
+
+
+def test_bench_defaults_match_production_defaults():
+    """基准工具必须衡量实际要跑的工作点。
+
+    bench_mcts.py 曾用 expand_topk=32 / rollout_steps=60，而生产默认是 64/60，
+    于是"基准显示没变"而"生产其实更慢"——这类漂移会让人得出错误结论。
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        '_bench_mcts_probe',
+        os.path.join(ROOT, 'scripts', 'bench_mcts.py'))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    bench_defaults = vars(mod.build_parser().parse_args([]))
+    prod = _argparse_defaults()
+    for bench_flag, prod_flag in (('expand_topk', '--expand-topk'),
+                                  ('rollout_steps', '--rollout-steps')):
+        assert bench_defaults[bench_flag] == prod[prod_flag], (
+            'bench_mcts.py 的 {}={} 与生产默认 {}={} 不一致'.format(
+                bench_flag, bench_defaults[bench_flag],
+                prod_flag, prod[prod_flag]))
+
+
+def test_expand_topk_8_flattens_the_dynamic_ramp():
+    """记录一个必须让使用者知道的副作用。
+
+    _dynamic_topk 用 min(阶段上限, expand_topk)：expand_topk=64 时实际被封顶到
+    32，且随进度 8→16→32 爬升；改成 8 之后全程恒为 8，搜索后期的精细化阶段
+    被取消。这是选择该工作点所付出的棋力代价。
+    """
+    ai = RecordingAI(50)
+    m = MCTS(ai, board_size=7, num_threads=1, expand_topk=8,
+             dynamic_topk=True)
+    seen = {m._dynamic_topk(s, 100) for s in (0, 20, 50, 80, 99)}
+    assert seen == {8}, 'expand_topk=8 时各阶段应恒为 8，实际 {}'.format(seen)
+
+    m64 = MCTS(ai, board_size=7, num_threads=1, expand_topk=64,
+               dynamic_topk=True)
+    ramp = [m64._dynamic_topk(s, 100) for s in (0, 20, 50, 80, 99)]
+    assert ramp == [8, 8, 16, 32, 32], \
+        'expand_topk=64 时的爬升行为被改动了，实际 {}'.format(ramp)

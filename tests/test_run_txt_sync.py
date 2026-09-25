@@ -226,10 +226,12 @@ def test_recommended_defaults_match_code(opt, expect):
     ('--expand-topk', '16'),
 ])
 def test_recommended_overrides_are_flagged_in_doc(opt, override):
-    """刻意偏离默认值的推荐项，⓪ 节必须显式标注 [刻意下调] 并写出真实默认值。
+    """刻意偏离默认值的推荐项，⓪ 节必须显式标注偏离并写出真实默认值。
 
-    这些值不是代码默认（如 --sims 默认 400），靠"不传"是拿不到的，必须显式传。
-    若有人误把它们"修正"回默认值，测试会失败。
+    这些值不是代码默认（如 --sims 默认 400、--expand-topk 默认 8），靠"不传"
+    是拿不到的，必须显式传。若有人误把它们"修正"回默认值，测试会失败。
+
+    标注词随方向而定（下调/上调），故只要求出现「刻意」二字。
     """
     import inspect
     import scripts.selfplay_train as st
@@ -238,7 +240,7 @@ def test_recommended_overrides_are_flagged_in_doc(opt, override):
                   r'[\'"].*?default=([^\n,]+)', src, re.S)
     code_val = m.group(1).strip().rstrip(')')
     assert code_val != override, \
-        f"{opt} 现在默认值就是 {override}，⓪ 节不应再标 [刻意下调]"
+        f"{opt} 现在默认值就是 {override}，⓪ 节不应再标为刻意偏离"
 
     txt = open(RUN_TXT, encoding='utf-8').read()
     start = txt.find('⓪ 推荐训练参数')
@@ -246,7 +248,7 @@ def test_recommended_overrides_are_flagged_in_doc(opt, override):
     sec = txt[start:end if end != -1 else len(txt)]
     line = next((l for l in sec.splitlines() if opt in l), None)
     assert line, f"⓪ 节缺少 {opt} 的说明行"
-    assert '[刻意下调]' in line, f"{opt} 是刻意覆盖默认值，必须标注 [刻意下调]"
+    assert '刻意' in line, f"{opt} 是刻意覆盖默认值，必须标注刻意偏离"
     assert override in line, f"{opt} 说明行未写出推荐值 {override}"
     assert f'默认 {code_val}' in line, \
         f"{opt} 说明行未写出真实默认值（默认 {code_val}），读者无法分辨"

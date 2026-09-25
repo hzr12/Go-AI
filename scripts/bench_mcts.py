@@ -14,6 +14,9 @@
     python scripts/bench_mcts.py --model <ckpt> --no-rollout
     python scripts/bench_mcts.py --model <ckpt> --threads 1 --threads 3
 
+⚠ expand-topk / rollout-steps 的默认值必须与 selfplay_train.py 的生产默认保持
+一致，否则基准衡量的就不是实际要跑的工作点（tests 里有一条守卫测试盯着这点）。
+
 输出
 ----
     每组配置打印 sims/s 的 mean/min/max，以及（--profile 时）按累计耗时
@@ -48,8 +51,8 @@ def build_parser():
     p.add_argument('--warmup', type=int, default=1, help='预热次数（不计入统计）')
     p.add_argument('--threads', type=int, nargs='+', default=[1, 3],
                    help='要测的 MCTS 线程数组合')
-    p.add_argument('--expand-topk', type=int, default=32)
-    p.add_argument('--rollout-steps', type=int, default=60)
+    p.add_argument('--expand-topk', type=int, default=8)
+    p.add_argument('--rollout-steps', type=int, default=30)
     p.add_argument('--temperature', type=float, default=1.0)
     p.add_argument('--no-rollout', action='store_true', help='关闭 rollout')
     p.add_argument('--profile', action='store_true',
