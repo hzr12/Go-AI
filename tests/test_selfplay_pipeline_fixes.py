@@ -811,6 +811,28 @@ def test_cpu_linear_workaround_is_bitwise_equivalent():
     assert torch.equal(lin(x), _cpu_linear_matmul(x, lin.weight))
 
 
+def test_probe_cpu_linear_detects_healthy_path():
+    """自检必须能真实跑通一次 nn.Linear——它就是"垫片是否生效"的判据。
+
+    该环境的故障是静默的，只能靠真跑一次确认。健康环境下自检必须为真，
+    否则说明探针本身写错了，会给出误导性的 FAIL。
+    """
+    import torch.nn.functional as F
+    from src.inference import probe_cpu_linear
+    real_linear = getattr(F.linear, '_goai_original', F.linear)
+    try:
+        F.linear = real_linear
+        ok, detail = probe_cpu_linear()
+        assert ok, '健康环境下自检应通过，实际: {}'.format(detail)
+        # 装上垫片后也必须通过
+        from src.inference import install_cpu_linear_workaround
+        install_cpu_linear_workaround(device='cpu', verbose=False)
+        ok2, detail2 = probe_cpu_linear()
+        assert ok2, '安装垫片后自检应通过，实际: {}'.format(detail2)
+    finally:
+        F.linear = real_linear
+
+
 def test_workaround_is_idempotent():
     """重复安装必须是空操作（幂等），避免反复替换包装函数。"""
     import torch.nn.functional as F

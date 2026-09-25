@@ -50,7 +50,23 @@ def _cpu_linear_matmul(input, weight, bias=None):
     return out + bias
 
 
-def install_cpu_linear_workaround(device=None):
+def probe_cpu_linear():
+    """实际跑一次 nn.Linear，确认 CPU 路径真的可用。返回 (ok, 说明)。
+
+    该环境的故障是静默的：垫片装没装、装了有没有生效，光看代码看不出来，
+    只能真跑一次。凡是新建 CPU GoAI 都打这一行，让日志能自证。
+    """
+    try:
+        import torch.nn as _nn
+        probe = _nn.Linear(2, 1)
+        out = probe(torch.zeros(1, 2))
+        return (tuple(out.shape) == (1, 1)), 'nn.Linear 形状 {}'.format(
+            tuple(out.shape))
+    except Exception as exc:  # noqa: BLE001
+        return False, repr(exc)[:120]
+
+
+def install_cpu_linear_workaround(device=None, verbose=True):
     """CPU 推理时安装 F.linear 垫片；非 CPU 设备不动。
 
     NPU/CUDA 上的 linear 是好的（走各自的真实算子），绝不能被替换。
@@ -65,6 +81,10 @@ def install_cpu_linear_workaround(device=None):
     # 记录原函数，便于测试复位、也便于必要时还原
     shim._goai_original = F.linear
     F.linear = shim
+    if verbose:
+        ok, detail = probe_cpu_linear()
+        print('[inference] 已安装 F.linear 垫片(matmul 实现) 自检={} {}'.format(
+            'OK' if ok else 'FAIL', detail), file=sys.stderr, flush=True)
     return True
 
 
