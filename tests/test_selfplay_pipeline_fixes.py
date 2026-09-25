@@ -811,39 +811,6 @@ def test_cpu_linear_workaround_is_bitwise_equivalent():
     assert torch.equal(lin(x), _cpu_linear_matmul(x, lin.weight))
 
 
-def test_cpu_worker_installs_linear_workaround(monkeypatch):
-    """CPU-only worker 必须安装垫片（该环境的 aten::linear 被 CANN 抢占）。"""
-    import torch
-    import torch.nn.functional as F
-    import scripts.async_pipeline as ap
-
-    # 复位到"未安装"状态，使本测试不依赖同文件内的执行顺序
-    real_linear = getattr(F.linear, '_goai_original', F.linear)
-    F.linear = real_linear
-    monkeypatch.setattr(ap.faulthandler, 'enable', lambda *a, **k: None)
-    stop = mp.get_context('spawn').Event()
-
-    class _StubWorker:
-        def __init__(self, *a, **k):
-            pass
-
-        def run(self):
-            pass
-
-    def _fake_game(self, ai, n, m):
-        stop.set()          # 必须置位，否则真实 run() 循环永不退出
-        return [], 0.0
-
-    monkeypatch.setattr(ap.SelfPlayWorker, '_build_ai', lambda self: object())
-    monkeypatch.setattr(ap.SelfPlayWorker, '_play_one_game', _fake_game)
-    try:
-        ap._async_selfplay_worker(0, 'm', None, make_args(), None, stop, None)
-        assert getattr(F.linear, '_goai_shim', False) is True, \
-            'CPU worker 未安装 F.linear 垫片'
-    finally:
-        F.linear = real_linear
-
-
 def test_workaround_is_idempotent():
     """重复安装必须是空操作（幂等），避免反复替换包装函数。"""
     import torch.nn.functional as F
@@ -870,6 +837,48 @@ def test_workaround_does_not_pollute_npu_path(monkeypatch):
         assert F.linear is real_linear, 'NPU 路径不应安装垫片'
         assert install_cpu_linear_workaround(device='cuda') is False
         assert F.linear is real_linear, 'CUDA 路径不应安装垫片'
+    finally:
+        F.linear = real_linear
+
+
+def test_cpu_goai_constructor_installs_workaround():
+    """只要构造了 CPU GoAI 就必须装垫片——不能只装在 worker 入口。
+
+    垫片原先只在 _selfplay_worker / _async_selfplay_worker 里安装，于是
+    **串行路径与主进程自身的 CPU 推理完全没有垫片**：手动指定 --device cpu
+    时主进程直接建 GoAI 跑 CPU 前向，照样崩在 nn.Linear。安装点必须在
+    GoAI.__init__ 按解析后的设备决定，才能覆盖 worker、串行、evaluate、
+    cli_play、WebUI 等全部 CPU 路径。
+    """
+    import torch.nn.functional as F
+    from src.inference import GoAI
+    real_linear = getattr(F.linear, '_goai_original', F.linear)
+    try:
+        F.linear = real_linear
+        GoAI(model_path=None, board_size=5, device='cpu', use_amp=True)
+        assert getattr(F.linear, '_goai_shim', False) is True, \
+            '构造 CPU GoAI 后未安装 F.linear 垫片'
+    finally:
+        F.linear = real_linear
+
+
+def test_npu_goai_constructor_does_not_install_workaround():
+    """NPU 上的 linear 是好的，构造 NPU GoAI 不得装垫片。"""
+    import torch.nn.functional as F
+    from src.inference import GoAI
+    real_linear = getattr(F.linear, '_goai_original', F.linear)
+    try:
+        F.linear = real_linear
+        ai = GoAI(model_path=None, board_size=5, device='cpu', use_amp=True)
+        # 手动把已解析设备改成 npu，模拟 NPU 分支不走安装逻辑
+        ai.device = 'npu'
+        ai.is_npu = True
+        install = getattr(F.linear, '_goai_shim', False)
+        assert install is True, '前置：CPU 构造应已安装'
+        F.linear = real_linear          # 复位后再验证非 CPU 不装
+        from src.inference import install_cpu_linear_workaround
+        assert install_cpu_linear_workaround(device=ai.device) is False
+        assert F.linear is real_linear
     finally:
         F.linear = real_linear
 

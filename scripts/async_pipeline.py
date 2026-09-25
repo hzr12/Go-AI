@@ -315,14 +315,8 @@ def _async_selfplay_worker(worker_id, model_path, onnx_model, args,
         torch.set_num_threads(1)
     except Exception:  # noqa: BLE001
         pass
-    # 某些 CANN 镜像会用 CANN 算子抢占 aten::linear，导致 CPU 上 nn.Linear
-    # 直接抛 "could not create a primitive descriptor for a matmul primitive"
-    #（同进程 mm/addmm/matmul/conv2d 均正常）。worker 恒为 CPU，故装等价垫片。
-    try:
-        from src.inference import install_cpu_linear_workaround
-        install_cpu_linear_workaround(device='cpu')
-    except Exception:  # noqa: BLE001
-        pass
+    # 注意：F.linear 垫片由 GoAI.__init__ 按解析后的设备统一安装
+    # （见 src/inference.py），worker 入口不再重复安装。
     SelfPlayWorker(worker_id, model_path, onnx_model, args, data_queue,
                    stop_event, progress_cb).run()
 

@@ -101,6 +101,9 @@ class GoAI:
                                "910A 用 torch_npu 1.11~2.1 均可）")
         # 910A 不支持 bf16，NPU 上一律 fp16 autocast；CPU 不开 amp
         self.use_amp = use_amp and (self.device.startswith("cuda") or self.is_npu)
+        # 安装点必须在这里（按解析后的设备），而不是各 worker 入口：串行路径与
+        # 主进程自身的 CPU 前向同样会踩到被 CANN 抢占的 aten::linear。
+        install_cpu_linear_workaround(device=self.device)
         if self.is_npu:
             print("[GoAI] Ascend NPU 推理：fp16 autocast（910A 无 bf16），"
                   "math 注意力，勿开 --compile。若每次启动 warmup 都超过 1 分钟，"
