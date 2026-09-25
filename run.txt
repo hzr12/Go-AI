@@ -64,8 +64,14 @@
 #     无收益（threads=1/2/3 在噪声内），8×3 明显不如 24×1 或 12×2
 #   ⚠ --spec-prefetch 1 是默认值，但只有 --mcts-threads>=4 时才真正生效；
 #     按上面的推荐（1 线程）它不会启用，这是有意的取舍
-#   ⚠ 不要传 --onnx-model：当前实现把 .onnx 路径当 torch 权重 torch.load，
-#     而 ONNX 是 protobuf 格式，启动即抛 UnpicklingError（已实测）。
+#   ⚠ 不要传 --onnx-model：当前实现把 .onnx 路径当 torch.load 读，会直接抛
+#     UnpicklingError（已实测）。
+#   ⚠ 不要把 --selfplay-device 设成 npu/cuda 配合 --parallel-games>1：仓库不做
+#     torch.npu.set_device 绑定，每个 worker 各建一个加速器运行时上下文且全部
+#     落在同一张卡上，并发建 matmul primitive 时实测崩：
+#     "could not create a primitive descriptor for a matmul primitive"。
+#     默认 cpu 即为正解——父进程用 --device 独占 NPU 训练，worker 走 CPU
+#     （NPU 仅占搜索约 17%，树/规则/rollout 本就 CPU 密集）。
 #     自对弈推理目前与训练共用同一个 torch 模型（MCTS 推理也在 NPU 上跑），
 #     功能可用但不是 CPU/ONNX 加速路径。
 #
@@ -230,7 +236,7 @@ python scripts/selfplay_train.py \
   --out models/az_best.pth
 
 # ============================================================
-# ③' RL 完整参数表（selfplay_train.py，53 项；默认值均取自 --help/源码）
+# ③' RL 完整参数表（selfplay_train.py，54 项；默认值均取自 --help/源码）
 # ============================================================
 # 用法：完整命令加 --help；下表为默认值，命令行显式传入即覆盖。
 #
@@ -295,7 +301,13 @@ python scripts/selfplay_train.py \
 #   --td-alpha-end F        α 调度终值（残局偏 v_td）；默认 0.9
 #
 # --- 设备 / 分布式 ---
-#   --device DEV            auto/cuda/npu/cpu；默认 auto
+#   --device DEV            训练设备 auto/cuda/npu/cpu；默认 auto
+#   --selfplay-device DEV   自对弈 worker 推理设备；默认 cpu。父进程用 --device
+#                          独占加速器训练。⚠ 不要设 npu/cuda 配合
+#                          --parallel-games>1：每个 worker 各建一个加速器运行时
+#                          上下文且仓库不做设备绑定，全挤同一张卡并发建算子
+#                          primitive，实测报 "could not create a primitive
+#                          descriptor for a matmul primitive"
 #   --ddp {0,1}             DDP 多卡（需 torchrun）；默认 0
 #   --streaming {0,1}       流式训练；默认 0
 #   --no-persist {0,1}      不写临时 npz；默认 0

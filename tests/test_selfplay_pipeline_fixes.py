@@ -674,10 +674,124 @@ def test_selfplay_workload_defaults_are_reasonable():
             d.get('--rollout-steps'))
 
 
+def test_async_worker_pins_torch_intraop_threads(monkeypatch):
+    """自对弈 worker 必须把 torch intra-op 线程钉为 1。
+
+    selfplay_train.py 从未调用 torch.set_num_threads()，而 torch 默认取
+    os.cpu_count()。--parallel-games N 就是 N×核数 个 intra-op 线程抢同样多的
+    核：8 worker × 24 核 = 192 线程抢 24 核，过度订阅会同时拖慢吞吐与尾延迟，
+    也会让 mcts-threads 的配比失去意义。实测不限线程比钉为 1 快 1.43~1.5x
+    （即钉为 1 后单进程变慢，但多进程总体大幅提速）。
+    """
+    import scripts.async_pipeline as ap
+
+    calls = []
+    stop = mp.get_context('spawn').Event()
+
+    class _StubWorker:
+        def __init__(self, *a, **k):
+            pass
+
+        def run(self):
+            calls.append('run')
+
+    def _fake_game(self, ai, n, m):
+        # 必须置位，否则 run() 的 `while not stop_event.is_set()` 会死循环
+        stop.set()
+        return [], 0.0
+
+    monkeypatch.setattr(ap.faulthandler, 'enable', lambda *a, **k: None)
+    monkeypatch.setattr(ap.SelfPlayWorker, '_build_ai', lambda self: object())
+    monkeypatch.setattr(ap.SelfPlayWorker, '_play_one_game', _fake_game)
+    monkeypatch.setattr(ap.torch, 'set_num_threads', lambda n: calls.append(n))
+    ap._async_selfplay_worker(0, 'm', None, make_args(), None, stop, None)
+    assert 1 in calls, 'worker 入口必须 torch.set_num_threads(1)'
+
+
+def test_sync_worker_pins_torch_intraop_threads(monkeypatch):
+    """同步 worker 同理。"""
+    import scripts.selfplay_train as st
+    calls = []
+
+    class _FakeAI:
+        def __init__(self, *a, **k):
+            pass
+
+    class _FakeQueue:
+        def put(self, item):
+            pass
+
+    monkeypatch.setattr(st, 'GoAI', _FakeAI)
+    monkeypatch.setattr(st, 'self_play_game', lambda *a, **k: ([], 0.0))
+    monkeypatch.setattr(st.torch, 'set_num_threads', lambda n: calls.append(n))
+    st._selfplay_worker(0, 'm.pth', make_args(rollout_steps=30), _FakeQueue())
+    assert 1 in calls, '同步 worker 必须 torch.set_num_threads(1)'
+
+
+def test_selfplay_device_default_is_cpu():
+    """自对弈 worker 默认必须用 CPU。
+
+    崩溃根因：worker 沿用训练设备（默认 auto → npu），而全仓库没有
+    torch.npu.set_device()，于是 N+1 个进程（父进程训练 + N worker）全部挤在
+    NPU 0 上、各自持有独立 CANN 上下文并发创建 matmul primitive，最终报
+    "could not create a primitive descriptor for a matmul primitive"。
+    """
+    d = _argparse_defaults()
+    assert d.get('--selfplay-device') == 'cpu', \
+        '--selfplay-device 默认应为 cpu（父进程独占加速器），实际 {}'.format(
+            d.get('--selfplay-device'))
+
+
+def test_resolve_selfplay_device_prefers_selfplay_device():
+    from scripts.selfplay_train import _resolve_selfplay_device
+    args = make_args(device='npu', selfplay_device='cpu', parallel_games=8)
+    assert _resolve_selfplay_device(args) == 'cpu'
+
+
+def test_shared_accelerator_across_workers_is_rejected():
+    """加速器 + 多 worker 必须直接报错，而不是走到 CANN 崩溃。"""
+    from scripts.selfplay_train import _resolve_selfplay_device
+    args = make_args(device='npu', selfplay_device='npu', parallel_games=8)
+    with pytest.raises(RuntimeError) as ei:
+        _resolve_selfplay_device(args)
+    msg = str(ei.value)
+    assert 'npu' in msg.lower() or '加速' in msg
+    assert 'selfplay-device' in msg, '报错应直接指明用哪个参数绕过'
+
+
+def test_single_worker_may_use_accelerator():
+    """只有 1 个 worker 时不存在多上下文竞争，应允许显式用加速器。"""
+    from scripts.selfplay_train import _resolve_selfplay_device
+    args = make_args(device='npu', selfplay_device='npu', parallel_games=1)
+    assert _resolve_selfplay_device(args) == 'npu'
+
+
+def test_sync_worker_builds_model_on_selfplay_device(monkeypatch):
+    """worker 建模型时必须用自对弈设备，而不是训练设备。"""
+    import scripts.selfplay_train as st
+    seen = {}
+
+    class _FakeAI:
+        def __init__(self, *a, **kw):
+            seen['device'] = kw.get('device')
+
+    class _FakeQueue:
+        def put(self, item):
+            pass
+
+    monkeypatch.setattr(st, 'GoAI', _FakeAI)
+    monkeypatch.setattr(st, 'self_play_game', lambda *a, **k: ([], 0.0))
+    st._selfplay_worker(0, 'm.pth', make_args(device='npu',
+                                               selfplay_device='cpu'),
+                        _FakeQueue())
+    assert seen['device'] == 'cpu', \
+        'worker 仍在用训练设备，实际 {}'.format(seen['device'])
+
+
 def test_bench_defaults_match_production_defaults():
     """基准工具必须衡量实际要跑的工作点。
 
-    bench_mcts.py 曾用 expand_topk=32 / rollout_steps=60，而生产默认是 64/60，
+    bench_mcts.py 曾用 expand_topk=32 / rollout_steps=60，与生产默认脱节，
     于是"基准显示没变"而"生产其实更慢"——这类漂移会让人得出错误结论。
     """
     import importlib.util

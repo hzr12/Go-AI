@@ -298,11 +298,42 @@ def compute_td_target(players, root_values, score, t,
 # --------------------------------------------------------------------------- #
 # 并行自对弈 worker
 # --------------------------------------------------------------------------- #
-def _selfplay_worker(gid, model_path, args, result_queue):
-    """单个自对弈进程。"""
-    device = args.device
+def _resolve_selfplay_device(args):
+    """解析自对弈 worker 的推理设备，并拦住会崩的组合。
+
+    根因（云端实测）：worker 原先直接沿用训练设备（--device 默认 auto → npu），
+    而全仓库没有 torch.npu.set_device()。于是 --parallel-games N 会产生 N+1 个
+    进程（父进程训练 + N 个 worker），每个持有独立 CANN 上下文却全部落在
+    NPU 0 上，并发创建 matmul primitive 时报
+    "could not create a primitive descriptor for a matmul primitive"。
+
+    因此：自对弈默认走 CPU，父进程独占加速器训练。NN 仅占搜索约 17%，而
+    树/规则/rollout 本就是 CPU 密集，24 个 CPU 核本来闲置。
+    """
+    device = getattr(args, 'selfplay_device', None) or 'cpu'
     if device == 'auto':
         device = _auto_select_device()
+    is_accel = device.startswith('npu') or device.startswith('cuda')
+    if is_accel and getattr(args, 'parallel_games', 1) > 1:
+        raise RuntimeError(
+            '自对弈设备 {} 与 --parallel-games {} 组合会崩溃：每个 worker 会各自'
+            '建立一个加速器运行时上下文，且仓库不做设备绑定，全部落在同一张卡上'
+            '并发创建算子 primitive，实测报 "could not create a primitive '
+            'descriptor for a matmul primitive"。请改用 --selfplay-device cpu'
+            '（推荐，父进程独占 {} 训练），或把 --parallel-games 降到 1。'
+            .format(device, args.parallel_games, getattr(args, 'device', 'auto')))
+    return device
+
+
+def _selfplay_worker(gid, model_path, args, result_queue):
+    """单个自对弈进程。"""
+    # torch 默认用 os.cpu_count() 个 intra-op 线程；N 个 worker 会变成
+    # N×核数 个线程抢核，必须钉为 1（理由同 async_pipeline 的 worker 入口）。
+    try:
+        torch.set_num_threads(1)
+    except Exception:  # noqa: BLE001
+        pass
+    device = _resolve_selfplay_device(args)
     
     # 每个进程独立加载模型（绕过 GIL）
     if args.onnx_model:
@@ -619,7 +650,15 @@ def main():
     
     # 设备
     ap.add_argument("--device", default="auto",
-                    help="设备选择：auto/cuda/npu/cpu")
+                    help="训练设备选择：auto/cuda/npu/cpu")
+    ap.add_argument("--selfplay-device", default="cpu",
+                    help="自对弈 worker 的推理设备：默认 cpu。父进程用 --device "
+                         "独占加速器训练，worker 走 CPU——NPU 只占搜索约 17%，"
+                         "而树/规则/rollout 本就 CPU 密集。⚠ 不要设为 npu/cuda "
+                         "配合 --parallel-games>1：每个 worker 会各建一个加速器"
+                         "运行时上下文且仓库不做设备绑定，全部挤同一张卡并发创建"
+                         "算子 primitive，实测报 'could not create a primitive "
+                         "descriptor for a matmul primitive'")
     
     ap.add_argument("--no-augment", type=int, default=0, choices=[0, 1],
                     help="关闭 8 对称增强 (0=开启, 1=关闭)")

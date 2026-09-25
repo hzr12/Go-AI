@@ -101,18 +101,41 @@ class SelfPlayWorker:
         """构建本 worker 的推理模型（独立加载，绕过 GIL）。"""
         from src.inference import GoAI
         if self.onnx_model:
-            return GoAI(
+            ai = GoAI(
                 model_path=self.onnx_model,
                 board_size=self.args.board_size,
                 device='cpu',
                 use_amp=False
             )
-        return GoAI(
-            model_path=self.model_path,
-            board_size=self.args.board_size,
-            device='cpu',
-            use_amp=True
-        )
+        else:
+            ai = GoAI(
+                model_path=self.model_path,
+                board_size=self.args.board_size,
+                device='cpu',
+                use_amp=True
+            )
+        self._report_device(ai)
+        return ai
+
+    def _report_device(self, ai):
+        """一次性打印模型与参数的真实设备。
+
+        云端出现过"CPU 张量却报 CANN 的 matmul primitive"（F.linear 处）。既然
+        `import torch` 后 torch_npu 并未自动加载、且同环境下纯 CPU matmul 正常，
+        那唯一还没被证实的前提就是"模型其实不在 CPU 上"。这个打印把该前提变成
+        可核对的事实，而不是推测。只在必要时打印，不进入热路径。
+        """
+        try:
+            param = next(ai.model.parameters())
+            dev = str(param.device)
+        except Exception as exc:  # noqa: BLE001
+            dev = '取不到({!r})'.format(exc)
+        print("[worker {}] 推理设备: 请求=cpu 参数={} torch_npu已加载={} "
+              "cann可见设备={!r}".format(
+                  self.worker_id, dev,
+                  'torch_npu' in sys.modules,
+                  os.environ.get('ASCEND_RT_VISIBLE_DEVICES')),
+              file=sys.stderr, flush=True)
 
     def _report_error(self, where, exc):
         """上报失败：写 stderr（flush）并累加共享错误计数。
@@ -282,6 +305,14 @@ def _async_selfplay_worker(worker_id, model_path, onnx_model, args,
     # 子进程里唯一能拿到栈的途径。
     try:
         faulthandler.enable()
+    except Exception:  # noqa: BLE001
+        pass
+    # torch 默认用 os.cpu_count() 个 intra-op 线程。不钉住的话，N 个 worker
+    # 就是 N×核数 个线程抢同样多的核（8 worker × 24 核 = 192 线程抢 24 核），
+    # 过度订阅会同时压低吞吐与尾延迟，也让 mcts-threads 的配比失去意义。
+    # MCTS 自身已有线程结构（选路径线程 + 消费线程），这里不再叠加。
+    try:
+        torch.set_num_threads(1)
     except Exception:  # noqa: BLE001
         pass
     SelfPlayWorker(worker_id, model_path, onnx_model, args, data_queue,
