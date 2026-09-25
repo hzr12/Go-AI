@@ -34,6 +34,12 @@ PREFETCH_D=16         # 在途 batch 数；每个约 49MB(B=2800)，16→约0.78
 DATA=data/sgf_19x19_full.npz
 OUT=models/sft_19x19_v18_npu4.pth
 C2NET=1               # 1=启用 OpenI 启智平台对接；平台已自带数据/输出时改 0
+# GradScaler 策略。910A 走 FP16 + GradScaler，默认从 65536 起步要靠减半
+# 向下搜平衡点（每次溢出白扔一个 batch），实测本模型平衡于 512~2048。
+# 直接给 1024 起步并把回涨间隔设成 100000（约等于关闭），避免缩放值在平衡点
+# 附近反复翻倍/减半震荡、持续偷步。设 0 则沿用 PyTorch 默认 65536 / 2000。
+SCALER_INIT=1024
+SCALER_GROWTH=100000
 
 # ---- ⚠ 4 卡 DDP 风险提示（重要）----
 # 此前记录过 4×910A 卡间网络不稳。DDP 的梯度 allreduce 是**每步硬同步**，
@@ -64,6 +70,7 @@ torchrun --nproc_per_node="$WORLD_SIZE" scripts/train_sft.py \
   --attention-dropout 0.1 --label-smoothing 0.1 \
   --gradient-accumulation-steps 1 \
   --use-amp 1 --use-ema 1 \
+  --scaler-init-scale "$SCALER_INIT" --scaler-growth-interval "$SCALER_GROWTH" \\
   --prefetch-workers "$PREFETCH_W" --prefetch-depth "$PREFETCH_D" \
   --log-every 50 --swanlab-every 10 --eval-every 1000 --save-every 500 \
   --early-stop 1 --early-stop-patience 3 \

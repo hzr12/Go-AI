@@ -94,6 +94,49 @@ def test_overflow_warning_threshold_exists():
     assert '首次跌破' in SRC, '缩放值跌破阈值时应只告警一次，避免刷屏'
 
 
+# --------------------------------------------------------------------------- #
+# 缩放值策略可配：不必每次都从 65536 猜下来，也不必在平衡点附近震荡
+# --------------------------------------------------------------------------- #
+def test_scaler_init_scale_and_growth_are_configurable():
+    assert "'--scaler-init-scale'" in SRC
+    assert "'--scaler-growth-interval'" in SRC
+    assert '_scaler_kwargs' in SRC
+    assert "init_scale" in SRC and "growth_interval" in SRC
+    # 默认不得改变既有行为（0 = 交给 PyTorch 默认 65536 / 2000）
+    m = re.search(r"'--scaler-init-scale',\s*type=float,\s*default=([\d.]+)", SRC)
+    assert m and float(m.group(1)) == 0.0, 'init-scale 默认应为 0（沿用 PyTorch 默认）'
+    m = re.search(r"'--scaler-growth-interval',\s*type=int,\s*default=(-?\d+)", SRC)
+    assert m and int(m.group(1)) == 0, 'growth-interval 默认应为 0（沿用 PyTorch 默认）'
+
+
+def test_npu_grad_scaler_forwards_kwargs():
+    """torch.npu.amp.GradScaler 必须能收到 init_scale / growth_interval。"""
+    assert 'def npu_grad_scaler(enabled: bool, **kwargs):' in SRC, \
+        'npu_grad_scaler 需接受并转发关键字参数，否则 NPU 上的配置无效'
+    assert 'torch.npu.amp.GradScaler(enabled=enabled, **kwargs)' in SRC
+
+
+def test_scaler_kwargs_actually_applied():
+    """配置非零时才传参，避免给不支持关键字的旧版后端传空 kwargs。"""
+    blk = SRC[max(0, SRC.index('_scaler_kwargs = {}') - 200):
+              SRC.index('npu_grad_scaler(enabled=use_scaler')]
+    assert 'if args.scaler_init_scale and args.scaler_init_scale > 0:' in blk, \
+        'init_scale 应有非零判断'
+    assert 'if args.scaler_growth_interval and args.scaler_growth_interval > 0:' in blk, \
+        'growth_interval 应有非零判断'
+
+
+def test_resume_may_override_scale():
+    """resume 会 load_state_dict 覆盖缩放值——这是预期行为，但需留有痕迹。
+
+    若用户从 checkpoint 续训并同时给了 --scaler-init-scale，后者会被
+    checkpoint 里的实际值盖掉。至少不应报错。
+    """
+    assert "scaler.load_state_dict(tstate['scaler'])" in SRC
+    assert 'except (RuntimeError, KeyError):' in SRC, \
+        'scaler 状态不兼容时应优雅降级（BF16->FP16 切换会不匹配）'
+
+
 def test_model_params_stay_fp32():
     """前提守卫：模型从未被转成 FP16。
 

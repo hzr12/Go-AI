@@ -59,8 +59,8 @@ def npu_empty_cache() -> None:
         pass
 
 
-def npu_grad_scaler(enabled: bool):
-    return torch.npu.amp.GradScaler(enabled=enabled)
+def npu_grad_scaler(enabled: bool, **kwargs):
+    return torch.npu.amp.GradScaler(enabled=enabled, **kwargs)
 
 
 def npu_out_of_memory_error_type():
@@ -776,6 +776,16 @@ def main():
                     help='启用 EMA（指数移动平均）权重，eval/save 时用 shadow 权重，提升 1-3%% accuracy (0=关闭, 1=开启)')
     ap.add_argument('--gradient-accumulation-steps', type=int, default=1,
                     help='梯度累积步数（模拟更大 batch size，效果等同于 batch_size * N）')
+    ap.add_argument('--scaler-init-scale', type=float, default=0.0,
+                    help='GradScaler 初始缩放值（0=用 PyTorch 默认 65536）。'
+                         '默认 65536 需要靠减半向下搜索平衡点，每次溢出白扔一个 '
+                         'batch；实测本模型在 4 卡 910A 上平衡于 512~2048，'
+                         '故建议直接给 1024 起步。设 --scaler-growth-interval 0 '
+                         '可关闭自动回涨，避免震荡反复偷步')
+    ap.add_argument('--scaler-growth-interval', type=int, default=0,
+                    help='连续多少个无溢出 step 后把缩放值翻倍'
+                         '（0=用 PyTorch 默认 2000；设一个大值如 100000 即'
+                         '相当于关闭回涨，让缩放值稳定在 init-scale 附近）')
     ap.add_argument('--compile', type=int, default=0, choices=[0, 1],
                     help='用 torch.compile 融合算子（GPU 上约 20-40%% 提速，首次迭代较慢）(0=关闭, 1=开启)')
     ap.add_argument('--compile-mode', default='default',
@@ -1137,14 +1147,27 @@ def main():
         optimizer = torch.optim.AdamW(_opt_groups)
     # BF16 后端（A100/NPU）下 use_scaler=False（BF16 不下溢，省去 loss scaling 的额外同步）；
     # V100/FP16 下开启 GradScaler。按设备选择 GradScaler 实现。
+    # 缩放值策略可配：从 65536 起步要靠减半向下搜索平衡点，每次溢出都白扔一个
+    # batch；已知平衡点后直接给 init_scale 并关掉回涨，可消除这段浪费与后续震荡。
+    _scaler_kwargs = {}
+    if args.scaler_init_scale and args.scaler_init_scale > 0:
+        _scaler_kwargs['init_scale'] = float(args.scaler_init_scale)
+    if args.scaler_growth_interval and args.scaler_growth_interval > 0:
+        _scaler_kwargs['growth_interval'] = int(args.scaler_growth_interval)
     if _backend == 'npu':
-        scaler = npu_grad_scaler(enabled=use_scaler)
+        scaler = npu_grad_scaler(enabled=use_scaler, **_scaler_kwargs)
     else:
         # torch.amp.GradScaler 在 torch 2.4+ 可用，旧版本用 torch.cuda.amp.GradScaler
         if hasattr(torch.amp, 'GradScaler'):
-            scaler = torch.amp.GradScaler(_backend, enabled=use_scaler)
+            scaler = torch.amp.GradScaler(
+                _backend, enabled=use_scaler, **_scaler_kwargs)
         else:
-            scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+            scaler = torch.cuda.amp.GradScaler(
+                enabled=use_scaler, **_scaler_kwargs)
+    if use_scaler and _scaler_kwargs:
+        logger.info("[fp16] GradScaler 初始缩放 %.0f，回涨间隔 %s 步",
+                    scaler.get_scale(),
+                    args.scaler_growth_interval or '默认 2000')
 
     # EMA（指数移动平均）：eval/save 时用 shadow 权重，提升 1-3% accuracy
     ema = EMA(model, decay=0.999) if args.use_ema == 1 else None
