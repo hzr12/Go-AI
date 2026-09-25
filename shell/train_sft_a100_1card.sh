@@ -34,10 +34,14 @@ C2NET=1               # 1=启用 OpenI 启智平台对接；平台已自带数�
 # 根因不是 batch 本身，而是 --compile-mode reduce-overhead：它走 CUDA Graphs，
 # 会维持一个**不归还**的私有内存池，在临界 batch 上直接吃光显存。
 # 去掉该参数（只留 --compile 1）后 3500 实测通过。
-# 另外两处：--value-res-blocks 11→8（value head 不受 --use-checkpoint 保护，
-# 是最大一块常驻激活）、--attn-window 5→7。
-# ⚠ 降显存不要动 --attn-window：window_global 显存正比于 nW×(ws²+ng)，
-#   而 ng=ceil(19/ws)² 在 ws 变小时暴涨（ws=3 比 ws=7 差 5.4×），要往大调。
+# 另外一处：--value-res-blocks 11→8（value head 不受 --use-checkpoint 保护，
+# 是最大一块常驻激活）。
+# --attn-window 固定 5，不要改：实测（B=2800/heads=4/d=48）
+#   ws=3  QK 28.6M + AV 47M = 76M MACs，但注意力激活约 3.1GB（爆）
+#   ws=5  QK 184M + AV 215M = 399M MACs，注意力激活约 1.07GB  ← 最优
+#   ws=7  QK 287M + AV 237M = 524M MACs，注意力激活约 1.13GB
+# ws=5 比 ws=7 少 31% 计算而显存持平。此前「ws 要往大调」的说法只按
+# nW×(ws²+ng) 估 K/V 序列、漏掉了查询维 ws²，结论是反的。
 
 torchrun --nproc_per_node="$WORLD_SIZE" scripts/train_sft.py \
   --data "$DATA" \
@@ -49,7 +53,7 @@ torchrun --nproc_per_node="$WORLD_SIZE" scripts/train_sft.py \
   --batch-size "$BATCH" --epochs 1 \
   --lr "$LR" --weight-decay 0.0001 \
   --attention-mode mix --num-attention-layers 4 --num-heads 4 \
-  --attn-mode window_global --attn-window 7 \
+  --attn-mode window_global --attn-window 5 \
   --attention-dropout 0.1 --label-smoothing 0.1 \
   --gradient-accumulation-steps 1 \
   --use-amp 1 --use-ema 1 \

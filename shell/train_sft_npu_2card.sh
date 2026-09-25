@@ -18,18 +18,17 @@ python -m pip install swanlab -q || \
   echo "[warn] swanlab 安装失败（多为无外网），将仅用 stdout 记录指标"
 
 # ---- 可调参数 ----
-# 每卡 batch 保持较高（3200）以榨干单卡算力，有效 batch = BATCH × WORLD_SIZE。
-# 有效 batch 6400（单卡 910A 的 2 倍），故 LR 需按平方根缩放律同步上调，
-# 否则等效学习率偏小、学得过于保守。
+# 910A 是 32GB 卡：BATCH=3200 实测 OOM（backward 的 BatchMatMul 申请 1.46GB
+# 时 rtMalloc 失败），BATCH=2800 实测可用。每卡显存与卡数无关，故 1/2/4 卡
+# 的每卡安全上限都是 2800。
 # 统一标定式：LR = 0.00356 × √(有效batch / 2500)
-#   → 0.00356 × √(6400/2500) = 0.00570
-# 若改为可比单卡的配置（BATCH=1600，有效 3200），LR 应回到 0.00403。
+#   → 0.00356 × √(5600/2500) = 0.00533
 # 有效 batch = BATCH × WORLD_SIZE
 WORLD_SIZE=2
-BATCH=3200            # 每卡 3200 × 2 卡 = 有效 6400
-LR=0.00570            # 按有效 batch 6400 标定：0.00356×√(6400/2500)
+BATCH=2800            # 每卡 2800 × 2 卡 = 有效 5600
+LR=0.00533            # 按有效 batch 5600 标定：0.00356×√(5600/2500)
 PREFETCH_W=12         # 每 rank 12 个，2 卡合计 24（对齐 24 核，避免进程超订）
-PREFETCH_D=16         # 在途 batch 数；每个约 53MB(B=3200)，16→约0.85GB/rank
+PREFETCH_D=16         # 在途 batch 数；每个约 49MB(B=2800)，16→约0.78GB/rank
 DATA=data/sgf_19x19_full.npz
 OUT=models/sft_19x19_v18_npu2.pth
 C2NET=1               # 1=启用 OpenI 启智平台对接；平台已自带数据/输出时改 0
@@ -44,7 +43,8 @@ C2NET=1               # 1=启用 OpenI 启智平台对接；平台已自带数�
 #   独立加载数据集，而 --data 是 required=True，非 rank 0 拿不到路径会直接退出）。
 #   日志已按 is_main 过滤，不会刷重复行。若 c2net 的 prepare() 有写盘副作用，
 #   正确修法是挪到 init_process_group 之后由 rank 0 调用再广播路径。
-# ⚠ 降显存不要动 --attn-window：要往大调而不是往小调。
+# --attn-window 固定 5：实测 ws=5 比 ws=7 少 31% MACs 而显存持平
+#   （ws=3 虽更省算但注意力激活约 3.1GB，会爆）。
 
 torchrun --nproc_per_node="$WORLD_SIZE" scripts/train_sft.py \
   --data "$DATA" \
@@ -56,7 +56,7 @@ torchrun --nproc_per_node="$WORLD_SIZE" scripts/train_sft.py \
   --batch-size "$BATCH" --epochs 1 \
   --lr "$LR" --weight-decay 0.0001 \
   --attention-mode mix --num-attention-layers 4 --num-heads 4 \
-  --attn-mode window_global --attn-window 7 \
+  --attn-mode window_global --attn-window 5 \
   --attention-dropout 0.1 --label-smoothing 0.1 \
   --gradient-accumulation-steps 1 \
   --use-amp 1 --use-ema 1 \

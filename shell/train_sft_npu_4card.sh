@@ -18,19 +18,19 @@ python -m pip install swanlab -q || \
   echo "[warn] swanlab 安装失败（多为无外网），将仅用 stdout 记录指标"
 
 # ---- 可调参数 ----
-# 每卡 batch 保持较高（3200）以榨干单卡算力，有效 batch = BATCH × WORLD_SIZE。
-# 有效 batch 12800（单卡 910A 的 4 倍），故 LR 需按平方根缩放律同步上调，
-# 否则等效学习率明显偏小、学得过于保守。
+# 910A 是 32GB 卡：BATCH=3200 实测 OOM（backward 的 BatchMatMul 申请 1.46GB
+# 时 rtMalloc 失败，报 driver error:out of memory），BATCH=2800 实测可用。
+# 每卡显存与卡数无关，故 1/2/4 卡的每卡安全上限都是 2800。
+# 有效 batch = BATCH × WORLD_SIZE；LR 按平方根缩放律同步。
 # 统一标定式：LR = 0.00356 × √(有效batch / 2500)
-#   → 0.00356 × √(12800/2500) = 0.00806
-# 若改为可比单卡的配置（BATCH=800，有效 3200），LR 应回到 0.00403。
+#   → 0.00356 × √(11200/2500) = 0.00754
 WORLD_SIZE=4
-BATCH=3200             # 每卡 3200 × 4 卡 = 有效 12800
-LR=0.00806            # 按有效 batch 12800 标定：0.00356×√(12800/2500)
+BATCH=2800            # 每卡 2800 × 4 卡 = 有效 11200
+LR=0.00754            # 按有效 batch 11200 标定：0.00356×√(11200/2500)
 PREFETCH_W=6          # 每 rank 6 个，4 卡合计 24（对齐 24 核）。
                       # 注意：worker 是**每 rank** 各起这么多，早期写 32 时
                       # 4 卡会起 128 个数据构造进程挤 24 核，反而严重拖慢。
-PREFETCH_D=16         # 在途 batch 数；每个约 53MB(B=3200)，16→约0.85GB/rank
+PREFETCH_D=16         # 在途 batch 数；每个约 49MB(B=2800)，16→约0.78GB/rank
 DATA=data/sgf_19x19_full.npz
 OUT=models/sft_19x19_v18_npu4.pth
 C2NET=1               # 1=启用 OpenI 启智平台对接；平台已自带数据/输出时改 0
@@ -43,8 +43,8 @@ C2NET=1               # 1=启用 OpenI 启智平台对接；平台已自带数�
 # 每卡 batch 很小（800）时单卡利用率不高，4 卡的吞吐优势可能被通信开销抵消；
 # 若要追求吞吐，可提高 BATCH，但必须同步按平方根律提高 LR 并重新验证。
 #
-# 其它：每 rank 独立加载全量数据集，主机内存约为单卡的 4 倍；
-# 不传 --compile / --flash-attn（NPU 自动禁用）；降显存不要动 --attn-window。
+# --attn-window 固定 5：实测 ws=5 比 ws=7 少 31% MACs 而显存持平
+#   （ws=3 虽更省算但注意力激活约 3.1GB，会爆）。
 # C2NET 注意：prepare() 与 --data 覆盖**故意**在所有 rank 上执行（每个 rank 都要
 #   独立加载数据集，而 --data 是 required=True，非 rank 0 拿不到路径会直接退出）。
 #   日志已按 is_main 过滤，不会刷重复行。若 c2net 的 prepare() 有写盘副作用，
@@ -60,7 +60,7 @@ torchrun --nproc_per_node="$WORLD_SIZE" scripts/train_sft.py \
   --batch-size "$BATCH" --epochs 1 \
   --lr "$LR" --weight-decay 0.0001 \
   --attention-mode mix --num-attention-layers 4 --num-heads 4 \
-  --attn-mode window_global --attn-window 7 \
+  --attn-mode window_global --attn-window 5 \
   --attention-dropout 0.1 --label-smoothing 0.1 \
   --gradient-accumulation-steps 1 \
   --use-amp 1 --use-ema 1 \

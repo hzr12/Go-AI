@@ -373,8 +373,9 @@ def test_total_prefetch_workers_fit_machine_cores():
 def test_prefetch_depth_reasonable():
     """--prefetch-depth 决定在途 batch 数（内存），不宜过大。
 
-    每个在途 batch 是 float32 12×19×19×B（B=3200 时约 53 MB），depth=32 即
-    1.65 GB/rank。depth>16 收益递减（流水线早已覆盖一步计算），徒增内存。
+    每个在途 batch 是 float32 12×19×19×B（B=2800 时约 49 MB，B=3500 约 58 MB），
+    depth=16 即约 0.8 GB/rank。depth>16 收益递减（流水线早已覆盖一步计算），
+    徒增内存。
     """
     sft = [f for f in _existing_sh() if f.startswith('train_sft')]
     for f in sft:
@@ -382,6 +383,87 @@ def test_prefetch_depth_reasonable():
         d = int(re.search(r'(?m)^PREFETCH_D=(\d+)', txt).group(1))
         assert d <= 16, f"{f} PREFETCH_D={d} 过大（在途 batch 内存线性增长）"
         assert d >= 2, f"{f} PREFETCH_D={d} 过小，预取失去意义"
+
+
+# --------------------------------------------------------------------------- #
+# NPU 显存相关参数：910A 是 32GB 卡，有实测上界
+# --------------------------------------------------------------------------- #
+def _npu_sft():
+    return [f for f in _existing_sh() if f.startswith('train_sft_npu')]
+
+
+@pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
+def test_npu_scripts_batch_within_proven_limit():
+    """NPU 每卡 BATCH 不得超过 2800。
+
+    910A 是 32GB 卡，实测 batch=3200 在 backward 的 BatchMatMul 申请
+    1.46GB 时 rtMalloc 失败（driver error:out of memory），2800 可用。
+    每卡显存与卡数无关，故 1/2/4 卡同一条上界。
+    """
+    got = _npu_sft()
+    assert got, '未找到 NPU SFT 脚本'
+    for f in got:
+        txt = open(os.path.join(SHELL_DIR, f), encoding='utf-8').read()
+        b = int(re.search(r'(?m)^BATCH=(\d+)', txt).group(1))
+        assert b <= 2800, \
+            f'{f} BATCH={b} 超出 910A 32GB 实测安全值 2800'
+
+
+@pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
+def test_npu_scripts_drop_falsified_measured_claim():
+    """那句被 OOM 证伪的「910A 实测可用」必须消失。
+
+    B=3200 当时只是按内存公式估的，脚本却写成「910A 实测可用」，
+    后被 backward BatchMatMul 的 rtMalloc OOM 证伪。
+
+    只禁这一句**正面的**误称；「B=3200 实测 OOM」这类真实的负向结论
+    应当保留（它记录了实测边界）。BATCH 值本身由
+    test_npu_scripts_batch_within_proven_limit 把关。
+    """
+    for f in _npu_sft():
+        txt = open(os.path.join(SHELL_DIR, f), encoding='utf-8').read()
+        assert '910A 实测可用' not in txt, \
+            f'{f} 仍写着「910A 实测可用」——该结论已被 OOM 证伪'
+        # 只查行首的真实赋值（注释里记录「B=3200 实测 OOM」是合法且必要的）
+        assert re.search(r'(?m)^BATCH=3200', txt) is None, \
+            f'{f} 仍把 BATCH 实际赋值为 3200'
+
+
+@pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
+def test_sft_scripts_attn_window_is_5():
+    """--attn-window 必须是 5：实测本负载下它才是最优。
+
+    B=2800/heads=4/d=48 下的实测值：
+      ws=3  QK 28.6M + AV 47M = 76M MACs，注意力激活约 3.1GB（会爆）
+      ws=5  QK 184M + AV 215M = 399M MACs，注意力激活约 1.07GB  ← 最优
+      ws=7  QK 287M + AV 237M = 524M MACs，注意力激活约 1.13GB
+    ws=5 比 ws=7 少 31% 计算而显存持平。
+
+    此前文档写「ws 要往大调」，那是只按 nW×(ws²+ng) 估 K/V 序列、
+    漏掉查询维 ws² 得出的，结论是反的。
+    """
+    sft = [f for f in _existing_sh() if f.startswith('train_sft')]
+    assert sft, '未找到 SFT 脚本'
+    for f in sft:
+        txt = open(os.path.join(SHELL_DIR, f), encoding='utf-8').read()
+        assert re.search(r'--attn-window\s+5\b', txt), \
+            f'{f} 应使用 --attn-window 5（ws=7 多算 31% 而显存不省）'
+        assert '降显存不要动' not in txt, \
+            f'{f} 仍留有已证伪的 attn-window 建议'
+
+
+@pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
+def test_sft_scripts_value_res_blocks_8():
+    """--value-res-blocks 必须是 8。
+
+    ValueNetwork 的 ResBlock **不受 --use-checkpoint 保护**（只有 backbone 有），
+    是最大一块常驻激活，11→8 约省 1.2~1.8GB。910A 只有 32GB，这点很关键。
+    """
+    sft = [f for f in _existing_sh() if f.startswith('train_sft')]
+    for f in sft:
+        txt = open(os.path.join(SHELL_DIR, f), encoding='utf-8').read()
+        assert re.search(r'--value-res-blocks\s+8\b', txt), \
+            f'{f} 应使用 --value-res-blocks 8（value head 不受 checkpoint 保护）'
 
 
 @pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')

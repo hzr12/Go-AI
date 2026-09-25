@@ -19,10 +19,13 @@ python -m pip install swanlab -q || \
 
 # ---- 可调参数（OOM 时优先降 BATCH，并同步按平方根律降 LR）----
 WORLD_SIZE=1
-BATCH=3200            # 910A 实测可用；有效 batch = BATCH × WORLD_SIZE
-LR=0.00403            # 0.00356 × √(3200/2500)，平方根缩放律
+# 910A 是 32GB 卡：BATCH=3200 实测 OOM（backward 的 BatchMatMul 申请 1.46GB
+# 时 rtMalloc 失败，报 driver error:out of memory），BATCH=2800 实测可用。
+# 注意每卡显存与卡数无关，所以 2/4 卡同样是 3200 装不下。
+BATCH=2800            # 32GB 卡实测可用；有效 batch = BATCH × WORLD_SIZE
+LR=0.00377            # 0.00356 × √(2800/2500)，平方根缩放律
 PREFETCH_W=24         # 预取进程数（单卡即全部），24 核机器铺满
-PREFETCH_D=16         # 在途 batch 数；每个约 53MB(B=3200)，16→约0.85GB
+PREFETCH_D=16         # 在途 batch 数；每个约 49MB(B=2800)，16→约0.78GB
 DATA=data/sgf_19x19_full.npz
 OUT=models/sft_19x19_v18_npu1.pth
 C2NET=1               # 1=启用 OpenI 启智平台对接；平台已自带数据/输出时改 0
@@ -32,8 +35,12 @@ C2NET=1               # 1=启用 OpenI 启智平台对接；平台已自带数�
 # · 不传 --compile：NPU 无 inductor，代码会自动禁用并打警告
 # · 不传 --flash-attn：NPU 上自动禁用，注意力走手写 math
 # · NPU 的 pin_memory 关闭 → 训练侧双缓冲 H2D 不生效（那只对 CUDA 有效）
-# ⚠ 降显存不要动 --attn-window：window_global 显存正比于 nW×(ws²+ng)，
-#   而 ng=ceil(19/ws)² 在 ws 变小时暴涨，要往大调而不是往小调。
+# --attn-window 固定 5，不要改：实测（B=2800/heads=4/d=48）
+#   ws=3  QK 28.6M + AV 47M = 76M MACs，但注意力激活约 3.1GB（爆）
+#   ws=5  QK 184M + AV 215M = 399M MACs，注意力激活约 1.07GB  ← 最优
+#   ws=7  QK 287M + AV 237M = 524M MACs，注意力激活约 1.13GB
+# ws=5 比 ws=7 少 31% 计算而显存持平。此前「ws 要往大调」的说法只按
+# nW×(ws²+ng) 估 K/V 序列、漏掉了查询维 ws²，结论是反的。
 
 torchrun --nproc_per_node="$WORLD_SIZE" scripts/train_sft.py \
   --data "$DATA" \
@@ -45,7 +52,7 @@ torchrun --nproc_per_node="$WORLD_SIZE" scripts/train_sft.py \
   --batch-size "$BATCH" --epochs 1 \
   --lr "$LR" --weight-decay 0.0001 \
   --attention-mode mix --num-attention-layers 4 --num-heads 4 \
-  --attn-mode window_global --attn-window 7 \
+  --attn-mode window_global --attn-window 5 \
   --attention-dropout 0.1 --label-smoothing 0.1 \
   --gradient-accumulation-steps 1 \
   --use-amp 1 --use-ema 1 \

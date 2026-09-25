@@ -211,6 +211,9 @@ def setup_logging(log_file, level: int = logging.INFO, rank: int = 0) -> logging
     return logger
 
 
+_HAS_FOREACH = hasattr(torch, '_foreach_mul_') and hasattr(torch, '_foreach_add_')
+
+
 class EMA:
     """指数移动平均（Exponential Moving Average）权重。
 
@@ -225,6 +228,23 @@ class EMA:
 
     @torch.no_grad()
     def update(self):
+        if _HAS_FOREACH:
+            # 原实现是逐参数 Python 循环，每参数 2 次独立设备 kernel 启动。
+            # 本模型 depth 很深（backbone 17 + res 8 + convnext 4 + attn 5
+            # + value 8 + policy 3），参数张量达数百个，即每步数百次启动；
+            # Ascend 的 ACL 单次启动开销明显高于 CUDA，累积可观。
+            # foreach 把它们合并成两次批量调用，数值语义与循环完全一致。
+            # 刻意不缓存张量列表：resume 时 ema.shadow 会被整体替换
+            # （见 main 的 resume 分支），缓存会持有失效张量。每步重建
+            # 列表的 Python 开销可忽略，收益全在 kernel 启动数上。
+            sh = []
+            ps = []
+            for name, param in self.model.named_parameters():
+                sh.append(self.shadow[name])
+                ps.append(param)
+            torch._foreach_mul_(sh, self.decay)
+            torch._foreach_add_(sh, ps, alpha=1 - self.decay)
+            return
         for name, param in self.model.named_parameters():
             self.shadow[name].data.mul_(self.decay).add_(param.data, alpha=1 - self.decay)
 
@@ -1105,6 +1125,16 @@ def main():
     best_eval_acc = -1.0
     start_epoch = 0
     t0 = time.time()
+    # 本进程起点。resume 会把 step 覆盖成 checkpoint 里的累计值，原式
+    # speed = step * bs / (now - t0) 于是把「累计步数」当成「本进程步数」；
+    # 且 bs 是每卡值未乘 world_size —— 两重错误。实测续训时该式输出
+    # 1059 s/s，而真实速率约 2635 s/s。
+    _step_at_start = 0
+    # 瞬时速率基准：只在 stdout 打点时推进，保证与打印行同口径
+    # （_should_log 会因 swanlab_every 让打点块每 10 步触发一次，
+    #   若跟着它推进，瞬时速率就会变成 10 步口径、与打印的 50 步区间不符）。
+    _last_stdout_t = t0
+    _last_stdout_step = 0
 
     # 早停机制初始化
     early_stop_counter = 0
@@ -1141,6 +1171,9 @@ def main():
             except (RuntimeError, KeyError):
                 logger.warning("[resume] scaler 状态不兼容（可能是 BF16→FP16 切换），从头开始")
             step = tstate.get('step', 0)
+            # 续训基准：本进程从 checkpoint 的累计步数起步
+            _step_at_start = step
+            _last_stdout_step = step
             best_eval_acc = tstate.get('best_eval_acc', -1.0)
             start_epoch = tstate.get('epoch', 0)
             if 'rng' in tstate:
@@ -1244,6 +1277,17 @@ def main():
         _prof_at = int(os.environ.get('GOAI_PROFILE', '0') or 0)
         _prof_ctx = None
         _accum_steps = args.gradient_accumulation_steps
+        # ---- 分段计时（纯 CPU 侧观测）----
+        # 动机：4 卡 910A 实测 4.25 s/step，扣除 eval（实测仅 0.2%）后
+        # 约 96% 是黑盒，无法判断瓶颈在取数 / 算子 / 通信 / 保存。
+        # 绝不在此插 synchronize()：那会打断预取与双缓冲流水，反而更慢。
+        # 代价是 t_comp 只反映 CPU 侧发射时间、不含 NPU 实际执行；
+        # 判读靠「各段之和 vs elapsed」的差额。
+        # 重置放在打点处，故某步的 save/eval（发生在其打点之后）计入
+        # 下一个区间 —— 这与墙钟口径一致。
+        _t_data = _t_comp = _t_save = _t_eval = 0.0
+        _t_data_max = 0.0
+        _n_timed = 0
         for i in range(n_batches):
             try:
                 if i % _accum_steps == 0:
@@ -1259,6 +1303,7 @@ def main():
                     except Exception as pe:  # noqa: BLE001
                         logger.warning("[profile] 不可用: %s", pe)
                         _prof_at = 0
+                _t_data0 = time.perf_counter()
                 if pf is not None:
                     # P0: 先提交下一个 batch，再取当前 batch（给 worker 更多预计算时间）
                     nxt = i + args.prefetch_depth
@@ -1294,6 +1339,11 @@ def main():
                     # A100 上转 NHWC 以匹配模型 channels_last 布局，卷积更快
                     if use_channels_last:
                         state = state.to(memory_format=torch.channels_last)
+                _dt = time.perf_counter() - _t_data0
+                _t_data += _dt
+                if _dt > _t_data_max:
+                    _t_data_max = _dt
+                _t_comp0 = time.perf_counter()
                 with maybe_autocast(device, amp_dtype):
                     policy_logits, value_logit = model(state)
                     policy_loss = F.cross_entropy(policy_logits, move_t,
@@ -1310,6 +1360,8 @@ def main():
                             value_logit.squeeze(), value_target)
                     loss = policy_loss + args.value_loss_weight * value_loss
                 scaler.scale(loss / _accum_steps).backward()
+                _t_comp += time.perf_counter() - _t_comp0
+                _n_timed += 1
                 if (i + 1) % _accum_steps == 0 or (i + 1) == n_batches:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -1371,14 +1423,35 @@ def main():
                     mem = npu_memory_reserved(device) / 1e9
                 else:
                     mem = 0.0
-                speed = step * bs / max(1e-6, time.time() - t0)
+                _now = time.time()
+                _eff_bs = bs * max(1, world_size)
+                speed = (step - _step_at_start) * _eff_bs / max(1e-6, _now - t0)
+                # 瞬时速率：距上一次 stdout 打点。与分段耗时同口径，
+                # 二者相乘即该区间理论样本数，可直接核对时间丢在哪。
+                spd_inst = ((step - _last_stdout_step) * _eff_bs
+                            / max(1e-6, _now - _last_stdout_t))
+                _nd = max(1, _n_timed)
+                _dms = _t_data * 1000.0 / _nd
+                _cms = _t_comp * 1000.0 / _nd
+                _sms = _t_save * 1000.0 / _nd
+                _ems = _t_eval * 1000.0 / _nd
+                _dmax = _t_data_max * 1000.0
+                # 重置放在打点处：某步的 save/eval 发生在其打点之后，
+                # 因此计入下一个区间，与墙钟口径一致
+                _t_data = _t_comp = _t_save = _t_eval = 0.0
+                _t_data_max = 0.0
+                _n_timed = 0
                 _scale = scaler.get_scale()
 
             if _do_stdout:
                 logger.info("[step %d/%d] loss=%.4f (p=%.4f v=%.4f) lr=%.2e "
-                            "scale=%.0f mem=%.2fGB spd=%.0f s/s elapsed=%.0fs",
+                            "scale=%.0f mem=%.2fGB spd=%.0f spd_inst=%.0f s/s "
+                            "elapsed=%.0fs | d=%.0f c=%.0f s=%.0f e=%.0f dmax=%.0f ms",
                             step, total_steps, _lv, _pv, _vv,
-                            lr, _scale, mem, speed, time.time() - t0)
+                            lr, _scale, mem, speed, spd_inst, _now - t0,
+                            _dms, _cms, _sms, _ems, _dmax)
+                _last_stdout_t = time.time()
+                _last_stdout_step = step
 
             if _do_swanlab:
                 try:
@@ -1387,8 +1460,13 @@ def main():
                         "policy_loss": _pv,
                         "value_loss": _vv,
                         "lr": lr,
-                        "memory_gb": mem,
-                        "speed": speed,
+                    "memory_gb": mem,
+                    "speed": speed,
+                    "speed_inst": spd_inst,
+                    "t_data_ms": _dms,
+                    "t_comp_ms": _cms,
+                    "t_save_ms": _sms,
+                    "t_eval_ms": _ems,
                         "epoch": epoch,
                         "step_pct": step / total_steps,
                         "scaler_scale": _scale if use_scaler else 1.0,
@@ -1410,6 +1488,7 @@ def main():
 
             # 定期保存快照（仅主进程写盘）
             if is_main and args.save_every > 0 and step % args.save_every == 0:
+                _t_save0 = time.perf_counter()
                 save_model(model, args.out + '.latest')
                 _state = {
                     'optimizer': optimizer.state_dict(),
@@ -1423,14 +1502,17 @@ def main():
                 if ema is not None:
                     _state['ema_shadow'] = ema.shadow
                 torch.save(_state, args.out + '.latest.train_state')
+                _t_save += time.perf_counter() - _t_save0
 
             # 定期评估：综合指标（所有 rank 都做 eval，避免 barrier 死锁）
             if args.eval_every > 0 and step % args.eval_every == 0 and len(eval_idx) > 0:
                 if ema is not None:
                     ema.apply_shadow()
+                _t_eval0 = time.perf_counter()
                 metrics = evaluate_metrics(
                     model, dataset, eval_idx, bs, device, amp_dtype,
                     use_channels_last=use_channels_last)
+                _t_eval += time.perf_counter() - _t_eval0
                 if ema is not None:
                     ema.restore()
                 if is_main:
