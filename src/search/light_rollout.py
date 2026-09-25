@@ -15,46 +15,71 @@ import numpy as np
 
 from src.game.go_rules import GoBoard
 
+from scipy.ndimage import label as _ndi_label
+
+# 2D 四连通结构（go_rules._STRUCT3 是 3D，供批量 (B,n,n) 标注用）
+_STRUCT2 = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
+
 
 def _fast_atari_mask(board: GoBoard, player) -> np.ndarray:
     """返回 (n*n,) bool：player 方「仅 1 口气」的棋子位置（打吃）。
 
-    用单次稀疏 BFS 对每个同色连通块计数自由点，替代完整 feature_planes
-    （后者每步都做多层 Python flood-fill）。rollout 中每步调用也极快。
-    player: 棋子值（1 或 -1，= board.current_player）。
+    向量化实现：连通块用 scipy.ndimage.label，气数用邻域移位加法 + bincount。
+    旧实现对每个己方棋子跑一次 Python BFS，实测占整个搜索 52.8%，是
+    rollout 阶段的主要开销。
+
+    ⚠ 语义要点：这里统计的是**互不相同**的气。别直接照抄
+    go_rules.feature_planes_batched 的 `bincount(weights=neigh_empty)` ——
+    那种求和会把「同时邻接同块两颗子」的空点重复计一次。一个空点邻接同块的
+    多颗子时只能算 1 气（旧实现用 set，恰好是去重的），所以下面先对每个空点
+    的至多 4 个邻接块号排序去重，只对「首次出现」的块号贡献 1。
     """
     n = board.board_size
     b = board.board
     occ = (b == player)
-    atari = np.zeros((n, n), dtype=bool)
-    visited = np.zeros((n, n), dtype=bool)
-    seeds = np.argwhere(occ)
-    if seeds.size == 0:
-        return atari.reshape(-1)
-    nb = ((1, 0), (-1, 0), (0, 1), (0, -1))
-    for (y, x) in seeds:
-        if visited[y, x]:
-            continue
-        stack = [(y, x)]
-        visited[y, x] = True
-        group = []
-        libs = set()
-        while stack:
-            cy, cx = stack.pop()
-            group.append((cy, cx))
-            for dy, dx in nb:
-                ny, nx = cy + dy, cx + dx
-                if 0 <= ny < n and 0 <= nx < n:
-                    v = b[ny, nx]
-                    if v == 0:
-                        libs.add((ny, nx))
-                    elif v == player and not visited[ny, nx]:
-                        visited[ny, nx] = True
-                        stack.append((ny, nx))
-        if len(libs) == 1:
-            for (gy, gx) in group:
-                atari[gy, gx] = True
+    if not occ.any():
+        return np.zeros((n * n,), dtype=bool)
+
+    labelled, num = _ndi_label(occ, structure=_STRUCT2)
+    if num == 0:
+        return np.zeros((n * n,), dtype=bool)
+
+    # 每个空点的 4 个邻接块号（越界/非本方棋子记 0）
+    nbr = np.zeros((4, n, n), dtype=np.int32)
+    nbr[0, 1:, :] = labelled[:-1, :]
+    nbr[1, :-1, :] = labelled[1:, :]
+    nbr[2, :, 1:] = labelled[:, :-1]
+    nbr[3, :, :-1] = labelled[:, 1:]
+
+    srt = np.sort(nbr, axis=0)
+    # 只在「该块号在本空点的邻接中首次出现」时贡献 1
+    is_first = np.empty((4, n, n), dtype=bool)
+    is_first[0] = srt[0] > 0
+    is_first[1:] = (srt[1:] != srt[:-1]) & (srt[1:] > 0)
+
+    empty = (b == 0)
+    contrib = (is_first & empty[None, :, :]).astype(np.int64).reshape(4, -1)
+    lib_counts = np.bincount(
+        srt.reshape(4, -1).ravel(), weights=contrib.ravel(),
+        minlength=num + 1).astype(np.int64)
+
+    atari = (lib_counts[labelled] == 1) & occ
     return atari.reshape(-1)
+
+
+def _sample_categorical(p, rng) -> int:
+    """按离散分布 p 采样下标（逆 CDF 法）。
+
+    等价于 rng.choice(len(p), p=p)，但快得多：choice 每次都要重新校验概率
+    并构建 CDF，而这里只需一次 cumsum + 一次 searchsorted。rollout 里每步都要
+    采样，实测 rng.choice 占整个搜索 8.2%。
+
+    注意：抽样**分布**完全相同，但消耗随机数的序列不同——固定种子下走出的
+    具体棋谱会与旧实现不同。这不影响任何统计性质。
+    """
+    cdf = np.cumsum(p)
+    cdf[-1] = 1.0  # 消除浮点累积误差，保证 searchsorted 不越界
+    return int(np.searchsorted(cdf, rng.random(), side='right'))
 
 
 class FastPolicy:
@@ -110,7 +135,7 @@ class FastPolicy:
         if s <= 0 or not np.isfinite(s):
             return board.board_size * board.board_size  # pass
         p = p / s
-        return int(rng.choice(board.board_size * board.board_size + 1, p=p))
+        return _sample_categorical(p, rng)
 
 
 def light_rollout(board: GoBoard, policy: "FastPolicy",

@@ -29,8 +29,9 @@ import sys
 import os
 import time
 import queue
+import faulthandler
+import traceback
 import multiprocessing as mp
-from multiprocessing import Process, Queue, Value, Lock
 from typing import List, Dict, Any, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -42,12 +43,13 @@ import torch
 class AsyncDataQueue:
     """共享内存数据队列，避免 pickle 序列化开销。"""
     
-    def __init__(self, maxsize=100):
-        self.queue = Queue(maxsize=maxsize)
+    def __init__(self, maxsize=100, ctx=None):
+        self.ctx = ctx if ctx is not None else mp.get_context()
+        self.queue = self.ctx.Queue(maxsize=maxsize)
         self.stats = {
-            'produced': Value('i', 0),
-            'consumed': Value('i', 0),
-            'errors': Value('i', 0),
+            'produced': self.ctx.Value('i', 0),
+            'consumed': self.ctx.Value('i', 0),
+            'errors': self.ctx.Value('i', 0),
         }
     
     def put(self, data: Dict[str, Any]):
@@ -77,12 +79,16 @@ class AsyncDataQueue:
         return self.queue.empty()
 
 
-class SelfPlayWorker(Process):
-    """自对弈工作进程。"""
+class SelfPlayWorker:
+    """自对弈工作进程主体。
+
+    刻意**不**继承 Process：multiprocessing 公开 API 无法向 Process 子类
+    注入 start method，而这里必须用 spawn（见 _make_worker）。改为普通类
+    + 模块级函数 target，由 ctx.Process(target=...) 启动。
+    """
     
     def __init__(self, worker_id, model_path, onnx_model, args, data_queue, 
                  stop_event, progress_cb=None):
-        super().__init__(daemon=True)
         self.worker_id = worker_id
         self.model_path = model_path
         self.onnx_model = onnx_model
@@ -91,25 +97,48 @@ class SelfPlayWorker(Process):
         self.stop_event = stop_event
         self.progress_cb = progress_cb
         
-    def run(self):
-        """进程主循环。"""
-        # 每个进程独立加载模型（绕过 GIL）
+    def _build_ai(self):
+        """构建本 worker 的推理模型（独立加载，绕过 GIL）。"""
         from src.inference import GoAI
         if self.onnx_model:
-            ai = GoAI(
+            return GoAI(
                 model_path=self.onnx_model,
                 board_size=self.args.board_size,
                 device='cpu',
                 use_amp=False
             )
-        else:
-            ai = GoAI(
-                model_path=self.model_path,
-                board_size=self.args.board_size,
-                device='cpu',
-                use_amp=True
-            )
-        
+        return GoAI(
+            model_path=self.model_path,
+            board_size=self.args.board_size,
+            device='cpu',
+            use_amp=True
+        )
+
+    def _report_error(self, where, exc):
+        """上报失败：写 stderr（flush）并累加共享错误计数。
+
+        共享计数让父进程在 worker 全死时能报出"发生过 N 次错误"，而不是
+        只看到一句无从查证的 0/8 存活。
+        """
+        try:
+            with self.data_queue.stats['errors'].get_lock():
+                self.data_queue.stats['errors'].value += 1
+        except Exception:  # noqa: BLE001
+            pass
+        print("[worker {}] {} 失败: {!r}".format(self.worker_id, where, exc),
+              file=sys.stderr, flush=True)
+        traceback.print_exc()
+
+    def run(self):
+        """进程主循环。"""
+        # 模型构建也必须在保护之内：原先它在 try 之外，抛异常会直接杀掉
+        # 子进程，父进程只看到 0/8 存活却完全拿不到原因。
+        try:
+            ai = self._build_ai()
+        except Exception as exc:  # noqa: BLE001
+            self._report_error('模型加载', exc)
+            return
+
         from src.search.mcts import MCTS
         from src.game.go_rules import GoBoard
         
@@ -140,8 +169,10 @@ class SelfPlayWorker(Process):
                 
                 game_id += 1
                 
-            except Exception as e:
-                # 进程内异常不崩溃
+            except Exception as exc:  # noqa: BLE001
+                # 不崩溃，但**必须上报**：原先 `except Exception: sleep(0.1)`
+                # 把异常整个吞掉，worker 永远活着却零产出，表现为"卡住"。
+                self._report_error('对局', exc)
                 time.sleep(0.1)
     
     def _play_one_game(self, ai, n_actions, max_moves):
@@ -162,6 +193,8 @@ class SelfPlayWorker(Process):
             spec_prefetch=bool(getattr(self.args, 'spec_prefetch', False)),
             use_rollout=getattr(self.args, 'use_rollout', False),
             rollout_lambda=getattr(self.args, 'rollout_lambda', 0.25),
+            rollout_steps=getattr(self.args, 'rollout_steps', None),
+            batch_cap=getattr(self.args, 'batch_cap', None),
             leaf_ab_depth=getattr(self.args, 'leaf_ab_depth', 2),
             c_puct=getattr(self.args, 'c_puct', 2.0),
             virtual_loss=getattr(self.args, 'virtual_loss', 8.0),
@@ -239,6 +272,44 @@ class SelfPlayWorker(Process):
         return data, board.score()
 
 
+def _async_selfplay_worker(worker_id, model_path, onnx_model, args,
+                           data_queue, stop_event, progress_cb=None):
+    """spawn 可 pickle 的 worker 入口。
+
+    必须是模块级函数：spawn 会 pickle 整个 worker 实例，局部闭包无法序列化。
+    """
+    # 原生崩溃（SIGSEGV/SIGABRT）不会产生 Python traceback，faulthandler 是
+    # 子进程里唯一能拿到栈的途径。
+    try:
+        faulthandler.enable()
+    except Exception:  # noqa: BLE001
+        pass
+    SelfPlayWorker(worker_id, model_path, onnx_model, args, data_queue,
+                   stop_event, progress_cb).run()
+
+
+_SIGNAL_NAMES = {
+    4: 'SIGILL', 6: 'SIGABRT', 8: 'SIGFPE', 9: 'SIGKILL',
+    11: 'SIGSEGV', 13: 'SIGPIPE', 15: 'SIGTERM', 24: 'SIGXCPU', 25: 'SIGXFSZ',
+}
+
+
+def _describe_exitcode(code):
+    """把 multiprocessing 的 exitcode 翻成人话。
+
+    约定：负值 = 被该信号杀死（-11 → SIGSEGV）。这是"worker 全部退出、
+    既无 traceback 也无错误计数"这类现象唯一能定位死因的线索。
+    """
+    if code is None:
+        return '仍在运行'
+    if code < 0:
+        sig = -code
+        return '被信号 {}（{}）杀死'.format(sig, _SIGNAL_NAMES.get(sig, '未知信号'))
+    if code == 0:
+        return '正常退出(0)'
+    return '以退出码 {} 结束'.format(code)
+
+
 class AsyncSelfPlayPipeline:
     """异步自对弈流水线。
     
@@ -249,32 +320,47 @@ class AsyncSelfPlayPipeline:
     - 动态负载均衡
     """
     
-    def __init__(self, args, model_path=None, onnx_model=None, progress_cb=None):
+    def __init__(self, args, model_path=None, onnx_model=None, progress_cb=None,
+                 start_method='spawn'):
         self.args = args
         self.model_path = model_path
         self.onnx_model = onnx_model
         self.progress_cb = progress_cb
-        
-        self.data_queue = AsyncDataQueue(maxsize=args.result_queue_max)
-        self.stop_event = mp.Event()
+
+        # 所有跨进程原语与 worker 必须来自**同一个** context。原先这里用
+        # 模块级 Queue 与 mp.Event()（绑定默认 context，Linux 上即 fork），
+        # 却把对象交给 spawn context 的进程：跨 context 传递同步原语不受支持，
+        # 子进程会无声死掉——没有 traceback，连错误计数都还是 0。
+        self.ctx = mp.get_context(start_method)
+        self.data_queue = AsyncDataQueue(maxsize=args.result_queue_max,
+                                         ctx=self.ctx)
+        self.stop_event = self.ctx.Event()
         self.workers = []
         self.total_games = 0
         self.buffer = []
         
+    def _make_worker(self, worker_id):
+        """用 spawn context 创建单个 worker 进程（不启动）。
+
+        不可用裸 Process.start()：Linux 默认 fork，而父进程此前已在 NPU 上
+        建模型并 warmup（起了 CANN 线程），fork 出的子进程继承被锁死的
+        CANN 上下文 → 表现为 worker 全部存活、CPU 0%、永远 0 产出。
+        同步路径早已用 spawn 修过同一问题（selfplay_train.py 内标记 "N2"），
+        异步路径此前漏修。
+        """
+        return self.ctx.Process(
+            target=_async_selfplay_worker,
+            args=(worker_id, self.model_path, self.onnx_model, self.args,
+                  self.data_queue, self.stop_event, self.progress_cb),
+            daemon=True,
+        )
+
     def start(self):
         """启动所有 Worker 进程。"""
         n_workers = self.args.parallel_games
         
         for i in range(n_workers):
-            worker = SelfPlayWorker(
-                worker_id=i,
-                model_path=self.model_path,
-                onnx_model=self.onnx_model,
-                args=self.args,
-                data_queue=self.data_queue,
-                stop_event=self.stop_event,
-                progress_cb=self.progress_cb
-            )
+            worker = self._make_worker(i)
             worker.start()
             self.workers.append(worker)
         

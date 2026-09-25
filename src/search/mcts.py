@@ -40,6 +40,10 @@ class MCTSNode:
     value_sum: float = 0.0          # 累加（对手视角）价值，取负即我方
     virtual_loss: float = 0.0         # 并行模拟占位的虚拟损失
     expanded: bool = False
+    claimed: bool = False           # 已被 worker 认领、待主线程批量展开。必须与
+                                    # expanded 分开：expanded 表示"已真正展开"。
+                                    # 若认领时就置 expanded，主线程再也筛不出待批量
+                                    # 评估的叶子，跨叶子批处理整段变成死代码
     proved: int = 0                 # MCTS-Solver：+1=to_play 必胜, -1=to_play 必败, 0=未知
     prefetch: Optional[tuple] = None  # worker 推测性预评估缓存 (policy_np, value_float)
 
@@ -69,7 +73,8 @@ class MCTS:
                  leaf_ab_uncertain=0.85, priors_leaf=False,
                  dirichlet_alpha=0.0, dirichlet_eps=0.0,
                  dynamic_topk=True, dynamic_virtual_loss=True,
-                 policy_pruning_thresh=0.01, vector_backup=True):
+                 policy_pruning_thresh=0.01, vector_backup=True,
+                 batch_cap=None):
         """
         Args:
             ai:            GoAI 实例（需支持 predict_batch）
@@ -103,6 +108,8 @@ class MCTS:
                  模拟的 visits 分布更贴近策略网络（策略+少量MCTS 的基础）。
             vector_backup: _backup 的 visit/value_sum 批量更新（numpy）路径。
                 True=向量化（默认，数值与原逐层循环等价）；False=原逐层循环。
+            batch_cap: 主线程单次从叶子队列最多取多少条路径做跨叶子批量前向。
+                None=沿用历史取值 max(num_threads*4, 32)（保持不变以免回归）。
         """
         self.ai = ai
         self.bs = board_size
@@ -110,6 +117,8 @@ class MCTS:
         self.c_puct = c_puct
         self.virtual_loss = virtual_loss
         self.num_threads = max(1, num_threads)
+        # None 时保持历史取值 max(num_threads*4, 32)，避免重开既有的批量回归
+        self.batch_cap = batch_cap or max(self.num_threads * 4, 32)
         self.temperature = temperature
         self.temperature_decay = temperature_decay
         self.use_rollout = use_rollout
@@ -279,7 +288,7 @@ class MCTS:
                 score = child.q() + child.u(self.c_puct)
                 if score > fallback_score:
                     fallback_score, fallback = score, child
-                if child.expanded and not child.children:
+                if (child.expanded or child.claimed) and not child.children:
                     continue  # 在途/死节点：跳过，改选其他分支
                 if child.proved == -1:
                     proven_loss = child
@@ -853,8 +862,8 @@ class MCTS:
                         return
                     path = self._select(root)
                     leaf = path[-1]
-                    if leaf.expanded:
-                        # 已被其他线程抢先展开/尚在途：本线程无事可做，
+                    if leaf.claimed:
+                        # 已被其他线程抢先认领/尚在途：本线程无事可做，
                         # sleep 释放 GIL，避免自旋挤占主线程的 torch 推理。
                         # 若已无任何在途工作，说明可选叶子全是「已展开但无
                         # children」的死节点，再等也不会有进展 → 退出，避免
@@ -866,7 +875,7 @@ class MCTS:
                         eff_vl = self._dynamic_virtual_loss(self._current_sim, total)
                         for node in path:
                             node.virtual_loss += eff_vl
-                        leaf.expanded = True  # 逻辑占位，真正展开在主线程
+                        leaf.claimed = True  # 认领占位；真正展开在主线程
                         produced += 1
                         pending += 1
                         leaf_q.put(path)
@@ -916,7 +925,7 @@ class MCTS:
         batch: List[list] = []
         # 攒批上限与 num_threads 解耦：num_threads=1 时也要能一次吞下 worker
         # 超前产出的多条路径，否则退化成「产出1→展开1」的完全串行（卡死根因）。
-        batch_cap = max(self.num_threads * 4, 32)  # 保持原有值避免回归
+        batch_cap = self.batch_cap
         while expanded_count < total:
             try:
                 path = leaf_q.get(timeout=0.2)
@@ -1004,9 +1013,9 @@ class MCTS:
         finished.set()
         for t in threads:
             t.join(timeout=1.0)
-        # 收尾：队列中未处理的路径，其叶子被占位(expanded=True)却未真正展开，
+        # 收尾：队列中未处理的路径，其叶子被认领(claimed=True)却未真正展开，
         # 路径上的虚拟损失也没回收。若不复位，下一轮树复用时这些节点既无
-        # children 又被判 expanded → worker 永远无法产出（死锁）；残留虚拟损失
+        # children 又被判在途 → worker 永远无法产出（死锁）；残留虚拟损失
         # 还会让它们的 PUCT 分数长期偏低，搜索统计被污染。
         while True:
             try:
@@ -1017,7 +1026,7 @@ class MCTS:
                 continue
             for nd in pth:
                 nd.virtual_loss = 0
-            pth[-1].expanded = False
+            pth[-1].claimed = False
 
         visits = np.zeros(self.n_actions, dtype=np.int64)
         for mv, child in root.children.items():
@@ -1028,21 +1037,31 @@ class MCTS:
         if root.children:
             root_value = -sum(c.q() for c in root.children.values()) / len(root.children)
 
+        probs = self._probs_from_visits(visits)
+        return visits, probs, root_value
+
+    def _probs_from_visits(self, visits):
+        """把根子节点的 visit 计数换算成可采样的落子分布。
+
+        两条分支都必须防住 visits 全零：温度 > 0 分支的 `vis / vis.sum()`
+        在全零时会算出 0/0 = NaN，而调用方 `s <= 0` 的兜底救不了——NaN 与
+        任何值比较都是 False，会直接落进 np.random.choice(p=NaN) 抛
+        ValueError。温度 <= 0 分支原本已有该保护，此处统一。
+        """
+        total = int(visits.sum())
+        if total <= 0:
+            probs = np.zeros(self.n_actions, dtype=np.float64)
+            probs[self.n_actions - 1] = 1.0  # 无任何统计量时退化为 pass
+            return probs
+
         temp = self.temperature
         if temp <= 0:
-            probs = np.zeros(self.n_actions)
-            # 确保 visits.sum() > 0 再取 argmax，避免全零时的意外行为
-            if visits.sum() > 0:
-                best_mv = int(np.argmax(visits))
-            else:
-                best_mv = self.n_actions - 1  # fallback to pass
-            # 确保 best_mv 在合法范围内
-            best_mv = min(max(best_mv, 0), self.n_actions - 1)
-            probs[best_mv] = 1.0
+            probs = np.zeros(self.n_actions, dtype=np.float64)
+            probs[int(np.argmax(visits))] = 1.0
         else:
             vis = visits.astype(np.float64) ** (1.0 / temp)
             probs = vis / vis.sum()
-        return visits, probs, root_value
+        return probs
 
     def _reuse_root(self, path_moves):
         """沿 path_moves 从上次搜索根下潜，返回可复用的子树根（或 None）。

@@ -318,6 +318,7 @@ def _selfplay_worker(gid, model_path, args, result_queue):
         args.temperature, args.expand_topk, args.expand_chunk,
         use_rollout=getattr(args, 'use_rollout', False),
         rollout_lambda=getattr(args, 'rollout_lambda', 0.25),
+        rollout_steps=getattr(args, 'rollout_steps', None),
         leaf_ab_depth=getattr(args, 'leaf_ab_depth', 2),
         c_puct=getattr(args, 'c_puct', 2.0),
         virtual_loss=getattr(args, 'virtual_loss', 8.0),
@@ -327,6 +328,23 @@ def _selfplay_worker(gid, model_path, args, result_queue):
         vector_backup=getattr(args, 'mcts_vector_backup', 1) == 1
     )
     result_queue.put({'gid': gid, 'data': game_data, 'score': score})
+
+
+def _on_worker_game(worker_id, game_data, score):
+    """异步 worker 每完成一局时的回调。
+
+    必须是**模块级**函数：worker 现以 spawn 启动，spawn 会 pickle 整个
+    worker 实例（含 progress_cb），局部闭包无法序列化，会在启动时炸掉。
+
+    此前 progress_cb 一直传 None，加上收集循环也不打印，worker 侧与主
+    进程双双毫无输出——用户无法区分"在算"与"已死"。
+    """
+    try:
+        n = len(game_data)
+    except TypeError:
+        n = -1
+    print("  [worker {}] 完成一局：{} 样本 score={:+.1f}".format(
+        worker_id, n, score), flush=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -805,15 +823,22 @@ def main():
                 # 启动异步流水线（如果尚未启动）
                 if not hasattr(main, '_pipeline') or main._pipeline is None:
                     main._pipeline = AsyncSelfPlayPipeline(
-                        args, model_path=args.model, onnx_model=args.onnx_model
-                    )
+                        args, model_path=args.model, onnx_model=args.onnx_model,
+                        progress_cb=_on_worker_game)
                     main._pipeline.start()
 
                 # 持续收集数据并训练
                 for _ in range(args.games_per_iter or 10):
                     # 收集数据
                     collected = 0
-                    while len(buffer) < args.batch_size * 20:
+                    # 收集目标只需够训练一轮。原先是 batch_size*20，比训练实际
+                    # 需要的 batch_size*5 多等 4 倍数据才起步；而 19 路自对弈
+                    # 一局约 250 样本，5120 样本需 15~25 局，CPU MCTS 下首次
+                    # 输出前可能静默十几分钟——看起来完全像卡死。
+                    _need = max(1, args.batch_size * 5)
+                    _t_wait = time.time()
+                    _last_report = _t_wait
+                    while len(buffer) < _need:
                         item = main._pipeline.data_queue.get(timeout=0.5)
                         if item:
                             game_data = item['data']
@@ -821,6 +846,40 @@ def main():
                             _process_game_data(game_data, score, bs, n_actions, buffer, args)
                             collected += 1
                             total_games += 1
+                            continue
+                        # 没拿到数据：必须区分「还在算」与「worker 全死了」。
+                        # 原先这里没有任何检查，worker 全死也会无限静默空转。
+                        _alive = sum(1 for w in main._pipeline.workers
+                                     if w.is_alive())
+                        if _alive == 0:
+                            from scripts.async_pipeline import _describe_exitcode
+                            _errs = main._pipeline.data_queue.stats['errors'].value
+                            _why = ', '.join(
+                                '#{} {}'.format(i, _describe_exitcode(w.exitcode))
+                                for i, w in enumerate(main._pipeline.workers))
+                            raise RuntimeError(
+                                '所有自对弈 Worker 均已退出（存活 {}/{}，'
+                                '累计 worker 错误 {} 次）。\n'
+                                '各 worker 终态: {}\n'
+                                'Python 异常会打印 traceback 到 stderr 并累加'
+                                '上面的错误计数；若计数为 0 而终态是「被信号杀死」，'
+                                '则是原生崩溃，请查子进程 stderr 上的 faulthandler 输出。'
+                                .format(_alive, len(main._pipeline.workers),
+                                        _errs, _why))
+                        _now = time.time()
+                        if _now - _last_report >= 15.0:
+                            _st = main._pipeline.data_queue.stats
+                            print("  [collect] buffer={}/{} 队列={} "
+                                  "已产/已取={}/{} 丢弃={} 存活Worker={}/{} "
+                                  "等待={:.0f}s".format(
+                                      len(buffer), _need,
+                                      main._pipeline.data_queue.qsize(),
+                                      _st['produced'].value,
+                                      _st['consumed'].value,
+                                      _st['errors'].value,
+                                      _alive, len(main._pipeline.workers),
+                                      _now - _t_wait), flush=True)
+                            _last_report = _now
 
                     if collected > 0 and is_main:
                         print(f"  收集 {collected} 局，buffer={len(buffer)}", flush=True)
