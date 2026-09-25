@@ -355,18 +355,36 @@ python scripts/eval_elo.py \
 # ============================================================
 # 性能基准与预期效果
 # ============================================================
-# 测试环境: 24核 CPU + 4卡 NPU 910A + 64GB RAM
+# 测试环境: 24核 CPU + 4卡 NPU 910A + 1024GB RAM
 #
-# V17 架构参数:
-#   - Backbone: 11.28M (ResBlock 8 + ConvNeXt 4 + Attention 5)
-#   - Value:    1.01M (96ch, 11 blocks)
-#   - Policy:   173k (128ch, 3 layers)
-#   - Total:    12.46M (vs V12 12.67M, 基本持平)
+# 【重要】下列参数量为按 AlphaGoNet 实际实例化**实测**所得，不是估算。
+# 历史记录曾有自相矛盾之处，已订正——尤其 V17 的 Value 一栏：
+#   旧记录写「1.01M (96ch, 11 blocks)」，但实测 96ch+11blocks = 2.00M，
+#   而 1.01M 实际对应 96ch + 5 blocks。文字与数字对不上，以实测为准。
 #
-# V12 vs V16 vs V17 对比:
-#   V12: 12.67M (back=12.40M, val=0.26M, pol=0.006M) -> top1=50%
-#   V16: 9.27M  (back=8.32M, val=0.93M, pol=0.016M) -> top1=40%
-#   V17: 12.46M (back=11.28M, val=1.01M, pol=0.17M) -> 预期 >50%
+# v18 架构参数（实测；对应 shell/train_sft_npu_4card.sh）:
+#   - Backbone: 11,189,952 (11.19M) 87.0%
+#     192ch，backbone-res 17 + res 8 + convnext 4 + attn 5
+#   - Value:     1,496,353 ( 1.50M) 11.6%
+#     96ch, 8 blocks（注意：不是 11）
+#   - Policy:      172,673 ( 0.17M)  1.3%
+#     128ch, 3 layers（1x1 -> 3x3 -> 1x1）
+#   - Total:    12,858,978 (12.86M)
+#   - 非参数 buffers: 14,475
+#   - FP32 权重 51.4MB | 含 AdamW 双矩 154.3MB | 含 EMA 102.9MB
+#
+# V17 同配置实测（仅 value-res-blocks 由 8 改 11）:
+#   - Total: 13,357,794 (13.36M)，其中 Value 1,995,169 (2.00M)
+#   即 v18 比 V17 少的 0.5M 几乎全部来自 value head 11→8。
+#
+# 参数量参考（value head 扫描，实测）:
+#   96ch: 3blk=0.66M  5blk=1.00M  6blk=1.16M  7blk=1.33M  8blk=1.50M  11blk=2.00M
+#   64ch: 8blk=0.70M  11blk=0.92M
+# policy head（19路 action=362）:
+#   128ch 3层=172,673 | 128ch 2层=24,961 | 64ch 3层=49,473
+#
+# 旧记录里的 V12/V16 数字已无法复现（对应配置未留存），不再作为对照基准。
+# 若要重新建立基线，请用实际实例化测量，不要手算或沿用旧值。
 #
 # SFT 训练:
 #   - batch=2800（每卡）× 4 卡 = 有效 11200，LR 0.00754
