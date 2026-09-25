@@ -334,6 +334,14 @@ def _selfplay_worker(gid, model_path, args, result_queue):
     except Exception:  # noqa: BLE001
         pass
     device = _resolve_selfplay_device(args)
+    if str(device).startswith('cpu'):
+        # 该 CANN 镜像会用 CANN 算子抢占 aten::linear，CPU 上 nn.Linear 不可用
+        #（同进程 mm/addmm/matmul/conv2d 正常）。装逐位等价的 matmul 垫片。
+        try:
+            from src.inference import install_cpu_linear_workaround
+            install_cpu_linear_workaround(device=device)
+        except Exception:  # noqa: BLE001
+            pass
     
     # 每个进程独立加载模型（绕过 GIL）
     if args.onnx_model:

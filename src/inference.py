@@ -31,6 +31,43 @@ def _ensure_torch_npu():
         return False
 
 
+def _cpu_linear_matmul(input, weight, bias=None):
+    """F.linear 的等价实现：走 matmul 而不是 aten::linear。
+
+    某些 Ascend CANN 镜像（实测 torch 2.1.0 + torch-npu-cann8）会用 CANN 的
+    算子抢占 **aten::linear** 这一个算子：CPU 上 `nn.Linear(64,1)` 直接抛
+    "could not create a primitive descriptor for a matmul primitive"，而同进程
+    的 mm / addmm / matmul / conv2d 全部正常。也就是说 nn.Linear 在该环境下
+    的 CPU 路径不可用。
+
+    而 F.linear(x, W, b) 在数学上就是 x @ W.T + b，因此改用 matmul 即可绕开。
+    本实现对 1-D/2-D/3-D/4-D 输入以及有无 bias 均与 nn.Linear **逐位相等**
+    （见 tests 里 test_cpu_linear_workaround_is_bitwise_equivalent）。
+    """
+    out = torch.matmul(input, weight.t())
+    if bias is None:
+        return out
+    return out + bias
+
+
+def install_cpu_linear_workaround(device=None):
+    """CPU 推理时安装 F.linear 垫片；非 CPU 设备不动。
+
+    NPU/CUDA 上的 linear 是好的（走各自的真实算子），绝不能被替换。
+    """
+    if device is not None and not str(device).startswith('cpu'):
+        return False
+    import torch.nn.functional as F
+    if getattr(F.linear, '_goai_shim', False):
+        return False
+    shim = _cpu_linear_matmul
+    shim._goai_shim = True
+    # 记录原函数，便于测试复位、也便于必要时还原
+    shim._goai_original = F.linear
+    F.linear = shim
+    return True
+
+
 class GoAI:
     """基于 SFT 模型的围棋对弈 / 分析引擎。
 

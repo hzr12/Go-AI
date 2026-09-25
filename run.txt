@@ -64,6 +64,12 @@
 #     无收益（threads=1/2/3 在噪声内），8×3 明显不如 24×1 或 12×2
 #   ⚠ --spec-prefetch 1 是默认值，但只有 --mcts-threads>=4 时才真正生效；
 #     按上面的推荐（1 线程）它不会启用，这是有意的取舍
+#   ⚠ 环境限制（实测 torch-npu-cann8 镜像 + torch 2.1.0）：CANN 会抢占
+#     aten::linear 这一个算子，导致纯 CPU 推理中的 nn.Linear 抛
+#     'could not create a primitive descriptor for a matmul primitive'
+#     （同进程 mm/addmm/matmul/conv2d 均正常）。worker 入口已自动安装等价垫片
+#     F.linear := x @ W.T + b（逐位相等）。但任何**新增**的自定义算子若用到
+#     nn.Linear，都会再次踩到，需同样避开。
 #   ⚠ 不要传 --onnx-model：当前实现把 .onnx 路径当 torch.load 读，会直接抛
 #     UnpicklingError（已实测）。
 #   ⚠ 不要把 --selfplay-device 设成 npu/cuda 配合 --parallel-games>1：仓库不做
