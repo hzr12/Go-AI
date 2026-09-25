@@ -213,6 +213,55 @@ def setup_logging(log_file, level: int = logging.INFO, rank: int = 0) -> logging
 
 _HAS_FOREACH = hasattr(torch, '_foreach_mul_') and hasattr(torch, '_foreach_add_')
 
+# GradScaler 低于该值即视为「缩放值已被反复压低」，值得告警。
+# PyTorch 默认 init_scale=65536；每发生一次溢出就减半。
+_OVERFLOW_WARN_SCALE = 1024.0
+
+
+def _locate_overflow(optimizer, logger, max_report=3):
+    """定位梯度 inf/nan 的来源参数组，只在溢出当步调用（开销可忽略）。
+
+    FP16 训练里「哪些参数在溢出」直接决定该调什么：value head 溢出通常指向
+    value_loss_weight / value_lr_mult 过大；backbone 溢出则更可能是注意力
+    logits 或 LR 本身。没有这一步就只能靠猜。
+
+    参数组按 **LR 比值**分类而非写死下标——opt_groups 的顺序一旦调整
+    （例如增删 no_decay 组），按下标判断就会误报。value 组的 LR 是基准的
+    value_lr_mult 倍（本项目默认 5.0），故取「LR 明显高于最低组」作为判据。
+    """
+    groups = optimizer.param_groups
+    lrs = [float(g.get('lr', 0.0)) for g in groups]
+    min_lr = min(lrs) if lrs else 0.0
+    bad = []
+    for gi, group in enumerate(groups):
+        n_inf = n_nan = 0
+        for p in group.get('params', []):
+            if p.grad is None:
+                continue
+            if torch.isinf(p.grad).any():
+                n_inf += 1
+            elif torch.isnan(p.grad).any():
+                n_nan += 1
+        if n_inf or n_nan:
+            is_value = lrs[gi] > 1.5 * max(min_lr, 1e-12)
+            bad.append((gi, lrs[gi], n_inf, n_nan, is_value))
+    if not bad:
+        logger.warning("[fp16] GradScaler 报告溢出，但未在参数组中找到 inf/nan"
+                       "（可能出现在已被释放的中间张量里）")
+        return
+    for gi, lr, n_inf, n_nan, is_value in bad[:max_report]:
+        logger.warning("[fp16] 梯度溢出：参数组 %d（%s, lr=%.2e）"
+                       "有 %d 个 inf / %d 个 nan 参数",
+                       gi, 'value head' if is_value else 'backbone/policy',
+                       lr, n_inf, n_nan)
+    if any(b[4] for b in bad):
+        logger.warning("[fp16] 溢出集中在 value head —— 优先下调 --value-loss-weight"
+                       "（默认 5.0）与 --value-lr-mult（默认 5.0）")
+    if any(not b[4] for b in bad):
+        logger.warning("[fp16] 溢出涉及 backbone/policy —— 优先下调 --lr；"
+                       "NPU 上注意力被强制走 math 并物化 logits，"
+                       "可考虑调小 --attn-window 降低 logits 幅度")
+
 
 class EMA:
     """指数移动平均（Exponential Moving Average）权重。
@@ -1288,6 +1337,7 @@ def main():
         _t_data = _t_comp = _t_save = _t_eval = 0.0
         _t_data_max = 0.0
         _n_timed = 0
+        _n_skipped = 0
         for i in range(n_batches):
             try:
                 if i % _accum_steps == 0:
@@ -1363,10 +1413,31 @@ def main():
                 _t_comp += time.perf_counter() - _t_comp0
                 _n_timed += 1
                 if (i + 1) % _accum_steps == 0 or (i + 1) == n_batches:
+                    # 缩放值下降 == 本步因 inf/nan 被 GradScaler 跳过，那一整个
+                    # batch 的数据就此白扔。实测 4 卡 910A 在 step~1770 出现
+                    # 16384→8192→4096→2048 的雪崩 + 大量 Skipping step。
+                    #
+                    # 注意：这里不把 clip_grad_norm_ 挪到 unscale_ 之前。模型
+                    # 参数始终是 FP32（只改了 memory_format，从未 .half()），
+                    # 梯度也是 FP32，其上限 3.4e38，缩放系数根本不可能让它
+                    # 在 65504 处溢出。那些 inf/nan 是前向/反向里真实的数值
+                    # 故障（最可疑是 NPU 强制 math 注意力物化大 logits 时的
+                    # FP16 溢出），不是 loss scaling 的伪影——所以真正的
+                    # 修复点在别处，此处只负责让它**可观测**。
+                    _scale_now = scaler.get_scale()
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     scaler.step(optimizer)
                     scaler.update()
+                    if use_scaler and scaler.get_scale() < _scale_now:
+                        _n_skipped += 1
+                        _locate_overflow(optimizer, logger)
+                        if _scale_now >= _OVERFLOW_WARN_SCALE > scaler.get_scale():
+                            logger.warning("[fp16] 缩放值首次跌破 %d：%.0f -> %.0f。"
+                                           "累计跳过 %d 步（占比 %.2f%%）。",
+                                           int(_OVERFLOW_WARN_SCALE), _scale_now,
+                                           scaler.get_scale(), _n_skipped,
+                                           100.0 * _n_skipped / max(1, step))
                     optimizer.zero_grad(set_to_none=True)
                     if ema is not None:
                         ema.update()
@@ -1446,9 +1517,10 @@ def main():
             if _do_stdout:
                 logger.info("[step %d/%d] loss=%.4f (p=%.4f v=%.4f) lr=%.2e "
                             "scale=%.0f mem=%.2fGB spd=%.0f spd_inst=%.0f s/s "
-                            "elapsed=%.0fs | d=%.0f c=%.0f s=%.0f e=%.0f dmax=%.0f ms",
+                            "elapsed=%.0fs skip=%d | "
+                            "d=%.0f c=%.0f s=%.0f e=%.0f dmax=%.0f ms",
                             step, total_steps, _lv, _pv, _vv,
-                            lr, _scale, mem, speed, spd_inst, _now - t0,
+                            lr, _scale, mem, speed, spd_inst, _now - t0, _n_skipped,
                             _dms, _cms, _sms, _ems, _dmax)
                 _last_stdout_t = time.time()
                 _last_stdout_step = step
@@ -1463,6 +1535,9 @@ def main():
                     "memory_gb": mem,
                     "speed": speed,
                     "speed_inst": spd_inst,
+                    "skipped_steps": _n_skipped,
+                    "skip_rate_pct": 100.0 * _n_skipped / max(1, step),
+                    "scaler_scale": _scale,
                     "t_data_ms": _dms,
                     "t_comp_ms": _cms,
                     "t_save_ms": _sms,
