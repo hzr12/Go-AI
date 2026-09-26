@@ -858,7 +858,7 @@ def _sync_stop_flag(stop_flag, is_dist, early_stop_enabled):
     dist.broadcast(stop_flag, src=0)
 
 
-def _build_param_groups(model, args):
+def _build_param_groups(model, args) -> list[dict]:
     """构造 AdamW 的四组参数：{非 value, value} × {decay, no_decay}。
 
     value head 独立 LR（参数量小，需要更高学习率补偿梯度不足）；
@@ -895,6 +895,58 @@ def _build_param_groups(model, args):
          'weight_decay': args.weight_decay},
         {'params': value_no_decay, 'lr': args.lr * args.value_lr_mult, 'weight_decay': 0.0},
     ]
+
+
+def _param_group_sizes(source, key=None):
+    """数出各参数组的参数个数；结构不可读时返回 None。
+
+    只用来拼告警文案，所以**绝不能自己抛**：它跑在 except 块里，抛一次就把
+    「真正该看的那个异常」盖掉了。`key` 给了就从映射里取，否则把 source 当序列用。
+    """
+    try:
+        groups = source[key] if key is not None else source
+        return [len(g['params']) for g in groups]
+    except (TypeError, AttributeError, KeyError, IndexError):
+        return None
+
+
+def _load_optimizer_state(optimizer, state, logger) -> bool:
+    """把 checkpoint 里的优化器状态灌进 optimizer；分组布局不兼容时告警并跳过。
+
+    返回 True = 已加载；False = 已跳过（Adam 动量从零开始）。
+
+    **为什么必须有这一层**：optimizer 的 state_dict 把**每组的参数个数**写进了
+    `param_groups`，而 `torch.optim.Optimizer.load_state_dict` 逐组比对大小，
+    不一致就直接
+    `ValueError: loaded state dict contains a parameter group that doesn't match
+    the size of optimizer's group`。C12 把 value 头的一维参数搬进 no-decay 组之后，
+    四组大小随之改变（`[7, 13, 11, 0]` → `[7, 13, 4, 7]`）→ **本提交之前存下的
+    任何 checkpoint 都再也续不上**，resume 在这里硬崩。分组布局变了以后，旧的动量
+    本来就是按「旧分组的参数下标」记的，映射到新分组上没有意义，跳过重训比崩掉正确。
+
+    **刻意只放行这一类失败**：判据是「异常类型 ∈ {ValueError, RuntimeError} 且信息里
+    点名 parameter group」（torch 对组布局不兼容只有两条消息，两条都含这个词）。
+    其余失败照旧抛出 —— resume 静默降级比崩掉难查得多：训完一整轮才发现动量没恢复。
+
+    torch 的组大小检查发生在 `deepcopy` 之后、`__setstate__` 之前，所以命中时
+    optimizer 状态**没有被半途写入**，跳过是干净的。
+    """
+    try:
+        optimizer.load_state_dict(state)
+    except (ValueError, RuntimeError) as exc:
+        if 'parameter group' not in str(exc):
+            raise
+        logger.warning(
+            "[resume] 【注意】优化器状态与当前参数分组不兼容，已跳过加载。"
+            "checkpoint 里的组大小 %s ≠ 当前 %s（torch: %s）。分组方案变了之后，旧的 "
+            "Adam 动量是按旧分组的参数下标记的，映射到新分组上已无意义，"
+            "因此优化器状态已重置，Adam 动量从零开始。模型权重 / EMA shadow / scaler / "
+            "step / epoch / rng 仍照常恢复，训练可以继续，但开头若干步的等效学习率会有"
+            "一次跳变。要保留动量，请用当前代码写出的 checkpoint 续训。",
+            _param_group_sizes(state, 'param_groups'),
+            _param_group_sizes(optimizer.param_groups), exc)
+        return False
+    return True
 
 
 def main():
@@ -1442,7 +1494,7 @@ def main():
         target.load_state_dict(ckpt)
         if os.path.isfile(state_path):
             tstate = torch.load(state_path, map_location=device)
-            optimizer.load_state_dict(tstate['optimizer'])
+            _load_optimizer_state(optimizer, tstate['optimizer'], logger)
             scheduler.load_state_dict(tstate['scheduler'])
             try:
                 scaler.load_state_dict(tstate['scaler'])

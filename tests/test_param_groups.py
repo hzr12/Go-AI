@@ -20,6 +20,7 @@ value 头全部参数（含 BatchNorm/LayerNorm 权重与 bias）都吃了 weigh
 下面这些断言**全部按 ndim 与前缀判定，不依赖任何具体参数名清单**——
 v21 会继续改结构，靠名字锁死会立刻失效。
 """
+import logging
 import os
 import sys
 
@@ -30,7 +31,7 @@ import torch.nn as nn
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from scripts.train_sft import _build_param_groups  # noqa: E402
+from scripts.train_sft import _build_param_groups, _load_optimizer_state  # noqa: E402
 from src.networks.alphanet import AlphaGoNet  # noqa: E402
 
 # 刻意取互不相同的数值：value 组与非 value 组靠 lr 就能区分，
@@ -293,3 +294,139 @@ def test_main_parser_supplies_exactly_the_attributes_the_builder_reads():
         f'_build_param_groups 读到的 args 属性变成了 {read}（本测试的 _Args 需要同步）'
     missing = [a for a in read if a not in flags]
     assert not missing, f'argparse 没有提供 {missing}，真实 main() 会在分组处 AttributeError'
+
+
+# ---------------------------------------------------------------- 9
+#
+# 以下三个用例针对 resume 路径的**运维断裂**：P2.4 把 value 头一维参数搬进
+# no-decay 组，四组大小从 [7, 13, 11, 0] 变成 [7, 13, 4, 7]。改动本身是本任务
+# 被要求的修复，但 optimizer 的 state_dict 把每组大小写进了 param_groups，
+# torch.optim.Optimizer.load_state_dict 逐组比对大小，不一致就抛
+#   ValueError: loaded state dict contains a parameter group that doesn't match
+#   the size of optimizer's group
+# → **任何在 C12 修复（提交 95652ae）之前存下的 checkpoint 都再也续不上**
+# （当时 main() 直接调 load_state_dict，硬崩）。
+# 修法是「只对这一类失败告警并跳过优化器状态，其余照旧恢复」，而不是静默吞异常。
+
+
+def _optimizer_over(model, args):
+    groups = _build_param_groups(model, args)
+    return torch.optim.AdamW(groups), groups
+
+
+# torch.optim.Optimizer.load_state_dict 对组布局不兼容只有两条消息，两条都点名
+# 'parameter group'（实测 torch 2.12.0+cpu）：
+#   ValueError("loaded state dict has a different number of parameter groups")
+#   ValueError("loaded state dict contains a parameter group that doesn't match "
+#              "the size of optimizer's group")
+# 前者组数不同、后者组大小不同，属于同一类断裂。
+_TORCH_GROUP_SIZE_MSG = ("loaded state dict contains a parameter group that doesn't "
+                         "match the size of optimizer's group")
+
+
+@pytest.mark.parametrize("exc_type", [None, RuntimeError],
+                         ids=["real-torch", "as-runtimeerror"])
+def test_incompatible_optimizer_state_is_skipped_with_warning(caplog, monkeypatch, exc_type):
+    """组大小对不上时：返回 False、不抛异常、告警里带新旧组大小与「重置」提示。
+
+    同时断言优化器状态仍是空的：torch 的组大小检查发生在 `__setstate__` **之前**
+    （先 deepcopy 再比对，命中就 raise），所以「跳过」不会留下半途写入的脏状态。
+
+    `exc_type=None` 走**真实** torch 抛错路径；`RuntimeError` 那个 case 是给
+    except 元组里的 RuntimeError 分支上锁的窄特征化用例 —— 只测真实路径的话，
+    把 except 收窄成 `except ValueError` 全绿，而 fused / 子类 optimizer 报
+    RuntimeError 时就会重新变成硬崩。
+    """
+    model, args = _tiny_model(), _Args()
+    optimizer, _ = _optimizer_over(model, args)
+    logger = logging.getLogger('train')
+
+    # 造一个「组大小与当前不符」的旧 state dict：从最大的一组里砍掉一个参数。
+    # 刻意不用 [7, 13, 11, 0] 这种写死的旧布局——组大小是会继续变的意图，
+    # 锁死它就变成「改常量才红」的检测器；这里要测的是行为：**不匹配就跳过**。
+    saved = optimizer.state_dict()
+    widest = max(range(len(saved['param_groups'])),
+                 key=lambda i: len(saved['param_groups'][i]['params']))
+    assert len(saved['param_groups'][widest]['params']) > 1, \
+        '测试前提失效：最大的一组只有 1 个参数，砍不掉'
+    saved['param_groups'][widest]['params'] = saved['param_groups'][widest]['params'][:-1]
+
+    old_sizes = [len(g['params']) for g in saved['param_groups']]
+    new_sizes = [len(g['params']) for g in optimizer.param_groups]
+    assert old_sizes != new_sizes, \
+        '测试前提失效：构造出的 state dict 布局与当前分组一致'
+
+    if exc_type is not None:
+        def _boom(_state, _t=exc_type):
+            raise _t(_TORCH_GROUP_SIZE_MSG)
+        monkeypatch.setattr(optimizer, 'load_state_dict', _boom)
+
+    with caplog.at_level(logging.WARNING, logger='train'):
+        assert _load_optimizer_state(optimizer, saved, logger) is False
+
+    assert not optimizer.state, \
+        '跳过后优化器里却出现了状态——加载并非在写入之前就失败（脏状态）'
+
+    text = caplog.text
+    assert '组大小' in text, f'告警没有点明是组大小的问题：{text!r}'
+    assert '重置' in text, f'告警没有说明优化器状态已被重置：{text!r}'
+    assert str(old_sizes) in text, f'告警里找不到旧组大小 {old_sizes}：{text!r}'
+    assert str(new_sizes) in text, f'告警里找不到新组大小 {new_sizes}：{text!r}'
+    assert 'Adam' in text, f'告警没有说明后果（Adam 动量从头开始）：{text!r}'
+
+
+def test_compatible_optimizer_state_loads_normally(caplog):
+    """布局一致时正常加载：返回 True、Adam 动量真的落到优化器里、且不打那条告警。
+
+    「返回 True」单独不够——一个什么都不做直接 return True 的实现也能骗过它，
+    所以这里逐个参数比对 exp_avg 的实际取值。
+    """
+    model, args = _tiny_model(), _Args()
+    source, groups = _optimizer_over(model, args)
+    for p in model.parameters():
+        p.grad = torch.ones_like(p)
+    source.step()
+    saved = source.state_dict()
+    want = {id(p): s['exp_avg'].clone() for p, s in source.state.items() if 'exp_avg' in s}
+    assert want, '测试前提失效：step() 之后优化器里没有任何 Adam 动量'
+
+    # 同样按当前分组建、但状态为空的优化器
+    fresh = torch.optim.AdamW(groups)
+    assert not fresh.state, '测试前提失效：fresh 优化器本该没有状态'
+
+    with caplog.at_level(logging.WARNING, logger='train'):
+        assert _load_optimizer_state(fresh, saved, logging.getLogger('train')) is True
+
+    assert '组大小' not in caplog.text, \
+        f'布局完全一致却打了组大小告警：{caplog.text!r}'
+
+    got = {id(p): s['exp_avg'] for p, s in fresh.state.items() if 'exp_avg' in s}
+    # want/got 已经以 id(p) 为键，直接比键集；套 _ids() 会变成「取 int 的 id」
+    assert set(got) == set(want), '加载后优化器里的参数集合与 checkpoint 对不上'
+    for pid, exp_avg in got.items():
+        assert torch.equal(exp_avg, want[pid]), \
+            f'参数 {pid} 的 Adam 动量没被真正加载进来'
+
+
+@pytest.mark.parametrize("exc_type,msg", [
+    (RuntimeError, 'boom'),
+    (ValueError, 'unrelated failure'),
+])
+def test_unrelated_load_error_still_propagates(monkeypatch, exc_type, msg):
+    """与分组无关的加载失败必须原样抛出。
+
+    这是「不许写 `except Exception: pass`」的闸门：宽泛的 except 会把**所有**
+    resume 失败都变成「优化器状态安静地丢了」，训完一整轮才发现动量没恢复。
+    ValueError 与 RuntimeError 都要覆盖——只测 RuntimeError 的话，
+    「只 catch RuntimeError」的写法照样能过，但它同样是错分支放行。
+    """
+    model, args = _tiny_model(), _Args()
+    optimizer, _ = _optimizer_over(model, args)
+
+    def _boom(_state):
+        raise exc_type(msg)
+
+    monkeypatch.setattr(optimizer, 'load_state_dict', _boom)
+    with pytest.raises(exc_type, match=msg):
+        _load_optimizer_state(optimizer, optimizer.state_dict(),
+                              logging.getLogger('train'))
