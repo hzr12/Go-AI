@@ -29,7 +29,9 @@ NPU 正式训练（4 卡 DDP）:
 import sys
 import os
 import time
+import queue
 import struct
+import traceback
 import argparse
 import multiprocessing as mp
 
@@ -299,34 +301,143 @@ def compute_td_target(players, root_values, score, t,
 # 并行自对弈 worker
 # --------------------------------------------------------------------------- #
 def _selfplay_worker(gid, model_path, args, result_queue):
-    """单个自对弈进程。"""
-    device = args.device
-    if device == 'auto':
-        device = _auto_select_device()
-    
-    # 每个进程独立加载模型（绕过 GIL）
-    if args.onnx_model:
-        ai = GoAI(model_path=args.onnx_model, board_size=args.board_size, 
-                  device='cpu', use_amp=False)
-    else:
-        ai = GoAI(model_path=model_path, board_size=args.board_size, device=device,
-                  use_amp=True, attn_mode='window', attn_window=7)
-    
-    game_data, score = self_play_game(
-        ai, args.board_size, args.sims,
-        args.max_moves or 3 * args.board_size * args.board_size,
-        args.temperature, args.expand_topk, args.expand_chunk,
-        use_rollout=getattr(args, 'use_rollout', False),
-        rollout_lambda=getattr(args, 'rollout_lambda', 0.25),
-        leaf_ab_depth=getattr(args, 'leaf_ab_depth', 2),
-        c_puct=getattr(args, 'c_puct', 2.0),
-        virtual_loss=getattr(args, 'virtual_loss', 8.0),
-        num_threads=getattr(args, 'mcts_threads', 3),  # 使用新的参数名
-        spec_prefetch=getattr(args, 'spec_prefetch', False),
-        use_diverse_rollout=getattr(args, 'use_diverse_rollout', False),
-        vector_backup=getattr(args, 'mcts_vector_backup', 1) == 1
-    )
+    """单个自对弈进程。
+
+    主体包 try/except BaseException：任何异常（模型加载失败 / OOM / board 断言）
+    都回传 {'gid', 'error'}，父进程据此立即报错，而不是静默退出让父进程
+    result_queue.get() 永久挂起（表现为「训练卡住」）。
+    """
+    try:
+        device = args.device
+        if device == 'auto':
+            device = _auto_select_device()
+
+        # 每个进程独立加载模型（绕过 GIL）
+        if args.onnx_model:
+            ai = GoAI(model_path=args.onnx_model, board_size=args.board_size,
+                      device='cpu', use_amp=False)
+        else:
+            ai = GoAI(model_path=model_path, board_size=args.board_size, device=device,
+                      use_amp=True, attn_mode='window', attn_window=7)
+
+        game_data, score = self_play_game(
+            ai, args.board_size, args.sims,
+            args.max_moves or 3 * args.board_size * args.board_size,
+            args.temperature, args.expand_topk, args.expand_chunk,
+            use_rollout=getattr(args, 'use_rollout', False),
+            rollout_lambda=getattr(args, 'rollout_lambda', 0.25),
+            leaf_ab_depth=getattr(args, 'leaf_ab_depth', 2),
+            c_puct=getattr(args, 'c_puct', 2.0),
+            virtual_loss=getattr(args, 'virtual_loss', 8.0),
+            num_threads=getattr(args, 'mcts_threads', 3),  # 使用新的参数名
+            spec_prefetch=getattr(args, 'spec_prefetch', False),
+            use_diverse_rollout=getattr(args, 'use_diverse_rollout', False),
+            vector_backup=getattr(args, 'mcts_vector_backup', 1) == 1
+        )
+    except BaseException:
+        result_queue.put({'gid': gid, 'error': traceback.format_exc()})
+        return
     result_queue.put({'gid': gid, 'data': game_data, 'score': score})
+
+
+# --------------------------------------------------------------------------- #
+# 多进程结果收集与子进程收尾
+# --------------------------------------------------------------------------- #
+def _reap_processes(processes, join_timeout=5.0):
+    """收尾全部子进程：先 join(timeout)，仍存活的 terminate 后再无超时 join。
+
+    保证任何异常路径都不泄漏子进程，也不会被 join() 无限阻塞。
+    """
+    for p in processes:
+        p.join(timeout=join_timeout)
+    for p in processes:
+        if p.is_alive():
+            p.terminate()
+            p.join()
+
+
+def _poll_worker_results(result_queue, processes, on_result=None, gids=None,
+                         poll_timeout=0.5, dead_grace=1.0):
+    """带 timeout 轮询收集全部 worker 结果，交给 on_result 逐个处理。
+
+    processes 必须已 start。get 超时后检查进程存活：只要有 worker「已退出却
+    没交付结果」，先给队列 dead_grace 的宽限（子进程退出前 feeder 线程可能刚
+    把结果刷进管道），仍无结果即判定崩溃并抛 RuntimeError —— 绝不无限阻塞。
+    on_result 省略时只收集不回调。
+    """
+    on_result = on_result or (lambda result: None)
+    gids = list(gids) if gids is not None else list(range(len(processes)))
+    total = len(processes)
+    results = []
+    delivered = set()
+
+    while len(results) < total:
+        try:
+            result = result_queue.get(timeout=poll_timeout)
+        except queue.Empty:
+            dead = next(((p, gid) for p, gid in zip(processes, gids)
+                         if gid not in delivered and not p.is_alive()), None)
+            if dead is None:
+                continue
+            p, dead_gid = dead
+            try:
+                result = result_queue.get(timeout=dead_grace)
+            except queue.Empty:
+                raise RuntimeError(
+                    f"[selfplay] worker gid={dead_gid} 已退出（exitcode={p.exitcode}）"
+                    f"但未交付结果，判定为崩溃；已收集 {len(results)}/{total} 局"
+                ) from None
+        if 'error' in result:
+            raise RuntimeError(
+                f"[selfplay] worker gid={result.get('gid')} 内部异常：\n"
+                f"{result['error']}")
+        results.append(result)
+        delivered.add(result.get('gid'))
+        on_result(result)
+    return results
+
+
+def _run_parallel_workers(result_queue, processes, on_result, gids=None,
+                          poll_timeout=0.5, join_timeout=5.0, dead_grace=1.0):
+    """start → 带 timeout 轮询收集 → finally 收尾，整段不泄漏子进程。"""
+    try:
+        for p in processes:
+            p.start()
+        return _poll_worker_results(result_queue, processes, on_result, gids,
+                                    poll_timeout, dead_grace)
+    finally:
+        _reap_processes(processes, join_timeout)
+
+
+# --------------------------------------------------------------------------- #
+# 异步流水线队列收集
+# --------------------------------------------------------------------------- #
+def _drain_queue_into_buffer(data_queue, buffer, args, bs, n_actions, max_stall=120):
+    """从异步流水线数据队列收集到 buffer 达标，返回本轮 collected 局数。
+
+    AsyncDataQueue.get 超时会自行吞掉 queue.Empty 并返回 None。旧循环遇 None
+    不计数也不退出，流水线一旦停止产出（worker 崩溃 / stop() 已调用）就永远
+    空转且无任何输出。这里连续 max_stall 次空轮询（默认 0.5s×120 = 60s 无数据）
+    即判定不再产出并抛 RuntimeError，带上 collected / len(buffer) / 阈值诊断。
+    """
+    target = args.batch_size * 20
+    collected = 0
+    stall = 0
+    while len(buffer) < target:
+        item = data_queue.get(timeout=0.5)
+        if item:
+            _process_game_data(item['data'], item['score'], bs, n_actions, buffer, args)
+            collected += 1
+            stall = 0
+            continue
+        stall += 1
+        if stall >= max_stall:
+            raise RuntimeError(
+                f"[selfplay] 异步流水线连续 {stall} 次（≈{stall * 0.5:.0f}s）无数据，"
+                f"判定已停止产出：collected={collected} len(buffer)={len(buffer)} / "
+                f"目标 {target}（max_stall={max_stall}）。"
+                f"请检查自对弈 worker 是否崩溃或流水线 stop() 是否已调用。")
+    return collected
 
 
 # --------------------------------------------------------------------------- #
@@ -812,16 +923,10 @@ def main():
 
                 # 持续收集数据并训练
                 for _ in range(args.games_per_iter or 10):
-                    # 收集数据
-                    collected = 0
-                    while len(buffer) < args.batch_size * 20:
-                        item = main._pipeline.data_queue.get(timeout=0.5)
-                        if item:
-                            game_data = item['data']
-                            score = item['score']
-                            _process_game_data(game_data, score, bs, n_actions, buffer, args)
-                            collected += 1
-                            total_games += 1
+                    # 收集数据（空队列连续 max_stall 次 → 报错，不静默空转）
+                    collected = _drain_queue_into_buffer(
+                        main._pipeline.data_queue, buffer, args, bs, n_actions)
+                    total_games += collected
 
                     if collected > 0 and is_main:
                         print(f"  收集 {collected} 局，buffer={len(buffer)}", flush=True)
@@ -852,15 +957,13 @@ def main():
                     # 显式用 spawn context（Windows 本就是 spawn，无行为变化）
                     ctx = mp.get_context('spawn')
                     result_queue = ctx.Queue(maxsize=args.result_queue_max)
-                    processes = []
-                    for g in range(args.parallel_games):
-                        p = ctx.Process(target=_selfplay_worker,
-                                        args=(g, args.model, args, result_queue))
-                        p.start()
-                        processes.append(p)
-                    # 收集结果
-                    for _ in range(args.parallel_games):
-                        result = result_queue.get()
+                    processes = [ctx.Process(target=_selfplay_worker,
+                                            args=(g, args.model, args, result_queue))
+                                 for g in range(args.parallel_games)]
+
+                    def _on_worker_result(result):
+                        """单局结果入 buffer。worker 崩溃由 _poll_worker_results 抛。"""
+                        nonlocal total_games
                         game_data = result['data']
                         score = result['score']
                         _process_game_data(game_data, score, bs, n_actions, buffer, args)
@@ -869,8 +972,8 @@ def main():
                             print(f"  [game {result['gid']+1}] score={score:+.1f} "
                                   f"moves={len(game_data)} buffer={len(buffer)}", flush=True)
 
-                    for p in processes:
-                        p.join()
+                    # 带 timeout 轮询收集；worker 崩溃立即报错，finally 收尾不泄漏子进程
+                    _run_parallel_workers(result_queue, processes, _on_worker_result)
             else:
                 # 串行生成
                 for g in range(args.games):
