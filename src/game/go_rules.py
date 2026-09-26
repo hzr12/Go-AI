@@ -14,13 +14,17 @@
   - pass（连续两次 pass 终局）
   - 中国规则计分：数子法（区域计分）+ 贴目 7.5
     （计分算法与 Tromp-Taylor 等价：空点归最近同色连通块；差异见 score() 注释）
-  - 位置超级劫（PSK）的**基础设施**：确定性 Zobrist 哈希 + 重复局面历史
-    （hash() / is_repetition() / _would_repeat()，见「Zobrist 哈希与重复局面」段）
+  - 位置超级劫（PSK）的**基础设施**：确定性 Zobrist 哈希 + 重复局面历史。
+    重复判定的键是 **position-only**（`position_hash()`，只含棋盘染色）——
+    Tromp-Taylor / OpenSpiel 口径；`hash()` 是含行棋方的通用局面指纹，**不用于**
+    重复判定（见「Zobrist 哈希与重复局面」段与 position_hash 的 docstring）
 未实现（监督学习不需要）：积攒劫、多劫循环判定、终局死子人工判定。
 
 ⚠ PSK 状态机已就位，但**尚未接入合法性**：superko 重复棋当前仍可落子
-（get_legal_moves() 与 play() 的判定逻辑未动）。接入由 v21 路线图 P2.6a-2 负责；
+（get_legal_moves() 与 play() 的判定逻辑未动）。接入由 v21 路线图 P2.6a-2b 负责；
 `tests/test_go_hash.py::test_repetition_not_yet_wired_into_legality` 锁住了这一点。
+⚠ 重复**不是终局条件**：Tromp-Taylor 规则 6/8 下重复是非法手，终局是两次连续 pass
+（`is_terminal()` 的语义，见其 docstring）。
 """
 
 import hashlib
@@ -70,7 +74,9 @@ def transform_coord(r: int, c: int, transform_id: int, board_size: int) -> int:
 #
 # 覆盖范围：每个交叉点 × {黑, 白} 两色（空点不需要表项：空 = 所有点项都不异或上去）
 #          + 行棋方一项。
-# 行棋方必须进哈希：PSK 的「局面」含 to_play，否则「同形但轮到对方」会被误判重复。
+# ⚠ 行棋方那一项**只**属于 `hash()`（通用局面指纹），**不属于** `position_hash()`
+#   （重复判定专用）。见 GoBoard.position_hash 的 docstring：用含行棋方的键判重复
+#   就是 SSK（situational superko），与 Tromp-Taylor / OpenSpiel 的 PSK 分歧。
 _ZOBRIST_SEED = b"Go-AI/v21/GoBoard/Zobrist/v1"
 _ZOBRIST_MASK = (1 << 64) - 1
 # 按 (行, 列) 索引而非 r*board_size+c：这样同一坐标在任何盘口下都是同一把钥匙，
@@ -133,7 +139,7 @@ class GoBoard:
 
     def clone(self) -> "GoBoard":
         """轻量克隆：复制推演所需状态（盘面/执子方/劫/连续 pass 计数/落子数/
-        **Zobrist 哈希 + 重复局面历史**）。
+        **两套 Zobrist 键 + 重复局面历史**）。
 
         **不复制** _undo_stack 与 move_history。原实现用 copy.deepcopy，会把随手数
         线性增长的撤销栈与着法历史整份复制，是叶子批量展开的主要开销之一。克隆出的
@@ -155,6 +161,7 @@ class GoBoard:
         nb._legal_cache = None
         nb._legal_cache_suicide = None
         nb._zobrist = self._zobrist
+        nb._pos_zobrist = self._pos_zobrist
         # 哈希所对应的盘面对象 = 克隆体**自己**的 board 数组（否则 hash() 会把它
         # 当成「外部替换了棋盘」而重新采纳，反倒丢掉刚深拷贝来的历史）
         nb._zobrist_ref = nb.board
@@ -290,19 +297,44 @@ class GoBoard:
 
     # ---- Zobrist 哈希与重复局面（位置超级劫 PSK 的地基）--------------------
     #
-    # 局面 = 棋盘 + 行棋方。哈希按落子**增量**维护（提子与行棋方翻转都计入），
-    # 不做每手全盘重算；undo() 复用同一份增量精确回退。
+    # **两套键，分工不可混用**（P2.6a-2a 写死）：
+    #   _zobrist / hash()          棋盘 + 行棋方 -> 通用局面指纹（缓存、诊断、对拍）。
+    #                               **不用于重复判定**。
+    #   _pos_zobrist / position_hash()
+    #                               仅棋盘染色   -> **重复判定专用**（Tromp-Taylor /
+    #                               OpenSpiel 的 position：不含「轮到谁」）。
+    # 为什么需要两套：通用指纹要能区分「同形但轮到对方」（否则缓存 / 对拍分不清两局），
+    # 而重复判定按规则**不能**区分。用错的后果具体是：拿含行棋方的键判重复 = SSK
+    # （situational superko），在「同一染色 + 异手方」的局面上与 Tromp-Taylor 分歧 ——
+    # 最小可见的一例是 pass（染色不变、行棋方翻转）。
+    # 两套键都在 play / undo / clone / reset / 接管路径上同步增量维护。
     #
-    # 两个谓词，语义必须分清（P2.6a-2 接入 PSK 时直接依赖这个区分）：
-    #   _would_repeat(candidate_hash) —— 「若下一手把局面变成 candidate_hash，
-    #       会不会命中历史」。**落子前**问，用于合法性判定。
-    #   is_repetition()              —— 「当前局面（不含本次落子）此前是否出现过」。
+    # 哈希按落子**增量**维护（提子与行棋方翻转都计入），不做每手全盘重算；
+    # undo() 复用同一份增量精确回退。
+    #
+    # 两个谓词，语义必须分清（P2.6a-2b 接入 PSK 时直接依赖这个区分）：
+    #   _would_repeat(candidate_pos_key) —— 「若下一手把**染色**变成 candidate，
+    #       会不会命中历史」。**落子前**问，用于合法性判定。候选键必须用
+    #       `position_hash_after_move(mv)` 算，不能用 `hash_after_move(mv)`。
+    #   is_repetition()                   —— 「当前染色（不含本次落子）此前是否出现过」。
     #       **落子后**自查历史用。
-    # 不能互相替代：play() 每次落子后都会把新界面的哈希追加进历史，所以落子后再问
+    # 不能互相替代：play() 每次落子后都会把新染色的键追加进历史，所以落子后再问
     # is_repetition() 答案恒为真（自己那一次出现）。
 
+    def _board_coloring_xor(self) -> int:
+        """仅棋盘染色的 Zobrist 异或（不含行棋方项）—— position 键的计算核心。
+
+        空点无项：空 = 该点的黑/白钥匙都不异或上去。
+        """
+        h = 0
+        board = self.board
+        rows, cols = np.nonzero(board)
+        for r, c in zip(rows.tolist(), cols.tolist()):
+            h ^= _zobrist_key(r, c, int(board[r, c]))
+        return h
+
     def _hash_from_board(self) -> int:
-        """按盘面全量重算哈希（棋盘 + 行棋方）。
+        """按盘面全量重算**通用指纹**（棋盘 + 行棋方）。
 
         只在重置 / 侦测到哈希与盘面脱钩时用；正常落子走增量，不做全盘重算。
 
@@ -311,12 +343,14 @@ class GoBoard:
         （例如死活 / 气紧之类的辅助标记），**这里会静默把它们按白子算进哈希** ——
         那时必须改成按取值分派钥匙，而不是继续沿用 `> 0`。
         """
-        h = _ZOBRIST_TO_PLAY[0 if self.current_player > 0 else 1]
-        board = self.board
-        rows, cols = np.nonzero(board)
-        for r, c in zip(rows.tolist(), cols.tolist()):
-            h ^= _zobrist_key(r, c, int(board[r, c]))
-        return h
+        return self._board_coloring_xor() ^ _ZOBRIST_TO_PLAY[0 if self.current_player > 0 else 1]
+
+    def _position_hash_from_board(self) -> int:
+        """按盘面全量重算 **position 键**（仅棋盘染色，不含行棋方）。
+
+        重复判定专用的那把；与 `_hash_from_board()` 的差别就是那一项行棋方。
+        """
+        return self._board_coloring_xor()
 
     def _adopt_as_new_game(self) -> None:
         """把当前盘面 + 行棋方**采纳**为「从此刻开局的一局新对局」。唯一实现。
@@ -348,7 +382,7 @@ class GoBoard:
           对局进度：Tromp-Taylor 规则 6 的 PSK 只看盘面涂色，而简单劫是它「只禁紧邻上一手
           之前那个局面」这一条更弱的限制，所以从该局面开新局时劫禁着照样成立。
           light_rollout 显式拷贝 ko_point 要的就是这个语义，不能在这里清掉。
-        重建：按盘面重算哈希，历史 = {当前局面}（**绝不伪造父局历史**）。
+        重建：按盘面重算**两套**键，历史 = {当前染色的 position 键}（**绝不伪造父局历史**）。
         """
         self.passes = 0
         self.move_number = 0
@@ -357,16 +391,18 @@ class GoBoard:
         self._legal_cache = None
         self._legal_cache_suicide = None
         self._zobrist = self._hash_from_board()
+        self._pos_zobrist = self._position_hash_from_board()
         self._zobrist_ref = self.board
         self._zobrist_player = self.current_player
-        self._pos_hash_history = [self._zobrist]
-        self._pos_hash_counts = {self._zobrist: 1}
+        self._pos_hash_history = [self._pos_zobrist]
+        self._pos_hash_counts = {self._pos_zobrist: 1}
 
     def _ensure_hash(self) -> None:
         """O(1) 守卫：侦测「增量哈希与盘面/行棋方脱钩」，并把当前局面**接管成一局新局**。
 
         入口（与本 docstring 保持一致）：`play()` / `undo()` / `hash()` /
-        `hash_after_move()` / `is_repetition()` / `_would_repeat()` 全部先调它。
+        `position_hash()` / `hash_after_move()` / `position_hash_after_move()` /
+        `is_repetition()` / `_would_repeat()` 全部先调它。
         `get_legal_moves()` 不调（它不碰哈希）。
 
         两种脱钩的处置**完全相同**，都走 `_adopt_as_new_game()`（契约见其 docstring）：
@@ -394,32 +430,57 @@ class GoBoard:
         self._adopt_as_new_game()
 
     def hash(self) -> int:
-        """当前局面（棋盘 + 行棋方，即 PSK 意义上的局面）的 Zobrist 哈希。
+        """通用局面指纹（棋盘 + **行棋方**）的 Zobrist 哈希。
 
         返回 [0, 2**64) 的 Python int。语义稳定：盘面与行棋方相同 => 哈希相同，
         跨实例、跨进程逐位一致（固定种子 + 模块加载时预生成）。
 
+        ⚠ **不用于重复判定**。重复判定必须用 `position_hash()`（仅棋盘染色）。
+        拿本方法去查重复历史 = SSK（situational superko），与 Tromp-Taylor /
+        OpenSpiel 的 PSK 在「同一染色 + 异手方」的局面上分歧 —— 最小可见的一例是
+        pass：染色不变、行棋方翻转，SSK 判它是新局面，PSK 判它重复同一染色。
+
         只读：不改盘面、行棋方、历史集合，也不失效合法性缓存。唯一可能的写入是
-        按当前盘面重算**过期**的增量哈希缓存（memoize，见 _ensure_hash）。
+        按当前盘面重算**过期**的增量哈希缓存（见 _ensure_hash）。
         """
         self._ensure_hash()
         return self._zobrist
 
-    def hash_after_move(self, move: int) -> int:
-        """只读推演：若现在下 move（-1 = pass），落子后局面的哈希。不改任何状态。
+    def position_hash(self) -> int:
+        """**重复判定专用**键：仅棋盘染色的 Zobrist 哈希（不含行棋方）。
 
-        供 P2.6a-2 在**落子前**问「这一手会不会命中重复历史」。只对合法着法
-        （含 pass）有定义；占点 / 劫禁着等非法落子语义未定义，调用方须先过
-        合法性检查。内部会临时落子以判定提子并立即还原（还原的是**原值**，
-        因此即使误传占点也不会擦掉棋子），故与 play() 一样不可重入。
+        这就是 Tromp-Taylor / OpenSpiel 口径下的 position —— 棋盘涂色本身，
+        既不含「轮到谁」，也不含历史着法。与 `hash()` 的差别就是那一项行棋方。
+
+        与 `hash()` 的分工（写死，别用反）：
+          - 重复判定（`_pos_hash_history` / `_pos_hash_counts` / `_would_repeat` /
+            `is_repetition`）**只**用本方法及其增量版本 `position_hash_after_move()`；
+          - `hash()` 是通用指纹（缓存键、诊断、对拍），需要区分「同形但轮到对方」。
+
+        为什么必须两套：规则要求重复判定**不**区分行棋方，而通用指纹**要**区分。
+        用错的后果 = SSK = 与 Tromp-Taylor 分歧（见 `hash()` 的 docstring）。
+
+        返回 [0, 2**64) 的 Python int，跨实例 / 跨盘口 / 跨进程确定性：只由
+        (行, 列, 颜色) 决定（空盘恒为 0）。
+
+        只读：不改盘面、行棋方、历史集合，也不失效合法性缓存。
         """
         self._ensure_hash()
-        delta = _ZOBRIST_TO_PLAY_XOR
+        return self._pos_zobrist
+
+    def _forecast_delta(self, move: int) -> int:
+        """只读推演一手棋对**棋盘染色**的哈希增量（落子点提子），不含行棋方翻转。
+
+        内部会临时落子以判定提子并立即还原（还原的是**原值**，因此即使误传占点
+        也不会擦掉棋子），故与 play() 一样不可重入。move == -1（pass）返回 0：
+        pass 不改变染色。
+        """
         if move == -1:
-            return self._zobrist ^ delta
+            return 0
         n = self.board_size
         r, c = divmod(move, n)
         color = self.current_player
+        delta = 0
         saved = self.board[r, c]
         try:
             self.board[r, c] = color
@@ -434,37 +495,79 @@ class GoBoard:
             delta ^= _zobrist_key(r, c, color)
         finally:
             self.board[r, c] = saved
-        return self._zobrist ^ delta
+        return delta
 
-    def _would_repeat(self, candidate_hash: int) -> bool:
-        """P2.6a-2 的 PSK 入口：局面（含行棋方）变成 candidate_hash 会不会命中历史。
+    def hash_after_move(self, move: int) -> int:
+        """只读推演：若现在下 move（-1 = pass），落子后**通用指纹**的值。不改任何状态。
 
-        「历史」含初始空局面。**落子前**在候选哈希上问 —— 因为 play() 每次落子后
-        都会把新局面的哈希追加进历史，落子后再自查必然为真。
+        与 `position_hash_after_move()` 的差别就是行棋方那一项，所以
+        **重复判定不要用本方法**（含行棋方 = SSK 的候选键）。PSK 合法性请用
+        `position_hash_after_move()`。
+
+        只对合法着法（含 pass）有定义；占点 / 劫禁着等非法落子语义未定义，调用方须先过
+        合法性检查。内部会临时落子以判定提子并立即还原，故与 play() 一样不可重入。
+        """
+        self._ensure_hash()
+        return self._zobrist ^ _ZOBRIST_TO_PLAY_XOR ^ self._forecast_delta(move)
+
+    def position_hash_after_move(self, move: int) -> int:
+        """只读推演：若现在下 move（-1 = pass），落子后**position 键**（仅染色）。
+
+        **P2.6a-2b 接线合法性时用本方法**算候选键：
+            `board._would_repeat(board.position_hash_after_move(mv))`
+        不可改用 `hash_after_move(mv)`（那是含行棋方的通用指纹 = SSK）。
+
+        move == -1（pass）返回**当前**键：pass 不改变染色，因此「pass 之后的染色」
+        必然已经在历史里，谓词会返回真。**接线时必须把 pass 排除在 PSK 判定之外**
+        （Tromp-Taylor 规则 6 禁的是重复棋，不是 pass；终局由两次连续 pass 表达），
+        否则任何 pass 都会被误判非法。
+
+        只对合法着法有定义；占点 / 劫禁着等非法落子语义未定义，调用方须先过合法性检查。
+        内部会临时落子以判定提子并立即还原，故与 play() 一样不可重入。
+        """
+        self._ensure_hash()
+        return self._pos_zobrist ^ self._forecast_delta(move)
+
+    def _would_repeat(self, candidate_pos_key: int) -> bool:
+        """PSK 谓词：局面**染色**变成 candidate_pos_key 会不会命中历史。
+
+        candidate 必须是 **position-only 键**（`position_hash()` /
+        `position_hash_after_move()`）；传 `hash()` 的值几乎必然查不到，表现为
+        「重复判定静默失效」。
+
+        「历史」含初始空局面。**落子前**在候选键上问 —— 因为 play() 每次落子后
+        都会把新染色的键追加进历史，落子后再自查必然为真。
 
         同样先过 `_ensure_hash()`：历史若属于另一个盘面，命中判定就毫无意义
         （O(1) 恒等比较，不在热路径上）。
         """
         self._ensure_hash()
-        return candidate_hash in self._pos_hash_counts
+        return candidate_pos_key in self._pos_hash_counts
 
     def is_repetition(self) -> bool:
-        """当前局面（含行棋方）此前是否出现过 —— **不含本次落子**。
+        """当前**染色**此前是否出现过 —— **不含本次落子**。
 
-        历史记录的是「每一手落子之后」的界面（含初始空局面），所以当前界面的那
-        一次出现总在集合里；真正要问的是「除本手之外当前局面此前是否出现过」，
-        即该哈希的出现次数 > 1。undo() 之后当前局面回到父局，语义同样成立。
+        历史记录的是「每一手落子之后」的染色（含初始空局面），所以当前染色的那
+        一次出现总在集合里；真正要问的是「除本手之外当前染色此前是否出现过」，
+        即该键的出现次数 > 1。undo() 之后当前局面回到父局，语义同样成立。
+
+        注意 pass：pass 不改变染色，所以**任何一手 pass 之后本方法都为真**
+        （该染色第二次出现）。这不是 bug，是 PSK 的定义；因此合法性判定必须把
+        pass 排除在外（见 `position_hash_after_move()` 的 docstring）。
         """
         self._ensure_hash()
-        return self._pos_hash_counts.get(self._zobrist, 0) > 1
+        return self._pos_hash_counts.get(self._pos_zobrist, 0) > 1
 
-    def _hash_delta(self, moved_by: int, move: int, captured) -> int:
-        """一手棋产生的哈希增量（落子点提子 + 行棋方翻转），不含历史计数。
+    def _board_delta(self, moved_by: int, move: int, captured) -> int:
+        """一手棋对**棋盘染色**的哈希增量（落子点 + 提子），不含行棋方翻转。
 
-        XOR 是对合运算 => 增量的逆就是它本身，所以 undo() 复用**这一条**表达式
-        （而不是另存一份父哈希）就能精确回到父局，且两处不可能写歪。
+        pass（move < 0）返回 0：染色没变。
+
+        XOR 是对合运算 => 增量的逆就是它本身，所以「落子」与「撤销落子」用的是**同一条**
+        表达式（而不是各存一份父哈希），两套键都能精确回到父局，且两处不可能写歪。
+        通用指纹的增量 = 本增量 ^ 行棋方翻转项。
         """
-        delta = _ZOBRIST_TO_PLAY_XOR
+        delta = 0
         if move >= 0:
             n = self.board_size
             r, c = divmod(move, n)
@@ -474,23 +577,31 @@ class GoBoard:
         return delta
 
     def _commit_position(self, moved_by: int, move: int, captured) -> None:
-        """增量更新哈希并把新局面的哈希追加进历史（每次成功落子一次）。"""
-        self._zobrist ^= self._hash_delta(moved_by, move, captured)
+        """增量更新**两套**键，并把新染色的键追加进历史（每次成功落子一次）。
+
+        两套键共用同一条棋盘增量：通用指纹额外异或一次行棋方翻转项，position 键不异或。
+        历史集合只收 position 键 —— 重复判定的键只有这一把。
+        """
+        delta = self._board_delta(moved_by, move, captured)
+        self._zobrist ^= delta ^ _ZOBRIST_TO_PLAY_XOR
+        self._pos_zobrist ^= delta
         self._zobrist_player = -moved_by
-        h = self._zobrist
+        h = self._pos_zobrist
         self._pos_hash_history.append(h)
         self._pos_hash_counts[h] = self._pos_hash_counts.get(h, 0) + 1
 
     def _rollback_position(self, moved_by: int, move: int, captured) -> None:
-        """回退哈希并把历史末尾那一项弹出（undo 一次）。
+        """回退**两套**键并把历史末尾那一项弹出（undo 一次）。
 
-        注意必须按**出现次数**回退而不是 set.discard()：同一局面可能出现多次，
-        直接 discard 会把更早那次出现也抹掉，于是「已经重复过」被误判成
-        「没重复过」—— 一个静默放行 superko 的 bug。
+        注意必须按**出现次数**回退而不是 set.discard()：同一染色可能出现多次
+        （例如实着 + 随后的 pass），直接 discard 会把更早那次出现也抹掉，于是
+        「已经重复过」被误判成「没重复过」—— 一个静默放行 superko 的 bug。
         """
         # 离场局面（撤销前的当前局面）必须就是历史末项，否则哈希与历史已经脱钩
-        leaving = self._zobrist
-        self._zobrist ^= self._hash_delta(moved_by, move, captured)
+        leaving = self._pos_zobrist
+        delta = self._board_delta(moved_by, move, captured)
+        self._zobrist ^= delta ^ _ZOBRIST_TO_PLAY_XOR
+        self._pos_zobrist ^= delta
         self._zobrist_player = moved_by
         last = self._pos_hash_history.pop()
         assert last == leaving, (
@@ -523,8 +634,8 @@ class GoBoard:
         返回是否成功（非法落子返回 False 且不改变状态）。
 
         record=True（默认）时把撤销信息压入 _undo_stack，可用 undo() 撤销
-        本次落子（含提子恢复 / 劫点 / pass 计数 / 历史 / 执子方 / Zobrist 哈希
-        / 重复局面历史 / 落子数）。
+        本次落子（含提子恢复 / 劫点 / pass 计数 / 历史 / 执子方 / 两套 Zobrist 键
+        （通用指纹 + 重复判定用的 position 键）/ 重复局面历史 / 落子数）。
         """
         n = self.board_size
         self._ensure_hash()
@@ -596,7 +707,8 @@ class GoBoard:
         """撤销最近一次成功 play（须 play(record=True)）。
 
         完整恢复：棋盘子与被提子、劫禁着点、pass 计数、着法历史、执子方、落子数、
-        Zobrist 哈希、重复局面历史（含出现次数）。
+        两套 Zobrist 键（通用指纹 + 重复判定用的 position 键）、
+        重复局面历史（含出现次数）。
         返回是否成功（栈空返回 False）。
 
         入口同样先过 `_ensure_hash()`：若盘面/行棋方已被外部改写，接管会连带清空
@@ -629,6 +741,10 @@ class GoBoard:
 
     def is_terminal(self, max_moves: int = None) -> bool:
         """终局判定：连续两次 pass（对局认输），或达到 move 上限。
+
+        ⚠ **重复局面不是终局条件**：Tromp-Taylor 规则 6/8 下「重复」是**非法手**
+        （PSK 由 _would_repeat 判，接线在 P2.6a-2b），终局只由两次连续 pass 表达。
+        本方法不查重复历史，不要在这里加。
 
         max_moves 为 None 时取 2 * board_size ** 2 —— 沿用仓库既有约定
         （tests/test_go_rules.py 随机对弈的步数上限、light_rollout 的
