@@ -227,6 +227,52 @@ def self_play_game(ai, board_size, sims, max_moves, temperature,
     return data, board.score()
 
 
+# --------------------------------------------------------------------------- #
+# 参数映射：并行 worker 与串行共用的唯一真相源
+# --------------------------------------------------------------------------- #
+def _selfplay_kwargs(args, bs):
+    """把 argparse Namespace 映射成自对弈一局所需的**全部**关键字参数。
+
+    并行 worker（_selfplay_worker）与 main() 串行分支曾各手写一份参数映射，
+    两者不一致且是**静默**分叉：worker 漏传 rollout_steps，落回本模块的函数签名
+    默认 None（MCTS 语义 = 2*N*N 步），而 --rollout-steps 的 argparse 默认是 60
+    —— 同一份 args，并行与串行跑出不同的对局（9 盘 162 步 vs 60 步，19 盘 722 步
+    vs 60 步）。集中到本函数后，增删改参数只改一处。
+
+    取值规则：全部经 getattr + **argparse 真实默认值**兜底（逐项对齐 main() 的
+    argparse 默认）。两层理由：
+      - getattr 兜底保留 worker 侧对残缺 Namespace 的容错（旧代码就有这层防御，
+        子进程拿到的 args 若被上游裁剪过，不该直接 AttributeError）；
+      - 兜底值与 argparse 默认保持一致，避免「残缺 Namespace 跑出的对局又与
+        命令行不同」——那等于把刚合并的分叉换个地方复活。
+    四个 0/1 标志统一 bool 归一化，两条路径类型一致。
+
+    刻意**不**传 priors_leaf / dir_alpha / dir_eps：D10 已把它们钉死为自对弈
+    函数的签名默认（True / 0.3 / 0.25），P3-B 会连同其他 MCTS 参数一起删除，
+    现在不接线是刻意的，不是漏。
+    """
+    return {
+        'board_size': bs,
+        'sims': getattr(args, 'sims', 400),
+        # --max-moves 默认 None → 3×点数（与旧两处写法逐字一致）
+        'max_moves': getattr(args, 'max_moves', None) or 3 * bs * bs,
+        'temperature': getattr(args, 'temperature', 1.0),
+        'expand_topk': getattr(args, 'expand_topk', 64),
+        'expand_chunk': getattr(args, 'expand_chunk', 0),
+        'use_rollout': bool(getattr(args, 'use_rollout', 0)),
+        'rollout_lambda': getattr(args, 'rollout_lambda', 0.25),
+        'rollout_steps': getattr(args, 'rollout_steps', 60),
+        'leaf_ab_depth': getattr(args, 'leaf_ab_depth', 2),
+        'c_puct': getattr(args, 'c_puct', 2.0),
+        'virtual_loss': getattr(args, 'virtual_loss', 8.0),
+        # 实际生效的是 --mcts-threads；--num-threads（默认 8）是死参数
+        'num_threads': getattr(args, 'mcts_threads', 3),
+        'spec_prefetch': bool(getattr(args, 'spec_prefetch', 1)),
+        'use_diverse_rollout': bool(getattr(args, 'use_diverse_rollout', 0)),
+        'vector_backup': bool(getattr(args, 'mcts_vector_backup', 1)),
+    }
+
+
 def augment8(plane, target, n):
     """8 对称增强：4 旋转 × 2 镜像（全向量化，复用 GoBoard.apply_symmetry_batch）。
 
@@ -321,19 +367,7 @@ def _selfplay_worker(gid, model_path, args, result_queue):
                       use_amp=True, attn_mode='window', attn_window=7)
 
         game_data, score = self_play_game(
-            ai, args.board_size, args.sims,
-            args.max_moves or 3 * args.board_size * args.board_size,
-            args.temperature, args.expand_topk, args.expand_chunk,
-            use_rollout=getattr(args, 'use_rollout', False),
-            rollout_lambda=getattr(args, 'rollout_lambda', 0.25),
-            leaf_ab_depth=getattr(args, 'leaf_ab_depth', 2),
-            c_puct=getattr(args, 'c_puct', 2.0),
-            virtual_loss=getattr(args, 'virtual_loss', 8.0),
-            num_threads=getattr(args, 'mcts_threads', 3),  # 使用新的参数名
-            spec_prefetch=getattr(args, 'spec_prefetch', False),
-            use_diverse_rollout=getattr(args, 'use_diverse_rollout', False),
-            vector_backup=getattr(args, 'mcts_vector_backup', 1) == 1
-        )
+            ai, **_selfplay_kwargs(args, args.board_size))
     except BaseException:
         result_queue.put({'gid': gid, 'error': traceback.format_exc()})
         return
@@ -987,7 +1021,6 @@ def main():
         pass
     bs = ai.board_size
     n_actions = bs * bs + 1
-    max_moves = args.max_moves or 3 * bs * bs
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
 
     # 最佳权重追踪
@@ -1079,18 +1112,7 @@ def main():
                 # 串行生成
                 for g in range(args.games):
                     game_data, score = self_play_game(
-                        ai, bs, args.sims, max_moves, args.temperature,
-                        args.expand_topk, args.expand_chunk,
-                        use_rollout=args.use_rollout,
-                        rollout_lambda=args.rollout_lambda,
-                        rollout_steps=args.rollout_steps,
-                        leaf_ab_depth=args.leaf_ab_depth,
-                        c_puct=args.c_puct,
-                        virtual_loss=args.virtual_loss,
-                        num_threads=getattr(args, 'mcts_threads', 3),
-                        spec_prefetch=args.spec_prefetch == 1,
-                        use_diverse_rollout=args.use_diverse_rollout == 1,
-                        vector_backup=args.mcts_vector_backup == 1)
+                        ai, **_selfplay_kwargs(args, bs))
                     _process_game_data(game_data, score, bs, n_actions, buffer, args)
                     total_games += 1
                     if is_main:
