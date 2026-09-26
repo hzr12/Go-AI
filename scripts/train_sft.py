@@ -858,6 +858,45 @@ def _sync_stop_flag(stop_flag, is_dist, early_stop_enabled):
     dist.broadcast(stop_flag, src=0)
 
 
+def _build_param_groups(model, args):
+    """构造 AdamW 的四组参数：{非 value, value} × {decay, no_decay}。
+
+    value head 独立 LR（参数量小，需要更高学习率补偿梯度不足）；
+    排除 bias / BatchNorm / LayerNorm 参数的 weight decay（标准做法）。
+
+    no_decay 判据是 **param.ndim == 1**，且集合里收的是 **param 对象**而不是名字。
+    这点是必须的：`model.named_parameters()` 产出全名（'value.fc.bias'），
+    而 `model.value.named_parameters()` 产出相对名（'fc.bias'）——两侧命名空间
+    不同，按名字比对永远不成立。本逻辑此前内联在 main() 里，正是栽在这里：
+    value 的 no_decay 组恒空、value decay 组吃掉 value 头全部参数（含 BN/LN 权重
+    与 bias），与 SFT 常规做法相反。`nn.Parameter` 按身份可哈希（`Tensor.__hash__`
+    是 id 语义），直接用对象做集合元素即可，不必绕 `id()`。
+
+    value 归属按**前缀** `'value.'` 判定而非子串 `'value' in n`：子串判定会把未来
+    v21 新增的 `backbone.value_proj` 之类（非 value 头、名字里带 value）误归到 value 组。
+
+    调用前提：`model` 必须是**裸模块**。DDP 包装后 `named_parameters()` 的名字会带
+    `module.` 前缀，`startswith('value.')` 就不再成立。main() 里本函数在
+    DistributedDataParallel 包装之前调用（分组只依赖模块自身结构，与 is_dist 无关），
+    改调用顺序时留意这一条。
+    """
+    no_decay_params = {p for p in model.parameters() if p.ndim == 1}
+    value_decay = [p for p in model.value.parameters() if p not in no_decay_params]
+    value_no_decay = [p for p in model.value.parameters() if p in no_decay_params]
+    other_decay = [p for n, p in model.named_parameters()
+                   if not n.startswith('value.') and p not in no_decay_params]
+    other_no_decay = [p for n, p in model.named_parameters()
+                      if not n.startswith('value.') and p in no_decay_params]
+    return [
+        {'params': other_decay, 'lr': args.lr,
+         'weight_decay': args.weight_decay},
+        {'params': other_no_decay, 'lr': args.lr, 'weight_decay': 0.0},
+        {'params': value_decay, 'lr': args.lr * args.value_lr_mult,
+         'weight_decay': args.weight_decay},
+        {'params': value_no_decay, 'lr': args.lr * args.value_lr_mult, 'weight_decay': 0.0},
+    ]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--data', required=True,
@@ -1296,28 +1335,7 @@ def main():
 
     # 参数组：value head 独立 LR（参数量小，需要更高学习率补偿梯度不足）
     # 排除 bias / BatchNorm / LayerNorm 参数的 weight decay（标准做法）
-    no_decay_params = set()
-    for name, param in model.named_parameters():
-        if param.ndim == 1:  # bias, BN/LN weight, BN/LN bias
-            no_decay_params.add(name)
-
-    value_decay = [p for n, p in model.value.named_parameters()
-                   if n not in no_decay_params]
-    value_no_decay = [p for n, p in model.value.named_parameters()
-                      if n in no_decay_params]
-    other_decay = [p for n, p in model.named_parameters()
-                   if 'value' not in n and n not in no_decay_params]
-    other_no_decay = [p for n, p in model.named_parameters()
-                      if 'value' not in n and n in no_decay_params]
-
-    _opt_groups = [
-        {'params': other_decay, 'lr': args.lr,
-         'weight_decay': args.weight_decay},
-        {'params': other_no_decay, 'lr': args.lr, 'weight_decay': 0.0},
-        {'params': value_decay, 'lr': args.lr * args.value_lr_mult,
-         'weight_decay': args.weight_decay},
-        {'params': value_no_decay, 'lr': args.lr * args.value_lr_mult, 'weight_decay': 0.0},
-    ]
+    _opt_groups = _build_param_groups(model, args)
     # A1: CUDA(A100) 启用 fused AdamW（单 kernel 融合 param 更新，省启动开销）；
     # NPU/CPU 走默认实现（910A 不支持 fused）
     if _backend == 'cuda':
