@@ -243,7 +243,14 @@ def test_two_breaks_one_per_loop():
 # 所以一直没被发现。
 # --------------------------------------------------------------------------- #
 def test_counter_not_reset_by_other_metric():
-    """`--early-stop-metric loss` 时，别的指标（top1）改善不得清零计数器。"""
+    """`--early-stop-metric loss` 时，别的指标（top1）改善不得清零计数器。
+
+    **本用例只锁判定函数的契约**：早停指标未改善时返回 `counter + 1`。
+    跨指标交互本身（main() 里那段判据会不会顺手把计数器抹平）**不由本用例覆盖** ——
+    修复前它就是绿的（那处复位在 main() 内，这个纯函数调用根本看不到它）。
+    跨指标由结构锁 `test_counter_reset_only_inside_decision_function` 覆盖：
+    任何在 `_early_stop_decision` 之外改写计数器的写法都会红。
+    """
     # 连续 3 次 eval：top1 一路涨（0.50 → 0.60），早停指标 loss 死死不动（0.30）
     best_metric, counter = 0.30, 0
     for k, top1 in enumerate((0.50, 0.55, 0.60), start=1):
@@ -294,10 +301,24 @@ def _one_func(tree, name):
 
 
 def _assigns_to(node, name):
-    """`node` 是否把 `name` 赋成值（含 `a, name, b = ...` 这种元组解包）。"""
-    if not isinstance(node, ast.Assign):
+    """`node` 是否把 `name` 写成了值 —— 覆盖全部**赋值语句**形态。
+
+    形态：`x = v`（ast.Assign）、`x += v`（ast.AugAssign）、`x: T = v`（ast.AnnAssign）、
+    `(x := v)`（ast.NamedExpr）；target 内的解包由 `ast.walk` 展开，故
+    `a, x, b = ...` 也收得到。注意后三者的 target 是**单个** `node.target` 而非
+    `node.targets` —— 只认 ast.Assign 时它们对整个锁隐形（实测：`x += 1` 与
+    `x: int = 0` 都收不到，字面子串计数 `'early_stop_counter = 0'` 也数不出后者）。
+
+    不覆盖（对本变量无现实意义，故有意不锁）：for/with/except-as 的绑定目标、
+    `del x`、以及对 `obj.x` 的属性赋值（那不重绑定这个名字本身）。
+    """
+    if isinstance(node, ast.Assign):
+        targets = node.targets
+    elif isinstance(node, (ast.AugAssign, ast.AnnAssign, ast.NamedExpr)):
+        targets = [node.target]
+    else:
         return False
-    for tg in node.targets:
+    for tg in targets:
         for sub in ast.walk(tg):
             if isinstance(sub, ast.Name) and sub.id == name:
                 return True
@@ -310,11 +331,30 @@ def _calls(node, func_name):
 
 
 def _src(texts):
-    return '; '.join(x.strip() for x in texts)
+    """把 AST 节点还原成源码片段（给断言消息用）。
+
+    注意：不能对节点调 `.strip()` —— ast 节点没有这个属性，会 AttributeError
+    把断言消息本身炸掉（那样锁虽然还是红的，但读不到任何原因）。
+    """
+    return '; '.join(ast.unparse(n).strip() for n in texts)
 
 
 def test_counter_reset_only_inside_decision_function():
-    """`early_stop_counter` 的写入点只有两个形态：main() 的初始化 + 接收判定结果。
+    """`early_stop_counter` 的写入点只有两种合法形态：init + from_decision。
+
+    写入点收集（`_assigns_to`）覆盖全部**赋值语句**形态 —— 普通赋值 `x = v`
+    （含 `a, x, b = ...` 元组解包）、增强赋值 `x += v`（AugAssign）、
+    带注解赋值 `x: int = v`（AnnAssign）、海象赋值 `(x := v)`（NamedExpr）；
+    其中只有**普通赋值**可能合法：
+
+    - `init`：直接挂在 `main()` 体上的 `early_stop_counter = 0`（一次性初始化）
+    - `from_decision`：值来自 `_early_stop_decision(...)`（元组解包写入）
+
+    为什么这两种之外一律 rogue：`x += 1` 是第二套计数规则（绕开判定函数的
+    改善/累加语义），`x: int = 0` 改的是声明而非计数状态 —— 两者都会让
+    「计数器只有一个权威」这个不变量在结构上无法判定。上面第一行的字面计数
+    `early_stop_counter = 0` 只是 brief 的原始判据（粗粒度、只认普通赋值的
+    字面形状），真正的锁是后面的 AST 角色判定：它连子串数不到的形态也能收。
 
     **结构锁，修复前必红**：修复前 main() 的「top1 刷新最佳」分支里还有第三处
     `early_stop_counter = 0` —— 一个计数器两个权威，`--early-stop-metric loss` 时
@@ -330,12 +370,15 @@ def test_counter_reset_only_inside_decision_function():
     writes = [n for n in ast.walk(_TRAIN_TREE) if _assigns_to(n, 'early_stop_counter')]
 
     def _role(w):
-        # 直接挂在 main() 体上 = 一次性初始化（唯一允许的字面 0）
-        if w in main_fn.body:
+        # 唯一合法的两种形态，都必须是**普通赋值**：
+        # init = 直接挂在 main() 体上的 `early_stop_counter = 0`（一次性初始化）
+        if isinstance(w, ast.Assign) and w in main_fn.body:
             return 'init'
-        # 其余只允许「值来自 _early_stop_decision(...)」= 接收判定结论
-        if _calls(w.value, '_early_stop_decision'):
+        # from_decision = 值来自 `_early_stop_decision(...)`（含元组解包）
+        if isinstance(w, ast.Assign) and _calls(w.value, '_early_stop_decision'):
             return 'from_decision'
+        # 增强赋值 / 带注解赋值即便挂在 main() 体上、即便值恰好来自判定函数，
+        # 也都不是合法形态（`x += 1` 是第二套计数规则；`x: int = 0` 改的是声明）
         return 'rogue'
 
     roles = sorted(_role(w) for w in writes)
