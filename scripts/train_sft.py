@@ -331,13 +331,35 @@ def load_dataset(path):
     return SupervisedDataset({k: d[k] for k in d.files})
 
 
+def _eval_batch_budget(n_samples, bs, max_batches):
+    """验证集批数预算：返回 (n_batches, truncated)。
+
+    `max_batches` 为 None 或 <= 0 时**不截断**（跑满整个验证集）；否则只跑前
+    `max_batches` 批。`truncated` 表示确实因上限少跑了批 —— 调用方靠它把
+    「这次评估只覆盖了验证集的一部分」显式写进返回值/日志，而不是让读日志的人
+    误以为指标来自全量验证集。
+
+    两个评估函数共用本函数，避免上限语义在两处漂移。
+    """
+    total = (n_samples + bs - 1) // bs
+    if max_batches is None or max_batches <= 0:
+        return total, False
+    return min(total, max_batches), total > max_batches
+
+
 def evaluate_top1(model, dataset, idxs, bs, device, amp_dtype, max_batches=50,
                   use_channels_last=False):
-    """验证集 top-1 着法准确率。返回 (accuracy, num_samples)。"""
+    """验证集 top-1 着法准确率。返回 (accuracy, num_samples)。
+
+    返回形状按历史契约保持二元组（本函数在 train_sft.py 内当前没有调用点，
+    `scripts/train_sft_ms.py` 里的是另一个独立同名函数），故截断信息不进
+    返回值、只写日志。`max_batches` 为 None 或 <= 0 时跑满验证集。
+    """
     model.eval()
     correct = 0
     total = 0
-    n_batches = min((len(idxs) + bs - 1) // bs, max_batches)
+    batches = 0
+    n_batches, truncated = _eval_batch_budget(len(idxs), bs, max_batches)
     with torch.no_grad():
         for b in range(n_batches):
             sel = idxs[b * bs:(b + 1) * bs]
@@ -353,7 +375,12 @@ def evaluate_top1(model, dataset, idxs, bs, device, amp_dtype, max_batches=50,
             pred = policy_logits.argmax(dim=-1)
             correct += int((pred == move_t).sum())
             total += len(sel)
+            batches += 1
     model.train()
+    if truncated:
+        logging.getLogger('train').info(
+            "[eval] top1 验证集被截断：只跑了 %d 批（n=%d，max_batches=%s；"
+            "传 <=0 可跑满验证集）", batches, total, max_batches)
     return correct / max(total, 1), total
 
 
@@ -366,6 +393,10 @@ def evaluate_metrics(model, dataset, idxs, bs, device, amp_dtype, max_batches=50
         kl                : model softmax vs expert one-hot 的 KL散量
         brier             : value 预测 vs 实际胜负的 Brier score（越小越好）
         n                 : 样本数
+        batches           : 本次**实际**跑掉的批数（idxs 尾部不足一整批时小于计划批数）
+        truncated         : 是否因 --eval-max-batches 上限少跑了批（评估覆盖度不足）
+
+    后两个键只增信息、不改计算：`max_batches` 为 None 或 <= 0 时跑满验证集。
     """
     import torch.nn.functional as F
     model.eval()
@@ -373,7 +404,8 @@ def evaluate_metrics(model, dataset, idxs, bs, device, amp_dtype, max_batches=50
     total = 0
     kl_sum = 0.0
     brier_sum = 0.0
-    n_batches = min((len(idxs) + bs - 1) // bs, max_batches)
+    batches = 0
+    n_batches, truncated = _eval_batch_budget(len(idxs), bs, max_batches)
     with torch.inference_mode():
         for b in range(n_batches):
             sel = idxs[b * bs:(b + 1) * bs]
@@ -389,6 +421,7 @@ def evaluate_metrics(model, dataset, idxs, bs, device, amp_dtype, max_batches=50
                 policy_logits, value_pred = model(state)
             B = len(sel)
             total += B
+            batches += 1
 
             # --- top-k 准确率 ---
             topk = policy_logits.topk(10, dim=-1).indices  # (B,10)
@@ -432,6 +465,9 @@ def evaluate_metrics(model, dataset, idxs, bs, device, amp_dtype, max_batches=50
         'kl': kl_sum / n,
         'brier': brier_sum / n,
         'n': total,
+        # 覆盖度可见化：只增信息，不参与上面任何一个指标的计算
+        'batches': batches,
+        'truncated': truncated,
     }
 
 
@@ -777,6 +813,8 @@ def main():
                          'sparse=窗口+全局token, window_global=块状窗口+全局token(手写math)')
     ap.add_argument('--attn-window', type=int, default=7, help='window 模式窗口边长')
     ap.add_argument('--eval-every', type=int, default=5000)
+    ap.add_argument('--eval-max-batches', type=int, default=50,
+                    help='验证集评估最多跑多少个 batch；<=0 表示不截断（跑满全部验证集）')
     ap.add_argument('--log-every', type=int, default=50,
                     help='每隔多少 step 打印一次训练日志（loss/lr/吞吐/显存）')
     ap.add_argument('--log-file', default='training.log',
@@ -931,6 +969,8 @@ def main():
                 args.num_heads, args.num_attention_layers, args.attention_dropout, args.compile)
     logger.info("日志: log_every=%d eval_every=%d save_every=%d out=%s",
                 args.log_every, args.eval_every, args.save_every, args.out)
+    logger.info("验证集评估: eval_max_batches=%d（<=0 = 跑满全部验证集；日志 [eval] 行的 "
+                "batches/truncated 即本次实际覆盖度）", args.eval_max_batches)
     # C2NET 输出路径重定向
     if _c2net_ctx is not None and is_main:
         _c2net_out = os.path.join(_c2net_ctx.output_path, os.path.basename(args.out))
@@ -1713,6 +1753,7 @@ def main():
                 _t_eval0 = time.perf_counter()
                 metrics = evaluate_metrics(
                     model, dataset, eval_idx, bs, device, amp_dtype,
+                    max_batches=args.eval_max_batches,
                     use_channels_last=use_channels_last)
                 _t_eval += time.perf_counter() - _t_eval0
                 if ema is not None:
@@ -1720,10 +1761,16 @@ def main():
                 if is_main:
                     logger.info(
                         "[eval] step=%d top1=%.4f top5=%.4f top10=%.4f "
-                        "kl=%.4f brier=%.4f (n=%d)%s",
+                        "kl=%.4f brier=%.4f (n=%d, batches=%d, truncated=%s)%s",
                         step, metrics['top1'], metrics['top5'], metrics['top10'],
                         metrics['kl'], metrics['brier'], metrics['n'],
+                        metrics['batches'], metrics['truncated'],
                         " ★ new best" if metrics['top1'] > best_eval_acc else "")
+                    if metrics['truncated']:
+                        logger.info(
+                            "[eval] 验证集被截断：本次只评估了 %d 批（--eval-max-batches=%s，"
+                            "传 <=0 跑满全部验证集）", metrics['batches'],
+                            args.eval_max_batches)
                     # SwanLab 记录评估指标
                     if swanlab_logger is not None:
                         try:
@@ -1734,6 +1781,8 @@ def main():
                                 "eval_kl": metrics['kl'],
                                 "eval_brier": metrics['brier'],
                                 "eval_n": metrics['n'],
+                                "eval_batches": metrics['batches'],
+                                "eval_truncated": metrics['truncated'],
                                 "best_eval_acc": best_eval_acc,
                             }, step=step)
                         except Exception as e:
@@ -1820,15 +1869,22 @@ def main():
             ema.apply_shadow()
         final_metrics = evaluate_metrics(
             model, dataset, eval_idx, bs, device, amp_dtype,
+            max_batches=args.eval_max_batches,
             use_channels_last=use_channels_last)
         if ema is not None:
             ema.restore()
         if is_main:
             logger.info(
                 "[eval] FINAL top1=%.4f top5=%.4f top10=%.4f "
-                "kl=%.4f brier=%.4f (n=%d)",
+                "kl=%.4f brier=%.4f (n=%d, batches=%d, truncated=%s)",
                 final_metrics['top1'], final_metrics['top5'], final_metrics['top10'],
-                final_metrics['kl'], final_metrics['brier'], final_metrics['n'])
+                final_metrics['kl'], final_metrics['brier'], final_metrics['n'],
+                final_metrics['batches'], final_metrics['truncated'])
+            if final_metrics['truncated']:
+                logger.info(
+                    "[eval] 最终评估的验证集被截断：只评估了 %d 批（--eval-max-batches=%s，"
+                    "传 <=0 跑满全部验证集）", final_metrics['batches'],
+                    args.eval_max_batches)
             # SwanLab 记录最终评估结果
             if swanlab_logger is not None:
                 try:
