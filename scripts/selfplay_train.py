@@ -576,6 +576,39 @@ def _drain_queue_into_buffer(data_queue, buffer, args, bs, n_actions, max_stall=
 
 
 # --------------------------------------------------------------------------- #
+# 权重落盘
+# --------------------------------------------------------------------------- #
+def _save_checkpoint(ai, args, bs, it):
+    """按训练格式把当前权重落盘，返回**实际写入的路径**。
+
+    沿用既有命名规则：`args.out` 不以 `.pth` 结尾时补后缀。所以真实路径在
+    `--out models/az` 时是 `models/az.pth` —— 与 `args.out` 不是同一个文件，
+    返回真实路径而不是让调用方复用 `args.out`，收尾打印的「最佳权重」才是
+    磁盘上真实存在的那个。
+    """
+    out_path = args.out if args.out.endswith('.pth') else args.out + '.pth'
+    torch.save({"model": ai.model.state_dict(), "iter": it,
+                "board_size": bs, "args": vars(args)}, out_path)
+    return out_path
+
+
+def _finalize_checkpoint(ai, args, bs, it, best_path, saved_any):
+    """收尾保证「最佳权重」一定落盘，返回真实存在的路径。
+
+    buffer 从未攒到训练阈值（`train_epochs` 一次都没跑）时一个权重文件都不存在，
+    收尾却无条件打印「最佳权重: {best_path}」—— 下游 eval_elo.py 会拿到一个
+    打不开的路径。宁可在这种情况下把当前权重（此时是初始权重）存下来，也不能
+    宣称一个不存在的产物。
+
+    saved_any 为真说明途中已经存过，原样返回 `best_path`（不再写盘，避免覆盖
+    真正的最佳权重 —— 收尾这一刻的权重未必比最佳权重好）。
+    """
+    if saved_any:
+        return best_path
+    return _save_checkpoint(ai, args, bs, it)
+
+
+# --------------------------------------------------------------------------- #
 # 训练
 # --------------------------------------------------------------------------- #
 def train_epochs(ai, buffer, args, device):
@@ -1025,7 +1058,9 @@ def main():
 
     # 最佳权重追踪
     best_loss = float('inf')
-    best_path = args.out
+    best_path = args.out      # 首次落盘后由 _save_checkpoint 的返回值覆盖
+    saved_any = False         # 是否真的存过盘 —— 收尾兜底的条件
+    it = 0                    # --iters 0 时 for 循环不执行，收尾兜底仍要用到迭代号
 
     buffer = []   # [(planes(12,n,n), target(n²+1), z)]
     total_games = 0
@@ -1035,6 +1070,7 @@ def main():
 
         if is_main:
             print(f"\n[iter {it}/{args.iters}] 开始自对弈...", flush=True)
+
 
         # SwanLab 记录迭代开始
         if swanlab_logger is not None:
@@ -1072,9 +1108,8 @@ def main():
                         # 保存最佳
                         if avg_loss < best_loss:
                             best_loss = avg_loss
-                            out_path = args.out if args.out.endswith('.pth') else args.out + '.pth'
-                            torch.save({"model": ai.model.state_dict(), "iter": it,
-                                       "board_size": bs, "args": vars(args)}, out_path)
+                            best_path = _save_checkpoint(ai, args, bs, it)
+                            saved_any = True
                             if is_main:
                                 print(f"[iter {it}] NEW BEST loss={avg_loss:.4f}", flush=True)
 
@@ -1132,12 +1167,10 @@ def main():
                 # 只保存最佳权重（节省空间）
                 if avg_loss < best_loss:
                     best_loss = avg_loss
-                    out_path = args.out if args.out.endswith('.pth') else args.out + '.pth'
-                    torch.save({"model": ai.model.state_dict(), "iter": it,
-                               "board_size": bs, "args": vars(args)}, out_path)
-                    if is_main:
-                        print(f"[iter {it}/{args.iters}] NEW BEST loss={avg_loss:.4f} "
-                              f"-> {out_path}", flush=True)
+                    best_path = _save_checkpoint(ai, args, bs, it)
+                    saved_any = True
+                    print(f"[iter {it}/{args.iters}] NEW BEST loss={avg_loss:.4f} "
+                          f"-> {best_path}", flush=True)
 
                 if is_main:
                     print(f"[iter {it}/{args.iters}] loss={avg_loss:.4f} buffer={len(buffer)} "
@@ -1161,6 +1194,9 @@ def main():
                 buffer.clear()
 
     if is_main:
+        # 兜底：一个权重都没存过（buffer 从未攒到训练阈值）时也必须落一个文件，
+        # 否则下面这句「最佳权重」指向磁盘上不存在的东西
+        best_path = _finalize_checkpoint(ai, args, bs, it, best_path, saved_any)
         print(f"训练完成。共 {total_games} 局，最佳权重: {best_path}")
         print("用 scripts/eval_elo.py 对比不同迭代权重棋力。")
         # SwanLab 结束

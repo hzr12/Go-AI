@@ -696,6 +696,49 @@ def _read_log_scalars(loss, policy_loss, value_loss):
     return loss.item(), policy_loss.item(), value_loss.item()
 
 
+def _early_stop_decision(early_stop_metric, current_metric, best_metric, counter, patience):
+    """早停的**唯一判定点**：返回 (new_best, new_counter, stop)，纯函数无副作用。
+
+    new_best 是布尔「本次 eval 是否刷新了最佳值」而不是最佳值本身 —— 调用方
+    据此决定要不要把 `best_metric` 推到 `current_metric`，方向判断只在这里一处，
+    避免「比较用一套方向、赋值用另一套」这种静默写反。
+
+    指标方向沿用既有语义：`loss` 越小越好（调用方已把 brier/kl 解析成
+    current_metric），其余（top1）越大越好。
+
+    stop 的判据是 `counter >= patience`（**含等号**）：patience-1 次无改善不停，
+    第 patience 次恰好停。
+    """
+    if early_stop_metric == 'loss':
+        improved = current_metric < best_metric
+    else:  # top1
+        improved = current_metric > best_metric
+    new_counter = 0 if improved else counter + 1
+    return improved, new_counter, new_counter >= patience
+
+
+def _sync_stop_flag(stop_flag, is_dist, early_stop_enabled):
+    """把 rank0 的早停结论广播给所有 rank（**没停也必须调用**）。
+
+    判定只在 rank0 做（计数器语义不变），但「停不停」必须所有 rank 一致：否则
+    rank0 跳出训练进入收尾的 eval、其余 rank 还在 step 循环里做反向，collectives
+    次序错配 → 挂死或 DDP 崩。
+
+    这里刻意**不**加 `if stop_flag.item()` 之类的短路：eval 块在所有 rank 上
+    同点到达（`--eval-every` / `--early-stop` 是逐 rank 相同的 CLI 参数，
+    `len(eval_idx) > 0` 也是全 rank 一致的本地条件），所以无条件 broadcast
+    才能保证「每个 rank 参加同样次数、同样次序的 collective」。一旦短路，
+    没停的 rank 直接跳过 broadcast、停了的 rank 阻塞在上面 —— 只是把
+    「epoch/step 次序错配」换成「broadcast 挂死」。
+
+    非 DDP 或未启用早停时不做任何事：单卡走 collective 纯属浪费，未启用早停时
+    stop_flag 恒为 0，广播一个常量没有意义。
+    """
+    if not is_dist or not early_stop_enabled:
+        return
+    dist.broadcast(stop_flag, src=0)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--data', required=True,
@@ -1228,6 +1271,11 @@ def main():
     # 早停机制初始化
     early_stop_counter = 0
     best_eval_metric = float('inf') if args.early_stop_metric == 'loss' else -1.0
+    # 停止标志：判定只在 rank0 做，但「停不停」要所有 rank 一致（否则 rank0 跳出
+    # 训练、其余 rank 还在 step 循环里做反向 → collectives 次序错配 → 挂死）。
+    # 每个 eval 点由 _sync_stop_flag 无条件 broadcast 回所有 rank，step/epoch 两层
+    # break 都读它。非 DDP 也建（单一代码路径，不写两套）。
+    stop_flag = torch.zeros(1, dtype=torch.long, device=device)
 
     # ---- 断点续训：从 --resume 指定的模型权重 + 同目录 .train_state.pt 恢复 ----
     if args.resume:
@@ -1713,29 +1761,42 @@ def main():
                         if ema is not None:
                             ema.restore()
 
-                # 早停检查
+                # 早停检查：判定只在 rank0 做（计数器语义不变），结论写进 stop_flag
                 if args.early_stop == 1 and is_main:
                     if args.early_stop_metric == 'loss':
                         current_metric = metrics.get('brier', metrics['kl'])
-                        if current_metric < best_eval_metric:
-                            best_eval_metric = current_metric
-                            early_stop_counter = 0
-                        else:
-                            early_stop_counter += 1
                     else:  # top1
                         current_metric = metrics['top1']
-                        if current_metric > best_eval_metric:
-                            best_eval_metric = current_metric
-                            early_stop_counter = 0
-                        else:
-                            early_stop_counter += 1
-
-                    if early_stop_counter >= args.early_stop_patience:
+                    improved, early_stop_counter, should_stop = _early_stop_decision(
+                        args.early_stop_metric, current_metric, best_eval_metric,
+                        early_stop_counter, args.early_stop_patience)
+                    if improved:
+                        best_eval_metric = current_metric
+                    if should_stop:
                         logger.info("[early_stop] 连续 %d 次 eval 无改善，触发早停",
-                                   args.early_stop_patience)
+                                    args.early_stop_patience)
                         if swanlab_logger is not None:
                             swanlab_logger.log({"early_stop": True, "final_step": step}, step=step)
-                        break
+                        # 不在这里 break：早停要跳出的是 **epoch** 循环，
+                        # 而这里在 step 循环内，break 只能跳完本 epoch —— 见下方双层 break
+                        stop_flag.fill_(1)
+
+                # 停止标志同步：所有 rank 必然同点到达（eval 块的进入条件与 CLI
+                # 参数逐 rank 相同），故**无条件** broadcast，stop_flag 未置位
+                # 也照发。放在 `is_main` 之外是关键：这里少了它，其他 rank 就
+                # 永远收不到停止信号。
+                _sync_stop_flag(stop_flag, is_dist, args.early_stop == 1)
+
+                if stop_flag.item():
+                    break
+
+        # 双层 break 之二：跳出 step 循环后还要跳出 epoch 循环（缩进 8 = epoch
+        # 循环体、step 循环之外），否则只跳过本 epoch 剩下的 step，外层
+        # for epoch 照开下一轮 → 早停等于没开。
+        if stop_flag.item():
+            if is_main:
+                logger.info("[early_stop] 提前结束训练，进入收尾流程（ONNX 导出 / 最终评估）")
+            break
 
     # 训练结束后导出 ONNX（可选）
     if args.export_onnx == 1 and is_main:
