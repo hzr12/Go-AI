@@ -260,12 +260,30 @@ class MultiHeadSelfAttention(nn.Module):
         )
         self.ffn_drop = nn.Dropout(dropout)
 
+    @property
+    def attn_drop_p(self):
+        """当前阶段**实际生效**的注意力 dropout 概率：eval/inference 阶段返回 0.0。
+
+        为什么需要这个派生属性：注意力 dropout 走的是**函数式** API
+        （`F.scaled_dot_product_attention(..., dropout_p=p)` /
+        `F.dropout(x, p)` / `_flash_attn_func(..., dropout_p=p)`），
+        它们的 `training` 形参**默认 True**，而 `_sdpa` 是模块级函数、内联的
+        `F.dropout` 在方法体里，两者都拿不到 `self.training` → `model.eval()`
+        关不掉注意力 dropout，SFT 评估的 logits 会逐次抖动、最佳模型选择是在噪声上做的。
+        同 block 的 `ffn_drop = nn.Dropout(...)`（模块式）本来就自动遵守 `self.training`，
+        注意力这一路是唯一的例外；MindSpore 孪生实现同样用 `nn.Dropout` 模块。
+        故所有 5 个注意力 dropout 站点的取值一律经由本属性。
+
+        训练期（`self.training is True`）返回 `self.attn_drop`，与修复前逐位相同。
+        """
+        return self.attn_drop if self.training else 0.0
+
     def _to_heads(self, t, B, N):
         # t: (B, N, C) -> (B, Hh, N, head_dim)
         return t.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
 
     def _global_attn(self, q, k, v):
-        return _sdpa(q, k, v, dropout_p=self.attn_drop, scale=self.scale)
+        return _sdpa(q, k, v, dropout_p=self.attn_drop_p, scale=self.scale)
 
     def _local_windows(self, t, H, W):
         """真 2D 局部窗口提取（2026-09 语义修正版）。
@@ -332,7 +350,7 @@ class MultiHeadSelfAttention(nn.Module):
                 x = x[:, :, :H, :W, :]               # 裁掉 pad（零化仅 ~40MB）
             return x.permute(0, 2, 3, 1, 4).reshape(B, N, Hh * d)
 
-        return unpart(_sdpa(part(q), part(k), part(v), dropout_p=self.attn_drop, scale=self.scale))
+        return unpart(_sdpa(part(q), part(k), part(v), dropout_p=self.attn_drop_p, scale=self.scale))
 
     def _sparse_attn(self, q, k, v, H, W):
         """稀疏注意力（固定稀疏模式）：局部滑动窗口 + 跨步长全局 token。
@@ -392,7 +410,7 @@ class MultiHeadSelfAttention(nn.Module):
         global_logits = global_logits.reshape(B * N, Hh, 1, ng)
         all_logits = torch.cat([local_logits, global_logits], dim=-1)  # (B*N, Hh, 1, ws²+ng)
         attn = all_logits.softmax(dim=-1)
-        if self.attn_drop > 0.0:
+        if self.training and self.attn_drop > 0.0:
             attn = torch.nn.functional.dropout(attn, p=self.attn_drop)
 
         # ---- 5) 值聚合：local 用 bmm，global 用 einsum 广播（避免 expand vg）----
@@ -469,7 +487,7 @@ class MultiHeadSelfAttention(nn.Module):
         vg_w = vg.unsqueeze(2).permute(0, 2, 1, 3, 4).expand(B, nW, Hh, ng, d).reshape(BnW, Hh, ng, d)
         k_full = torch.cat([k_p, kg_w], dim=2)  # (BnW, Hh, ws²+ng, d)
         v_full = torch.cat([v_p, vg_w], dim=2)
-        out = _sdpa(q_p, k_full, v_full, dropout_p=self.attn_drop,
+        out = _sdpa(q_p, k_full, v_full, dropout_p=self.attn_drop_p,
                     scale=self.scale)  # (BnW, Hh, ws², d)
 
         # ---- 5) unpartition ----
@@ -490,7 +508,7 @@ class MultiHeadSelfAttention(nn.Module):
         def attn_1d(tokens):
             # tokens: (B*Hh*L, S, d) -> 把 Hh 融进 batch 做标准 MHA
             t = tokens.view(-1, Hh, tokens.shape[1], d)
-            return _sdpa(t, t, t, dropout_p=self.attn_drop, scale=self.scale).view(-1, tokens.shape[1], d)
+            return _sdpa(t, t, t, dropout_p=self.attn_drop_p, scale=self.scale).view(-1, tokens.shape[1], d)
 
         # 行注意力：每行 H 个 token 互相看，把 (B,Hh,H,W,d) 重排为 (B*Hh*H, W, d)
         qr = q.view(B, Hh, H, W, d).reshape(B * Hh * H, W, d)
