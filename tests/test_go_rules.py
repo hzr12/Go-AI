@@ -42,7 +42,13 @@ def test_suicide_illegal():
 
 
 def test_ko():
-    """劫争后立即回提必须非法。构造标准 ko 形：黑下 (1,2) 提白 (1,1) 形成劫。"""
+    """劫争后立即回提必须非法。构造标准 ko 形：黑下 (1,2) 提白 (1,1) 形成劫。
+
+    P2.6a-2c 起，判罚理由从「`ko_point` 字段」改成「**PSK 复现了提子之前的染色**」：
+    Tromp-Taylor 规则 6 的全文只有「doesn't repeat an earlier grid coloring」一句，
+    **没有** ko-capture 从句，所以 `play()` 里那道 `move == self.ko_point` 的劫禁被删掉、
+    换成与掩码同判据的 PSK 检查。下面两段断言把「理由」钉死，不只是「结果碰巧对」。
+    """
     b = GoBoard(9)
     b.board[:] = 0
     # 行/列 (r,c): (0,1)黑 (0,2)白 (1,0)黑 (1,1)白 (1,3)白 (2,1)黑 (2,2)白
@@ -59,9 +65,23 @@ def test_ko():
     assert ok is True
     assert b.board[1, 1] == 0, "白子应被提掉"
     assert b.ko_point == 1 * 9 + 1, f"应形成劫，ko_point={b.ko_point}"
-    # 白若立即回提于 (1,1) -> 非法（劫）
+    # 白若立即回提于 (1,1) -> 非法。判罚 = PSK：回提复现的是「黑提之前」的染色，
+    # 而那个染色的 position 键在开局接管时就进了历史（P2.6a-1 的 _adopt_as_new_game）。
     b.current_player = -1
-    assert b.play(1 * 9 + 1) is False, "劫争回提应非法"
+    assert b._would_repeat(b.position_hash_after_move(1 * 9 + 1)) is True, \
+        "回提必须命中 PSK 历史（复现提子前的染色）"
+    assert b.play(1 * 9 + 1) is False, "劫争回提应非法（PSK 判罚，与掩码同答案）"
+    # 理由不是 ko_point 字段：人工把它清成 -1（历史不动）仍然非法
+    b.ko_point = -1
+    assert b.play(1 * 9 + 1) is False, "ko_point 置 -1 也解禁不了 —— 判罚来自 PSK"
+    # 理由是「染色在历史里」：resync_hash() 接管后历史重建为 {当前局面}，同一手变为可下
+    b.ko_point = 1 * 9 + 1
+    adopted = b.clone()
+    adopted.resync_hash()
+    assert adopted._pos_hash_history == [adopted.position_hash()], \
+        "接管必须把重复局面历史重建为 {当前局面}"
+    assert adopted.play(1 * 9 + 1) is True, \
+        "历史被接管后同一手必须可下 —— 证明上一条拒绝来自染色重复"
     # 白在别处落子后，劫解除
     b.play(8 * 9 + 8)
     assert b.ko_point == -1, "落子后应解除劫禁"

@@ -287,6 +287,18 @@ def _triple_ko_board():
 
 
 def test_undo_restores_repetition_history():
+    """undo() 必须把重复局面历史**精确**回滚（按出现次数回退，不按 set.discard）。
+
+    ⚠ P2.6a-2c 的结构改动：本用例原先用「**真的把闭合成手落一遍**」来制造重复局面，
+    再验 `is_repetition()` / 计数回滚。那条脚手架现在**不可能**成立 —— TT 规则 6 下
+    重复局面**永远造不出来**（掩码那句自 P2.6a-2b-1 就在，`play()` 那句由 P2.6a-2c 补齐，
+    两条路径对这一手一致地拒）。所以改用 **pass** 造出同色的第二次出现：pass 不改染色，
+    同样让该键的出现次数从 1 变成 2，而它是**合法**的。
+
+    「末手确实复现了开局染色」这个性质并没有因此变弱 —— 它由上面两行
+    `cand == h0` / `pcand == p0` 加上 `_naive_key` 的独立确认承担，不依赖「落得下去」。
+    下面 undo 之后的每一条断言（哈希回到父局、计数回到 1、历史长度）期望值**一个都没变**。
+    """
     b = _triple_ko_board()
     start_key = _naive_key(b)
     h0 = b.hash()
@@ -297,10 +309,10 @@ def test_undo_restores_repetition_history():
         assert b.current_player == who, f"第 {i} 手行棋方不符"
         assert b._would_repeat(b.position_hash_after_move(mv)) is False, \
             f"第 {i} 手不应是重复"
-        assert b.play(mv) is True, f"第 {i} 手 {mv} 应合法（简单劫不禁止它）"
+        assert b.play(mv) is True, f"第 {i} 手 {mv} 应合法（掩码与 play() 同答案）"
         assert _naive_key(b) != start_key, f"第 {i} 手后不得已与开局相同"
 
-    # 第 6 手：闭合成手 —— 谓词必须命中
+    # 第 6 手：闭合成手 —— 谓词必须命中，且**两条路径都必须拒它**
     who, last = _TRIPLE_KO_SEQUENCE[-1]
     assert b.current_player == who
     cand = b.hash_after_move(last)
@@ -308,12 +320,13 @@ def test_undo_restores_repetition_history():
     pcand = b.position_hash_after_move(last)
     assert pcand == p0, "候选局面的 position 键应与开局相同"
     assert b._would_repeat(pcand) is True, "造成真重复的那一手必须命中谓词"
+    assert not b.get_legal_moves()[last], "闭合成手在掩码里非法"
+    assert b.play(last) is False, "play() 与掩码同答案：闭合成手不可下"
 
-    # 与哈希实现无关的独立确认：这是真重复，不是伪造
-    assert b.play(last) is True
-    assert _naive_key(b) == start_key, "末手后局面必须与开局逐字节相同"
-    assert b.hash() == h0
-    assert b.is_repetition() is True, "当前局面此前出现过 -> is_repetition() 为真"
+    # 用 pass 造出同色的第二次出现（pass 恒合法；不落子、染色不变）
+    assert b.play(-1) is True
+    assert b.is_repetition() is True, "当前染色此前出现过 -> is_repetition() 为真"
+    assert b._pos_hash_counts[b.position_hash()] == 2
 
     # ---- undo 必须把历史精确回滚 ----
     assert b.undo() is True
@@ -323,10 +336,9 @@ def test_undo_restores_repetition_history():
     assert b._pos_hash_counts[p0] == 1, "开局染色的计数必须回到 1"
     assert len(b._pos_hash_history) == len(_TRIPLE_KO_SEQUENCE), \
         f"历史长度应回到 {len(_TRIPLE_KO_SEQUENCE)}，实际 {len(b._pos_hash_history)}"
-    # 幂等：再走一遍闭合成手，谓词仍应命中（历史未被 undo 破坏）
+    # 幂等：再问一次闭合成手，谓词仍应命中（历史未被 undo 破坏），且 play() 仍拒它
     assert b._would_repeat(b.position_hash_after_move(last)) is True
-    assert b.play(last) is True
-    assert b.hash() == h0
+    assert b.play(last) is False
 
     # 一路 undo 回开局，哈希与历史都回到初始状态
     while b.move_number > 0:
@@ -405,10 +417,14 @@ def test_repetition_is_wired_into_legality():
         "超级劫闭合成手必须在合法性掩码里被判非法"
     assert b.get_legal_moves().sum() > 0, "其余点必须照常合法（没有误伤整盘）"
 
-    # play() 是**结构性**检查、不查 PSK（见其 docstring）：直接调它仍能落下去。
-    # 这条断言把那条分工钉住 —— 合法性集合的唯一真相源是掩码，不是 play() 的返回值。
-    assert b.play(last) is True, "play() 只做结构性检查（占点/简单劫/自杀）"
-    assert b.is_repetition() is True, "落子后当前染色重现了一次"
+    # P2.6a-2c 起 `play()` **也**查 PSK（判据与掩码同一条 TT 规则 6），所以同一手
+    # 从两条路径都必须被拒。本行在 P2.6a-2b-1 时是 `assert b.play(last) is True`
+    # （当时它钉的是「play() 只做结构性检查、不查 PSK」这条分工），现在翻转。
+    assert b.play(last) is False, "play() 必须与掩码一致地拒绝超级劫成手"
+    # 被拒之后状态必须原样（PSK 判定排在提交之前）：当前染色没有重复出现过
+    assert b.is_repetition() is False, "play() 被拒 => 盘面没变，当前染色没有重复"
+    # 两条路径必须同答案：掩码说非法的点，play() 一律拒绝
+    assert not b.get_legal_moves()[last], "被拒后掩码不变（PSK 判定不改状态、不失效缓存）"
 
 
 # --------------------------------------------------------------------------- #
@@ -675,22 +691,28 @@ def test_current_player_rewrite_is_adopted_as_new_game():
     assert b.current_player == -1, "undo 必须回到本局的行棋方"
 
 
-def test_adoption_keeps_ko_ban_but_drops_stale_legal_cache():
+def test_adoption_keeps_ko_point_but_drops_stale_legal_cache():
     """ko_point 属于**局面描述**而不是对局进度，接管时保留。
 
     Tromp-Taylor 规则 6 的 PSK 只看盘面涂色；`ko_point` 是「上一手是否形成简单劫」的
-    信息位，P2.6a-2b-1 起它**不再参与掩码判罚**（PSK 已覆盖简单劫）。但它仍被
-    `play()` 读着（`play()` 里那道 `move == self.ko_point` 的劫禁，**TT 规则本身没有
-    这一条**，全文见 `GoBoard` 类 docstring），所以从该局面开新局时那个点在**落子层**
-    照样被拒 —— light_rollout 显式拷贝 ko_point 要的就是这个语义，不能在接管时清掉。
+    信息位。自 P2.6a-2c 起它**在两条路径上都不再参与判罚**（`play()` 里那道
+    `move == self.ko_point` 的非 TT 劫禁已删，改判与掩码同一条 TT 规则 6），
+    所以从该局面开新局时那个点在**落子层**也是**可下**的 —— light_rollout 显式拷贝
+    ko_point 要的是「保留这个信息位」这个语义，而**不是**任何禁令，所以不能在接管时清掉。
 
-    ⚠ **掩码层的断言在 P2.6a-2b-1 翻转过一次**，值得写清楚为什么：
-    接管把历史重建成 `{当前局面}`，于是「提子之前那个染色」不在历史里，PSK 判不出
-    那个回提点 —— 掩码因此会**放行**它（正常对局下历史完整，PSK 独立禁掉它，两条掩码
-    逐位相同，见 `tests/test_go_rules_legality.py::test_ko_point_does_not_affect_legality`）。
-    这不是回归，而是「绝不伪造父局历史」这条取舍的已知代价：宁可漏判重复，也不误禁
-    合法着法。旧断言 `assert not legal[cur.ko_point]` 断言的正是「掩码读 ko_point 字段」，
-    与新契约直接冲突，故改为断言**落子层**仍然拒绝该点。
+    ⚠ 本用例断言**翻转过两次**，值得把两次的理由都写下来：
+      1. P2.6a-2b-1 翻转**掩码层**：接管把历史重建成 `{当前局面}`，于是「提子之前那个
+         染色」不在历史里，PSK 判不出那个回提点 —— 掩码因此**放行**它（正常对局下历史
+         完整，PSK 独立禁掉它，两条掩码逐位相同，见
+         `tests/test_go_rules_legality.py::test_ko_point_does_not_affect_legality`）。
+         旧断言 `assert not legal[cur.ko_point]` 断言的正是「掩码读 ko_point 字段」，
+         与新契约直接冲突，故改为断言**落子层**拒绝该点（那时它真的拒，靠那道劫禁）。
+      2. P2.6a-2c 翻转**落子层**（本行）：那道劫禁被删掉，`play()` 改判 PSK；接管后
+         历史里没有「提子之前那个染色」，PSK 与掩码一样判不出来，于是该点重新变成
+         **合法**。这正是「两条路径同答案」的收敛状态 —— 分歧方向从「掩码放行 / play()
+         拒绝」翻转成了两边一致，而不是又开一个新分歧。
+    那不是回归，而是「绝不伪造父局历史」这条取舍的已知代价：宁可漏判重复，也不误禁
+    合法着法。
     """
     src = _triple_ko_board()
     who, mv = _TRIPLE_KO_SEQUENCE[0]
@@ -713,8 +735,15 @@ def test_adoption_keeps_ko_ban_but_drops_stale_legal_cache():
     assert cur._pos_hash_history == [cur.position_hash()]
     legal = cur.get_legal_moves()
     assert legal[0], "接管必须失效属于旧盘面的合法性缓存"
-    # 落子层：play() 仍按它自己那道劫禁拒绝该点（掩码不读该字段，见上）
-    assert cur.clone().play(cur.ko_point) is False, "该点在落子层仍不可下"
+    # 落子层：ko_point 已不参与判罚，PSK 又判不出（历史刚重建）-> 该点可下，
+    # 且**与掩码同答案**。两条路径一致才是本用例现在要锁的东西。
+    assert legal[cur.ko_point], "掩码放行该点（PSK 判不出提子前的染色）"
+    assert cur.clone().play(cur.ko_point) is True, \
+        "play() 必须与掩码同答案：接管后该点可下（不再有 ko_point 劫禁）"
+    # 反面对照：正常对局（历史完整）下同一点被两条路径一致地拒 —— 差别只在历史
+    full = src.clone()
+    assert not full.get_legal_moves()[full.ko_point], "历史完整时掩码禁它（PSK 命中）"
+    assert full.clone().play(full.ko_point) is False, "历史完整时 play() 也禁它"
 
 
 def test_undo_shares_the_adoption_entry_point():
