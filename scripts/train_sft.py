@@ -393,7 +393,9 @@ def evaluate_metrics(model, dataset, idxs, bs, device, amp_dtype, max_batches=50
         kl                : model softmax vs expert one-hot 的 KL散量
         brier             : value 预测 vs 实际胜负的 Brier score（越小越好）
         n                 : 样本数
-        batches           : 本次**实际**跑掉的批数（idxs 尾部不足一整批时小于计划批数）
+        batches           : 本次**实际**跑掉的批数。防御性计数：批数预算已把尾部残批算作
+                             整一批、循环里的 break 在非空 idxs 下不会触发，故当前恒等于
+                             计划批数；仍按实际计数只为将来循环若提前退出时日志报真值
         truncated         : 是否因 --eval-max-batches 上限少跑了批（评估覆盖度不足）
 
     后两个键只增信息、不改计算：`max_batches` 为 None 或 <= 0 时跑满验证集。

@@ -16,7 +16,8 @@
   - 参数存在性：默认 50、可显式传值、`<=0` 能传进、紧跟 `--eval-every`
     声明、且**不得**出现在 run.txt 的 RL 参数表里（那是 selfplay_train.py
     的表，误加会同时污染 `tests/test_run_txt_sync.py` 的双向齐全断言）
-  - 截断语义：上限生效时只跑上限那么多批、`<=0` 与不传都跑满验证集
+  - 截断语义：上限生效时只跑上限那么多批、`<=0`/`None` 与不传都跑满验证集；
+    `evaluate_top1`（本模块无调用点）也有直接调用的执行覆盖，同一套预算语义
   - 零回归：不传参数与显式 `max_batches=50` 的既有指标逐位相同
   - 截断可见化：返回值含 `batches` / `truncated`，日志行与 SwanLab 上报
     也带这两个信息（旧键一律不动）
@@ -209,15 +210,17 @@ def test_eval_max_batches_absent_from_run_txt_rl_table():
 
 
 # --------------------------------------------------------------------------- #
-# 2. 截断语义：上限生效 / <=0 不截断 / 不传即默认
+# 2. 截断语义：上限生效 / <=0 与 None 不截断 / 不传即默认（两个评估函数）
 # --------------------------------------------------------------------------- #
 def test_evaluate_metrics_respects_cap():
     """40 样本 / bs=4 → 验证集共 10 批。
 
-      · max_batches=3  → 只跑 3 批、n=12、truncated=True
-      · max_batches=0  → 跑满 10 批、n=40、truncated=False
-      · max_batches=-1 → 同 0
-      · 不传           → 默认 50 > 10 → 跑满 10 批、truncated=False
+      · max_batches=3    → 只跑 3 批、n=12、truncated=True
+      · max_batches=0    → 跑满 10 批、n=40、truncated=False
+      · max_batches=-1   → 同 0
+      · max_batches=None → 同 0（本仓既有约定：`train_sft_ms.py` 的
+        `evaluate_top1(..., max_batches=None)` 就是「跑满」的传法）
+      · 不传             → 默认 50 > 10 → 跑满 10 批、truncated=False
     """
     n_samples = 10 * BS
 
@@ -226,7 +229,9 @@ def test_evaluate_metrics_respects_cap():
     assert m3['n'] == 3 * BS, f"n={m3['n']}，应为 {3 * BS}"
     assert m3['truncated'] is True, '因上限少跑了批，truncated 必须为 True'
 
-    for cap in (0, -1):
+    # None 与 <=0 同义：跑满整个验证集（`max_batches is None` 是独立分支，
+    # 漏测它等于让「显式传 None」这条调用方式零覆盖）。
+    for cap in (0, -1, None):
         m, ds, _ = _run_eval(n_samples, max_batches=cap)
         assert ds.calls == 10, f'max_batches={cap} 应跑满 10 批，实跑 {ds.calls} 批'
         assert m['n'] == n_samples, f"max_batches={cap}: n={m['n']}，应为 {n_samples}"
@@ -236,6 +241,45 @@ def test_evaluate_metrics_respects_cap():
     assert ds_def.calls == 10, f'不传参数（默认 50 > 10）应跑满，实跑 {ds_def.calls} 批'
     assert m_def['n'] == n_samples
     assert m_def['truncated'] is False
+
+
+def _run_top1(n_samples, **kwargs):
+    """跑一次 evaluate_top1，返回 (accuracy, num_samples, dataset)。"""
+    ds = _FakeDataset(n_samples)
+    model = _FakeModel()
+    idxs = np.arange(n_samples)
+    kwargs.setdefault('device', 'cpu')
+    kwargs.setdefault('amp_dtype', AMP)
+    acc, n = t.evaluate_top1(model, ds, idxs, BS, **kwargs)
+    return acc, n, ds
+
+
+def test_evaluate_top1_shares_budget_semantics():
+    """直接调用 `evaluate_top1`：它与 `evaluate_metrics` 共用同一批数预算。
+
+    train_sft.py 内它没有调用点（见 `test_evaluate_top1_has_no_call_site_in_module`），
+    所以这是它唯一的执行覆盖：上限生效、`<=0` 与 `None` 跑满、不传 ≡ 显式 0。
+    返回形状按历史契约仍是 `(accuracy, num_samples)` 二元组（截断信息只走日志）。
+    """
+    n_samples = 10 * BS
+
+    acc3, n3, ds3 = _run_top1(n_samples, max_batches=3)
+    assert ds3.calls == 3, f'上限 3 却跑了 {ds3.calls} 批'
+    assert n3 == 3 * BS, f'n={n3}，应为 {3 * BS}'
+
+    for cap in (0, -1, None):
+        _, n, ds = _run_top1(n_samples, max_batches=cap)
+        assert ds.calls == 10, f'max_batches={cap} 应跑满 10 批，实跑 {ds.calls} 批'
+        assert n == n_samples, f'max_batches={cap}: n={n}，应为 {n_samples}'
+
+    # 不传（默认 50 > 10）≡ 显式 0：加 max_batches 参数没改它的数值
+    acc_def, n_def, ds_def = _run_top1(n_samples)
+    acc_0, n_0, ds_0 = _run_top1(n_samples, max_batches=0)
+    assert (ds_def.calls, n_def) == (ds_0.calls, n_0) == (10, n_samples)
+    assert acc_def == acc_0, \
+        f'默认与显式 0 的准确率不一致: {acc_def!r} vs {acc_0!r}（数值必须逐位不变）'
+    assert acc_def != acc3, \
+        '截断与跑满的准确率竟然相同 —— 假数据失去区分度，这条测试已失效'
 
 
 # --------------------------------------------------------------------------- #
@@ -275,8 +319,10 @@ def test_default_matches_explicit_50():
 def test_metrics_report_truncation():
     """返回值必须含 `batches`（实际跑的批数）与 `truncated`（是否因上限少跑）。
 
-    修复前必红：两个键都不存在。`batches` 取**实际**跑掉的批数而非计划批数
-    —— idxs 尾部不足一整批时两者会差 1，报告「实际」才不会被日志反证。
+    修复前必红：两个键都不存在。`batches` 在循环内按**实际**跑掉的批数计数，属于
+    防御性设计：批数预算已用 `ceil` 把尾部残批算作整一批，而循环里的 `break` 只在
+    `sel` 为空时触发（非空 idxs 下不可达），所以它当前恒等于计划批数；按实际计数
+    是为了将来循环若可能提前退出，报出来的仍是真值。
     """
     n_samples = 10 * BS
 
@@ -293,11 +339,16 @@ def test_metrics_report_truncation():
 
     # 既有 6 个键必须原样保留（旧键一律不动）
     assert set(('top1', 'top5', 'top10', 'kl', 'brier', 'n')) <= set(m)
-    # 尾部不足一整批时 batches 必须报实际值
-    m_tail, ds_tail, _ = _run_eval(3 * BS + 1, max_batches=0)
-    assert m_tail['batches'] == ds_tail.calls == 4, \
-        f'41 样本 / bs=4 应只跑满 4 批（末批 1 个样本），实得 {m_tail["batches"]}'
-    assert m_tail['n'] == 3 * BS + 1
+    # 尾部残批：残批必须真的被跑到并计入 batches / n（否则 n 会少 1）
+    n_tail = 3 * BS + 1
+    want_tail_batches = -(-n_tail // BS)                     # 向上取整
+    tail_size = n_tail - (want_tail_batches - 1) * BS        # 末批的样本数
+    m_tail, ds_tail, _ = _run_eval(n_tail, max_batches=0)
+    assert m_tail['batches'] == ds_tail.calls == want_tail_batches, \
+        (f'{n_tail} 样本 / bs={BS} 应跑满 {want_tail_batches} 批'
+         f'（末批 {tail_size} 个样本），实得 {m_tail["batches"]} 批')
+    assert m_tail['n'] == n_tail, \
+        f'n 应为 {n_tail}（含末批那 {tail_size} 个样本），实得 {m_tail["n"]}'
 
 
 def test_eval_log_and_swanlab_report_truncation():
