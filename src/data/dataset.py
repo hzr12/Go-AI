@@ -11,7 +11,9 @@
     to_play : int8                            该样本轮到谁落子（1 黑 / -1 白）
 
 特征平面（12 通道）由 GoBoard.feature_planes 统一构造，保证与推理/评估一致。
-运行时随机施加 8 种对称变换之一（等价于 8 倍静态增强，内存仅 1/8）。
+训练期运行时随机施加 8 种对称变换之一（等价于 8 倍静态增强，内存仅 1/8）；
+**评估期不施加**（`sample_batch_numpy(..., augment=False)`）—— 验证集不该被随机
+翻转/旋转污染，详见该方法的 docstring。
 """
 
 import numpy as np
@@ -47,7 +49,7 @@ class SupervisedDataset:
     def __len__(self):
         return self.N
 
-    def sample_batch_numpy(self, idxs, rng=None):
+    def sample_batch_numpy(self, idxs, rng=None, augment=True):
         """
         给定样本下标，返回 numpy 版 (states, moves_out, values)：
             states    : (B, 12, H, W) float32
@@ -60,7 +62,22 @@ class SupervisedDataset:
         避免逐样本 Python 循环，训练吞吐显著更高。
 
         rng: 可选随机源，供多线程预取时各线程使用独立 Generator，避免竞争全局
-            np.random。为 None 时沿用全局 np.random（保持原行为）。
+            np.random。为 None 时沿用全局 np.random（保持原行为）。**仅在
+            `augment=True` 时被读取**。
+
+        augment: 是否施加 8 路随机对称增强，**默认 True = 训练路径**（`sample_batch`、
+            `_BatchPrefetcher` 的 worker、`train_sft_ms.py` 都靠这个默认值吃增强，行为
+            逐位不变）。`False` = **评估路径**（`train_sft.py` 的 `evaluate_metrics` /
+            `evaluate_top1`）：验证集不该被随机翻转/旋转 —— 推理时不会出现随机翻转的
+            棋盘，那层方差与真实输入分布不符，还会把「对称等价但标签已同步」的一致性
+            混进 top-1 的分母里。`augment=False` 的精确语义是：
+              ① **完全不抽 `tforms`**（连 RNG 都不碰：`rng` 既不被读、传入的 Generator
+                 也不被推进，全局 np.random 亦然）→ 评估指标与采样种子彻底无关；
+              ② `states` 直接返回 `feature_planes_batched(...)` 的原始输出，不做
+                 `out = np.empty_like` 那一遍拷贝/变换；
+              ③ `moves` **不做 `SYMMETRIES` 重映射**，但**保留**非法/越界 → `bs*bs` 的
+                 标签规范化 —— pass 是动作空间里的第 `bs*bs` 类，这个定义必须与
+                 「要不要翻转棋盘」解耦，否则 eval 与训练对 pass 的理解就不一样了。
         """
         bs = self.board_size
         B = len(idxs)
@@ -69,49 +86,59 @@ class SupervisedDataset:
         op_h = self.op_hist[idxs]
         ko = self.ko[idxs]
         to_play = self.to_play[idxs]
-        if rng is None:
-            tforms = np.random.randint(0, 8, size=B)
-        else:
-            tforms = rng.integers(0, 8, size=B)  # Generator 用 integers，非 randint
+        tforms = None
+        if augment:
+            if rng is None:
+                tforms = np.random.randint(0, 8, size=B)
+            else:
+                tforms = rng.integers(0, 8, size=B)  # Generator 用 integers，非 randint
 
         # 批量构造 12 通道特征（B,12,H,W）
         states = GoBoard.feature_planes_batched(boards, my_h, op_h, to_play, ko)
 
-        # 向量化对称增强：8 种变换（4 旋转 × 2 镜像），与 SYMMETRIES 坐标变换严格对齐。
-        # np.rot90 是逆时针旋转，SYMMETRIES 是顺时针，故用 k=-k；
-        # _FLIP 翻转列 (W/axis=3)，不是行 (H/axis=2)；
-        # _FLIP_ROTxx = _ROTxx ∘ _FLIP，即先翻转再旋转。
-        # 注意: np.fliplr 对2D数组翻转 axis=1(W)是正确的，但对4D数组翻转 axis=2(H)
-        # 是错误的——此处用显式切片 [:, :, :, ::-1] 精确指定 W 轴。
-        # 优化：一次性分配输出数组，避免重复分配
-        out = np.empty_like(states)
-        for t in range(8):
-            mask = tforms == t
-            if not mask.any():
-                continue
-            arr = states[mask].copy()  # copy 避免视图问题
-            if t >= 4:
-                arr = arr[:, :, :, ::-1]            # flip W (axis=3)
-            k = t % 4
-            if k > 0:
-                arr = np.rot90(arr, k=-k, axes=(2, 3))  # CW rotation
-            out[mask] = arr
-        states = out
+        if augment:
+            # 向量化对称增强：8 种变换（4 旋转 × 2 镜像），与 SYMMETRIES 坐标变换严格对齐。
+            # np.rot90 是逆时针旋转，SYMMETRIES 是顺时针，故用 k=-k；
+            # _FLIP 翻转列 (W/axis=3)，不是行 (H/axis=2)；
+            # _FLIP_ROTxx = _ROTxx ∘ _FLIP，即先翻转再旋转。
+            # 注意: np.fliplr 对2D数组翻转 axis=1(W)是正确的，但对4D数组翻转 axis=2(H)
+            # 是错误的——此处用显式切片 [:, :, :, ::-1] 精确指定 W 轴。
+            # 优化：一次性分配输出数组，避免重复分配
+            out = np.empty_like(states)
+            for t in range(8):
+                mask = tforms == t
+                if not mask.any():
+                    continue
+                arr = states[mask].copy()  # copy 避免视图问题
+                if t >= 4:
+                    arr = arr[:, :, :, ::-1]            # flip W (axis=3)
+                k = t % 4
+                if k > 0:
+                    arr = np.rot90(arr, k=-k, axes=(2, 3))  # CW rotation
+                out[mask] = arr
+            states = out
+        # augment=False：states 直接就是 feature_planes_batched 的原始输出
+        # （恒等变换，连 out 缓冲都不分配）
 
         # 向量化坐标对称变换（move）
         moves_out = np.full(B, bs * bs, dtype=np.int64)  # 默认 pass/越界 -> 专用类别
         mv = np.asarray(self.moves[idxs], dtype=np.int64)
         valid = (mv >= 0) & (mv < bs * bs)
-        r, c = np.divmod(np.where(valid, mv, 0), bs)
-        for t in range(8):
-            mask = tforms == t
-            if not mask.any():
-                continue
-            # 只对有效走法做对称变换，pass/越界保留默认标签
-            vmask = mask & valid
-            if vmask.any():
-                rr, cc = SYMMETRIES[t](r[vmask], c[vmask], bs)
-                moves_out[vmask] = rr * bs + cc
+        if augment:
+            r, c = np.divmod(np.where(valid, mv, 0), bs)
+            for t in range(8):
+                mask = tforms == t
+                if not mask.any():
+                    continue
+                # 只对有效走法做对称变换，pass/越界保留默认标签
+                vmask = mask & valid
+                if vmask.any():
+                    rr, cc = SYMMETRIES[t](r[vmask], c[vmask], bs)
+                    moves_out[vmask] = rr * bs + cc
+        else:
+            # 不做 SYMMETRIES 重映射，但保留上面的非法/越界 -> bs*bs 规范化：
+            # pass 标签的语义与「要不要翻转棋盘」无关，两条路径必须一致
+            moves_out[valid] = mv[valid]
 
         values = self.values[idxs].astype(np.float32).reshape(-1, 1)
         # 优先使用 winrates（连续胜率），缺失则回退到 values

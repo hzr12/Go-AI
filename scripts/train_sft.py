@@ -331,24 +331,37 @@ def load_dataset(path):
     return SupervisedDataset({k: d[k] for k in d.files})
 
 
-# ---- eval 的确定性：固定采样源 + 与训练 RNG 流隔离 ----
-# 验证集评估要走 8 路对称增强抽样（`SupervisedDataset.sample_batch_numpy`）。修复前
+# ---- eval 的确定性：固定采样源 + 与训练 RNG 流隔离 + 关闭数据增强 ----
+# 验证集评估本来要走 8 路对称增强抽样（`SupervisedDataset.sample_batch_numpy`）。修复前
 # 两个评估函数都不给 rng，抽样便落到**全局** np.random 上，后果有两层：
 #   ① 同一份权重、同一份 eval_idx 连跑两次 eval，指标不同（KL/Brier 尤其抖）——
 #      「模型变好了」与「这次抽到的变换不一样」分不开；
 #   ② 每次 eval 都推进全局流 → 训练侧 `rng.shuffle(train_idx)` 与训练 batch 的增强抽样
 #      结果取决于「eval 跑过几次、什么时候跑」→ **eval 频率会改写训练轨迹**。
-# 故 eval 一律用下面这个固定种子的独立 Generator，并全程包在 `_isolated_global_rng()`
-# 里兜底：eval 既不读也不写训练的那条随机流。种子写进 `[eval]` 日志行，读日志的人才
-# 知道这批指标是在固定抽样下算出来的。
+# P2.2 用下面这个固定种子的独立 Generator + `_isolated_global_rng()` 兜底解决了这两层。
+#
+# 但「固定」不等于「正确」：被评估的仍然是**随机挑了对称**的验证集，推理时不会出现
+# 随机翻转的棋盘，顶-1 的分母里还混进了「对称等价但标签已同步」的一致性。故评估路径
+# 一律传 `augment=False` —— **评估零随机**，于是「指标与采样种子无关」才真正成立。
+# 连带后果：`EVAL_SAMPLING_SEED` 与 `evaluate_*(..., rng=)` 现在**不被消费**（只是被
+# 透传给 `sample_batch_numpy`），保留这条链路是为了既有的契约锁与将来的显式入口 ——
+# 训练侧 `_BatchPrefetcher` 的 `seed=1234` 与它数值相同但依旧互不相干。
+# 增强**只在训练侧**发生（`sample_batch` / 预取器 worker / `train_sft_ms.py` 走默认
+# `augment=True`），见 `tests/test_eval_no_augment.py`。
 EVAL_SAMPLING_SEED = 1234
 
 
 def _eval_rng() -> np.random.Generator:
     """评估用的随机源：每次调用返回**全新**的、由 `EVAL_SAMPLING_SEED` 播种的 Generator。
 
-    「全新」是复现的前提：同一个 Generator 连抽两次会前进，两次 eval 就会拿到不同的
-    变换向量。调用方想在自己的流上做 A/B 对比时，把 `rng=` 显式传进评估函数即可。
+    「全新」是复现的前提：同一个 Generator 连抽两次会前进，两次 eval 就会在**开启增强**
+    时拿到不同的变换向量。
+
+    注意：评估现在固定传 `augment=False`（评估零随机），所以这个 Generator 事实上
+    **不会被消费** —— 它只是被原样透传给 `sample_batch_numpy`。保留这条链路的理由：
+    `tests/test_eval_determinism.py` 的「eval 传下去的 rng 由 `EVAL_SAMPLING_SEED` 播种」
+    是一条既有契约锁；且将来若评估要重新开启某种抽样（例如按棋局分层抽样），显式
+    `rng=` 就是那条入口，不需要再改函数签名。
     """
     return np.random.default_rng(EVAL_SAMPLING_SEED)
 
@@ -398,9 +411,13 @@ def evaluate_top1(model, dataset, idxs, bs, device, amp_dtype, max_batches=50,
     `scripts/train_sft_ms.py` 里的是另一个独立同名函数），故截断信息不进
     返回值、只写日志。`max_batches` 为 None 或 <= 0 时跑满验证集。
 
-    `rng`: 对称增强抽样的随机源。默认 None → 落到 `_eval_rng()`（固定种子
-    `EVAL_SAMPLING_SEED`）而不是全局 np.random，故同一份权重连跑两次的准确率逐位
-    相同；显式传入则用调用方的流（用于故意做 A/B 对比）。
+    **评估一律传 `augment=False`**：验证集不做 8 路随机对称增强，因此准确率只取决于
+    「权重 + 验证集原始长相」，与采样种子、eval 频率都无关。
+
+    `rng`: 采样随机源。默认 None → 落到 `_eval_rng()`（固定种子
+    `EVAL_SAMPLING_SEED`）。因为下面固定传 `augment=False`，这个 rng **不被消费**，
+    只是被透传；保留它是为了 `tests/test_eval_determinism.py` 的既有契约锁与将来的
+    显式入口。
     """
     model.eval()
     correct = 0
@@ -413,7 +430,7 @@ def evaluate_top1(model, dataset, idxs, bs, device, amp_dtype, max_batches=50,
             sel = idxs[b * bs:(b + 1) * bs]
             if len(sel) == 0:
                 break
-            states_np, moves_np, _ = dataset.sample_batch_numpy(sel, rng=eval_rng)
+            states_np, moves_np, _ = dataset.sample_batch_numpy(sel, rng=eval_rng, augment=False)
             state = torch.from_numpy(states_np).to(device)
             if use_channels_last:
                 state = state.to(memory_format=torch.channels_last)
@@ -448,10 +465,17 @@ def evaluate_metrics(model, dataset, idxs, bs, device, amp_dtype, max_batches=50
 
     后两个键只增信息、不改计算：`max_batches` 为 None 或 <= 0 时跑满验证集。
 
-    `rng`: 对称增强抽样的随机源。默认 None → 落到 `_eval_rng()`（固定种子
-    `EVAL_SAMPLING_SEED`）而不是全局 np.random。默认值即保障：任何调用点（包括将来
-    新写的、忘了传 rng 的）都不可能不小心拿到不确定性 —— 同一份权重 + 同一份 eval_idx
-    连跑两次，八个指标逐位相同。显式传入则用调用方的流（用于故意做 A/B 对比）。
+    **评估一律传 `augment=False`**：验证集不做 8 路随机对称增强。这是 P2.2「固定
+    采样种子」的下一块拼图 —— 种子只固定了「抽到哪一组对称」，可被评估的仍是一份
+    随机翻转/旋转过的验证集；关掉增强后评估**零随机**，指标只取决于「权重 + 验证集
+    原始长相」。`tests/test_eval_no_augment.py` 的用例 5 端到端锁这条性质。
+
+    `rng`: 采样随机源。默认 None → 落到 `_eval_rng()`（固定种子
+    `EVAL_SAMPLING_SEED`），显式传入则用调用方的流。因为下面固定传 `augment=False`，
+    这个 rng **不被消费**、只是被透传 —— 「同一份权重 + 同一份 eval_idx 连跑两次，八个
+    指标逐位相同」现在由「评估零随机」保证，不再依赖它。默认值即保障：任何调用点
+    （包括将来新写的、忘了传 rng 的）都不可能不小心拿到不确定性。保留这条链路是为了
+    `tests/test_eval_determinism.py` 的既有契约锁与将来的显式入口。
 
     采样循环整体包在 `_isolated_global_rng()` 里：eval 既不改全局 numpy 状态，也不改
     torch 状态，故训练侧的随机流与「eval 跑过几次、什么时候跑」无关。
@@ -470,7 +494,7 @@ def evaluate_metrics(model, dataset, idxs, bs, device, amp_dtype, max_batches=50
             sel = idxs[b * bs:(b + 1) * bs]
             if len(sel) == 0:
                 break
-            states_np, moves_np, values_np = dataset.sample_batch_numpy(sel, rng=eval_rng)
+            states_np, moves_np, values_np = dataset.sample_batch_numpy(sel, rng=eval_rng, augment=False)
             state = torch.from_numpy(states_np).to(device)
             if use_channels_last:
                 state = state.to(memory_format=torch.channels_last)
