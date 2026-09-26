@@ -295,8 +295,11 @@ def test_undo_restores_repetition_history():
     两条路径对这一手一致地拒）。所以改用 **pass** 造出同色的第二次出现：pass 不改染色，
     同样让该键的出现次数从 1 变成 2，而它是**合法**的。
 
-    「末手确实复现了开局染色」这个性质并没有因此变弱 —— 它由上面两行
-    `cand == h0` / `pcand == p0` 加上 `_naive_key` 的独立确认承担，不依赖「落得下去」。
+    「末手确实复现了开局染色」这个性质本身仍然成立，但它**不再有盘面级的独立确认**：
+    现在只由 `pcand == p0`（重复判定用的 position 键对上了）承载；`cand == h0` 是同一个
+    被测哈希路径的自我一致（同源，不算独立证据），而 `_naive_key` 在循环里只剩
+    `!= start_key`（第 5 手之后盘面本来就与开局不同）—— 所以本用例**不**声称独立确认。
+    「forecast 与真实落子的一致性」由 `test_hash_after_move_matches_actual_play` 独立覆盖。
     下面 undo 之后的每一条断言（哈希回到父局、计数回到 1、历史长度）期望值**一个都没变**。
     """
     b = _triple_ko_board()
@@ -324,16 +327,21 @@ def test_undo_restores_repetition_history():
     assert b.play(last) is False, "play() 与掩码同答案：闭合成手不可下"
 
     # 用 pass 造出同色的第二次出现（pass 恒合法；不落子、染色不变）
+    # 「1 -> 2 -> 1」的前半段也钉上，undo 那条才是**增量**断言而不是裸的终态
+    assert b._pos_hash_counts[p0] == 1, "pass 之前：开局染色只出现这一次（回滚断言的起点）"
     assert b.play(-1) is True
     assert b.is_repetition() is True, "当前染色此前出现过 -> is_repetition() 为真"
-    assert b._pos_hash_counts[b.position_hash()] == 2
+    assert b._pos_hash_counts[b.position_hash()] == 2, "pass 之后：同色的第二次出现（1 -> 2）"
 
     # ---- undo 必须把历史精确回滚 ----
     assert b.undo() is True
     h5 = b.hash()
     assert h5 != h0, "undo 后应回到父局（不是闭合成手）"
     assert b.is_repetition() is False, "父局此前未出现过 -> is_repetition() 为假"
-    assert b._pos_hash_counts[p0] == 1, "开局染色的计数必须回到 1"
+    assert b._pos_hash_counts[p0] == 1, \
+        "pass 造成的那一次出现（1 -> 2）必须被精确回滚（2 -> 1）"
+    assert all(cnt == 1 for cnt in b._pos_hash_counts.values()), \
+        "回滚后每个染色都恰好出现一次：本用例里唯一的重复来自那次 pass"
     assert len(b._pos_hash_history) == len(_TRIPLE_KO_SEQUENCE), \
         f"历史长度应回到 {len(_TRIPLE_KO_SEQUENCE)}，实际 {len(b._pos_hash_history)}"
     # 幂等：再问一次闭合成手，谓词仍应命中（历史未被 undo 破坏），且 play() 仍拒它
@@ -413,18 +421,64 @@ def test_repetition_is_wired_into_legality():
         assert b.play(mv) is True
     who, last = _TRIPLE_KO_SEQUENCE[-1]
     assert b._would_repeat(b.position_hash_after_move(last)) is True
-    assert not b.get_legal_moves()[last], \
+    mask_before = b.get_legal_moves()
+    assert not mask_before[last], \
         "超级劫闭合成手必须在合法性掩码里被判非法"
-    assert b.get_legal_moves().sum() > 0, "其余点必须照常合法（没有误伤整盘）"
+    assert mask_before.sum() > 0, "其余点必须照常合法（没有误伤整盘）"
+    # 掩码已进缓存（第一次调用算完存的是 `legal.copy()`，第二次拿到的才是缓存本体）
+    cached_mask = b.get_legal_moves()
+    assert cached_mask is b._legal_cache, "夹具前提：掩码必须已进 `_legal_cache`"
 
     # P2.6a-2c 起 `play()` **也**查 PSK（判据与掩码同一条 TT 规则 6），所以同一手
     # 从两条路径都必须被拒。本行在 P2.6a-2b-1 时是 `assert b.play(last) is True`
     # （当时它钉的是「play() 只做结构性检查、不查 PSK」这条分工），现在翻转。
+    #
+    # ---- 失败路径零残留：快照取在 play() **之前**，逐项与之后的状态对 ----
+    # 这条不变量只能这样钉。原来那两条断言**证不了它**：
+    #   - `is_repetition() is False` 不受「落点留了一颗子」影响（当前染色只记历史，
+    #     漏子不进历史，谓词照样为假）；
+    #   - `get_legal_moves()[last]` 为 False 更是**占位恒真** —— 那个点被占/被 PSK 禁，
+    #     有没有漏子它都是 False。
+    # 能证伪的是「这一手棋一格都没发生」：盘面逐格相同、落点仍空、撤销栈不增长、
+    # move_number / passes / ko_point / move_history 不变、PSK 历史不记账、两套哈希不变，
+    # 且掩码缓存**仍是拒绝前那一个对象**（`get_legal_moves()` 命中缓存时直接返回
+    # `_legal_cache`）—— 顺带钉住「PSK 拒绝不得错误失效缓存」。
+    rr, cc = divmod(last, N)
+    before_board = b.board.copy()
+    before_moves = list(b.move_history)
+    before_stack = len(b._undo_stack)
+    before_move_number = b.move_number
+    before_passes = b.passes
+    before_ko = b.ko_point
+    before_history = list(b._pos_hash_history)
+    before_hash = b.hash()
+    before_pos = b.position_hash()
+
     assert b.play(last) is False, "play() 必须与掩码一致地拒绝超级劫成手"
-    # 被拒之后状态必须原样（PSK 判定排在提交之前）：当前染色没有重复出现过
-    assert b.is_repetition() is False, "play() 被拒 => 盘面没变，当前染色没有重复"
-    # 两条路径必须同答案：掩码说非法的点，play() 一律拒绝
-    assert not b.get_legal_moves()[last], "被拒后掩码不变（PSK 判定不改状态、不失效缓存）"
+
+    # 试落的子必须已撤销（`go_rules.py:954` 把落点置 0 -> 推演 -> 命中就在 `:956` 直接 return）
+    assert b.board[rr, cc] == 0, "被拒后落点必须仍是空点（试落的子已还原）"
+    assert np.array_equal(b.board, before_board), "被拒后盘面必须逐格原样"
+    # 提交阶段的一切都不得发生（PSK 判定排在提交之前）
+    assert len(b._undo_stack) == before_stack, "被拒不得压撤销栈"
+    assert b.move_number == before_move_number, "被拒不得递增落子数"
+    assert b.passes == before_passes, "被拒不得动 pass 计数"
+    assert b.ko_point == before_ko, "被拒不得改 ko_point（只读信息位）"
+    assert list(b.move_history) == before_moves, "被拒不得记着法"
+    # 哈希与重复判定状态都不得变化
+    assert b.hash() == before_hash, "被拒后通用哈希必须不变"
+    assert b.position_hash() == before_pos, "被拒后 position 键必须不变"
+    assert list(b._pos_hash_history) == before_history, "被拒不得往 PSK 历史里记账"
+    assert b.is_repetition() is False, "被拒 => 当前染色此前未重复出现过（这是性质，不是残留证据）"
+    # 缓存不得被错误失效，且两条路径必须同答案
+    # （`cached_mask` 持有缓存数组的强引用，所以 `is` 比较不会被 id 复用骗过；
+    #  若缓存被置 None 后重算，存进去的会是**另一个**数组对象）
+    assert b._legal_cache is cached_mask, "被拒不得失效掩码缓存（仍是拒绝前那一个）"
+    after_mask = b.get_legal_moves()
+    assert after_mask is cached_mask, "被拒后 get_legal_moves() 必须命中同一个缓存"
+    assert np.array_equal(after_mask, mask_before), "被拒后掩码必须逐格原样"
+    assert not after_mask[last], "掩码说非法的点，play() 一律拒绝"
+    assert after_mask.sum() > 0, "其余点仍然合法（拒绝没有误伤整盘）"
 
 
 # --------------------------------------------------------------------------- #

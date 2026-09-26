@@ -745,8 +745,10 @@ def test_play_still_rejects_suicide_and_occupied():
     b = _hand_built(N5, _SUICIDE_5_STONES, to_play=1)
     # (1) 纯自杀：两个邻点都是白，且两块白气数都 >= 2（提不掉）-> 落子后己方无气
     for pt in ((0, 0), (1, 1)):
-        assert b.clone().play(_idx(N5, *pt)) is False, f"纯自杀 {pt} 必须被拒"
-        assert b.board[_idx(N5, *pt) // N5][pt[1]] == 0, "被拒后盘面必须原样"
+        probe = b.clone()
+        assert probe.play(_idx(N5, *pt)) is False, f"纯自杀 {pt} 必须被拒"
+        # 断言必须打在**真正 play 的那个盘**上（`probe`）—— 打在 `b` 上恒真、空转
+        assert probe.board[pt[0]][pt[1]] == 0, "被拒后盘面必须原样（试落的子已撤销）"
     # (2) 自杀但提子 -> 合法（提子那一侧是「禁自杀」判据的另一半）
     assert b.clone().play(_idx(N5, 2, 4)) is True, "自杀但提子必须放行"
     # (3) 占点：点上有子 -> 恒非法（与 PSK 无关）
