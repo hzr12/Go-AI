@@ -356,17 +356,27 @@ def _reap_processes(processes, join_timeout=5.0):
             p.join()
 
 
-def _poll_worker_results(result_queue, processes, on_result=None, gids=None,
+def _poll_worker_results(result_queue, processes, on_result, gids=None,
                          poll_timeout=0.5, dead_grace=1.0):
     """带 timeout 轮询收集全部 worker 结果，交给 on_result 逐个处理。
 
-    processes 必须已 start。get 超时后检查进程存活：只要有 worker「已退出却
-    没交付结果」，先给队列 dead_grace 的宽限（子进程退出前 feeder 线程可能刚
-    把结果刷进管道），仍无结果即判定崩溃并抛 RuntimeError —— 绝不无限阻塞。
-    on_result 省略时只收集不回调。
+    processes 必须**全部已 start**。on_result 必填，每收一局调用一次。
+    gids 省略时按位置取 range(len(processes))；显式传入时长度必须与 processes
+    一致，否则直接 ValueError —— zip 会静默截断并让末尾 worker 永远不被监控。
+
+    get 超时后检查进程存活：只要有 worker「已退出却没交付结果」，先给队列
+    dead_grace 秒的宽限（容忍「进程已退出」与「管道数据可见」之间的竞态；
+    这是有界等待，最坏多等 dead_grace 秒，**不保证**挽回已丢失的 put），
+    仍无结果即判定崩溃并抛 RuntimeError —— 绝不无限阻塞。
     """
-    on_result = on_result or (lambda result: None)
-    gids = list(gids) if gids is not None else list(range(len(processes)))
+    if gids is None:
+        gids = range(len(processes))
+    else:
+        gids = list(gids)
+        if len(gids) != len(processes):
+            raise ValueError(
+                f"gids 长度 {len(gids)} 与进程数 {len(processes)} 不一致，"
+                f"拒绝静默截断（否则末尾 worker 永远不被监控）")
     total = len(processes)
     results = []
     delivered = set()
@@ -375,6 +385,7 @@ def _poll_worker_results(result_queue, processes, on_result=None, gids=None,
         try:
             result = result_queue.get(timeout=poll_timeout)
         except queue.Empty:
+            # 还没死过（或已死的都交付过了）→ 继续等，绝不误报崩溃
             dead = next(((p, gid) for p, gid in zip(processes, gids)
                          if gid not in delivered and not p.is_alive()), None)
             if dead is None:
@@ -399,26 +410,55 @@ def _poll_worker_results(result_queue, processes, on_result=None, gids=None,
 
 def _run_parallel_workers(result_queue, processes, on_result, gids=None,
                           poll_timeout=0.5, join_timeout=5.0, dead_grace=1.0):
-    """start → 带 timeout 轮询收集 → finally 收尾，整段不泄漏子进程。"""
+    """start → 带 timeout 轮询收集 → finally 收尾，整段不泄漏子进程。
+
+    只把**已成功 start** 的进程交给 _reap_processes：未 start 的进程 _popen
+    为 None，join() 会触发 stdlib 断言「can only join a started process」，
+    把真正的失败原因（高 --parallel-games 下的 EAGAIN / fd 耗尽）盖掉。
+    """
+    started = []
     try:
         for p in processes:
             p.start()
-        return _poll_worker_results(result_queue, processes, on_result, gids,
+            started.append(p)
+        return _poll_worker_results(result_queue, started, on_result, gids,
                                     poll_timeout, dead_grace)
     finally:
-        _reap_processes(processes, join_timeout)
+        _reap_processes(started, join_timeout)
 
 
 # --------------------------------------------------------------------------- #
 # 异步流水线队列收集
 # --------------------------------------------------------------------------- #
-def _drain_queue_into_buffer(data_queue, buffer, args, bs, n_actions, max_stall=120):
+def _pipeline_has_live_worker(pipeline):
+    """判定异步流水线是否还有可能继续产出：stop_event 未置位且任一 worker 存活。
+
+    只看 is_alive() 不够：stop() 置位 stop_event 后，仍在跑长对局的 worker 会继续
+    is_alive() 好一阵（run() 的 while 只在每局之间检查 stop_event），但它绝不会再 put
+    —— 继续等就是白等。两个条件任一不满足即视为「不再产出」。
+    """
+    if pipeline.stop_event.is_set():
+        return False
+    return any(w.is_alive() for w in pipeline.workers)
+
+
+def _drain_queue_into_buffer(data_queue, buffer, args, bs, n_actions, max_stall=120,
+                             alive_fn=None):
     """从异步流水线数据队列收集到 buffer 达标，返回本轮 collected 局数。
 
-    AsyncDataQueue.get 超时会自行吞掉 queue.Empty 并返回 None。旧循环遇 None
-    不计数也不退出，流水线一旦停止产出（worker 崩溃 / stop() 已调用）就永远
-    空转且无任何输出。这里连续 max_stall 次空轮询（默认 0.5s×120 = 60s 无数据）
-    即判定不再产出并抛 RuntimeError，带上 collected / len(buffer) / 阈值诊断。
+    AsyncDataQueue.get 超时会自行吞掉 queue.Empty 并返回 None。
+
+    max_stall 度量的是「连续无产出 **且** 无存活 worker 的空轮询次数」，不是「慢」。
+    仓库自己推荐的 19x19 / 400 sims 配置（见本文件 docstring）首局常需数分钟，
+    加上各 worker 首次加载模型，慢而活着是常态 —— 纯「队列空」预算会误杀
+    数小时的健康训练。
+
+    - alive_fn 给了且返回 True（还有 worker 存活）→ 空轮询计数**重置**并继续等；
+    - 只有计数达到 max_stall **且**（alive_fn is None 或 alive_fn() 为 False）
+      才抛 RuntimeError，并带 collected / len(buffer) / 阈值 / max_stall 诊断；
+    - alive_fn 为 None 时退化为纯「队列空」预算（仅适合已知无 worker 存活的场景，
+      如单测，或调用点在流水线 start() 之前）。真实调用点传
+      `_pipeline_has_live_worker`。
     """
     target = args.batch_size * 20
     collected = 0
@@ -430,13 +470,18 @@ def _drain_queue_into_buffer(data_queue, buffer, args, bs, n_actions, max_stall=
             collected += 1
             stall = 0
             continue
+        # 还有活着的 worker → 视为「慢而非死」，重置空轮询预算继续等
+        if alive_fn is not None and alive_fn():
+            stall = 0
+            continue
         stall += 1
         if stall >= max_stall:
             raise RuntimeError(
-                f"[selfplay] 异步流水线连续 {stall} 次（≈{stall * 0.5:.0f}s）无数据，"
-                f"判定已停止产出：collected={collected} len(buffer)={len(buffer)} / "
-                f"目标 {target}（max_stall={max_stall}）。"
-                f"请检查自对弈 worker 是否崩溃或流水线 stop() 是否已调用。")
+                f"[selfplay] 异步流水线连续 {stall} 次（≈{stall * 0.5:.0f}s）无产出且"
+                f"无存活 worker，判定已停止：collected={collected} "
+                f"len(buffer)={len(buffer)} / 目标 {target}（max_stall={max_stall}）。"
+                f"请检查自对弈 worker 是否崩溃（模型加载失败/OOM/board 断言）"
+                f"或流水线 stop() 是否已调用。")
     return collected
 
 
@@ -923,9 +968,11 @@ def main():
 
                 # 持续收集数据并训练
                 for _ in range(args.games_per_iter or 10):
-                    # 收集数据（空队列连续 max_stall 次 → 报错，不静默空转）
+                    # 收集数据（无产出 **且** 无存活 worker 连续 max_stall 次 → 报错；
+                    # worker 还活着就继续等，慢启动的 19x19/400 sims 不会被误杀）
                     collected = _drain_queue_into_buffer(
-                        main._pipeline.data_queue, buffer, args, bs, n_actions)
+                        main._pipeline.data_queue, buffer, args, bs, n_actions,
+                        alive_fn=lambda: _pipeline_has_live_worker(main._pipeline))
                     total_games += collected
 
                     if collected > 0 and is_main:
