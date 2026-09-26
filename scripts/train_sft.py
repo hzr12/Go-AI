@@ -1842,12 +1842,16 @@ def main():
                 if ema is not None:
                     ema.restore()
                 if is_main:
+                    # 不打 seed：评估固定 `augment=False`，`EVAL_SAMPLING_SEED` 与 `rng=`
+                    # 都不被消费，指标与种子无关。打出它等于宣称「这批数字依赖这个常量」，
+                    # 运维改了却发现数字不动 —— 那是主动误导。`augment=off` 陈述的是真实
+                    # 状态：这批指标算在**未经随机对称变换**的验证集上。
                     logger.info(
                         "[eval] step=%d top1=%.4f top5=%.4f top10=%.4f "
-                        "kl=%.4f brier=%.4f (n=%d, batches=%d, truncated=%s, seed=%d)%s",
+                        "kl=%.4f brier=%.4f (n=%d, batches=%d, truncated=%s, augment=off)%s",
                         step, metrics['top1'], metrics['top5'], metrics['top10'],
                         metrics['kl'], metrics['brier'], metrics['n'],
-                        metrics['batches'], metrics['truncated'], EVAL_SAMPLING_SEED,
+                        metrics['batches'], metrics['truncated'],
                         " ★ new best" if metrics['top1'] > best_eval_acc else "")
                     if metrics['truncated']:
                         logger.info(
@@ -1957,13 +1961,13 @@ def main():
         if ema is not None:
             ema.restore()
         if is_main:
+            # 同上：FINAL 行也不打 seed（`augment=off` 才是这批数字的真实前提）
             logger.info(
                 "[eval] FINAL top1=%.4f top5=%.4f top10=%.4f "
-                "kl=%.4f brier=%.4f (n=%d, batches=%d, truncated=%s, seed=%d)",
+                "kl=%.4f brier=%.4f (n=%d, batches=%d, truncated=%s, augment=off)",
                 final_metrics['top1'], final_metrics['top5'], final_metrics['top10'],
                 final_metrics['kl'], final_metrics['brier'], final_metrics['n'],
-                final_metrics['batches'], final_metrics['truncated'],
-                EVAL_SAMPLING_SEED)
+                final_metrics['batches'], final_metrics['truncated'])
             if final_metrics['truncated']:
                 logger.info(
                     "[eval] 最终评估的验证集被截断：只评估了 %d 批（--eval-max-batches=%s，"

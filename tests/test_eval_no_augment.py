@@ -24,21 +24,34 @@ P2.2 用 `EVAL_SAMPLING_SEED` 把抽样**固定**了，但「固定」不等于�
 
 覆盖
 ----
-  - 用例 1：`augment=False` 的 `states` 与直接调 `GoBoard.feature_planes_batched` 的结果
-    **逐位相等**；`moves` 等于原始 `moves`（仅做非法/越界 → `bs*bs` 规范化）
-  - 用例 2（**行为性红**）：`augment=False` 不消耗任何随机 —— 全局 `np.random.get_state()`
-    四段、**传进来的 rng 自身**都不推进；`torch.get_rng_state()` 也不动
-  - 用例 3：`augment=True` 仍按同一个 `t` 同步变换 `states` 与 `moves`（`t=4` → W 轴翻转，
-    move `(r,c) → (r, bs-1-c)`），且与 `augment=False` 的输出不同（默认路径没被改坏）
-  - 用例 4：`moves == -1`（pass）与越界标签在**两种模式**下都归一到 `bs*bs`
-    —— 标签规范化必须与对称变换**解耦**，否则 eval 与训练对「pass」的定义就不一样了
-  - 用例 5（**行为性红，端到端**）：两个不同 `EVAL_SAMPLING_SEED` 下 `evaluate_metrics`
-    的八个指标**逐位相同**
-  - 用例 6（**结构锁，修复前必红**）：AST 检查两个 eval 函数内的 `sample_batch_numpy(...)`
-    都带 `augment=False`，且**只有**这两处（训练侧与预取器不受影响）
-  - 用例 7：训练路径零回归 —— `sample_batch(...)`（不传 `augment`）的输出与显式
-    `augment=True` 逐位相同
-  - 用例 8：预取器 worker 仍走增强（调用点没有 `augment` 形参 → 取默认 True）
+编号与本文件**章节注释**一致，9 个测试函数一一对应（P2.3b 对齐；此前模块 docstring 写的是
+「用例 1–8」，既漏了 5b、又多出一条并不存在的用例 8，报告 §表又用的是另一套编号）：
+
+  - 用例 1（`test_augment_false_returns_raw_features_and_moves`）：`augment=False` 的
+    `states` 与直接调 `GoBoard.feature_planes_batched` 的结果**逐位相等**；
+    `moves` 等于原始 `moves`（仅做非法/越界 → `bs*bs` 规范化）
+  - 用例 2（`test_augment_false_consumes_no_randomness`，**行为性红**）：`augment=False`
+    不消耗任何随机 —— 全局 `np.random.get_state()` 四段、**传进来的 rng 自身**都不推进；
+    `torch.get_rng_state()` 也不动
+  - 用例 3（`test_augment_true_still_transforms_consistently`）：`augment=True` 仍按同一个
+    `t` 同步变换 `states` 与 `moves`（`t=4` → W 轴翻转，move `(r,c) → (r, bs-1-c)`），
+    且与 `augment=False` 的输出不同（默认路径没被改坏）
+  - 用例 4（`test_invalid_move_normalized_in_both_modes`）：`moves == -1`（pass）与越界标签
+    在**两种模式**下都归一到 `bs*bs` —— 标签规范化必须与对称变换**解耦**，否则 eval 与
+    训练对「pass」的定义就不一样了
+  - 用例 5（`test_eval_metrics_independent_of_sampling_seed`，**行为性红，端到端**）：两个
+    不同 `EVAL_SAMPLING_SEED` 下 `evaluate_metrics` 的八个指标**逐位相同**（假 dataset）
+  - 用例 5b（`test_real_dataset_eval_is_seed_independent`）：同上，但喂**真**
+    `SupervisedDataset` —— 假 dataset 只能证明接线，真数据才证明 `augment=False` 在真实
+    抽样路径上确实生效
+  - 用例 6a（`test_eval_call_sites_pass_augment_false`，**结构锁，修复前必红**）：按函数定位，
+    两个 eval 函数内的 `sample_batch_numpy(...)` 都带 `augment=False` 字面量
+  - 用例 6b（`test_only_eval_call_sites_disable_augmentation`）：按全文件扫描定边界 ——
+    传 `augment=False` 的调用点**全部**落在两个 eval 函数内，预取器 worker 连 `augment`
+    kwarg 都不许出现。（P2.3b 删掉了它原先的「全文件恰好 3 处调用」计数锁：那是实现形状锁，
+    与真实不变式无关，详见该用例 docstring）
+  - 用例 7（`test_training_path_default_is_augment_true`）：训练路径零回归 ——
+    `sample_batch(...)`（不传 `augment`）的输出与显式 `augment=True` 逐位相同
 
 空转守卫（防假绿）
 ----------------
@@ -320,8 +333,8 @@ def test_augment_false_consumes_no_randomness():
     空转守卫（第一段）：默认路径（`augment=True` + `rng=None`）**必须**推进全局流 ——
     证明下面那些「不变」断言不是恒真。
     """
-    idxs = np.arange(len(_make_dataset()))
     ds = _make_dataset()
+    idxs = np.arange(len(ds))
 
     # --- 空转守卫：默认路径确实在抽全局随机（这条修复前后都应绿） ---
     np.random.seed(20260926)
@@ -598,28 +611,75 @@ def test_eval_call_sites_pass_augment_false():
 
 
 def test_only_eval_call_sites_disable_augmentation():
-    """全文件扫描：关增强的调用点**恰好两处**，训练侧与预取器一处都不许少。
+    """全文件扫描：传 `augment=False` 的调用点**全部**落在两个 eval 函数内，其余不传。
 
     这是风险边界锁。`sample_batch_numpy` 的 `augment` 默认 True，训练路径靠默认值吃增强；
     若有人顺手给 `_prefetch_worker` 或别处加上 `augment=False`，训练就静默失去了 8 倍增强
     —— 训练指标照样好看，只是模型变弱，事后极难归因。
+
+    **P2.3b 修正：这里曾断言「全文件恰好 3 处 `sample_batch_numpy` 调用」（top1 / metrics /
+    预取器），已删除。** 那是一条把当前**实现形状**抄进测试的计数锁：P2.3 写进
+    `_eval_rng` docstring 的合法演进路径是「将来评估若要重新开启某种抽样，显式 `rng=` 就是
+    那条入口」—— 将来合法地多一个调用点，它就会红，挡住的不是回归，只是「文件长变了」。
+
+    真实不变式与调用点**数量**无关，故按「归属 + 实参」判定（行号区间找最内层函数，不靠
+    出现顺序，行号会被无关改动推着走）：
+
+      ① 两个 eval 函数内的**每**一处调用都带 `augment=False`（字面量 False，写成变量不算）；
+      ② eval 之外的调用点**不得**带 `augment=False`；
+      ③ `_prefetch_worker` 内的调用连 `augment` 这个 kwarg 都不许出现（比 ② 更严：训练侧
+         必须走默认值，理由同 docstring 第一段）；
+      ④ eval 之外的调用点至少存在一个 —— 否则 ② 恒真，本用例空转。
+
+    ② 只禁 `False`、不禁「显式 `True`」是有意的：训练路径将来写一句 `augment=True` 只是把
+    既有默认写明白，行为不变，不该被这条边界锁拦下（那又变成另一种形状锁）。
     """
     tree = ast.parse(TRAIN_SRC_TEXT)
     calls = [n for n in ast.walk(tree)
              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
              and n.func.attr == 'sample_batch_numpy']
-    assert len(calls) == 3, \
-        f'train_sft.py 里应有 3 处 sample_batch_numpy 调用（top1 / metrics / 预取器），' \
-        f'实得 {len(calls)} 处 —— 若新增了调用点，请一并复核它该走哪条增强语义'
+    assert calls, 'train_sft.py 里一处 sample_batch_numpy 调用都没有 —— 扫描本身已失效'
 
-    off = [n for n in calls
-           if any(kw.arg == 'augment' and ast.unparse(kw.value) == 'False'
-                  for kw in n.keywords)]
-    assert len(off) == 2, \
-        f'应恰好有 2 处传 augment=False（两个 eval 函数），实得 {len(off)} 处：' \
-        f'{[ast.unparse(n) for n in off]}'
+    def _fn_of(node):
+        """`node` 所在的最内层函数名（模块级则 None）。"""
+        owners = [f for f in ast.walk(tree)
+                  if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and f.lineno <= node.lineno <= (f.end_lineno or f.lineno)]
+        return min(owners, key=lambda f: f.lineno).name if owners else None
 
-    # 预取器 worker：训练路径必须仍吃增强（调用点不传 augment → 取默认 True）
+    def _augment_kwarg(node):
+        """`augment` 实参的源码文本（没传这个 kwarg 则 None）。"""
+        for kw in node.keywords:
+            if kw.arg == 'augment':
+                return ast.unparse(kw.value)
+        return None
+
+    EVAL_FNS = ('evaluate_metrics', 'evaluate_top1')
+    inside = [n for n in calls if _fn_of(n) in EVAL_FNS]
+    outside = [n for n in calls if _fn_of(n) not in EVAL_FNS]
+
+    assert inside, \
+        f'两个 eval 函数（{"/".join(EVAL_FNS)}）里一处 sample_batch_numpy 调用都没找到 —— ' \
+        f'归属判定失效或函数被改名'
+
+    # ① eval 内的每一处都必须关增强
+    for n in inside:
+        assert _augment_kwarg(n) == 'False', (
+            f'{_fn_of(n)} 里的 sample_batch_numpy 没传 augment=False'
+            f'（实参 {_augment_kwarg(n)!r}）：{ast.unparse(n)}')
+
+    # ② eval 之外一律不许关增强
+    for n in outside:
+        assert _augment_kwarg(n) != 'False', (
+            f'{_fn_of(n)} 里的 sample_batch_numpy 不该传 augment=False：{ast.unparse(n)} —— '
+            f'训练路径靠默认 True 吃 8 倍增强，关掉它训练指标照样好看、只是模型变弱，'
+            f'事后极难归因')
+
+    # ④ 空转守卫：非 eval 调用点确实存在（预取器 worker），否则 ② 是恒真
+    assert outside, \
+        '一个 eval 之外的 sample_batch_numpy 调用点都没找到 —— ② 已恒真，本用例空转'
+
+    # ③ 预取器 worker：连 augment 这个 kwarg 都不许出现
     worker_calls = _sample_batch_calls(t._prefetch_worker)
     assert len(worker_calls) == 1, \
         f'_prefetch_worker 里应有 1 处 sample_batch_numpy 调用，实得 {len(worker_calls)} 处'

@@ -21,7 +21,10 @@
   - 契约锁：传进 `sample_batch_numpy` 的 rng 是由 `EVAL_SAMPLING_SEED` 播种的
     Generator；不传 `rng` 时也必须落到 `_eval_rng()` 而不是把 None 透传（4、5）
   - 既有性质加锁：train/eval 分割用 `default_rng(0)`、按棋局分支的 `eval_idx` 升序（6）
-  - 可见性锁：两处 `[eval]` 日志行都打出 eval 采样种子（7）
+  - 可见性锁（**防回归**，P2.3b 反转过朝向）：两处 `[eval]` 日志行**不得**再出现 `seed=` /
+    `EVAL_SAMPLING_SEED`（评估已零随机，打种子等于宣称指标依赖一个不生效的常量），
+    同时仍必须带批数/截断字段（7）。用例 7 的函数名 `test_eval_log_reports_sampling_seed`
+    是历史遗留 —— 名字停在修复之前，断言朝向已反转为「不许打种子」，读时以 docstring 为准。
 
 用例 6 是给**既有**性质加锁（分割本来就是确定性的），不是缺陷用例，修复前后都应绿。
 用例 1/3 是行为性红：修复前它们因「指标不等 / 全局流错位」而失败。
@@ -433,18 +436,31 @@ def test_eval_split_order_is_deterministic():
 
 
 # --------------------------------------------------------------------------- #
-# 7. 可见性锁：日志里能看出 eval 抽样是固定种子的
+# 7. 可见性锁（防回归）：日志不得宣称指标依赖 eval 采样种子，但覆盖度字段必须在
 # --------------------------------------------------------------------------- #
 def test_eval_log_reports_sampling_seed():
-    """两处 `[eval]` 日志都要在**同一个 `logger.info(...)` 调用**里打出 eval 采样种子。
+    """两处 `[eval]` 日志**不得**再宣称指标依赖采样种子（防回归锁）。
 
-    读日志的人只有从这一行才能知道「这批指标是在固定种子的增强抽样下算出来的」，
-    否则一次 KL 抖动到底该信几分无从判断。SwanLab 侧不要求（它收的是指标本身）。
+    **这条断言的朝向在 P2.3b 里被反转过，请连函数名一起读。** 原来这里断言「`seed=%d` 与
+    `EVAL_SAMPLING_SEED` 出现在同一个 `logger.info` 调用里」—— 那等于把**当时**的实现形状
+    抄进测试。P2.3 让评估固定传 `augment=False` 之后，`EVAL_SAMPLING_SEED` 与 `rng=` 都不再
+    被消费，指标与种子无关；可这条断言仍在要求日志打出它，于是「种子已失效」这个事实在测试
+    里被**反向锁死**：谁想把 `seed=%d` 删掉（那才是修复）都会先撞红，而留着它，日志继续
+    主动误导运维去调一个不影响任何数字的常量。现在反转成防回归锁。
 
-    定位方式是「取到那个 `logger.info` 调用本身的源码」，而不是在锚点后面截一段固定
-    长度的窗口：窗口会把紧邻的下一条无关日志（`[eval] 验证集被截断：…`）也圈进来，于是
-    「格式串里有 `seed=%d`」与「实参里有 `EVAL_SAMPLING_SEED`」可以由两处互不相干的
-    文本分别凑出来 → 假绿。现在两个条件必须在同一个调用内同时成立。
+    锁两件事：
+      ① 格式串里不得出现 `seed=`（含 `deterministic_seed=` 这类变体）—— 日志不得宣称种子；
+      ② 实参里不得出现 `EVAL_SAMPLING_SEED` —— 否则会留下「格式串没 seed=、实参却多传一个
+         常量」的错位（多一个实参对 `%` 格式化会直接抛 `TypeError`，但 `ast.unparse` 看得出）。
+
+    同时保留正向断言：覆盖度信息（批数 / 截断）不能被一起删掉 —— 那是读日志的人判断
+    「这批指标能不能信」的唯一依据。`tests/test_eval_coverage.py` 的用例 4 从 main() 源码
+    窗口侧锁同一条；这里从 `logger.info` 调用本身侧锁，两处定位方式不同、互为对照。
+
+    定位方式仍是「取到那个 `logger.info` 调用本身的源码」，而不是锚点后截一段固定长度的
+    窗口：窗口会把紧邻的下一条无关日志（`[eval] 验证集被截断：…`）也圈进来，于是
+    「格式串里有 `seed=%`」与「实参里有 `EVAL_SAMPLING_SEED`」可以由两处互不相干的文本
+    分别凑出来 → 假绿。现在两个条件都在同一个调用内判定。
     """
     tree = ast.parse(textwrap.dedent(inspect.getsource(t.main)))
     calls = [ast.unparse(n) for n in ast.walk(tree)
@@ -454,10 +470,15 @@ def test_eval_log_reports_sampling_seed():
         matched = [c for c in calls if anchor in c]
         assert matched, f'main() 里找不到含 {anchor} 的 logger.info 调用'
         for call in matched:
-            assert 'seed=%d' in call, \
-                f'{anchor} 的 logger.info 调用里没有打印 eval 采样种子'
-            assert 'EVAL_SAMPLING_SEED' in call, \
-                f'{anchor} 的 logger.info 调用里种子不是取自 EVAL_SAMPLING_SEED 常量'
+            assert 'seed=' not in call, (
+                f'{anchor} 的 logger.info 里出现 `seed=`：评估固定 augment=False、零随机，'
+                f'种子不影响任何指标，打出来只会让人以为数字依赖它。实参: {call}')
+            assert 'EVAL_SAMPLING_SEED' not in call, (
+                f'{anchor} 的 logger.info 仍在传 EVAL_SAMPLING_SEED —— '
+                f'格式串已不宣称种子，实参却还留着它（错位）。实参: {call}')
+            # 正向：可见性不能跟着一起删
+            assert 'batches=%d' in call and 'truncated=%s' in call, \
+                f'{anchor} 的 logger.info 丢了批数/截断字段 —— 指标覆盖度不可见。实参: {call}'
 
 
 def test_isolation_helper_restores_both_streams():

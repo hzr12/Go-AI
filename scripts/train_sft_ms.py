@@ -5,7 +5,8 @@
 与 scripts/train_sft.py 的对应关系
 ----------------------------------
 - 数据：复用 src/data/dataset.py 的 SupervisedDataset（走 sample_batch_numpy，
-  不依赖 torch），因此 npz 格式、12 通道特征、8 对称增强与 torch 版完全一致。
+  不依赖 torch），因此 npz 格式、12 通道特征与 torch 版完全一致；8 对称增强**只在训练
+  侧**发生（训练循环走默认 augment=True），验证集评估显式 augment=False，与 torch 版同口径。
 - 损失：与 torch 版一致 —— cross_entropy(policy) + mse(value)，权重 1:1。
 - 调度：warmup(5%) + cosine，逐 step，与 torch 版 SequentialLR(LinearLR,
   CosineAnnealingLR) 等价。
@@ -94,7 +95,10 @@ def evaluate_top1(net, ds, idxs, bs, board_size, max_batches=None):
         sel = idxs[b * bs:(b + 1) * bs]
         if len(sel) == 0:
             break
-        states, moves, _ = ds.sample_batch_numpy(sel)
+        # 验证集不做 8 路随机对称变换，与 torch 版 `evaluate_*` 同口径（P2.3b）。
+        # 不加这一句时两条路径评估的是不同的数据集，同一份验证集会选出不同的「最佳」权重。
+        # 注意：训练循环里那一处 `sample_batch_numpy(sel)` 走默认 augment=True，**不要**动。
+        states, moves, _ = ds.sample_batch_numpy(sel, augment=False)
         policy, _ = net(Tensor(states, ms.float32))
         pred = ops.ArgMaxWithValue(axis=-1)(policy)[0].asnumpy()
         correct += int((pred == moves).sum())
