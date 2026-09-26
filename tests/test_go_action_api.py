@@ -113,7 +113,9 @@ def test_action_space_contract():
       1. **`PASS` 是类级常量且值随盘口变**（5 路 25 / 9 路 81）：它必须**不是**逐实例
          赋值的属性（那会出现第二个真相源），也必须**不能**在类上取（`GoBoard.PASS`
          抛 AttributeError）—— 类上没有「默认盘口」可言，让它大声报错好过让 5 路
-         静默用 19 路的 361，那会让动作空间与扁平坐标错位 336。
+         静默用 19 路的 361，那会让动作空间与扁平坐标错位 336。**写入与删除同样要
+         报错**（`b.PASS = …` / `del b.PASS`）：只定义 `__get__` 的描述符是非数据的，
+         实例 `__dict__` 排在它前面，一次赋值就能静默遮蔽掉整个槽位。
       2. 坐标 ↔ 动作严格互逆，且动作编号与掩码下标**同一套**（`r*n+c`）。
       3. 动作 ↔ 文本严格互逆（含 `'pass'` 与四个角），并钉住**列字母在前**的 SGF 记法
          （`(行2, 列3)` 必须是 `"dc"` 而不是 `"cd"`）。
@@ -130,6 +132,15 @@ def test_action_space_contract():
         assert b.num_actions() == b.PASS + 1
         with pytest.raises(AttributeError):
             GoBoard.PASS            # 类上访问必须大声报错（见上）
+        # 写入 / 删除同样必须报错：只定义 __get__ 的话 _PassSlot 是**非数据描述符**，
+        # 而实例 __dict__ 排在描述符之前 —— `board.PASS = 5` 会**静默**挂上一个 int 5
+        # 把描述符整个遮蔽掉，此后 PASS 与 n*n 永久分叉且零报错（症状是 pass 被当成
+        # 棋盘上的一个点）。守卫必须是结构性的，不能靠调用方记得别写。
+        with pytest.raises(AttributeError):
+            b.PASS = n2 + 7
+        with pytest.raises(AttributeError):
+            del b.PASS
+        assert b.PASS == n2, "失败的写入不得留下痕迹（PASS 仍由 board_size 决定）"
 
         # ---- 坐标 ↔ 动作 ----
         for (r, c) in ((0, 0), (0, n - 1), (n - 1, 0), (n - 1, n - 1),

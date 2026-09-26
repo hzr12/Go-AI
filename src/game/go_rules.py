@@ -161,6 +161,21 @@ class _PassSlot:
     因此**类上访问（`GoBoard.PASS`）直接抛 AttributeError**，只允许实例访问
     （`board.PASS` / `self.PASS`）。这条报错是设计的一部分：它拦住
     `PASS = GoBoard.PASS` 这类模块级常量（那会在 5 路与 19 路共用一个值）。
+
+    **写入 / 删除也一并封死**（`__set__` / `__delete__`）。只定义 `__get__` 的话本类
+    是**非数据描述符**，而实例 `__dict__` 在描述符之前查找 —— 于是
+    `board.PASS = 5` 会**静默**在实例上挂一个 int 5，把描述符整个遮蔽掉：此后
+    `board.PASS` 恒为 5，与 `board_size * board_size`（5 路 25 / 19 路 361）分叉，
+    `num_actions() == PASS + 1` 这条不变式当场失效，症状是「pass 被当成棋盘上的
+    一个点」而且**没有任何报错**。补上 `__set__` 之后本类成为数据描述符，
+    属性查找永远走它，赋值只能大声失败。
+    真想给一个具体盘面钉一个 pass 编号，请写**局部变量** `pass_action = board.PASS` ——
+    它的作用域天然不会跨盘口。
+
+    ⚠ 覆盖范围：这两个方法只拦**实例**上的写入。类级重绑定
+    （`GoBoard.PASS = 5`）是给类属性赋值、不经过描述符协议，拦不住 —— 要拦它得上
+    metaclass，超出本任务范围（那一处至少还是**可见**的：改完之后类上访问不再抛
+    AttributeError，单元测试第 1 条会立刻发现）。
     """
     __slots__ = ()
 
@@ -172,6 +187,20 @@ class _PassSlot:
                 "「默认盘口」可言。要一个模块级常量就写 "
                 "`PASS = GoBoard(board_size).PASS`。")
         return obj.board_size * obj.board_size
+
+    def __set__(self, obj, value):
+        raise AttributeError(
+            f"GoBoard.PASS 是只读槽位，不得赋值（board.PASS = {value!r}）：它的值"
+            f"由 board_size * board_size 唯一决定（{obj.board_size} 路 = "
+            f"{obj.board_size * obj.board_size}），写进去就等于凭空造出第二个"
+            f"真相源，且会静默遮蔽本描述符。真要一个 pass 编号就写局部变量 "
+            f"`pass_action = board.PASS`。")
+
+    def __delete__(self, obj):
+        raise AttributeError(
+            "GoBoard.PASS 是只读槽位，不得删除（del board.PASS）：它是全类共享的"
+            "动作空间约定，删掉之后所有实例访问都会退化成 AttributeError，而调用点"
+            "（legal_actions / is_legal / MCTS 的 n_actions-1）会一起崩。")
 
 
 class GoBoard:
@@ -230,6 +259,9 @@ class GoBoard:
     ---- PASS：类级常量，值 = board_size * board_size ----
     `GoBoard.PASS` 是**动作空间**里 pass 的编号（`board_size * board_size`），
     它是描述符而不是普通 int —— 因为值随盘口变，见 `_PassSlot` 的 docstring。
+    读走实例、写入删除一律报错（`__get__` 只在实例上给值，`__set__` / `__delete__`
+    抛 `AttributeError`），所以「类上取」与「实例上写」两种错法都是**结构性地**
+    出声，而不是静默分叉。
     动作空间与 `play()` 的「棋盘方言」（pass = -1）是**两套编号**，
     `legal_actions()` / `is_legal()` 只认动作空间；详见动作空间段的注释。
     """
@@ -505,12 +537,24 @@ class GoBoard:
         return r * n + c
 
     def action_to_string(self, action: int) -> str:
-        """动作编号 → 文本记法。`PASS` → `'pass'`，落子 → 两字母 SGF 风格串。
+        """动作编号 → 文本记法。`PASS` → `'pass'`，落子 → **两字母** SGF 风格串。
 
         **记法只有一套，就是 `parse_move_str` 那一套**（先读它，别造第二套）：
         小写字母，**列字母在前、行字母在后**（SGF 约定），`'aa'` = (行 0, 列 0) = 角，
         `'ee'` = 天元。`action_to_string(a) == parse_move_str` 的逆，
         `string_to_action(action_to_string(a)) == a` 对全部合法 a 成立。
+
+        ⚠ **「小写字母」只在 `board_size <= 26` 时为真**：本实现按
+        `chr(ord('a') + 索引)` 造字母（无查表，所以没有字母表可越界），而
+        `__init__` 允许 `board_size` 到 `_ZOBRIST_STRIDE = 32`（Zobrist 坐标表的
+        覆盖上限）—— 于是 27 路起越出 `a..z`：第 27..30 行/列落成 `{ | } ~`，
+        31/32 路落成 `\x7f` / `\x80`（**连可打印都不是**，别拿去写 SGF 或 JSON）。
+        **往返仍然成立**（`parse_move_str` 用的是同一套算术，两边同进同出，已实测
+        26/27/30/31/32 路往返一致），所以这不是错误、只是用词要准确：别拿
+        `s.isalpha()` / `s.islower()` 当落子串的合法性判据（判据用
+        `string_to_action`），也别照着 `parse_move_str` 自己的 docstring
+        （「统一用小写字母 a-s」）去推 26 以上的盘口。
+        在用盘口（5/7/9/13/19）都远在 26 以内。
 
         越界（含 `-1`）抛 `ValueError`：`-1` **不是**动作空间的编码（见段首的表）。
         """
@@ -534,6 +578,10 @@ class GoBoard:
         动作编号里 —— 那正是段首表里最危险的那一格。
 
         ⚠ **`'pass'` 映射到 `PASS`（n*n），不是 -1**。`-1` 留在棋盘方言里。
+
+        接受的记法与 `action_to_string` **同一个 26 的天花板**（那里写全了，
+        含 31/32 路会落到不可打印字符这件事）：`board_size > 26` 时两字母串的字符
+        会越出 `a..z`，两边仍然严格互逆。
         """
         ok, mv = self.parse_move_str(s)
         if not ok:
@@ -556,9 +604,16 @@ class GoBoard:
         一旦接上，所有 pass 都会被判非法，对局将**永远无法终局**（终局 = 两次连续 pass）。
         `is_legal()` 里对 PASS 的短路与本行的无条件追加是同一件事的两面。
 
-        只读：与 `get_legal_moves()` 一样在入口过 `_ensure_hash()`（由掩码那一侧做），
-        不改状态、不失效缓存。**不适用于 MCTS 热路径**：那里要的是
-        `np.flatnonzero(mask)` 之后接 `n_actions - 1`，省掉中间的 Python list。
+        只读**意图**（不落子、不改行棋方），但入口同样过 `_ensure_hash()`：PSK 判定读
+        的是重复局面历史，历史若属于别的盘面，命中判定毫无意义（这与掩码的契约完全
+        一致，调用由掩码那一侧代劳）。
+        ⚠ **别把它读成「绝不改状态」**：`_ensure_hash()` 可能触发
+        `_adopt_as_new_game()`，那是一次实打实的状态变更（重置 `move_number` /
+        `passes` / `_undo_stack` **并把 `_legal_cache` 置 None**）。措辞与
+        `is_legal` 的同一句保持一致。
+
+        **不适用于 MCTS 热路径**：那里要的是 `np.flatnonzero(mask)` 之后接
+        `n_actions - 1`，省掉中间的 Python list。
         """
         mask = self.get_legal_moves()
         return [int(i) for i in np.flatnonzero(mask).tolist()] + [self.PASS]
@@ -571,6 +626,16 @@ class GoBoard:
         `is_legal(a) == bool(get_legal_moves()[a])`。掩码是合法点集合的**唯一**真相源，
         本方法是它对单个点的投影（O(1) 级邻域扫描 + 至多一次提子推演），
         逐点对拍由 `tests/test_go_action_api.py::test_is_legal_matches_mask` 钉住。
+
+        ⚠ **上面那条等价是有前提的，前提就是类 docstring 的「局面状态字段的读写
+        契约」**：**就地改写 `board.board` 之后必须调 `resync_hash()`**。
+        `_ensure_hash()` 只侦测「board **数组对象**被换掉」与「current_player 被改写」
+        两种脱钩，**察觉不到就地改写**，于是增量哈希仍属于旧盘面：带缓存的
+        `get_legal_moves()` / `legal_actions()`（旧掩码）与现算的 `is_legal`（新盘面）
+        可能给出不同答案 —— 而**此时 `is_legal` 才是对的那个**（它直接读 `self.board`）。
+        所以看到两者不一致时，先查有没有漏 `resync_hash()`，别急着判 `is_legal` 有 bug。
+        本方法的 docstring 刻意把这条写在这里而不是只放在 `_ensure_hash` 里：
+        契约的**受益方**是这里那条等价声明。
 
         边界：
           - `action == PASS` → **True**（结构保证；理由见 `legal_actions` 的 ⚠ 段）；
@@ -619,6 +684,14 @@ class GoBoard:
         # 一个布尔同时回答「己方合并后有气吗」与「敌块是不是被打吃」。
         # 这里**不**取 tolist() 快照：单点判定只读 ≤4 个邻点与其连通块，
         # 整盘快照是 O(n²) 的无用拷贝（掩码需要它是因为要扫全盘）。
+        # ⚠ **与掩码的差异是有意的取舍，不是等价，也不是漏改**：掩码走
+        # `self.board.tolist()` 是因为它逐候选扫全盘 n*n 次邻域，那里 numpy 标量
+        # 每次比较都要造一个标量再取 __bool__，实测 19 路空盘一次掩码
+        # 2.53 ms → 0.26 ms（10x，见掩码 docstring）。本方法每点只碰 ≤4 个邻点，
+        # 一次 tolist() 的 O(n²) 拷贝**远超**那点省下来的开销，而本方法对外承诺的
+        # 是「与 n² 无关」（见上文成本段）—— 换成 tolist() 会把这个无条件性质悄悄
+        # 变成 O(n²)。正确性两边一致（`board[nr, nc] == 0` 对 Python int 与
+        # np.int8 同义，`has_lib_ex` 也只做数值比较），所以**别顺手「对齐」**。
         board = self.board
         has_lib_ex = self._group_has_liberty_excluding
         capture = False
