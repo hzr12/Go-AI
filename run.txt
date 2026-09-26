@@ -306,11 +306,7 @@ python scripts/selfplay_train.py \
 #       会被当成位置参数而报错）。模拟数在界面「模拟数」下拉里选，没有
 #       --simulations 这个选项。
 # 推荐配置：ONNX + 多线程 + 策略深度2
-python scripts/webui.py --port 7860 --device cpu --priors-leaf \
-    --onnx models/sft_19x19_v17.onnx \
-    --mode hybrid --hybrid-sims 32 --hybrid-blend 0.5 \
-    --expand-topk 8 --num-threads 4 \
-    --policy-depth 2 --policy-width 4 --policy-topk 12
+python scripts/webui.py --port 7860 --device cpu --priors-leaf --model models/sft_19x19_v12.pth --mode hybrid --hybrid-sims 32 --hybrid-blend 0.5 --expand-topk 8 --num-threads 4 --policy-depth 2 --policy-width 4 --policy-topk 12 --onnx
 
 # 高质量模式：纯 MCTS（较慢但更强；模拟数在界面选 400/800/1600）
 python scripts/webui.py --port 7860 --device cpu --priors-leaf \
