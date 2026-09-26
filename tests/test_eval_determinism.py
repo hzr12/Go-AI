@@ -15,7 +15,9 @@
 ----
   - 行为锁：同一假模型 + 同一 eval_idx 连调两次 `evaluate_metrics`，全部返回指标逐位
     相同（1）；不插 eval 与插一次 eval 后从全局流抽到的数逐位相同（3）
-  - 状态锁：eval 前后全局 `np.random` 与 `torch` CPU RNG 状态都不变（2）
+  - 状态锁：eval **窗口内消耗的**随机不逃逸出去 —— 假模型在 forward 里真的抽 torch
+    随机（`consume_torch_rng=True`），返回后 numpy 四段状态与 torch CPU 状态逐位不变
+    （2）；`_isolated_global_rng()` 在正常路径与异常路径上都还原两条流（8）
   - 契约锁：传进 `sample_batch_numpy` 的 rng 是由 `EVAL_SAMPLING_SEED` 播种的
     Generator；不传 `rng` 时也必须落到 `_eval_rng()` 而不是把 None 透传（4、5）
   - 既有性质加锁：train/eval 分割用 `default_rng(0)`、按棋局分支的 `eval_idx` 升序（6）
@@ -35,7 +37,14 @@ dropout，所以它证明的是「抽样固定后，同权重两次 eval 逐位�
 `--attention-dropout` 在 `train_sft.py:868` 的默认值就是 0.1、run.txt 的 SFT 命令也
 显式传 0.1，故生产配置下 eval 仍在抽 torch 随机、logits 仍在抖动 —— 详见
 `.superpowers/sdd/2026-09-25-v21-roadmap/task-p2-2-report.md`。
-本任务的隔离机制仍把它兜住了：那些抽样在 eval 结束时被还原，训练轨迹不受影响。
+
+**本任务的隔离只覆盖 CPU 生成器**：`torch.get_rng_state()` 快照/还原的是 CPU 的
+MT19937，而上面那些 dropout 掩码抽自 **device（CUDA/NPU）生成器** —— 那条流既没有被
+快照也没有被还原，且它与训练 dropout 共用同一股随机。所以「eval 频率会改写训练轨迹」
+这个缺陷被隔离机制消掉**只在 CPU 上成立**（本文件的实测即 CPU 全绿）；`--device cuda`
+（`run.txt` 实际用的就是它）下 eval 频率仍会改写训练轨迹。device 侧的解耦取决于后续
+任务给 functional dropout 补 `self.training` 闸门 —— 在那之前不要把「8 passed」读成
+「生产配置下训练轨迹已与 eval 频率解耦」。
 
 全部 CPU、秒级：假 model（定长无并列 logits）+ 假 dataset（逐条照抄真实
 `sample_batch_numpy` 的随机源语义），不加载真模型、不读真数据。
@@ -59,6 +68,11 @@ BS = 4              # 假 batch size
 N_SAMPLES = 40      # 10 批
 N_ACTIONS = 32      # 假动作数（须 >= 10，evaluate_metrics 内部 topk(10)）
 AMP = torch.float32
+
+# `EVAL_SAMPLING_SEED = 1234` 与训练侧 `_BatchPrefetcher.__init__` 的默认
+# `seed=1234`（`train_sft.py:630`）**数值相同但互不相干**，不要以为有耦合：
+# 前者喂 `np.random.default_rng` 给验证集的 8 路增强抽样，后者喂预取器各子进程的
+# `default_rng(seed + wi)`。改其中一个不会动到另一个。
 
 
 # --------------------------------------------------------------------------- #
@@ -115,10 +129,15 @@ class _FakeModel:
     最优着法 = 真值着法 + 5*t (mod A)：t=0 时 top1 命中，t≠0 时 5*t mod 32 必不等于
     0（32 不是 5 的因子）→ 全部落错。于是 top1 恰好是「抽到 t=0 的样本比例」，对变换
     极其敏感。无并列 → topk 结果唯一确定，指标不依赖 torch 怎么打破并列。
+
+    `consume_torch_rng=True` 时每次前向都真的抽一个 torch 随机数（抽完丢掉，不进
+    logits）—— 用来模拟真模型在 eval 期的 dropout 消耗，见用例 2。默认关闭：其余用例
+    关心的是抽样源，让前向保持纯确定性，免得混入无关变量。
     """
 
-    def __init__(self, n_actions=N_ACTIONS):
+    def __init__(self, n_actions=N_ACTIONS, consume_torch_rng=False):
         self.n_actions = n_actions
+        self.consume_torch_rng = consume_torch_rng
 
     def eval(self):
         pass
@@ -127,6 +146,8 @@ class _FakeModel:
         pass
 
     def __call__(self, state):
+        if self.consume_torch_rng:
+            torch.rand(1)                 # 抽了就丢：只模拟「消耗了 torch 全局随机」
         B = state.shape[0]
         ids = state[:, 0, 0, 0].long()
         tforms = state[:, 1, 0, 0].long()
@@ -153,6 +174,22 @@ def _run_metrics(ds, model=None, idxs=None, **kwargs):
 def _seeded_first_draw(size):
     """`EVAL_SAMPLING_SEED` 播种的流抽出的**第一段**变换向量。"""
     return np.random.default_rng(t.EVAL_SAMPLING_SEED).integers(0, 8, size=size)
+
+
+def _assert_numpy_state_unchanged(before, after, ctx):
+    """断言 `np.random.get_state()` 元组的**四段**全等。
+
+    元组是 `('MT19937', keys(624,), pos, has_gauss, cached_gaussian)`：keys 数组必须用
+    `np.array_equal`（`==` 会得到逐元素布尔数组，`assert` 语义完全不同），其余标量直接
+    比。**四段都要比**：状态字未回绕时 `keys` 数组原地不动、只有 `pos` 前进，只比 keys
+    会漏掉最常见的那种流推进（见报告第四节的实测 `(32,0,0.0) -> (72,0,0.0)`）。
+    """
+    assert before[0] == after[0], \
+        f'{ctx}：全局随机源算法被换了: {before[0]!r} -> {after[0]!r}'
+    assert np.array_equal(before[1], after[1]), \
+        f'{ctx}：全局 np.random 的 624 个状态字被改动了 —— 训练 RNG 流被偷走'
+    assert before[2:] == after[2:], \
+        f'{ctx}：全局 np.random 的 pos/高斯缓存被改动: {before[2:]} -> {after[2:]}'
 
 
 # --------------------------------------------------------------------------- #
@@ -197,16 +234,31 @@ def test_repeated_eval_is_bit_identical():
 
 
 # --------------------------------------------------------------------------- #
-# 2. 状态锁：eval 不动全局 np.random / torch CPU RNG
+# 2. 状态锁：eval 窗口内消耗的随机不逃逸（numpy + torch CPU 两条流）
 # --------------------------------------------------------------------------- #
 def test_eval_does_not_disturb_global_numpy_state():
-    """eval 前后 `np.random.get_state()` 与 `torch.get_rng_state()` 必须完全不变。
+    """eval **窗口内消耗掉的**随机不会逃出去：返回后 numpy 与 torch 全局状态逐位不变。
 
-    state 元组是 `('MT19937', keys(624,), pos, has_gauss, cached_gaussian)`：keys 数组
-    用 `np.array_equal` 比（`==` 会得到逐元素布尔数组，`assert` 语义完全不同），其余
-    标量直接比。torch 侧用 `torch.equal`（ByteTensor，同样要逐位比而不是 `==`）。
+    断言的契约是「**消耗不逃逸**」，不是「eval 没消耗随机」—— 这一点决定它能不能承重。
+    早期版本让假模型不碰 torch 随机、却在 eval **返回之后**才比 `torch.get_rng_state()`：
+    上下文管理器退出时已经把状态还原了，于是该断言对「窗口内到底消耗了没有」恒为真 ——
+    一个前向里带活 dropout 的真模型照样通过，红不了（结构上不可能失败）。
 
-    修复前必红：eval 抽变换时走了全局 `np.random.randint`，状态被推进。
+    现在假模型在 forward 里**真的抽 torch 随机**（`consume_torch_rng=True`），断言真正
+    在问的是「eval 抽走的这些随机数会不会漏出去」。把 `_isolated_global_rng()` `finally`
+    里的 `torch.set_rng_state(...)` 去掉，这条立刻红（报告里有自检输出）。
+
+    为什么用假模型手工制造消耗，而不是直接用真 `AlphaGoNet`：真模型确实在 eval 期间
+    消耗 torch 随机（注意力 dropout 是 functional 版，`model.eval()` 关不掉，见模块
+    docstring「已知边界」），但那份消耗抽自 **device 生成器**；本机无 GPU，锁不了那条流。
+    「eval 期的真模型不消耗 torch 随机」这个前提本身，要等 functional dropout 补上
+    `self.training` 闸门之后，由后续任务用**真模型**来钉 —— 在那之前，这里先把
+    「消耗 → 被还原」这段契约在可控的 CPU 流上钉住。
+
+    numpy 侧四段全比（算法名 / 624 个状态字 / pos / has_gauss+cached_gaussian）；torch 侧
+    用 `torch.equal`（ByteTensor，同样要逐位比而不是 `==`，后者会得到逐元素布尔 Tensor）。
+
+    修复前必红：eval 抽变换时走了全局 `np.random.randint`，状态被推进（pos 32→72）。
     """
     np.random.seed(20260926)
     torch.manual_seed(20260926)
@@ -215,19 +267,15 @@ def test_eval_does_not_disturb_global_numpy_state():
     np_before = np.random.get_state()
     torch_before = torch.get_rng_state().clone()
 
-    _run_metrics(_FakeDataset())
+    # 关键：前向里真的消耗 torch 全局随机，否则下面那条断言是恒真的
+    _run_metrics(_FakeDataset(), model=_FakeModel(consume_torch_rng=True))
 
-    np_after = np.random.get_state()
+    _assert_numpy_state_unchanged(np_before, np.random.get_state(), '跑完一次 eval 后')
     torch_after = torch.get_rng_state()
-    assert np_before[0] == np_after[0], \
-        f'全局随机源算法被换了: {np_before[0]!r} -> {np_after[0]!r}'
-    assert np.array_equal(np_before[1], np_after[1]), \
-        '全局 np.random 的 624 个状态字被 eval 改动了 —— eval 偷走了训练 RNG 流'
-    assert np_before[2:] == np_after[2:], \
-        f'全局 np.random 的 pos/高斯缓存被改动: {np_before[2:]} -> {np_after[2:]}'
-    assert torch.equal(torch_before, torch_after), \
-        'torch CPU RNG 状态被 eval 推进了（eval 走 inference_mode + model.eval()，' \
-        '本不该消耗任何 torch 随机）'
+    assert torch.equal(torch_before, torch_after), (
+        'eval 窗口内消耗的 torch 随机逃逸了：前向抽的随机数把训练的 CPU RNG 流推进了 —— '
+        '训练轨迹又会依赖 eval 频率。去掉 _isolated_global_rng() 的 torch.set_rng_state '
+        '即可复现')
 
 
 # --------------------------------------------------------------------------- #
@@ -375,19 +423,28 @@ def test_eval_split_order_is_deterministic():
 # 7. 可见性锁：日志里能看出 eval 抽样是固定种子的
 # --------------------------------------------------------------------------- #
 def test_eval_log_reports_sampling_seed():
-    """两处 `[eval]` 日志行都要打出 eval 采样种子。
+    """两处 `[eval]` 日志都要在**同一个 `logger.info(...)` 调用**里打出 eval 采样种子。
 
     读日志的人只有从这一行才能知道「这批指标是在固定种子的增强抽样下算出来的」，
     否则一次 KL 抖动到底该信几分无从判断。SwanLab 侧不要求（它收的是指标本身）。
+
+    定位方式是「取到那个 `logger.info` 调用本身的源码」，而不是在锚点后面截一段固定
+    长度的窗口：窗口会把紧邻的下一条无关日志（`[eval] 验证集被截断：…`）也圈进来，于是
+    「格式串里有 `seed=%d`」与「实参里有 `EVAL_SAMPLING_SEED`」可以由两处互不相干的
+    文本分别凑出来 → 假绿。现在两个条件必须在同一个调用内同时成立。
     """
-    main_src = textwrap.dedent(inspect.getsource(t.main))
-    for anchor in ('"[eval] step=%d', '"[eval] FINAL'):
-        i = main_src.find(anchor)
-        assert i != -1, f'main() 里找不到 {anchor} 日志行'
-        region = main_src[i:i + 700]
-        assert 'seed=%d' in region, f'{anchor} 日志行没有打印 eval 采样种子'
-        assert 'EVAL_SAMPLING_SEED' in region, \
-            f'{anchor} 日志行的种子不是取自 EVAL_SAMPLING_SEED 常量'
+    tree = ast.parse(textwrap.dedent(inspect.getsource(t.main)))
+    calls = [ast.unparse(n) for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+             and n.func.attr == 'info']
+    for anchor in ('[eval] step=%d', '[eval] FINAL'):
+        matched = [c for c in calls if anchor in c]
+        assert matched, f'main() 里找不到含 {anchor} 的 logger.info 调用'
+        for call in matched:
+            assert 'seed=%d' in call, \
+                f'{anchor} 的 logger.info 调用里没有打印 eval 采样种子'
+            assert 'EVAL_SAMPLING_SEED' in call, \
+                f'{anchor} 的 logger.info 调用里种子不是取自 EVAL_SAMPLING_SEED 常量'
 
 
 def test_isolation_helper_restores_both_streams():
@@ -396,6 +453,12 @@ def test_isolation_helper_restores_both_streams():
     这是 eval 侧的兜底机制：万一将来有代码路径仍去碰全局随机源（老调用点、新增的
     增强、第三方库内部的 `np.random`），也不会把状态推进出去。`finally` 语义一并锁住
     —— eval 中途 OOM 抛错不该顺手改掉训练的随机流。
+
+    numpy 侧四段全比（含 `pos` 与高斯缓存）：只比 624 个状态字会漏掉「状态字未回绕、
+    只有 pos 前进」这种最常见的流推进。
+
+    这条与用例 2 互补：这里直接把上下文管理器拎出来测「窗口内的消耗被还原」；用例 2
+    走完整的 `evaluate_metrics` 路径。前向里的 torch 消耗由用例 2 的假模型提供。
     """
     np.random.seed(7)
     torch.manual_seed(7)
@@ -407,8 +470,8 @@ def test_isolation_helper_restores_both_streams():
         np.random.randint(0, 8, size=64)
         torch.rand(64)
 
-    assert np.array_equal(np_before[1], np.random.get_state()[1]), \
-        '_isolated_global_rng() 退出后没有还原全局 np.random'
+    _assert_numpy_state_unchanged(np_before, np.random.get_state(),
+                                  '_isolated_global_rng() 正常退出后')
     assert torch.equal(torch_before, torch.get_rng_state()), \
         '_isolated_global_rng() 退出后没有还原 torch RNG'
 
@@ -424,7 +487,7 @@ def test_isolation_helper_restores_both_streams():
         pass
     else:
         raise AssertionError('模拟的异常没冒出来，测试本身失效')
-    assert np.array_equal(np_before[1], np.random.get_state()[1]), \
-        'eval 抛异常时没有还原全局 np.random —— 一次 OOM 就能改掉训练轨迹'
+    _assert_numpy_state_unchanged(np_before, np.random.get_state(),
+                                  'eval 抛异常时')
     assert torch.equal(torch_before, torch.get_rng_state()), \
         'eval 抛异常时没有还原 torch RNG'
