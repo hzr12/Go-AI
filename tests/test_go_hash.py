@@ -19,6 +19,7 @@ GoBoard Zobrist 哈希 / 重复局面（PSK 地基）测试。
   - 重复局面尚未接入 get_legal_moves()（P2.6a-2b 才接），本任务行为零变化
 """
 import os
+import re
 import subprocess
 import sys
 
@@ -529,10 +530,40 @@ def test_num_passes_and_is_terminal():
     assert e2.move_number == cap3 - 1
     assert e2.is_terminal() is False, f"上限前一手（{cap3 - 1}）不应终局"
 
-    # 上限按盘口缩放，不是写死的常数
+    # ---- 上限按盘口缩放，不是写死的常数 ----
+    #
+    # 钉法：把**同一个手数**（cap3 = 18）横向摊到 5 种盘口上问「默认上限触发了没有」。
+    # 3 路的默认上限正好是 18（2·3²）-> 终局；5/9/13/19 路的默认上限 50/162/338/722 都
+    # 远大于 18 -> 都不终局。两侧都有界，所以这条断言**不空转**：
+    # 上限若被写死成与盘口无关的常数（或干脆恒假），3 路那条立刻红；上限若被写死成
+    # 9 路的 162，5/9/13/19 那几条立刻红。
+    #
+    # 原来那版拿**新建**的 GoBoard(n) 去问 is_terminal(max_moves=cap3)：新建棋盘的
+    # move_number 与 num_passes 都是 0，0 >= 18 恒假 —— 对任何盘口、任何上限公式都
+    # 返回 False，什么也没钉住（报告 §4(a) 曾把它当成「上限随盘口缩放」的证据）。
+    # 现在每个盘口都**真的走到 18 手**，且全程实着（num_passes == 0），于是终局只可能
+    # 由 move 上限触发，不受「两次连续 pass」干扰。
+    #
+    # 3 路走 _CAP_LINE_3X3（上面已用过的夹具），其余盘口用 _greedy_new_move（本文件 §8
+    # 的合法着法生成器：滤掉自杀与重复局面，所以 PSK 接入后这段仍然合法）。5 路只有
+    # 25 个点，18 手实着远远够得着；不需要真的走到 2n²-1 / 2n² —— 5 路那要走 50 手，
+    # 而第 25 手实着必须靠提子腾地方、必然造出重复局面（见 §8 docstring），不可达。
     for n in (3, 5, 9, 13, 19):
-        assert GoBoard(n).is_terminal(max_moves=cap3) is False, \
-            f"{n} 路默认上限 2n²={2 * n * n}，{cap3} 手不该终局"
+        c = GoBoard(n)
+        while c.move_number < cap3:
+            i = c.move_number
+            mv = _CAP_LINE_3X3[i] if n == 3 else _greedy_new_move(c)
+            assert mv >= 0, f"{n} 路走到 {cap3} 手前应还有可下的实着（第 {i} 手没有）"
+            assert c.play(mv) is True, f"{n} 路第 {i} 手 {mv} 应合法"
+            assert c.is_repetition() is False, f"{n} 路第 {i} 手之后染色重现了"
+        assert c.num_passes == 0, "全程实着 -> 终局只可能由 move 上限触发"
+        assert c.move_number == cap3
+        assert c.is_terminal() is (n == 3), (
+            f"{n} 路在第 {cap3} 手：默认上限 2n²={2 * n * n} -> 终局应为 {n == 3}")
+        assert c.is_terminal(max_moves=2 * n * n) is (n == 3), \
+            "显式传 2n² 必须与默认值一致（默认值就是 2n²）"
+        assert c.is_terminal(max_moves=2 * n * n + 1) is False, \
+            f"{n} 路在 {cap3} 手不该越过 2n²+1={2 * n * n + 1} 这条上限"
 
 
 # --------------------------------------------------------------------------- #
@@ -1028,21 +1059,111 @@ def test_position_key_is_size_independent():
     assert other.position_hash() != p_small
 
 
+def _clauses(text):
+    """把中文 docstring 按句读切成子句（统一空白后再切，避免跨行换行拆句子）。"""
+    flat = re.sub(r"\s+", " ", text or "")
+    return [c for c in re.split(r"[。；]", flat) if c.strip()]
+
+
 def test_docstring_distinguishes_the_two_keys():
     """**文档锁**（如标题所述：这是结构锁，不是行为断言）。
 
     「哪把钥匙用于重复判定」是本段最容易被回归的 knowledge：两套哈希长得几乎一样，
     用错 = SSK = 与 Tromp-Taylor 分歧，而这种用错在功能测试里几乎抓不到
     （只在罕见的奇数染色循环上才出错）。所以直接锁 docstring。
+
+    锁**三处**「键的分工」文本，且是**带方向**地锁（不只是子串存在）：
+      1. `GoBoard.position_hash.__doc__` / `GoBoard.hash.__doc__`（方法 docstring）
+      2. **模块头** `go_rules.__doc__`（⚠ PSK 段）—— 以前不在锁内
+      3. 谓词侧见 `test_repetition_predicate_doc_pairs_with_the_position_key`
+
+    方向锁：凡是写出「不用于……重复判定」的子句，该子句里都不得出现 `position_hash()`；
+    模块头还额外要求主语**显式**是 `hash()`（那里两把钥匙同段出现，是「都提到了但
+    方向写反」最容易溜过去的地方）。用反引号锚定的 `` `hash()` `` 匹配是关键 ——
+    它不会被 `` `position_hash()` `` 里的「hash()」子串误命中。
     """
     pos_doc = GoBoard.position_hash.__doc__ or ""
     full_doc = GoBoard.hash.__doc__ or ""
+    mod_doc = go_rules.__doc__ or ""
+
     assert "重复判定" in pos_doc, "position_hash() 必须写明它服务于重复判定"
     assert "hash()" in pos_doc, "position_hash() 必须点名与 hash() 的分工"
     assert "不用于重复判定" in full_doc, \
         "hash() 必须明说自己不用于重复判定（否则后来人会拿它判 PSK）"
     assert "position_hash()" in full_doc, "hash() 必须指向 position_hash()"
     assert pos_doc.strip() != full_doc.strip(), "两把钥匙的 docstring 不能是同一段文本"
+
+    # position_hash() 侧：必须自称重复判定专用，且**不得**自称「不用于重复判定」
+    assert "不用于重复判定" not in pos_doc, \
+        "position_hash() 正是重复判定专用键，不能写成不用于重复判定"
+    assert re.search(r"重复判定[^。]{0,12}专用", pos_doc), \
+        "position_hash() 必须自称「重复判定专用」"
+    assert "`hash()`" in pos_doc, \
+        "两把钥匙的 docstring 都必须用反引号写出对家的调用形式 `hash()` / `position_hash()`"
+
+    # 模块头：必须点名两把钥匙 + 明写「重复判定的键是 position-only」
+    assert "`position_hash()`" in mod_doc, "模块头必须点名重复判定专用的那把钥匙"
+    assert "`hash()`" in mod_doc, "模块头必须点名通用指纹那把钥匙"
+    assert re.search(r"重复判定的键[^。]{0,20}position-only", mod_doc), \
+        "模块头必须明写「重复判定的键是 position-only（position_hash()）」"
+
+    # 方向锁。凡是写出「不用于……重复判定」的子句，其主语必须**紧邻**地是 `hash()`；
+    # 方法 docstring 里的主语可以是隐含的（`hash.__doc__` 说「不用于重复判定」时主语
+    # 就是它自己），所以**显式主语**的检查只对模块头成立 —— 那里两把钥匙同段出现，
+    # 也正是「都提到了但方向写反」最容易溜过去的地方。
+    # 用反引号锚定的 `hash()` 匹配是关键：它不会被 `position_hash()` 里的「hash()」
+    # 子串误命中。
+    for where, doc in (("模块头", mod_doc), ("hash() 的 docstring", full_doc),
+                       ("position_hash() 的 docstring", pos_doc)):
+        for clause in _clauses(doc):
+            if "不用于" not in clause or "重复判定" not in clause:
+                continue
+            assert "`position_hash()`" not in clause, \
+                f"{where}：不得把 `position_hash()` 说成不用于重复判定（实测子句={clause}）"
+            if where == "模块头":
+                assert "`hash()`" in clause, \
+                    f"模块头：「不用于……重复判定」的主语必须**显式**是 `hash()`（实测子句={clause}）"
+    mod_warnings = [c for c in _clauses(mod_doc) if "不用于" in c and "重复判定" in c]
+    assert mod_warnings, "模块头必须有一句明写 `hash()` 不用于重复判定"
+    assert "`hash()`" in mod_warnings[0], \
+        f"模块头该句的主语必须是 `hash()`，实测={mod_warnings[0]}"
+
+
+def test_repetition_predicate_doc_pairs_with_the_position_key():
+    """**文档锁，第三处**：谓词与键的配对句 —— 本任务实际出过缺陷的位置。
+
+    「重复判定的键」这句话在源码里被复述了三次（模块头 / 两个哈希方法 / 谓词侧），
+    每一次复述都是一次写错的机会。已发生的实例：`_adopt_as_new_game` 的 docstring 曾写
+    「`_would_repeat(hash())` 对『就是当前局面』的位置返回假」。在 position-only 语义下
+    `hash()`（含行棋方）的值**永远**不在历史里，所以这句话从「描述一个具体 bug 的症状」
+    悄悄变成「对任何局面都成立」——而它正是「谓词配哪把钥匙」唯一的源级示范，后来人会
+    照着它把 SSK 键接进 PSK。测试里对应的镜像句当时改了，这句漏了，而当时的文档锁只看
+    两个哈希方法的 `__doc__`，抓不到（缺陷住在别处的 docstring 里）。
+
+    所以这里直接钉住配对形式，且是双向的：
+      - `_adopt_as_new_game` / `_would_repeat` 必须示范 `_would_repeat(position_hash())`；
+      - 任何地方都不得出现 `_would_repeat(hash())` / `_would_repeat(self.hash())` 这种配对。
+    """
+    adopt_doc = GoBoard._adopt_as_new_game.__doc__ or ""
+    pred_doc = GoBoard._would_repeat.__doc__ or ""
+
+    pair_pos = re.compile(r"_would_repeat\(\s*(?:self\.)?position_hash\(\)\s*\)")
+    pair_wrong = re.compile(r"_would_repeat\(\s*(?:self\.)?hash(?:_after_move)?\(\s*[^()]*\)")
+
+    assert pair_pos.search(adopt_doc), (
+        "_adopt_as_new_game 必须示范 `_would_repeat(position_hash())`："
+        "历史里存的是染色键，配通用指纹等于 SSK")
+    assert not pair_wrong.search(adopt_doc), (
+        "_adopt_as_new_game 不得示范 `_would_repeat(hash())`：那是 SSK 的候选键，"
+        "对任何局面都查不到历史")
+    # 谓词自己的 docstring 也必须把配对说清（候选键 = position-only 键）
+    assert pair_pos.search(pred_doc) or "position-only" in pred_doc, \
+        "_would_repeat 必须明写候选键是 position-only 键（position_hash 系列）"
+    assert not pair_wrong.search(pred_doc), \
+        "_would_repeat 不得示范用 hash() 作候选键"
+    # 键名带反引号书写，避免「position_hash() 里含 hash() 子串」式的误判
+    assert "`position_hash()`" in pred_doc, \
+        "_would_repeat 必须用反引号点名 `position_hash()`"
 
 
 if __name__ == "__main__":
