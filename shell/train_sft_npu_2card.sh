@@ -73,7 +73,7 @@ torchrun --nproc_per_node="$WORLD_SIZE" scripts/train_sft.py \
   --gradient-accumulation-steps 1 \
   --use-amp 1 --use-ema 1 \
   --npu-graph-compile "$NPU_GRAPH_COMPILE" \
-  --scaler-init-scale "$SCALER_INIT" --scaler-growth-interval "$SCALER_GROWTH" \\
+  --scaler-init-scale "$SCALER_INIT" --scaler-growth-interval "$SCALER_GROWTH" \
   --prefetch-workers "$PREFETCH_W" --prefetch-depth "$PREFETCH_D" \
   --log-every 50 --swanlab-every 10 --eval-every 2000 --save-every 500 \
   --early-stop 1 --early-stop-patience 3 \
