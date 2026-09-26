@@ -72,7 +72,13 @@ class _FakeDataset:
         """被请求的批数（= 评估函数实际跑的批数）。"""
         return len(self.batch_sizes)
 
-    def sample_batch_numpy(self, sel):
+    def sample_batch_numpy(self, sel, rng=None):
+        """`rng` 是评估侧固定采样源传进来的随机源（P2.2 新增），本假 dataset **刻意不用它**。
+
+        本模块锁的是「批数预算 / 截断可见化」，数值必须由 `sel` 单独决定，才谈得上
+        「跑满 vs 截断」「默认 vs 显式 50」的逐位比较 —— 掺进抽样噪声后那些相等断言就
+        只是在比噪声。抽样确定性由 `tests/test_eval_determinism.py` 负责。
+        """
         sel = np.asarray(list(sel), dtype=np.int64)
         B = len(sel)
         self.batch_sizes.append(B)

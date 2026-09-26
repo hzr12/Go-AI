@@ -18,7 +18,7 @@ import random
 import sys
 import threading
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import numpy as np
 import torch
@@ -331,6 +331,49 @@ def load_dataset(path):
     return SupervisedDataset({k: d[k] for k in d.files})
 
 
+# ---- eval 的确定性：固定采样源 + 与训练 RNG 流隔离 ----
+# 验证集评估要走 8 路对称增强抽样（`SupervisedDataset.sample_batch_numpy`）。修复前
+# 两个评估函数都不给 rng，抽样便落到**全局** np.random 上，后果有两层：
+#   ① 同一份权重、同一份 eval_idx 连跑两次 eval，指标不同（KL/Brier 尤其抖）——
+#      「模型变好了」与「这次抽到的变换不一样」分不开；
+#   ② 每次 eval 都推进全局流 → 训练侧 `rng.shuffle(train_idx)` 与训练 batch 的增强抽样
+#      结果取决于「eval 跑过几次、什么时候跑」→ **eval 频率会改写训练轨迹**。
+# 故 eval 一律用下面这个固定种子的独立 Generator，并全程包在 `_isolated_global_rng()`
+# 里兜底：eval 既不读也不写训练的那条随机流。种子写进 `[eval]` 日志行，读日志的人才
+# 知道这批指标是在固定抽样下算出来的。
+EVAL_SAMPLING_SEED = 1234
+
+
+def _eval_rng() -> np.random.Generator:
+    """评估用的随机源：每次调用返回**全新**的、由 `EVAL_SAMPLING_SEED` 播种的 Generator。
+
+    「全新」是复现的前提：同一个 Generator 连抽两次会前进，两次 eval 就会拿到不同的
+    变换向量。调用方想在自己的流上做 A/B 对比时，把 `rng=` 显式传进评估函数即可。
+    """
+    return np.random.default_rng(EVAL_SAMPLING_SEED)
+
+
+@contextmanager
+def _isolated_global_rng():
+    """上下文期间对全局随机流（numpy + torch CPU）的改动在退出时全部还原。
+
+    eval 侧的随机性已经走独立的 `rng`，这里是第二道防线：任何仍会碰到全局随机源的
+    路径（老调用点、将来新增的增强、第三方库内部的 `np.random` 调用）都不会把状态推进
+    出去，训练轨迹因此与「eval 跑过几次」无关。torch 侧同理 —— eval 走
+    `inference_mode` + `model.eval()`，本不该消耗任何 torch 随机，一并存取只为把这条
+    性质钉住（见 `tests/test_eval_determinism.py`）。
+
+    还原放在 `finally`：eval 中途 OOM 抛错也不该顺手改掉训练的随机流。
+    """
+    np_state = np.random.get_state()
+    torch_state = torch.get_rng_state()
+    try:
+        yield
+    finally:
+        np.random.set_state(np_state)
+        torch.set_rng_state(torch_state)
+
+
 def _eval_batch_budget(n_samples, bs, max_batches):
     """验证集批数预算：返回 (n_batches, truncated)。
 
@@ -348,24 +391,29 @@ def _eval_batch_budget(n_samples, bs, max_batches):
 
 
 def evaluate_top1(model, dataset, idxs, bs, device, amp_dtype, max_batches=50,
-                  use_channels_last=False):
+                  use_channels_last=False, rng=None):
     """验证集 top-1 着法准确率。返回 (accuracy, num_samples)。
 
     返回形状按历史契约保持二元组（本函数在 train_sft.py 内当前没有调用点，
     `scripts/train_sft_ms.py` 里的是另一个独立同名函数），故截断信息不进
     返回值、只写日志。`max_batches` 为 None 或 <= 0 时跑满验证集。
+
+    `rng`: 对称增强抽样的随机源。默认 None → 落到 `_eval_rng()`（固定种子
+    `EVAL_SAMPLING_SEED`）而不是全局 np.random，故同一份权重连跑两次的准确率逐位
+    相同；显式传入则用调用方的流（用于故意做 A/B 对比）。
     """
     model.eval()
     correct = 0
     total = 0
     batches = 0
+    eval_rng = _eval_rng() if rng is None else rng
     n_batches, truncated = _eval_batch_budget(len(idxs), bs, max_batches)
-    with torch.no_grad():
+    with _isolated_global_rng(), torch.no_grad():
         for b in range(n_batches):
             sel = idxs[b * bs:(b + 1) * bs]
             if len(sel) == 0:
                 break
-            states_np, moves_np, _ = dataset.sample_batch_numpy(sel)
+            states_np, moves_np, _ = dataset.sample_batch_numpy(sel, rng=eval_rng)
             state = torch.from_numpy(states_np).to(device)
             if use_channels_last:
                 state = state.to(memory_format=torch.channels_last)
@@ -385,7 +433,7 @@ def evaluate_top1(model, dataset, idxs, bs, device, amp_dtype, max_batches=50,
 
 
 def evaluate_metrics(model, dataset, idxs, bs, device, amp_dtype, max_batches=50,
-                     use_channels_last=False):
+                     use_channels_last=False, rng=None):
     """验证集综合指标：top-1/5/10 准确率 + policy KL + value Brier score。
 
     返回 dict:
@@ -399,6 +447,14 @@ def evaluate_metrics(model, dataset, idxs, bs, device, amp_dtype, max_batches=50
         truncated         : 是否因 --eval-max-batches 上限少跑了批（评估覆盖度不足）
 
     后两个键只增信息、不改计算：`max_batches` 为 None 或 <= 0 时跑满验证集。
+
+    `rng`: 对称增强抽样的随机源。默认 None → 落到 `_eval_rng()`（固定种子
+    `EVAL_SAMPLING_SEED`）而不是全局 np.random。默认值即保障：任何调用点（包括将来
+    新写的、忘了传 rng 的）都不可能不小心拿到不确定性 —— 同一份权重 + 同一份 eval_idx
+    连跑两次，八个指标逐位相同。显式传入则用调用方的流（用于故意做 A/B 对比）。
+
+    采样循环整体包在 `_isolated_global_rng()` 里：eval 既不改全局 numpy 状态，也不改
+    torch 状态，故训练侧的随机流与「eval 跑过几次、什么时候跑」无关。
     """
     import torch.nn.functional as F
     model.eval()
@@ -407,13 +463,14 @@ def evaluate_metrics(model, dataset, idxs, bs, device, amp_dtype, max_batches=50
     kl_sum = 0.0
     brier_sum = 0.0
     batches = 0
+    eval_rng = _eval_rng() if rng is None else rng
     n_batches, truncated = _eval_batch_budget(len(idxs), bs, max_batches)
-    with torch.inference_mode():
+    with _isolated_global_rng(), torch.inference_mode():
         for b in range(n_batches):
             sel = idxs[b * bs:(b + 1) * bs]
             if len(sel) == 0:
                 break
-            states_np, moves_np, values_np = dataset.sample_batch_numpy(sel)
+            states_np, moves_np, values_np = dataset.sample_batch_numpy(sel, rng=eval_rng)
             state = torch.from_numpy(states_np).to(device)
             if use_channels_last:
                 state = state.to(memory_format=torch.channels_last)
@@ -1763,10 +1820,10 @@ def main():
                 if is_main:
                     logger.info(
                         "[eval] step=%d top1=%.4f top5=%.4f top10=%.4f "
-                        "kl=%.4f brier=%.4f (n=%d, batches=%d, truncated=%s)%s",
+                        "kl=%.4f brier=%.4f (n=%d, batches=%d, truncated=%s, seed=%d)%s",
                         step, metrics['top1'], metrics['top5'], metrics['top10'],
                         metrics['kl'], metrics['brier'], metrics['n'],
-                        metrics['batches'], metrics['truncated'],
+                        metrics['batches'], metrics['truncated'], EVAL_SAMPLING_SEED,
                         " ★ new best" if metrics['top1'] > best_eval_acc else "")
                     if metrics['truncated']:
                         logger.info(
@@ -1878,10 +1935,11 @@ def main():
         if is_main:
             logger.info(
                 "[eval] FINAL top1=%.4f top5=%.4f top10=%.4f "
-                "kl=%.4f brier=%.4f (n=%d, batches=%d, truncated=%s)",
+                "kl=%.4f brier=%.4f (n=%d, batches=%d, truncated=%s, seed=%d)",
                 final_metrics['top1'], final_metrics['top5'], final_metrics['top10'],
                 final_metrics['kl'], final_metrics['brier'], final_metrics['n'],
-                final_metrics['batches'], final_metrics['truncated'])
+                final_metrics['batches'], final_metrics['truncated'],
+                EVAL_SAMPLING_SEED)
             if final_metrics['truncated']:
                 logger.info(
                     "[eval] 最终评估的验证集被截断：只评估了 %d 批（--eval-max-batches=%s，"
@@ -1896,6 +1954,10 @@ def main():
                         "final_top10": final_metrics['top10'],
                         "final_kl": final_metrics['kl'],
                         "final_brier": final_metrics['brier'],
+                        # 覆盖度可见化（P2.1 遗留）：收尾指标同样只覆盖了验证集的一部分，
+                        # 截断在 swanlab 曲线上不可见就等于没说
+                        "final_batches": final_metrics['batches'],
+                        "final_truncated": final_metrics['truncated'],
                     }, step=total_steps)
                     swanlab_logger.finish()
                     logger.info("[swanlab] 实验跟踪已完成")
