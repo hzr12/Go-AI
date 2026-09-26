@@ -49,6 +49,7 @@ class AsyncDataQueue:
             'consumed': Value('i', 0),
             'errors': Value('i', 0),
         }
+        self.closed = False
     
     def put(self, data: Dict[str, Any]):
         """放入数据（带统计）。"""
@@ -75,6 +76,29 @@ class AsyncDataQueue:
     
     def empty(self) -> bool:
         return self.queue.empty()
+
+    def close(self):
+        """关闭底层 mp 队列，释放管道/信号量句柄。重复调用安全。
+
+        mp.Queue 只在 close()/join_thread()/gc 时才关管道读端与信号量；每轮迭代
+        新建一条流水线却不 close，句柄会随迭代数线性泄漏（长跑训练下表现为
+        句柄耗尽 / 管道 fd 堆积）。
+
+        - 幂等：closed 标志让第二次调用直接返回（stop() 可能被重复触及）；
+        - 底层队列没有 close()（替身/旧实现）时不抛；
+        - 关闭失败只告警不抛：这是收尾路径，不能因为关句柄失败而盖掉真正的
+          失败原因、更不能把 workers 列表留在未清空状态。
+        """
+        if self.closed:
+            return
+        self.closed = True
+        closer = getattr(self.queue, 'close', None)
+        if closer is None:
+            return
+        try:
+            closer()
+        except Exception as e:
+            print(f"[async] 关闭数据队列失败（忽略）: {e}")
 
 
 class SelfPlayWorker(Process):
@@ -281,10 +305,38 @@ class AsyncSelfPlayPipeline:
         print(f"[async] 启动 {n_workers} 个自对弈 Worker")
     
     def stop(self):
-        """停止所有 Worker。"""
+        """停止所有 Worker 并收尾（幂等）。
+
+        收尾三件事，缺一不可：
+        1. `join(timeout=5.0)` 之后仍 `is_alive()` 的是**拖尾 worker** ——
+           `stop_event` 只在每局之间被检查（run() 的 while），正在下长对局的
+           worker 会活过 stop。只 join 就返回等于「打印已停止但进程还在」；
+           它们绝不会再 put，所以 terminate 掉没有数据损失。
+        2. `data_queue.close()` 释放 mp.Queue 的管道/信号量句柄（每轮迭代一条
+           流水线，不关就线性泄漏）。
+        3. 清空 `self.workers`：stop() 可被重复触及（幂等），留着已 join 过的
+           worker 会二次 join；`start()` 也只 append，不清空 —— 复用同一个对象
+           叠加进程是调用方的责任（selfplay 侧靠重建流水线对象规避）。
+        """
+        if not self.workers and self.data_queue.closed:
+            return                      # 已 stop 过（workers 已空 + 队列已关）
+
         self.stop_event.set()
+        stragglers = []
         for w in self.workers:
             w.join(timeout=5.0)
+            if w.is_alive():
+                stragglers.append(w)
+        for w in stragglers:
+            w.terminate()
+            w.join(timeout=5.0)
+
+        survivors = [w for w in stragglers if w.is_alive()]
+        self.data_queue.close()
+        self.workers.clear()
+        if survivors:
+            print(f"[async] 警告：{len(survivors)} 个 Worker 在 terminate() 后仍存活"
+                  f"（pid={[getattr(w, 'pid', '?') for w in survivors]}）")
         print("[async] 所有 Worker 已停止")
     
     def collect_buffer(self, max_samples=None):

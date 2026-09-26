@@ -442,8 +442,44 @@ def _pipeline_has_live_worker(pipeline):
     return any(w.is_alive() for w in pipeline.workers)
 
 
+def _ensure_async_pipeline(holder, args, model_path=None, onnx_model=None):
+    """按需构造并启动异步流水线，挂在 holder._pipeline 上，返回该流水线。
+
+    holder 是持有 `_pipeline` 属性的对象（生产传 main）。`getattr(..., None) is None`
+    才构造 —— 判据是「**本轮迭代还没有活着的流水线**」，不是「这个进程有没有建过」。
+
+    为什么必须能重建：stop() 会置位 `stop_event` 并回收 worker，而
+    `AsyncSelfPlayPipeline.start()` 只往 `self.workers` 里 append（不重置
+    `stop_event`、不清空列表）。所以同一个对象**无法**二次 start()：新 worker
+    一进 run() 的 while 就看到 stop_event 已置位而秒退。因此每轮迭代 stop 之后
+    必须由 `_shutdown_async_pipeline` 把引用置 None，这里在下一轮重新构造。
+    """
+    from scripts.async_pipeline import AsyncSelfPlayPipeline
+
+    pipeline = getattr(holder, '_pipeline', None)
+    if pipeline is None:
+        pipeline = AsyncSelfPlayPipeline(
+            args, model_path=model_path, onnx_model=onnx_model)
+        pipeline.start()
+        holder._pipeline = pipeline
+    return pipeline
+
+
+def _shutdown_async_pipeline(holder):
+    """停止流水线并解挂，使下一轮迭代能重建。无流水线时为空操作。"""
+    pipeline = getattr(holder, '_pipeline', None)
+    if pipeline is None:
+        return
+    try:
+        pipeline.stop()
+    finally:
+        # 解挂是「下一轮重新构建」的前置条件：即使 stop() 自身抛错也必须置
+        # None，否则残留的半死流水线会被下一轮当成「已启动」而复用。
+        holder._pipeline = None
+
+
 def _drain_queue_into_buffer(data_queue, buffer, args, bs, n_actions, max_stall=120,
-                             alive_fn=None):
+                             alive_fn=None, max_wait=1800.0):
     """从异步流水线数据队列收集到 buffer 达标，返回本轮 collected 局数。
 
     AsyncDataQueue.get 超时会自行吞掉 queue.Empty 并返回 None。
@@ -459,29 +495,49 @@ def _drain_queue_into_buffer(data_queue, buffer, args, bs, n_actions, max_stall=
     - alive_fn 为 None 时退化为纯「队列空」预算（仅适合已知无 worker 存活的场景，
       如单测，或调用点在流水线 start() 之前）。真实调用点传
       `_pipeline_has_live_worker`。
+
+    max_wait 是与存活判定**正交**的最后一道兜底（绝对无产出预算，默认 30 分钟）：
+    `SelfPlayWorker.run()` 的 `except Exception` 吞掉一切异常并无限重试
+    （`_play_one_game` 与 MCTS 构造都在该 try 内），所以「每局必失败」的错误
+    （--sims/--dir-alpha 等 MCTS 配置错误、规则层断言、MCTS 内 MemoryError）会让
+    worker 永远 is_alive()、永远不 put —— 此时 stall 恒被重置、上一条判据永远
+    不触发，等待退化成静默无限进行。只要有产出（哪怕很稀疏）就归零重计；
+    超过 max_wait 即抛 RuntimeError，与 worker 是否存活无关。传 None 关闭该上限。
     """
     target = args.batch_size * 20
     collected = 0
     stall = 0
+    silent_since = time.monotonic()
     while len(buffer) < target:
         item = data_queue.get(timeout=0.5)
         if item:
             _process_game_data(item['data'], item['score'], bs, n_actions, buffer, args)
             collected += 1
             stall = 0
+            silent_since = time.monotonic()
             continue
         # 还有活着的 worker → 视为「慢而非死」，重置空轮询预算继续等
         if alive_fn is not None and alive_fn():
             stall = 0
-            continue
-        stall += 1
-        if stall >= max_stall:
+        else:
+            stall += 1
+            if stall >= max_stall:
+                raise RuntimeError(
+                    f"[selfplay] 异步流水线连续 {stall} 次（≈{stall * 0.5:.0f}s）无产出且"
+                    f"无存活 worker，判定已停止：collected={collected} "
+                    f"len(buffer)={len(buffer)} / 目标 {target}（max_stall={max_stall}）。"
+                    f"请检查自对弈 worker 是否崩溃（模型加载失败/OOM/board 断言）"
+                    f"或流水线 stop() 是否已调用。")
+        silent = time.monotonic() - silent_since
+        if max_wait is not None and silent > max_wait:
             raise RuntimeError(
-                f"[selfplay] 异步流水线连续 {stall} 次（≈{stall * 0.5:.0f}s）无产出且"
-                f"无存活 worker，判定已停止：collected={collected} "
-                f"len(buffer)={len(buffer)} / 目标 {target}（max_stall={max_stall}）。"
-                f"请检查自对弈 worker 是否崩溃（模型加载失败/OOM/board 断言）"
-                f"或流水线 stop() 是否已调用。")
+                f"[selfplay] 异步流水线已连续 {silent:.1f}s 一局都没产出"
+                f"（max_wait={max_wait}s）：worker 存活但无产出，判定已卡死 —— "
+                f"collected={collected} len(buffer)={len(buffer)} / 目标 {target}。"
+                f"存活信号可信不代表会出数据：SelfPlayWorker.run() 的 except "
+                f"Exception 会吞掉每局必失败的异常并无限重试（async_pipeline.py），"
+                f"典型成因是 MCTS 配置错误（--sims/--dir-alpha 等）、规则层断言或 "
+                f"MCTS 内 MemoryError。请核对这些参数与 worker 的 stderr。")
     return collected
 
 
@@ -954,25 +1010,23 @@ def main():
         # 检查是否启用异步流水线（块必须在 for it 循环体内逐迭代执行；
         # 旧版此块在循环外只跑一轮且 buffer 不清空，是"共 0 局"的根因之一）
         if args.async_pipeline == 1:
-            from scripts.async_pipeline import AsyncSelfPlayPipeline
             # 异步模式：生成与训练并行（仅主进程驱动流水线；非主进程等待）
             if is_main:
                 print(f"[async] 使用异步流水线模式", flush=True)
 
-                # 启动异步流水线（如果尚未启动）
-                if not hasattr(main, '_pipeline') or main._pipeline is None:
-                    main._pipeline = AsyncSelfPlayPipeline(
-                        args, model_path=args.model, onnx_model=args.onnx_model
-                    )
-                    main._pipeline.start()
+                # 每轮迭代按需（重新）构建流水线：上一轮 stop() 已解挂并置位
+                # stop_event，同一个对象无法二次 start()
+                pipeline = _ensure_async_pipeline(
+                    main, args, model_path=args.model, onnx_model=args.onnx_model)
 
                 # 持续收集数据并训练
                 for _ in range(args.games_per_iter or 10):
                     # 收集数据（无产出 **且** 无存活 worker 连续 max_stall 次 → 报错；
-                    # worker 还活着就继续等，慢启动的 19x19/400 sims 不会被误杀）
+                    # worker 还活着就继续等，慢启动的 19x19/400 sims 不会被误杀；
+                    # 另有绝对无产出上限 max_wait=1800s 兜底「活着却一局都不出」）
                     collected = _drain_queue_into_buffer(
-                        main._pipeline.data_queue, buffer, args, bs, n_actions,
-                        alive_fn=lambda: _pipeline_has_live_worker(main._pipeline))
+                        pipeline.data_queue, buffer, args, bs, n_actions,
+                        alive_fn=lambda: _pipeline_has_live_worker(pipeline))
                     total_games += collected
 
                     if collected > 0 and is_main:
@@ -994,8 +1048,8 @@ def main():
                         # 清空 buffer
                         buffer = []
 
-                # 停止流水线（本轮内停止，下轮迭代重新按需启动）
-                main._pipeline.stop()
+                # 停止流水线并解挂（下轮迭代由 _ensure_async_pipeline 重新构建）
+                _shutdown_async_pipeline(main)
         else:
             # 同步模式：原有逻辑
             if args.parallel_games > 1 and args.ddp == 0:

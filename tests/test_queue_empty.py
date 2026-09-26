@@ -107,6 +107,22 @@ def test_drain_raises_on_stall():
     assert q.polls == 3, '必须在 max_stall 次后停下，不能无止境空转'
 
 
+def test_drain_raises_exactly_at_max_stall_without_alive_fn():
+    """alive_fn=None（旧纯空预算语义）时，恰好第 max_stall 次空轮询就抛错。
+
+    边界锁定：既不早抛（第 2 次就炸会把慢 worker 误判成崩溃）也不晚报
+    （再多等一次就退化成 P1.2 要消灭的静默空转）。
+    """
+    q = _FakeQueue([None] * 50)
+    args = _args(batch_size=1)
+
+    with pytest.raises(RuntimeError) as ei:
+        _drain_queue_into_buffer(q, [], args, 2, 5, max_stall=3, alive_fn=None)
+
+    assert q.polls == 3, f'必须恰好停在 max_stall=3 次，实际 polls={q.polls}'
+    assert '无存活 worker' in str(ei.value)
+
+
 def test_stall_counts_consecutive_polls_only():
     """空轮询累计 4 次但每次都不连续（max_stall=4）→ 不误报。"""
     q = _FakeQueue([None, None,
@@ -221,7 +237,7 @@ def test_real_pipeline_exposes_liveness_signal():
 
     若上游把 workers/stop_event 改名或删掉，存活判定会静默退化成 False，误杀慢启动的训练。
     构造真实流水线（不 start，不起进程）断言容器形状；元素类型由 SelfPlayWorker
-    的 Process 继承关系保证。
+    的 Process 继承关系保证。finally 关闭底层 mp.Queue，不在测试进程留句柄。
     """
     from multiprocessing import Process
     from scripts.async_pipeline import AsyncSelfPlayPipeline, SelfPlayWorker
@@ -231,7 +247,10 @@ def test_real_pipeline_exposes_liveness_signal():
 
     pipeline = AsyncSelfPlayPipeline(
         argparse.Namespace(result_queue_max=4, parallel_games=2))
-    assert isinstance(pipeline.workers, list)
-    assert not pipeline.stop_event.is_set()
-    assert _pipeline_has_live_worker(pipeline) is False, \
-        '未 start() 的流水线没有存活 worker，调用点在 start() 之后才传 alive_fn'
+    try:
+        assert isinstance(pipeline.workers, list)
+        assert not pipeline.stop_event.is_set()
+        assert _pipeline_has_live_worker(pipeline) is False, \
+            '未 start() 的流水线没有存活 worker，调用点在 start() 之后才传 alive_fn'
+    finally:
+        pipeline.data_queue.close()
