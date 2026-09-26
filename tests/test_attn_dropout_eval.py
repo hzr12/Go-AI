@@ -274,13 +274,49 @@ def _sdpa_dropout_arg_values(tree):
     return out
 
 
+def _mhsa_class(tree):
+    """`MultiHeadSelfAttention` 的 ClassDef 节点（按名字定位，不写死行号）。"""
+    return next((n for n in ast.walk(tree)
+                 if isinstance(n, ast.ClassDef) and n.name == 'MultiHeadSelfAttention'),
+                None)
+
+
+def _sparse_attn_inline_gates(tree):
+    """`MultiHeadSelfAttention._sparse_attn` **函数体内**所有 `if` 的判据（源码形式）。
+
+    返回 `None` 表示这个方法找不到了（被挪走或改名）。
+
+    定位必须限定在函数体里，不能用文件级的 `any(...)`：文件级的检查分不清
+    「sparse 这一处内联 `F.dropout` 的闸门在 `_sparse_attn` 里」与「文件里**别的**地方
+    有一处同形的门」。P4.1 要往本文件加新块类，届时同形的门会不止一处 —— 那时文件级
+    `any(...)` 依然为真，却完全证明不了 sparse 那一处被管住了。这条锁要能挡住以后新增的
+    **同类站点**，前提是它锁的是站点而不是文本。
+    """
+    cls = _mhsa_class(tree)
+    if cls is None:
+        return None
+    fn = next((f for f in cls.body
+               if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and f.name == '_sparse_attn'), None)
+    if fn is None:
+        return None
+    return [ast.unparse(n.test) for n in ast.walk(fn) if isinstance(n, ast.If)]
+
+
 def test_all_five_attn_dropout_sites_are_gated():
     """AST 扫描：`_sdpa` 的 4 个 `dropout_p` 全部走 `attn_drop_p`，内联门带 `self.training`。
 
-    4 处 `_sdpa` 调用分别服务 `_global_attn`(:268) / `_window_attn`(:335) /
-    `_window_global_attn`(:472) / `_axial_attn` 的 `attn_1d`(:493)，第 5 处是
-    `_sparse_attn` 里的内联 `F.dropout`（`:395-396`）。缺任何一个，行为用例 1/3 都会红；
-    这条再加一层静态锁，让「漏改」在 review 与 CI 里都直接可见。
+    4 处 `_sdpa` 调用分别服务 `_global_attn`(`backbone.py:286`) / `_window_attn`(`:353`) /
+    `_window_global_attn`(`:490`) / `_axial_attn` 的 `attn_1d`(`:511`)，第 5 处是
+    `_sparse_attn` 里的内联 `F.dropout`（`:413-414`，行号按**修复后**的 backbone.py）。
+    缺任何一个，行为用例 1/3 都会红；这条再加一层静态锁，让「漏改」在 review 与 CI 里
+    都直接可见。
+
+    下面三段查的是**同一个站点的三种失败形态**，缺一不可：
+      ① `_sdpa` 的 `dropout_p` 直接透传 `self.attn_drop`（4 处 `_sdpa` 站点）
+      ② `_sparse_attn` 的函数体里根本没有带 `self.training` 的内联门
+      ③ 该内联门存在，但**不在** `_sparse_attn` 里（被挪到别的函数/别的类）
+    ②③ 都需要站点级的定位，见 `_sparse_attn_inline_gates` 的 docstring。
     """
     src = open(BACKBONE_PY, encoding='utf-8').read()
     tree = ast.parse(src)
@@ -295,23 +331,30 @@ def test_all_five_attn_dropout_sites_are_gated():
         f'应恰好有 4 处 _sdpa 调用取 self.attn_drop_p（global/window/window_global/axial），'
         f'实得 {len(gated)} 处：{_sdpa_dropout_arg_values(tree)}')
 
-    # 第 5 处：_sparse_attn 里的内联门必须带 self.training
+    # 第 5 处：_sparse_attn 里的内联门必须带 self.training，且必须就在 _sparse_attn 里
     bare_gates = [ast.unparse(n.test) for n in ast.walk(tree)
                   if isinstance(n, ast.If) and ast.unparse(n.test) == 'self.attn_drop > 0.0']
     assert not bare_gates, (
         f'仍有不带 self.training 的内联 dropout 门（{bare_gates}）—— sparse 模式的'
         f'注意力 dropout 在 eval 下照旧生效')
-    assert any(ast.unparse(n.test) == 'self.training and self.attn_drop > 0.0'
-               for n in ast.walk(tree) if isinstance(n, ast.If)), \
-        '找不到形如 `if self.training and self.attn_drop > 0.0:` 的内联门 —— ' \
-        'sparse 模式（_sparse_attn 的内联 F.dropout）的 dropout 闸门缺失'
+
+    sparse_gates = _sparse_attn_inline_gates(tree)
+    assert sparse_gates is not None, \
+        ('MultiHeadSelfAttention 上找不到 _sparse_attn 方法 —— 站点被挪走或改了名，'
+         '本文件的站点清单已失效，需重新核对')
+    assert 'self.training and self.attn_drop > 0.0' in sparse_gates, (
+        f'_sparse_attn 的函数体里找不到 `if self.training and self.attn_drop > 0.0:` '
+        f'内联门，实得 {sparse_gates} —— sparse 模式（内联 F.dropout）的 dropout 闸门'
+        f'缺失，或闸门被挪到了别的函数里（文件级同形的门不算数）')
+    assert 'self.attn_drop > 0.0' not in sparse_gates, (
+        f'_sparse_attn 的函数体里还有不带 self.training 的内联门（{sparse_gates}）—— '
+        f'sparse 模式的注意力 dropout 在 eval 下照旧生效')
 
     # attn_drop_p 必须是 property，且带说明「为什么函数式 API 要显式关」
-    prop = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef) and node.name == 'MultiHeadSelfAttention':
-            prop = next((f for f in node.body
-                         if isinstance(f, ast.FunctionDef) and f.name == 'attn_drop_p'), None)
+    cls = _mhsa_class(tree)
+    prop = next((f for f in cls.body
+                 if isinstance(f, ast.FunctionDef) and f.name == 'attn_drop_p'), None) \
+        if cls is not None else None
     assert prop is not None, 'MultiHeadSelfAttention 上没有 attn_drop_p 属性'
     assert any(ast.unparse(d) == 'property' for d in prop.decorator_list), \
         'attn_drop_p 必须是 @property（取值要跟 self.training 走，不能构造期算死）'
