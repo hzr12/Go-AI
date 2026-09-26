@@ -430,7 +430,7 @@ def train_epochs(ai, buffer, args, device):
 
     accum_counter = 0
     for _ in range(args.epochs):
-        opt.zero_grad()  # 每轮开始清零（原先每 batch 清零，会丢弃首 batch 梯度）
+        opt.zero_grad()  # 每轮开始兜底清零（正常路径 step 后已清，防外部残留）
         for _ in range(steps_per_epoch * accum):
             idx = np.random.randint(0, n, size=min(args.batch_size, n))
             batch = [buffer[i] for i in idx]
@@ -493,6 +493,7 @@ def train_epochs(ai, buffer, args, device):
                 if args.clip_grad > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                 opt.step()
+            opt.zero_grad()  # 每次 step 后立即清零，防止跨 step 陈旧梯度叠加污染
             scheduler.step()
             if ema is not None:
                 ema.update()
