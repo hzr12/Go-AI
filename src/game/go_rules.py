@@ -14,17 +14,19 @@
   - pass（连续两次 pass 终局）
   - 中国规则计分：数子法（区域计分）+ 贴目 7.5
     （计分算法与 Tromp-Taylor 等价：空点归最近同色连通块；差异见 score() 注释）
-  - 位置超级劫（PSK）的**基础设施**：确定性 Zobrist 哈希 + 重复局面历史。
+  - 位置超级劫（PSK）：确定性 Zobrist 哈希 + 重复局面历史，**并已接入合法性**。
     重复判定的键是 **position-only**（`position_hash()`，只含棋盘染色）——
     Tromp-Taylor / OpenSpiel 口径；`hash()` 是含行棋方的通用局面指纹，**不用于**
     重复判定（见「Zobrist 哈希与重复局面」段与 position_hash 的 docstring）
 未实现（监督学习不需要）：积攒劫、多劫循环判定、终局死子人工判定。
 
-⚠ PSK 状态机已就位，但**尚未接入合法性**：superko 重复棋当前仍可落子
-（get_legal_moves() 与 play() 的判定逻辑未动）。接入由 v21 路线图 P2.6a-2b 负责；
-`tests/test_go_hash.py::test_repetition_not_yet_wired_into_legality` 锁住了这一点。
-⚠ 重复**不是终局条件**：Tromp-Taylor 规则 6/8 下重复是非法手，终局是两次连续 pass
-（`is_terminal()` 的语义，见其 docstring）。
+⚠ 合法性判定**收敛在 `get_legal_moves()` 一处**（P2.6a-2b-1 起四条全在那里判：
+空点 / 禁自杀 / 简单劫 / PSK）。两点必须记住：
+  - 重复**不是终局条件**：Tromp-Taylor 规则 6/8 下重复是**非法手**，终局是两次连续
+    pass（`is_terminal()` 的语义，见其 docstring）。
+  - `play()` 只做**结构性**检查（占点 / 简单劫 / 自杀），**不查 PSK**。所以绕过
+    get_legal_moves() 直接调 `play()` 仍能落下一个超级劫着法 —— 掩码是合法点集合的
+    **唯一**真相源，消费者必须从它取候选（动作空间 API 见 P2.6a-2b-2）。
 """
 
 import hashlib
@@ -113,8 +115,53 @@ def _zobrist_key(r: int, c: int, color: int) -> int:
     return _ZOBRIST_TABLE[2 * (r * _ZOBRIST_STRIDE + c) + (0 if color > 0 else 1)]
 
 
+# 4 邻域偏移（模块级常量，避免在逐候选的热循环里每次重建元组）。
+# 与 _neighbor_groups / _group_has_liberty / _group_liberty_count 里的内联写法同义。
+_NB4 = ((-1, 0), (1, 0), (0, -1), (0, 1))
+
+
 class GoBoard:
-    """围棋棋盘。内部棋盘取值：-1=白, 0=空, 1=黑。"""
+    """围棋棋盘。内部棋盘取值：-1=白, 0=空, 1=黑。
+
+    ---- 局面状态字段的读写契约 ----
+    `board` / `current_player` 是**真相源**（也是「外部盘面接管」的唯一入口：
+    改写它们之后必须让 `_ensure_hash()` 或 `resync_hash()` 跑一次）。
+    `ko_point` 是**只读派生量**，见下面的专门说明。
+    `passes` / `move_number` / `move_history` / `_undo_stack` 是**对局进度**，
+    由 `play()` / `undo()` / `_adopt_as_new_game()` 维护，消费者只读
+    （只读别名：`to_play` / `num_passes`）。
+
+    ---- `ko_point`：只读派生量，**不参与合法性判罚** ----
+    语义只剩一句话：「**上一手是否形成了简单劫**」——若上一手恰好提掉一颗子、且落下的
+    这颗子自身只剩 1 口气（正好是被提点），`ko_point` 记下那颗被提子的扁平坐标，
+    否则为 -1。它由 `play()` 写、`undo()` 回退，**任何消费者都只该拿它当信息位读**
+    （`feature_planes_batched` 的 ko 通道就是这种读法）。
+
+    为什么不参与判罚（P2.6a-2b-1，v21 路线图 D14）：**位置超级劫覆盖了经典的单子劫**。
+    单子劫的回提会把染色复现成「上一手之前」那个局面，而那个染色的 position 键必然
+    记在 PSK 历史里，所以 `get_legal_moves()` 的 PSK 判定会独立地把它禁掉 ——
+    两条判罚叠加没有增量信息，却让「合法性由谁裁决」这件事多了一个真相源。
+    实测后果：掩码里 `ko_point` 置 -1 与不置，掩码**逐位相同**
+    （`tests/test_go_rules_legality.py::test_ko_point_does_not_affect_legality`）。
+    ⚠ 但「PSK 覆盖简单劫」这句话**只对单子劫成立**：`play()` 的成劫判据并不要求
+    落子后那块是单子，多子提子形成的劫其回提不复现染色，PSK 判不出来。下面列出
+    两处由此产生的已知分歧。
+
+    ⚠ **两处已知的掩码 / TT 分歧**（P2.6a-2b-1 引入，刻意不在本段修，见该任务报告）：
+    Tromp-Taylor 规则 6 是**两句**：「禁劫争」+「禁重复棋」。本引擎把后一句做进了掩码
+    （PSK），前一句仍留在 `play()` 里，于是有两种棋会出现「掩码放行、play() 拒绝」：
+      (1) **多子提子形成的劫**（`play()` 的成劫判据是「恰好提 1 子 **且** 落子后己方块
+          总气 == 1」，**没有**要求那块是单子）。若那块有 2 颗以上，回提会一次提掉
+          整块，落子后的染色与「提子之前」那个染色**不同** -> 不是 PSK 重复，掩码看不出来，
+          而规则 6 前半句仍然禁它。实测 9 路随机自对弈里约 **1.2%** 的取点会撞上这一条。
+          （经典单子劫不受影响：回提恰好复现提子前的染色，PSK 独立禁掉，实测
+          `test_simple_ko_is_illegal_immediately` / `test_ko_point_does_not_affect_legality`。）
+      (2) **外部盘面接管**（`_ensure_hash()` 触发 `_adopt_as_new_game()`）之后：历史被
+          重建成 {当前局面}，劫争之前那个染色不在历史里，PSK 同样判不出。
+    要在掩码层补齐 (1)，唯一的办法是把「上一手是否成劫」这个信息带进掩码 —— 那正是
+    `ko_point` 字段，而 P2.6a-2b-1 明确要求把它从判罚里摘掉。收口位置见 P2.6a-2b-2 的
+    `is_legal()`（动作空间层有「上一手」这一层语义，适合把两条规则并列表达）。
+    """
 
     def __init__(self, board_size: int = 19, komi: float = 7.5):
         if board_size > _ZOBRIST_STRIDE:
@@ -131,7 +178,9 @@ class GoBoard:
         n = self.board_size
         self.board = np.zeros((n, n), dtype=np.int8)
         self.current_player = 1  # 1=黑, -1=白
-        self.ko_point = -1       # 打劫禁着点（扁平坐标），-1 表示无
+        # 「上一手是否形成简单劫」的只读派生量，**不参与合法性判罚**（PSK 已覆盖），
+        # 详见类 docstring 的专门段落。
+        self.ko_point = -1       # 上一手形成的简单劫：被提子的扁平坐标，-1 表示无
         # 其余全部字段（对局进度 + 哈希 + 重复局面历史）由 _adopt_as_new_game()
         # 统一重建 —— 「新的一局」在 GoBoard 里只有这一处实现，reset 与外部盘面接管
         # 共用它，两条路径不可能长歪。
@@ -159,7 +208,6 @@ class GoBoard:
         nb.move_history = []
         nb._undo_stack = []
         nb._legal_cache = None
-        nb._legal_cache_suicide = None
         nb._zobrist = self._zobrist
         nb._pos_zobrist = self._pos_zobrist
         # 哈希所对应的盘面对象 = 克隆体**自己**的 board 数组（否则 hash() 会把它
@@ -178,45 +226,123 @@ class GoBoard:
     def is_on_board(self, r, c):
         return 0 <= r < self.board_size and 0 <= c < self.board_size
 
-    def get_legal_moves(self, check_suicide: bool = False) -> np.ndarray:
-        """返回长度为 size*size 的 bool 掩码，True 表示该点可落子。
+    def get_legal_moves(self) -> np.ndarray:
+        """返回长度为 size*size 的 bool 掩码，True 表示该点可落子（Tromp-Taylor 口径）。
 
-        check_suicide=True 时额外过滤自杀手（需模拟落子，较慢但更准确）。
-        结果会被缓存，直到下次 play()/undo()/reset() 时失效。
+        **合法性判定唯一的真相源**。判三条（`ko_point` 不再单独判罚，见类 docstring）：
+
+          1. **空点**；
+          2. **禁自杀**：落子后己方连通块（落点 + 邻接同色块合并）总气 ≥ 1，
+             **或者**该手提掉了敌子。**绝不原地改 `self.board` 做模拟** ——
+             判定只用邻接棋块的气数，见下面「自杀判定的等价变形」；
+          3. **位置超级劫（PSK）**：落子后的染色若命中历史集合则非法。
+
+        **顺序：先禁自杀，再判 PSK。** 这是正确性要求而不是性能偏好：
+        `position_hash_after_move()` 内部会**临时写 `self.board[r, c]`** 来推演提子，
+        所以绝不能在「盘上已经放了子」的状态里调它。自杀点压根没有「落子后的染色」，
+        对它算候选键也没有意义。
+
+        ⚠ **本掩码不等于完整的 Tromp-Taylor 合法性集合**：规则 6 是两句，本方法只做了
+        后一句（PSK）。前一句「禁劫争」仍留在 `play()` 里，所以「多子提子形成的劫」的
+        立即回提会**被本掩码放行**（回提一次提掉整块，染色不复现，PSK 判不出），而
+        `play()` 拒绝它。实测 9 路随机自对弈约 1.2% 的取点撞上这一条。详见类 docstring
+        的「两处已知的掩码 / TT 分歧」段与 P2.6a-2b-1 报告。
+
+        ---- 自杀判定的等价变形（不写盘） ----
+        落点 (r, c) 落子**前**是空点，因此它**必然**落在每个相邻块的气里。据此：
+          - 邻接**敌**块气数 == 1  ⟹ 它的气全被落点占掉 ⟹ 该手**提子** ⟹ 合法
+            （提子后落点旁边必然空出被提子的位置，落子方有气）；
+          - 邻接**同色**块气数 ≥ 2  ⟹ 除落点外还有别的气 ⟹ 合并后己方有气 ⟹ 合法；
+          - 落点有**空的**正交邻点 ⟹ 落子方有气 ⟹ 合法；
+          - 三条都不成立 ⟹ 落子后己方块无气且未提子 ⟹ **自杀，非法**。
+        「气数 ≥ 2」而不是「有气」是关键：同色邻块那唯一的一口气**就是落点本身**，
+        落上去等于自己把那口气堵死。只判「有气」会把这类点错放成合法。
+
+        ---- PSK 的两段式（掩码被 MCTS 与自对弈每手调用，必须压成本） ----
+          1. 廉价判据：该候选是否**提子**（上面已经算出来了，不额外花钱）；
+          2. **不提子**的候选走**纯算术**：候选染色 = 落点从「空」变「己方子」，
+             不提子就没有别的染色变化，而 position 键只含棋盘染色（连行棋方翻转都
+             不影响），所以 `position_hash() ^ _zobrist_key(r, c, color)` 就是候选键 ——
+             **O(1)，不动棋盘**；
+          3. **提子**的候选才走 `position_hash_after_move(mv)` 的完整推演（数量极少）；
+          4. 命中历史 → 该点置 False。
+        ⚠ **不许**用「只有提子才可能违反 PSK」这种剪枝：提子与否与「是否复现历史染色」
+        无关，P2.6a-1 已给出理论反例，至今未被证明或推翻。
+        ⚠ 候选键必须是 **position-only** 口径。喂 `hash_after_move(mv)`（含行棋方 =
+        SSK）会**静默**查不中历史，表现为「超级劫手被判合法」。
+
+        ---- pass ----
+        **本掩码没有 PASS 槽**（长度恒为 n*n），所以 pass 天然不进入 PSK 判定 ——
+        这就是 Tromp-Taylor 规则 6「禁的是重复棋、不是 pass」在这一层的落法，也正是
+        简报要求「不要在这里写 `if mv == -1: continue`」的原因：那在长度 n*n 的掩码里
+        是死代码。动作空间层（`legal_actions()` / MCTS 的候选表）要把 PASS 作为**永远
+        合法**的动作显式加进去（见 P2.6a-2b-2）。
+
+        ---- 状态变更收口 ----
+        入口先 `_ensure_hash()`：本方法是它的**首个调用者**，而它可能触发
+        `_adopt_as_new_game()` —— 那是一次状态变更（重置 `move_number` / `passes` /
+        `_undo_stack` 并失效缓存）。本方法被文档描述为只读且带缓存，绝不能在扫描中途
+        发生这种变更，所以把它收在入口：扫描过程**只**写 `_legal_cache`。
+
+        结果缓存在 `_legal_cache`，由 `play()` / `undo()` / `reset()` /
+        `_adopt_as_new_game()` 失效。
         """
-        if not check_suicide and self._legal_cache is not None:
+        if self._legal_cache is not None:
             return self._legal_cache
-        if check_suicide and self._legal_cache_suicide is not None:
-            return self._legal_cache_suicide
+
+        # 入口收口：可能触发 _adopt_as_new_game()（状态变更），必须在扫描开始前发生。
+        self._ensure_hash()
 
         n = self.board_size
-        legal = (self.board == 0).reshape(-1).copy()
-        if self.ko_point >= 0:
-            legal[self.ko_point] = False
-        if check_suicide:
-            color = self.current_player
-            for i in range(n * n):
-                if not legal[i]:
-                    continue
+        color = self.current_player
+        legal = (self.board == 0).reshape(-1)
+        if legal.any():
+            # 读路径用 **Python int 列表快照**，不用 numpy 数组：逐候选 4 邻域扫描里
+            # `board[nr, nc] == 0` 会造 numpy 标量再取 __bool__，实测 19 路空盘一次
+            # 掩码 2.53 ms → 0.26 ms（10x），而 tolist() 本身只要 0.003 ms。
+            # 掩码是热路径（MCTS 每个展开节点、自对弈每手都要），这个便宜必须占。
+            # 快照与 numpy 数组在本方法内**始终一致**：扫描过程不写盘，而
+            # position_hash_after_move() 的临时落子会立刻还原（它读的是 self.board）。
+            board = self.board.tolist()
+            # 局部绑定：热循环里逐候选调用，属性查找与 _ensure_hash 的重复调用都省掉。
+            # PSK 历史集合与 position 键在整轮扫描里不变（扫描不写盘、不换行棋方），
+            # 所以 `cand in counts` 与 `_would_repeat(cand)` **完全等价**。
+            counts = self._pos_hash_counts
+            pos_key = self._pos_zobrist
+            has_lib_ex = self._group_has_liberty_excluding
+            zkey = _zobrist_key
+
+            for i in np.flatnonzero(legal).tolist():
                 r, c = divmod(i, n)
-                # 模拟落子检查是否为自杀
-                self.board[r, c] = color
-                has_liberty = self._group_has_liberty(r, c)
-                # 检查是否提掉对手子（非自杀）
-                if not has_liberty:
-                    opponent = -color
-                    for nb_r, nb_c in ((r-1,c),(r+1,c),(r,c-1),(r,c+1)):
-                        if self.is_on_board(nb_r, nb_c) and self.board[nb_r, nb_c] == opponent:
-                            if not self._group_has_liberty(nb_r, nb_c):
-                                has_liberty = True
-                                break
-                self.board[r, c] = 0
-                if not has_liberty:
+                # ---- 2. 禁自杀 + 提子判据：一次邻域扫描同时得到两件事 ----
+                capture = False
+                liberty = False
+                for dr, dc in _NB4:
+                    nr = r + dr
+                    nc = c + dc
+                    if nr < 0 or nr >= n or nc < 0 or nc >= n:
+                        continue
+                    v = board[nr][nc]
+                    if v == 0:
+                        liberty = True                  # 落点自身的气
+                    elif v == color:
+                        if has_lib_ex(board, nr, nc, r, c):   # 同色邻块除落点外还有气
+                            liberty = True
+                    elif not has_lib_ex(board, nr, nc, r, c):  # 敌块的气全被落点占掉
+                        capture = True                  # -> 提子
+                if not capture and not liberty:
                     legal[i] = False
-        if not check_suicide:
-            self._legal_cache = legal.copy()
-        else:
-            self._legal_cache_suicide = legal.copy()
+                    continue
+
+                # ---- 3. PSK（两段式；必须在自杀判定之后，见本方法 docstring）----
+                if capture:
+                    cand = self.position_hash_after_move(i)
+                else:
+                    cand = pos_key ^ zkey(r, c, color)
+                if cand in counts:
+                    legal[i] = False
+
+        self._legal_cache = legal.copy()
         return legal
 
     # ---- 连通块 / 气 -------------------------------------------------------
@@ -270,6 +396,48 @@ class GoBoard:
                 if v == 0:
                     return True
                 if v == color and (nr, nc) not in seen:
+                    seen.add((nr, nc))
+                    stack.append((nr, nc))
+        return False
+
+    def _group_has_liberty_excluding(self, board, seed_r, seed_c, ex_r, ex_c) -> bool:
+        """判断 board 上 (seed_r, seed_c) 所在同色连通块是否还有**除 (ex_r, ex_c) 以外**的气。
+
+        只服务 `get_legal_moves()` 的禁自杀判定。落点 (ex_r, ex_c) 落子**前**是空点，
+        所以它必然落在每个相邻块的气里；「这个块除落点外还有没有别的气」于是同时
+        回答两个问题（详见 get_legal_moves 的 docstring）：
+          - 己方邻块：除落点外还有气 ⟹ 落子合并后己方有气 ⟹ 非自杀；
+          - 敌块：除落点外**没有**气 ⟹ 落子把它提掉 ⟹ 非自杀（提子后落点旁必空）。
+
+        为什么**不**用 `_group_liberty_count` 判（那个也能答，判据是 >=2 / ==1）：
+        气数必须数**完**所有气，没有早退；而这里要的正是「有没有」这一个布尔。
+        实测差别很大：19 路中盘一次掩码 26.6 ms → 6.1 ms（早退把「大气块」压成 O(1)）。
+        掩码被 MCTS 与自对弈每手调用，这个差别是决定性的。
+
+        `board` 是**读快照**（`GoBoard.get_legal_moves` 传的是 `self.board.tolist()`，
+        逐格读比 numpy 标量快约 10x）。本方法只读它、不写；传 numpy 数组也能工作
+        （`board[nr][nc]` 对两者都成立）。
+
+        早退语义与 `_group_has_liberty` 一致：找到第一个「非落点」的气就返回 True。
+        前提：(ex_r, ex_c) 在 board 上**必须仍是空点** —— 本方法只读棋盘、不落子，
+        所以从 `get_legal_moves()` 调用时天然满足；绝不能在已落子的盘面上调它。
+        """
+        n = self.board_size
+        color = board[seed_r][seed_c]
+        stack = [(seed_r, seed_c)]
+        seen = {(seed_r, seed_c)}
+        while stack:
+            r, c = stack.pop()
+            for dr, dc in _NB4:
+                nr = r + dr
+                nc = c + dc
+                if nr < 0 or nr >= n or nc < 0 or nc >= n:
+                    continue
+                v = board[nr][nc]
+                if v == 0:
+                    if nr != ex_r or nc != ex_c:
+                        return True
+                elif v == color and (nr, nc) not in seen:
                     seen.add((nr, nc))
                     stack.append((nr, nc))
         return False
@@ -381,13 +549,16 @@ class GoBoard:
           _undo_stack = []  撤销栈，每项 (move, captured|None, prev_ko, prev_passes,
                             prev_player)。必须一起清：栈里存的是上一局的着法，撤销它会把
                             上一局的子恢复到新盘上，并且回滚时会把刚重建的历史弹空。
-          _legal_cache / _legal_cache_suicide = None
-                            盘面可能被换过，缓存的掩码属于旧盘面。
+          _legal_cache = None    盘面可能被换过，缓存的掩码属于旧盘面。
         保留（**局面描述**，调用方写了什么就是什么）：
           board、current_player、**ko_point**。ko_point 是「盘面 + 上一手」的性质而不是
-          对局进度：Tromp-Taylor 规则 6 的 PSK 只看盘面涂色，而简单劫是它「只禁紧邻上一手
-          之前那个局面」这一条更弱的限制，所以从该局面开新局时劫禁着照样成立。
-          light_rollout 显式拷贝 ko_point 要的就是这个语义，不能在这里清掉。
+          对局进度：它是「上一手是否形成简单劫」的信息位（见类 docstring），从该局面
+          开新局时「上一手形成了简单劫」这件事照样成立，所以不能在这里清掉 ——
+          light_rollout 显式拷贝 ko_point 要的就是这个语义。
+          ⚠ 但要注意：历史被重建成 {当前局面} 之后，**劫争之前那个染色不在历史里**，
+          PSK 判不出劫禁着点 —— 于是「掩码放行 + play() 拒绝」在劫禁着点上短暂分叉。
+          这是「绝不伪造父局历史」这条取舍的已知代价（宁可漏判重复），正常对局下
+          两者永远一致。
         重建：按盘面重算**两套**键，历史 = {当前染色的 position 键}（**绝不伪造父局历史**）。
         """
         self.passes = 0
@@ -395,7 +566,6 @@ class GoBoard:
         self.move_history = []
         self._undo_stack = []
         self._legal_cache = None
-        self._legal_cache_suicide = None
         self._zobrist = self._hash_from_board()
         self._pos_zobrist = self._position_hash_from_board()
         self._zobrist_ref = self.board
@@ -408,8 +578,12 @@ class GoBoard:
 
         入口（与本 docstring 保持一致）：`play()` / `undo()` / `hash()` /
         `position_hash()` / `hash_after_move()` / `position_hash_after_move()` /
-        `is_repetition()` / `_would_repeat()` 全部先调它。
-        `get_legal_moves()` 不调（它不碰哈希）。
+        `is_repetition()` / `_would_repeat()` / `get_legal_moves()` 全部先调它。
+
+        `get_legal_moves()` 自 P2.6a-2b-1 起也是入口（它要查 PSK 历史）。它虽然是
+        「只读且带缓存」的方法，但**必须**把本调用放在函数入口而不是扫描中途：本方法
+        可能触发 `_adopt_as_new_game()`，那是一次状态变更（重置 `move_number` /
+        `passes` / `_undo_stack` 并失效缓存），绝不能发生在一次掩码扫描的中间。
 
         两种脱钩的处置**完全相同**，都走 `_adopt_as_new_game()`（契约见其 docstring）：
           - board **数组对象**被整体换掉（如 light_rollout 的只读推演逐字段赋值）；
@@ -519,17 +693,26 @@ class GoBoard:
     def position_hash_after_move(self, move: int) -> int:
         """只读推演：若现在下 move（-1 = pass），落子后**position 键**（仅染色）。
 
-        **P2.6a-2b 接线合法性时用本方法**算候选键：
+        **算 PSK 候选键只能用本方法**：
             `board._would_repeat(board.position_hash_after_move(mv))`
-        不可改用 `hash_after_move(mv)`（那是含行棋方的通用指纹 = SSK）。
+        不可改用 `hash_after_move(mv)`（那是含行棋方的通用指纹 = SSK；喂进去会
+        **静默**查不中历史，表现为「超级劫手被判合法」）。
 
         move == -1（pass）返回**当前**键：pass 不改变染色，因此「pass 之后的染色」
-        必然已经在历史里，谓词会返回真。**接线时必须把 pass 排除在 PSK 判定之外**
+        必然已经在历史里，谓词会返回真。**调用方必须把 pass 排除在 PSK 判定之外**
         （Tromp-Taylor 规则 6 禁的是重复棋，不是 pass；终局由两次连续 pass 表达），
         否则任何 pass 都会被误判非法。
+        ✅ 已落位（P2.6a-2b-1）：`get_legal_moves()` 返回的掩码长度恒为 n*n、**没有
+        PASS 槽**，所以 pass 天然不进 PSK 判定 —— 豁免就靠「掩码里没有这一格」实现。
+        动作空间层（P2.6a-2b-2 的 `legal_actions()`、MCTS 的 `+ [n_actions - 1]`
+        候选表）负责把 PASS 作为**永远合法**的动作显式加回去。
+        ⚠ 不要为了「表达豁免」在 `get_legal_moves()` 里加 `if mv == -1: continue`
+        —— 那个循环遍历的是 n*n 个点，`mv` 永远取不到 -1，是死代码。
 
         只对合法着法有定义；占点 / 劫禁着等非法落子语义未定义，调用方须先过合法性检查。
-        内部会临时落子以判定提子并立即还原，故与 play() 一样不可重入。
+        内部会临时落子以判定提子并立即还原，故与 play() 一样不可重入：
+        **绝不能在 `self.board[r, c]` 已经放了子的时候调它**（`get_legal_moves()`
+        的「先禁自杀、再判 PSK」顺序就是为了这条，见该方法 docstring）。
         """
         self._ensure_hash()
         return self._pos_zobrist ^ self._forecast_delta(move)
@@ -546,6 +729,10 @@ class GoBoard:
 
         同样先过 `_ensure_hash()`：历史若属于另一个盘面，命中判定就毫无意义
         （O(1) 恒等比较，不在热路径上）。
+
+        `get_legal_moves()` 在热路径上**不调本方法**，而是直接查 `_pos_hash_counts`
+        —— 那里已经在函数入口调过一次 `_ensure_hash()`，且扫描过程不写盘、不换行棋方，
+        所以两种写法完全等价。改那段代码时别把这个前提弄丢。
         """
         self._ensure_hash()
         return candidate_pos_key in self._pos_hash_counts
@@ -642,6 +829,14 @@ class GoBoard:
         record=True（默认）时把撤销信息压入 _undo_stack，可用 undo() 撤销
         本次落子（含提子恢复 / 劫点 / pass 计数 / 历史 / 执子方 / 两套 Zobrist 键
         （通用指纹 + 重复判定用的 position 键）/ 重复局面历史 / 落子数）。
+
+        ⚠ **本方法只做结构性检查，不查 PSK**（P2.6a-2b-1 起）：
+        它拒的是「占点」「简单劫（`move == self.ko_point`，Tromp-Taylor 规则 6 前半句）」
+        「自杀」。**超级劫（PSK）只在 `get_legal_moves()` 里判**，所以绕过掩码直接调
+        `play()` 仍能落下一个会造成局面重复的棋 —— 那是刻意的分工：掩码是合法点集合的
+        唯一真相源，而把 PSK 塞进 `play()` 需要在每手落子时多做一次历史查询（rollout
+        与 MCTS 叶子都要走这条路）。所有消费者都从掩码取候选，因此不构成漏洞；
+        动作空间 API（P2.6a-2b-2 的 `is_legal()`）是把这条契约收口的地方。
         """
         n = self.board_size
         self._ensure_hash()
@@ -656,7 +851,6 @@ class GoBoard:
             self._commit_position(self.current_player, -1, None)
             self.current_player = -self.current_player
             self._legal_cache = None
-            self._legal_cache_suicide = None
             return True
 
         if move < 0 or move >= n * n:
@@ -706,7 +900,6 @@ class GoBoard:
         self._commit_position(color, move, captured)
         self.current_player = -self.current_player
         self._legal_cache = None
-        self._legal_cache_suicide = None
         return True
 
     def undo(self) -> bool:
@@ -740,7 +933,6 @@ class GoBoard:
         self.current_player = player
         self._rollback_position(player, move, captured)
         self._legal_cache = None
-        self._legal_cache_suicide = None
         return True
 
     # ---- 终局与计分 --------------------------------------------------------
@@ -749,7 +941,7 @@ class GoBoard:
         """终局判定：连续两次 pass（对局认输），或达到 move 上限。
 
         ⚠ **重复局面不是终局条件**：Tromp-Taylor 规则 6/8 下「重复」是**非法手**
-        （PSK 由 _would_repeat 判，接线在 P2.6a-2b），终局只由两次连续 pass 表达。
+        （PSK 已于 P2.6a-2b-1 接入 `get_legal_moves()`），终局只由两次连续 pass 表达。
         本方法不查重复历史，不要在这里加。
 
         max_moves 为 None 时取 2 * board_size ** 2 —— 沿用仓库既有约定
@@ -878,7 +1070,9 @@ class GoBoard:
     #   1..3   : 己方前 1/2/3 手落子
     #   4      : 对手棋子
     #   5..7   : 对手前 1/2/3 手落子
-    #   8      : 合法点掩码（含劫禁着点已排除）
+    #   8      : 合法点掩码（= get_legal_moves()：空点 ∧ 非自杀 ∧ 非 PSK 重复。
+    #             P2.6a-2b-1 起**取值变严** —— 通道序号与含义不变，只是这一格更严；
+    #             它仍然只有 n*n 个点、**不含 PASS**）
     #   9      : 执子方常数（to_play，±1）
     #   10     : 己方气数=1 的块掩码
     #   11     : 对手气数=1 的块掩码
@@ -936,7 +1130,7 @@ class GoBoard:
 
     @staticmethod
     def feature_planes_batched(boards, my_hist, op_hist, to_play, ko=None):
-        """向量化批量版 feature_planes，语义与单图 feature_planes 完全一致。
+        """向量化批量版 feature_planes，**通道 8 除外**（见下）。
 
         输入:
             boards   : (B, n, n) int8，取值 -1/0/1
@@ -945,6 +1139,14 @@ class GoBoard:
             to_play  : (B,) int8，轮到谁落子（1 黑 / -1 白）
             ko       : (B,) int16，劫禁着点扁平坐标（-1 无）；可选，用于通道 8 排除
         返回: (B, 12, n, n) float32
+
+        ⚠ **通道 8 与单图版不再等价（P2.6a-2b-1 起，已知分歧，非回归）**：
+        本方法只拿到裸 `boards` 数组，**没有 GoBoard、因而没有重复局面历史**，
+        所以它算不出 PSK，也就没法做禁自杀判定；这里仍然只做「空点 ∧ 排除 ko」。
+        单图 `feature_planes()` 的通道 8 走 `get_legal_moves()`，取值**更严**。
+        这个分歧在本任务之前就已存在（单图版在 `check_suicide=False` 默认下同样不查
+        自杀），本任务只是把它拉大。收口需要把重复局面历史一起批量喂进来
+        （P2.6b 的下游语义同步 / P4.3 的 17 通道），不要在这里假装两者一致。
 
         性能: 用 scipy.ndimage.label 一次性标注连通块并向量化计算气数，
             scipy 释放 GIL，两个颜色的标注线程可真正并行。
@@ -978,7 +1180,9 @@ class GoBoard:
                 # 【修复】使用对齐后的索引进行赋值
                 planes[b_idx, ch_base + c_idx, r, c] = 1.0
 
-        # 通道 8: 合法点掩码（空点，劫禁着点排除）—— 与单图 get_legal_moves 一致
+        # 通道 8: 合法点掩码（空点，ko 点排除）。⚠ **与单图 get_legal_moves() 不等价**：
+        # 这里没有重复局面历史，算不出 PSK，也就没做禁自杀判定（见本方法 docstring
+        # 的「通道 8 除外」段）。P2.6a-2b-1 之后单图版更严，两者的分歧被本任务拉大。
         legal = (boards == 0).astype(np.float32)
         if ko is not None:
             ko = np.asarray(ko).reshape(B)

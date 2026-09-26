@@ -14,9 +14,11 @@ GoBoard Zobrist 哈希 / 重复局面（PSK 地基）测试。
      而通用指纹 hash() 含行棋方、**不用于**重复判定（§9）
 
 另锁两条本任务的生命周期契约:
-  - 外部盘面接管（整体替换 board 数组、或只改写 current_player）= **以此局面为新局**：
+  - 外部盘面接管（整体替换 board 数组、或只改写 current_player）= **以此局面为新局**:
     对局进度归零、重复局面历史重建为 {当前局面}、ko_point 作为局面描述保留
-  - 重复局面尚未接入 get_legal_moves()（P2.6a-2b 才接），本任务行为零变化
+  - 重复局面**已**接入 get_legal_moves()（P2.6a-2b-1 接入）:
+    `test_repetition_is_wired_into_legality` 锁住「超级劫手被判非法」，
+    掩码其余三条判定的覆盖在 `tests/test_go_rules_legality.py`
 """
 import os
 import re
@@ -351,7 +353,7 @@ def test_hash_after_move_matches_actual_play():
     b = _fresh()
     rng = np.random.default_rng(2)
     for _ in range(10):
-        legal = np.flatnonzero(b.get_legal_moves(check_suicide=True))
+        legal = np.flatnonzero(b.get_legal_moves())
         b.play(int(rng.choice(legal)))
 
     before = b.board.copy()
@@ -383,19 +385,30 @@ def test_hash_after_move_matches_actual_play():
     assert b.position_hash() == p
 
 
-def test_repetition_not_yet_wired_into_legality():
-    """本任务范围锁：重复局面尚未接入 get_legal_moves()（P2.6a-2b 才接）。
+def test_repetition_is_wired_into_legality():
+    """PSK 已接入 `get_legal_moves()`：那手造成真重复的棋现在**非法**。
 
-    现在那手 superko 重复棋仍然可落 —— P2.6a-2b 会把本断言翻转。
+    本断言在 P2.6a-2a 的原形态是 `test_repetition_not_yet_wired_into_legality`
+    （「本任务不得改变落子合法性」），由 P2.6a-2b-1 接线时翻转。
+
+    覆盖面分工：本文件测**重复判定与掩码的关系**（这里）；掩码本身的四条判定
+    （禁自杀 / 简单劫 / 眼位 / 成本）由 `tests/test_go_rules_legality.py` 负责。
     """
     b = _triple_ko_board()
     for who, mv in _TRIPLE_KO_SEQUENCE[:-1]:
         assert b.current_player == who
+        assert b.get_legal_moves()[mv], f"第 {mv} 手在闭合成手之前必须合法"
         assert b.play(mv) is True
     who, last = _TRIPLE_KO_SEQUENCE[-1]
     assert b._would_repeat(b.position_hash_after_move(last)) is True
-    assert b.play(last) is True, "本任务不得改变落子合法性"
-    assert b.get_legal_moves().sum() > 0
+    assert not b.get_legal_moves()[last], \
+        "超级劫闭合成手必须在合法性掩码里被判非法"
+    assert b.get_legal_moves().sum() > 0, "其余点必须照常合法（没有误伤整盘）"
+
+    # play() 是**结构性**检查、不查 PSK（见其 docstring）：直接调它仍能落下去。
+    # 这条断言把那条分工钉住 —— 合法性集合的唯一真相源是掩码，不是 play() 的返回值。
+    assert b.play(last) is True, "play() 只做结构性检查（占点/简单劫/自杀）"
+    assert b.is_repetition() is True, "落子后当前染色重现了一次"
 
 
 # --------------------------------------------------------------------------- #
@@ -665,9 +678,19 @@ def test_current_player_rewrite_is_adopted_as_new_game():
 def test_adoption_keeps_ko_ban_but_drops_stale_legal_cache():
     """ko_point 属于**局面描述**而不是对局进度，接管时保留。
 
-    Tromp-Taylor 规则 6 的 PSK 只看盘面涂色，简单劫是它「只禁紧邻上一手之前那个局面」这条
-    更弱的限制 —— 与整盘历史无关，所以从该局面开新局时劫禁着照样成立。
-    light_rollout 显式拷贝 ko_point 要的就是这个语义，不能在接管时清掉。
+    Tromp-Taylor 规则 6 的 PSK 只看盘面涂色；`ko_point` 是「上一手是否形成简单劫」的
+    信息位，P2.6a-2b-1 起它**不再参与掩码判罚**（PSK 已覆盖简单劫）。但它仍被
+    `play()` 读着（Tromp-Taylor 规则 6 的前半句「禁劫争」），所以从该局面开新局时
+    劫禁着在**落子层**照样成立 —— light_rollout 显式拷贝 ko_point 要的就是这个语义，
+    不能在接管时清掉。
+
+    ⚠ **掩码层的断言在 P2.6a-2b-1 翻转过一次**，值得写清楚为什么：
+    接管把历史重建成 `{当前局面}`，于是「劫争之前那个染色」不在历史里，PSK 判不出
+    劫禁着点 —— 掩码因此会**放行**它（正常对局下历史完整，PSK 独立禁掉它，两条掩码
+    逐位相同，见 `tests/test_go_rules_legality.py::test_ko_point_does_not_affect_legality`）。
+    这不是回归，而是「绝不伪造父局历史」这条取舍的已知代价：宁可漏判重复，也不误禁
+    合法着法。旧断言 `assert not legal[cur.ko_point]` 断言的正是「掩码读 ko_point 字段」，
+    与新契约直接冲突，故改为断言**落子层**仍然拒绝该点。
     """
     src = _triple_ko_board()
     who, mv = _TRIPLE_KO_SEQUENCE[0]
@@ -685,12 +708,13 @@ def test_adoption_keeps_ko_ban_but_drops_stale_legal_cache():
 
     h = cur.hash()
     assert h == src.hash()
-    assert cur.ko_point == src.ko_point, "劫禁着属于局面描述，接管时保留"
+    assert cur.ko_point == src.ko_point, "ko_point 属于局面描述，接管时保留"
     assert cur.move_number == 0 and cur.num_passes == 0
     assert cur._pos_hash_history == [cur.position_hash()]
     legal = cur.get_legal_moves()
     assert legal[0], "接管必须失效属于旧盘面的合法性缓存"
-    assert not legal[cur.ko_point], "劫禁着点仍不可下"
+    # 落子层：play() 仍按规则 6 前半句拒绝劫禁着点（掩码不读该字段，见上）
+    assert cur.clone().play(cur.ko_point) is False, "劫禁着点在落子层仍不可下"
 
 
 def test_undo_shares_the_adoption_entry_point():
@@ -823,12 +847,13 @@ def test_zobrist_key_depends_only_on_row_col_and_color():
 def _greedy_new_move(b):
     """确定性取一手「合法、非自杀、且不造成重复局面」的着法（最小索引优先）。
 
-    过滤重复局面是为了让夹具在 P2.6a-2b 接入 PSK 之后**依然合法**：
+    `get_legal_moves()` 自 P2.6a-2b-1 起**已经**含禁自杀与 PSK，所以下面那层
+    `_would_repeat` 过滤是**冗余**的、保留只是为了在有人改坏实现时立刻炸掉：
     过滤用的键必须是 position-only（`position_hash_after_move`），用含行棋方的
     `hash_after_move` 会永远命中不了历史（历史里存的是染色键），过滤静默失效。
     返回 -1 表示无此着（pass）。
     """
-    for mv in np.flatnonzero(b.get_legal_moves(check_suicide=True)).tolist():
+    for mv in np.flatnonzero(b.get_legal_moves()).tolist():
         if not b._would_repeat(b.position_hash_after_move(mv)):
             return mv
     return -1
