@@ -680,13 +680,13 @@ def test_adoption_keeps_ko_ban_but_drops_stale_legal_cache():
 
     Tromp-Taylor 规则 6 的 PSK 只看盘面涂色；`ko_point` 是「上一手是否形成简单劫」的
     信息位，P2.6a-2b-1 起它**不再参与掩码判罚**（PSK 已覆盖简单劫）。但它仍被
-    `play()` 读着（Tromp-Taylor 规则 6 的前半句「禁劫争」），所以从该局面开新局时
-    劫禁着在**落子层**照样成立 —— light_rollout 显式拷贝 ko_point 要的就是这个语义，
-    不能在接管时清掉。
+    `play()` 读着（`play()` 里那道 `move == self.ko_point` 的劫禁，**TT 规则本身没有
+    这一条**，全文见 `GoBoard` 类 docstring），所以从该局面开新局时那个点在**落子层**
+    照样被拒 —— light_rollout 显式拷贝 ko_point 要的就是这个语义，不能在接管时清掉。
 
     ⚠ **掩码层的断言在 P2.6a-2b-1 翻转过一次**，值得写清楚为什么：
-    接管把历史重建成 `{当前局面}`，于是「劫争之前那个染色」不在历史里，PSK 判不出
-    劫禁着点 —— 掩码因此会**放行**它（正常对局下历史完整，PSK 独立禁掉它，两条掩码
+    接管把历史重建成 `{当前局面}`，于是「提子之前那个染色」不在历史里，PSK 判不出
+    那个回提点 —— 掩码因此会**放行**它（正常对局下历史完整，PSK 独立禁掉它，两条掩码
     逐位相同，见 `tests/test_go_rules_legality.py::test_ko_point_does_not_affect_legality`）。
     这不是回归，而是「绝不伪造父局历史」这条取舍的已知代价：宁可漏判重复，也不误禁
     合法着法。旧断言 `assert not legal[cur.ko_point]` 断言的正是「掩码读 ko_point 字段」，
@@ -713,8 +713,8 @@ def test_adoption_keeps_ko_ban_but_drops_stale_legal_cache():
     assert cur._pos_hash_history == [cur.position_hash()]
     legal = cur.get_legal_moves()
     assert legal[0], "接管必须失效属于旧盘面的合法性缓存"
-    # 落子层：play() 仍按规则 6 前半句拒绝劫禁着点（掩码不读该字段，见上）
-    assert cur.clone().play(cur.ko_point) is False, "劫禁着点在落子层仍不可下"
+    # 落子层：play() 仍按它自己那道劫禁拒绝该点（掩码不读该字段，见上）
+    assert cur.clone().play(cur.ko_point) is False, "该点在落子层仍不可下"
 
 
 def test_undo_shares_the_adoption_entry_point():

@@ -2,8 +2,9 @@
 GoBoard 合法性接入测试（P2.6a-2b-1：禁自杀 + 位置超级劫进 `get_legal_moves()`）。
 
 本文件锁住的是**接线之后**的合法性语义。`get_legal_moves()` 判三条：空点 / 禁自杀 /
-位置超级劫（PSK）；规则 6 的前半句「禁劫争」降级为 `play()` 的结构性检查，`ko_point`
-随之变成只读信息位（见 §6b 那个钉缺口的用例）。
+位置超级劫（PSK = Tromp-Taylor 规则 6 的全文，掩码因此**就是**完整的 TT 合法点集合）。
+`play()` 另有一道 **TT 规则之外**的劫禁（`move == self.ko_point`），`ko_point` 随之只是
+只读信息位；两者的分叉见 §6b 那个钉住它的用例。
 
 覆盖面（5 路与 9 路各一组，19 路一组专测成本）：
   1. `test_suicide_is_illegal`                     角上单点自杀 / 单点自杀 / 自杀但提子
@@ -20,7 +21,8 @@ GoBoard 合法性接入测试（P2.6a-2b-1：禁自杀 + 位置超级劫进 `get
   - `test_psk_candidate_key_ignores_side_to_play`
         PSK 候选键 = position-only（染色，与行棋方无关）
   - `test_known_gap_mask_allows_multi_stone_ko_recapture`
-        **钉住已知缺口**：多子提子形成的劫，其立即回提不被 PSK 覆盖（掩码比 TT 宽松）
+        **钉住两处分歧**：多子提子形成的劫，其立即回提**按 TT 是合法手**（掩码放行是对的），
+        但 `play()` 仍按自己那道非 TT 的劫禁拒绝
 
 为什么 3 只在 9 路跑：多劫循环夹具需要 **3 个互不相邻的劫形**，最小足迹就是 9 路
 （三劫夹具的子占 (2..8, 1..8)）。已用穷举验证过 **5 路装不下任何双劫循环**（把标准
@@ -172,8 +174,8 @@ def test_suicide_boundary_same_colour_group_losing_its_only_liberty():
     """
     b = _hand_built(N5, _SUICIDE_5_STONES, to_play=1)
     mv = _idx(N5, 0, 3)
-    assert b.get_legal_moves()[mv] is np.False_ or not b.get_legal_moves()[mv], \
-        "(0,3) 必须被判自杀"
+    mask = b.get_legal_moves()
+    assert not mask[mv], "(0,3) 必须被判自杀"
     assert b.clone().play(mv) is False, "play() 也必须拒绝（结构性自杀检查）"
     # 对照：**同一个点换成白方下是合法的** —— 白子并入白块 A，而 A 除 (0,3) 外还有
     # {(0,0),(1,1),(2,2)} 三口气（并顺手提到只剩这一口气的黑块）。
@@ -284,23 +286,33 @@ def test_positional_superko_illegal():
 def test_psk_candidate_key_ignores_side_to_play():
     """PSK 的关键语义：重复判定**只看棋盘染色，与行棋方无关**。
 
-    掩码的 PSK 分支用的候选键是 position-only 键。这里从两侧钉住它：
-      1. 同一染色、**相反行棋方**的两个棋盘，`position_hash()` 必须逐位相同，
-         而通用指纹 `hash()` 必须不同 —— 掩码的判罚若误用 `hash_after_move`，
-         候选键会与历史里的染色键永不相等，表现为「超级劫手被判合法」；
-      2. 该键确实出现在 PSK 历史里（谓词命中）。
+    从两侧钉住它：
+      1. **掩码层**（红得住的那条）：三重劫的闭合成手在掩码里必须被判非法。
+         若掩码的 PSK 分支改用 `hash_after_move()`（含行棋方），候选键与历史里存的
+         染色键永不相等 -> 静默查不中 -> 闭合成手被放行 -> 本行红。
+      2. **键层**：同一染色、**相反行棋方**的两个棋盘，`position_hash()` 必须逐位相同，
+         而通用指纹 `hash()` 必须不同。
 
-    ⚠ 为什么这里测的是**键**而不是「掩码上的分歧」：掩码长度恒为 n*n、**没有 PASS 槽**，
-    而 Tromp-Taylor 口径下 PSK 与 SSK 唯一的最小分歧实例就是 pass（染色不变、行棋方翻转）
-    —— 它被「掩码里没有这一格」排除在判定之外，因此**经由实着无法在掩码上观察到
-    PSK/SSK 的分歧**（实着造成的局面重复，其与上次出现的间隔必为偶数，间隔偶数 ⟹
-    行棋方相同）。已用 288 局随机对弈（5/7/9 路）穷举扫描确认无反例。
-    所以这里锁的是判罚所依赖的**那把钥匙**的语义，而不是一个观察不到的现象。
+    ⚠ **必须说清这条用例证明到哪一步**：第 2 组断言只证明**那把钥匙**的语义
+    （position-only vs 含行棋方），**不证明掩码 PSK 分支的语义** —— 掩码根本不调
+    `position_hash()`，它调的是 `position_hash_after_move()`。也就是说，把掩码**整套**
+    换成 situational 键（本组断言仍绿、上面那条掩码断言也绿：实着造成的局面重复与上次
+    出现的间隔必为偶数，偶数间隔 ⟹ 行棋方相同 ⟹ SSK 与 PSK 在掩码上同判），
+    本用例抓不到。已用 288 局随机对弈（5/7/9 路）逐候选扫描确认实着路径上无反例，
+    所以这个盲区在实着上不可观察；要抓它需要构造离奇数间隔的循环（pass 不在掩码里）。
+    第 1 组断言守的是**现实中最可能发生的回归**：候选键误用 `hash_after_move()` 之后
+    键族与历史不匹配，掩码静默失效。
     """
     a = _hand_built(N9, _TRIPLE_KO_STONES, to_play=1)
     for who, mv in _TRIPLE_KO_SEQUENCE[:-1]:
         assert a.play(mv) is True
 
+    # ---- 1. 掩码层：行为性红（候选键族必须与历史里的染色键同族）----
+    who, closing = _TRIPLE_KO_SEQUENCE[-1]
+    assert not a.get_legal_moves()[closing], \
+        "闭合成手必须在掩码里被判非法（候选键若含行棋方就会静默查不中历史）"
+
+    # ---- 2. 键层：position 键只认染色，通用指纹认行棋方 ----
     twin = a.clone()
     twin.current_player = -a.current_player
     twin.resync_hash()
@@ -310,7 +322,6 @@ def test_psk_candidate_key_ignores_side_to_play():
         "position 键（= 掩码 PSK 分支的候选键口径）只认棋盘染色"
     assert twin.hash() != a.hash(), "通用指纹含行棋方，必须仍能区分二者"
 
-    who, closing = _TRIPLE_KO_SEQUENCE[-1]
     key = a.position_hash_after_move(closing)
     assert key in a._pos_hash_counts, "候选键必须真的命中历史（否则测试是空转）"
     assert key == a._pos_hash_history[0], "闭合成手复现的正是开局染色"
@@ -366,6 +377,10 @@ def test_no_board_mutation_during_legality_check():
           入口」这件事的可观察后果 —— 掩码算完之后，重复局面历史必须**属于当前盘面**。
           行为性红：接入前 `get_legal_moves()` 根本不调 `_ensure_hash()`，外部换掉
           board 数组后历史仍属于旧盘面，`_would_repeat(position_hash())` 返回假。
+      (a2) **入口调用排在缓存检查之前**：接管会失效 `_legal_cache`，所以只要
+          `_ensure_hash()` 在缓存检查**之后**，外部换掉 board 数组再只调
+          `get_legal_moves()` 就会拿到**属于旧盘面**的过期掩码。行为性红：投毒过的
+          缓存会被原样返回。
       (b) **零残留**：在已经自洽的盘面上调用，前后所有状态逐位相同（第二次调用走缓存，
           也必须一样）。
       (c) **零模拟**：判定过程中对 `self.board` 的写入只允许出现在**提子候选**上
@@ -387,6 +402,22 @@ def test_no_board_mutation_during_legality_check():
         "当前局面必须在历史里 —— 接入前这里会因为历史陈旧而返回假"
     assert b._pos_hash_history != stale_hist, \
         "本用例必须真的换掉了盘面（否则断言空转）"
+
+    # ---- (a2) 入口调用必须在缓存检查之前 ----
+    # 走的是「调用方只调 get_legal_moves()、不碰 hash()/play()」这条最朴素的路径：
+    # 那种情况下没有任何别的方法会先把缓存清掉。
+    poisoned = GoBoard(N5)
+    poisoned.get_legal_moves()               # 热缓存：此刻的掩码属于**空盘**（全 True）
+    assert poisoned._legal_cache is not None
+    poisoned._legal_cache[_idx(N5, 4, 4)] = False   # 人为投毒：把新盘面上合法的一格标非法
+    poisoned.board = src.board.copy()        # 外部整体换盘面
+    mask = poisoned.get_legal_moves()        # 只调这一个方法
+    assert mask[_idx(N5, 4, 4)], \
+        "换掉 board 数组后只调 get_legal_moves() 也必须重算（入口 _ensure_hash 排在缓存检查之前）"
+    assert not mask[_idx(N5, 0, 0)], \
+        "新盘面上 (0,0) 是自杀点，必须为 False —— 拿到的是空盘的旧掩码就说明顺序反了"
+    assert poisoned._pos_hash_history == [poisoned.position_hash()], \
+        "重算掩码之前必须先完成接管（否则是「哈希已重置、掩码还是旧的」）"
 
     # ---- (b) 零残留 ----
     for n, stones in ((N5, _SUICIDE_5_STONES), (N9, _SUICIDE_9_STONES)):
@@ -441,8 +472,8 @@ def test_eye_filling_stays_legal():
     for n, stones, pt in ((N5, _LAST_LIB_5_STONES, _LAST_LIB_5_POINT),):
         b = _hand_built(n, stones, to_play=1)
         mv = _idx(n, *pt)
-        assert b.get_legal_moves()[mv] is np.False_ or not b.get_legal_moves()[mv], (
-            f"{n} 路：整块只剩这一口气，填它是自杀，必须禁")
+        mask = b.get_legal_moves()
+        assert not mask[mv], f"{n} 路：整块只剩这一口气，填它是自杀，必须禁"
         assert b.clone().play(mv) is False
 
 
@@ -484,7 +515,7 @@ def test_ko_point_does_not_affect_legality():
 
 
 # --------------------------------------------------------------------------- #
-# 6b. 已知分歧（钉住缺口，别让它被悄悄忘掉）
+# 6b. 与 play() 的已知分歧（钉住它，别让它被悄悄忘掉）
 # --------------------------------------------------------------------------- #
 
 # A=(4,4) 白；黑下 B=(4,5) 提掉它，且黑块 {B,(4,6)} 提子后**只剩 1 口气** = A。
@@ -498,24 +529,26 @@ _MULTI_KO_STONES = {
 
 
 def test_known_gap_mask_allows_multi_stone_ko_recapture():
-    """**已知缺口**，刻意不在 P2.6a-2b-1 修：掩码比 Tromp-Taylor 宽松一处。
+    """**已知分歧**，刻意不在 P2.6a-2b-1 修：**掩码是对的，偏差在 `play()` 那道劫禁。**
 
-    简报的前提是「PSK 已覆盖简单劫」。这对**单子劫**成立，但 `play()` 的成劫判据是
-    「恰好提 1 子 **且** 落子后己方块总气 == 1」，**没有**要求那块是单子。
-    于是一块 2 颗子的黑棋被打吃时：
+    Tromp-Taylor 规则 6 的全文只有一句：「A turn is either a pass; or a move that doesn't
+    repeat an earlier grid coloring.」——**没有** ko-capture 从句。所以「多子提子形成的劫」
+    的立即回提，在 TT 下**是合法手**，本掩码放行它是**正确**的。
 
-      - 白回提会一次提掉**整块 2 子**，落子后的染色与「黑提之前」那个染色**不同**
-        （那颗 (4,6) 的黑子被一并提掉了）-> 不是 PSK 重复，掩码看不出来；
-      - 但 Tromp-Taylor 规则 6 的前半句「禁劫争」仍然禁它 -> `play()` 拒绝。
+    简报的前提「PSK 已覆盖简单劫」对**单子劫**成立。但 `play()` 的成劫判据是
+    「恰好提 1 子 **且** 落子后己方块总气 == 1」，**没有**要求那块是单子。于是一块
+    2 颗子的黑棋被打吃时：白回提会一次提掉**整块 2 子**，落子后的染色与「黑提之前」那个
+    染色**不同**（那颗 (4,6) 的黑子被一并提掉了）-> 不是 PSK 重复 -> 掩码按 TT 放行；
+    而 `play()` 读 `ko_point`、拒掉它。**多出来的禁令在 `play()` 侧，TT 并没有这条。**
 
     实测频率：9 路随机自对弈 100 局里约 1.2% 的取点撞上这一条（30759 次成功取点中
     373 次被 `play()` 拒绝，全部属于本类）。
 
-    收口位置：要在掩码层补齐，唯一办法是把「上一手是否成劫」带进掩码 —— 那正是
-    `ko_point` 字段，而本任务明确要求把它从判罚里摘掉。建议在 P2.6a-2b-2 的
-    `is_legal()`（动作空间层有「上一手」这一层语义）把规则 6 的两句并列表达。
+    收口方向：**拿掉 `play()` 里 `if move == self.ko_point: return False`**（连带后果见
+    `GoBoard` 类 docstring 的「与 `play()` 的两处分歧」段：`play()` 不查 PSK，拿掉之后
+    它连经典单子劫的立即回提也会接受）。**不是**把「上一手是否成劫」带进掩码。
 
-    **本测试的用途是钉住这个缺口**：将来 whoever 收口了它（无论是把 ko 判罚放回掩码、
+    **本测试的用途是钉住这个分歧**：将来 whoever 收口了它（无论是拿掉 `play()` 的劫禁、
     还是把 `play()` 的成劫判据收窄成「必须是单子」），本测试都会红，并在失败信息里
     指出该改哪一处。它不是对当前行为的「背书」。
     """
@@ -531,12 +564,12 @@ def test_known_gap_mask_allows_multi_stone_ko_recapture():
     assert sum(1 for r in range(N9) for c in range(N9)
                if b.board[r, c] == 1 and (r, c) in ((4, 5), (4, 6))) == 2
 
-    # 缺口本体：回提不是 PSK 重复 -> 掩码放行
+    # 分歧本体：回提不是 PSK 重复 -> 掩码按 TT 放行
     assert b._would_repeat(b.position_hash_after_move(recapture)) is False, \
-        "前提：这一手不复现历史染色，所以 PSK 判不出来"
+        "前提：这一手不复现历史染色，所以 PSK（= TT 规则 6）判不出来，也就该放行"
     assert b.get_legal_moves()[recapture], \
-        "**当前**行为：掩码放行（缺口）。收口后本行会红 —— 那是好事。"
-    # 而 play() 仍然拒绝（规则 6 前半句）
+        "**当前**行为：掩码放行（这才是 TT 的答案）。收口后本行会红 —— 那是好事。"
+    # 而 play() 仍然拒绝（它自己那道 TT 之外的劫禁）
     assert b.clone().play(recapture) is False
 
     # 收窄成单子劫之后，PSK 就能独立禁掉：这是缺口不存在的情形
@@ -558,10 +591,13 @@ def test_legality_cost_is_bounded():
         20 ms 是 **15~40 倍**的余量；
       - 接入前语义最接近的旧路径 `get_legal_moves(check_suicide=True)` 实测
         1.0~1.2 ms，所以 20 ms 并不比「接入前就已经很慢」更宽松；
-      - 而它足以抓住两类真回归：① 某处退回「每个候选都走一次
-        `position_hash_after_move` 的完整推演」（实测 ~13~46 µs/候选，
-        19 路满盘就是 5~17 ms，会顶到上界）；② 自杀判定退回「每个候选都原地落子模拟」
+      - 而它足以抓住**最贵的那一类真回归**：自杀判定退回「每个候选都原地落子模拟」
         或丢掉早退（实测 26.6 ms，直接破线）。
+
+    ⚠ **它抓不住另一类回归，别把这条上界当万能护栏**：PSK 判罚退回「每个候选都走
+    `position_hash_after_move` 的完整推演」（实测 ~13~46 µs/候选 × 19 路中盘约 181 个空点
+    ≈ **2.4~8.3 ms**）**仍在 20 ms 以内**。抓它要另加断言（例如统计
+    `position_hash_after_move` 的调用次数 ≤ 提子候选数），本轮没做。
     """
     b = GoBoard(19)
     rng = np.random.default_rng(20260926)
