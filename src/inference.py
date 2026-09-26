@@ -682,7 +682,10 @@ class GoAI:
             legal = board.get_legal_moves()
             if to_play == human_color:
                 print(board.to_string())
-                print(f"合法着法数: {len(legal)}  | 输入坐标(如 ce)，或 pass，或 resign")
+                # 掩码是长度恒为 n*n 的 ndarray，所以「合法着法数」必须数真值，不能取
+                # len()（那是 n*n）。P2.6a 起掩码里多了禁自杀与 PSK 两类 False，真值数
+                # 与空点数不再相等，这个数字现在真的会骗人。
+                print(f"合法着法数: {int(legal.sum())}  | 输入坐标(如 ce)，或 pass，或 resign")
                 inp = input("你的着法: ").strip().lower()
                 if inp in ("pass", ""):
                     board.play(-1)

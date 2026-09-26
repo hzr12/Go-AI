@@ -191,7 +191,14 @@ def play_game(black, white, board_size, max_moves):
     while passes < 2 and mc < max_moves:
         to_play = board.current_player
         legal = board.get_legal_moves()
-        if len(legal) == 0:
+        # ⚠ 判据必须是 `not legal.any()`，不是 `len(legal) == 0`：掩码是长度恒为 n*n 的
+        # ndarray，`len(legal)` 永远是 n*n，这一支**从来没进过**（写成 len() 是个哑分支）。
+        # 它本来就不是回归（老规则下也一样错），但 P2.6a 之后掩码里多了禁自杀与 PSK 两类
+        # False，「无处可下」比以前更容易出现；一旦出现，`select()` 里的
+        # `np.random.choice(np.where(legal)[0])` 会在空数组上抛 ValueError 直接崩掉整场循环。
+        # 改成 any() 与 evaluate.py:51 / selfplay_train.py:182 / async_pipeline.py:208 /
+        # inference.py:609 同一写法；行为上只影响「原本会崩」的那条路径。
+        if not legal.any():
             mv = board_size * board_size  # pass
         else:
             mv = players[to_play].select(board, hists[0], hists[1], to_play,

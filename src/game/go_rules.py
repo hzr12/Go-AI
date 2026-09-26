@@ -40,6 +40,22 @@
     而 `play()` 是它唯一的执行口，二者不再有分工也没有偏差。
     逐点对拍由 `tests/test_go_rules_legality.py::test_play_and_mask_agree_on_every_move`
     钉住；改动其中任何一侧的判定时，那条测试会红。
+
+---- 动作空间（OpenSpiel 风格，P2.6a-2b-2）----
+三套编码并存，**各自的 pass 编号不同**，这是本引擎最容易静默出错的地方：
+  - **棋盘方言**：`play()` / `move_history` / `feature_planes` 历史通道 / MCTS 的
+    `path_moves` / webui 与 cli_play 的 `PASS = -1` —— pass 记作 **-1**；
+  - **动作空间**：`GoBoard.PASS`（= `n*n`）、`num_actions()`（= `n*n+1`）、
+    `legal_actions()`、`is_legal()`、MCTS 的树内编码（`n_actions - 1`）——
+    pass 记作 **n*n**；
+  - **掩码**：长度恒为 n*n，**没有** pass 槽位。
+所以 `is_legal(-1)` 为 **False**（越界）而 `play(-1)` 为 **True**（合法 pass）；
+`is_legal(PASS)` 为 **True** 而 `play(PASS)` 为 **False**（越界）——
+**这两对都不可比**，`is_legal()` 的返回值不能拿去预判 `play()` 的返回值，
+要落一个动作编号必须先换算：`play(-1 if a == board.PASS else a)`。
+PASS 恒合法且**不查 PSK**：pass 不改变染色，`position_hash_after_move(-1)` 恒等于
+当前键（该键必然已在历史里），谓词恒为真，接上去就会把所有 pass 判成非法、
+对局永远无法终局。完整说明见「动作空间」段与各方法 docstring。
 """
 
 import hashlib
@@ -133,6 +149,31 @@ def _zobrist_key(r: int, c: int, color: int) -> int:
 _NB4 = ((-1, 0), (1, 0), (0, -1), (0, 1))
 
 
+class _PassSlot:
+    """`GoBoard.PASS` 的描述符：PASS 的动作值恒等于 `board_size * board_size`。
+
+    为什么是描述符而不是一个普通类属性：PASS 的值**随盘口变**（5 路 25 / 9 路 81 /
+    19 路 361），写成 `PASS = 361` 那种类级 int 就等于把「默认盘口」硬编码进引擎 ——
+    5 路的 `board.PASS` 会静默变成 361，而 `coord_to_action(5, 0)` 返回 25，
+    于是「动作空间」与「扁平坐标」两套编号错位 336，症状是 pass 被当成棋盘上的一个点、
+    或者随机走子下出越界动作。宁可让它**大声报错**。
+
+    因此**类上访问（`GoBoard.PASS`）直接抛 AttributeError**，只允许实例访问
+    （`board.PASS` / `self.PASS`）。这条报错是设计的一部分：它拦住
+    `PASS = GoBoard.PASS` 这类模块级常量（那会在 5 路与 19 路共用一个值）。
+    """
+    __slots__ = ()
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            raise AttributeError(
+                "GoBoard.PASS 必须从实例读（board.PASS）：它的值是 board_size * "
+                "board_size，随盘口变化（5 路 25 / 9 路 81 / 19 路 361），类上没有"
+                "「默认盘口」可言。要一个模块级常量就写 "
+                "`PASS = GoBoard(board_size).PASS`。")
+        return obj.board_size * obj.board_size
+
+
 class GoBoard:
     """围棋棋盘。内部棋盘取值：-1=白, 0=空, 1=黑。
 
@@ -185,7 +226,16 @@ class GoBoard:
     （**另一条同样可行的收法，本任务没选**：把成劫判据收窄成「那块必须是单子」，让
     `ko_point` 只标记经典劫。它与掩码的 PSK 完全重合、不再有任何增量严格性，但会在
     引擎里留下一条 TT 没有的禁令 —— 与「判据只有 PSK 一条」这个更干净的立场冲突。）
+
+    ---- PASS：类级常量，值 = board_size * board_size ----
+    `GoBoard.PASS` 是**动作空间**里 pass 的编号（`board_size * board_size`），
+    它是描述符而不是普通 int —— 因为值随盘口变，见 `_PassSlot` 的 docstring。
+    动作空间与 `play()` 的「棋盘方言」（pass = -1）是**两套编号**，
+    `legal_actions()` / `is_legal()` 只认动作空间；详见动作空间段的注释。
     """
+
+    # 动作空间的 PASS 槽（描述符：值 = board_size * board_size，见 _PassSlot）
+    PASS = _PassSlot()
 
     def __init__(self, board_size: int = 19, komi: float = 7.5):
         if board_size > _ZOBRIST_STRIDE:
@@ -384,6 +434,219 @@ class GoBoard:
 
         self._legal_cache = legal.copy()
         return legal
+
+    # ---- 动作空间（OpenSpiel 风格）------------------------------------------
+    #
+    # ⚠⚠ **三套编码并存，混用会静默出错 —— 动手前先读完这一段** ⚠⚠
+    #
+    #   | 编码            | 取值                     | pass      | 谁在用                                   |
+    #   |-----------------|--------------------------|-----------|------------------------------------------|
+    #   | 棋盘方言        | 0 .. n*n-1               | **-1**    | `play()` / `move_history` / `undo_stack` |
+    #   |                 |                          |           | `feature_planes` 的历史通道 / MCTS 的    |
+    #   |                 |                          |           | `path_moves` / webui 的 `PASS = -1`       |
+    #   | 动作空间（本段）| 0 .. n*n-1，**外加 n*n** | **n*n**   | `PASS` / `num_actions()` /               |
+    #   |                 |                          |           | `legal_actions()` / `is_legal()` /       |
+    #   |                 |                          |           | MCTS 的树内编码（`n_actions - 1`）       |
+    #   | 掩码            | 长度恒为 n*n 的 bool 数组 | **无槽位**| `get_legal_moves()` / 通道 8             |
+    #
+    # 三个必然踩到的坑，全部**由结构保证**而不是靠调用方记得：
+    #   - `is_legal(-1)` → **False**（-1 在动作空间里越界），而 `play(-1)` → **True**（合法的
+    #     pass）。两者**不可比**，不要拿 `is_legal(x)` 的结果去预判 `play(x)`；
+    #   - `is_legal(PASS)` → **True**，而 `play(PASS)` → **False**（n*n 越界，pass 在
+    #     `play()` 里是 -1）。要落一个动作必须先换算：`play(-1 if a == PASS else a)`；
+    #   - `legal_actions()` 里的 PASS 是**无条件追加**的，不查 PSK（理由见下）。
+    #
+    # 为什么动作空间要把 PASS 放进编号里：这是 OpenSpiel 的约定（`num_actions()` 覆盖
+    # 全部动作，策略网络的输出维度因此是 n*n+1，掩码类接口不需要为 pass 开后门），
+    # 本仓库的 MCTS 早就按这个约定写死了 `n_actions = n*n+1`（见 `src/search/mcts.py`），
+    # 本段只是把那套**已经存在但只存在于调用点里**的约定收进引擎，给出唯一名字与
+    # 换算函数。它**没有**改变任何既有调用点的行为。
+
+    def num_actions(self) -> int:
+        """动作空间大小 = `board_size * board_size + 1`（末位是 PASS）。
+
+        与 `PASS` 同源（`num_actions() == PASS + 1`），所以「动作编号上界」永远
+        不用在调用点各写一遍 `bs*bs + 1`（`MCTS.n_actions` / `inference.choose_move` /
+        webui / rollout 都是同一份）。策略网络的输出维度也等于本值。
+        """
+        return self.board_size * self.board_size + 1
+
+    def action_to_coord(self, action: int) -> tuple:
+        """动作编号 → 棋盘坐标 `(r, c)`。**PASS 不是坐标**，对它抛 `ValueError`。
+
+        只接受 `0 <= action < PASS`（即 `0 .. n*n-1`）。越界（含负数、`PASS`、
+        `>= num_actions()`）一律 `ValueError` —— 这里**不**返回 `None`：
+        返回 `None` 会让 `r, c = board.action_to_coord(a)` 抛一句
+        「cannot unpack non-sequence」或者更糟的 NoneType 栈，调用方根本看不出
+        自己漏了 `a == PASS` 的分支；显式异常把「pass 没有坐标」这件事说清楚。
+
+        `PASS` 请走 `action_to_string()`，落子请走 `play(-1)`。
+        """
+        n = self.board_size
+        if action < 0 or action >= n * n:
+            raise ValueError(
+                f"action={action} 不是落子动作：落子动作范围是 [0, {n * n})，"
+                f"而 PASS={self.PASS}（=n*n）没有坐标。pass 用 action_to_string()"
+                f"（返回 'pass'），落子用 play(-1)。")
+        return divmod(action, n)
+
+    def coord_to_action(self, r: int, c: int) -> int:
+        """棋盘坐标 `(r, c)` → 动作编号 `r * board_size + c`。越界抛 `ValueError`。
+
+        与 `action_to_coord` 严格互逆（`coord_to_action(*action_to_coord(a)) == a`
+        对全部 `a < PASS` 成立）。编号用 `r * n + c` 而不是 SGF 的 `c * n + r`，
+        与 `move_history` / `apply_symmetry_batch` / 掩码下标**同一套**；
+        只有**文本**记法是 SGF 风格（列字母在前），见 `action_to_string`。
+        """
+        n = self.board_size
+        if not (0 <= r < n and 0 <= c < n):
+            raise ValueError(
+                f"坐标 ({r}, {c}) 越界：{n} 路盘的合法坐标是 0..{n - 1}。")
+        return r * n + c
+
+    def action_to_string(self, action: int) -> str:
+        """动作编号 → 文本记法。`PASS` → `'pass'`，落子 → 两字母 SGF 风格串。
+
+        **记法只有一套，就是 `parse_move_str` 那一套**（先读它，别造第二套）：
+        小写字母，**列字母在前、行字母在后**（SGF 约定），`'aa'` = (行 0, 列 0) = 角，
+        `'ee'` = 天元。`action_to_string(a) == parse_move_str` 的逆，
+        `string_to_action(action_to_string(a)) == a` 对全部合法 a 成立。
+
+        越界（含 `-1`）抛 `ValueError`：`-1` **不是**动作空间的编码（见段首的表）。
+        """
+        if action == self.PASS:
+            return "pass"
+        n = self.board_size
+        if action < 0 or action >= n * n:
+            raise ValueError(
+                f"action={action} 越界：合法动作是 [0, {n * n}]，末位 {self.PASS} "
+                f"是 PASS（棋盘方言里的 pass 是 -1，不是动作编号）。")
+        r, c = divmod(action, n)
+        return chr(ord('a') + c) + chr(ord('a') + r)
+
+    def string_to_action(self, s: str) -> int:
+        """文本记法 → 动作编号。`parse_move_str` 的**严格版**（非法输入抛异常）。
+
+        与 `parse_move_str` 的唯一区别是**失败处理**，接受的记法完全相同
+        （`'pass'` / `'resign'` / `''` → PASS；两字母串 → `r*n+c`；SGF 风格、列在前）。
+        这里抛 `ValueError` 而不是返回 `(ok, mv)`，因为动作空间层的调用方要的是
+        「一个动作编号」，`ok=False` 那种 `(False, -1)` 的返回值会把 -1 混进
+        动作编号里 —— 那正是段首表里最危险的那一格。
+
+        ⚠ **`'pass'` 映射到 `PASS`（n*n），不是 -1**。`-1` 留在棋盘方言里。
+        """
+        ok, mv = self.parse_move_str(s)
+        if not ok:
+            raise ValueError(
+                f"{s!r} 不是合法的着法串（记法见 action_to_string：'aa'=左上角、"
+                f"'pass'=虚着，{self.board_size} 路用 a.."
+                f"{chr(ord('a') + self.board_size - 1)}）")
+        return self.PASS if mv == -1 else mv
+
+    def legal_actions(self) -> list:
+        """全部合法动作的**升序**列表 = 掩码里的真点 + 末位 `PASS`（**无条件**）。
+
+        掩码长度为 n*n 且**没有** PASS 槽，所以 pass 天然不进 PSK 判定；
+        本方法把 PASS 作为**永远合法**的动作显式追加到末位。因为 PASS = n*n 大于
+        掩码里任何下标，「掩码下标升序 + 末尾追加」**天然就是升序**，不需要再排一次。
+
+        ⚠ **追加是无条件的，且绝不可改成「对 PASS 查一次 PSK」**：
+        pass 不改变棋盘染色，所以 `position_hash_after_move(-1)` 恒等于当前键，
+        而当前键必然已在重复局面历史里（每次落子都记它）—— 谓词**恒为真**。
+        一旦接上，所有 pass 都会被判非法，对局将**永远无法终局**（终局 = 两次连续 pass）。
+        `is_legal()` 里对 PASS 的短路与本行的无条件追加是同一件事的两面。
+
+        只读：与 `get_legal_moves()` 一样在入口过 `_ensure_hash()`（由掩码那一侧做），
+        不改状态、不失效缓存。**不适用于 MCTS 热路径**：那里要的是
+        `np.flatnonzero(mask)` 之后接 `n_actions - 1`，省掉中间的 Python list。
+        """
+        mask = self.get_legal_moves()
+        return [int(i) for i in np.flatnonzero(mask).tolist()] + [self.PASS]
+
+    def is_legal(self, action: int) -> bool:
+        """单个动作是否合法 —— **单点判定，绝不物化全掩码**。
+
+        判据与 `get_legal_moves()` 掩码**逐条同源、同一顺序**（空点 / 禁自杀 / PSK，
+        见掩码 docstring 的等价变形与两段式），所以对任意 `0 <= action < n*n`：
+        `is_legal(a) == bool(get_legal_moves()[a])`。掩码是合法点集合的**唯一**真相源，
+        本方法是它对单个点的投影（O(1) 级邻域扫描 + 至多一次提子推演），
+        逐点对拍由 `tests/test_go_action_api.py::test_is_legal_matches_mask` 钉住。
+
+        边界：
+          - `action == PASS` → **True**（结构保证；理由见 `legal_actions` 的 ⚠ 段）；
+          - `action` 越界（含 `-1` 与 `>= num_actions()`）→ **False**，**不抛**。
+            这是「问一个非法编号合不合法」的答案，与 `action_to_coord` 的「把非法编号
+            换算成坐标」不同 —— 后者才抛。
+          - 占点 → False（不落任何子）。
+
+        ⚠ **绝不写成 `return bool(self.get_legal_moves()[action])`**：那会把 `is_legal`
+          退化成「每次调用都物化整张 n*n 掩码」，单点 O(1) 的 API 变成 O(n²)，
+          在按候选调用的场景（UI 逐点问、rollout 采样）上是数量级的差别。
+          `tests/test_go_action_api.py::test_is_legal_does_not_materialize_the_mask`
+          用一个「被调用就抛异常」的 `get_legal_moves` 桩把这条钉死。
+
+        **成本**：与盘面**面积无关**，只与「落点四周那几个连通块有多大」有关
+        （≤4 个邻块各一次带早退的 flood fill + 至多一次提子推演）。
+        实测 19 路随机自对弈中盘（180 手后、179 个合法点）：
+        一次**冷**掩码 0.66 ms，而本方法逐点判定 ≈ 23 µs/点 —— 约 1/29。
+        ⚠ 别拿「掩码有缓存时按位取值只要 0.5 µs」来比：那不是本方法的工作量。
+        本方法**不读** `_legal_cache`：复用缓存当然更快，但那样「绝不物化全掩码」
+        这条保证就只在缓存冷时成立（依赖调用顺序），而本方法的成本模型要的是
+        「与 n² 无关」这个无条件性质。P2.7 若要再快，正确方向是**增量棋块/气**
+        （把邻块查询也变成 O(1)），不是把掩码捡回来。
+
+        ⚠ **`-1` 在动作空间里越界**，所以 `is_legal(-1) is False`；而 `play(-1)`
+          是**合法**的 pass（棋盘方言）。两者**不可比**，别拿本方法的返回值去预判
+          `play()` 的返回值 —— `is_legal(PASS)` 为真而 `play(PASS)` 也为假正是同一个
+          道理（pass 在 `play()` 里是 -1）。落子请先换算：
+          `play(-1 if a == self.PASS else a)`。
+
+        只读，但入口同样过 `_ensure_hash()`：PSK 判定读的是重复局面历史，
+        历史若属于别的盘面，命中判定毫无意义（这与掩码的契约完全一致）。
+        """
+        n = self.board_size
+        self._ensure_hash()
+        if action == self.PASS:
+            return True
+        if action < 0 or action >= n * n:
+            return False
+        r, c = divmod(action, n)
+        color = self.current_player
+        if self.board[r, c] != 0:
+            return False
+        # 判据与掩码逐字同源（get_legal_moves docstring 的「自杀判定的等价变形」）：
+        # 落点落子前是空点 -> 它必然落在每个相邻块的气里，于是「除落点外还有没有气」
+        # 一个布尔同时回答「己方合并后有气吗」与「敌块是不是被打吃」。
+        # 这里**不**取 tolist() 快照：单点判定只读 ≤4 个邻点与其连通块，
+        # 整盘快照是 O(n²) 的无用拷贝（掩码需要它是因为要扫全盘）。
+        board = self.board
+        has_lib_ex = self._group_has_liberty_excluding
+        capture = False
+        liberty = False
+        for dr, dc in _NB4:
+            nr = r + dr
+            nc = c + dc
+            if nr < 0 or nr >= n or nc < 0 or nc >= n:
+                continue
+            v = board[nr, nc]
+            if v == 0:
+                liberty = True               # 落点自身的气
+            elif v == color:
+                if has_lib_ex(board, nr, nc, r, c):   # 同色邻块除落点外还有气
+                    liberty = True
+            elif not has_lib_ex(board, nr, nc, r, c):  # 敌块的气全被落点占掉 -> 提子
+                capture = True
+        if not capture and not liberty:
+            return False                      # 自杀（⚠ 相对 TT 的有意偏离）
+        # PSK（TT 规则 6），两段式与掩码相同：提子才走完整推演，不提子走纯算术。
+        # 历史集合直接查 `_pos_hash_counts`（与掩码同一个理由，见 `_would_repeat` 的
+        # docstring）：入口已过 `_ensure_hash()`，扫描期间不写盘也不换行棋方，
+        # 所以两种写法完全等价。
+        if capture:
+            cand = self.position_hash_after_move(action)
+        else:
+            cand = self._pos_zobrist ^ _zobrist_key(r, c, color)
+        return cand not in self._pos_hash_counts
 
     # ---- 连通块 / 气 -------------------------------------------------------
 
@@ -901,6 +1164,11 @@ class GoBoard:
         必然已在历史里，查下去恒为「重复」。TT 规则 6 禁的是重复**棋**，不是 pass；
         终局由两次连续 pass 表达（`is_terminal()`）。
 
+        ⚠ **本方法说棋盘方言（pass = -1），不是动作空间**（那里 pass = `PASS` = n*n）。
+        `play(PASS)` 越界返回 False，`is_legal(-1)` 也是 False 而 `play(-1)` 是 True ——
+        落子一个动作编号前必须换算 `play(-1 if a == self.PASS else a)`，
+        见模块头「动作空间」段。
+
         判定失败时**不改变任何状态**（PSK 那一支的试落子已还原）。
         """
         n = self.board_size
@@ -1175,6 +1443,10 @@ class GoBoard:
                 r, c = divmod(mv, n)
                 planes[5 + k][r, c] = 1.0
 
+        # 通道 8 = 合法点（TT 口径：禁自杀 + PSK）
+        # ⚠ 供 P4.2 / P4.3 引用：这一格的值 = `get_legal_moves()`，即 TT 规则 6 的
+        # 完整合法点集合，外加一条**有意偏离**（禁自杀，TT 本身允许自提）。
+        # 只有 n*n 个点、**不含 PASS**（动作空间里的 pass 是 n*n，见 `GoBoard.PASS`）。
         planes[8] = self.get_legal_moves().reshape(n, n).astype(np.float32)
         planes[9] = float(to_play)
 
@@ -1218,15 +1490,25 @@ class GoBoard:
         返回: (B, 12, n, n) float32
 
         ⚠ **通道 8 与单图版不再等价（P2.6a-2b-1 起，已知分歧，非回归）**：
-        本方法只拿到裸 `boards` 数组，**没有 GoBoard、因而没有重复局面历史**，
-        所以它算不出 PSK —— 通道 8 因此只做「空点 ∧ 排除 ko」。
-        单图 `feature_planes()` 的通道 8 走 `get_legal_moves()`，取值**更严**。
-        ⚠ 禁自杀是**另一回事**，别混进来：它是纯局部判定（邻接块的气），
-        `boards` 数组本身就够算，本路径**没有做**是取舍（保持热路径成本），
-        不是「算不出来」。这个分歧在本任务之前就已存在（单图版在 `check_suicide=False`
-        默认下同样不查自杀），本任务只是把它拉大。收口需要把重复局面历史一起批量喂进来
-        （P2.6b 的下游语义同步 / P4.3 的 17 通道），禁自杀则可以直接向量化补上，
-        不要在这里假装两者一致。
+        两条路径的通道 8 差在**三件**互相独立的事上，别混成一句「更松」：
+          1. **PSK：算不出来**（不是选择）。本方法只拿到裸 `boards` 数组，**没有
+             GoBoard、因而没有重复局面历史**，超级劫在这条路径上**物理上无法判**。
+             单图 `feature_planes()` 的通道 8 走 `get_legal_moves()`，含 PSK，取值更严。
+          2. **禁自杀：算得出来，但本路径有意没做**（是**选择**，不是物理不可能）。
+             它是纯局部判定（只看邻接块的气），`boards` 数组本身就够算；不做是为了
+             保持热路径成本（每节点一次批量前向的成本敏感）。这个分歧在本任务之前
+             就已存在（单图版在 `check_suicide=False` 默认下同样不查自杀），
+             P2.6a-2b-1 只是把它拉大。**可以直接向量化补上**（P4.3 的 17 通道）。
+          3. **排除 `ko` 点：一条遗留近似，且单图侧已不再有对应判罚**（P2.6a-2b-1/2c）。
+             `ko_point` 早已降级为**只读信息位**（见 `GoBoard` 类 docstring），单图掩码
+             **不读它** —— 简单劫由 PSK 独立禁掉。所以这里的「排除 ko」不再镜像任何
+             规则，只是**碰巧**与单图侧一致：单子劫两边都禁（一个靠 PSK、一个靠字段）；
+             而在「多子提子形成的劫」（`ko_point` 的成劫判据不要求那块是单子）与
+             「外部盘面接管后无历史」两种情形下，本路径会比规则**更严**（禁掉按 TT 合法的
+             着法）。⚠ 改本函数时不要把这个更严当成「安全」：它与单图通道 8 的差
+             正是训练分布的来源之一（输入分布登记见路线图 D14）。
+        收口需要把重复局面历史一起批量喂进来（P2.6b 的下游语义同步 / P4.3 的 17 通道），
+        不要在这里假装两条路径一致。
 
         性能: 用 scipy.ndimage.label 一次性标注连通块并向量化计算气数，
             scipy 释放 GIL，两个颜色的标注线程可真正并行。
@@ -1260,10 +1542,12 @@ class GoBoard:
                 # 【修复】使用对齐后的索引进行赋值
                 planes[b_idx, ch_base + c_idx, r, c] = 1.0
 
-        # 通道 8: 合法点掩码（空点，ko 点排除）。⚠ **与单图 get_legal_moves() 不等价**：
-        # 这里没有重复局面历史，算不出 PSK（见本方法 docstring 的「通道 8 除外」段）；
-        # 禁自杀是纯局部判定、boards 就够算，本路径**有意没做**（保持热路径成本），
-        # 同样不是「算不出来」。P2.6a-2b-1 之后单图版更严，两者的分歧被本任务拉大。
+        # 通道 8: 合法点掩码（空点，ko 点排除）。⚠ **与单图 get_legal_moves() 不等价**，
+        # 差在三件独立的事上（PSK 算不出 / 禁自杀有意没做 / 排除 ko 是遗留近似，
+        # 单图侧已改由 PSK 判简单劫、不再读该字段）—— 见本方法 docstring 的
+        # 「通道 8 除外」段。禁自杀是纯局部判定、boards 就够算，本路径**有意没做**
+        # （保持热路径成本），是选择不是算不出来；「排除 ko」则不是选择也不是算不出，
+        # 它比规则更严，别当成安全边际。
         legal = (boards == 0).astype(np.float32)
         if ko is not None:
             ko = np.asarray(ko).reshape(B)
