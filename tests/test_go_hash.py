@@ -9,9 +9,11 @@ GoBoard Zobrist 哈希 / 重复局面（PSK 地基）测试。
   5. 真重复局面（三劫循环，6 手 superko）+ undo 回滚语义
   6. 初始局面在历史集合内
   7. num_passes / move_number / is_terminal / is_game_over
+  8. 小盘口（5 路）维度：divmod 坐标映射 / 跨盘口同一把 Zobrist 钥匙 / 2·n² 上限
 
 另锁两条本任务的生命周期契约:
-  - 外部整体替换 board 数组（light_rollout 的只读推演）必须被自动采纳
+  - 外部盘面接管（整体替换 board 数组、或只改写 current_player）= **以此局面为新局**：
+    对局进度归零、重复局面历史重建为 {当前局面}、ko_point 作为局面描述保留
   - 重复局面尚未接入 get_legal_moves()（P2.6a-2 才接），本任务行为零变化
 """
 import os
@@ -22,6 +24,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from src.game import go_rules  # noqa: E402
 from src.game.go_rules import GoBoard  # noqa: E402
 
 N = 9
@@ -475,19 +478,25 @@ def test_num_passes_and_is_terminal():
 
 
 # --------------------------------------------------------------------------- #
-# 生命周期契约：外部替换 board 数组
+# 生命周期契约：外部盘面接管 = 以此局面为新的一局
 # --------------------------------------------------------------------------- #
 
-def test_external_board_replacement_is_adopted():
+def test_external_board_replacement_is_adopted_as_new_game():
     """light_rollout 用「新建 GoBoard + 逐字段赋值」做只读推演，不走 clone()。
 
     外部整体替换 board 数组时，hash() 必须给出**该盘面**的正确哈希，
     否则 P2.6a-2 接入 PSK 后 rollout 会拿空盘哈希判重复，静默把整局下成 pass。
+
+    并且整个状态契约必须自洽：接管 = **以此局面为新的一局**（对局进度归零、
+    历史重建为 {当前局面}），而不是「哈希换了、计数与历史留着上一局的」。
     """
     src = _fresh()
     rng = np.random.default_rng(11)
     for _ in range(10):
         src.play(_pick(src, rng))
+    assert src.move_number == 10
+    assert src.play(-1) is True, "让源局面的连续 pass 计数非零，好检验它被归零"
+    assert src.num_passes == 1
 
     cur = GoBoard(N)
     cur.board = src.board.copy()
@@ -495,14 +504,119 @@ def test_external_board_replacement_is_adopted():
     cur.ko_point = src.ko_point
     cur.passes = src.passes
     cur.move_history = list(src.move_history)
-    assert cur.hash() == src.hash(), "被采纳的局面哈希必须与源局面一致"
-    # 采纳后按新盘面继续走仍自洽
+    # 抄来的是陈旧状态，下面逐项断言接管把它清干净
+    assert cur.move_number == 0 and len(cur._pos_hash_history) == 1
+
+    h = cur.hash()
+    assert h == src.hash(), "被采纳的局面哈希必须与源局面一致"
+
+    # ---- 契约：以此局面为新的一局 ----
+    assert cur.move_number == 0, "move_number 必须归零，不能停在源局面的计数上"
+    assert cur.num_passes == 0, "连续 pass 计数必须归零"
+    assert cur.move_history == [], "着法历史属于上一局"
+    assert cur._undo_stack == [], "撤销栈属于上一局"
+    assert cur._pos_hash_history == [h], "历史重建为 {当前局面}"
+    assert cur._pos_hash_counts == {h: 1}
+    assert cur._would_repeat(h) is True, "当前局面必须在历史里（它是这一局的开局）"
+    assert cur.is_repetition() is False, "开局局面此前没出现过"
+
+    # ---- 接管后按新盘面继续走仍自洽 ----
     mv = _pick(cur, rng)
-    before = cur.hash()
     assert cur.play(mv) is True
-    assert cur.hash() != before
+    assert cur.hash() != h
+    assert cur.hash() == cur._pos_hash_history[-1]
+    assert cur.is_repetition() is False
     assert cur.undo() is True
-    assert cur.hash() == src.hash(), "undo 必须回到被采纳的局面"
+    assert cur.hash() == h == cur._pos_hash_history[-1]
+    assert cur._pos_hash_counts == {h: 1}
+    assert cur.move_number == 0
+
+
+def test_current_player_rewrite_is_adopted_as_new_game():
+    """只改写 current_player 的那一支同样按「以此局面为新局」处理。
+
+    旧实现只重算哈希却**保留**旧历史，于是盘面与自己的历史永久脱钩：
+    「翻转 + play + undo」之后 hash() != _pos_hash_history[-1]，且当前哈希根本不是
+    _pos_hash_counts 的键 —— `_would_repeat(hash())` 对「就是当前局面」的位置返回假。
+    """
+    b = _fresh()
+    assert b.play(4 * N + 4) is True
+    assert b.play(2 * N + 2) is True
+    assert b.current_player == 1, "两手之后又轮到黑，本测试要靠改写触发接管"
+
+    b.current_player = -1                      # 外部改写行棋方
+    h = b.hash()
+    assert b._zobrist == h and b._zobrist_player == -1
+    assert b._pos_hash_history == [h], "历史必须重建为 {当前局面}"
+    assert b._pos_hash_counts == {h: 1}
+    assert b._would_repeat(h) is True, "当前局面必须在历史里"
+    assert b.is_repetition() is False
+    assert b.move_number == 0, "对局进度归零"
+    assert b.num_passes == 0
+
+    # 翻转 + play + undo：全过程自洽（这正是审查实测崩掉的那条路径）
+    mv = 3 * N + 3
+    assert b.play(mv) is True
+    assert b.hash() == b._pos_hash_history[-1], "落子后当前哈希必须就是历史末项"
+    assert b._zobrist in b._pos_hash_counts
+    assert b.undo() is True
+    assert b.hash() == h == b._pos_hash_history[-1]
+    assert b._pos_hash_counts == {h: 1}
+    assert b._would_repeat(b.hash()) is True
+    assert b.is_repetition() is False
+    assert b.move_number == 0
+    assert b.current_player == -1, "undo 必须回到本局的行棋方"
+
+
+def test_adoption_keeps_ko_ban_but_drops_stale_legal_cache():
+    """ko_point 属于**局面描述**而不是对局进度，接管时保留。
+
+    Tromp-Taylor 规则 6 的 PSK 只看盘面涂色，简单劫是它「只禁紧邻上一手之前那个局面」这条
+    更弱的限制 —— 与整盘历史无关，所以从该局面开新局时劫禁着照样成立。
+    light_rollout 显式拷贝 ko_point 要的就是这个语义，不能在接管时清掉。
+    """
+    src = _triple_ko_board()
+    who, mv = _TRIPLE_KO_SEQUENCE[0]
+    assert src.current_player == who
+    assert src.play(mv) is True
+    assert src.ko_point >= 0, "夹具必须造出劫禁着"
+
+    cur = GoBoard(N)
+    cur.get_legal_moves()                  # 先把**旧盘面**的掩码缓存热起来
+    assert cur._legal_cache is not None
+    cur._legal_cache[0] = False             # 人为投毒：接管若不失效缓存，0 号点就会漏掉
+    cur.board = src.board.copy()
+    cur.current_player = src.current_player
+    cur.ko_point = src.ko_point
+
+    h = cur.hash()
+    assert h == src.hash()
+    assert cur.ko_point == src.ko_point, "劫禁着属于局面描述，接管时保留"
+    assert cur.move_number == 0 and cur.num_passes == 0
+    assert cur._pos_hash_history == [h]
+    legal = cur.get_legal_moves()
+    assert legal[0], "接管必须失效属于旧盘面的合法性缓存"
+    assert not legal[cur.ko_point], "劫禁着点仍不可下"
+
+
+def test_undo_shares_the_adoption_entry_point():
+    """undo() 与 play()/hash() 走同一条入口（代码与 docstring 一致的那一半）。
+
+    外部整体换掉盘面后，撤销必须**干净地失败**，而不是拿上一局的着法去恢复一颗
+    新盘上不存在的棋子、并把刚重建的历史弹空。
+    """
+    b = _triple_ko_board()
+    who, mv = _TRIPLE_KO_SEQUENCE[0]
+    assert b.current_player == who and b.play(mv) is True
+    assert b._undo_stack and b.move_number == 1
+
+    b.board = np.zeros((N, N), dtype=np.int8)      # 外部整体换盘面
+    b.current_player = 1
+    assert b.undo() is False, "接管已清空上一局的撤销栈，必须返回 False"
+    assert not b.board.any(), "撤销不得改动盘面"
+    assert b.hash() == _fresh().hash(), "哈希必须与新盘面一致"
+    assert b.move_number == 0
+    assert b._pos_hash_history == [b.hash()]
 
 
 def test_in_place_board_mutation_needs_resync():
@@ -519,6 +633,143 @@ def test_in_place_board_mutation_needs_resync():
     ref.board[0, 0] = 1
     ref.resync_hash()
     assert b.hash() == ref.hash(), "resync_hash 后必须按盘面重算"
+    # 显式接管与自动接管是同一份实现：对局进度同样归零
+    b.play(2 * N + 2)
+    assert b.move_number == 1
+    b.resync_hash()
+    assert b.move_number == 0 and b.num_passes == 0
+    assert b._pos_hash_history == [b.hash()]
+
+
+# --------------------------------------------------------------------------- #
+# 8. 小盘口（5 路）维度：坐标映射、跨盘口同一把钥匙、2·n² 上限
+# --------------------------------------------------------------------------- #
+
+SMALL = 5
+
+
+def _hand_built(n, stones, to_play):
+    """按 (r, c) 摆子并显式接管（测试夹具姿势）。"""
+    b = GoBoard(n)
+    for (r, c), v in stones.items():
+        b.board[r, c] = v
+    b.current_player = to_play
+    b.resync_hash()
+    return b
+
+
+def test_flat_move_index_maps_to_row_col_on_small_board():
+    """非 9 路盘口下 divmod(move, n) 的坐标映射（含撤销往返）。"""
+    b = GoBoard(SMALL)
+    for i, mv in enumerate((0, 6, 8, 12, 24)):
+        assert b.play(mv) is True
+        r, c = divmod(mv, SMALL)
+        color = 1 if i % 2 == 0 else -1      # 黑白交替，所以断言颜色而不只是非空
+        assert b.board[r, c] == color, \
+            f"move={mv} 在 {SMALL} 路必须落在 ({r}, {c}) 且是 {'黑' if color > 0 else '白'}"
+    # 同一个扁平索引在不同盘口上是**不同**的坐标
+    a5, a9 = GoBoard(SMALL), GoBoard(N)
+    assert a5.play(6) and a9.play(6)
+    assert divmod(6, SMALL) == (1, 1) and divmod(6, N) == (0, 6)
+    assert a5.board[1, 1] == 1 and a5.board[0, 1] == 0
+    assert a9.board[0, 6] == 1 and a9.board[1, 1] == 0
+    assert a5.hash() != a9.hash(), "不同坐标不得撞出同一哈希"
+
+    h0 = GoBoard(SMALL).hash()
+    assert a5.undo() is True and a5.hash() == h0, "5 路上的增量撤销必须精确复原"
+
+
+def test_same_coordinates_hash_identically_on_any_board_size():
+    """同一坐标在任何盘口下取到同一把 Zobrist 钥匙 —— 报告 §1 声称的设计优势。
+
+    走**增量路径**验证：在 5 路上真落子的局面，与 9/13/19 路上手摆的同坐标局面
+    哈希必须逐位相同（既证明 _hash_delta 的 divmod 映射，也证明跨盘口不串扰）。
+    """
+    seq = [0, 6, 12, 18, 24, 3, 9, 7]
+    small = GoBoard(SMALL)
+    for mv in seq:
+        assert small.play(mv) is True
+    h_small = small.hash()
+    stones = {(r, c): int(small.board[r, c])
+              for r, c in zip(*np.nonzero(small.board))}
+    assert len(stones) == len(seq), "夹具这串着法不该有提子"
+
+    for n in (9, 13, 19):
+        ref = _hand_built(n, stones, small.current_player)
+        assert ref.hash() == h_small, f"{n} 路盘的同坐标局面哈希必须相同"
+        assert ref._pos_hash_history == [h_small]
+
+    # 哈希只认坐标 + 行棋方：行棋方不同则哈希不同（跨盘口同样成立）
+    flipped = _hand_built(N, stones, -small.current_player)
+    assert flipped.hash() != h_small
+
+
+def test_zobrist_key_depends_only_on_row_col_and_color():
+    """直接钉住「钥匙表按 (r, c) 寻址、与盘口无关」这条不变式。
+
+    报告 §1 声称的优势至今没有任何测试锁着；这里直接查表：同一坐标取到的就是那一项，
+    且该项等于 sha256(种子|标签) 的前 8 字节（任何语言都能复算）。跨盘口取到同一把钥匙
+    这件事本身由上面那条测试（5 路增量局面 == 19 路手摆局面）从行为上证明。
+    """
+    for (r, c) in ((0, 0), (1, 2), (2, 3), (4, 4)):
+        for color in (1, -1):
+            idx = 2 * (r * go_rules._ZOBRIST_STRIDE + c) + (0 if color > 0 else 1)
+            label = b"p|%d|%d|%s" % (r, c, b"B" if color > 0 else b"W")
+            key = go_rules._zobrist_key(r, c, color)
+            assert key == go_rules._ZOBRIST_TABLE[idx], "寻址必须是 (行,列) 而非 r*n+c"
+            assert key == go_rules._zobrist_entry(label), "表项必须只由标签决定"
+    assert go_rules._zobrist_key(2, 3, 1) != go_rules._zobrist_key(2, 3, -1), "两色不同钥匙"
+    assert go_rules._zobrist_key(2, 3, 1) != go_rules._zobrist_key(3, 2, 1), "坐标不共用钥匙"
+    # 表必须覆盖到 19 路（否则大盘口会静默撞钥匙）
+    assert go_rules._ZOBRIST_STRIDE >= 19
+
+
+def _greedy_new_move(b):
+    """确定性取一手「合法、非自杀、且不造成重复局面」的着法（最小索引优先）。
+
+    过滤重复局面是为了让夹具在 P2.6a-2 接入 PSK 之后**依然合法**。
+    返回 -1 表示无此着（pass）。
+    """
+    for mv in np.flatnonzero(b.get_legal_moves(check_suicide=True)).tolist():
+        if not b._would_repeat(b.hash_after_move(mv)):
+            return mv
+    return -1
+
+
+def test_small_board_move_cap_is_two_n_squared():
+    """5 路默认上限 = 2·n² = 50 手（不是 9 路那个 162）：上限逐盘口生效。
+
+    用一条**真实可达、全程无重复局面**的 5 路走子（24 实着 + 24 pass = 48 手）把它落到
+    具体手数上：默认上限仍未触发，而显式传 48 立刻终局 —— 两者一夹，默认上限落在
+    (48, ...]；配合下面按盘口核对公式的断言，5 路这条就是 2·5² = 50。
+
+    为什么停在 48 而不是 50（这条事实本身对 P2.6a-2 有用）：5 路只有 25 个点，
+    24 颗子之后剩下那个点已是**自己的眼**（下上去是自杀），所以第 25 手实着必须靠一次
+    提子腾地方 —— 而提子必然让某个局面重复（回提的位置与之前逐字节相同），那是 superko
+    着法。P2.6a-2 把 Tromp-Taylor 的「重复即终局」接上之后，小盘口的 2·n² 上限实际上
+    近乎死规则。同理，§7 那条 9 路上限测试用的 27 遍三劫循环全是 superko 着法，
+    接入 PSK 时必须换夹具。
+    """
+    for n in (SMALL, N, 13):
+        c = GoBoard(n)
+        assert c.is_terminal(max_moves=0) is True, "上限比较是 move_number >= max_moves"
+        assert c.is_terminal() is False, f"{n} 路默认上限 2n²={2 * n * n}，开局不该终局"
+
+    b = GoBoard(SMALL)
+    for i in range(24):
+        mv = _greedy_new_move(b)
+        assert mv >= 0, f"第 {i} 手应还有不重复的实着可下"
+        assert b.play(mv) is True
+        assert b.num_passes == 0, "实着必须清零连续 pass 计数"
+        assert b.play(-1) is True
+    assert b.move_number == 48
+    assert b.num_passes == 1, "末手是 pass，但没有连续两次 -> 终局只可能由上限触发"
+    assert len(b._pos_hash_counts) == 49, "48 手 + 开局 = 49 个互不相同的局面"
+    assert b.is_repetition() is False
+    assert b.is_terminal(max_moves=48) is True, "显式上限 48 立刻终局"
+    assert b.is_terminal(max_moves=49) is False
+    assert b.is_terminal() is False, "48 手时 5 路默认上限（50）未触发"
+    assert b.is_game_over() is False
 
 
 if __name__ == "__main__":

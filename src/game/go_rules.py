@@ -126,15 +126,10 @@ class GoBoard:
         self.board = np.zeros((n, n), dtype=np.int8)
         self.current_player = 1  # 1=黑, -1=白
         self.ko_point = -1       # 打劫禁着点（扁平坐标），-1 表示无
-        self.passes = 0          # 连续 pass 计数
-        # 已落手数（含 pass）。刻意不从 move_history 派生：clone() 有意不带
-        # move_history（MCTS 叶子只要推演状态），派生会让子局的计数归零。
-        self.move_number = 0
-        self.move_history = []   # 记录每步落子扁平坐标，pass 记为 -1
-        self._undo_stack = []    # 撤销栈：每项 (move, captured|None, prev_ko, prev_passes, prev_player)
-        self._legal_cache = None
-        self._legal_cache_suicide = None
-        self._reset_hash_state()
+        # 其余全部字段（对局进度 + 哈希 + 重复局面历史）由 _adopt_as_new_game()
+        # 统一重建 —— 「新的一局」在 GoBoard 里只有这一处实现，reset 与外部盘面接管
+        # 共用它，两条路径不可能长歪。
+        self._adopt_as_new_game()
 
     def clone(self) -> "GoBoard":
         """轻量克隆：复制推演所需状态（盘面/执子方/劫/连续 pass 计数/落子数/
@@ -310,6 +305,11 @@ class GoBoard:
         """按盘面全量重算哈希（棋盘 + 行棋方）。
 
         只在重置 / 侦测到哈希与盘面脱钩时用；正常落子走增量，不做全盘重算。
+
+        ⚠ 前提：board 的取值只可能是 -1/0/1（本类只写这三个值），因此 `_zobrist_key`
+        里用 `color > 0` 判黑在这里是等价的。若将来同一个数组里要放别的非零取值
+        （例如死活 / 气紧之类的辅助标记），**这里会静默把它们按白子算进哈希** ——
+        那时必须改成按取值分派钥匙，而不是继续沿用 `> 0`。
         """
         h = _ZOBRIST_TO_PLAY[0 if self.current_player > 0 else 1]
         board = self.board
@@ -318,8 +318,44 @@ class GoBoard:
             h ^= _zobrist_key(r, c, int(board[r, c]))
         return h
 
-    def _reset_hash_state(self) -> None:
-        """把哈希与历史重置为「当前盘面即一局之始」：历史 = {当前局面}。"""
+    def _adopt_as_new_game(self) -> None:
+        """把当前盘面 + 行棋方**采纳**为「从此刻开局的一局新对局」。唯一实现。
+
+        这是「外部盘面接管」的唯一入口，三处共用同一个函数（所以三条路径不可能长歪）：
+          - `reset()`：造完空盘后调用；
+          - `_ensure_hash()`：侦测到 board 数组被换掉 / current_player 被改写时自动调用；
+          - `resync_hash()`：调用方手搓盘面后的显式入口。
+
+        **归零而不是沿用旧值**：来路不明的旧状态与新盘面之间没有任何因果关系，留着只会
+        让「盘面 / 哈希 / 历史」三者互相矛盾。实测过的两种症状：字段拷贝路径上
+        move_number 停在上一局的计数（却是 0），而「只改写 current_player」那一支会
+        重算哈希却保留旧历史，于是当前局面的哈希根本不是历史的键，
+        `_would_repeat(hash())` 对「就是当前局面」的位置返回假。
+        宁可漏判重复，也绝不误禁合法着法。
+
+        归零（**对局进度**，属于上一局）：
+          passes = 0        连续 pass 计数
+          move_number = 0   已落手数（含 pass）。刻意不从 move_history 派生：clone() 有意
+                            不带 move_history（MCTS 叶子只要推演状态），派生会让子局归零。
+          move_history = [] 落子扁平坐标序列，pass 记为 -1
+          _undo_stack = []  撤销栈，每项 (move, captured|None, prev_ko, prev_passes,
+                            prev_player)。必须一起清：栈里存的是上一局的着法，撤销它会把
+                            上一局的子恢复到新盘上，并且回滚时会把刚重建的历史弹空。
+          _legal_cache / _legal_cache_suicide = None
+                            盘面可能被换过，缓存的掩码属于旧盘面。
+        保留（**局面描述**，调用方写了什么就是什么）：
+          board、current_player、**ko_point**。ko_point 是「盘面 + 上一手」的性质而不是
+          对局进度：Tromp-Taylor 规则 6 的 PSK 只看盘面涂色，而简单劫是它「只禁紧邻上一手
+          之前那个局面」这一条更弱的限制，所以从该局面开新局时劫禁着照样成立。
+          light_rollout 显式拷贝 ko_point 要的就是这个语义，不能在这里清掉。
+        重建：按盘面重算哈希，历史 = {当前局面}（**绝不伪造父局历史**）。
+        """
+        self.passes = 0
+        self.move_number = 0
+        self.move_history = []
+        self._undo_stack = []
+        self._legal_cache = None
+        self._legal_cache_suicide = None
         self._zobrist = self._hash_from_board()
         self._zobrist_ref = self.board
         self._zobrist_player = self.current_player
@@ -327,32 +363,35 @@ class GoBoard:
         self._pos_hash_counts = {self._zobrist: 1}
 
     def _ensure_hash(self) -> None:
-        """O(1) 守卫：侦测「增量哈希与盘面/行棋方脱钩」并修正。
+        """O(1) 守卫：侦测「增量哈希与盘面/行棋方脱钩」，并把当前局面**接管成一局新局**。
 
-        play() / undo() / hash() 的入口都调它。两种脱钩：
-          - board **数组对象**被整体换掉（如 light_rollout 的只读推演逐字段赋值）：
-            采纳为「从该局面开局」的新对局 —— 当前哈希按盘面重算，历史只含它自己。
-            绝不伪造父局历史：宁可漏判重复，也不误禁合法着法。
-          - 只有 current_player 被直接改写：按盘面重算哈希，保留既有历史。
+        入口（与本 docstring 保持一致）：`play()` / `undo()` / `hash()` /
+        `hash_after_move()` / `is_repetition()` / `_would_repeat()` 全部先调它。
+        `get_legal_moves()` 不调（它不碰哈希）。
+
+        两种脱钩的处置**完全相同**，都走 `_adopt_as_new_game()`（契约见其 docstring）：
+          - board **数组对象**被整体换掉（如 light_rollout 的只读推演逐字段赋值）；
+          - 只有 current_player 被直接改写。
+        两者都按「以此局面为新局」处理：不保留来路不明的旧历史，也不保留旧的对局计数。
         （就地改写 board 元素、不换数组对象是察觉不到的 —— 那条路径必须由调用方
         显式 resync_hash()，见该方法。）
         """
         if self._zobrist_ref is self.board and self._zobrist_player == self.current_player:
             return
-        if self._zobrist_ref is not self.board:
-            self._reset_hash_state()
-        else:
-            self._zobrist = self._hash_from_board()
-            self._zobrist_player = self.current_player
+        self._adopt_as_new_game()
 
     def resync_hash(self) -> None:
-        """把当前盘面与行棋方**采纳**为「从此刻开局」：重算哈希，历史 = {当前局面}。
+        """把当前盘面与行棋方**采纳**为「从此刻开局的一局新对局」（显式入口）。
 
         外部直接手搓棋盘（测试夹具、导入外部局面、只读推演）后必须调用，否则增量
-        哈希与盘面不一致。整体替换 board 数组的场景 _ensure_hash() 会自动采纳，
+        哈希与盘面不一致。整体替换 board 数组的场景 `_ensure_hash()` 会自动采纳，
         本方法是给「就地改写」用的显式入口。
+
+        语义与自动采纳**逐字段一致**（共用 `_adopt_as_new_game`）：move_number /
+        passes / move_history / _undo_stack 归零，重复局面历史重建为 {当前局面}；
+        ko_point 与盘面、行棋方一样按调用方写的保留。
         """
-        self._reset_hash_state()
+        self._adopt_as_new_game()
 
     def hash(self) -> int:
         """当前局面（棋盘 + 行棋方，即 PSK 意义上的局面）的 Zobrist 哈希。
@@ -402,7 +441,11 @@ class GoBoard:
 
         「历史」含初始空局面。**落子前**在候选哈希上问 —— 因为 play() 每次落子后
         都会把新局面的哈希追加进历史，落子后再自查必然为真。
+
+        同样先过 `_ensure_hash()`：历史若属于另一个盘面，命中判定就毫无意义
+        （O(1) 恒等比较，不在热路径上）。
         """
+        self._ensure_hash()
         return candidate_hash in self._pos_hash_counts
 
     def is_repetition(self) -> bool:
@@ -555,7 +598,12 @@ class GoBoard:
         完整恢复：棋盘子与被提子、劫禁着点、pass 计数、着法历史、执子方、落子数、
         Zobrist 哈希、重复局面历史（含出现次数）。
         返回是否成功（栈空返回 False）。
+
+        入口同样先过 `_ensure_hash()`：若盘面/行棋方已被外部改写，接管会连带清空
+        属于旧局的撤销栈，于是这里返回 False —— 而不是拿旧局的着法去恢复一颗
+        新盘上不存在的棋子。
         """
+        self._ensure_hash()
         if not self._undo_stack:
             return False
         move, captured, ko, passes, player = self._undo_stack.pop()
