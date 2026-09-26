@@ -27,6 +27,8 @@ buffer 从未攒到训练阈值时 `train_epochs` 一次都没跑，一个权重
     单卡或未启用早停时零 collective
   - 结构锁：广播点不在任何 `is_main` 分支内、stop_flag 在 epoch for 之前创建、
     epoch/step 两层各一处 `stop_flag` break
+  - 早停计数器只有一个权威：跨指标（top1）复位已删除，判定函数独占归零规则
+  - 结构锁：selfplay 无恒真嵌套的 `if is_main:`
   - `_save_checkpoint` / `_finalize_checkpoint`：返回真实落盘路径；
     从未存过时收尾补存、存过则原样返回且不写盘
 
@@ -51,6 +53,12 @@ sys.path.insert(0, ROOT)
 
 import scripts.selfplay_train as st          # noqa: E402
 import scripts.train_sft as t                # noqa: E402
+
+
+def _read_source(module):
+    """读被导入模块的源文件全文（结构锁要覆盖 main() 之外的函数体，如判定函数）。"""
+    with open(module.__file__, encoding='utf-8') as fh:
+        return fh.read()
 
 
 # --------------------------------------------------------------------------- #
@@ -223,6 +231,152 @@ def test_two_breaks_one_per_loop():
     assert len(inside) == 1, 'step 循环内必须 break（否则继续训完本 epoch 剩下的 step）'
     assert len(outside) == 1, \
         'epoch 循环内、step 循环外必须再 break 一次（缺它 = 早停只跳 batch，训练照跑完）'
+
+
+# --------------------------------------------------------------------------- #
+# 早停计数器：**唯一权威**是判定函数（跨指标复位已删除）
+#
+# 修复前 main() 在「top1 刷新最佳 → 保存模型」分支里顺手写了第二处
+# `early_stop_counter = 0`。top1 与 `--early-stop-metric` 是两个独立指标：
+# top1 改善不代表早停指标改善。于是每次 top1 涨就把计数抹平，loss 迟迟不动
+# 也攒不满 patience，早停形同虚设。默认 `--early-stop-metric top1` 路径自洽，
+# 所以一直没被发现。
+# --------------------------------------------------------------------------- #
+def test_counter_not_reset_by_other_metric():
+    """`--early-stop-metric loss` 时，别的指标（top1）改善不得清零计数器。"""
+    # 连续 3 次 eval：top1 一路涨（0.50 → 0.60），早停指标 loss 死死不动（0.30）
+    best_metric, counter = 0.30, 0
+    for k, top1 in enumerate((0.50, 0.55, 0.60), start=1):
+        improved, new_counter, should_stop = t._early_stop_decision(
+            'loss', 0.30, best_metric, counter, 3)
+        assert not improved, \
+            f'第 {k} 次：loss 没变就不是改善（同期 top1={top1} 涨了也不算数）'
+        assert new_counter == k, (
+            f'第 {k} 次：top1={top1} 改善但早停指标未改善，计数器应累加到 {k}，'
+            f'实际 {new_counter} —— 跨指标复位会让它永远是 0，patience 攒不满')
+        assert should_stop == (k == 3), \
+            f'第 {k} 次的 should_stop 应为 {k == 3}，实际 {should_stop}'
+        counter = new_counter
+
+    # 早停指标**自身**改善 → 归零（唯一有权归零的地方）
+    assert t._early_stop_decision('loss', 0.29, best_metric, counter, 3) == (True, 0, False), \
+        '早停指标自身改善时必须清零，否则早过一次就直接早停'
+
+
+# 用例「top1 路径改善仍归零 / 非改善仍累加 / patience 边界含等号」由 P1.4 已有的
+# `test_counter_resets_on_improvement_and_stops_at_patience`（top1 段：0.6>0.5 →
+# 0、0.4<0.5 → +1、再 +1 恰停）与 `test_patience_boundary_is_exactly_counter_ge_patience`
+# 覆盖，按 brief 要求复用而非重复造。删除 :1743 的跨指标复位不影响它们 ——
+# 那条复位在 main() 里，不在判定函数内。
+
+_TRAIN_SRC = _read_source(t)
+_SELFPLAY_SRC = _read_source(st)
+_TRAIN_TREE = ast.parse(_TRAIN_SRC)
+_SELFPLAY_TREE = ast.parse(_SELFPLAY_SRC)
+
+
+def _parent_map(tree):
+    return {id(c): p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
+
+
+def _chain(node, parents):
+    cur = parents.get(id(node))
+    while cur is not None:
+        yield cur
+        cur = parents.get(id(cur))
+
+
+def _one_func(tree, name):
+    found = [n for n in ast.walk(tree)
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name]
+    assert len(found) == 1, f'should be exactly 1 def {name}, got {len(found)}'
+    return found[0]
+
+
+def _assigns_to(node, name):
+    """`node` 是否把 `name` 赋成值（含 `a, name, b = ...` 这种元组解包）。"""
+    if not isinstance(node, ast.Assign):
+        return False
+    for tg in node.targets:
+        for sub in ast.walk(tg):
+            if isinstance(sub, ast.Name) and sub.id == name:
+                return True
+    return False
+
+
+def _calls(node, func_name):
+    return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+        and node.func.id == func_name
+
+
+def _src(texts):
+    return '; '.join(x.strip() for x in texts)
+
+
+def test_counter_reset_only_inside_decision_function():
+    """`early_stop_counter` 的写入点只有两个形态：main() 的初始化 + 接收判定结果。
+
+    **结构锁，修复前必红**：修复前 main() 的「top1 刷新最佳」分支里还有第三处
+    `early_stop_counter = 0` —— 一个计数器两个权威，`--early-stop-metric loss` 时
+    patience 永远攒不满。
+    """
+    assert _TRAIN_SRC.count('early_stop_counter = 0') == 1, (
+        f"train_sft.py 里有 {_TRAIN_SRC.count('early_stop_counter = 0')} 处 "
+        f"`early_stop_counter = 0`，应恰好 1 处（main() 的初始化）—— 多出来的那处"
+        f"是「最佳模型保存」判据(top1)在跨指标复位早停计数器")
+
+    decision = _one_func(_TRAIN_TREE, '_early_stop_decision')
+    main_fn = _one_func(_TRAIN_TREE, 'main')
+    writes = [n for n in ast.walk(_TRAIN_TREE) if _assigns_to(n, 'early_stop_counter')]
+
+    def _role(w):
+        # 直接挂在 main() 体上 = 一次性初始化（唯一允许的字面 0）
+        if w in main_fn.body:
+            return 'init'
+        # 其余只允许「值来自 _early_stop_decision(...)」= 接收判定结论
+        if _calls(w.value, '_early_stop_decision'):
+            return 'from_decision'
+        return 'rogue'
+
+    roles = sorted(_role(w) for w in writes)
+    rogues = [w for w in writes if _role(w) == 'rogue']
+    assert not rogues, (
+        f'train_sft.py:{[w.lineno for w in rogues]} 在 `_early_stop_decision` 之外'
+        f'以非判定结果的形式改写 `early_stop_counter`（{_src(rogues)}）—— 计数器只能由'
+        f'判定函数独占维护，否则「最佳模型保存」判据与「早停判据」两个独立指标会互相污染')
+    assert roles == ['from_decision', 'init'], \
+        f'`early_stop_counter` 的写入点应恰好是 [初始化, 接收判定结果] 两个，实际 {roles}'
+
+    # 归零规则本身只在判定函数里（new_counter = 0 if improved else counter + 1）
+    zero_rules = [n for n in ast.walk(decision)
+                  if isinstance(n, ast.Assign) and isinstance(n.value, ast.IfExp)
+                  and any(isinstance(tg, ast.Name) and tg.id == 'new_counter'
+                          for tg in n.targets)]
+    assert len(zero_rules) == 1, \
+        f'_early_stop_decision 里应有且仅有一条「改善则归零」规则，实际 {len(zero_rules)}'
+    assert isinstance(zero_rules[0].value.body, ast.Constant) \
+        and zero_rules[0].value.body.value == 0, '改善分支必须把计数器置 0'
+    assert ast.unparse(zero_rules[0].value.test) == 'improved', \
+        '归零条件必须是早停指标自身的改善'
+
+
+def test_no_dead_nested_is_main_in_selfplay():
+    """selfplay_train.py 不得有 `if is_main:` 直接嵌在另一个 `if is_main:` 内。
+
+    **结构锁，修复前必红**：内层判据恒真（外层已判过），是纯噪音；P1.4 删掉了第三处，
+    剩 async 分支的 NEW BEST 打印与同步分支的 loss 打印两处。
+    """
+    parents = _parent_map(_SELFPLAY_TREE)
+    nested = []
+    for n in ast.walk(_SELFPLAY_TREE):
+        if isinstance(n, ast.If) and ast.unparse(n.test) == 'is_main':
+            if any(isinstance(a, ast.If) and ast.unparse(a.test) == 'is_main'
+                   for a in _chain(n, parents)):
+                nested.append(n.lineno)
+
+    assert not nested, (
+        f'selfplay_train.py 第 {nested} 行是恒真嵌套的 `if is_main:` —— 外层已经判过，'
+        f'内层永远为真；应删掉内层判断、缩进外移（打印内容一个字都不改）')
 
 
 # --------------------------------------------------------------------------- #

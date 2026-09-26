@@ -1738,9 +1738,14 @@ def main():
                             }, step=step)
                         except Exception as e:
                             logger.warning("[swanlab] eval log 失败: %s", e)
+                # 「最佳模型保存」判据（top1，越大越好）只负责 best_eval_acc 与落盘，
+                # 与「早停判据」（--early-stop-metric）无关 —— 哪怕默认值下两者都读
+                # top1，语义上仍是两个独立指标。早停计数器由 _early_stop_decision
+                # 独占维护（改善则归零、无改善则累加），此处复位会让
+                # --early-stop-metric loss 的 patience 被 top1 的改善反复抹平、
+                # 永远攒不满，早停形同虚设。
                 if metrics['top1'] > best_eval_acc:
                     best_eval_acc = metrics['top1']
-                    early_stop_counter = 0  # 重置早停计数器
                     if is_main:
                         if ema is not None:
                             ema.apply_shadow()

@@ -1110,8 +1110,7 @@ def main():
                             best_loss = avg_loss
                             best_path = _save_checkpoint(ai, args, bs, it)
                             saved_any = True
-                            if is_main:
-                                print(f"[iter {it}] NEW BEST loss={avg_loss:.4f}", flush=True)
+                            print(f"[iter {it}] NEW BEST loss={avg_loss:.4f}", flush=True)
 
                         # 清空 buffer
                         buffer = []
@@ -1172,22 +1171,21 @@ def main():
                     print(f"[iter {it}/{args.iters}] NEW BEST loss={avg_loss:.4f} "
                           f"-> {best_path}", flush=True)
 
-                if is_main:
-                    print(f"[iter {it}/{args.iters}] loss={avg_loss:.4f} buffer={len(buffer)} "
-                          f"games={total_games} {dt:.0f}s", flush=True)
-                    # SwanLab 记录迭代指标
-                    if swanlab_logger is not None:
-                        z_arr = np.asarray([b[2] for b in buffer[:min(len(buffer), 4096)]])
-                        swanlab.log({
-                            "iter_loss": avg_loss,
-                            "iter_games": total_games,
-                            "buffer_size": len(buffer),
-                            "iter_time_s": dt,
-                            "games_per_iter": collected if 'collected' in locals() else 0,
-                            "td/z_mean": float(z_arr.mean()),
-                            "td/z_std": float(z_arr.std()),
-                            "td/enabled": args.td,
-                        }, step=it)
+                print(f"[iter {it}/{args.iters}] loss={avg_loss:.4f} buffer={len(buffer)} "
+                      f"games={total_games} {dt:.0f}s", flush=True)
+                # SwanLab 记录迭代指标
+                if swanlab_logger is not None:
+                    z_arr = np.asarray([b[2] for b in buffer[:min(len(buffer), 4096)]])
+                    swanlab.log({
+                        "iter_loss": avg_loss,
+                        "iter_games": total_games,
+                        "buffer_size": len(buffer),
+                        "iter_time_s": dt,
+                        "games_per_iter": collected if 'collected' in locals() else 0,
+                        "td/z_mean": float(z_arr.mean()),
+                        "td/z_std": float(z_arr.std()),
+                        "td/enabled": args.td,
+                    }, step=it)
 
                 # 同步模式：每轮训练完成后重置 buffer（训完即清，避免旧局
                 # 与新网络视角的 TD 标签混用；与 async 分支清空语义一致）
