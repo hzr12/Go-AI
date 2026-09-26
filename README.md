@@ -144,7 +144,10 @@ Go-AI/
   - `score()` → `float`：Tromp-Taylor 数子，**黑 − 白** 目数（终局判定）。
   - `parse_move_str(s, color)` → `(ok, mv)`：坐标串（如 `"ce"`）转扁平索引。
   - `to_string()`：文本化棋盘（供 CLI 展示）。
-- 规则：气(liberties)计算、提子、`ko_point` 单劫禁着、双 pass 终局。贴目 `komi` 默认 6.5（中国规则常用）。
+- 规则：气(liberties)计算、提子、**禁自杀**、**位置超级劫（PSK，重复染色即非法）**、双 pass 终局。
+  `ko_point` 仍会计算，但只是「上一手是否形成单劫」的**只读描述位，不参与合法性**（PSK 已覆盖简单劫）。
+  贴目 `komi` 默认 6.5（中国规则常用）。自杀与 PSK 属 Tromp-Taylor 口径（禁自杀是相对 TT 的有意偏离，
+  TT 规则本身允许自提）。
 - 克隆：无 `clone()` 方法，MCTS 用 `copy.deepcopy(board)` 复制局面。
 
 ### 4.2 特征平面（12 通道）
