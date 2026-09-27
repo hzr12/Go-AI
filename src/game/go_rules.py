@@ -148,6 +148,30 @@ def _zobrist_key(r: int, c: int, color: int) -> int:
 # 与 _neighbor_groups / _group_has_liberty / _group_liberty_count 里的内联写法同义。
 _NB4 = ((-1, 0), (1, 0), (0, -1), (0, 1))
 
+# 每个 (board_size, color) 一份的扁平钥匙数组（uint64），供掩码的 PSK 段向量化。
+# ⚠ **必须是 uint64 而不是 int64**：`_ZOBRIST_MASK = 2**64 - 1`，所以一把钥匙
+#   可以 >= 2**63，落进 int64 会 OverflowError；而掩码算的是 `pos_key ^ key`
+#   （同样可能 >= 2**63），`searchsorted` 也要求两侧同 dtype。
+# 盘口只有 5/9/13/19 几种，缓存最多 8 条目，构建成本一次性。
+_ZKEY_ARRAYS = {}
+
+# 掩码走向量化的盘口面积阈值（格）。数值来自实测交叉点，见
+# `GoBoard._vectorized_mask_worth_it` 的 docstring —— **别拍脑袋改**，改之前先重测。
+_VECTORIZED_MASK_MIN_CELLS = 256
+
+
+def _zkey_array(n: int, color: int):
+    """(n*n,) uint64 数组：第 r*n+c 项 = 该点上的 color 色 Zobrist 钥匙。"""
+    cached = _ZKEY_ARRAYS.get((n, color))
+    if cached is None:
+        base = np.arange(n, dtype=np.int64)[:, None] * _ZOBRIST_STRIDE
+        idx = (2 * (base + np.arange(n, dtype=np.int64)[None, :])
+               + (0 if color > 0 else 1)).ravel()
+        cached = np.fromiter((_ZOBRIST_TABLE[i] for i in idx),
+                             dtype=np.uint64, count=idx.size)
+        _ZKEY_ARRAYS[(n, color)] = cached
+    return cached
+
 
 def _groups_desync_error(r, c):
     """棋块/气表与盘面脱钩时的异常（就地改写 board 却没 resync_hash 的后果）。
@@ -338,6 +362,9 @@ class GoBoard:
         # 扁平视图必须指向**克隆体自己**那份数组（否则写回会写进源棋盘的数组）
         nb._gid_flat = nb._gid.reshape(-1) if nb._gid is not None else None
         nb._groups_valid = self._groups_valid
+        # 气数查找表（掩码向量化用）：必须各自一份，否则一个克隆体落子会改掉
+        # 源棋盘的气数
+        nb._lib_count = self._lib_count.copy() if self._lib_count is not None else None
         # 克隆体的撤销栈从空开始，所以「未记录落子」的计数也从 0 起算
         nb._unrecorded_seq = 0
         nb._zobrist = self._zobrist
@@ -348,6 +375,10 @@ class GoBoard:
         nb._zobrist_player = self._zobrist_player
         nb._pos_hash_history = list(self._pos_hash_history)
         nb._pos_hash_counts = dict(self._pos_hash_counts)
+        # 只在本盘口走向量化时才维护它（小盘口可能是 None）—— 见 _sorted_history_keys
+        nb._pos_sorted = (self._pos_sorted.copy()
+                          if (self._pos_sorted is not None
+                              and self._vectorized_mask_worth_it()) else None)
         return nb
 
     # ---- 基础查询 ----------------------------------------------------------
@@ -446,6 +477,58 @@ class GoBoard:
         if self._legal_cache is not None:
             return self._legal_cache
 
+        # 实际计算走哪条实现由**盘口大小**决定（见 `_vectorized_mask_worth_it`）：
+        # 大盘口走向量化，小盘口走标量。本方法的 docstring 描述的是**规则语义**；
+        # 实现在哪条路上、谁快谁慢，是实现细节。
+        if self._vectorized_mask_worth_it():
+            legal = self._legal_masks_vectorized()
+        else:
+            legal = self._legal_masks_reference()
+        self._legal_cache = legal.copy()
+        return legal
+
+    def _vectorized_mask_worth_it(self) -> bool:
+        """掩码该走向量化还是标量？**按盘口面积分派**，理由是实测出来的。
+
+        两条实现的成本形状完全不同：
+
+          - 标量（`_legal_masks_reference`）：成本**正比于空点数**。
+            实测 9 路 81 点 0.056 ms、13 路 0.090 ms、19 路中局 179 点 0.257 ms。
+          - 向量化（`_legal_masks_vectorized`）：成本**近乎固定**在 ~0.10 ms ——
+            numpy 每个算子调用的固定开销约 1.5-2 µs，而那条实现一次要 ~50 个算子
+            （补边 2 次 `full` + 1 次 `copyto`、四个方向各 2 次切片 + 1 次聚集 +
+            3 次比较 + 2 次 `|=`、PSK 的 XOR/searchsorted/clip/比较/花式赋值、
+            外加脱钩守卫的两次归约）。81 个点的工作量根本填不满这些调用开销。
+
+        于是交叉点落在 13 路与 19 路之间：19 路向量化快 1.9 倍，小盘口标量快
+        1.8~4.8 倍。阈值取 256 格（16 路及以上；仓库里实际只有 19 路触发）。
+
+        ⚠ **这不是「向量化总是更好」**：把一条 numpy 实现当唯一实现、只在大盘口上
+        测过，是很常见的自欺。两条实现都被 `tests/test_go_vectorized_mask.py`
+        在随机对弈的每一手上**逐位对拍**，所以分派阈值调整不会带来语义风险。
+        """
+        return self.board_size * self.board_size >= _VECTORIZED_MASK_MIN_CELLS
+
+    def _legal_masks_reference(self):
+        """**逐候选标量实现**，与 `_legal_masks_vectorized()` 逐位同义。
+
+        双重身份：
+          - **小盘口的生产路径**（见 `_vectorized_mask_worth_it`）；
+          - **大盘口的语义 oracle** —— `tests/test_go_vectorized_mask.py` 在随机对弈的
+            **每一手**上断言 `get_legal_moves()` 与本方法**逐位相同**。两条实现风格
+            完全不同（一条逐点 Python + 查表，一条整盘 numpy 聚集），互为对照，
+            任何一条 drifted 都不会被另一条的实现细节掩盖。
+
+        保留它的理由与 P2.7a 保留 flood fill 版 `_group_has_liberty*` 完全一样。
+
+        本方法与向量化版共享同一条不变量：
+          「落点此刻是空点 -> 它必然落在每个相邻块的气里」
+        所以「除落点外的气数」这一个整数就同时回答了非自杀（>0）与提子（==0）。
+        **别在这里加新判据** —— 加了就得同步到向量化版，而向量化版靠
+        `tests/test_go_vectorized_mask.py` 与随机局不变量兜底。
+        """
+        # ⚠ 本方法只在**小盘口**当生产路径（见 _vectorized_mask_worth_it），
+        #   同时是向量化那条路的语义 oracle（测试逐位对拍）。
         n = self.board_size
         color = self.current_player
         legal = (self.board == 0).reshape(-1)
@@ -509,9 +592,92 @@ class GoBoard:
                     cand = pos_key ^ zkey(r, c, color)
                 if cand in counts:
                     legal[i] = False
-
-        self._legal_cache = legal.copy()
         return legal
+
+    def _legal_masks_vectorized(self):
+        """**向量化实现（生产路径）** —— 整盘 numpy，一次算完所有候选点。
+
+        语义与 `_legal_masks_reference()`（标量 oracle）**逐位相同**，由
+        `tests/test_go_vectorized_mask.py` 逐步对拍钉住。这里只讲「怎么算」。
+
+        ---- 结构判据（禁自杀 + 提子）整盘化 ----
+        标量版对每个空点做一次 4 邻域扫描；这里改成「对每个方向做一次整盘比较」：
+        用一个 **1 格补边**的 (n+2, n+2) 数组把越界邻居纳入运算 ——
+          - board 补 **2**（既不是 0 也不是 ±1）；
+          - gid 补**哨兵号 n*n**；
+        于是越界邻居对三个判据都零贡献，不需要任何越界分支。
+        哨兵槽的气数恒为 0，于是它的「除落点外的气数」= -1，既不 >0 也不 ==0。
+        ⚠ **空点也映射到哨兵槽**，且这一步是**显式**的（`np.copyto(..., where=)`）：
+        空点的 gid 是 -1，而 numpy 的 -1 索引会**绕到数组末尾** —— 末尾恰好也是哨兵槽，
+        值同样是 0，所以「碰巧对」。**不许依赖这个巧合**，显式换掉更便宜也更清楚。
+
+        气数靠**一次聚集**拿到：`rest = _lib_count[shifted_gid] - 1`。
+        `_lib_count` 由 `play()` / `undo()` 增量维护（与 `_groups` 同步），
+        所以这里没有任何 Python 层的逐点循环。
+
+        ---- PSK 整盘化 ----
+        不提子的候选键是 `pos_key ^ zkey(r, c, color)`，整盘一次 XOR 算完；
+        「命中历史」用 **排序 + searchsorted**（历史是 uint64 键的 dict，
+        一次 mask 调用里历史不变，所以每轮排序一次即可）。
+        提子的候选才逐个走 `position_hash_after_move()` 的完整推演 —— 数量极少
+        （中盘通常 0~3 个），保留 Python 循环是划算的。
+
+        ---- 脱钩守卫 ----
+        表与盘面脱钩（就地改写 board 却没 resync）时，标量版会抛
+        `_groups_desync_error`；这里若不查就会**静默算错**（哨兵槽让 -1 看起来
+        像空点）。所以先花两次归约确认「表里的空点数 == 盘面空点数」，
+        不等就抛同一个错 —— 保住「失败方式大声」这条性质。
+        """
+        n = self.board_size
+        n2 = n * n
+        color = self.current_player
+        opponent = -color
+        self._ensure_groups()
+
+        board = self.board
+        is_empty = (board == 0)
+
+        # ---- 脱钩守卫（两次归约，~1-2 µs；换「失败方式大声」）----
+        if int((self._gid < 0).sum()) != int(is_empty.sum()):
+            bad = np.argwhere((self._gid < 0) & ~is_empty)
+            r, c = (int(bad[0][0]), int(bad[0][1])) if bad.size else (0, 0)
+            raise _groups_desync_error(r, c)
+
+        # ---- 补边 ----
+        bp = np.full((n + 2, n + 2), 2, dtype=np.int8)
+        bp[1:-1, 1:-1] = board
+        gp = np.full((n + 2, n + 2), n2, dtype=np.int32)
+        np.copyto(gp[1:-1, 1:-1], self._gid, where=self._gid >= 0)
+        lib_count = self._lib_count
+
+        # ---- 四个方向各一次整盘比较 ----
+        liberty = np.zeros((n, n), dtype=bool)
+        capture = np.zeros((n, n), dtype=bool)
+        for dr, dc in _NB4:
+            shb = bp[1 + dr:1 + dr + n, 1 + dc:1 + dc + n]
+            shg = gp[1 + dr:1 + dr + n, 1 + dc:1 + dc + n]
+            rest = lib_count[shg] - 1          # 「除落点外的气数」
+            liberty |= (shb == 0) | ((shb == color) & (rest > 0))
+            capture |= (shb == opponent) & (rest == 0)
+
+        legal = is_empty & (liberty | capture)
+        flat = legal.reshape(-1)
+        idx = np.flatnonzero(flat)
+        if idx.size:
+            # ---- PSK（TT 规则 6）----
+            cap_flat = capture.reshape(-1)
+            plain = idx[~cap_flat[idx]]         # 不提子的候选：纯算术
+            if plain.size:
+                cand = np.uint64(self._pos_zobrist) ^ _zkey_array(n, color)[plain]
+                hist = self._sorted_history_keys()   # 已有序
+                if hist.size:
+                    pos = np.searchsorted(hist, cand)
+                    np.clip(pos, 0, hist.size - 1, out=pos)
+                    flat[plain[hist[pos] == cand]] = False
+            for i in idx[cap_flat[idx]].tolist():   # 提子的候选：完整推演（极少）
+                if self._would_repeat(self.position_hash_after_move(i)):
+                    flat[i] = False
+        return legal.reshape(-1)
 
     # ---- 动作空间（OpenSpiel 风格）------------------------------------------
     #
@@ -700,7 +866,8 @@ class GoBoard:
         ≤4 次查表（`len(libs) - (落点在不在里面)`）+ 至多一次提子推演，
         全部与 n² 和块的大小无关。
         实测 19 路随机自对弈中盘（180 手后、179 个合法点）：
-        一次**冷**掩码 0.24 ms，而本方法逐点判定 ≈ 5.2 µs/点 —— 约 1/46。
+        一次**冷**掩码 0.14 ms（19 路走向量化那条路，见 `_vectorized_mask_worth_it`），
+        而本方法逐点判定 ≈ 5.0 µs/点 —— 约 1/28。
         （P2.7a 之前这里是「≤4 个邻块各一次带早退的 flood fill」，19 路 23 µs/点、
         冷掩码 0.66 ms；增量棋块/气表把两者都换成了查表。）
         ⚠ 别拿「掩码有缓存时按位取值只要 0.5 µs」来比：那不是本方法的工作量。
@@ -857,12 +1024,42 @@ class GoBoard:
                 groups[g] = (v, frozenset(libs), frozenset(stones))
         # ⚠ 数组必须在**填完** `gid` 之后才建（早一步建出来的是一张全 -1 的表）。
         self._gid = np.array(gid, dtype=np.int32)
+        # 气数查找表：第 g 号槽 = 块 g 的气数。**第 n*n 号槽是哨兵，恒为 0** ——
+        # 掩码向量化时，越界邻居与空点都被映射到它，于是「除落点外的气数」= -1，
+        # 既不 >0（非自杀判据）也不 ==0（提子判据），对结果零贡献。
+        lc = np.zeros(n * n + 1, dtype=np.int32)
+        for g, rec in groups.items():
+            lc[g] = len(rec[1])
+        self._lib_count = lc
         # 扁平视图：增量写回一次只碰 1 + 合并 + 被提 个点，而 numpy 的
         # fancy-index 在这个量级**比 Python 循环还慢**（实测 1 点 1.24 vs 0.71 µs、
         # 8 点 1.73 vs 1.29 µs，交叉点在 ~20 点）。视图只在重建时取一次。
         self._gid_flat = self._gid.reshape(-1)
         self._groups = groups
         self._groups_valid = True
+
+    def _sorted_history_keys(self):
+        """去重历史键的**有序 uint64 数组** —— 掩码批量查重的唯一数据源。
+
+        走向量化的盘口：直接返回 `_commit_position` / `_rollback_position` 同步维护的
+        `_pos_sorted`（O(1) 摊还地维护，见那里的条件与代价说明）。
+        不走向量化的盘口：标量掩码查的是 dict，本来用不着它 —— 但测试会**两条路径
+        都跑**（9/13 路也直接调 `_legal_masks_vectorized()` 做逐位对拍），所以这里
+        按需**临时**构造一个返回。
+
+        ⚠ 临时的那份**绝不缓存**：缓存它等于给一条「不再被维护」的数组开后门 ——
+        下一次 commit/rollback 不会更新它，向量化路径就会拿着过期数据算 PSK。
+        """
+        if self._vectorized_mask_worth_it():
+            srt = self._pos_sorted
+            if srt is None:
+                # 防御：`board_size` 是公开属性，被改写成更大盘口（或 clone 早于
+                # 任何一次 commit）时可能轮到「走向量化但没有维护好的数组」。
+                # 那就补建一次并缓存 —— 从这一刻起 commit/rollback 会开始维护它。
+                srt = np.array(sorted(self._pos_hash_counts), dtype=np.uint64)
+                self._pos_sorted = srt
+            return srt
+        return np.array(sorted(self._pos_hash_counts), dtype=np.uint64)
 
     def _libs_excluding_count(self, libs, point):
         """`libs`（frozenset）中除 `point` 之外的气数 —— 「这个块除落点外还有气吗」。
@@ -946,10 +1143,9 @@ class GoBoard:
         #   一个已不存在的块号，于是**整段长气被静默跳过** —— 表现为合并块的
         #   气莫名少掉几个（实测：白方合并后的块少了一口气 (7,6)，
         #   而那口气是被提黑子的位置）。
-        flat = self._gid_flat
+        flat_view = self._gid_flat
         for pt, g in zip(points, new_gids):
-            flat[pt] = g
-
+            flat_view[pt] = g
         # ---- 5) 被提的每颗子：它现在的空位是周围存活块的新气 ----
         for flat in cap_stones:
             cr, cc = divmod(flat, n)
@@ -967,6 +1163,24 @@ class GoBoard:
                 if ng not in old_values:
                     old_values[ng] = self._groups[ng]
                 self._groups[ng] = (ncol, nlibs | {flat}, nstones)
+
+        # ---- 6) 气数表：被碰过的块全部重算一遍 ----
+        #
+        # ⚠ **必须排在第 5 步之后**（与上面 gid 写回排在第 4 步之后是同一条理由，
+        #   这里踩的是同一个坑）：第 5 步才给「被提子周围的存活块」加气，而那些块
+        #   的新气**晚于**任何更早的刷新。实测（9 路随机第 42 手）：一个 2 气的黑块
+        #   提子后长到 5 气，气数表却停在 3，于是掩码把它误判成「唯一一口气」=
+        #   提子点，放行了一手自杀 —— 而 `play()` 用的是块表里的真值，正确地拒了。
+        #   两套真相源分叉，症状是「掩码放行、play 拒绝」。
+        #
+        # `old_values` 恰好就是**被碰的块集合**（新建的落点块、合并掉的同色块、
+        # 被删的提子块、增减过气的邻居块），一次 ≤8 次赋值，与盘面大小无关；
+        # 块被删掉了就写 0。
+        lc = self._lib_count
+        gs = self._groups
+        for g in old_values:
+            rec = gs.get(g)
+            lc[g] = len(rec[1]) if rec is not None else 0
         return old_values, points, old_gids, new_gids
 
     def _restore_groups_after_move(self, record) -> None:
@@ -985,9 +1199,14 @@ class GoBoard:
                 self._groups.pop(g, None)
             else:
                 self._groups[g] = val
-        flat = self._gid_flat
+        flat_view = self._gid_flat
         for pt, g in zip(points, old_gids):
-            flat[pt] = g
+            flat_view[pt] = g
+        lc = self._lib_count
+        gs = self._groups
+        for g in old_values:
+            rec = gs.get(g)
+            lc[g] = len(rec[1]) if rec is not None else 0
 
     def _neighbor_groups(self, r, c):
         """返回 (r,c) 的 4 邻域内不同颜色的连通块列表。"""
@@ -1226,6 +1445,7 @@ class GoBoard:
         self._groups = None
         self._gid = None
         self._gid_flat = None
+        self._lib_count = None
         self._groups_valid = False
         self._unrecorded_seq = 0
         self._zobrist = self._hash_from_board()
@@ -1234,6 +1454,14 @@ class GoBoard:
         self._zobrist_player = self.current_player
         self._pos_hash_history = [self._pos_zobrist]
         self._pos_hash_counts = {self._pos_zobrist: 1}
+        # 去重后历史键的**有序数组**（掩码向量化那段的批量查重靠它，见
+        # `_sorted_history_keys`）。它是 `_pos_hash_counts` 的**派生缓存**：dict
+        # 仍是唯一真相源（单键 `in` 判定仍走 dict）。
+        # ⚠ **只在本盘口真的走向量化时才维护**（见 `_commit_position`）：维护它
+        #   要一次 `np.insert`，实测 ~10 µs/手（H=40~200 都一样，它按次数重分配），
+        #   而小盘口走标量路径、压根不查这个数组 —— 白付。实测不条件化时
+        #   9 路自对弈吞吐 8090 -> 5863 步/秒，正是这 13 µs/手。
+        self._pos_sorted = np.array([self._pos_zobrist], dtype=np.uint64)
 
     def _ensure_hash(self) -> None:
         """O(1) 守卫：侦测「增量哈希与盘面/行棋方脱钩」，并把当前局面**接管成一局新局**。
@@ -1470,6 +1698,17 @@ class GoBoard:
         h = self._pos_zobrist
         self._pos_hash_history.append(h)
         self._pos_hash_counts[h] = self._pos_hash_counts.get(h, 0) + 1
+        # 有序数组只收**首次出现**的键（去重）：批量查重只问「在不在」，不问次数。
+        # 已在里面就什么都不做 —— 这一步就是为什么下面 rollback 能无脑 np.delete。
+        # ⚠ 条件化维护：小盘口（标量掩码）不查它，别替它付 np.insert 的 ~10 µs。
+        if self._vectorized_mask_worth_it():
+            srt = self._pos_sorted
+            if srt.size == 0:
+                self._pos_sorted = np.array([h], dtype=np.uint64)
+            else:
+                pos = int(np.searchsorted(srt, np.uint64(h)))
+                if pos >= srt.size or srt[pos] != h:
+                    self._pos_sorted = np.insert(srt, pos, np.uint64(h))
 
     def _rollback_position(self, moved_by: int, move: int, captured) -> None:
         """回退**两套**键并把历史末尾那一项弹出（undo 一次）。
@@ -1492,6 +1731,14 @@ class GoBoard:
             self._pos_hash_counts[last] = remaining
         else:
             del self._pos_hash_counts[last]
+            # 计数归零 = 这个染色在历史里不再存在 -> 从有序数组里删掉它。
+            # （中途还有更早的一次出现时计数 > 0，数组里保留，正确。）
+            # 条件化理由同 `_commit_position`。
+            if self._vectorized_mask_worth_it():
+                srt = self._pos_sorted
+                pos = int(np.searchsorted(srt, np.uint64(last)))
+                if pos < srt.size and srt[pos] == last:
+                    self._pos_sorted = np.delete(srt, pos)
 
     @property
     def to_play(self) -> int:
