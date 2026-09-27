@@ -1,0 +1,19 @@
+{
+  "eval_children_planes": "ef68468f46fb12c8d023cc33b8459f9c8cbaf7354e309e39dcca21facf550493",
+  "fastpolicy_logits": "a17f8b5845e15ca6c6813e044910a86b96d889d9e4b5059cf003f0e2751f6eca",
+  "fixture": {
+    "board_size": 9,
+    "numpy": "1.26.4",
+    "seed": 1234,
+    "torch": "2.12.0+cpu"
+  },
+  "forward_level_planes": "7a7e4fc1e59117b4ee06645290856f3202fd7a10fc9ab32eaba4289f930398d3",
+  "planes1_b1": "a0cb04597263071368ad302f558b8b67b31555bf3ea7f615420e91c1faeaceaa",
+  "planes1_b2": "c445e254b1a94ebe2bbba6521bbcc4e1c4740bb4047520bb578afff5ca0f67c6",
+  "search120_probs": "bbed005ad1ae07ef86fedc3b5810d6dc72ade8d06e7e067ebfeeceb9186222b5",
+  "search120_value": "0.18016924262376485",
+  "search120_visits": "6125e137b28ccdb182e66d631b0cfecf41fcf70671a8b10134d112fce3c36061",
+  "search50_probs": "bbed005ad1ae07ef86fedc3b5810d6dc72ade8d06e7e067ebfeeceb9186222b5",
+  "search50_value": "0.1769211358542359",
+  "search50_visits": "e5bd659deef0a88e2982a546b2d9c1afb9b14cb41d2df82eac702e98e3abc43e"
+}

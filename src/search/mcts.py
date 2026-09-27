@@ -2,7 +2,8 @@
 MCTS 搜索（AlphaGoZero 风格 PUCT），基于 SFT 主线的 GoAI 网络。
 
 与已删除的旧 minimax/MuZero 代码无关：本模块只用 src.game.go_rules.GoBoard
-的 12 通道 feature_planes 与合法着法接口，配合 GoAI.predict_batch 批量评估
+的 feature_planes（**通道数 = 所挂模型的 `in_channels`**，见 `_in_channels`）
+与合法着法接口，配合 GoAI.predict_batch 批量评估
 叶子节点，是推理提速（GPU 上 N=400~800 仅 1-2s/步）的核心。
 
 加速手段：
@@ -133,7 +134,12 @@ class MCTS:
         # 注意：树复用复用根不重新展开，故仅每局首手有噪声——训练管线每局新建树即可。
         self.dir_alpha = float(dirichlet_alpha)
         self.dir_eps = float(dirichlet_eps)
-        self._fast_policy = FastPolicy(board_size) if use_rollout else None
+        # LightPLS 的特征通道数与所挂模型一致（MCTS 侧全部建特征的位置都按它
+        # 造，见 `_in_channels`）。use_rollout=False 时不向模型要通道数——那
+        # 样连 rollout 也不会用到它，没必要提前把「模型缺 in_channels」变成
+        # 构造期错误；真正要用特征时（`_planes1` 等）仍会照常报错。
+        self._fast_policy = (FastPolicy(board_size, n_channels=self._in_channels())
+                             if use_rollout else None)
         self._rng = np.random.default_rng(1234)
         # 特征缓存：避免相同局面重复计算 feature_planes_batched
         # 19路状态空间大，缓存 16384 条；9路 4096 条。
@@ -188,13 +194,34 @@ class MCTS:
     def _clone_hist(self, h):
         return list(h)
 
-    def _planes1(self, board, my_hist, op_hist, to_play):
-        """单局面 12 通道特征，带 LRU + TTL 缓存（相同局面复用）。
+    def _in_channels(self):
+        """特征平面通道数 = 所挂模型的 `in_channels`（P4.8 起由 stem 形状推断）。
 
-        ⚠ P4.3 起 `feature_planes*` 的默认通道数是 17（v21 stem 需要的布局），而
-          MCTS 推的仍是 `in_channels=12` 的旧权重，所以此处**显式钉住 12** ——
-          不钉的话这里会静默产出 17 格并在 `predict_batch` 的前向里炸形状。
-          GoAI 双代落地后（P4.8/4.16）这一格改由权重形状推断的值驱动。
+        搜索侧所有建特征的位置都调它，故「12 通道」不再出现在本模块的任何
+        调用点上：12 通道 checkpoint 得到 12，17 通道 v21 模型得到 17。
+
+        ⚠ 缺失时**报错，绝不回退 12**（P4.13b）：回退等于把 MCTS 重新钉回旧
+          布局，并且会对通道数未知的模型**静默**喂 12 格特征——那正是这次要拆
+          掉的东西。真错配仍要响亮：这里报的是「问不到」，`GoAI.predict_batch`
+          的 F5 守卫报的是「问到了但对不上」，两层都不能被架空。
+        """
+        n = getattr(self.ai, "in_channels", None)
+        if n is None:
+            raise RuntimeError(
+                f"MCTS 构造特征平面需要所挂模型暴露 in_channels，但 "
+                f"{type(self.ai).__name__} 上没有该属性。通道数必须向模型要，"
+                f"不得回退写死的 12：请改用 GoAI（其 in_channels 从 checkpoint "
+                f"的 stem 形状推断），或给这个对象补上同契约的 in_channels 属性。")
+        return int(n)
+
+    def _planes1(self, board, my_hist, op_hist, to_play):
+        """单局面特征（通道数 = 模型 `in_channels`），带 LRU + TTL 缓存。
+
+        P4.13b 起通道数由 `_in_channels()` 向所挂模型要，不再钉死 12：
+        12 通道 checkpoint 拿 12（逐字节不变，见
+        `tests/baseline_in_channels.json`），17 通道 v21 模型拿 17。
+        通道数与模型对不上的话，`GoAI.predict_batch` 的 F5 守卫会响亮地抛，
+        不再靠这里「显式钉 12」去绕开形状错误。
         """
         # 缓存 key: 棋盘 hash + to_play（哈希 numpy 数组的 bytes）
         h_key = tuple(my_hist) if not my_hist or isinstance(my_hist[0], int) else tuple(tuple(h) for h in my_hist)
@@ -212,7 +239,7 @@ class MCTS:
                 self._plane_cache_ts.pop(cache_key, None)
         planes = board.feature_planes_batched(
             board.board[None], [list(my_hist)], [list(op_hist)],
-            [to_play], [board.ko_point], n_channels=12)[0]
+            [to_play], [board.ko_point], n_channels=self._in_channels())[0]
         # LRU: 超过上限时淘汰一半
         if len(self._plane_cache) >= self._plane_cache_max:
             keys = list(self._plane_cache.keys())
@@ -244,9 +271,9 @@ class MCTS:
     def _forward_level(self, nodes):
         """对一批节点批量前向，返回 (policies(B,A), values(B,))。
 
-        一次性组装整批 12 通道特征 + 单次 predict，最大化 CPU/ONNX 吞吐
-        （替代 predict_batch 逐子建特征 + 碎片化单图前向）。
-        ⚠ 12 通道是**显式钉住**的（旧权重的输入分布，理由同 `_planes1`）。
+        一次性组装整批特征（通道数 = 模型 `in_channels`）+ 单次 predict，最大化
+        CPU/ONNX 吞吐（替代 predict_batch 逐子建特征 + 碎片化单图前向）。
+        P4.13b 起通道数向所挂模型要（`_in_channels`），不再钉死 12。
         """
         if not nodes:
             return np.zeros((0, self.n_actions)), np.zeros(0)
@@ -256,7 +283,7 @@ class MCTS:
         tps = [n[3] for n in nodes]
         kos = [n[0].ko_point for n in nodes]
         planes = nodes[0][0].feature_planes_batched(arrays, my_hs, op_hs, tps, kos,
-                                                    n_channels=12)
+                                                     n_channels=self._in_channels())
         states = [(None, my_hs[i], op_hs[i], tps[i], planes[i])
                   for i in range(len(nodes))]
         return self.ai.predict_batch(states)
@@ -401,8 +428,8 @@ class MCTS:
         """评估一批候选着法并创建子节点。返回各子节点叶子视角价值列表。
 
         在叶子的棋盘上「play → 快照 → (rollout) → undo」串行推进；子节点不持有棋盘。
-        所有子局面的 12 通道特征用 feature_planes_batched 一次性向量化构造
-        （替代逐子 Python flood-fill），CPU 特征侧提速数倍。
+        所有子局面的特征（通道数 = 模型 `in_channels`）用 feature_planes_batched
+        一次性向量化构造（替代逐子 Python flood-fill），CPU 特征侧提速数倍。
         priors: 可选 {mv: prior}，提供时用叶子 policy 先验（priors_leaf），
         否则用子局面自身 policy（旧方案）。
         """
@@ -428,9 +455,10 @@ class MCTS:
 
         if not child_meta:
             return []
-        # 向量化一次性构造整批子节点特征（12 通道 = 旧权重布局，显式钉住）
+        # 向量化一次性构造整批子节点特征（通道数 = 所挂模型，见 _in_channels）
         planes_batch = board.feature_planes_batched(
-            np.stack(child_boards), my_hs, op_hs, to_plays, kos, n_channels=12)
+            np.stack(child_boards), my_hs, op_hs, to_plays, kos,
+            n_channels=self._in_channels())
         states = [(None, list(mh), list(oh), ct, planes_batch[i])
                   for i, (mv, ct, mh, oh, rv) in enumerate(child_meta)]
         policies, values = self.ai.predict_batch(states)
@@ -623,7 +651,8 @@ class MCTS:
             offset += n_children
         return results
 
-    def lookahead(self, board, my_hist, op_hist, to_play, topk=12, width=4,
+    def lookahead(self, board, my_hist, op_hist, to_play,
+                  topk=12, width=4,
                   depth=2):
         """策略 N 步批量推演（minimax 展开 top-K/width 着法树，价值回传）。
 
@@ -894,7 +923,7 @@ class MCTS:
                         planes = pb.feature_planes_batched(
                             pb.board[None], [list(prefetch_leaf.my_hist)],
                             [list(prefetch_leaf.op_hist)], [prefetch_leaf.to_play],
-                            [pb.ko_point], n_channels=12)[0]
+                            [pb.ko_point], n_channels=self._in_channels())[0]
                         pol, val = self.ai.predict_batch(
                             [(None, list(prefetch_leaf.my_hist),
                               list(prefetch_leaf.op_hist),

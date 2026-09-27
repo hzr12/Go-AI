@@ -11,9 +11,13 @@ LightPLS 含义：
 - 融合：叶子最终 value = (1-λ)·v_net + λ·v_rollout
 """
 
+import logging
+
 import numpy as np
 
 from src.game.go_rules import GoBoard
+
+logger = logging.getLogger(__name__)
 
 
 def _fast_atari_mask(board: GoBoard, player) -> np.ndarray:
@@ -61,15 +65,30 @@ class FastPolicy:
     """极轻量走子策略：对合法点做档位打分，按 softmax 采样。
 
     纯 numpy 启发式（靠近已有棋子、避免送吃），速度极快，可作为 rollout 的
-    轻量策略。若传入 weights（长度 12 或 12 个 channel 的线性权重）则叠加使用。
+    轻量策略。若传入 weights（长度等于 `n_channels` 的线性权重）则叠加使用。
+
+    `n_channels` 是**特征构造的通道数**（P4.13b）：默认 12 保住了「没有模型的
+    独立调用方」（webui / selfplay_train / light_rollout.__main__）手里那份
+    12 维权重向量的旧布局；MCTS 则把自己的（模型驱动的）通道数显式传进来。
     """
 
     def __init__(self, board_size: int, weights: np.ndarray = None,
-                 temperature: float = 1.0):
+                 temperature: float = 1.0, n_channels: int = 12):
         self.n = board_size
         self.weights = weights.astype(np.float32) if weights is not None else None
         self.temperature = float(temperature)
+        self.n_channels = int(n_channels)
         self._atari_penalty = 1.2
+        # P4.13b 起 n_channels 由调用方（MCTS 按所挂模型）传入，权重维数与它
+        # 不一致是契约违约：权重项会被跳过（见 logits），特征仍按 n_channels
+        # 造。这种不一致必须**响亮**——本任务的整条 thesis 就是「没有静默的
+        # 错通道行为」，故构造期告警一次（不抛：抛会打断「权重项不参与」的
+        # 既有契约，且仓库内暂无任何调用方传 weights，属潜在而非现实风险）。
+        if self.weights is not None and self.weights.shape[0] != self.n_channels:
+            logger.warning(
+                "FastPolicy 权重维数 %d 与 n_channels=%d 不一致：权重项不参与 "
+                "logits（特征仍按 %d 通道造，绝不回退 12）",
+                self.weights.shape[0], self.n_channels, self.n_channels)
 
     def logits(self, board: GoBoard) -> np.ndarray:
         n = self.n
@@ -93,14 +112,19 @@ class FastPolicy:
         logit = np.where(legal, logit, np.float32(-1e9)).astype(np.float32)
         if self.weights is not None:
             # 仅在显式提供线性权重时才计算完整特征（默认 FastPolicy 不触发）
-            # ⚠ `n_channels=12` 与下面的 `reshape(12, -1)` / `weights.shape[0] == 12`
-            #   是同一个契约的三个面：P4.3 起 feature_planes* 默认 17 通道，而
-            #   FastPolicy 的权重向量是 12 维的旧布局。三个面必须一起改。
+            # ⚠ `n_channels=nc`、下面的 `reshape(nc, -1)` 与
+            #   `weights.shape[0] == nc` 是同一个契约的三个面（P4.13b 起三者
+            #   同为 `self.n_channels`，由 MCTS 按所挂模型传入）。三个面必须一起
+            #   改：只有它们一致，`tensordot` 才落在合法的 (nc,)×(nc,n*n) 上。
+            #   通道数与权重维数不一致时权重项不参与，但特征仍按
+            #   `self.n_channels` 造——绝不为此回退到 12；这种不一致在构造期
+            #   已告警（见 __init__ 的 logger.warning），不再完全静默。
+            nc = self.n_channels
             fp = board.feature_planes_batched(
                 b[None], [[-1, -1, -3]], [[-1, -1, -3]],
                 [abs(board.current_player)], [board.ko_point],
-                n_channels=12).reshape(12, -1)
-            if self.weights.ndim == 1 and self.weights.shape[0] == 12:
+                n_channels=nc).reshape(nc, -1)
+            if self.weights.ndim == 1 and self.weights.shape[0] == nc:
                 logit = logit + np.tensordot(self.weights, fp, axes=([0], [0])).reshape(-1).astype(np.float32)
         # 追加 pass 着法（索引 n*n），logit=0
         logit = np.append(logit, 0.0)
