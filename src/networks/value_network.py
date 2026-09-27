@@ -98,3 +98,43 @@ class ValueNetwork(nn.Module):
         x = self.gap(x).flatten(1)
         x = self.fc(x)
         return x
+
+
+class FCValueHead(nn.Module):
+    """v21 的全连接价值头（P4.1），逐项 **142,017** 参数。
+
+    结构（权威表 §2 的 value 行）：
+        1×1 Conv 184→32 无bias + BN    5,952
+        GAP                            —（无参数）
+        FC   32→128 **带**bias         4,224
+        FC  128→512 **带**bias        66,048
+        FC  512→128 **带**bias        65,664
+        FC  128→  1 **带**bias           129
+        合计                          142,017
+
+    末尾是 `nn.Tanh()`（值域 [-1,1]），与 P4.5 的 `value_t ∈ [-1,1]` 回归口径
+    以及推理/Brier 侧「按 tanh/[-1,1] 解释 value」的既有约定一致。
+    ⚠ 这是**有意偏离**既有 `ValueNetwork`：后者的 `forward`（:92-100）是裸线性
+    输出、无 Tanh，head 与消费端差了一个 tanh。Tanh 零参数，预算表区分不出来，
+    需用户裁决，详见 report §5。
+    """
+
+    def __init__(self, in_channels=184, hidden_channels=32):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, hidden_channels, 1, bias=False)  # 5,888
+        self.bn = nn.BatchNorm2d(hidden_channels)                            # 64
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Linear(hidden_channels, 128)      # 4,224
+        self.fc2 = nn.Linear(128, 512)                  # 66,048
+        self.fc3 = nn.Linear(512, 128)                  # 65,664
+        self.fc4 = nn.Linear(128, 1)                    # 129
+        self.out_tanh = nn.Tanh()
+
+    def forward(self, x):
+        # x: (B, in_channels, H, W) -> (B, 1)，值域 (-1, 1)
+        x = F.relu(self.bn(self.conv(x)))
+        x = self.gap(x).flatten(1)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        return self.out_tanh(self.fc4(x))

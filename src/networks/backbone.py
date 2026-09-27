@@ -711,3 +711,303 @@ class SharedBackbone(nn.Module):
         else:
             out = F.relu(self.bn_out(self.conv_out(out)))
         return out
+
+
+# ============================================================================
+# v21 新块类（P4.1）
+#
+# 这三个类 + 两个头（P4.1 落 policy_network.py / value_network.py）只**新增**，
+# 既有 resnet / convnext 路径与既有类签名一字未改（D5）：v21 走自己的构建类
+# （P4.2 的 V21_CFG），不经过 SharedBackbone / AttentionResBlock。
+#
+# 权威结构 = 用户给定的逐层参数表（P4.1 brief §2）。本节所有类的参数量都被
+# tests/test_arch_v21_blocks.py 逐类**精确相等**锁住（113,528 / 224,480 /
+# 326,416），不是窗口 —— 全网预算窗口留给 P4.2 的 test_v21_budget。
+# ============================================================================
+
+
+class MHSA(MultiHeadSelfAttention):
+    """v21 的多头自注意力核心（Wq/Wk/Wv/Wo **四个独立无 bias** Linear）。
+
+    `TransformerBlock` 与 `CrossAttnRes` 共用本类，两处预算都是
+    3×184×184（Wq/Wk/Wv）+ 184×184（Wo）= 135,424。
+
+    为什么**继承** MultiHeadSelfAttention 而不是新写一个注意力类
+    ------------------------------------------------------------
+    1) 预算：父类是**融合** qkv（`nn.Linear(C, 3C, bias=False)`），参数量数值上
+       恰好等于 3 个独立 Linear，但 state_dict 布局不同（无法逐权从旧模型迁移），
+       而且父类还自带 `ln1/ln2/ffn/ffn_drop`（368+368+44,160×2+128 = 89,184 个
+       多余参数），整体会超出 v21 的分项预算。故不能直接复用父类的 forward。
+    2) **注意力 dropout 的 eval 闸门（P2.2b）**：`_sdpa(..., dropout_p=...)` 是
+       文件级静态锁 `tests/test_attn_dropout_eval.py::test_all_five_attn_dropout_sites_are_gated`
+       的对象，它对本文件做**文件级** AST 扫描并断言取 `self.attn_drop_p` 的
+       `_sdpa` 站点**恰好 4 处**。在 backbone.py 里新增第 5 处 `_sdpa` 站点会
+       让那条既有测试变红。本类因此**不自己调 `_sdpa`**，而是复用父类
+       `_global_attn()`（闸门站点之一，`backbone.py` 内唯一的 global 注意力入口）。
+       这样既拿到 4 个独立无 bias Linear，又不多造一处未经闸门覆盖的站点。
+
+    因此 `__init__` 刻意**不**调用 `MultiHeadSelfAttention.__init__`（那会建出融合
+    qkv 与 FFN），只手工填 `_global_attn` / `_to_heads` / `attn_drop_p` 真正读到的
+    最小属性集。本类**只支持 global 模式**（v21 的块布局里 MHSA 就是全局注意力；
+    window/sparse 等模式的参数与形状不属本预算）。
+    """
+
+    def __init__(self, channels, num_heads=4, dropout=0.0):
+        nn.Module.__init__(self)
+        assert channels % num_heads == 0, "channels 必须能被 num_heads 整除"
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.attn_drop = dropout
+        # 父类 forward 的 window/sparse 分支会读 mode/window_size；v21 只用 global，
+        # 这里填一个合法值只为避免误用父类 forward 时抛 AttributeError。
+        self.mode = "global"
+        self.window_size = 7
+
+        self.wq = nn.Linear(channels, channels, bias=False)
+        self.wk = nn.Linear(channels, channels, bias=False)
+        self.wv = nn.Linear(channels, channels, bias=False)
+        self.wo = nn.Linear(channels, channels, bias=False)
+
+    def forward(self, x):
+        # x: (B, C, H, W) -> 内部 (B, N=H*W, C)，**不含**残差（残差归块所有）
+        B, C, H, W = x.shape
+        N = H * W
+        seq = x.flatten(2).transpose(1, 2)                    # (B, N, C)
+        q = self._to_heads(self.wq(seq), B, N)                # (B, Hh, N, d)
+        k = self._to_heads(self.wk(seq), B, N)
+        v = self._to_heads(self.wv(seq), B, N)
+        # 复用既有闸门站点：_global_attn 内部是 _sdpa(..., dropout_p=self.attn_drop_p,
+        # scale=self.scale)。不要对 q 预乘 scale（math 路径会内部再乘一次）。
+        out = self._global_attn(q, k, v)                       # (B, Hh, N, d)
+        out = out.transpose(1, 2).reshape(B, N, C)
+        out = self.wo(out).transpose(1, 2).reshape(B, C, H, W)
+        return out
+
+
+class MambaLTI(nn.Module):
+    """Mamba 风格的**线性时序（LTI）**块：dt 步长的因果累积递推（C=184, expand=2,
+    d_conv=4, d_state N=16, ddt rank=4），逐块 **113,528** 参数。
+
+    语义（x: (B, C, H, W) -> 同形；内部按 (B, T=H*W, ·) 的**行主序**序列看）：
+
+        h  = LayerNorm(x)                                    # pre-LN（唯一一层）
+        [xs, z] = split(in_proj(h), 2)                       # in_proj 184→368，各 184
+        xc     = SiLU(causal_dwconv1d_k4(xs))                # 仅 x 路，深度卷积
+        [dt_raw, bc] = split(x_proj(xc), rank, 2N)           # 4 + 32 = 36
+        dt     = softplus(dt_proj(dt_raw))                   # (B,T,184)，逐通道 > 0
+        [Bm, Cm] = split(bc, N, N)                           # 各 16
+        y_t     = ( Σ_{s≤t} exp( A ⊙ (Σ_{r=s+1..t} dt_r) ) · dt_s·xc_s ⊙ Bm_s ) · Cm_t
+        y       = y + D * xc                                 # D：逐通道直通
+        out     = out_proj(y) * SiLU(z)                      # z 走 SiLU 门
+        返回    x + out                                      # pre-norm 残差
+
+    ⚠ `expand=2` 是 **in_proj 的扇出**（C→2C 拆 x/z），不是分支内宽度扩张 ——
+    见 `__init__` 里的注释（关系到 113,528 这个数）。
+
+    LTI 递推（状态更新 + 输出投影）的闭式，见
+    `.superpowers/sdd/2026-09-25-v21-roadmap/task-p4-1-report.md` §3；
+    `tests/test_arch_v21_blocks.py` 用测试内独立写的双重 for 循环朴素参考逐步对齐。
+
+    因果性：递推只用 s ≤ t 的量，深度卷积**左**填充 k-1=3，三处都没有未来信息。
+    `test_ssm_causality` 直接钉这条（改 t 之后的输入不得影响 t 的输出）。
+
+    实现选择（无参数开销、但影响梯度流，已在 report 里列为待用户确认项）：
+      * 递推按 T 步**顺序**扫描（内存 O(B·C·S)，19×19 → 361 步）。闭式的
+        (T,T) 衰减矩阵需要 B·T²·C·S 个数（184 通道 × 16 状态时 T=361 要 30e9），
+        不可物化；若将来要提速，方向是分块扫描 / 关联扫描（不是换语义）。
+      * `A` 以 log 形式 `A_log` 存储（`A = -exp(A_log)`，初值 log(1..N) ⇒
+        A ∈ {-1..-16}），与 Mamba 参考实现同；参数量与 `A` 直接存储完全相同
+        （184×16 = 2,944），但初值落在稳定区间而不是围绕 0 抖动。
+      * `z` 的 SiLU 门作用在 **z** 上（Mamba 参考实现：`out_proj(y) * silu(z)`），
+        而不是作用在 y 上；见 report §3 的说明。
+    """
+
+    def __init__(self, channels=184, expand=2, d_conv=4, d_state=16,
+                 ddt_rank=4):
+        super().__init__()
+        # ⚠ `expand` 的含义以**权威表**为准，不是 Mamba 惯例。表里给的是
+        #   `in_proj 184→368`（=67,712）、`dw conv1d Conv1d(184,184,...)`、
+        #   `out_proj 184→184` ⇒ 每个分支的宽度就是 C=184，in_proj 的**扇出**
+        #   才是 2×C（拆两半各 184：x 路 / z 路），即 d_inner = C。
+        #   若按惯例理解成「分支内扩张 d_inner = 2C = 368」，in_proj 会变成
+        #   184→736（135,424），本块变 223,560 —— 比权威的 113,528 多 110,032。
+        assert expand == 2, (
+            '权威表只定义 expand=2（in_proj 扇出 2C，拆 x/z 各 C）；'
+            '其它 expand 值未在参数表里定义，不臆造。收到 {}'.format(expand))
+        self.channels = channels
+        self.expand = expand
+        self.d_inner = channels                  # 184（= d_model，见上）
+        self.d_state = d_state                  # 16
+        self.d_conv = d_conv                    # 4
+        self.ddt_rank = ddt_rank                # 4
+        self.dt_project_rank = ddt_rank + 2 * d_state   # 36 = x_proj 输出维
+
+        self.norm = LayerNorm2d(channels)                                   # 368
+        self.in_proj = nn.Linear(channels, expand * channels, bias=False)  # 67,712
+        # 深度因果卷积，**仅**作用于 x 路
+        self.dw_conv = nn.Conv1d(self.d_inner, self.d_inner, d_conv,
+                                 groups=self.d_inner, bias=True)            # 920
+        self.x_proj = nn.Linear(self.d_inner, self.dt_project_rank, bias=False)  # 6,624
+        self.dt_proj = nn.Linear(ddt_rank, self.d_inner, bias=True)         # 920
+        # A：逐通道 184×16 的状态转移率矩阵（log 形式存储，见类 docstring）
+        a_init = torch.arange(1, d_state + 1, dtype=torch.float32).log()
+        self.A_log = nn.Parameter(a_init.repeat(channels, 1))               # 2,944
+        self.D = nn.Parameter(torch.ones(channels))                         # 184
+        self.out_proj = nn.Linear(self.d_inner, channels, bias=False)       # 33,856
+
+    def _selective_scan(self, decay, drive, cvec):
+        """顺序扫描的 dt 步长因果累积递推。
+
+        decay: (B, T, d_inner, N) = exp(dt_t ⊙ A)，元素 ∈ (0, 1]
+        drive: (B, T, d_inner, N) = dt_t · xc_t ⊙ B_t
+        cvec:  (B, T, N)         = C_t
+
+        返回 (B, T, d_inner)。T 步的 Python 循环换来 O(B·d_inner·N) 的显存；
+        换成闭式 (T,T) 衰减矩阵会物化 T²·C·N 个元素，19×19 下不可接受。
+        """
+        B, T, d_inner, n = decay.shape
+        state = decay.new_zeros(B, d_inner, n)
+        out = []
+        for t in range(T):
+            state = state * decay[:, t] + drive[:, t]
+            out.append((state * cvec[:, t].unsqueeze(1)).sum(-1))
+        return torch.stack(out, dim=1)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        T = H * W
+
+        h = self.norm(x).flatten(2).transpose(1, 2)            # (B, T, C)
+        hs, z = self.in_proj(h).split(self.d_inner, dim=-1)  # 各 (B, T, 184)
+
+        # 深度因果卷积：左填充 k-1，保证 out[t] 只看 xs[t-3..t]
+        xs = F.pad(hs.transpose(1, 2), (self.d_conv - 1, 0))
+        xc = F.silu(self.dw_conv(xs).transpose(1, 2))        # (B, T, d_inner)
+
+        # x_proj 36 维拆成 ddt_rank(=4) + 2N(=32)：注意必须按「前 4 / 后 32」
+        # 切，不能用 split(4)（那会切成 9 块）。
+        proj_db = self.x_proj(xc)
+        dt_raw, bc = proj_db[..., :self.ddt_rank], proj_db[..., self.ddt_rank:]
+        dt = F.softplus(self.dt_proj(dt_raw))                # (B, T, d_inner) > 0
+        b_vec, c_vec = bc.split(self.d_state, dim=-1)        # 各 (B, T, 16)
+
+        A = -torch.exp(self.A_log)                           # (d_inner, 16) < 0
+        decay = torch.exp(dt.unsqueeze(-1) * A)              # (B,T,d_inner,16)
+        drive = dt.unsqueeze(-1) * xc.unsqueeze(-1) * b_vec.unsqueeze(2)
+        y = self._selective_scan(decay, drive, c_vec)        # (B, T, d_inner)
+        y = y + self.D * xc                                 # D 逐通道直通
+
+        out = self.out_proj(y) * F.silu(z)                   # z 走 SiLU 门
+        return (x + out.transpose(1, 2).reshape(B, C, H, W))  # pre-norm 残差
+
+
+class TransformerBlock(nn.Module):
+    """pre-norm Transformer 块：MHSA + FFN(184→240→184)，逐块 **224,480** 参数。
+
+    两条恒等捷径（残差）：
+        x = x + MHSA(LN1(x))
+        x = x + FFN(LN2(x))
+
+    FFN 中间维 **240**（ratio 240/184 ≈ 1.304；旧表的 276 / 1.5 已作废）。
+    注意力用**四个独立无 bias Linear**（Wq/Wk/Wv/Wo），不是融合 qkv。
+    注意力 dropout 走 MHSA 内部的既有闸门 `attn_drop_p`（P2.2b）。
+    """
+
+    def __init__(self, channels=184, num_heads=4, ffn_hidden=240,
+                 attn_dropout=0.0):
+        super().__init__()
+        self.channels = channels
+        self.ffn_hidden = ffn_hidden
+        self.norm1 = LayerNorm2d(channels)                   # 368
+        self.attn = MHSA(channels, num_heads=num_heads, dropout=attn_dropout)  # 135,424
+        self.norm2 = LayerNorm2d(channels)                   # 368
+        self.fc1 = nn.Linear(channels, ffn_hidden, bias=False)   # 44,160
+        self.fc2 = nn.Linear(ffn_hidden, channels, bias=False)   # 44,160
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x = x + self.attn(self.norm1(x))                      # 恒等捷径 1
+        h = self.norm2(x).flatten(2).transpose(1, 2)          # (B, N, C)
+        h = self.fc2(F.gelu(self.fc1(h)))                    # (B, N, C)
+        x = x + h.transpose(1, 2).reshape(B, C, H, W)        # 恒等捷径 2
+        return x
+
+
+class CrossAttnRes(nn.Module):
+    """跨层注意力残差块：拼接主干第 1/5/9 号块的输出后投影回来，逐块
+    **326,416** 参数。
+
+        taps = (s1, s5, s9)   # 主干第 1、5、9 号块（1-based）的输出
+        x = x + proj(concat(LN1(s1), LN1(s5), LN1(s9)))      # 跨层投影支路
+        x = x + MHSA(LN2(x))                                  # 恒等捷径
+        x = x + FFN(LN3(x))                                   # 恒等捷径
+
+    三路的分工（哪一路是 identity 捷径）
+    ------------------------------------
+    **第一路 `s1`（主干第 1 号块，紧邻 stem 的浅层抽头）是 identity 捷径**：
+    它表征最浅、离输入最近，投影支路主要靠它把局部/原始特征直通过来；第二路 `s5`
+    与第三路 `s9` 提供中/深层多尺度语义。若用户本意是 `s9` 才算 identity 捷径，
+    只需改本类 docstring 与 P4.2 的抽头顺序 —— 参数量与计算图完全不受影响。
+    （顶层接线归 P4.2：本类只消费抽头，不自己去找主干。）
+
+    为什么 LN1 是 **184 维**、且三路共用一个
+    --------------------------------------
+    权威表给「pre-LN ×3：1,104」= 3 × 368，即**三个** 184 通道的 LayerNorm。
+    若 LN1 直接作用在 concat 后的 552 通道上，它自己就是 1,104（552×2），
+    加上 LN2/LN3 的 736 → 1,840，本块会变成 327,152（比权威的 326,416 多 736）。
+    既要满足 326,416、又要保住 `proj(LN(concat(...)))` 的「先 norm 再 proj」次序，
+    唯一解是：**一个 184 维 LN 逐路作用后 concat**（三路共用同一套仿射参数）。
+    这是本任务里唯一需要我自己钉死的实现细节（brief §4「需要你自己钉死」），
+    已在 report §4 单列，供用户确认是否改用 `LN1(proj(concat))`（同参数、
+    换归一化位置与统计口径）。
+
+    明确**没有** BatchNorm 也没有 ReLU：权威表的 326,416 不含 BN 的 368。
+    """
+
+    def __init__(self, channels=184, tap_channels=(184, 184, 184),
+                 num_heads=4, ffn_hidden=240, attn_dropout=0.0):
+        super().__init__()
+        self.channels = channels
+        self.tap_channels = tuple(int(c) for c in tap_channels)
+        if len(self.tap_channels) != 3:
+            raise ValueError(
+                'CrossAttnRes 需要恰好 3 路抽头（主干第 1/5/9 号块），'
+                '收到 {} 路'.format(len(self.tap_channels)))
+        self.ffn_hidden = ffn_hidden
+        self.norm_tap = LayerNorm2d(channels)                 # 368（逐路复用）
+        self.proj = nn.Conv2d(sum(self.tap_channels), channels, 1, bias=False)  # 101,568
+        self.norm_attn = LayerNorm2d(channels)               # 368
+        self.attn = MHSA(channels, num_heads=num_heads, dropout=attn_dropout)  # 135,424
+        self.norm_ffn = LayerNorm2d(channels)                # 368
+        self.fc1 = nn.Linear(channels, ffn_hidden, bias=False)   # 44,160
+        self.fc2 = nn.Linear(ffn_hidden, channels, bias=False)   # 44,160
+
+    def _check_taps(self, taps):
+        if len(taps) != 3:
+            raise ValueError(
+                'CrossAttnRes.forward 需要 3 路抽头（主干第 1/5/9 号块的输出），'
+                '收到 {} 路'.format(len(taps)))
+        for i, (t, want) in enumerate(zip(taps, self.tap_channels)):
+            if t.dim() != 4:
+                raise ValueError(
+                    '第 {} 路抽头应为 (B, C, H, W)，收到形状 {}'.format(i + 1, tuple(t.shape)))
+            if t.shape[1] != want:
+                raise ValueError(
+                    '第 {} 路抽头通道数应为 {}（构造时给的 tap_channels[{}]），'
+                    '收到 {} —— 抽头宽度必须与构造参数一致，'
+                    '否则 proj 的 in_channels={} 与实际 concat 宽度对不上'
+                    .format(i + 1, want, i, t.shape[1], sum(self.tap_channels)))
+
+    def forward(self, x, taps):
+        B, C, H, W = x.shape
+        self._check_taps(taps)
+        s1, s5, s9 = (self.norm_tap(t) for t in taps)
+        merged = self.proj(torch.cat([s1, s5, s9], dim=1))  # 无 BN、无 ReLU
+
+        x = x + merged                                       # 跨层投影支路
+        x = x + self.attn(self.norm_attn(x))                 # 恒等捷径
+        h = self.norm_ffn(x).flatten(2).transpose(1, 2)
+        h = self.fc2(F.gelu(self.fc1(h)))
+        x = x + h.transpose(1, 2).reshape(B, C, H, W)       # 恒等捷径
+        return x
