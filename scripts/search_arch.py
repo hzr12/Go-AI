@@ -95,29 +95,77 @@ V12_CFG = dict(backbone_channels=192, backbone_res_blocks=17,
 # 规则自己失效。故本轮不再看「哪边是表头」，只看「哪边能被形状的精确算术
 # 唯一确定」（即下方 arbitration_rule）。
 #
-# 键名对齐 P4.1 的类名：MambaLTI / TransformerBlock / CrossAttnRes
-# （块13-14 旧称 LightAttn，用户本轮改称「Transformer 块」，旧称作废）。
+# 版本：P4.9d 跟随用户「Mamba-1 换 Mamba-2」（块9-12）：参数
+# 454,112→**516,960**（每块 113,528→**129,240**），backbone_total
+# 6,499,800→**6,562,648**，total_params 9,008,547→**9,071,395**。形状字段
+# 一并入锚点，让 P4.2 只读本常量就能拿到块布局：d_state(N) 16→**64**、
+# 低秩 r=**4**、d_conv=4、dt_rank=4、expand=2；A 由稠密 C×N 改为**结构化
+# 低秩 C*r + r*N = 184*4 + 4*64 = 992**（稠密口径本该是 184*64 = 11,776）。
+# 分项级核对（已写成常驻测试，不只写在报告里）：
+#   368 + 67,712 + 920 + 24,288 + 920 + 992 + 184 + 33,856 = 129,240
+#
+# ⚠ P4.9d 那轮 total_params 取 **9,071,395**，不是任务书给的 9,071,389：后者
+#   与本表其余字面量**无法自洽**——6,562,648+2,366,730+142,017 = 9,071,395
+#   （差 6），从旧值顺推也对不上（9,008,547 + 62,848 = 9,071,395）。按
+#   arbitration_rule 第①支（形状被唯一钉死 → 取该形状的精确算术值，冲突的
+#   表记数字 = 笔误），9,071,389 属表内笔误，不予采用。P4.9e 已把该数换成
+#   9,067,443（见下），但**不改口**——9,071,395 在本轮之前一直是对的。
+#
+# 版本：P4.9e 跟随用户「Mamba-2 的 A 用 **per-head scalar decay**」（块9-12）：
+#   head 数 P=**4**，把 C=184 切成 4×**46**（head_dim），A 只剩**每 head 一个
+#   标量** ⇒ A_log 形状 (4,)、记账 **992 → 4**。键 `mamba2_rank` 与 A 的
+#   「结构化低秩 C*r + r*N」口径**整体作废**（键名与描述都从锚点里删掉，免得
+#   后人照着旧参数ization 改回来）；新增 `mamba2_n_heads: 4` /
+#   `mamba2_head_dim: 46`。参数 516,960 → **513,008**（每块 129,240 →
+#   **128,252**），backbone_total 6,562,648 → **6,558,696**，total_params
+#   9,071,395 → **9,067,443**。分项级核对（已写成常驻测试，不只写在报告里）：
+#   368 + 67,712 + 920 + 24,288 + 920 + 4 + 184 + 33,856 = 128,252（×4 = 513,008）
+#   d_state(N)=64 / d_conv=4 / dt_rank=4 / expand=2（in_proj 扇出，非 d_inner）
+#   **全部不变**——本轮只动 A 的记账与两个新增的 head 字段。
+#
+# ⚠ policy 头**保持 2,366,730 不变**（用户明确「policy 不变」）。曾有一版
+#   「Flatten 之后首个 FC 128→120」的改法被**撤回**——该变更并不存在，故
+#   **不**登记为 known_discrepancies / user_directed_change 之类的条目：登记
+#   等于给后续 agent 留一张「待办」票据，引它把已撤回的改动"顺手"改回来。
+#
+# 键名对齐 P4.1 的类名：Mamba2 / TransformerBlock / CrossAttnRes
+# （块13-14 旧称 LightAttn，用户本轮改称「Transformer 块」，旧称作废；
+#  块9-12 旧称 MambaLTI，用户本轮改用 Mamba-2，旧称作废）。
 #
 # 仲裁规则（唯一一条；权威表内的每处冲突都按它判定，见 arbitration_rule）：
-#   **形状被唯一钉死时，取该形状的精确算术值；与它冲突的表记数字即笔误。
-#     形状本身自相矛盾时，精确算术无法裁决，两口径都留着待用户裁决，
-#     实施暂取与已发布实现一致的那个。**
+#   **①形状被唯一钉死 → 取该形状的精确算术值，与它冲突的表记数字即笔误
+#     （resolved_by_exact_arithmetic）。
+#     ②形状本身自相矛盾 → 精确算术无法裁决，两口径都留着待用户裁决
+#     （unresolved_shape_conflict），实施暂取与已发布实现一致的那个。
+#     ③②那类经用户**显式裁决** → 按裁决取值（resolved_by_user_ruling）；被否的
+#     那一个整口径连同它会把合计顶到多少一起记成 voided_by_user_ruling 留痕。
+#     显式裁决优先于算术。**
 # 关键在于「可唯一确定」这个前提——它把两类表面同型的证据（一个数字 vs 另一个
 # 数字）分开：(b) 里表把 fc2 的形状与 bias 都写死了，精确算术**有**唯一解，
-# 规则给出结论；(a) 里表头文字与它自己给的参数量指向**不同**形状，精确算术
-# 压根选不出谁对，规则只能升级为「待裁决」。P4.9b 对这两处用了两套相反的标
-# 准（(a) 弃表取实算、(b) 取实算弃表头），本轮统一为这一条。
+# 规则第①支给出结论；(a) 里表头文字与它自己给的参数量指向**不同**形状，精确算术
+# 压根选不出谁对，只能走第②支。P4.9b 对这两处用了两套相反的标准（(a) 弃表取
+# 实算、(b) 取实算弃表头），P4.9b 之后统一为这一条。
+# ⚠ 第②支是**有终态**的中间态，不是「永远悬着」：用户 2026-09-27 就 (a) 拍了
+#   板（stem = 3×3），(a) 已转入第③支。见下方 known_discrepancies。
 #
 # 权威表内有两处笔误/冲突（见 P4.1 brief §3）。已按上述规则处理，**并**把
 # 两个口径都显式记在此处与 known_discrepancies——不可静默抹掉：
 #   (a) stem：表头文字写「7×7 Conv 17→184」，同给的参数量 28,152 却是 3×3
 #       的值（3×3: 9×17×184 = 28,152；7×7: 49×17×184 = 153,272）。
-#       **冲突在形状本身**，28,152 与 153,272 在各自形状下都精确 ⇒ 规则不能
-#       裁决。28,152+368(BN) = 28,520 正好是现有 3×3 stem+BN，故实施暂取
-#       3×3。⚠ 硬依赖：若最终确认改 7×7，stem 合计变 153,640
-#       （+125,120），本表**整表作废**，backbone_total/total_params 必须重算。
+#       **冲突在形状本身**，28,152 与 153,272 在各自形状下都精确 ⇒ 算术裁决
+#       不了（规则第②支）。**用户 2026-09-27 显式裁决：stem 取 3×3**（第③支）
+#       ⇒ 本表 stem = 28,152+368(BN) = **28,520**，各合计按 3×3。
+#       ⚠ 7×7 口径**已作废但必须整份留痕**（voided_by_user_ruling）：它会把
+#       stem 顶到 153,640（+125,120），本轮基数下 backbone_total 6,683,816 /
+#       total_params 9,192,563。日后有人从 git 历史里翻出 7×7 提案，先看到
+#       这里：它不是「新选项」，是**被明确否掉的**那一支。
+#       ⚠ 裁决书里同时流传着 6,687,768 / 9,196,515：那是按 P4.9d 基数
+#       （6,562,648）算的，比上面的精确值多 3,952——恰是本轮 A 记账改动省下的
+#       4×(992-4)。按第①支取精确值 6,683,816 / 9,192_563，两个数都记在
+#       known_discrepancies 的 voided_alternative 里，免得对不上时被当成
+#       「锚点自己算错了」。
 #       （表/裁定里把 7×7 写成 153,296 / stem 153,664，比精确值多 24，是同
-#       一处表内笔误；两个口径都记在 known_discrepancies 里待裁决。）
+#       一处表内笔误。）
 #   (b) policy 头：笔误在**分项**那一行，不在合计。分项写「FC 128→256
 #       带bias：32,896」，而 nn.Linear(128, 256) 的 bias 恒为 out_features =
 #       256 个 ⇒ 精确值 32,768+256 = **33,024**；bias=False 是 32,768。
@@ -136,14 +184,34 @@ ANCHOR_V21 = {
     'backbone_channels': 184,
     # 冲突取值标准（上方注释的长版规则）。P4.2 仲裁预算时**只按这一条**走，
     # 不得对同型证据换个标准——测试逐字断言其存在。
-    'arbitration_rule': '形状被唯一钉死时取该形状的精确算术值（冲突的表记数字'
-                        '=笔误）；形状本身矛盾时精确算术不裁决，两口径都留着，'
-                        '实施暂取与已发布实现一致者',
+    # P4.9e：stem 那条形状冲突已由用户显式裁决（3×3），故规则补上第三支——
+    # 「算术裁决不了」的中间态（unresolved_shape_conflict）**有终态**，
+    # 用户拍板后按裁决取值、被否口径 voided_by_user_ruling 留痕。
+    'arbitration_rule': '①形状被唯一钉死 → 取该形状的精确算术值，与它冲突的'
+                        '表记数字即笔误（resolved_by_exact_arithmetic）；'
+                        '②形状本身矛盾 → 精确算术不裁决，两口径都留着待用户'
+                        '裁决，实施暂取与已发布实现一致者'
+                        '（unresolved_shape_conflict）；③经用户显式裁决 → 按'
+                        '裁决取值（resolved_by_user_ruling），被否口径连同它会'
+                        '把合计顶到多少一起记 voided_by_user_ruling 留痕，'
+                        '显式裁决优先于算术',
     # 块布局：哪些块、几个。键名 = P4.1 的类名，勿再改回旧称
     'layout': {
-        'stem': 'Conv3x3(17->184)+BN',   # 按 3×3 记 28,152，见上 (a)
+        'stem': 'Conv3x3(17->184)+BN',   # 按 3×3 记 28,152（用户裁决），见上 (a)
         'res_blocks': 8,             # ResBlock ×8 @184
-        'mamba_lti_blocks': 4,       # MambaLTI ×4 @184
+        'mamba2_blocks': 4,          # Mamba2 ×4 @184（旧称 MambaLTI 作废）
+        # 块9-12 的 Mamba-2 形状（P4.2 只读本锚点即可拿到块布局）：
+        'mamba2_d_state': 64,        # N：状态维（Mamba-1 的 16 作废）
+        'mamba2_d_conv': 4,          # 短卷积核宽度
+        'mamba2_dt_rank': 4,         # dt 投影的低秩维（x_proj 出向 4+2*64=132）
+        'mamba2_expand': 2,          # in_proj 扇出 2C（184→368）；d_inner 仍是 C=184
+        # A 用 per-head scalar decay：head 数 P=4 把 C=184 切成 4×46，
+        # A 只剩每 head 一个标量。⚠ 旧的「结构化低秩 C*r + r*N = 992」口径与
+        # `mamba2_rank` 键**整体作废**（键名与描述都不许留在锚点里）。
+        'mamba2_n_heads': 4,         # P=4：A 的标量个数 = head 数
+        'mamba2_head_dim': 46,       # 每 head 覆盖的通道 = 184/4
+        'mamba2_A_params': 4,        # per-head 标量：P 个（A_log 形状 (4,)）
+        'mamba2_A_form': 'per-head scalar decay, A_log shape (4,)',
         'transformer_blocks': 2,     # TransformerBlock ×2 @184
         'transformer_heads': 4,
         'ffn_hidden': 240,           # FFN 184→240→184，块13-14/15-16 共用
@@ -156,12 +224,13 @@ ANCHOR_V21 = {
     'params': {
         'stem': 28_520,
         'res_blocks': 4_881_152,     # 8 × 610,144
-        'mamba_lti': 454_112,        # 4 × 113,528
+        'mamba2': 513_008,           # 4 × 128,252（Mamba-2 per-head scalar A；旧 MambaLTI 454,112 作废）
         'transformer': 448_960,      # 2 × 224,480
         'cross_attn_res': 652_832,   # 2 × 326,416
         'out': 34_224,
     },
-    'backbone_total': 6_499_800,     # 主干合计（= params 六项之和，测试断言自洽）
+    'backbone_total': 6_558_696,     # 主干合计（= params 六项之和，测试断言自洽）
+
     # 头：权威表只给了参数量；维度钉 in/out 两端（隐藏维未给定，不臆造）
     'heads': {
         'in': 184,                   # 头喂入 = 主干输出通道
@@ -172,23 +241,42 @@ ANCHOR_V21 = {
         'value_params': 142_017,     # value 头（新增部分）
         'value_out': 1,
     },
-    'total_params': 9_008_547,       # 主干 + 两头（测试断言自洽）
+    'total_params': 9_067_443,       # 主干 + 两头（测试断言自洽）
     # 上文 (a)(b) 两条矛盾的机器可读记录。id/about/stated/recorded/delta/
     # resolution/status 缺一不可：任一字段被静默改动/删除都会被
     # test_anchor_v21_documents_known_discrepancies 抓住。resolution 取
-    # arbitration_rule 的两个分支之一，测试按同一把尺子逐条核。
+    # arbitration_rule 的三支之一，测试按同一把尺子逐条核。
     'known_discrepancies': (
         {
             'id': 'stem_kernel_3x3_vs_7x7',
-            'about': 'stem 卷积核：表头文字 7×7，给的参数量却是 3×3 的值',
+            'about': 'stem 卷积核：表头文字 7×7，给的参数量却是 3×3 的值；'
+                     '用户 2026-09-27 显式裁决取 3×3',
             'stated': 153_296,        # 7×7：表/裁定里写的口径
             'stated_exact': 153_272,  # 7×7：49×17×184 精确值（表记多 24，同属表内笔误）
-            'recorded': 28_152,       # 3×3：9×17×184（本锚点采用）
+            'recorded': 28_152,       # 3×3：9×17×184（本锚点采用，用户裁决确认）
             'delta': 125_144,        # 153,296 - 28,152（按表记口径；精确口径 125,120）
-            # 冲突在**形状**上：28,152 与 153,272 在各自形状下都精确 ⇒ 规则不裁决
-            'resolution': 'unresolved_shape_conflict',
-            'status': '未裁决：按 3×3 实施；若改 7×7 则 stem 合计 153,640'
-                      '（精确口径）/153,664（表记口径），整表作废需重算',
+            # 冲突在**形状**上：28,152 与 153,272 在各自形状下都精确 ⇒ 算术裁决不了
+            # （规则第②支）。用户已显式裁决 ⇒ 规则第③支：按 3×3 走，7×7 作废留痕。
+            'resolution': 'resolved_by_user_ruling',
+            'ruled_by': 'user_ruling_2026-09-27（规则第③支：显式裁决优先于算术）',
+            # 被否口径必须**整份**留痕（连同它会把合计顶到多少），否则日后有人
+            # 从 git 历史里翻出 7×7 提案，会当成「还没评估过的选项」。
+            'voided': 'voided_by_user_ruling',
+            'voided_alternative': (
+                ('kernel', '7x7'),
+                ('conv_params', 153_272),        # 49×17×184
+                ('stem_with_bn', 153_640),       # 153,272 + 368
+                ('backbone_total', 6_683_816),   # 6,558,696 - 28,520 + 153,640
+                ('total_params', 9_192_563),     # 6,683,816 + 2,366,730 + 142,017
+                ('note', '作废：用户 2026-09-27 裁决 stem 取 3×3，7×7 不是新选项。'
+                         '裁决书里同时流传 6,687,768 / 9,196,515，那是按 P4.9d 基数'
+                         '（6,562,648）算的，比这里的精确值多 3,952——恰是本轮 A '
+                         '记账改动省下的 4×(旧低秩记账 - 4)；按规则第①支取精确值'),
+            ),
+            'status': '已裁决（用户 2026-09-27，规则第③支）：stem 取 3×3，合计 '
+                      '28,520 不变；7×7 口径作废但留痕（153,272 / stem 153,640，'
+                      '会顶到 backbone 6,683,816 / total 9,192,563）——若日后确认'
+                      '改 7×7，本表**整表作废**、backbone_total/total_params 必须重算',
         },
         {
             'id': 'policy_fc2_128_off',
@@ -198,10 +286,12 @@ ANCHOR_V21 = {
             'recorded': 33_024,       # 128×256+256：同一形状的唯一精确值（本锚点采用）
             'delta': 128,             # 33,024 - 32,896（recorded - stated）
             'total_stated': 2_366_730,  # 表头自己写的合计：与修正后的分项和一致
-            # 形状（含 bias 标志）被表写死 ⇒ 精确算术有唯一解 ⇒ 规则裁决 recorded
+            # 形状（含 bias 标志）被表写死 ⇒ 精确算术有唯一解 ⇒ 规则第①支裁决 recorded
             'resolution': 'resolved_by_exact_arithmetic',
             'status': '已裁定（P4.9c）：分项行改按 33,024，合计 2,366,730 与表头'
-                      '一致，total_params 9,008,547；与已发布 FCPolicyHead 实测一致',
+                      '一致；主干改 Mamba-2 / per-head scalar A 后 total_params '
+                      '9,067,443，policy 头本身**不变**（曾提的「首个 FC 128→120」'
+                      '已被用户撤回，故不登记为条目）',
         },
     ),
 }
@@ -417,12 +507,15 @@ def run_preset(batch=None, key='all'):
 def run_anchor_v21():
     """陈列 v21 权威参数锚点（ANCHOR_V21，静态字面量，非本工具实测）。
 
-    P4.2 接线落地前 AlphaGoNet 还造不出 MambaLTI/TransformerBlock/
+    P4.2 接线落地前 AlphaGoNet 还造不出 Mamba2/TransformerBlock/
     CrossAttnRes 结构，故 `--preset v21` 不做 forward 投影，只打印锚点表，
     并当场核算主干合计与总合计——表内数字自相矛盾会直接暴露在输出里。
     表内那两处**已知**笔误（stem 3×3 vs 7×7 的形状冲突、policy 分项 fc2 的
     32,896）不在此判对错，只按 known_discrepancies 逐条陈列，避免看起来像
-    被静默抹平。
+    被静默抹平。**但每条都带出 resolution**：两条都已定案——policy 走规则
+    第①支（精确算术），stem 走第③支（用户 2026-09-27 显式裁决 3×3，7×7
+    口径以 voided_by_user_ruling 留痕）。悬而未决的状态在这张表里必须看得
+    出来，故不在此处做任何「已定案」的粉饰。
     """
     A = ANCHOR_V21
     lay, vh = A['layout'], A['heads']
@@ -432,8 +525,8 @@ def run_anchor_v21():
         'stem': 'stem {}'.format(lay['stem']),
         'res_blocks': 'ResBlock ×{} @{}'.format(
             lay['res_blocks'], A['backbone_channels']),
-        'mamba_lti': 'MambaLTI ×{} @{}'.format(
-            lay['mamba_lti_blocks'], A['backbone_channels']),
+        'mamba2': 'Mamba2 ×{} @{}'.format(
+            lay['mamba2_blocks'], A['backbone_channels']),
         'transformer': 'TransformerBlock ×{} @{} heads={} {}'.format(
             lay['transformer_blocks'], A['backbone_channels'],
             lay['transformer_heads'], ffn),
@@ -460,10 +553,20 @@ def run_anchor_v21():
     print('in={} → backbone {}ch → 头 in={}，policy out={}，value out={}'.format(
         A['in_channels'], A['backbone_channels'], vh['in'],
         vh['policy_out'], vh['value_out']))
+    # Mamba-2 形状单列一行：块布局（P4.2 只读锚点就能拿到）不该只活在源码里。
+    # ⚠ expand=2 是 in_proj 的**扇出**（184→368），不是分支内宽 d_inner=2C。
+    # P4.9e 起 A 是 per-head 标量：报 P（head 数）+ head_dim，不再报 r（无 r 了）。
+    print('Mamba2 形状：N={} P={}(heads={}×{}) d_conv={} dt_rank={} expand={}'
+          ' A={}（{}）'.format(
+              lay['mamba2_d_state'], lay['mamba2_n_heads'],
+              lay['mamba2_n_heads'], lay['mamba2_head_dim'],
+              lay['mamba2_d_conv'], lay['mamba2_dt_rank'], lay['mamba2_expand'],
+              lay['mamba2_A_params'], lay['mamba2_A_form']))
     for d in A['known_discrepancies']:
-        print('⚠ 已知矛盾[{}]：{}（表记 {:,} / 本锚点采 {:,}，差 {:,}）{}'.format(
-            d['id'], d['about'], d['stated'], d['recorded'], d['delta'],
-            d['status']))
+        print('⚠ 已知矛盾[{}](resolution={})：{}（表记 {:,} / 本锚点采 {:,}，'
+              '差 {:,}）{}'.format(
+                  d['id'], d['resolution'], d['about'], d['stated'],
+                  d['recorded'], d['delta'], d['status']))
     print('注：v21 结构在 P4.2 接线落地前不可实测；17ch measure 已支持'
           '（measure/in_channels=17），--emit-flags 需 V21_CFG，暂不支持')
     return dict(parts=dict(A['params']), backbone_total=total,
