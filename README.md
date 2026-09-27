@@ -138,16 +138,34 @@ Go-AI/
 - 棋盘状态：`board` 为 `int8 (n, n)`，取值 `-1`=白、`0`=空、`1`=黑。
 - 当前执子方：`current_player`（`1`=黑 / `-1`=白），**注意不是** `to_play`（MCTS 内部用 1/2 表示，二者不等价）。
 - 核心方法：
-  - `play(mv)` → `bool`：落子 `mv`；`mv == n*n` 表示**虚着(pass)**；非法着法返回 `False`（不抛异常）。
-  - `get_legal_moves()` → `bool (n*n,)` 一维掩码（`True`=合法）。
-  - `feature_planes(my_hist, op_hist, to_play)` → `(12, n, n)` 特征（见 §4.2）。
-  - `score()` → `float`：Tromp-Taylor 数子，**黑 − 白** 目数（终局判定）。
-  - `parse_move_str(s, color)` → `(ok, mv)`：坐标串（如 `"ce"`）转扁平索引。
+  - `play(mv)` → `bool`：落子 `mv`（扁平下标 `r*n + c`）；**虚着(pass) 传 `-1`**；
+    非法着法（含自杀、重复染色）返回 `False`（不抛异常）。
+    ⚠ **动作空间的 `PASS`（`GoBoard.PASS == n*n`）不是 `play()` 接受的写法**：`play(GoBoard.PASS)` 返回 `False`，
+    要下 pass 请用 `play(-1)`（等价写法：`play(-1 if a == board.PASS else a)`）。
+  - `get_legal_moves()` → `bool (n*n,)` 一维掩码（`True`=合法）。TT 口径：空点 + 禁自杀 + 位置超级劫。
+  - `legal_actions()` → `list[int]`：升序的合法**动作**（含 `PASS`）。
+  - `is_legal(a)` → `bool`：**单点**判定，不物化全掩码；`a == PASS` 恒为 `True`；越界返回 `False`。
+    与 `get_legal_moves()` 逐点等价（`is_legal(a) == bool(mask[a])`，`0 <= a < n*n`）。
+  - `num_actions()` → `n*n + 1`；`PASS = n*n`（类级常量，带写入守卫）。
+  - `action_to_coord(a)` / `coord_to_action(r, c)`：动作 ↔ 坐标，越界抛 `ValueError`。
+  - `action_to_string(a)` / `string_to_action(s)`：动作 ↔ 文本记法（**列字母在前**的 SGF 风格，如 `"ee"`=天元、`"pass"`=虚着），
+    非法输入抛 `ValueError`；记法与 `parse_move_str` 是**同一套**（`string_to_action` 直接委托它）。
+  - `feature_planes(my_hist, op_hist, to_play)` → `(12, n, n)` 特征（见 §4.2）。第 8 通道 = 合法点掩码。
+  - `score()` → `float`：**黑 − 白** 面积分（`B_area − W_area − komi`，`>0` 黑胜）；`result()` 是其符号。
+  - `is_terminal(max_moves=None)` → `bool`：连续两次 pass 或达到 `2*n*n` 手上限。
+    ⚠ **重复局面不是终局条件**（TT 下它是非法手），本方法不查重复历史。
+  - `hash()` / `position_hash()` / `is_repetition()`：局面指纹与重复局面查询（`position_hash` 只含棋盘染色，
+    重复判定用它；`hash` 含行棋方，仅作通用指纹——**两者不可混用**）。
+  - `parse_move_str(s, color)` → `(ok, mv)`：坐标串转扁平索引。
   - `to_string()`：文本化棋盘（供 CLI 展示）。
 - 规则：气(liberties)计算、提子、**禁自杀**、**位置超级劫（PSK，重复染色即非法）**、双 pass 终局。
-  `ko_point` 仍会计算，但只是「上一手是否形成单劫」的**只读描述位，不参与合法性**（PSK 已覆盖简单劫）。
-  贴目 `komi` 默认 6.5（中国规则常用）。自杀与 PSK 属 Tromp-Taylor 口径（禁自杀是相对 TT 的有意偏离，
-  TT 规则本身允许自提）。
+  `ko_point` 仍会计算，但只是「上一手是否形成单劫」的**只读描述位，不参与合法性**（PSK 已覆盖简单劫，
+  且 Tromp-Taylor 规则里本就没有独立的禁劫条款——多子提子后回提按 TT 是合法手）。
+  贴目 `komi` 默认 6.5（中国规则常用）。禁自杀是**相对 TT 的有意偏离**（TT 规则本身允许自提），
+  以免后人拿 TT 原文「纠正」它。
+- 规则/计分对拍语料在 `tests/data/go_parity.json`（10 条手工推导局面），回放测试
+  `tests/test_go_rules_parity.py`（含 200 局随机对局的合法性/计分/生命周期不变量，
+  其中的面积分解是**独立实现**，用来交叉校验 `score()`）。
 - 克隆：无 `clone()` 方法，MCTS 用 `copy.deepcopy(board)` 复制局面。
 
 ### 4.2 特征平面（12 通道）

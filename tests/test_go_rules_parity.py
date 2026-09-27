@@ -171,3 +171,113 @@ def test_corpus_scores_are_board_only_not_history():
         assert fresh.score() == pytest.approx(case['expected_score']), (
             f"语料 {case['id']}: 分数依赖了历史状态而非盘面"
         )
+
+
+# --------------------------------------------------------------------------- #
+# 随机对局不变量（200 局：9 路 100 + 5 路 100，固定种子可复现）
+# --------------------------------------------------------------------------- #
+
+def _areas(b):
+    """独立实现一次面积分解，用来**交叉校验** `score()`（不复用引擎算法）。
+
+    返回 (B_area, W_area, neutral)：己方子数 + 只接触该色的空区；其余空点中立。
+    """
+    n = b.board_size
+    board = b.board
+    empty = board == 0
+    vis = np.zeros((n, n), dtype=bool)
+    b_terr = w_terr = neutral = 0
+    for r in range(n):
+        for c in range(n):
+            if not empty[r, c] or vis[r, c]:
+                continue
+            stack = [(r, c)]
+            vis[r, c] = True
+            size = 0
+            colors = set()
+            while stack:
+                cr, cc = stack.pop()
+                size += 1
+                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    nr, nc = cr + dr, cc + dc
+                    if not (0 <= nr < n and 0 <= nc < n):
+                        continue
+                    if empty[nr, nc] and not vis[nr, nc]:
+                        vis[nr, nc] = True
+                        stack.append((nr, nc))
+                    elif board[nr, nc] != 0:
+                        colors.add(int(board[nr, nc]))
+            if colors == {1}:
+                b_terr += size
+            elif colors == {-1}:
+                w_terr += size
+            else:
+                neutral += size
+    b_stones = int((board == 1).sum())
+    w_stones = int((board == -1).sum())
+    return b_stones + b_terr, w_stones + w_terr, neutral
+
+
+def _check_board_invariants(b, n, komi, where):
+    """合法性/动作空间一致 + 分数与独立面积分解吻合 + 范围与整数分解合法。"""
+    mask = b.get_legal_moves()
+    actions = b.legal_actions()
+    assert actions == sorted(actions), f"{where}: legal_actions 未升序"
+    assert b.PASS in actions, f"{where}: legal_actions 缺 PASS"
+    assert b.num_actions() == n * n + 1, f"{where}: num_actions 不是 n*n+1"
+    for a in range(n * n + 1):
+        assert b.is_legal(a) == (a == b.PASS or bool(mask[a])), f"{where}: is_legal({a}) 与掩码不一致"
+
+    s = b.score()
+    assert np.isfinite(s), f"{where}: score 非有限"
+    assert abs(s * 2 - round(s * 2)) < 1e-9, f"{where}: komi={komi} 下出现整数分 {s}"
+    B, W, neutral = _areas(b)
+    assert B + W + neutral == n * n, f"{where}: 面积分解不闭合 {B}+{W}+{neutral} != {n * n}"
+    assert s == pytest.approx(B - W - komi), (
+        f"{where}: score={s} 与独立面积分解 B-W-komi={B - W - komi} 不符"
+    )
+    assert -(n * n + komi) <= s <= (n * n - komi), f"{where}: score 越界 {s}"
+    assert b.result() == (1 if s > 0 else (-1 if s < 0 else 0)), f"{where}: result 与 score 符号不一致"
+
+
+@pytest.mark.parametrize('n,komi,games', [(9, 7.5, 100), (5, 6.5, 100)])
+def test_random_games_invariants(n, komi, games):
+    """200 局随机自对弈（固定种子）：每手之后的合法性/计分不变量，以及 undo/clone 生命周期。"""
+    for g in range(games):
+        rng = np.random.default_rng(1000 + 17 * n + g)
+        b = GoBoard(n, komi=komi)
+        start_hash = b.hash()
+        played = 0
+        for _ in range(2 * n * n):
+            if b.is_terminal():
+                break
+            actions = b.legal_actions()
+            assert actions, f"{n}x{n} 第 {g} 局: legal_actions 为空"
+            points = [x for x in actions if x != b.PASS]
+            if not points:
+                # 只剩 pass 可下：连下两手终局。这两手也要计入 played，
+                # 否则后面按 played 撤销会少撤两手、停在 pass 后的局面。
+                b.play(-1)
+                b.play(-1)
+                played += 2
+                break
+            # 10% 概率 pass（制造终局与贴目相关形状），其余随机选点
+            a = b.PASS if rng.random() < 0.1 else int(rng.choice(points))
+            assert b.play(-1 if a == b.PASS else a), (
+                f"{n}x{n} 第 {g} 局第 {played} 手: play() 拒绝了掩码判为合法的动作 {a}"
+            )
+            played += 1
+            _check_board_invariants(b, n, komi, f"{n}x{n} 第 {g} 局第 {played} 手后")
+        # 注意：**不能**断言「落子后哈希必变」——走子 + 全部被提可以合法回到空盘，
+        # 且行棋方也回到初始方，那种局面哈希本就该等于初始哈希。
+        # 真正的不变量是下面这条：按 played 手数撤销后必须精确回到初始局面。
+        # 生命周期：clone 后哈希与盘面一致；undo 全部手回到初始局面
+        c = b.clone()
+        assert c.hash() == b.hash(), f"{n}x{n} 第 {g} 局: clone 后哈希不一致"
+        assert c.board.tobytes() == b.board.tobytes(), f"{n}x{n} 第 {g} 局: clone 盘面不一致"
+        for _ in range(played):
+            assert b.undo(), f"{n}x{n} 第 {g} 局: undo 失败"
+        assert b.hash() == start_hash, f"{n}x{n} 第 {g} 局: 全部 undo 后未回到初始哈希"
+        assert not b.board.any(), f"{n}x{n} 第 {g} 局: 全部 undo 后盘面非空"
+        assert not b.is_repetition(), f"{n}x{n} 第 {g} 局: 终局被判为重复局面"
+        _check_board_invariants(b, n, komi, f"{n}x{n} 第 {g} 局全部撤销后")
