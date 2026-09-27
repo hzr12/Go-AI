@@ -342,14 +342,29 @@ def test_ssm_is_causal_in_time():
 
     逐个 t0 扫一遍：既检查 t0 之前逐位不变，也检查 t0 及之后**确实变了**
     （后者是前者的空转守卫：若扰动根本没进计算路径，「不变」证明不了因果性）。
+
+    ⚠ 扰动必须**逐通道不同**（这是 review 打回重写的关键点）
+    ---------------------------------------------------------
+    `MambaLTI` 的 pre-LN 是**逐位置**的 `LayerNorm2d`，它会减掉每个位置上
+    8 个通道的均值。第一版扰动写成 `x2[:,:,r,c] += 5.0`（8 个通道同加 5.0），
+    是个**均匀平移**，被 pre-LN 整体消掉：实测 pre-LN 后 delta = 8.9e-16、
+    in_proj 后 delta = 1.1e-16。SSM 什么都没看到，输出变化只剩残差 `x + out` 里的
+    那份直接拷贝 —— 于是「之后必变」读到的 5.0 全部是残差给的，而「之前不变」在
+    换成**前向扫描**（state 从 drive_t 累到 drive_{T-1}）的实现下**依然成立**：
+    实测 leak = 0.000e+00（本该 > 0）。这条测试对扫描曾是彻底空转的。
+    改成逐通道随机扰动后：正确实现 leak = 0.0e+00，前向扫描 leak = 3.34e-04
+    （见 report 的 `## Fix 增补` §1）。
     """
     m = _small_mamba()
     x = torch.randn(2, 8, 4, 4, dtype=torch.float64)
+    # 逐通道的随机扰动（形状 (B, C)，只加在被扰动的那一个位置上 ⇒ 8 个通道各不相同）
+    bump = torch.randn(2, 8, dtype=torch.float64,
+                       generator=torch.Generator().manual_seed(20260925)) * 3.0
     with torch.no_grad():
         base = m(x)
         for t0 in range(16):
             x2 = x.clone()
-            x2[:, :, t0 // 4, t0 % 4] += 5.0
+            x2[:, :, t0 // 4, t0 % 4] += bump
             delta = (m(x2) - base).flatten(2)          # (B, C, T)
             if t0:
                 before = delta[:, :, :t0].abs().max().item()
@@ -490,6 +505,151 @@ def test_cross_attn_res_uses_three_inputs():
         wide(x, taps)                                             # 仍按 552 传 → 抛
 
 
+def _hand_mhsa(attn, x):
+    """手写的 MHSA 前向：只用 `wq/wk/wv/wo` 的权重 + 显式 scale 重写一遍。
+
+    **不**调用 `attn.forward`，也**不**调用模块级 `_sdpa` / `_global_attn` ——
+    参考实现必须与生产实现独立，否则只能发现「生产 vs 生产」。
+    eval 下 `attn_drop_p == 0.0`，与 `_sdpa` 的 math 路径（q 预乘 scale）同口径。
+    """
+    B, C, H, W = x.shape
+    N = H * W
+    seq = x.flatten(2).transpose(1, 2)                        # (B, N, C)
+    Hh, d = attn.num_heads, attn.head_dim
+
+    def _heads(t):
+        return t.view(B, N, Hh, d).transpose(1, 2)            # (B, Hh, N, d)
+
+    q = _heads(F.linear(seq, attn.wq.weight)) * attn.scale
+    k = _heads(F.linear(seq, attn.wk.weight))
+    v = _heads(F.linear(seq, attn.wv.weight))
+    w = (q @ k.transpose(-2, -1)).softmax(dim=-1) @ v        # (B, Hh, N, d)
+    return F.linear(w.transpose(1, 2).reshape(B, N, C),
+                    attn.wo.weight).transpose(1, 2).reshape(B, C, H, W)
+
+
+def _hand_ffn(blk, norm, x):
+    """手写的 FFN 支路：`x + fc2(gelu(fc1(flatten(LN(x)))))`。
+
+    `norm` 由调用方显式传入（`norm1` 还是 `norm2`），因为「norm 作用在哪一步」
+    正是要钉的东西，不能由这里替实现决定。
+    """
+    h = norm(x).flatten(2).transpose(1, 2)                    # (B, N, C)
+    h = F.linear(F.gelu(F.linear(h, blk.fc1.weight)), blk.fc2.weight)
+    return h.transpose(1, 2).reshape(x.shape)
+
+
+def _rms_delta(got, *others):
+    """实测 max|Δ|（float64，用来在报错里打出偏差量级）。"""
+    return max((got - o).abs().max().item() for o in others)
+
+
+def test_transformer_block_matches_hand_written_pre_norm_formula():
+    """`TransformerBlock` 的**完整**前向 == 测试内手写的 pre-norm 公式。
+
+    这条补的是 review 打回的一个真实缺口：第 13 条只把两条支路的**末端权重**
+    清零来证明「有两条恒等捷径」，**没有任何断言**钉住
+      ① pre-norm 的**位置**（`attn` / `ffn` 吃的是 LN 之后的张量）；
+      ② 两条残差支路的**次序**（注意力在前、FFN 在后，且第二条吃第一条的输出）。
+    实测：把 `norm1`/`norm2` 整个旁路掉（模块仍在 ⇒ 参数量不变），或者把两条残差
+    的次序对调，22 条旧测试**全绿** —— 一次「无害的重构」就能静默改掉架构。
+
+    手写公式：x0 = x；x1 = x0 + MHSA(LN1(x0))；x2 = x1 + FFN(LN2(x1))。
+    `LayerNorm2d` 本身复用块上的实例（它是既有共享类，另有 D5 签名锁），
+    「norm 作用在哪一步」由本测试的组合方式决定，不由被测代码决定。
+    """
+    torch.manual_seed(11)
+    m = TransformerBlock().eval().double()
+    x = torch.randn(2, CH, 5, 5, dtype=torch.float64)
+
+    with torch.no_grad():
+        x1 = x + _hand_mhsa(m.attn, m.norm1(x))
+        want = x1 + _hand_ffn(m, m.norm2, x1)
+        got = m(x)
+
+        assert torch.allclose(got, want, rtol=1e-9, atol=1e-11), \
+            ('TransformerBlock 与手写 pre-norm 公式不一致：max|Δ|={:.3e} —— '
+             'norm 位置或两条残差支路的次序被改了'
+             ).format(_rms_delta(got, want))
+
+        # 对照 ①：去掉 pre-norm（两条支路直接吃未归一化的 x）必须**不**等于本实现
+        no_pre = _hand_ffn(m, m.norm2, x + _hand_mhsa(m.attn, x))
+        assert not torch.allclose(got, no_pre, rtol=1e-6, atol=1e-9), \
+            ('去掉 pre-norm 后输出不变 —— 本测试分辨不出 norm 的位置（空转）'
+             '（max|Δ|={:.3e}）').format(_rms_delta(got, no_pre))
+
+        # 对照 ②：post-norm（norm 放在残差**之后**）必须**不**等于本实现
+        a = m.norm1(x) + _hand_mhsa(m.attn, x)          # LN 在残差之后 = post-norm
+        post = a + _hand_ffn(m, m.norm2, a)
+        assert not torch.allclose(got, post, rtol=1e-6, atol=1e-9), \
+            ('post-norm 写法与本实现相同 —— 本测试分辨不出 pre/post（空转）'
+             '（max|Δ|={:.3e}）').format(_rms_delta(got, post))
+
+        # 对照 ③：两条残差支路对调（FFN 在前、注意力在后）必须**不**等于本实现
+        x1s = x + _hand_ffn(m, m.norm1, x)
+        swapped = x1s + _hand_mhsa(m.attn, m.norm2(x1s))
+        assert not torch.allclose(got, swapped, rtol=1e-6, atol=1e-9), \
+            ('把两条残差支路对调后输出不变 —— 本测试分辨不出支路次序（空转）'
+             '（max|Δ|={:.3e}）').format(_rms_delta(got, swapped))
+
+
+def test_cross_attn_res_matches_hand_written_pre_norm_formula():
+    """`CrossAttnRes` 的**完整**前向 == 测试内手写的 pre-norm 公式。
+
+    第 14 条只把 `wo`/`fc2` 清零后**单独取投影支路**去比（`m(x, taps) - x`），
+    于是 `norm_attn` / `norm_ffn` 的位置与两条捷径的次序**无人看守**：实测把它们
+    旁路掉或把捷径对调，22 条旧测试全绿。本条把三段全串起来比：
+
+        y1 = x + proj(cat(LN_tap(s1), LN_tap(s5), LN_tap(s9)))   # 跨层投影支路
+        y2 = y1 + MHSA(LN_attn(y1))                             # 恒等捷径
+        y3 = y2 + FFN(LN_ffn(y2))                               # 恒等捷径
+
+    连带的额外收益：`y1` 的残差腿是**当前流 `x`**，不是 `s1`。类 docstring 里
+    「第一路 s1 是 identity 捷径」的说法是装饰性的（`s1` 只是被 concat 进去的
+    一路特征，没有任何 identity 语义），这条断言把「快捷腿是 x」钉死。
+    """
+    torch.manual_seed(13)
+    m = CrossAttnRes().eval().double()
+    x = torch.randn(2, CH, 5, 5, dtype=torch.float64)
+    taps = tuple(torch.randn(2, CH, 5, 5, dtype=torch.float64) for _ in range(3))
+
+    with torch.no_grad():
+        merged = F.conv2d(torch.cat([m.norm_tap(t) for t in taps], dim=1),
+                          m.proj.weight)
+        y1 = x + merged
+        y2 = y1 + _hand_mhsa(m.attn, m.norm_attn(y1))
+        want = y2 + _hand_ffn(m, m.norm_ffn, y2)
+        got = m(x, taps)
+
+        assert torch.allclose(got, want, rtol=1e-9, atol=1e-11), \
+            ('CrossAttnRes 与手写 pre-norm 公式不一致：max|Δ|={:.3e} —— '
+             'norm 位置或两条恒等捷径的次序被改了'
+             ).format(_rms_delta(got, want))
+
+        # 对照 ①：旁路 `norm_attn` / `norm_ffn`（注意力/FFN 直接吃未归一化的 y）必须不等
+        y2_np = y1 + _hand_mhsa(m.attn, y1)
+        no_pre = y2_np + _hand_ffn(m, m.norm_ffn, y2_np)
+        assert not torch.allclose(got, no_pre, rtol=1e-6, atol=1e-9), \
+            ('旁路 norm_attn/norm_ffn 后输出不变 —— 本测试分辨不出 pre-norm（空转）'
+             '（max|Δ|={:.3e}）').format(_rms_delta(got, no_pre))
+
+        # 对照 ②：两条恒等捷径对调（FFN 在前、注意力在后）必须**不**等于本实现
+        y2s = y1 + _hand_ffn(m, m.norm_attn, y1)
+        swapped = y2s + _hand_mhsa(m.attn, m.norm_ffn(y2s))
+        assert not torch.allclose(got, swapped, rtol=1e-6, atol=1e-9), \
+            ('把两条恒等捷径对调后输出不变 —— 本测试分辨不出支路次序（空转）'
+             '（max|Δ|={:.3e}）').format(_rms_delta(got, swapped))
+
+        # 对照 ③：快捷腿必须取**当前流 x**；换成第一路抽头 s1 必须**不**等于本实现
+        leg_s1 = taps[0] + merged
+        leg_s1 = leg_s1 + _hand_mhsa(m.attn, m.norm_attn(leg_s1))
+        leg_s1 = leg_s1 + _hand_ffn(m, m.norm_ffn, leg_s1)
+        assert not torch.allclose(got, leg_s1, rtol=1e-6, atol=1e-9), \
+            ('把跨层残差的快捷腿从「当前流 x」换成「第一路抽头 s1」结果不变 —— '
+             '本测试分辨不出快捷腿的来源（空转）'
+             '（max|Δ|={:.3e}）').format(_rms_delta(got, leg_s1))
+
+
 def test_mhsa_core_is_shared_not_duplicated():
     """两个块类共用**同一个** MHSA 实现（brief §1：不要复制两份注意力）。"""
     assert type(TransformerBlock().attn) is MHSA
@@ -512,6 +672,13 @@ def test_mhsa_core_is_shared_not_duplicated():
 # 8. 两个头的输出
 # --------------------------------------------------------------------------- #
 def test_head_output_shapes_and_range():
+    """两个头的输出形状与值域；**Tanh 的去留是已裁决项，不是待定项**。
+
+    `FCValueHead` 末尾的 `nn.Tanh()` 曾被 report §5 标成「需用户裁决」。用户已
+    **裁决保留 Tanh**（report §5 的裁决记录），所以本测试里所有关于 Tanh 的断言
+    都是**终态约束**，不是「等裁决结果再定」的占位：删 `out_tanh` 一行会让本条
+    测试变红，这是**预期行为**，不是需要修的回归。要改这个决定，得先推翻裁决。
+    """
     p = FCPolicyHead().eval()
     v = FCValueHead().eval()
     x = torch.randn(3, CH, BOARD, BOARD)

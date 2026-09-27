@@ -115,8 +115,11 @@ class FCValueHead(nn.Module):
     末尾是 `nn.Tanh()`（值域 [-1,1]），与 P4.5 的 `value_t ∈ [-1,1]` 回归口径
     以及推理/Brier 侧「按 tanh/[-1,1] 解释 value」的既有约定一致。
     ⚠ 这是**有意偏离**既有 `ValueNetwork`：后者的 `forward`（:92-100）是裸线性
-    输出、无 Tanh，head 与消费端差了一个 tanh。Tanh 零参数，预算表区分不出来，
-    需用户裁决，详见 report §5。
+    输出、无 Tanh，head 与消费端差了一个 tanh。Tanh 零参数，预算表区分不出来。
+    **用户已裁决：Tanh 保留**（见 report §5 的裁决记录）—— 不是待定项，P4.2
+    之后的任务不必再为此往返提问。
+    ✅ 下游复核：`src/` 全量 grep 没有任何 `sigmoid(value)` 调用点
+    （`inference.py:6` 已按「tanh 后落在 [-1,1]」解释 value），二次压缩的风险不存在。
     """
 
     def __init__(self, in_channels=184, hidden_channels=32):

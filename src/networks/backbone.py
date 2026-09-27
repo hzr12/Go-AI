@@ -759,8 +759,12 @@ class MHSA(MultiHeadSelfAttention):
         self.head_dim = channels // num_heads
         self.scale = self.head_dim ** -0.5
         self.attn_drop = dropout
-        # 父类 forward 的 window/sparse 分支会读 mode/window_size；v21 只用 global，
-        # 这里填一个合法值只为避免误用父类 forward 时抛 AttributeError。
+        # 父类 forward 的 window/sparse 分支会读 mode/window_size；v21 只用 global。
+        # ⚠ 这两个属性是**惰性占位**，不是安全网：父类 forward 还会读
+        # `self.ln1/ln2/ffn/ffn_drop`，本类**刻意不建**这些（+89,184 参数），
+        # 所以误用父类 forward 照样 AttributeError。填它们只是为了让
+        # `getattr(m, 'mode', None)` 这类查询拿到合法值，不至于在别处炸出
+        # 「缺属性」而不是「用错类」这种更难排查的错。
         self.mode = "global"
         self.window_size = 7
 
@@ -810,7 +814,9 @@ class MambaLTI(nn.Module):
     `tests/test_arch_v21_blocks.py` 用测试内独立写的双重 for 循环朴素参考逐步对齐。
 
     因果性：递推只用 s ≤ t 的量，深度卷积**左**填充 k-1=3，三处都没有未来信息。
-    `test_ssm_causality` 直接钉这条（改 t 之后的输入不得影响 t 的输出）。
+    `test_ssm_is_causal_in_time` 直接钉这条（改 t 之后的输入不得影响 t 的输出），
+    `test_ssm_scan_matches_naive_triple_loop` / `test_ssm_scan_equals_dt_strided_cumulative_form`
+    从两个独立参考实现侧钉同一条性质。
 
     实现选择（无参数开销、但影响梯度流，已在 report 里列为待用户确认项）：
       * 递推按 T 步**顺序**扫描（内存 O(B·C·S)，19×19 → 361 步）。闭式的
@@ -935,21 +941,37 @@ class TransformerBlock(nn.Module):
 
 
 class CrossAttnRes(nn.Module):
-    """跨层注意力残差块：拼接主干第 1/5/9 号块的输出后投影回来，逐块
+    """跨层注意力残差块：拼接主干三个浅/中/深位置的输出后投影回来，逐块
     **326,416** 参数。
 
-        taps = (s1, s5, s9)   # 主干第 1、5、9 号块（1-based）的输出
+        taps = (s1, s5, s9)   # 三个抽头的输出，见下面的「编号有歧义」
         x = x + proj(concat(LN1(s1), LN1(s5), LN1(s9)))      # 跨层投影支路
         x = x + MHSA(LN2(x))                                  # 恒等捷径
         x = x + FFN(LN3(x))                                   # 恒等捷径
 
-    三路的分工（哪一路是 identity 捷径）
-    ------------------------------------
-    **第一路 `s1`（主干第 1 号块，紧邻 stem 的浅层抽头）是 identity 捷径**：
-    它表征最浅、离输入最近，投影支路主要靠它把局部/原始特征直通过来；第二路 `s5`
-    与第三路 `s9` 提供中/深层多尺度语义。若用户本意是 `s9` 才算 identity 捷径，
-    只需改本类 docstring 与 P4.2 的抽头顺序 —— 参数量与计算图完全不受影响。
-    （顶层接线归 P4.2：本类只消费抽头，不自己去找主干。）
+    「第 1、5、9 号块」的编号**有歧义**（report §7.3 列了三种读法）
+    --------------------------------------------------------
+    本类**只消费抽头**，不自己去找主干，所以编号的裁定不影响参数量与计算图，
+    但它决定 P4.2 从哪里取特征 —— 因此把歧义与本任务的选择写在这里（P4.2 读的是
+    本类 docstring，不是 report）：
+
+    | 读法 | s1 | s5 | s9 |
+    |---|---|---|---|
+    | **A/B：块号 = ResBlock/Mamba/… 的序号，stem 不计数**（**本任务采用**） | **ResBlock #1** | **ResBlock #5** | **MambaLTI #1** |
+    | C：把 stem 算作第 1 个 | stem 输出 | ResBlock #4 | ResBlock #8 |
+
+    ⚠ 采用 A/B 时 **s9 是第一个 `MambaLTI` 块，不是 ResBlock #8** —— 两者是完全
+    不同的特征（SSM 块 vs 第 8 个残差块）。**P4.2 接线前请按上表核对一遍**；若要改成
+    读法 C，只需改接线，本类一行都不用动。
+
+    快捷腿是**当前流 `x`**，不是 `s1`
+    --------------------------------
+    实际计算图是 `x = x + proj(concat(...))`：`proj` 那条支路的残差腿是**进入本块的
+    当前流 `x`**。`s1`/`s5`/`s9` 三路地位**完全对等**，都只是被逐路 LN 后 concat 进去
+    的特征通道，没有哪一路享有 identity 语义 —— 把 concat 次序换成 `(s5,s9,s1)`
+    只是一个**纯置换**，不改变「谁提供恒等通路」这件事。`tests/test_arch_v21_blocks.py`
+    的 `test_cross_attn_res_matches_hand_written_pre_norm_formula` 把「快捷腿 = x」
+    钉住了（把腿换成 `s1` 会红）。
 
     为什么 LN1 是 **184 维**、且三路共用一个
     --------------------------------------
@@ -959,7 +981,7 @@ class CrossAttnRes(nn.Module):
     既要满足 326,416、又要保住 `proj(LN(concat(...)))` 的「先 norm 再 proj」次序，
     唯一解是：**一个 184 维 LN 逐路作用后 concat**（三路共用同一套仿射参数）。
     这是本任务里唯一需要我自己钉死的实现细节（brief §4「需要你自己钉死」），
-    已在 report §4 单列，供用户确认是否改用 `LN1(proj(concat))`（同参数、
+    已在 report §4(c) 单列，供用户确认是否改用 `LN1(proj(concat))`（同参数、
     换归一化位置与统计口径）。
 
     明确**没有** BatchNorm 也没有 ReLU：权威表的 326,416 不含 BN 的 368。
@@ -972,8 +994,8 @@ class CrossAttnRes(nn.Module):
         self.tap_channels = tuple(int(c) for c in tap_channels)
         if len(self.tap_channels) != 3:
             raise ValueError(
-                'CrossAttnRes 需要恰好 3 路抽头（主干第 1/5/9 号块），'
-                '收到 {} 路'.format(len(self.tap_channels)))
+                'CrossAttnRes 需要恰好 3 路抽头（主干第 1/5/9 号块；编号读法见类 '
+                'docstring，s9 = MambaLTI #1），收到 {} 路'.format(len(self.tap_channels)))
         self.ffn_hidden = ffn_hidden
         self.norm_tap = LayerNorm2d(channels)                 # 368（逐路复用）
         self.proj = nn.Conv2d(sum(self.tap_channels), channels, 1, bias=False)  # 101,568
@@ -986,8 +1008,8 @@ class CrossAttnRes(nn.Module):
     def _check_taps(self, taps):
         if len(taps) != 3:
             raise ValueError(
-                'CrossAttnRes.forward 需要 3 路抽头（主干第 1/5/9 号块的输出），'
-                '收到 {} 路'.format(len(taps)))
+                'CrossAttnRes.forward 需要 3 路抽头（主干第 1/5/9 号块的输出；'
+                '编号读法见类 docstring，s9 = MambaLTI #1），收到 {} 路'.format(len(taps)))
         for i, (t, want) in enumerate(zip(taps, self.tap_channels)):
             if t.dim() != 4:
                 raise ValueError(

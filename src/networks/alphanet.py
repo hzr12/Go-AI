@@ -89,7 +89,11 @@ class AlphaGoNet(nn.Module):
             observation: (batch, in_channels, H, W)
         Returns:
             policy: (batch, action_size) logits
-            value:  (batch, 1) 黑方视角胜率 logit（经 sigmoid 映射到 [0,1]，0=白胜 1=黑胜）
+            value:  (batch, 1) 黑方视角价值，值域 [-1,1]（-1=白胜 1=黑胜）。
+                     ⚠ 不是「sigmoid 映射到 [0,1] 的胜率」：v19 的 ValueNetwork 是
+                     裸线性输出（无 Tanh），v21 的 FCValueHead 末尾有 nn.Tanh()，
+                     口径按 `inference.py:6` 的「tanh 后落在 [-1,1]」解释。
+                     要胜率请自行做 (v+1)/2，不要套 sigmoid。
         """
         shared_state = self.backbone(observation)
         policy = self.policy(shared_state)
