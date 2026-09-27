@@ -1239,16 +1239,36 @@ def compute_l2_report(param_groups):
     **一律不做 all_reduce**（`_read_log_scalars` 直接 `.item()`，stdout 由
     rank0 的 logger 过滤、swanlab 只在 is_main 建），本项跟随同一口径：本地
     计算、本地 `.item()`、不加 collective。DDP 构造时把 rank0 的参数
-    broadcast 给所有 rank、每步再 all_reduce 梯度，故各 rank 的 θ 恒一致，
-    本项在各 rank 上是同一个数 —— 同一个日志键不会在不同 rank 上打架，
-    也就没有引入新的同步点/挂死风险。
+    broadcast 给所有 rank、每步再 all_reduce 梯度（`find_unused_parameters`
+    =False、无 `no_sync`），故各 rank 的 θ 恒一致，本项在各 rank 上是同一个数
+    —— 同一个日志键不会在不同 rank 上打架，也就没有引入新的同步点/挂死风险。
+    ⚠ 例外：`GradScaler.step` 只在**本地**查 `found_inf`、不做 all_reduce，
+    所以一次 inf/nan 触发的 step 跳过是**单 rank** 的 —— 那一步各 rank 的 θ
+    会分叉，本项在那一行就会跨 rank 不一致。稳态（无跳过）下不影响。
 
-    代价：每步多一遍 decay 参数的平方和（v18 参考配置 12,838,112 个 fp32
-    参数 ≈ 51 MB 读/step）。实测每步增量见 report `## Fix2（b）增补` §3.4。
-    `p.detach()` 保证不建图、不占住反向图；每组一次 `float()` 同步（两组
-    decay ⇒ 2 次），与日志打点原有的 3 次同量级。
+    代价（⚠ 分清「参数字节」与「实际流量」，两者差 ~3×）：`p.detach().pow(2).sum()`
+    是「逐元素 kernel + 归约 kernel」两段，流量是 **读 θ + 写 θ² + 读 θ²**
+    ≈ 3 × 参数字节。v18 参考配置 decay 参数 12,838,112 × 4 B = 51.35 MB
+    ⇒ **~154 MB/step 的实际流量**，不是 51 MB（后者只是参数字节计数）。
+    `p.detach()` 保证不建图、不占住反向图。设备同步是**每次调用 1 次**
+    `float()`（四组里两个 decay 组，只在最后读回一次），但本函数在训练循环里
+    **每个 micro-batch 都无条件跑**（不在 `if _do_stdout or _do_swanlab:` 里），
+    比日志打点那 3 次同步频繁得多 —— 见 report `## Fix3 增补` §3 的 NPU 说明。
     """
-    total = 0.0
+    # 累加全部留在**设备上**，整个调用只做一次 `float()`（= 一次 host 同步）。
+    # ⚠ 逐组 `float()` 是 2 次同步，而本函数在训练循环里**每个 micro-batch 都跑**
+    #   （不在 `if _do_stdout or _do_swanlab:` 里），比日志打点的 3 次同步频繁
+    #   ~`_accum_steps` × `--log-every` 倍。
+    # ⚠ `sq.double()` 不是可有可无的：它让乘加保持 **float64** 精度，与旧的
+    #   `wd * float(sq)`（python double 乘加）**逐位相同**；若留在 float32 上
+    #   累加，wd 的 float32 舍入会让 `l2_report ∝ --weight-decay` 这条线性律
+    #   只剩 ~1e-8 的相对精度（`test_l2_report_scales_with_weight_decay` 的
+    #   `rel=1e-9` 会红）。代价只是每个 decay 组多两个 0 维标量 kernel。
+    # ⚠ 单次读回不引入任何 θ 错位：所有 `pow(2).sum()` 的读都发生在这一行之前，
+    #   仍是**同一个 θ**。
+    #   `tests/test_huber_loss.py::test_l2_report_uses_decay_group_only` 用
+    #   TorchDispatchMode 数 `aten::item`，把「恰好一次」钉住。
+    total = None
     for group in param_groups:
         wd = float(group.get('weight_decay') or 0.0)
         if wd == 0.0:
@@ -1258,8 +1278,9 @@ def compute_l2_report(param_groups):
             s = p.detach().pow(2).sum()
             sq = s if sq is None else sq + s
         if sq is not None:
-            total += wd * float(sq)     # 每组一次设备同步
-    return total
+            term = sq.double() * wd
+            total = term if total is None else total + term
+    return 0.0 if total is None else float(total)
 
 
 def _param_group_sizes(source, key=None):
@@ -2265,6 +2286,11 @@ def main():
                     # `log_loss − policy − value` 反推 l2_report 时要记得 fp32
                     # 舍入：两项都是 O(1)~O(10)，差值只剩 ~1e-7 的绝对精度
                     # （test_log_loss_identity 按这个容差断言）。
+                    # ⚠ 但**真正的**精度上限是 stdout 的 `%.4f`（下面 logger.info
+                    # 里 loss/p/v 都是 4 位小数 ⇒ 量化步长 1e-4，对初值
+                    # l2_report=0.588 而言是 0.017%），不是 fp32 舍入。且
+                    # `log_loss − policy − value` 只在 `--value-loss-weight == 1`
+                    # 时等于 l2_report；w≠1 时它是 w·value。
                     # ⚠ 读 loss 曲线的人必须知道：log_loss **不是**被优化的目标。
                     l2_report = compute_l2_report(optimizer.param_groups)
                     opt_loss, log_loss = compose_losses(
