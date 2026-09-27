@@ -637,16 +637,30 @@ class GoBoard:
         board = self.board
         is_empty = (board == 0)
 
-        # ---- 脱钩守卫（两次归约，~1-2 µs；换「失败方式大声」）----
-        if int((self._gid < 0).sum()) != int(is_empty.sum()):
-            bad = np.argwhere((self._gid < 0) & ~is_empty)
-            r, c = (int(bad[0][0]), int(bad[0][1])) if bad.size else (0, 0)
-            raise _groups_desync_error(r, c)
+        # ---- 脱钩守卫：逐点比较「有块号」与「是棋子」，精确、不留后门 ----
+        # ⚠ 这里**必须逐点比**，不能比「空点数 == gid<0 数」那种计数代理：
+        #   一次「石头 -> 空」加一次「空 -> 石头」的成对改写会让两个计数**都保持
+        #   不变**，于是计数代理放行、而标量实现会抛 —— 两条路径对同一个契约违反
+        #   给出不同答案（实测 9 路 30 手后成对改写：向量化静默返回掩码，标量抛）。
+        # 代价：一次 `!=` + 一次 `any`（19 路 ~3 µs，占掩码 138 µs 的 2%）。
+        mismatch = (self._gid >= 0) != ~is_empty
+        if mismatch.any():
+            bad = np.argwhere(mismatch)
+            raise _groups_desync_error(int(bad[0][0]), int(bad[0][1]))
 
         # ---- 补边 ----
+        # 承重的性质其实只有一条：**哨兵号 n*n 是 `_lib_count` 的合法下标**
+        # （该数组长度 n*n+1），于是 `lib_count[哨兵]` 恒为 0，而越界邻居与空点
+        # 都被映射到它。至于「气数 0 -> rest = -1 -> 既不 >0 也不 ==0」——
+        # 那条推理**用不上**：`rest` 只在 `(shb == color)` / `(shb == opponent)`
+        # 的分支里被读，而哨兵格子的 `shb` 恒为 2（补边）或 0（空点），两个分支都进不去。
+        # 别照着「rest = -1 所以安全」去简化这两个判断。
         bp = np.full((n + 2, n + 2), 2, dtype=np.int8)
         bp[1:-1, 1:-1] = board
         gp = np.full((n + 2, n + 2), n2, dtype=np.int32)
+        # 空点的 gid 是 -1，而 numpy 的 -1 索引会绕到数组末尾 —— 末尾恰好也是哨兵槽，
+        # 值同样是 0，所以「不换也对」。仍然显式换掉：这条正确性不该建立在
+        # 「负索引绕回到我们想要的那一格」这种巧合上。
         np.copyto(gp[1:-1, 1:-1], self._gid, where=self._gid >= 0)
         lib_count = self._lib_count
 
@@ -1042,13 +1056,14 @@ class GoBoard:
         """去重历史键的**有序 uint64 数组** —— 掩码批量查重的唯一数据源。
 
         走向量化的盘口：直接返回 `_commit_position` / `_rollback_position` 同步维护的
-        `_pos_sorted`（O(1) 摊还地维护，见那里的条件与代价说明）。
-        不走向量化的盘口：标量掩码查的是 dict，本来用不着它 —— 但测试会**两条路径
-        都跑**（9/13 路也直接调 `_legal_masks_vectorized()` 做逐位对拍），所以这里
-        按需**临时**构造一个返回。
+        `_pos_sorted`（见那里的条件与代价说明）。
+        不走向量化的盘口：标量掩码查的是 dict，本来用不着它；但测试会在 5/9/13 路
+        **直接调** `_legal_masks_vectorized()` 做逐位对拍（那条路在这些盘口上不是
+        生产路径，却必须给出同样的答案），所以这里按需**临时**构造一个返回。
 
         ⚠ 临时的那份**绝不缓存**：缓存它等于给一条「不再被维护」的数组开后门 ——
-        下一次 commit/rollback 不会更新它，向量化路径就会拿着过期数据算 PSK。
+        下一次 commit/rollback 不会更新它，向量化路径就会拿着过期数据算 PSK，
+        症状是「静默放行一手 superko」。
         """
         if self._vectorized_mask_worth_it():
             srt = self._pos_sorted
