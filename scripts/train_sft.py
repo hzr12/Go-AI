@@ -170,12 +170,23 @@ from scripts.build_dataset import build
 
 def save_model(model, path):
     """保存模型权重，并剥离 DDP 包裹产生的 'module.' 前缀与 torch.compile 产生的
-    '_orig_mod.' 前缀，保证存档无论是否经 DDP/compile 都能被后续普通加载/resume 使用。"""
+    '_orig_mod.' 段，保证存档无论是否经 DDP/compile 都能被后续普通加载/resume 使用。
+
+    ⚠ '_orig_mod.' 出现在**路径任意层级**，不只在开头。两种 compile 形态落点不同：
+    整模型 compile（CUDA `--compile 1`）把**顶层**包成 OptimizedModule
+    （'_orig_mod.backbone.xxx.weight'），而 Linear-only compile（D2，
+    `--npu-graph-compile 1`，见 `_compile_linear_submodules`）顶层仍是原模型、
+    只把每个 nn.Linear 包起来，段落在**路径中段**（'backbone.qkv._orig_mod.weight'）。
+    故这里按 `'_orig_mod.' in k` 判存在性、按 `str.replace` 去**所有**层级，
+    不能沿用旧实现的 `replace(..., 1)`（只换首个）——那在 Linear-only 形态下
+    会原样留下中段前缀，存档键与 evaluate.py / inference / webui / convert_ckpt
+    期待的未编译布局对不上，load_state_dict 直接失败。
+    """
     sd = model.state_dict()
     if any(k.startswith('module.') for k in sd.keys()):
         sd = {k.replace('module.', '', 1): v for k, v in sd.items()}
-    if any(k.startswith('_orig_mod.') for k in sd.keys()):
-        sd = {k.replace('_orig_mod.', '', 1): v for k, v in sd.items()}
+    if any('_orig_mod.' in k for k in sd.keys()):
+        sd = {k.replace('_orig_mod.', ''): v for k, v in sd.items()}
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     torch.save(sd, path)
 
@@ -263,16 +274,33 @@ def _locate_overflow(optimizer, logger, max_report=3):
                        "可考虑调小 --attn-window 降低 logits 幅度")
 
 
+def _ema_key(name: str) -> str:
+    """EMA shadow 的键：去掉 torch.compile 往参数名里插的 '_orig_mod.' 段。
+
+    ⚠ 必须去，否则编译一开就 KeyError：EMA 在**编译之前**按当时的
+    `named_parameters()` 名字建 shadow，而 update / apply_shadow / restore 是按
+    **运行时**的名字取键的。torch.compile 无论哪种形态都会改名字（整模型 compile
+    插在开头，Linear-only compile 插在路径中段），键空间一变就再也对不上。
+    这条路径此前是直接崩的、而非被跳过：`shell/train_sft_a100_1card.sh` 同时开了
+    `--compile 1` 与 `--use-ema 1`，5 个 NPU SFT 脚本也都开了 `--use-ema 1`。
+
+    去段后 shadow 的键停在「未编译布局」，与 train_state 里的 `ema_shadow` 键一致，
+    旧 checkpoint 不受影响（它们的键本来就没有这一段）。
+    """
+    return name.replace('_orig_mod.', '')
+
+
 class EMA:
     """指数移动平均（Exponential Moving Average）权重。
 
     维护模型参数的 shadow copy，eval/save 时用 EMA 权重可提升 1-3% accuracy。
+    键一律经 `_ema_key` 归一，理由见该函数。
     """
 
     def __init__(self, model, decay=0.999):
         self.model = model
         self.decay = decay
-        self.shadow = {name: param.clone().detach()
+        self.shadow = {_ema_key(name): param.clone().detach()
                        for name, param in model.named_parameters()}
 
     @torch.no_grad()
@@ -289,23 +317,24 @@ class EMA:
             sh = []
             ps = []
             for name, param in self.model.named_parameters():
-                sh.append(self.shadow[name])
+                sh.append(self.shadow[_ema_key(name)])
                 ps.append(param)
             torch._foreach_mul_(sh, self.decay)
             torch._foreach_add_(sh, ps, alpha=1 - self.decay)
             return
         for name, param in self.model.named_parameters():
-            self.shadow[name].data.mul_(self.decay).add_(param.data, alpha=1 - self.decay)
+            k = _ema_key(name)
+            self.shadow[k].data.mul_(self.decay).add_(param.data, alpha=1 - self.decay)
 
     def apply_shadow(self):
-        self.backup = {name: param.clone()
+        self.backup = {_ema_key(name): param.clone()
                        for name, param in self.model.named_parameters()}
         for name, param in self.model.named_parameters():
-            param.data = self.shadow[name].data
+            param.data = self.shadow[_ema_key(name)].data
 
     def restore(self):
         for name, param in self.model.named_parameters():
-            param.data = self.backup[name].data
+            param.data = self.backup[_ema_key(name)].data
         del self.backup
 
 
@@ -949,6 +978,108 @@ def _load_optimizer_state(optimizer, state, logger) -> bool:
     return True
 
 
+# ---- NPU Linear-only 图编译（D2）------------------------------------------------
+def _compile_linear_submodules(model, backend, rollback=None):
+    """递归把 model 下每个 nn.Linear 子模块就地替换为 torch.compile(子模块, …)。
+
+    返回回滚表 `[(parent_module, attr_name, original_module), ...]`，按替换顺序追加；
+    传入 `rollback` 则复用调用方持有的表（main 靠它在预热失败时回滚）。
+
+    **为什么只编 Linear、其余仍 eager**（D2）
+    整模型 `torch.compile` 在 4 卡 910A 上把常驻显存从 26.7~31.1GB 顶到 OOM
+    边缘，而实测收益只落在 Linear 那一小段：子模块图
+    `chunk + Linear2d + silu`，invoke=1 / frames=2 / break=0，graph=10.779ms
+    vs eager=14.453ms ≈ **1.34x**。卷积/注意力主体留在 eager，图缓冲与 workspace
+    也就不必为整张网络付。代价是图数量变多（每 Linear 一张），换来「关掉也不会
+    慢回去以外的东西」——没开图编译时代码路径与原来完全一致。
+
+    **只替换「子」模块、不包顶层**：顶层保持裸模块，参数对象不变，于是
+    `_build_param_groups` 早前抓到的 param 引用、EMA 的 shadow 张量、DDP 的
+    `module.` 前缀逻辑都不受影响。⚠ 但名字会变：被包的 Linear 在
+    `named_parameters()` / `state_dict()` 里多出 '_orig_mod.' 段
+    （中段，见 `save_model` / `_ema_key` / `_load_model_state` 三处对齐）。
+
+    **先收集再替换**：`torch.compile` 返回的 OptimizedModule 本身也是 nn.Module，
+    而 `model.modules()` 是惰性生成器。边遍历边替换实测直接爆
+    `RecursionError: maximum recursion depth exceeded`（995 层重复）——生成器走进
+    新包进去的 `_orig_mod`，那个 Linear 立刻又满足 `isinstance(..., nn.Linear)`，
+    于是一层套一层。先收集一遍就没有这个问题。
+    """
+    rollback = [] if rollback is None else rollback
+    targets = []
+    for parent in model.modules():
+        for name, child in parent.named_children():
+            if isinstance(child, torch.nn.Linear):
+                targets.append((parent, name, child))
+    if not targets:
+        # 宁可抛出去走「回退 eager + 告警」，也不要静默什么都不做：开了开关却
+        # 没有图，用户会以为已经在跑图模式。
+        raise RuntimeError('模型里没有 nn.Linear 子模块，Linear-only 图编译无处可施')
+    try:
+        for parent, name, child in targets:
+            # setattr 走 nn.Module.__setattr__ → 落进 _modules。nn.Sequential /
+            # nn.ModuleList 的子模块名是 '0'/'1'…（字符串），同一条路径同样有效，
+            # 故不必为容器类型分支。
+            setattr(parent, name, torch.compile(child, backend=backend, dynamic=False))
+            # 记在 setattr 之后：torch.compile / setattr 任一抛异常时这条并未生效，
+            # 不该被记进回滚表。此处通常也不会抛——torch.compile 是惰性的，
+            # 真正的编译错误在首次前向（预热）时才浮出来，由 main 的 except 兜。
+            rollback.append((parent, name, child))
+    except Exception:
+        # 半途失败必须还原：只留「一半 Linear 被编译」的混合模型不会报错，
+        # 只会静默变慢且极难查（逐个 verify 才知道少了哪层图）。
+        _rollback_linear_submodules(rollback)
+        raise
+    return rollback
+
+
+def _rollback_linear_submodules(rollback) -> int:
+    """按回滚表把 (parent, name, orig) 逐条写回，返回还原条数。
+
+    **幂等**：同一条记录重复还原结果相同（写回的是同一个 orig 对象），
+    所以「替换中途失败」（`_compile_linear_submodules` 内部已还原一次）与
+    「预热失败」（main 的 except 再还原一次）两条路径都调它也不会互相踩。
+    """
+    n = 0
+    for parent, name, orig in rollback:
+        setattr(parent, name, orig)
+        n += 1
+    return n
+
+
+def _load_model_state(model, ckpt, logger) -> None:
+    """把 state_dict 灌进 model，自动对齐 torch.compile 引入的 '_orig_mod.' 段。
+
+    两种 compile 形态把这一段放在**不同位置**：整模型 compile（CUDA `--compile 1`）
+    插在开头，Linear-only compile（`--npu-graph-compile 1`）插在路径中段。
+    因此这里不按位置处理，而是**双向规范化**：先把目标模型与 checkpoint 的键
+    都归一到「未编译布局」，再按目标模型当前的真实键写回去。
+
+    比旧实现多修掉一个 bug：旧代码在 `hasattr(model, '_orig_mod')` 时把前缀
+    **补回** ckpt，却把权重灌进已经剥掉前缀的 `model._orig_mod`（其
+    `state_dict()` 键本就无前缀）——`--compile 1` + `--resume` 必然
+    RuntimeError（missing/unexpected key）。现在两侧同归一，这个矛盾不存在。
+    """
+    target = getattr(model, '_orig_mod', model)  # 整模型 compile：剥到真实模块
+    # 未编译布局的键 → 目标模型当前真实键。setdefault 保留首个（真重复才会撞上）。
+    canon = {}
+    for k in target.state_dict().keys():
+        canon.setdefault(k.replace('_orig_mod.', ''), k)
+    aligned = {}
+    moved = 0
+    for k, v in ckpt.items():
+        c = k.replace('_orig_mod.', '')
+        real = canon.get(c, c)
+        moved += real != k
+        aligned[real] = v
+    # 「对齐有没有发生 / 发生了几处」是可观测的：resume 静默换掉权重比崩掉难查，
+    # 键名对不上时也正是从这条日志里看出来的。
+    if moved:
+        logger.info("[state_dict] %d/%d 个权重键按 compile 包装（_orig_mod.）重定位",
+                    moved, len(ckpt))
+    target.load_state_dict(aligned)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--data', required=True,
@@ -1042,10 +1173,11 @@ def main():
                          '（0=用 PyTorch 默认 2000；设一个大值如 100000 即'
                          '相当于关闭回涨，让缩放值稳定在 init-scale 附近）')
     ap.add_argument('--npu-graph-compile', type=int, default=0, choices=[0, 1],
-                    help='NPU 上用 TorchAir 图编译替代 eager（受控实验）。'
+                    help='NPU 上用 TorchAir 图编译替代 eager（受控实验，D2 Linear-only：'
+                         '只递归编译各 nn.Linear 子模块，其余仍 eager，不包整张网络）。'
                          'NPU 上 inductor 不可用，必须显式传 torchair backend；'
                          'torch_npu 须先于 torchair 导入，否则图模式会静默降级为'
-                         'eager 而不报错。失败自动回退 eager。'
+                         'eager 而不报错。失败自动整表回滚并回退 eager。'
                          '⚠ 显存风险：本项目 4 卡 910A 常驻已达 26.7~31.1GB/32GB，'
                          '图模式的 workspace 与图缓冲可能再炸；且实测环境为 '
                          'torch 2.1.0 / torch_npu 2.1.0.post3 / CANN 8.0.RC1，'
@@ -1483,15 +1615,10 @@ def main():
                 logger.info("[resume] 使用中途快照训练状态: %s", _latest)
         logger.info("[resume] 加载模型权重: %s", args.resume)
         ckpt = torch.load(args.resume, map_location=device)
-        # 统一前缀：checkpoint 可能带（来自 compile 存档）或不带 "_orig_mod." 前缀，
-        # 目标模型也可能被 compile 包成 OptimizedModule（内部为 _orig_mod）。
-        # 先全部规范化成不带前缀，再按需补回，保证任意组合都能匹配。
-        ckpt = {k.replace('_orig_mod.', '', 1): v for k, v in ckpt.items()}
-        target = getattr(model, '_orig_mod', model)  # compile 后为真实模块
-        if hasattr(model, '_orig_mod'):
-            ckpt = {'_orig_mod.' + k: v for k, v in ckpt.items()}
-            logger.info("[resume] 模型已 torch.compile 包装，权重按 _orig_mod. 前缀对齐")
-        target.load_state_dict(ckpt)
+        # 键对齐交给 _load_model_state：checkpoint 与目标模型两侧都归一到未编译布局
+        # 再写回，compile 存档（顶层 _orig_mod. 或 Linear-only 的中段 _orig_mod.）
+        # 与普通存档任意组合都能灌进来。
+        _load_model_state(model, ckpt, logger)
         if os.path.isfile(state_path):
             tstate = torch.load(state_path, map_location=device)
             _load_optimizer_state(optimizer, tstate['optimizer'], logger)
@@ -1526,20 +1653,14 @@ def main():
             raise FileNotFoundError(f"--model 指定的模型不存在: {args.model}")
         logger.info("[model] 仅加载模型权重: %s（optimizer/scheduler 从头开始）", args.model)
         ckpt = torch.load(args.model, map_location=device)
-        # 统一前缀：checkpoint 可能带（来自 compile 存档）或不带 "_orig_mod." 前缀
-        ckpt = {k.replace('_orig_mod.', '', 1): v for k, v in ckpt.items()}
-        target = getattr(model, '_orig_mod', model)
-        if hasattr(model, '_orig_mod'):
-            ckpt = {'_orig_mod.' + k: v for k, v in ckpt.items()}
-        target.load_state_dict(ckpt)
+        # 同 resume：键对齐统一走 _load_model_state。
+        _load_model_state(model, ckpt, logger)
 
-    # torch.compile 融合算子（GPU 上约 20-40%% 提速）。必须在 resume 加载之后再做，
-    # 否则模型会被包成 OptimizedModule，其 state_dict 带 "_orig_mod." 前缀，与
-    # checkpoint 的 "backbone.xxx" 不匹配导致 load 失败。
-    # NPU TorchAir 图编译（受控实验）。与 --compile 互斥：NPU 上 inductor 不可用，
-    # 两条路径都必须显式指定 backend，不能同时开。位置同样在 resume 加载之后——
-    # 图编译会把模型包起来，state_dict 带 "_orig_mod." 前缀，先编译再加载权重
-    # 会因键名不匹配而失败。
+    # torch.compile 融合算子（GPU 上约 20-40%% 提速）。必须在 resume 加载之后再做。
+    # NPU TorchAir 图编译（受控实验，D2 Linear-only）。与 --compile 互斥：NPU 上
+    # inductor 不可用，两条路径都必须显式指定 backend，不能同时开。位置同样在
+    # resume 加载之后（--compile 会把顶层包成 OptimizedModule，先编译再灌权重
+    # 会因键名不匹配而失败；Linear-only 形态灌得进去，但一样放后面更不容易忘）。
     #
     # 背景：4 卡 910A 实测 NPU 报 Aicore Usage Rate 85~100%，而实际只有
     # 659 samples/s/卡。AICore 一直「忙」但产出极低，是 eager 小算子的典型形态。
@@ -1552,25 +1673,35 @@ def main():
     #      上 OOM 的元凶（CUDA Graphs 私有内存池不归还），NPU 上同样避开；
     #   3. 任何失败都回退 eager——常驻已 26.7~31.1GB/32GB，图模式的 workspace
     #      与图缓冲极易再炸，绝不能让整个训练崩掉。
+    #
+    # D2：**不**再 `torch.compile(model, …)` 包整张网络，改成逐个 nn.Linear
+    # 递归替换（`_compile_linear_submodules`）。理由、实测数字与代价见该函数
+    # docstring。回滚靠回滚表逐条写回，不再靠 `getattr(model, '_orig_mod', model)`
+    # 剥顶层包装——顶层现在压根没被包，这条已随 D2 作废。
     if _npu_graph:
+        _npu_rollback = []
         try:
             import torch_npu  # noqa: F401  顺序要求：必须先于 torchair
             import torchair
             _tacfg = torchair.CompilerConfig()
             _npui = torchair.get_npu_backend(compiler_config=_tacfg)
-            model = torch.compile(model, backend=_npui, dynamic=False)
+            # 逐 Linear 就地替换；回滚表由本函数持有，预热失败时整表写回
+            _npu_rollback = _compile_linear_submodules(model, _npui, _npu_rollback)
             # 预热前向必须与真实训练一致地包 autocast：FP32 输入干灌会报
             # flash-attn 只接受 fp16/bf16，导致图编译被误判为不可用而回退 eager，
-            # 且这个误判极难排查。
+            # 且这个误判极难排查。torch.compile 是惰性的，编译错误在这里才浮出来。
             with torch.no_grad(), maybe_autocast(device, amp_dtype):
                 _dummy = torch.zeros(1, 12, args.board_size, args.board_size,
                                     device=device)
                 model(_dummy)
-            logger.info("[train] NPU TorchAir 图编译已启用")
+            logger.info("[train] NPU TorchAir Linear-only 图编译已启用（已编译 %d 个 "
+                        "nn.Linear，其余子模块仍 eager）", len(_npu_rollback))
         except Exception as e:  # noqa: BLE001
-            # 真正回退 eager：剥离 OptimizedModule 包装，恢复原始模块引用
-            model = getattr(model, '_orig_mod', model)
-            logger.warning("[train] NPU TorchAir 图编译失败，回退 eager: %s", e)
+            # 真正回退 eager：按回滚表把每个 nn.Linear 换回原对象。幂等，
+            # 「替换中途失败」（helper 内部已还原过一次）与「预热失败」都适用。
+            _restored = _rollback_linear_submodules(_npu_rollback)
+            logger.warning("[train] NPU TorchAir 图编译失败，已还原 %d 个 nn.Linear 子模块，"
+                           "回退 eager: %s", _restored, e)
             if isinstance(e, ImportError):
                 logger.warning("[train] 常见原因：torchair 随 torch_npu 附带，"
                                "不可单独 pip install；同时需确认 CANN 的 ATC/ACL "
