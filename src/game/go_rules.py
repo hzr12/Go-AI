@@ -314,6 +314,13 @@ class GoBoard:
         nb.move_history = []
         nb._undo_stack = []
         nb._legal_cache = None
+        # 棋块/气表（P2.7a）：**容器**浅拷贝、**值是不可变元组** -> 未修改的块
+        # 跨克隆体零拷贝共享，修改走写时复制。这是「MCTS 每个候选一次 clone()」
+        # 能付得起的关键：深拷贝整张块表会让每个候选都付 O(#块) 的重建。
+        nb._groups = dict(self._groups) if self._groups is not None else None
+        nb._gid = self._gid.copy() if self._gid is not None else None
+        nb._groups_valid = self._groups_valid
+        nb._group_undo = []      # 克隆体的撤销栈从空开始（与 _undo_stack 一致）
         nb._zobrist = self._zobrist
         nb._pos_zobrist = self._pos_zobrist
         # 哈希所对应的盘面对象 = 克隆体**自己**的 board 数组（否则 hash() 会把它
@@ -431,7 +438,13 @@ class GoBoard:
             # 所以 `cand in counts` 与 `_would_repeat(cand)` **完全等价**。
             counts = self._pos_hash_counts
             pos_key = self._pos_zobrist
-            has_lib_ex = self._group_has_liberty_excluding
+            # P2.7a：气的查询走增量表（O(1)），不再对每个邻块做一次 flood fill。
+            # `_ensure_groups()` 排在最前：adopt 之后表可能是失效的。
+            # `_gid.tolist()` 一次（19 路 0.003 ms）换掉内层成千上万次 numpy
+            # 标量构造 —— 与上面 `board.tolist()` 同一个理由。
+            self._ensure_groups()
+            gids = self._gid.tolist()
+            groups = self._groups
             zkey = _zobrist_key
 
             for i in np.flatnonzero(legal).tolist():
@@ -447,11 +460,17 @@ class GoBoard:
                     v = board[nr][nc]
                     if v == 0:
                         liberty = True                  # 落点自身的气
-                    elif v == color:
-                        if has_lib_ex(board, nr, nc, r, c):   # 同色邻块除落点外还有气
-                            liberty = True
-                    elif not has_lib_ex(board, nr, nc, r, c):  # 敌块的气全被落点占掉
-                        capture = True                  # -> 提子
+                    else:
+                        # 落点此刻是空点 -> 它必然在这个邻块的气里，于是
+                        # 「除落点外的气数」一个整数就同时回答己方（非自杀）
+                        # 与敌方（提子）两个问题。
+                        libs = groups[gids[nr][nc]][1]
+                        rest = len(libs) - (1 if i in libs else 0)
+                        if v == color:
+                            if rest > 0:
+                                liberty = True
+                        elif rest == 0:
+                            capture = True              # -> 提子
                 if not capture and not liberty:
                     legal[i] = False
                     continue
@@ -650,15 +669,20 @@ class GoBoard:
           `tests/test_go_action_api.py::test_is_legal_does_not_materialize_the_mask`
           用一个「被调用就抛异常」的 `get_legal_moves` 桩把这条钉死。
 
-        **成本**：与盘面**面积无关**，只与「落点四周那几个连通块有多大」有关
-        （≤4 个邻块各一次带早退的 flood fill + 至多一次提子推演）。
+        **成本**：与盘面**面积无关**，也**与邻块大小无关**（P2.7a 起）：
+        ≤4 次查表（`len(libs) - (落点在不在里面)`）+ 至多一次提子推演，
+        全部与 n² 和块的大小无关。
         实测 19 路随机自对弈中盘（180 手后、179 个合法点）：
-        一次**冷**掩码 0.66 ms，而本方法逐点判定 ≈ 23 µs/点 —— 约 1/29。
+        一次**冷**掩码 0.24 ms，而本方法逐点判定 ≈ 5.2 µs/点 —— 约 1/46。
+        （P2.7a 之前这里是「≤4 个邻块各一次带早退的 flood fill」，19 路 23 µs/点、
+        冷掩码 0.66 ms；增量棋块/气表把两者都换成了查表。）
         ⚠ 别拿「掩码有缓存时按位取值只要 0.5 µs」来比：那不是本方法的工作量。
         本方法**不读** `_legal_cache`：复用缓存当然更快，但那样「绝不物化全掩码」
         这条保证就只在缓存冷时成立（依赖调用顺序），而本方法的成本模型要的是
-        「与 n² 无关」这个无条件性质。P2.7 若要再快，正确方向是**增量棋块/气**
-        （把邻块查询也变成 O(1)），不是把掩码捡回来。
+        「与 n² 无关」这个无条件性质。⚠ 这条性质有个前提：表在 adopt 之后是失效的，
+        第一次调用要付一次 O(n²) 重建（19 路 0.7 ms，**每局一次**）—— 那次重建
+        由 `_ensure_hash()` 触发的采纳一并决定，不在本方法的 O(1) 承诺之内，
+        因为它属于「换盘面」这个显式动作，而不是「问一个点」。
 
         ⚠ **`-1` 在动作空间里越界**，所以 `is_legal(-1) is False`；而 `play(-1)`
           是**合法**的 pass（棋盘方言）。两者**不可比**，别拿本方法的返回值去预判
@@ -682,8 +706,9 @@ class GoBoard:
         # 判据与掩码逐字同源（get_legal_moves docstring 的「自杀判定的等价变形」）：
         # 落点落子前是空点 -> 它必然落在每个相邻块的气里，于是「除落点外还有没有气」
         # 一个布尔同时回答「己方合并后有气吗」与「敌块是不是被打吃」。
-        # 这里**不**取 tolist() 快照：单点判定只读 ≤4 个邻点与其连通块，
+        # 这里**不**取 tolist() 快照：单点判定只读 ≤4 个邻点、≤4 个块记录，
         # 整盘快照是 O(n²) 的无用拷贝（掩码需要它是因为要扫全盘）。
+        # `_gid` 同理：只逐点索引 4 次，numpy 标量的那点开销远小于一次 O(n²) 拷贝。
         # ⚠ **与掩码的差异是有意的取舍，不是等价，也不是漏改**：掩码走
         # `self.board.tolist()` 是因为它逐候选扫全盘 n*n 次邻域，那里 numpy 标量
         # 每次比较都要造一个标量再取 __bool__，实测 19 路空盘一次掩码
@@ -691,9 +716,14 @@ class GoBoard:
         # 一次 tolist() 的 O(n²) 拷贝**远超**那点省下来的开销，而本方法对外承诺的
         # 是「与 n² 无关」（见上文成本段）—— 换成 tolist() 会把这个无条件性质悄悄
         # 变成 O(n²)。正确性两边一致（`board[nr, nc] == 0` 对 Python int 与
-        # np.int8 同义，`has_lib_ex` 也只做数值比较），所以**别顺手「对齐」**。
-        board = self.board
-        has_lib_ex = self._group_has_liberty_excluding
+        # np.int8 同义，查表也只做整数比较），所以**别顺手「对齐」**。
+        # P2.7a：气的查询走增量表（O(1) 查表，不做 flood fill）。
+        # ⚠ 「与 n² 无关」这条对外承诺**照样成立**：`_ensure_groups()` 只在表
+        # 失效时（即 adopt 之后）才重建，而重建是 O(n²) 但**每局一次**；
+        # 稳态下本方法只碰 <=4 个邻点。
+        self._ensure_groups()
+        groups = self._groups
+        gid_of = self._gid
         capture = False
         liberty = False
         for dr, dc in _NB4:
@@ -701,13 +731,16 @@ class GoBoard:
             nc = c + dc
             if nr < 0 or nr >= n or nc < 0 or nc >= n:
                 continue
-            v = board[nr, nc]
+            v = int(self.board[nr, nc])
             if v == 0:
                 liberty = True               # 落点自身的气
-            elif v == color:
-                if has_lib_ex(board, nr, nc, r, c):   # 同色邻块除落点外还有气
+                continue
+            libs = groups[int(gid_of[nr, nc])][1]
+            rest = len(libs) - (1 if action in libs else 0)
+            if v == color:
+                if rest > 0:                 # 同色邻块除落点外还有气
                     liberty = True
-            elif not has_lib_ex(board, nr, nc, r, c):  # 敌块的气全被落点占掉 -> 提子
+            elif rest == 0:                  # 敌块的气全被落点占掉 -> 提子
                 capture = True
         if not capture and not liberty:
             return False                      # 自杀（⚠ 相对 TT 的有意偏离）
@@ -722,6 +755,200 @@ class GoBoard:
         return cand not in self._pos_hash_counts
 
     # ---- 连通块 / 气 -------------------------------------------------------
+    #
+    # ⚠ 本节有**两套**棋块查询，别混用：
+    #   - `_groups` / `_gid`（P2.7a 增量表）：**热路径**用这个，查气 O(1)；
+    #   - `_neighbor_groups` / `_group_has_liberty*` / `_group_liberty_count`
+    #     （flood fill）：**参考实现**，留给测试当 oracle，别再挂进热路径。
+    # 踩过的坑：「惰性重建表」那版正是把热路径换成查表，却让每个候选
+    # `clone()+play()` 都付一次 O(n²) 全盘重建（19 路 87 µs → 2080 µs），
+    # 掩码也跟着从 0.66 ms 涨到 2.19 ms。教训全文见
+    # `.superpowers/sdd/2026-09-25-v21-roadmap/task-p2-7a-negative-result.md`。
+
+    # ---- 增量棋块/气表（P2.7a） -------------------------------------------
+    #
+    # 三件套，缺一不可：
+    #   self._gid       (n,n) int32 数组，每点的块号；空点 = -1
+    #   self._groups    {块号: (颜色, frozenset(气), frozenset(棋子))}
+    #   self._group_undo 与 _undo_stack 同步的撤销记录栈
+    #
+    # **块号 = 该块里那颗「扫描到的第一个点」的扁平坐标**，因此块号天然唯一
+    # （一个点同一时刻只属于一个块）且在表被重建后可能改变 —— 这没问题，
+    # 因为表内从不留悬挂引用：撤销记录里的块号只活到它自己那次 undo，
+    # 而任何重建都发生在 `_adopt_as_new_game()`，它会连 `_undo_stack` 一起清空。
+    #
+    # **值一律不可变**（tuple + frozenset）：`clone()` 因此只需 `dict(...)`
+    # 浅拷贝；任何修改都换新元组（写时复制），共享者永远看不到变化。
+
+    def _ensure_groups(self) -> None:
+        """保证增量表与盘面一致（不一致才按盘面全量 flood fill 重建）。
+
+        失效**只有一个来源**：`_adopt_as_new_game()`（reset / 外部换 board 数组 /
+        外部改 current_player / resync_hash）。`play()` 与 `undo()` 走增量路径，
+        永不置失效。
+
+        ⚠ **惰性重建的陷阱正在这里**：本方法看着安全，但它把成本从「查询时」挪到
+        「变更后第一次查询」，而 MCTS 是变更远多于查询的形态。所以表**必须**在
+        `play()` 入口就备好 —— 只有 adopt 之后才付这一次全盘重建。
+        """
+        if self._groups_valid:
+            return
+        n = self.board_size
+        board = self.board.tolist()
+        gid = [[-1] * n for _ in range(n)]
+        groups = {}
+        for r0 in range(n):
+            row = board[r0]
+            for c0 in range(n):
+                v = row[c0]
+                if v == 0 or gid[r0][c0] >= 0:
+                    continue
+                g = r0 * n + c0
+                stack = [(r0, c0)]
+                gid[r0][c0] = g
+                libs = set()
+                stones = set()
+                while stack:
+                    r, c = stack.pop()
+                    stones.add(r * n + c)
+                    for dr, dc in _NB4:
+                        nr = r + dr
+                        nc = c + dc
+                        if nr < 0 or nr >= n or nc < 0 or nc >= n:
+                            continue
+                        w = board[nr][nc]
+                        if w == 0:
+                            libs.add(nr * n + nc)
+                        elif w == v and gid[nr][nc] < 0:
+                            gid[nr][nc] = g
+                            stack.append((nr, nc))
+                groups[g] = (v, frozenset(libs), frozenset(stones))
+        self._gid = np.array(gid, dtype=np.int32)
+        self._groups = groups
+        self._groups_valid = True
+
+    def _libs_excluding_count(self, libs, point):
+        """`libs`（frozenset）中除 `point` 之外的气数 —— 「这个块除落点外还有气吗」。
+
+        O(1)（集合大小 + 一次成员判定），替代原来的「整块 flood fill 数气」。
+        掩码 docstring「自杀判定的等价变形」用的正是这个量：己方邻块 >=1 -> 非自杀，
+        敌块 ==0 -> 提子。
+        """
+        return len(libs) - (1 if point in libs else 0)
+
+    def _update_groups_after_move(self, move, color, own_gids, cap_gids, neighbor_gids):
+        """把「落子 + 提子」增量写进棋块表，并返回可回滚的记录。
+
+        必须在**盘面已经改完**（落点放了子、被提子删了）之后调用：新气要算给
+        周围**还活着**的块，而被提点的块号要在这一步复位成 -1。
+
+        只碰这些块（与盘面大小**无关**）：
+          - 落点所在的新块：气 = 各同色邻块的气的并集，剔掉落点，再加落点自己的空邻点；
+          - 未被提的敌邻块：各少一口气（= 落点）；
+          - 被提的敌块：整块删除，其每颗子的**存活邻居**各多一口气（= 该被提点）。
+        返回 `(old_values, points, old_gids, new_gids)`：
+          old_values  {块号: 旧值}，值为 None 表示该块本次才新建（undo 时删掉）
+          points/old_gids/new_gids  gid 数组里被改写的点及其改写前后的块号
+        """
+        n = self.board_size
+        r, c = divmod(move, n)
+        g_new = move                # 新块号取落点：它就是这块里的一颗子，天然唯一
+        old_values = {}
+        points = [move]
+        old_gids = [int(self._gid[r, c])]
+        new_gids = [g_new]
+
+        # ---- 1) 落点新块：并入同色邻块的棋子与气 ----
+        libs = set()
+        stones = [move]
+        for g in own_gids:
+            ocol, olibs, ostones = self._groups[g]
+            old_values[g] = self._groups[g]
+            libs |= olibs
+            for flat in ostones:
+                stones.append(flat)
+                points.append(flat)
+                old_gids.append(g)
+                new_gids.append(g_new)
+            del self._groups[g]
+        libs.discard(move)          # 落点不再是自己块的气
+        for dr, dc in _NB4:         # 落点自己的空邻点成为新气（含刚被提掉的位置）
+            nr = r + dr
+            nc = c + dc
+            if 0 <= nr < n and 0 <= nc < n and int(self.board[nr, nc]) == 0:
+                libs.add(nr * n + nc)
+        old_values[g_new] = None    # 本次新建
+        self._groups[g_new] = (color, frozenset(libs), frozenset(stones))
+
+        # ---- 2) 未被提的敌邻块：失去落点这口气 ----
+        for g in neighbor_gids:
+            if g == g_new or g in cap_gids or g not in self._groups:
+                continue
+            ocol, olibs, ostones = self._groups[g]
+            if move not in olibs:
+                continue
+            if g not in old_values:
+                old_values[g] = self._groups[g]
+            self._groups[g] = (ocol, olibs - {move}, ostones)
+
+        # ---- 3) 被提块：整块从表里摘掉 ----
+        cap_stones = []
+        for g in cap_gids:
+            rec = self._groups[g]
+            old_values[g] = rec
+            del self._groups[g]
+            cap_stones.extend(rec[2])
+            for flat in rec[2]:
+                points.append(flat)
+                old_gids.append(g)
+                new_gids.append(-1)
+
+        # ---- 4) gid 数组先落定（合并后的新块号 / 被提点复位 -1）----
+        # ⚠ **顺序是正确性要求**：第 5 步要按「存活邻居的块号」找块加气，
+        #   而合并块的旧块号已经被删掉了。数组若还停在旧值，第 5 步查到的是
+        #   一个已不存在的块号，于是**整段长气被静默跳过** —— 表现为合并块的
+        #   气莫名少掉几个（实测：白方合并后的块少了一口气 (7,6)，
+        #   而那口气是被提黑子的位置）。
+        self._gid.reshape(-1)[np.array(points, dtype=np.intp)] = np.array(
+            new_gids, dtype=np.int32)
+
+        # ---- 5) 被提的每颗子：它现在的空位是周围存活块的新气 ----
+        for flat in cap_stones:
+            cr, cc = divmod(flat, n)
+            for dr, dc in _NB4:
+                nr = cr + dr
+                nc = cc + dc
+                if not (0 <= nr < n and 0 <= nc < n):
+                    continue
+                if int(self.board[nr, nc]) == 0:
+                    continue
+                ng = int(self._gid[nr, nc])
+                if ng < 0 or ng not in self._groups or flat in self._groups[ng][1]:
+                    continue
+                ncol, nlibs, nstones = self._groups[ng]
+                if ng not in old_values:
+                    old_values[ng] = self._groups[ng]
+                self._groups[ng] = (ncol, nlibs | {flat}, nstones)
+        return old_values, points, old_gids, new_gids
+
+    def _restore_groups_after_move(self, record) -> None:
+        """回滚一次 `_update_groups_after_move()`：把被碰过的块与块号原样换回去。
+
+        因为块的值是**不可变元组**，「换回去」只是换引用，不需要任何拷贝 ——
+        这就是撤销记录能只存旧值的原因。
+        """
+        if record is None:
+            # 没有记录（例如表当时是失效的）：宁可作废等重建，也绝不留在错的状态。
+            self._groups_valid = False
+            return
+        old_values, points, old_gids, _new_gids = record
+        for g, val in old_values.items():
+            if val is None:
+                self._groups.pop(g, None)
+            else:
+                self._groups[g] = val
+        self._gid.reshape(-1)[np.array(points, dtype=np.intp)] = np.array(
+            old_gids, dtype=np.int32)
 
     def _neighbor_groups(self, r, c):
         """返回 (r,c) 的 4 邻域内不同颜色的连通块列表。"""
@@ -757,7 +984,12 @@ class GoBoard:
         return groups
 
     def _group_has_liberty(self, seed_r, seed_c) -> bool:
-        """判断 (seed_r, seed_c) 所在连通块是否还有气。"""
+        """判断 (seed_r, seed_c) 所在连通块是否还有气。
+
+        ⚠ **P2.7a 起不在热路径上**：热路径走 `_groups` 增量表。本方法与
+        `_neighbor_groups` / `_group_has_liberty_excluding` / `_group_liberty_count`
+        一起**保留为参考实现（oracle）**，供测试对拍，别再挂进 MCTS 路径。
+        """
         n = self.board_size
         color = self.board[seed_r, seed_c]
         stack = [(seed_r, seed_c)]
@@ -788,7 +1020,12 @@ class GoBoard:
         为什么**不**用 `_group_liberty_count` 判（那个也能答，判据是 >=2 / ==1）：
         气数必须数**完**所有气，没有早退；而这里要的正是「有没有」这一个布尔。
         实测差别很大：19 路中盘一次掩码 26.6 ms → 6.1 ms（早退把「大气块」压成 O(1)）。
-        掩码被 MCTS 与自对弈每手调用，这个差别是决定性的。
+
+        ⚠ **P2.7a 起本方法已不在热路径上**：`get_legal_moves()` / `is_legal()` /
+        `play()` / `_forecast_delta()` 全部改用增量棋块/气表（O(1) 查表，
+        19 路 5.2 µs/点），本方法**保留下来当 oracle** ——
+        `tests/test_go_incremental_groups.py` 用测试内独立实现的 flood fill
+        对拍整张表，另有测试直接拿本方法的结果当期望值。**别再挂进热路径**。
 
         `board` 是**读快照**（`GoBoard.get_legal_moves` 传的是 `self.board.tolist()`，
         逐格读比 numpy 标量快约 10x）。本方法只读它、不写；传 numpy 数组也能工作
@@ -943,6 +1180,14 @@ class GoBoard:
         self.move_history = []
         self._undo_stack = []
         self._legal_cache = None
+        # 棋块/气表（P2.7a）同样作废：这张表是**增量维护**的，旧表属于旧盘面。
+        # ⚠ 这里**不**单独清 `_group_undo`：它与 `_undo_stack` 同生共死（一次 play
+        # 推一条、一次 undo 弹一条），而上面刚把 `_undo_stack` 清空，旧记录因此
+        # **无处可寻、天然作废** —— 不需要第二处真相源。
+        self._groups = None
+        self._gid = None
+        self._groups_valid = False
+        self._group_undo = []
         self._zobrist = self._hash_from_board()
         self._pos_zobrist = self._position_hash_from_board()
         self._zobrist_ref = self.board
@@ -1031,30 +1276,41 @@ class GoBoard:
     def _forecast_delta(self, move: int) -> int:
         """只读推演一手棋对**棋盘染色**的哈希增量（落子点提子），不含行棋方翻转。
 
-        内部会临时落子以判定提子并立即还原（还原的是**原值**，因此即使误传占点
-        也不会擦掉棋子），故与 play() 一样不可重入。move == -1（pass）返回 0：
-        pass 不改变染色。
+        **全程只读**（P2.7a）：提子探测走增量棋块/气表，既不临时落子也不写任何
+        状态，所以本方法**可重入**、对误传的占点/非法着法照样给出一个「按规则
+        推演」的值（是否合法由调用方判）。move == -1（pass）返回 0：pass 不改变染色。
         """
         if move == -1:
             return 0
         n = self.board_size
         r, c = divmod(move, n)
         color = self.current_player
+        opponent = -color
+        # P2.7a：提子探测走增量表，**全程不写盘**（旧实现要临时落子再还原）。
+        # 判据与旧实现逐条同义：落点此刻是空点、必然在被提块的气里，
+        # 所以「该块被提掉」⟺「它的气恰好只有落点这一个」。
+        self._ensure_groups()
+        groups = self._groups
         delta = 0
-        saved = self.board[r, c]
-        try:
-            self.board[r, c] = color
-            opponent = -color
-            for nb_color, comp in self._neighbor_groups(r, c):
-                if nb_color == opponent:
-                    cr0, cc0 = comp[0]
-                    if (self.board[cr0, cc0] == opponent
-                            and not self._group_has_liberty(cr0, cc0)):
-                        for (cr, cc) in comp:
-                            delta ^= _zobrist_key(cr, cc, opponent)
-            delta ^= _zobrist_key(r, c, color)
-        finally:
-            self.board[r, c] = saved
+        seen_gids = set()
+        for dr, dc in _NB4:
+            nr = r + dr
+            nc = c + dc
+            if nr < 0 or nr >= n or nc < 0 or nc >= n:
+                continue
+            if int(self.board[nr, nc]) != opponent:
+                continue
+            g = int(self._gid[nr, nc])
+            if g in seen_gids:      # 同一块可能被多个邻点触及，必须去重
+                continue            # （不去重会把该块的钥匙异或两次、抵消掉）
+            seen_gids.add(g)
+            _ocol, olibs, ostones = groups[g]
+            if len(olibs) == 1 and move in olibs:
+                # 整块提掉：必须遍历**整块**的棋子，只扫邻域是不够的
+                # （惰性重建那版就错在这里，见负面结论笔记）。
+                for flat in ostones:
+                    delta ^= _zobrist_key(flat // n, flat % n, opponent)
+        delta ^= _zobrist_key(r, c, color)
         return delta
 
     def hash_after_move(self, move: int) -> int:
@@ -1066,7 +1322,7 @@ class GoBoard:
 
         只对合法着法（含 pass）有定义；占点 / 自杀 / 重复局面（PSK）等非法落子语义未定义，
         调用方须先过合法性检查（`get_legal_moves()` 掩码或 `play()` 的返回值）。
-        内部会临时落子以判定提子并立即还原，故与 play() 一样不可重入。
+        **只读**（P2.7a：`_forecast_delta()` 不再临时落子），故可重入。
         """
         self._ensure_hash()
         return self._zobrist ^ _ZOBRIST_TO_PLAY_XOR ^ self._forecast_delta(move)
@@ -1093,9 +1349,10 @@ class GoBoard:
 
         只对合法着法有定义；占点 / 自杀 / 重复局面（PSK）等非法落子语义未定义，调用方须先过
         合法性检查（`get_legal_moves()` 掩码或 `play()` 的返回值）。
-        内部会临时落子以判定提子并立即还原，故与 play() 一样不可重入：
-        **绝不能在 `self.board[r, c]` 已经放了子的时候调它**（`get_legal_moves()`
-        的「先禁自杀、再判 PSK」顺序、以及 `play()` 在推演前把试落的子置 0，都是为了这条）。
+        **只读**（P2.7a：`_forecast_delta()` 不再临时落子，所以「盘面上已经放了子」
+        这件事不再有任何技术后果）。但**语义**上仍要求传入的是「本手之前」的盘面 ——
+        染色的定义就是如此。`get_legal_moves()` 的「先禁自杀、再判 PSK」顺序保留着，
+        它保证推演发生在合法的候选上。
         """
         self._ensure_hash()
         return self._pos_zobrist ^ self._forecast_delta(move)
@@ -1268,46 +1525,78 @@ class GoBoard:
         color = self.current_player
         opponent = -color
 
-        # 试落子
-        self.board[r, c] = color
-        # 提掉相邻 opponent 块中无气的
-        captured = []
-        for nb_color, comp in self._neighbor_groups(r, c):
-            if nb_color == opponent:
-                cr0, cc0 = comp[0]
-                if self.board[cr0, cc0] == opponent and not self._group_has_liberty(cr0, cc0):
-                    captured.extend(comp)
-
+        # ---- 结构判定：全走增量表，零 flood fill、**零试落子**（P2.7a）----
+        #
+        # 落点此刻是**空点**，因此它必然落在每个相邻块的气里 —— 这就是掩码
+        # docstring「自杀判定的等价变形」那条不变式。于是一次 4 邻域扫描同时得到：
+        #   own_gids  待合并的同色邻块
+        #   cap_gids  唯一的气就是落点的敌块 -> 本手提掉它们
+        #   liberty   落子后己方块除落点外还有气
+        # ⚠ `_ensure_groups()` 排在最前：表失效（adopt 之后）必须先备好，
+        # 否则每个候选都要付一次全盘重建 —— 那正是惰性重建版的致命处。
+        self._ensure_groups()
+        own_gids = []
+        cap_gids = []
+        seen_gids = set()
+        liberty = False
+        for dr, dc in _NB4:
+            nr = r + dr
+            nc = c + dc
+            if nr < 0 or nr >= n or nc < 0 or nc >= n:
+                continue
+            v = int(self.board[nr, nc])
+            if v == 0:
+                liberty = True              # 落点自身的气
+                continue
+            g = int(self._gid[nr, nc])
+            if g in seen_gids:              # 同一块可能被多个邻点触及，必须去重
+                continue
+            seen_gids.add(g)
+            libs = self._groups[g][1]
+            if v == color:
+                own_gids.append(g)
+                if len(libs) > 1:          # 除落点外还有气（p 在 libs 里，故 >1）
+                    liberty = True
+            elif len(libs) == 1:           # 敌块唯一的气就是落点 -> 提子
+                cap_gids.append(g)
         # 检查自身是否还有气（禁自杀）
-        if not captured and not self._group_has_liberty(r, c):
-            self.board[r, c] = 0  # 撤销
+        if not cap_gids and not liberty:
             return False
 
         # 位置超级劫（TT 规则 6 = TT 规则的全文；与 get_legal_moves() **同一判据、同一键**）。
-        # ⚠ 必须排在上面那批结构检查**之后**：`_would_repeat()` 的历史只有「每一手成功
-        #   落子之后」的染色，试落的这手还不算数；反过来，先判 PSK 就得为一个注定被拒的
-        #   着法走完整的提子推演。与掩码「先禁自杀、再判 PSK」是同一条理由。
-        # ⚠ 必须先把试落的子**拿掉**再推演：`position_hash_after_move()` 自己会临时落子
-        #   来判提子（它还原的是原值），踩在一个已经放了子的点上就等于把它当成空点重算
-        #   一遍——见该方法 docstring 的「绝不能在 self.board[r, c] 已经放了子的时候调它」。
-        #   被提子此刻仍在盘上（提子动作在下面才执行），所以落点置 0 之后的状态就是
-        #   「本手之前」的盘面，_forecast_delta() 推演出的键与掩码算出的候选键一致。
-        self.board[r, c] = 0
+        # ⚠ 必须排在上面那批结构检查**之后**：`psk` 的历史只有「每一手成功落子之后」的
+        #   染色，这一手还不算数；反过来，先判 PSK 就得为一个注定被拒的着法走完整的
+        #   提子推演。与掩码「先禁自杀、再判 PSK」是同一条理由。
+        # ⚠ 此刻盘面是**本手之前**的（结构判定已全部走表，一个子都没落），
+        #   这正是 `position_hash_after_move()` 唯一允许的前置状态 ——
+        #   P2.7a 之前这里是靠「落子 -> 判提子 -> 把子拿掉 -> 推演 -> 再放回去」
+        #   的手工 dance 达成的，现在那套 dance 整个删掉了。
         if self._would_repeat(self.position_hash_after_move(move)):
-            return False        # 盘面已还原（落点置 0），无需再撤销
-        self.board[r, c] = color
+            return False        # 盘面自始至终未改，无需还原
 
-        # 执行提子
-        for (cr, cc) in captured:
-            self.board[cr, cc] = 0
+        # 到这里才真正改盘：落子 + 提子
+        self.board[r, c] = color
+        captured = []
+        for g in cap_gids:
+            for flat in self._groups[g][2]:
+                cr, cc = divmod(flat, n)
+                captured.append((cr, cc))
+                self.board[cr, cc] = 0
+        # 增量维护棋块/气表（P2.7a）。必须在提子**已从盘上删掉**之后：新气要算给
+        # 周围还活着的块，而被提点的块号在这里复位成 -1。
+        group_record = self._update_groups_after_move(
+            move, color, own_gids, cap_gids, seen_gids)
 
         # 压撤销信息（此时 ko/passes/player 尚未更新）
         if record:
             self._undo_stack.append(
                 (move, captured, self.ko_point, self.passes, self.current_player))
+            # 棋块表的撤销记录与 _undo_stack **同步**：一次 play 推一条、
+            # 一次 undo 弹一条，绝不单独维护第二条生命周期。
+            self._group_undo.append(group_record)
 
         # 打劫判定：提掉恰好 1 子，且落子子本身恰好只剩 1 气（即被提点）-> 形成劫
-        if len(captured) == 1 and self._group_liberty_count(r, c) == 1:
+        if len(captured) == 1 and len(self._groups[move][1]) == 1:
             self.ko_point = captured[0][0] * n + captured[0][1]
         else:
             self.ko_point = -1
@@ -1344,6 +1633,11 @@ class GoBoard:
                 cap_color = -player  # 被提子为落子方对手
                 for (cr, cc) in captured:
                     self.board[cr, cc] = cap_color
+            # 棋块/气表回滚（P2.7a）：只对**实着**回滚。pass 根本没改盘面，
+            # 它的撤销记录栈里也没有对应条目 —— 这里若照弹，弹走的会是**上一手
+            # 实着**的记录，把表恢复到一个从未存在过的状态。
+            self._restore_groups_after_move(
+                self._group_undo.pop() if self._group_undo else None)
         self.move_history.pop()
         self.ko_point = ko
         self.passes = passes
