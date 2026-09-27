@@ -89,26 +89,56 @@ V12_CFG = dict(backbone_channels=192, backbone_res_blocks=17,
 # backbone_total 6,419,944→6,499,800、total_params 8,928,691→9,008,419，
 # FFN 中间维 276→240（ratio 1.5→1.304）。**旧值与 light_attn_* 键名作废。**
 #
+# 版本：P4.9c 更正 policy 头：2,366,602→2,366,730、total_params
+# 9,008,419→9,008,547。P4.9b 的裁定是「以分项实算为准」，但那组分项里**有
+# 一行本身就是笔误**（见下 (b)）——用一个含笔误的分项和去否定表头，等于让
+# 规则自己失效。故本轮不再看「哪边是表头」，只看「哪边能被形状的精确算术
+# 唯一确定」（即下方 arbitration_rule）。
+#
 # 键名对齐 P4.1 的类名：MambaLTI / TransformerBlock / CrossAttnRes
 # （块13-14 旧称 LightAttn，用户本轮改称「Transformer 块」，旧称作废）。
 #
-# 权威表内有两处自相矛盾（见 P4.1 brief §3）。已按裁定取值，但**仍待用户
-# 最终裁决**，故显式记录在此——不可静默抹掉：
+# 仲裁规则（唯一一条；权威表内的每处冲突都按它判定，见 arbitration_rule）：
+#   **形状被唯一钉死时，取该形状的精确算术值；与它冲突的表记数字即笔误。
+#     形状本身自相矛盾时，精确算术无法裁决，两口径都留着待用户裁决，
+#     实施暂取与已发布实现一致的那个。**
+# 关键在于「可唯一确定」这个前提——它把两类表面同型的证据（一个数字 vs 另一个
+# 数字）分开：(b) 里表把 fc2 的形状与 bias 都写死了，精确算术**有**唯一解，
+# 规则给出结论；(a) 里表头文字与它自己给的参数量指向**不同**形状，精确算术
+# 压根选不出谁对，规则只能升级为「待裁决」。P4.9b 对这两处用了两套相反的标
+# 准（(a) 弃表取实算、(b) 取实算弃表头），本轮统一为这一条。
+#
+# 权威表内有两处笔误/冲突（见 P4.1 brief §3）。已按上述规则处理，**并**把
+# 两个口径都显式记在此处与 known_discrepancies——不可静默抹掉：
 #   (a) stem：表头文字写「7×7 Conv 17→184」，同给的参数量 28,152 却是 3×3
 #       的值（3×3: 9×17×184 = 28,152；7×7: 49×17×184 = 153,272）。
-#       28,152+368(BN) = 28,520 正好是现有 3×3 stem+BN，故本锚点**按 3×3
-#       记 28,152**。⚠ 硬依赖：若最终确认改 7×7，stem 合计变 153,640
+#       **冲突在形状本身**，28,152 与 153,272 在各自形状下都精确 ⇒ 规则不能
+#       裁决。28,152+368(BN) = 28,520 正好是现有 3×3 stem+BN，故实施暂取
+#       3×3。⚠ 硬依赖：若最终确认改 7×7，stem 合计变 153,640
 #       （+125,120），本表**整表作废**，backbone_total/total_params 必须重算。
 #       （表/裁定里把 7×7 写成 153,296 / stem 153,664，比精确值多 24，是同
 #       一处表内笔误；两个口径都记在 known_discrepancies 里待裁决。）
-#   (b) policy 头：表里写合计 2,366,730，但它自己的分项之和是 2,366,602，
-#       差 128。故本锚点**以分项实算 2,366,602 为权威**，total_params 据此
-#       得 9,008,419；表里的 2,366,730 保留在 known_discrepancies 待裁决。
+#   (b) policy 头：笔误在**分项**那一行，不在合计。分项写「FC 128→256
+#       带bias：32,896」，而 nn.Linear(128, 256) 的 bias 恒为 out_features =
+#       256 个 ⇒ 精确值 32,768+256 = **33,024**；bias=False 是 32,768。
+#       **没有任何 bias 设置给出 32,896**（它 = 32,768+128，即把 bias 误记成
+#       in_features；32,896 唯一能落地的 Linear 读法是转置的 Linear(256,128)，
+#       与层链矛盾——fc1 出 128，fc2 的入维是 128 而非 256）。形状被钉死 ⇒
+#       规则裁决 33,024。修正后分项之和 17,856+4,704+2,218,112+33,024+
+#       93,034 = **2,366,730**，与表头自己写的合计**一致**——P4.9b 声明
+#       「表头错了」是误判，真相是分项错、表头对。本锚点取 2,366,730，
+#       total_params = 6,499,800+2,366,730+142,017 = 9,008,547，与已发布的
+#       FCPolicyHead 实测（tests/test_arch_v21_blocks.py:64）重新一致。
 # 两条同时以结构化字面量记在 known_discrepancies，测试逐字段断言其存在。
 ANCHOR_V21 = {
     'name': 'v21',
     'in_channels': 17,               # 特征平面通道（P4.3 补齐后）
     'backbone_channels': 184,
+    # 冲突取值标准（上方注释的长版规则）。P4.2 仲裁预算时**只按这一条**走，
+    # 不得对同型证据换个标准——测试逐字断言其存在。
+    'arbitration_rule': '形状被唯一钉死时取该形状的精确算术值（冲突的表记数字'
+                        '=笔误）；形状本身矛盾时精确算术不裁决，两口径都留着，'
+                        '实施暂取与已发布实现一致者',
     # 块布局：哪些块、几个。键名 = P4.1 的类名，勿再改回旧称
     'layout': {
         'stem': 'Conv3x3(17->184)+BN',   # 按 3×3 记 28,152，见上 (a)
@@ -135,16 +165,18 @@ ANCHOR_V21 = {
     # 头：权威表只给了参数量；维度钉 in/out 两端（隐藏维未给定，不臆造）
     'heads': {
         'in': 184,                   # 头喂入 = 主干输出通道
-        # policy 头：分项实算为权威值；用户表写的是 2,366,730，差 128，见上 (b)
-        'policy_params': 2_366_602,
+        # policy 头 = 表头自己写的合计 2,366,730。分项「FC 128→256 带bias：
+        # 32,896」是笔误（应为 128*256+256=33,024），见上 (b)。
+        'policy_params': 2_366_730,
         'policy_out': 362,           # 19×19 + pass
         'value_params': 142_017,     # value 头（新增部分）
         'value_out': 1,
     },
-    'total_params': 9_008_419,       # 主干 + 两头（测试断言自洽）
-    # 上文 (a)(b) 两条矛盾的机器可读记录。id/stated/recorded/delta/status
-    # 缺一不可：任一字段被静默改动/删除都会被
-    # test_anchor_v21_documents_known_discrepancies 抓住。
+    'total_params': 9_008_547,       # 主干 + 两头（测试断言自洽）
+    # 上文 (a)(b) 两条矛盾的机器可读记录。id/about/stated/recorded/delta/
+    # resolution/status 缺一不可：任一字段被静默改动/删除都会被
+    # test_anchor_v21_documents_known_discrepancies 抓住。resolution 取
+    # arbitration_rule 的两个分支之一，测试按同一把尺子逐条核。
     'known_discrepancies': (
         {
             'id': 'stem_kernel_3x3_vs_7x7',
@@ -152,17 +184,24 @@ ANCHOR_V21 = {
             'stated': 153_296,        # 7×7：表/裁定里写的口径
             'stated_exact': 153_272,  # 7×7：49×17×184 精确值（表记多 24，同属表内笔误）
             'recorded': 28_152,       # 3×3：9×17×184（本锚点采用）
-            'delta': 125_144,        # 153,296 - 28,152（按表记口径）
+            'delta': 125_144,        # 153,296 - 28,152（按表记口径；精确口径 125,120）
+            # 冲突在**形状**上：28,152 与 153,272 在各自形状下都精确 ⇒ 规则不裁决
+            'resolution': 'unresolved_shape_conflict',
             'status': '未裁决：按 3×3 实施；若改 7×7 则 stem 合计 153,640'
                       '（精确口径）/153,664（表记口径），整表作废需重算',
         },
         {
-            'id': 'policy_total_128_off',
-            'about': 'policy 头：表里的合计比其自身分项之和多 128',
-            'stated': 2_366_730,      # 用户表写的合计
-            'recorded': 2_366_602,    # 分项实算（本锚点采用，total_params 据此）
-            'delta': 128,             # 2,366,730 - 2,366,602
-            'status': '未裁决：以分项实算 2,366,602 为权威，差 128 待用户确认',
+            'id': 'policy_fc2_128_off',
+            'about': 'policy 头分项「FC 128→256 带bias：32,896」是笔误：'
+                     'bias 被记成了 in_features，表头合计 2,366,730 反而是对的',
+            'stated': 32_896,         # 表的分项行原样写的值（32,768+128）
+            'recorded': 33_024,       # 128×256+256：同一形状的唯一精确值（本锚点采用）
+            'delta': 128,             # 33,024 - 32,896（recorded - stated）
+            'total_stated': 2_366_730,  # 表头自己写的合计：与修正后的分项和一致
+            # 形状（含 bias 标志）被表写死 ⇒ 精确算术有唯一解 ⇒ 规则裁决 recorded
+            'resolution': 'resolved_by_exact_arithmetic',
+            'status': '已裁定（P4.9c）：分项行改按 33,024，合计 2,366,730 与表头'
+                      '一致，total_params 9,008,547；与已发布 FCPolicyHead 实测一致',
         },
     ),
 }
@@ -381,12 +420,14 @@ def run_anchor_v21():
     P4.2 接线落地前 AlphaGoNet 还造不出 MambaLTI/TransformerBlock/
     CrossAttnRes 结构，故 `--preset v21` 不做 forward 投影，只打印锚点表，
     并当场核算主干合计与总合计——表内数字自相矛盾会直接暴露在输出里。
-    表内那两处**已知**矛盾（stem 3×3 vs 7×7、policy 合计差 128）不在此
-    判对错，只按 known_discrepancies 逐条陈列，避免看起来像被静默抹平。
+    表内那两处**已知**笔误（stem 3×3 vs 7×7 的形状冲突、policy 分项 fc2 的
+    32,896）不在此判对错，只按 known_discrepancies 逐条陈列，避免看起来像
+    被静默抹平。
     """
     A = ANCHOR_V21
     lay, vh = A['layout'], A['heads']
     ffn = 'ffn={}(ratio {})'.format(lay['ffn_hidden'], lay['ffn_ratio'])
+    # label[k] 会让 params 每加一个键就 KeyError。这张表要长，故缺键退回键名
     label = {
         'stem': 'stem {}'.format(lay['stem']),
         'res_blocks': 'ResBlock ×{} @{}'.format(
@@ -402,10 +443,11 @@ def run_anchor_v21():
         'out': 'out {}'.format(lay['out']),
     }
     print('v21 参数锚点（ANCHOR_V21，用户权威给定；**非**本工具实测）')
+    print('仲裁规则（冲突取值标准）：{}'.format(A['arbitration_rule']))
     print(SEP)
     total = 0
     for k, v in A['params'].items():
-        print('{:<52}{:>12,}'.format(label[k], v))
+        print('{:<52}{:>12,}'.format(label.get(k, k), v))
         total += v
     print('{:<52}{:>12,}  {}'.format(
         '主干合计', total,
