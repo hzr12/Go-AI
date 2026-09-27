@@ -1,6 +1,13 @@
-"""self_play_game 两调用点的参数映射回归测试（并行 worker 漏传 rollout-steps）。
+"""selfplay_train 参数面 + self_play_game 两调用点的参数映射回归测试。
 
-背景：`_selfplay_worker`（多进程并行）与 main() 串行分支曾各手写一份
+⚠️ 本文件有**两段互不相干**的断言，请连同下面的分节注释一起读：
+  · 第 1 段（_SPEC_TABLE / _MAPPED_DESTS ...）：self_play_game 两调用点的参数映射
+    回归，原用于钉「并行 worker 漏传 rollout-steps」。
+  · 第 2 段（_EXPECTED_PARAM_SURFACE ...）：P3.0 的 CLI 参数面清单（PPO/KL 三参数
+    + --epochs 语义改写）。
+两段都会在 P3 RL 重构（去 MCTS）时被 P3-B 整体作废重写，见文末「不在测试范围内」。
+
+第 1 段的背景：`_selfplay_worker`（多进程并行）与 main() 串行分支曾各手写一份
 `self_play_game` 参数映射，两者不一致且是**静默**分叉：
   - 并行 worker **没传** `rollout_steps`，落回函数签名默认 None（语义 = 2*N*N 步），
     而 `--rollout-steps` 的 argparse 默认是 60 —— 同一份 args，并行与串行跑出
@@ -17,6 +24,8 @@
   - 两处调用点形态一致（结构/wiring 断言）
   - 四个 0/1 标志统一归一化成 bool（默认组 + 显式 CLI 值组）
   - max_moves 兜底 3*bs*bs（bs 取自入参，不是 args.board_size）
+  - **P3.0 参数面**：main() 的 argparse 块逐项清单（56 项）、PPO/KL 三参数的
+    路线图默认值、`--epochs` 的 PPO epoch 语义
 
 注意：**P3 RL 重构（去 MCTS，3.0-g）会改写本文件** —— 届时 RL 不再传 MCTS
 参数，下面的参数表断言应整体作废重写，而不是逐条修补。
@@ -241,3 +250,254 @@ def test_max_moves_fallback():
     assert st._selfplay_kwargs(_real_args(max_moves=None), 19)['max_moves'] == 3 * 19 * 19, \
         'bs 必须取入参（串行传 ai.board_size），不是 args.board_size'
     assert st._selfplay_kwargs(_real_args(max_moves=123), _BS)['max_moves'] == 123
+
+
+# --------------------------------------------------------------------------- #
+# 第 2 段：P3.0 的 CLI 参数面
+#
+# P3.0 **只加参数、不实现损失**。所以本段钉的是「参数面」这一层契约：三个 PPO/KL
+# 参数存在且默认值等于路线图 D13 ⑧、--epochs 的语义已改写成 PPO epoch 数。
+# 损失侧（P3-C 策略侧裁剪+KL / P3-D value MSE+value clipping）的断言由那两个任务
+# 各自新增（路线图指定的 tests/test_rl_ppo.py / test_rl_kl_penalty.py /
+# test_rl_value_loss.py），**不在本文件**。
+#
+# 为什么逐项列清单而不是只数个数：只锁 `len()==56` 时，「删一个旧的 + 加两个新的」
+# 恰好抵消，测试照绿而参数面已经变了。逐项 (flag, type, default) 相等才能同时锁住
+# 「没删」「没改名」「没改默认值」「没多加」四件事。
+# --------------------------------------------------------------------------- #
+
+# 「没写 default=」的哨兵。与 None 区分开：--max-moves 写了 default=None，
+# 而 --device/--ver 是**根本没有** default= 关键字。两者语义不同（前者显式 None，
+# 后者 argparse 自己给 None），混为一谈会让「删掉 default=」这类改动静默通过。
+_NO_DEFAULT = object()
+
+# main() 的 argparse 块**完整**清单，逐项 (flag, type, default)。
+# 分组只为可读性；分组边界对应源码里的注释块，P3-B 删 MCTS 参数时按组整段删。
+_EXPECTED_PARAM_SURFACE = (
+    # ---- 训练 / 生成主参数 ----
+    ('--model', 'str', None),
+    ('--board-size', 'int', 9),
+    ('--iters', 'int', 5),
+    ('--games', 'int', 4),
+    ('--sims', 'int', 400),
+    ('--max-moves', 'int', None),
+    ('--temperature', 'float', 1.0),
+    ('--buffer-size', 'int', 500),
+    ('--batch-size', 'int', 256),
+    # --epochs：P3.0 起语义 = PPO 更新轮数（路线图 D13 ⑦，不新增 --ppo-epochs）
+    ('--epochs', 'int', 2),
+    ('--lr', 'float', 0.001),
+    ('--weight-decay', 'float', 0.0001),
+    ('--value-lr-mult', 'float', 0.5),
+    ('--result-queue-max', 'int', 100),
+    ('--streaming', 'int', 0),
+    ('--no-persist', 'int', 0),
+    ('--ddp', 'int', 0),
+    ('--device', None, 'auto'),
+    ('--no-augment', 'int', 0),
+    ('--use-ema', 'int', 0),
+    ('--clip-grad', 'float', 1.0),
+    ('--grad-accum-steps', 'int', 1),
+    ('--out', 'str', 'models/az'),
+    ('--save-every', 'int', 1),
+    ('--parallel-games', 'int', 8),
+    ('--onnx-model', 'str', None),
+    ('--async-pipeline', 'int', 0),
+    ('--games-per-iter', 'int', 10),
+    ('--swanlab', 'int', 0),
+    ('--swanlab-api-key', 'str', ''),
+    ('--ver', None, 'rl'),
+    ('--c2net', 'int', 0),
+    # ---- MCTS（路线图 D11：P3-B 删 19 个参数，含本组 17 个）----
+    ('--expand-topk', 'int', 64),
+    ('--expand-chunk', 'int', 0),
+    ('--c-puct', 'float', 2.0),
+    ('--virtual-loss', 'float', 8.0),
+    ('--num-threads', 'int', 8),
+    ('--spec-prefetch', 'int', 1),
+    ('--leaf-ab-depth', 'int', 2),
+    ('--dynamic-topk', 'int', 0),
+    ('--dynamic-virtual-loss', 'int', 0),
+    ('--policy-pruning-thresh', 'float', 0.01),
+    ('--use-diverse-rollout', 'int', 0),
+    ('--use-rollout', 'int', 0),
+    ('--rollout-lambda', 'float', 0.25),
+    ('--rollout-steps', 'int', 60),
+    ('--mcts-threads', 'int', 3),
+    ('--batch-cap', 'int', 64),
+    ('--mcts-vector-backup', 'int', 1),
+    # ---- TD 价值标签 ----
+    ('--td', 'int', 1),
+    ('--td-steps', 'int', 3),
+    ('--td-alpha-init', 'float', 0.2),
+    ('--td-alpha-end', 'float', 0.9),
+    # ---- P3.0 新增：PPO / KL（策略侧由 P3-C 消费，value 侧由 P3-D 消费）----
+    ('--ppo-clip', 'float', 0.2),
+    ('--kl-coef', 'float', 0.01),
+    ('--kl-target', 'float', 0.01),
+)
+
+# P3.0 的**增量**：恰好 3 个。路线图 D11 的算式是 53 →(P3-B 删 19)→ 34 →(P3.0 +3)→ 37；
+# P3.0 落地时 P3-B 还没跑，故当下是 53 → 56，P3-B 之后才是 34+3=37。
+# 下方 test_delta_is_exactly_three_ppo_kl_params 把这条算式的每一段都断言住。
+_P3_0_NEW_PARAMS = (
+    ('--ppo-clip', 'float', 0.2),
+    ('--kl-coef', 'float', 0.01),
+    ('--kl-target', 'float', 0.01),
+)
+
+# 路线图 D11 钉死的 MCTS 删除条数。P3.0 **不**执行删除（P3-B 的活），这里只把
+# 37 = 34 + 3 这个终点记成常量，使 P3-B 落地后本文件能自证总数对得上。
+_ROADMAP_POST_P3_B_TOTAL = 37
+_MCTS_PARAMS_TO_DELETE = 19
+
+
+def _real_param_surface():
+    """从 main() 源码 AST 抽出 [(flag, type, default, help)]，按源码行号排序。
+
+    与 _real_argparse_defaults 的分工：那个只抽 default（给 _real_args 造 Namespace），
+    且**不区分**「没写 default=」与「default=None」；本函数要锁参数面（flag 名 +
+    type + default 三者齐全），故必须把 type/无 default 哨兵一起抽出来。
+    ast.walk 不保证源码顺序，按 lineno 排一次，失败信息才可读。
+    """
+    src = textwrap.dedent(inspect.getsource(st.main))
+    found = []
+    for node in ast.walk(ast.parse(src)):
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == 'add_argument'):
+            continue
+        flag = node.args[0].value
+        type_name = None
+        default = _NO_DEFAULT
+        help_text = None
+        for kw in node.keywords:
+            if kw.arg == 'type':
+                type_name = getattr(kw.value, 'id', None)
+            elif kw.arg == 'default':
+                default = ast.literal_eval(kw.value)
+            elif kw.arg == 'help':
+                help_text = ast.literal_eval(kw.value)
+        found.append((node.lineno, (flag, type_name, default, help_text)))
+    return [row for _, row in sorted(found, key=lambda r: r[0])]
+
+
+def _surface_by_flag():
+    return {flag: (type_name, default, help_text)
+            for flag, type_name, default, help_text in _real_param_surface()}
+
+
+def test_param_surface_matches_itemised_list_exactly():
+    """参数面逐项 == 清单，且总数 == 清单长度（防「删一个 + 加一个」互相抵消）。"""
+    surface = _surface_by_flag()
+    expected = {flag: (type_name, default)
+                for flag, type_name, default in _EXPECTED_PARAM_SURFACE}
+    assert len(_EXPECTED_PARAM_SURFACE) == len(expected), \
+        '清单自身有重复 flag，逐项表失去意义'
+    missing = sorted(set(expected) - set(surface))
+    extra = sorted(set(surface) - set(expected))
+    wrong = {f: (surface[f][0], surface[f][1], expected[f]) for f in sorted(set(expected) & set(surface))
+             if (surface[f][0], surface[f][1]) != expected[f]}
+    assert not missing, f'参数面缺这些 flag: {missing}'
+    assert not extra, (f'参数面多出这些 flag: {extra}；'
+                       f'路线图 D11 只允许 P3.0 +3 个参数，不许顺手多加')
+    assert not wrong, (f'这些参数的 type/default 与清单不符（实为 type, default, 期望）: '
+                       f'{wrong}')
+    assert len(surface) == len(_EXPECTED_PARAM_SURFACE) == 56, \
+        f'参数面应恰好 56 项（P3.0 前 53 + 3），实为 {len(surface)}'
+
+
+def test_delta_is_exactly_three_ppo_kl_params():
+    """P3.0 的增量恰好是那 3 个 PPO/KL 参数：一个不多、一个不少、旧的一个没删。
+
+    把路线图 D11 的算式整条钉住：
+      53（P3.0 前） → 56（P3.0 后） →(P3-B 删 19)→ 37（P3.0 + P3-B 后）
+    故 P3-B 落地时，本测试的 56 - 19 必须等于 _ROADMAP_POST_P3_B_TOTAL。
+    """
+    surface = _surface_by_flag()
+    before = set(_EXPECTED_PARAM_SURFACE) - set(_P3_0_NEW_PARAMS)
+    assert len(before) == 53, f'P3.0 前的基线应是 53 项，实为 {len(before)}'
+    for flag, type_name, default in _P3_0_NEW_PARAMS:
+        got = surface.get(flag, (None, _NO_DEFAULT))
+        assert (got[0], got[1]) == (type_name, default), \
+            f'{flag} 实为 type={got[0]} default={got[1]}，' \
+            f'期望 type={type_name} default={default}'
+    assert len(surface) - len(before) == 3, \
+        f'增量不是 3 个（{len(surface)} - {len(before)}）'
+    assert not {f for f, _, _ in before} - set(surface), \
+        'P3.0 不允许删任何既有参数（MCTS 参数由 P3-B 删）'
+    assert 56 - _MCTS_PARAMS_TO_DELETE == _ROADMAP_POST_P3_B_TOTAL, \
+        '路线图算式 56-19 应等于 37'
+
+
+def test_ppo_clip_default_is_roadmap_epsilon():
+    """--ppo-clip 0.2：PPO 裁剪范围 ε（路线图 D13 ①⑧）。P3-D 的 value clipping 复用它。
+
+    ε 的断言只看 help 的**首句**（第一个「：」之前）：完整 help 里 `clip(r,1-ε,1+ε)`
+    与末句「复用同一个 ε」都含 ε，查整段的话把首句的 ε 说明删掉也照样绿。
+    """
+    type_name, default, help_text = _surface_by_flag()['--ppo-clip']
+    assert type_name == 'float', f'--ppo-clip 应为 float，实为 {type_name}'
+    assert default == 0.2, f'--ppo-clip 默认应为 0.2，实为 {default}'
+    assert help_text, '--ppo-clip 必须有 help（否则 --help 里读不到它是干什么的）'
+    head = help_text.split('：')[0]
+    assert 'ε' in head or 'epsilon' in head.lower(), \
+        f'--ppo-clip 的 help 首句必须点明它是 PPO 裁剪范围 ε，实为: {head!r}'
+
+
+def test_kl_coef_default_is_initial_beta():
+    """--kl-coef 0.01 是 β 的**初值**：help 必须写明「初值」与自适应，否则 P3-C 会误当常数。"""
+    type_name, default, help_text = _surface_by_flag()['--kl-coef']
+    assert type_name == 'float', f'--kl-coef 应为 float，实为 {type_name}'
+    assert default == 0.01, f'--kl-coef 默认应为 0.01，实为 {default}'
+    assert '初值' in help_text, \
+        '--kl-coef 的 help 必须写明它是 β 的初值（P3-C 会做 β 自适应）'
+    assert 'β' in help_text, '--kl-coef 的 help 应写明它就是 KL 惩罚系数 β'
+
+
+def test_kl_target_default_and_two_x_abort_rule():
+    """--kl-target 0.01，且 help 必须写明 running-KL > 2×本值 时提前中止（路线图 D13 ⑥）。"""
+    type_name, default, help_text = _surface_by_flag()['--kl-target']
+    assert type_name == 'float', f'--kl-target 应为 float，实为 {type_name}'
+    assert default == 0.01, f'--kl-target 默认应为 0.01，实为 {default}'
+    assert '2' in help_text and '×' in help_text, \
+        '--kl-target 的 help 必须写明「2×」提前中止因子（P3-C 的硬信任域约束靠它）'
+    assert '中止' in help_text or 'abort' in help_text.lower(), \
+        '--kl-target 的 help 必须写明超限会提前中止本轮剩余 minibatch'
+
+
+def test_epochs_semantics_is_ppo_epoch_count():
+    """--epochs 保留（不新增 --ppo-epochs），语义改为 PPO 更新轮数。
+
+    路线图 D13 ⑦：PPO 更新轮数 = 现有 --epochs。type/默认值不变（int / 2），
+    变的是 help 文本 —— 这是 P3-C 唯一能看出「外层 for _ in range(args.epochs)
+    就是 PPO epoch 循环」的锚点。
+
+    断言只查**首个分句**（第一个「（」之前）而不是整段 help：help 末尾那句
+    「（原「每轮迭代训练遍数」；…）」是刻意保留的沿革说明，整段查 'PPO' 会被它
+    连带满足 —— 那样把主句改回旧语义（全段再无 PPO，但沿革说明里还有）也会照绿。
+    """
+    type_name, default, help_text = _surface_by_flag()['--epochs']
+    assert type_name == 'int', f'--epochs 应为 int，实为 {type_name}'
+    assert default == 2, f'--epochs 默认仍应是 2（P3.0 只改语义不改默认值），实为 {default}'
+    head = help_text.split('（')[0]
+    assert 'PPO' in head, (
+        f'--epochs help 的**主句**必须声明它是 PPO 更新轮数（路线图 D13 ⑦），实为: {head!r}')
+    assert '轮' in head or 'epoch' in head.lower(), \
+        f'--epochs help 的主句必须说明它是个「轮数」，实为: {head!r}'
+    assert '--ppo-epochs' not in ' '.join(
+        h for _, _, _, h in _real_param_surface() if h), \
+        '路线图 D13 ⑦ 明令不新增 --ppo-epochs'
+
+
+def test_new_params_are_not_wired_into_mcts_or_kwargs_mapping():
+    """三个新参数只属损失侧：不得进 _selfplay_kwargs（那是 self_play_game 的搜索参数）。
+
+    误接的后果是静默的：_selfplay_kwargs 的返回值被当作 self_play_game 的关键字
+    参数传下去，多一个键就是 TypeError（吵闹但安全）；而若有人图省事给
+    self_play_game 加形参接收它们，就会把训练超参漏进搜索路径。故显式钉住。
+    """
+    keys = set(st._selfplay_kwargs(_real_args(), _BS))
+    for flag in ('--ppo-clip', '--kl-coef', '--kl-target'):
+        dest = flag.lstrip('-').replace('-', '_')
+        assert dest not in keys, f'{dest} 不该出现在 _selfplay_kwargs 里（损失侧参数）'

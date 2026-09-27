@@ -824,7 +824,10 @@ def main():
     ap.add_argument("--buffer-size", type=int, default=500, help="replay buffer 容量（局数，非样本数）")
     ap.add_argument("--batch-size", type=int, default=256,
                     help="训练 batch（C2: NPU 甜点 256，显存约 2-3x 旧 64）")
-    ap.add_argument("--epochs", type=int, default=2, help="每轮迭代训练遍数")
+    ap.add_argument("--epochs", type=int, default=2,
+                    help="PPO 更新轮数：每轮迭代把 replay buffer 走几遍 PPO 更新"
+                         "（原「每轮迭代训练遍数」；语义改写于 P3.0，"
+                         "PPO 裁剪+KL 由 P3-C 接入，value 侧由 P3-D 接入）")
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--value-lr-mult", type=float, default=0.5,
@@ -924,6 +927,26 @@ def main():
                     help="TD α 调度终值（残局，偏 v_td）")
     ap.add_argument("--c2net", type=int, default=0, choices=[0, 1],
                     help="启用 C2NET (OpenI 启智平台) 支持 (0=关闭, 1=开启)")
+
+    # ---- PPO / KL（路线图 D13）----
+    # P3.0 **只声明不消费**：本组三个参数在损失里的精确读法、β 自适应状态挂在哪、
+    # 2×target 提前中止读哪个值，都写在
+    # .superpowers/sdd/2026-09-25-v21-roadmap/task-p3-0-report.md 的「接线契约」一节。
+    # 策略侧（PPO 裁剪代理目标 + KL 惩罚）由 P3-C 接入，value 侧（value clipping）由
+    # P3-D 接入；**在它们落地前这三个参数不改变任何数值行为**。
+    ap.add_argument("--ppo-clip", type=float, default=0.2,
+                    help="PPO 裁剪范围 ε：r=exp(logp_new-logp_old)，代理目标 "
+                         "L_pi=-min(r·A, clip(r,1-ε,1+ε)·A)。"
+                         "P3-D 的 value clipping 复用同一个 ε，不另设参数")
+    ap.add_argument("--kl-coef", type=float, default=0.01,
+                    help="KL 惩罚系数 β 的**初值**（不是常数）：L_pi -= β·KL_k1，"
+                         "P3-C 另做 β 自适应朝 --kl-target 走，"
+                         "自适应状态挂 ai 上（与 optimizer/EMA 同生命周期），"
+                         "不每轮从本参数重读")
+    ap.add_argument("--kl-target", type=float, default=0.01,
+                    help="目标 KL。P3-C 两处都读它：① β 自适应的调节目标；"
+                         "② 每次更新后 running-KL > 2×本值 时提前中止本轮剩余 "
+                         "minibatch（信任域硬约束，2× 是写死的因子，不另设参数）")
 
     args = ap.parse_args()
 
