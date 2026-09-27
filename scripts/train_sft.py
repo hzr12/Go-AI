@@ -239,6 +239,9 @@ def _locate_overflow(optimizer, logger, max_report=3):
     参数组按 **LR 比值**分类而非写死下标——opt_groups 的顺序一旦调整
     （例如增删 no_decay 组），按下标判断就会误报。value 组的 LR 是基准的
     value_lr_mult 倍（本项目默认 5.0），故取「LR 明显高于最低组」作为判据。
+    ⚠ `--value-loss-weight` 的默认已在 P4.5-fix 由 5.0 改为 1.0（删补偿），
+    下面的告警文案同步改了；`--value-lr-mult` 仍是 5.0（那是 LR 倍数、不是
+    损失补偿，不在本次裁决范围内）。
     """
     groups = optimizer.param_groups
     lrs = [float(g.get('lr', 0.0)) for g in groups]
@@ -267,7 +270,7 @@ def _locate_overflow(optimizer, logger, max_report=3):
                        lr, n_inf, n_nan)
     if any(b[4] for b in bad):
         logger.warning("[fp16] 溢出集中在 value head —— 优先下调 --value-loss-weight"
-                       "（默认 5.0）与 --value-lr-mult（默认 5.0）")
+                       "（默认 1.0，无补偿）与 --value-lr-mult（默认 5.0）")
     if any(not b[4] for b in bad):
         logger.warning("[fp16] 溢出涉及 backbone/policy —— 优先下调 --lr；"
                        "NPU 上注意力被强制走 math 并物化 logits，"
@@ -352,6 +355,27 @@ def maybe_autocast(device, dtype=torch.float16):
                     return torch.cuda.amp.autocast(enabled=True, dtype=dtype)
                 return torch.npu.amp.autocast(enabled=True, dtype=dtype)
     return nullcontext()
+
+
+def _positive_beta(text):
+    """`--huber-beta` 的 argparse type：要求严格 > 0。
+
+    为什么必须校验（P4.5-fix）：`beta<=0` 时 `F.smooth_l1_loss` **不报错**——
+    `beta=0` 静默退化成纯 L1（`|d|`，拐点消失），`beta<0` 才在**训练跑到第一
+    个 batch 的反向**时抛原生 `RuntimeError`（位置在 `compute_*_loss` 里，
+    栈里全是训练循环，用户拿不到「是哪个旗写错了」的信息）。改成在解析期就
+    用 argparse 的标准错误格式拒掉。
+    """
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f'--huber-beta 必须 > 0（收到非数值 {text!r}）')
+    if not (value > 0.0) or value != value or value == float('inf'):
+        raise argparse.ArgumentTypeError(
+            f'--huber-beta 必须 > 0（0 会静默退化成 L1，负值会让 '
+            f'F.smooth_l1_loss 在训练中途抛 RuntimeError），收到 {text!r}')
+    return value
 
 
 def load_dataset(path):
@@ -562,8 +586,19 @@ def evaluate_metrics(model, dataset, idxs, bs, device, amp_dtype, max_batches=50
             kl_sum += float(kl_per_sample.sum())
 
             # --- value Brier score ---
-            # Brier = mean((pred - actual)^2), actual in {-1,+1}, pred in tanh output
-            # 映射到 [0,1]: actual_01 = (actual+1)/2, pred_01 = (pred+1)/2
+            # Brier = mean((pred_01 − act_01)²)，两个量都先线性映射到 [0,1]：
+            #   act_01 = (value_t+1)/2 ∈ {0,1}；pred_01 = (value_pred+1)/2。
+            # ⚠ 作用在**裸输出**上：`value_pred` 就是 `model(state)` 的第二个
+            # 返回值，本文件全程没有 `tanh`；当前 `alphanet.py` 用的还是裸线性
+            # `ValueNetwork`（`FCValueHead` 的 Tanh 尚未接线）。所以上一版注释
+            # 写的「pred in tanh output」是陈旧且误导的 —— P4.5 让 value_t∈[-1,1]
+            # 成了承重契约，这个假注释会让人以为映射里已经有一个 tanh。
+            #
+            # C8 删掉旧 BCE 分支的收益（机制，勿简化成「按 tanh 解释」）：旧
+            # BCEWithLogits 的最优**裸输出**是 ±2.197（=logit(0.9)，因为旧分支把
+            # 目标压成了 (v+1)/2*0.8+0.1），而 Brier 是把这个裸输出线性映射到
+            # [0,1] 再与 0/1 比 —— 两者尺度错配，指标里带 ~2.197 量级的系统性
+            # 伪影。改回归 ±1 之后，裸输出与 [-1,1] 契约对齐，伪影消失。
             pred_01 = (value_pred.squeeze(-1) + 1) / 2
             act_01 = (value_t.squeeze(-1) + 1) / 2
             brier_sum += float(((pred_01 - act_01) ** 2).sum())
@@ -842,6 +877,173 @@ def _read_log_scalars(loss, policy_loss, value_loss):
     同步次数减半。
     """
     return loss.item(), policy_loss.item(), value_loss.item()
+
+
+# ---- D4（SFT 侧）：policy/value 损失口径 ------------------------------------------------
+# 三个 CLI 开关：--policy-loss {huber,ce}（默认 huber）、--value-loss {huber,mse}
+# （默认 huber）、--huber-beta（默认 0.5，既是 smooth L1 的 beta 也是拐点 delta）。
+# C8 修正：value 的 BCE 分支已删（见 compute_value_loss docstring）。
+# RL 侧（scripts/selfplay_train.py）的损失是 P3-C/P3-D，**不经过这里** —— 本文件
+# 的函数只服务 train_sft 自己的调用点，改语义不会波及 RL。
+#
+# 日志契约（不可动）：main() 打点仍用 loss / policy_loss / value_loss 三个键，
+# 下游 run.txt、看板与 tests/test_run_txt_sync.py 的消费者绑着它们，
+# tests/test_huber_loss.py::test_log_keys_unchanged 把三个键钉死。
+#
+# ⚠ P4.5-fix 遗留的未解问题（**不是**已修复项，见 report `## Fix 增补`）：
+# policy 默认走 huber 时，其梯度天然比 value 弱 ~A 倍（Huber 在概率域的梯度
+# ∝ p(1−p) ≈ 1/A），修掉 1/A 归约 bug + 删掉 5.0 倍 value 补偿之后，实测
+# value:policy 仍差 250~360:1（老的 ce+bce 口径是 2.2:1）。**共享主干因此仍是
+# value-only 的**（实测主干上 value:policy ≈ 435:1）。要真正补平需要动
+# `--policy-loss` 的默认值（改回 ce）或重新定义 policy 的回归对象 —— 决定权在
+# 控制器，本任务不擅自改默认。
+
+
+def huber_loss(pred, target, beta=0.5, reduction='mean'):
+    """Huber（smooth L1）—— D4 的唯一 Huber 实现，口径在本 docstring 钉死。
+
+    数学式（逐元素误差 d = pred − target，N = 元素数）::
+
+        h(d) = 0.5 * d² / beta    若 |d| <  beta      （二次段，∂h/∂d = d/beta）
+             = |d| − 0.5 * beta    若 |d| ≥ beta      （线性段，∂h/∂d = sign(d)）
+        reduction='mean'  →  (1/N) · Σ h(d)     ← 默认，value 侧用它
+        reduction='none'  →  h(d) 逐元素        ← policy 侧自己聚合（见下）
+
+    ⚠ **「线性段梯度 = ±1」只在 N=1 时成立**（P4.5-fix 更正）。mean 归约把每个
+    元素的梯度也除以 N，实测（beta=0.5, d=1）：N=1 → ±1.000000、N=8 → ±0.125000、
+    N=2888（B=8 × A=361）→ ±0.000346。上一版 docstring 拿「±1 vs ±0.5」当
+    smooth_l1 与 huber_loss 的选型依据，是 `test_huber_limits` 用**单元素张量**
+    造出来的假象 —— 在真实的 B×A 张量上，smooth_l1 的线性段梯度是 ±1/N，
+    `F.huber_loss` 的是 ±beta/N，两者只差一个统一的 beta 因子。
+
+    实现选择（三问三答，改动前先读完）：
+
+    1. **用 `F.smooth_l1_loss(..., beta=)`，不用 `F.huber_loss(..., delta=)`。**
+       D4 简报「两者在 beta ≤ 1 时完全等价」的断言在本仓实测的 torch 2.12.0+cpu
+       上**不成立**，torch 自己的 docstring 也这么写（"In general, Huber loss
+       differs from SmoothL1Loss by a factor of delta"）。实测（float64、
+       d ∈ linspace(-3,3,20001)、逐位比较）：
+
+           F.huber_loss(delta=b) == b · F.smooth_l1_loss(beta=b)     恒等，仅 b=1 时两者相等
+
+       选 smooth_l1 的理由因此**不是**梯度 ±1（那是被 N=1 掩盖的假象），而是
+       **量纲约定**：smooth_l1 就是教科书 Huber(delta=b) 本身
+       （实测 `smooth_l1(beta=b) ≡ Huber(delta=b)` 逐位相等，拐点确实在 |d|=b），
+       而 `F.huber_loss` 是它的 b 倍缩放 —— 用 smooth_l1 时 `--huber-beta`
+       的语义与 Huber 的 delta 直觉一致，改 beta 只改拐点、不改整体量纲。
+       ⚠ 顺带证伪 fix 简报里的另一句：它把 smooth_l1 说成「delta 取 1.0 的
+       Huber 再整体除以 b」，并据此断言拐点固定在 1.0、与 beta 无关 ——
+       **同样是错的**：b=0.5 时两者最大差 2.25（线性段不等），仅 b=1 巧合
+       相等。拐点就在 |d|=b。逐位 oracle 见
+       tests/test_huber_loss.py::test_huber_matches_torch_reference。
+    2. **reduction 显式写出**：默认 `'mean'` 与被替换的旧 value 口径
+       （`F.mse_loss` 默认 mean）对齐；`'none'` 是 P4.5-fix 给 policy 侧用的
+       逃生口 —— policy 必须**逐样本**聚合（类内 sum 后对 batch 取 mean），
+       原因见 compute_policy_loss docstring 的 1/A 稀释分析。
+    3. **数值稳定性**：|d| ≥ beta 段梯度有界（∝ sign(d)/N，不随误差放大），
+       SFT 早期 value 误差可能很大（目标 ±1、初值 ~0 → |d| ~ 1），此时 log
+       不会被一次离群样本炸出天文数字（MSE 会：其梯度 ∝ 2|d|）。代价是大误差
+       处损失只按 |d| 线性增长 —— 日志上 value_loss 早期是一条**斜率恒定**的
+       下降线，收敛末段（|d|<beta）才转成二次的平滑收口。
+    """
+    return F.smooth_l1_loss(pred, target, beta=beta, reduction=reduction)
+
+
+def compute_policy_loss(policy_logits, move_t, kind,
+                        label_smoothing=0.1, huber_beta=0.5):
+    """按 `--policy-loss` 分派 policy 损失；返回标量张量。
+
+    kind='ce'   —— **原口径原样保留**：`F.cross_entropy(logits, move_t,
+        label_smoothing=...)`，与 D4 之前的调用逐字相同（默认 label_smoothing
+        0.1 也照旧生效），数值行为不得改变。
+    kind='huber' —— 对 policy **目标**（label-smoothed one-hot 分布）做 Huber：
+        · 目标 y = (1−eps)·onehot(move_t) + eps/A（eps = label_smoothing，
+          A = 动作数）—— 与 `F.cross_entropy(label_smoothing=eps)` 用的是
+          **同一构造**，故 `--label-smoothing` 对两条路径语义一致；
+        · 预测侧 = `softmax(policy_logits)`（模型输出是 logits，目标是概率
+          分布，必须先归一化到同一值域 [0,1] 才能逐元素回归）；
+        · 归约 = **类内 sum over A，再对 batch 取 mean**（P4.5-fix 修，见下）。
+
+    ⚠ **P4.5-fix：归约口径是修过的实现 bug，不是设计选择。**
+    D4 首版用 `huber_loss(..., reduction='mean')`，对 **B×A 个元素**求均值；
+    而被它替换掉的 `F.cross_entropy` 是**逐样本**（类内 softmax 已归一）再对
+    batch 求均值。两者差一个 **1/A 的稀释**（A=361 → 361×）。实测（B=8, A=361,
+    beta=0.5, targets ±1, 近均匀初值，损失输入空间的梯度范数）：
+
+        policy 梯度范数   ce 3.178e-01  →  D4 首版 huber 2.723e-06  （塌 116,707×）
+
+    另有一个**不可修**的量级差：Huber 打在 softmax 概率上时，梯度 ∝ p(1−p)，
+    近均匀初值下 ≈ 1/A，比 CE 的 O(1) 天然弱 ~A 倍。所以**修归约只是把实现
+    bug 拿掉，policy/value 的相对梯度仍严重失衡（详见 report 的
+    `## Fix 增补` §残余比值）**。
+
+    两种归约都实现并实测过（B=8, A=361, beta=0.5, targets ±1）：
+
+        口径                        policy_loss 起步   |g_policy|      value:policy(w=1)
+        sum over A, mean over B  ←  0.649744          9.829e-04        359.7 : 1
+        mean over A, mean over B     1.7998e-03        2.723e-06      129,854 : 1
+
+    选 **sum over A, mean over B**：老 CE 的量级是「每样本约 1~6」
+    （实测 ln(361)=5.89），`mean over A` 会把它压到 1/361，直接改变可学习率
+    的含义与 `--value-loss-weight` 的语义。代价是 policy_loss 起步值比 CE 小
+    ~9 倍（0.650 vs 5.889）—— 量级变了，但**不再随 A 变化**（老 CE 也是 O(ln A)）。
+
+    与 CE 的量级差异（**已知行为变化，不是 bug**）：初始时 softmax ≈ 1/A、目标
+    ≈ 1−eps，|d| ≈ 0.9 落在线性段 → 每样本 policy_loss ≈ (0.9−0.5·0.5)·(1−1/A)
+    + 360·二次段 ≈ **0.650**（旧 docstring 写的 ~1.5e-3 是 `mean over A` 口径的
+    值，且 (0.9−0.25)/361 精确算是 **1.80e-03** 不是 1.5e-3），而 CE 起步
+    ≈ ln(A) ≈ 5.89。`loss` 与 `policy_loss` 的数值与旧 run **不可直接比**。
+    """
+    if kind == 'ce':
+        return F.cross_entropy(policy_logits, move_t,
+                               label_smoothing=label_smoothing)
+    if kind == 'huber':
+        A = policy_logits.shape[-1]
+        eps = float(label_smoothing)
+        with torch.no_grad():
+            target = torch.full_like(policy_logits, eps / A)
+            target.scatter_(1, move_t.long().view(-1, 1),
+                            1.0 - eps + eps / A)
+        pred = F.softmax(policy_logits, dim=-1)
+        # 逐样本：类内 sum over A，再对 batch 取 mean（对齐 F.cross_entropy 的
+        # 「batch 维求均值」口径；reduction='none' + 手工聚合是唯一能同时
+        # 保住逐元素 Huber 与逐样本归约的写法）
+        return huber_loss(pred, target, beta=huber_beta,
+                          reduction='none').sum(dim=-1).mean()
+    raise ValueError(f"--policy-loss 只接受 huber|ce，收到 {kind!r}")
+
+
+def compute_value_loss(value_pred, value_target, kind, huber_beta=0.5):
+    """按 `--value-loss` 分派 value 损失；返回标量张量。
+
+    目标一律是 `value_t ∈ [-1,1]`（无 winrates 时是硬标签 ±1，有 winrates 时是
+    连续胜率 (−1,1)），**原样回归** —— 不做概率化、不截断、不取 log。
+
+    C8 修正：旧代码在「数据无 winrates」时走 BCE 分支 ——
+    `(v+1)/2*0.8+0.1` 把目标压进 [0.1,0.9] 再喂 `binary_cross_entropy_with_logits`
+    （打在本该是 Tanh/有界的 value 输出上，语义错：BCEWithLogits 期望未压缩的
+    logit，目标却被手工搬进概率空间；两条数据路径还把同一个 value 头训到两种
+    值域 ±2.197 vs ±1）。该分支已整段删除，本函数不再看 `dataset.winrates` ——
+    winrates 路径若要旧行为，传 `--value-loss mse`（与旧 MSE 调用逐位相同）。
+
+    kind='mse'  —— **原口径原样保留**：`F.mse_loss(pred.squeeze(),
+        target.squeeze())`，与 D4 之前 winrates 分支的调用逐字相同。
+    kind='huber' —— 同样 squeeze 后对 (value_pred − value_t) 做
+        `huber_loss(beta=huber_beta)`，**mean over B**（N=B，不是 B×A：
+        value 每个样本只有一个标量，类内没有可聚合的维度）。
+
+    squeeze 沿用旧实现（(B,1)→(B,)），保证 mse 分支连形状都与改前一致。
+    value 侧**不涉及** P4.5-fix 修的那个 1/A 稀释：被替换的 `F.mse_loss` 本身
+    就是 mean over B，与这里的归约逐位同口径。
+    """
+    pred = value_pred.squeeze()
+    target = value_target.squeeze()
+    if kind == 'mse':
+        return F.mse_loss(pred, target)
+    if kind == 'huber':
+        return huber_loss(pred, target, beta=huber_beta)
+    raise ValueError(f"--value-loss 只接受 huber|mse，收到 {kind!r}")
+
 
 
 def _early_stop_decision(early_stop_metric, current_metric, best_metric, counter, patience):
@@ -1150,8 +1352,40 @@ def main():
     ap.add_argument('--model', default='',
                     help='加载预训练权重（仅权重，optimizer/scheduler/step 从头开始）。'
                          '用于迁移学习或微调，不加载优化器状态')
-    ap.add_argument('--value-loss-weight', type=float, default=5.0,
-                    help='value loss 权重（BCE loss 下需更大权重平衡 policy/value 梯度）')
+    ap.add_argument('--value-loss-weight', type=float, default=1.0,
+                    help='value loss 权重。默认 1.0 = 无补偿（P4.5-fix 按用户裁决'
+                         '删掉了 BCE 时代为平衡 policy/value 梯度而加的 5.0 倍'
+                         '补偿）。⚠ 换 --value-loss 后 policy/value 的梯度量级'
+                         '关系已变，见 report `## Fix 增补`：policy 默认走 huber，'
+                         '其梯度天然比 value 弱 ~A 倍，修掉归约 bug 后实测仍差 '
+                         '约 250~360:1，此参数不足以单独补平。')
+    # ---- D4（SFT 侧）：损失口径三参数 ------------------------------------
+    # 只加这三个（D1：v21 不新增其他 CLI 参数）。RL 侧的对应拆分在 P3-C/P3-D，
+    # scripts/selfplay_train.py 不在本任务范围。
+    ap.add_argument('--policy-loss', default='huber',
+                    choices=['huber', 'ce'],
+                    help='policy 损失：huber=对 label-smoothed one-hot 目标做 Huber'
+                         '(smooth L1, beta=--huber-beta，归约=类内 sum over A + '
+                         'batch mean)；ce=原交叉熵口径（数值行为与 D4 之前逐位一致）。'
+                         '默认 huber（D4）')
+    ap.add_argument('--value-loss', default='huber',
+                    choices=['huber', 'mse'],
+                    help='value 损失：huber=对 value_t∈[-1,1] 直接 Huber'
+                         '(smooth L1, beta=--huber-beta)；mse=原均方误差口径'
+                         '（数值行为与 D4 之前逐位一致）。默认 huber（D4/C8，'
+                         'BCE 分支已删）')
+    ap.add_argument('--huber-beta', default=0.5,
+                    type=_positive_beta,
+                    help='Huber(smooth L1) 的 beta，同时就是拐点位置 delta：'
+                         '|误差|<beta 走二次段、>=beta 走线性段（线性段的逐元素'
+                         '梯度是 sign(d)，但 mean 归约会再除以元素数 N —— '
+                         'N=2888 时只有 ±0.00035，不是 ±1）。'
+                         '实现用 F.smooth_l1_loss(beta=)，它就是教科书 '
+                         'Huber(delta=beta) 本身；torch 的 F.huber_loss(delta=) '
+                         '则是它的 beta 倍缩放（仅 beta=1 时两者相等），故不用。'
+                         '同时作用于 --policy-loss=huber 与 --value-loss=huber，'
+                         '必须 >0（0 会静默退化成 L1，负值在训练中途才炸），'
+                         '默认 0.5')
     ap.add_argument('--value-lr-mult', type=float, default=5.0,
                     help='value head 学习率倍数（相对主干 LR，补偿参数量小的梯度不足）')
     ap.add_argument('--label-smoothing', type=float, default=0.1,
@@ -1847,18 +2081,22 @@ def main():
                 _t_comp0 = time.perf_counter()
                 with maybe_autocast(device, amp_dtype):
                     policy_logits, value_logit = model(state)
-                    policy_loss = F.cross_entropy(policy_logits, move_t,
-                                                  label_smoothing=args.label_smoothing)
-                    # 价值损失：根据数据是否含 winrates 字段选择 MSE 或 BCE
-                    if dataset.winrates is not None:
-                        # 使用连续胜率标签 (D) + MSE loss
-                        value_target = value_t.squeeze()  # BF16
-                        value_loss = F.mse_loss(value_logit.squeeze(), value_target)
-                    else:
-                        # 回退到原有 BCE 逻辑
-                        value_target = (value_t.squeeze() + 1) / 2 * 0.8 + 0.1  # BF16
-                        value_loss = F.binary_cross_entropy_with_logits(
-                            value_logit.squeeze(), value_target)
+                    # D4：policy/value 损失由 --policy-loss / --value-loss 分派
+                    #（默认均为 huber），--huber-beta 同时供两处使用。
+                    # C8：value 的 BCE 分支已删 —— 无 winrates 时也直接对
+                    # value_t ∈ [-1,1] 回归；不再按数据字段分叉目标变换。
+                    # P4.5-fix：--value-loss-weight 默认 1.0（BCE 时代的 5.0 倍
+                    # 补偿已按用户裁决删除）。⚠ 这只把 value:policy 的梯度比从
+                    # 443,808:1 拉到 ~250~360:1（老的 ce+bce 是 2.2:1），**远未
+                    # 补平** —— policy 走 huber 时梯度 ∝ p(1−p) ≈ 1/A 是结构性的。
+                    # 见 report `## Fix 增补` §残余比值。
+                    policy_loss = compute_policy_loss(
+                        policy_logits, move_t, args.policy_loss,
+                        label_smoothing=args.label_smoothing,
+                        huber_beta=args.huber_beta)
+                    value_loss = compute_value_loss(
+                        value_logit, value_t, args.value_loss,
+                        huber_beta=args.huber_beta)
                     loss = policy_loss + args.value_loss_weight * value_loss
                 scaler.scale(loss / _accum_steps).backward()
                 _t_comp += time.perf_counter() - _t_comp0
