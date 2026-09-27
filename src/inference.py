@@ -283,11 +283,14 @@ class GoAI:
 
         planes: 可选，预先算好的 12 通道 np.ndarray (12,H,W)。传入可避免重复
         feature_planes 计算（MCTS 增量特征场景）。
+        ⚠ P4.3 起 `feature_planes*` 的默认通道数是 17，而本路径推的模型是
+          `in_channels=12`（`GoAI` 的旧代权重）→ 通道数**显式钉住 12**。P4.8/4.16
+          的 `_infer_in_channels` 落地后，这里改由权重形状推断出的值驱动。
         """
         if planes is None:
             planes = board.feature_planes_batched(
                 board.board[None], [list(my_hist)], [list(op_hist)],
-                [to_play], [board.ko_point])[0]
+                [to_play], [board.ko_point], n_channels=12)[0]
         x = torch.from_numpy(np.ascontiguousarray(planes)).unsqueeze(0).to(self.device).float()
         if self.channels_last:
             x = x.to(memory_format=torch.channels_last)
@@ -328,7 +331,8 @@ class GoAI:
                 planes = None
             if planes is None:
                 planes = b.feature_planes_batched(
-                    b.board[None], [list(mh)], [list(oh)], [tp], [b.ko_point])[0]
+                    b.board[None], [list(mh)], [list(oh)], [tp], [b.ko_point],
+                    n_channels=12)[0]
             planes_list.append(np.ascontiguousarray(planes, dtype=np.float32))
         # ONNX 快速路径：全程 numpy，避免 numpy→torch→numpy 往返
         if self._ort is not None:

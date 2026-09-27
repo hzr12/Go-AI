@@ -219,9 +219,11 @@ class SelfPlayWorker(Process):
             )
             
             # 记录样本
+            # ⚠ n_channels=12：与 selfplay_train.py 同一契约（旧权重布局），
+            #   v21 训练切 17 通道时这一格必须同步切。
             planes = np.ascontiguousarray(board.feature_planes_batched(
                 board.board[None], [list(hists[0])], [list(hists[1])],
-                [to_play], [board.ko_point])[0])
+                [to_play], [board.ko_point], n_channels=12)[0])
             
             vt = np.zeros(n_actions)
             vs = visits.sum()

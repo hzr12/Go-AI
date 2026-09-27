@@ -10,8 +10,12 @@
     value   : int8                            胜负标签（+1 黑胜 / -1 白胜）
     to_play : int8                            该样本轮到谁落子（1 黑 / -1 白）
 
-特征平面（12 通道）由 GoBoard.feature_planes 统一构造，保证与推理/评估一致。
-训练期运行时随机施加 8 种对称变换之一（等价于 8 倍静态增强，内存仅 1/8）；
+特征平面由 `GoBoard.feature_planes_batched` 统一构造，保证与推理/评估一致。
+**通道数由构造参数 `n_channels` 决定，默认 12**（C7「12↔17，默认 12 保零回归」）：
+12 = P4.3 之前的布局，喂 `in_channels=12` 的旧权重与旧数据，输出逐字节不变；
+17 = v21 stem（`Conv3×3(17→184)`）需要的布局，通道表见
+`src/game/go_rules.py` 的「特征平面」段注释。
+训练期运行时随机施加 8 种对称增强之一（等价于 8 倍静态增强，内存仅 1/8）；
 **评估期不施加**（`sample_batch_numpy(..., augment=False)`）—— 验证集不该被随机
 翻转/旋转污染，详见该方法的 docstring。
 """
@@ -19,11 +23,11 @@
 import numpy as np
 import torch
 
-from src.game.go_rules import GoBoard, SYMMETRIES
+from src.game.go_rules import GoBoard, SYMMETRIES, _check_n_channels
 
 
 class SupervisedDataset:
-    def __init__(self, data: dict):
+    def __init__(self, data: dict, n_channels: int = 12):
         """
         data 必须含：boards(int8), my_hist(int16), op_hist(int16),
                        ko(int16), moves(int16), values(int8), to_play(int8)
@@ -31,7 +35,20 @@ class SupervisedDataset:
                winrates(float32) — 连续胜率标签（手数比例软标签 D），优先于 values。
                game_weights(float32) — 每样本的游戏权重（SGF 元数据加权），用于加权采样。
         均为 shape=(N, ...) 的 numpy 数组，N 相同。
+
+        n_channels: 特征平面通道数，取 12..17 的前缀，**默认 12**。
+            - `12`：P4.3 之前的布局。旧调用点与旧数据因此**一个字节都不变**，
+              连 `feature_planes_batched` 的成本都不变（尾部 5 格直接不算，
+              不是「算了再切」—— 这条路径在 MCTS 每个叶子展开时都调）。
+            - `17`：v21 stem（`Conv3×3(17→184)`）需要的布局。新增的 5 格
+              （己方/对方眼位、双方块气=2、劫禁点掩码）**全部**从下面已有的
+              `boards` / `to_play` / `ko` 三列现算，npz **不需要**新增列
+              （键盘点见 P4.3 report）。
+        ⚬ 通道数必须在**数据侧与模型侧同时**改（`V21_CFG['in_channels']`），
+          只改一侧得到的是形状错或静默错值，不是零回归。
         """
+        _check_n_channels(n_channels)
+        self.n_channels = n_channels
         self.boards = data['boards']
         self.my_hist = data['my_hist']
         self.op_hist = data['op_hist']
@@ -52,7 +69,7 @@ class SupervisedDataset:
     def sample_batch_numpy(self, idxs, rng=None, augment=True):
         """
         给定样本下标，返回 numpy 版 (states, moves_out, values)：
-            states    : (B, 12, H, W) float32
+            states    : (B, n_channels, H, W) float32
             moves_out : (B,) int64
             values    : (B, 1) float32
 
@@ -60,6 +77,7 @@ class SupervisedDataset:
         torch 张量——供 MindSpore 训练脚本使用（910B 环境无 torch）。
         使用向量化批量特征构造（GoBoard.feature_planes_batched）+ 向量化对称增强，
         避免逐样本 Python 循环，训练吞吐显著更高。
+        `n_channels` 由构造参数决定（默认 12），`states` 的 C 轴恒等于它。
 
         rng: 可选随机源，供多线程预取时各线程使用独立 Generator，避免竞争全局
             np.random。为 None 时沿用全局 np.random（保持原行为）。**仅在
@@ -93,8 +111,11 @@ class SupervisedDataset:
             else:
                 tforms = rng.integers(0, 8, size=B)  # Generator 用 integers，非 randint
 
-        # 批量构造 12 通道特征（B,12,H,W）
-        states = GoBoard.feature_planes_batched(boards, my_h, op_h, to_play, ko)
+        # 批量构造特征（B, n_channels, H, W）；`n_channels` 直接下传而不是
+        # 「先造 17 通道再切前 12」—— 12 通道路径要连成本都零回归（MCTS 叶子
+        # 展开与训练预取都调这条路径）。
+        states = GoBoard.feature_planes_batched(boards, my_h, op_h, to_play, ko,
+                                                 n_channels=self.n_channels)
 
         if augment:
             # 向量化对称增强：8 种变换（4 旋转 × 2 镜像），与 SYMMETRIES 坐标变换严格对齐。

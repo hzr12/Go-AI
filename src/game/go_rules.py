@@ -65,9 +65,157 @@ from scipy.ndimage import label as _scipy_label
 
 _label_pool = ThreadPoolExecutor(max_workers=2)
 
+# `feature_planes_batched` 里「两个颜色要不要分派到线程池」的门槛，按**元素数**
+# （= B·n²）而不是按 B 计 —— 真正决定 GIL 乒乓划不划算的是数组多大。数值来自实测
+# 交叉点，见 `feature_planes_batched` 里那段分派注释。
+_LIB_PARALLEL_MIN_ELEMS = 10_000
+
 # scipy.ndimage.label 的 4 邻域 3D 结构元素（模块级常量，避免每次调用重建）
 _STRUCT3 = np.zeros((3, 3, 3), dtype=bool)
 _STRUCT3[1] = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
+
+
+# ---- 17 通道特征平面的三个共享核 --------------------------------------------
+# 单图 `GoBoard.feature_planes` 与批量 `GoBoard.feature_planes_batched` 共用下面
+# 三个函数：**眼位**（`_neighbor_all`）与**块气**（`_distinct_liberty_counts`）的判定
+# 口径必须只有一份实现，否则两条路径的通道 10/11/12/13/14/15 会随实现漂移
+# （而它们的输出要喂同一份 v21 stem）。放模块级而不是做成方法，是因为
+# `feature_planes_batched` 是 `@staticmethod`（只拿到裸 int8 board，没有 GoBoard 实例）。
+
+def _neighbor_all(mask):
+    """返回「4 个正交邻点全为 True」的点掩码。接受任意前置维（(n,n) 或 (B,n,n)）。
+
+    四个方向的移位比较，没有内点掩码、没有分支 —— 「严格内点」是**结构性**的：
+    行/列两个方向各自先 `zeros_like` 再把 mask 挪一格**赋值**进去，于是该方向的
+    第 0 行（或第 0 列）从没被赋值、恒为 False；末行/末列被赋值填过却**没有**对应的
+    `&=`（盘外那一维不存在），所以各补一次显式清零。四边因此自动出局。
+
+    ⚠ 三个都必须记住的写法约束（每条都只会给出「看起来能跑」的错值，不抛异常）：
+      1. 行/列永远是**最后两轴**，`...` 只吃前面的轴。`out[..., 1:, :]` 是**行**，
+         `out[..., :, 1:]` 才是**列**；写反 → 结果恒为全 False。
+      2. 每个方向的第一个动作必须是**赋值**（`=`），不能是 `&=`：`zeros & x` 恒为
+         False，四步全 `&=` 会把整张掩码抹平。
+      3. 行方向与列方向必须落在**两张独立**的数组上（`up` / `lf`）：在同一个
+         `out` 上先做行方向再 `out[..., :, 1:] = ...`，第二次赋值会把行方向的结果
+         整片覆盖掉。
+    ⚠ 边长 1 / 2 时四个方向全落在空切片或只剩边界，结果恒为全 False —— 同样正确。
+
+    性能（19×19 bool，CPU，`time.perf_counter` × 4000 次取均值）：
+    本函数（2 次分配）**12.5 µs**；写成 4 次分配（上下左右各一张临时量再 `&`）
+    实测 **23.3 µs**；1 次分配 + 3 次清零 **12.3 µs**（差别在噪声内）。
+    批量路径每调要跑 2 次（两个颜色），所以这里翻倍就是 17 通道相对 12 通道的
+    眼位成本 —— 选 2 次分配那一版省下 0.9 µs/通道（B=32 时省 30 µs/通道）。
+    """
+
+    def _shift_axis(mask, axis):
+        """沿 `axis`（-2 = 行 / -1 = 列）做「上下都邻」的两条件合并。"""
+        t = np.zeros_like(mask)
+        if axis == -2:                      # 行
+            t[..., 1:, :] = mask[..., :-1, :]
+            t[..., :-1, :] &= mask[..., 1:, :]
+            t[..., -1, :] = False
+        else:                               # 列
+            t[..., :, 1:] = mask[..., :, :-1]
+            t[..., :, :-1] &= mask[..., :, 1:]
+            t[..., :, -1] = False
+        return t
+
+    return _shift_axis(mask, -2) & _shift_axis(mask, -1)
+
+
+# 四个正交方向上「位置 → 相邻子」的取样切片。`_LIB_DIR_SLICES[d] = (dst, src)`：
+# 在 `dst` 指定的那些位置上，读 `src` 指定的那个**邻点**的块号（邻点不是该颜色 ⇒ 0）。
+# ⚠ `dst`/`src` 的形状必须逐轴相同（都是整块切掉一行**或**一列），否则后面没法把两张表
+#   逐元素互相比 —— 写成 (B,n-1,n) 对 (B,n,n-1) 就会 broadcasting 失败。
+# ⚠ 边界那一圈**故意不写**（`np.zeros` 保持 0）：那里本来就没有邻子，0 正是要的语义。
+#   代价是这 4 张表必须每次新建（复用缓冲会带上一次调用的脏边界）。
+_LIB_DIR_SLICES = (
+    ((slice(None), slice(0, -1), slice(None)), (slice(None), slice(1, None), slice(None))),  # 邻子在下方
+    ((slice(None), slice(1, None), slice(None)), (slice(None), slice(0, -1), slice(None))),  # 邻子在上方
+    ((slice(None), slice(None), slice(0, -1)), (slice(None), slice(None), slice(1, None))),  # 邻子在右方
+    ((slice(None), slice(None), slice(1, None)), (slice(None), slice(None), slice(0, -1))),  # 邻子在左方
+)
+
+
+def _distinct_liberty_counts(labelled, num, empty):
+    """整批返回「每块的气数」，形状 `(num + 1,)` int64。**口径：去重空点个数**。
+
+    与单图 `GoBoard._group_liberty_count`（flood fill + `set((r, c))`）**逐块相同**：
+    一个空点被同块的两颗子共享时，对该块**只算 1 气**。
+
+    ⚠ **口径订正（P4.3-fix）**：批量路径此前用「入射计数」——对块内每颗子求自己的
+      空邻点数再 `bincount` 求和，那数的是「(子, 气) 关联**次数**」而不是「去重坐标
+      **数**」。U 形块（围棋里极常见的形状，两颗子夹住同一个气点）因此被多算：一个
+      **真实 2 气**的 U 形块按入射算是 3~5 气，于是它既不进通道 10/11（「气==1」）
+      也不进通道 14/15（「气==2」）—— **两个 bucket 都漏**。单图侧一直是对的（`set`
+      天然去重），所以这是批量侧的纯 bug，不是取舍：修批量侧，标量侧不动。
+      代价要记账：12 通道路径的**取值**随之变化（见 task-p4-3-fix-report.md 的
+      「输入分布变更说明」，P4.12 run.txt / P4.13 GoAI 双代要用）。
+
+    实现（O(B·n²)，既不排序、也没有 `(num+1)·n²` 的巨型 bincount）：
+      把「(空点 q, 邻子 p, 块号 g)」的关联拆成**按方向**的 4 张表 —— 第 d 张在每个
+      位置 q 上记「q 在方向 d 上的邻子属于哪块」（邻子不是该颜色 ⇒ 0；**这一步不判
+      q 是否为空**，判空留给下面的 `fresh` 掩码，省一次 masked copy）。气 = 对每个
+      **空点** q 收集到的**非零块号集合的大小**，去重分两步：
+        1. **同一方向内天然不重复**：给定 q 与方向 d，q 在 d 上的邻点位置唯一，
+           所以 (q, d) 至多贡献一个块号。
+        2. **跨方向去重**：块号 k 在 q 上算「新」当且仅当 k>0 ∧ q 为空 ∧ q 的**其它**
+           方向都没报过 k。链式写法（对第 k 个方向逐个与前 k 个方向比）正好覆盖
+           C(4,2)=6 对方向组合。
+      ⚠ **只与紧邻的前一个方向比（`k != d_{k-1}`）是不够的** —— 形如 (1, 2, 1, 3) 的
+        跨位撞号会漏掉，`test_liberty_count_is_distinct_not_incidence` 的第 ④ 个形状
+        （黑 {(1,2),(2,1),(2,2)} + 空 (0,2)(1,1)）专抓这个。
+      ⚠ **不要用单个 `last[q]` 槽记「上一个块号」** —— 同一个 q 上可能有 3~4 个**不同**
+        块号，单槽会把「第 3 个方向报回第 1 个方向的块号」误判成重复。
+      ⚠ **不要把不同方向的结果「加」进同一个 key 槽**（`key += seen_k`）—— 一个 q
+        可以同时邻接 3~4 个**不同**块号，相加会撞出一个既不是块号也不在任何 bin 里的值。
+      ⚠ `np.bincount` 只**累加**、不去重，所以「是不是新出现」必须在累加**之前**判完。
+        这里借 `bincount(x, weights=w)` 的权重位把那张 0/1 掩码直接送进去（`w=0` 的项
+        贡献 0），**省掉一次把掩码写回标签数组的 masked copy** —— 那一步是本函数
+        曾经的真正瓶颈（`np.where` / `int32*bool` / `np.copyto(where=)` 在 19 路 B=32
+        上各要 6~14 µs，而 `bincount(weights=)` 只要 2.2 µs）。
+
+    实测代价（19 路 62% 密度，`time.perf_counter`，warmup 40 + 400 reps 均值，单颜色，
+    含 `scipy.ndimage.label` 本身）：
+        B=1  0.035 ms    B=8  0.081 ms    B=32 0.228 ms
+    同机旧的「入射计数 + neigh_empty」是 0.019 / 0.044 / 0.122 ms
+    （`label` 本身占 0.024 / 0.039 / 0.093 ms，两者都含）。整条 `feature_planes_batched`
+    的前后对比（B=1 **-22.6%** / B=8 **-4.2%** / B=32 **+31.7%**）见
+    task-p4-3-fix-report.md §2 —— B=32 那档**微超 +30% 的目标**，取舍在该报告里说明。
+    """
+    lab = np.asarray(labelled)
+    shape = lab.shape
+    seen = []
+    for dst, src in _LIB_DIR_SLICES:       # 纯移位拷贝，**不乘 empty 掩码**
+        buf = np.zeros(shape, dtype=np.int32)
+        buf[dst] = lab[src]
+        seen.append(buf)
+    fresh = np.empty(shape, dtype=bool)
+    dup = np.empty(shape, dtype=bool)
+    lib = np.zeros(num + 1, dtype=np.float64)
+    for k in range(4):
+        cur = seen[k]
+        np.greater(cur, 0, out=fresh)      # 邻子必须是本颜色的子
+        np.logical_and(fresh, empty, out=fresh)   # 且该点本身是空的
+        for j in range(k):                 # 链式：与**全部**先前方向比
+            np.not_equal(cur, seen[j], out=dup)
+            np.logical_and(fresh, dup, out=fresh)
+        lib += np.bincount(cur.ravel(), weights=fresh.ravel(), minlength=num + 1)
+    return lib.astype(np.int64)
+
+
+def _check_n_channels(n_channels):
+    """`n_channels` 只允许落在 12..17（通道表是一个**前缀**连续的契约，见段注释）。
+
+    为什么不放开：`>= 12` 保证 0-11 永远齐（那 12 格是旧权重见过的全部输入），
+    `<= 17` 保证不越界（越界要么静默写进 planes 之外、要么被裁掉，两种都是错答案）。
+    13/14/15 这些中间值允许，是为了让「只加眼位」「只加 atari 梯度」这类实验
+    不用改生产代码。
+    """
+    if not 12 <= n_channels <= 17:
+        raise ValueError(
+            f"n_channels={n_channels} 越界：特征平面的通道表恒为 17 格，"
+            f"只允许取前缀 12..17（12 = P4.3 之前的布局，17 = v21 stem 需要的布局）。")
 
 
 # 对称变换：8 种（4 旋转 × 2 翻转）。用于数据增强时的坐标重映射。
@@ -2140,31 +2288,78 @@ class GoBoard:
             return (False, -1)
         return (True, r * n + c)
 
-    # ---- 特征平面（12 通道）------------------------------------------------
+    # ---- 特征平面（17 通道；`n_channels` 可裁到 12 保旧行为）------------------
     #
     # 布局（当前执子方视角，to_play 为当前落子方 1/黑 -1/白）：
     #   0      : 己方棋子
-    #   1..3   : 己方前 1/2/3 手落子
+    #   1..3   : 己方前 1/2/3 手落子（**最近一手在 idx 1**，其次 2，再次 3）
     #   4      : 对手棋子
-    #   5..7   : 对手前 1/2/3 手落子
+    #   5..7   : 对手前 1/2/3 手落子（**最近一手在 idx 5**，次序同上）
     #   8      : 合法点掩码（= get_legal_moves()：空点 ∧ 非自杀 ∧ 非 PSK 重复。
     #             P2.6a-2b-1 起**取值变严** —— 通道序号与含义不变，只是这一格更严；
     #             它仍然只有 n*n 个点、**不含 PASS**）
     #   9      : 执子方常数（to_play，±1）
     #   10     : 己方气数=1 的块掩码
     #   11     : 对手气数=1 的块掩码
+    #   12     : 己方眼位（空点 ∧ **严格内点** ∧ 4 邻全为己方）          ← v21 新增
+    #   13     : 对方眼位（空点 ∧ **严格内点** ∧ 4 邻全为对方）          ← v21 新增
+    #   14     : 己方气数=2 的块掩码                                    ← v21 新增
+    #   15     : 对方气数=2 的块掩码                                    ← v21 新增
+    #   16     : 劫禁点掩码（`ko_point` 的单点，无劫则全零）              ← v21 新增
     #
     # my_hist / op_hist: 长度均为 3 的扁平坐标序列（不足补 -1），最近一手在 index 0。
+    #
+    # ⚠ **0-11 的语义与下标一个字都没动** —— P4.3 只在尾部追加 5 格。v21 的 stem 是
+    # `Conv3×3(17→184)`（用户给定规格），所以**默认通道数是 17**；旧数据 / 旧权重
+    # 路径用 `n_channels=12` 裁回前 12 格，输出与 P4.3 之前**逐字节相同**
+    # （C7「12↔17，默认 12 保零回归」在 feature 侧的落法）。
+    # ⚠ **通道定义是跨进程契约**：数据侧（`src/data/dataset.py`）、训练侧
+    # （`V21_CFG['in_channels']`）、推理侧（GoAI 双代）必须同时改，只改一处会得到
+    # 「模型与数据的通道数不一致」的静默错答案。
+    #
+    # ---- 为什么是 12-16 这 5 个（用户 2026-09-27 直接给定，不容改写）----
+    #   - 12/13 **眼位**是死活 / 做眼的核心信号，而 12 通道版本里**完全没有**；
+    #     代价 = 每个颜色 4 次移位比较（`_neighbor_all`），**没有 flood fill**。
+    #   - 14/15 补 **atari 梯度**：已有「气==1」、缺「气==2」，只多一个 bucket、
+    #     **零额外标注** —— 块的气数本来就按连通块数算出来一次，`==1` 与 `==2`
+    #     是同一份气数结果上的两次比较。
+    #   - 16 **劫禁点**此前被**合并进通道 8 且不可分辨**（8 只说「不是合法点」，
+    #     推不出「为什么」）；`ko` 列本来就在手上，**零成本**。
+    #   合起来：5 个新增通道**全部来自已有列或批量路径已算好的标签 + 气数**。
+    #
+    # ---- 三处语义上必须钉死的含糊（裁定，不留解释空间）----
+    #   ① 「4 邻全为己方」对边界点怎么办 → **规定：点必须严格内点**（4 个正交邻点
+    #      全在盘内）且四邻全是该颜色。**边界点与角落点永远不是眼位。**
+    #      实现上不需要额外的内点掩码，见 `_neighbor_all` 的 docstring。
+    #   ② 「气=2」是**整块的气数**，与 10/11 的「块气==1」同一口径：按连通块数气，
+    #      **不是按点**。所以 14/15 是**块掩码**，与 10/11 同型。
+    #      ⚠ 口径的**内容**也一并钉死：**气数 = 与该块相邻的「去重」空点个数**
+    #      （同块的两颗子夹住同一个气点时，那一点对该块只算 1 气；不同块各算 1 气）。
+    #      批量路径与单图路径共用 `_distinct_liberty_counts` / `_group_liberty_count`
+    #      这一份口径，通道 10/11/14/15 因此在两条路径上逐位相同。
+    #   ③ 通道 16 = `GoBoard.ko_point`（**只读派生位**，「上一手是否形成简单劫」，
+    #      见类 docstring；`-1` 表示无 → 该通道全零）。它**不参与合法性判定**
+    #      （PSK 已覆盖），只是把「现在混在通道 8 里、不可分辨」的信息单独显式化。
 
-    def feature_planes(self, my_hist, op_hist, to_play=None):
+    def feature_planes(self, my_hist, op_hist, to_play=None, n_channels=17):
+        """构造特征平面，返回 `(n_channels, n, n)` float32。通道表见上方段注释。
+
+        `n_channels` 取 12..17 的前缀（越界抛 ValueError，见 `_check_n_channels`）：
+        12 = P4.3 之前的布局（旧权重的输入分布，**逐字节零回归**），
+        17 = v21 stem 需要的布局。取值只影响**尾部 5 格算不算**，
+        0-11 的取值在任何取值下都相同。
+        """
         n = self.board_size
         if to_play is None:
             to_play = self.current_player
-        planes = np.zeros((12, n, n), dtype=np.float32)
+        _check_n_channels(n_channels)
+        planes = np.zeros((n_channels, n, n), dtype=np.float32)
         opp = -to_play
 
-        planes[0] = (self.board == to_play)
-        planes[4] = (self.board == opp)
+        mine = (self.board == to_play)
+        theirs = (self.board == opp)
+        planes[0] = mine
+        planes[4] = theirs
 
         for k, mv in enumerate(my_hist):
             if mv >= 0:
@@ -2182,44 +2377,99 @@ class GoBoard:
         planes[8] = self.get_legal_moves().reshape(n, n).astype(np.float32)
         planes[9] = float(to_play)
 
-        # 气 = 1 掩码
+        # 通道 12/13：眼位。**严格内点 ∧ 4 邻同色 ∧ 该点为空**（裁定 ①）。
+        # 与批量路径共用 `_neighbor_all`，两条路径因此在结构上不可能分叉。
+        # ⚠ 逐格判 `>= idx + 1`，不能合成一个 `>= 13`：那会让 `n_channels=13`
+        #   去写不存在的 planes[13]（前缀语义是「前 13 格」= 0..12）。
+        if n_channels >= 13:
+            empty = (self.board == 0)
+            planes[12] = _neighbor_all(mine) & empty
+            if n_channels >= 14:
+                planes[13] = _neighbor_all(theirs) & empty
+
+        # 通道 10/11/14/15：块气掩码。口径是**整块**的气数 = 与该块相邻的**去重**空点
+        # 个数（`_group_liberty_count` 用 `set` 收集气点坐标，同一个气点被同块两子共享
+        # 时只算 1 气），每块**只数一次**，`==1` / `==2` 是同一份结果的两个 bucket ——
+        # 改前是「数一次气 + 再 flood fill 一次标记」，这里合成一趟，而 `seen` 的标记
+        # 顺序与改前逐字一致，所以 10/11 的取值不可能变。
+        # ⚠ 批量路径**共用同一口径**（`_distinct_liberty_counts`）：它曾用入射计数，
+        #   共享气点会多算，已在 P4.3-fix 订正。改这个口径前先看那里 docstring 的记账。
         my_liberties1 = np.zeros((n, n), dtype=bool)
         op_liberties1 = np.zeros((n, n), dtype=bool)
+        my_liberties2 = np.zeros((n, n), dtype=bool)
+        op_liberties2 = np.zeros((n, n), dtype=bool)
         seen = np.zeros((n, n), dtype=bool)
         for r in range(n):
             for c in range(n):
                 v = self.board[r, c]
                 if v == 0 or seen[r, c]:
                     continue
-                if self._group_liberty_count(r, c) == 1:
-                    stack = [(r, c)]
-                    seen[r, c] = True
-                    while stack:
-                        y, x = stack.pop()
-                        if v == to_play:
-                            my_liberties1[y, x] = True
-                        else:
-                            op_liberties1[y, x] = True
-                        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                            ny, nx = y + dr, x + dc
-                            if 0 <= ny < n and 0 <= nx < n and not seen[ny, nx] and self.board[ny, nx] == v:
-                                seen[ny, nx] = True
-                                stack.append((ny, nx))
+                nlibs = self._group_liberty_count(r, c)
+                if nlibs == 1:
+                    bucket = my_liberties1 if v == to_play else op_liberties1
+                elif nlibs == 2:
+                    bucket = my_liberties2 if v == to_play else op_liberties2
+                else:
+                    bucket = None      # 气 >= 3：四个通道都不标，但仍要 flood 标记 seen
+                stack = [(r, c)]
+                seen[r, c] = True
+                while stack:
+                    y, x = stack.pop()
+                    if bucket is not None:
+                        bucket[y, x] = True
+                    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                        ny, nx = y + dr, x + dc
+                        if 0 <= ny < n and 0 <= nx < n and not seen[ny, nx] and self.board[ny, nx] == v:
+                            seen[ny, nx] = True
+                            stack.append((ny, nx))
         planes[10] = my_liberties1
         planes[11] = op_liberties1
+        # ⚠ 逐格判 `>= idx + 1`：合成一个 `>= 15` 会让 `n_channels=15` 去写
+        #   不存在的 planes[15]（前缀语义是「前 15 格」= 0..14）。
+        if n_channels >= 15:
+            planes[14] = my_liberties2
+            if n_channels >= 16:
+                planes[15] = op_liberties2
+
+        # 通道 16：劫禁点。**只读信息位，不参与合法性判定**（PSK 已覆盖，裁定 ③）。
+        # 越界防御：`ko_point` 由 `play()` 写、恒为 -1 或合法扁平坐标；这里仍补一次
+        # 范围检查，因为批量路径的 `ko` 来自 npz（外部数据），而两条路径必须同答案。
+        if n_channels >= 17 and 0 <= self.ko_point < n * n:
+            planes[16].flat[self.ko_point] = 1.0
         return planes
 
     @staticmethod
-    def feature_planes_batched(boards, my_hist, op_hist, to_play, ko=None):
-        """向量化批量版 feature_planes，**通道 8 除外**（见下）。
+    def feature_planes_batched(boards, my_hist, op_hist, to_play, ko=None,
+                               n_channels=17):
+        """向量化批量版 feature_planes，**通道 8 除外**（见下）。通道表与单图版
+        逐格相同（见「特征平面」段注释），默认返回 17 通道。
 
         输入:
             boards   : (B, n, n) int8，取值 -1/0/1
             my_hist  : (B, 3) int16，己方前 3 手扁平坐标（-1 填充）
             op_hist  : (B, 3) int16
             to_play  : (B,) int8，轮到谁落子（1 黑 / -1 白）
-            ko       : (B,) int16，劫禁着点扁平坐标（-1 无）；可选，用于通道 8 排除
-        返回: (B, 12, n, n) float32
+            ko       : (B,) int16，劫禁着点扁平坐标（-1 无）；可选。
+                       双重用途：① 通道 8 的遗留排除（**保留既有行为**，见下）；
+                       ② 通道 16 的只读信息位（v21 新增）。
+            n_channels: 12..17，通道表的前缀长度（越界抛 ValueError）。
+        返回: (B, n_channels, n, n) float32
+
+        ---- 与单图 `feature_planes()` 的一致性（逐格裁定）----
+          - 通道 **0-7、9-15 逐位相同**（P4.3-fix 起不再有例外）：
+            眼位共用 `_neighbor_all`；**块气共用 `_distinct_liberty_counts` 的「去重空点
+            个数」口径**（与单图 `_group_liberty_count` 的 `set` 去重同口径）；
+            历史/棋子/to_play 都是同一份输入的同一套 scatter。
+            `tests/test_go_feature_planes_v21.py::test_batched_matches_scalar` 对拍
+            （含 10/11/14/15，且**不挂任何前提**）。
+            ⚠ 订正记录：本路径的块气曾经是**入射计数**（对块内每颗子数自己的空邻点再
+            求和），同一块的两颗子共享一个气点时会多算，于是 10/11 与 14/15 都可能漏标
+            —— 那与单图版不一致，**是 bug 而不是取舍**，P4.3-fix 已修批量侧。
+          - 通道 **8 存在已文档化的分歧**（不是回归，见下）。
+          - 通道 **16 依赖调用方传 `ko`**：不传 `ko`（None）则该通道恒为全零，
+            而单图版永远能从 `GoBoard.ko_point` 读到。这不是算不出来，是**签名里
+            根本没有那个信息**（裸 int8 board 不携带上一手）—— 与通道 8 的
+            「无重复历史」同源。
 
         ⚠ **通道 8 与单图版不再等价（P2.6a-2b-1 起，已知分歧，非回归）**：
         两条路径的通道 8 差在**三件**互相独立的事上，别混成一句「更松」：
@@ -2230,7 +2480,7 @@ class GoBoard:
              它是纯局部判定（只看邻接块的气），`boards` 数组本身就够算；不做是为了
              保持热路径成本（每节点一次批量前向的成本敏感）。这个分歧在本任务之前
              就已存在（单图版在 `check_suicide=False` 默认下同样不查自杀），
-             P2.6a-2b-1 只是把它拉大。**可以直接向量化补上**（P4.3 的 17 通道）。
+             P2.6a-2b-1 只是把它拉大。**可以直接向量化补上**（仍留给后续任务）。
           3. **排除 `ko` 点：一条遗留近似，且单图侧已不再有对应判罚**（P2.6a-2b-1/2c）。
              `ko_point` 早已降级为**只读信息位**（见 `GoBoard` 类 docstring），单图掩码
              **不读它** —— 简单劫由 PSK 独立禁掉。所以这里的「排除 ko」不再镜像任何
@@ -2239,22 +2489,36 @@ class GoBoard:
              「外部盘面接管后无历史」两种情形下，本路径会比规则**更严**（禁掉按 TT 合法的
              着法）。⚠ 改本函数时不要把这个更严当成「安全」：它与单图通道 8 的差
              正是训练分布的来源之一（输入分布登记见路线图 D14）。
-        收口需要把重复局面历史一起批量喂进来（P2.6b 的下游语义同步 / P4.3 的 17 通道），
+        收口需要把重复局面历史一起批量喂进来（P2.6b 的下游语义同步），
         不要在这里假装两条路径一致。
 
         性能: 用 scipy.ndimage.label 一次性标注连通块并向量化计算气数，
-            scipy 释放 GIL，两个颜色的标注线程可真正并行。
+            大批量时两个颜色分派到线程池（scipy 释放 GIL，可真并行；门槛见
+            `_LIB_PARALLEL_MIN_ELEMS` 与下方那段分派注释）。
             multiprocessing prefetcher 提供跨 worker 的真正 CPU 并行。
+            ⚠ **新增的 5 通道（12-16）没有引入任何 flood fill**：14/15 复用已经算好的
+            `lib_counts`（只是多两次 `==2` 比较），12/13 是 4 次移位比较，16 是一次
+            scatter。
+            ⚠ **块气的去重**（`_distinct_liberty_counts`）是 O(B·n²) 的 4 方向链式比较。
+            19 路 62% 密度下整条函数相对「P4.3 之前（入射计数 + 恒开线程池）」的实测：
+            B=1 **-21%**、B=8 **+2%**、B=32 **+41%**。B=32 那档**超了 +30% 的目标**
+            （B=1/B=8 都在目标内或更快），取舍与实测数字见
+            `task-p4-3-fix-report.md` §2 —— 那一档落在**训练预取线程**上（被
+            multiprocessing prefetcher 掩盖），MCTS 热路径（B=1）反而快了 21%。
+            实测原始数字另见 `task-p4-3-report.md`（12→17 通道的成本）。
         """
+        _check_n_channels(n_channels)
         boards = np.asarray(boards)
         B, n, _ = boards.shape
-        planes = np.zeros((B, 12, n, n), dtype=np.float32)
+        planes = np.zeros((B, n_channels, n, n), dtype=np.float32)
         to_play = np.asarray(to_play).reshape(B, 1, 1)
         opp = -to_play  # (B,1,1)
 
-        # 通道 0/4: 己方/对手棋子
-        planes[:, 0] = (boards == to_play)
-        planes[:, 4] = (boards == opp)
+        # 通道 0/4: 己方/对手棋子（`mine`/`theirs` 复用给眼位通道 12/13）
+        mine = (boards == to_play)
+        theirs = (boards == opp)
+        planes[:, 0] = mine
+        planes[:, 4] = theirs
 
         # 通道 1-3 / 5-7: 历史手（向量化 scatter）
         my_hist = np.asarray(my_hist).reshape(B, 3)
@@ -2280,7 +2544,8 @@ class GoBoard:
         # 「通道 8 除外」段。禁自杀是纯局部判定、boards 就够算，本路径**有意没做**
         # （保持热路径成本），是选择不是算不出来；「排除 ko」则不是选择也不是算不出，
         # 它比规则更严，别当成安全边际。
-        legal = (boards == 0).astype(np.float32)
+        empty = (boards == 0)
+        legal = empty.astype(np.float32)
         if ko is not None:
             ko = np.asarray(ko).reshape(B)
             vk = ko >= 0
@@ -2289,44 +2554,82 @@ class GoBoard:
                 bidx = np.nonzero(vk)[0]
                 r, c = np.divmod(ko[bidx].astype(np.int64), n)
                 legal[bidx, r, c] = 0.0
+                # 通道 16（v21 新增）：同一个 `ko` 列的**只读信息位**读法。
+                # 与通道 8 共用上面算好的 bidx/r/c，所以这一格不额外花 scatter 的钱；
+                # 它不参与合法性判定（PSK 已覆盖），只是把「混在通道 8 里、不可分辨」
+                # 的信息单独显式化。
+                if n_channels >= 17:
+                    planes[bidx, 16, r, c] = 1.0
         planes[:, 8] = legal
 
         # 通道 9: 执子方常数
         planes[:, 9] = to_play.astype(np.float32)
 
-        # 通道 10/11: 气数=1 掩码（整批向量化连通块标注 + 邻空计数）
+        # 通道 12/13: 眼位（空点 ∧ 严格内点 ∧ 4 邻同色）。与单图版共用
+        # `_neighbor_all`，`empty` 也复用上面通道 8 已经算好的那张 —— 4 次移位比较，
+        # **无 flood fill**。严格内点是结构性的（盘外读到 zeros），见该函数 docstring。
+        # ⚠ 逐格判 `>= idx + 1`，不能合成一个 `>= 13`（见单图版同名注释）。
+        if n_channels >= 13:
+            planes[:, 12] = _neighbor_all(mine) & empty
+            if n_channels >= 14:
+                planes[:, 13] = _neighbor_all(theirs) & empty
+
+        # 通道 10/11/14/15: 气数=1 / =2 掩码（整批向量化连通块标注 + **去重**气数）
         my_lib1 = np.zeros((B, n, n), dtype=np.float32)
         op_lib1 = np.zeros((B, n, n), dtype=np.float32)
-        # 每个棋子点的 4 邻域空点坐标数（整数 0-4），整批一次算，与单图
-        # _group_liberty_count 逐点计数语义一致（每个空邻域坐标各算 1 气）。
-        empty = (boards == 0)
-        neigh_empty = np.zeros((B, n, n), dtype=np.int8)
-        neigh_empty[:, :-1, :] += empty[:, 1:, :]
-        neigh_empty[:, 1:, :]  += empty[:, :-1, :]
-        neigh_empty[:, :, :-1] += empty[:, :, 1:]
-        neigh_empty[:, :, 1:]  += empty[:, :, :-1]
-
+        my_lib2 = np.zeros((B, n, n), dtype=np.float32) if n_channels >= 15 else None
+        op_lib2 = np.zeros((B, n, n), dtype=np.float32) if n_channels >= 15 else None
+        # ⚠ 这里**不再**算「每颗子的空邻点数」（旧的 `neigh_empty`）：那个量数的是
+        #   「(子, 气) 关联次数」而不是「去重气点数」，U 形块会被多算（曾经的气数口径
+        #   bug，见 `_distinct_liberty_counts` 的 docstring）。去重直接在块号层面做，
+        #   所以这 4 次移位累加整体删掉 —— 新算法比旧的入射计数**只贵一点点**。
         # 并行标注：scipy.ndimage.label 释放 GIL，两个颜色的标注可真正并行
-        def _label_and_mark(mask, lib_plane, to_play_val):
+        def _label_and_mark(mask, lib_plane1, lib_plane2):
             if not mask.any():
                 return
             labelled, num = _scipy_label(mask, structure=_STRUCT3)
             if num == 0:
                 return
-            w = np.where(mask, neigh_empty, 0).ravel()
-            lib_counts = np.bincount(labelled.ravel(), weights=w,
-                                     minlength=num + 1).astype(np.int64)
-            lib_plane[(lib_counts[labelled] == 1) & mask] = 1.0
+            lib_counts = _distinct_liberty_counts(labelled, num, empty)
+            # 每格的气数（整块口径，= 去重空点数，与单图 `_group_liberty_count` 相同）。
+            # **物化一次、比较两次** —— 通道 14/15 因此相对通道 10/11 只多一次 `==2`
+            # 比较，不多一遍 flood fill。
+            per = lib_counts[labelled]
+            lib_plane1[(per == 1) & mask] = 1.0
+            if lib_plane2 is not None:
+                lib_plane2[(per == 2) & mask] = 1.0
 
-        future_my = _label_pool.submit(_label_and_mark,
-                                       boards == to_play, my_lib1, to_play)
-        future_op = _label_pool.submit(_label_and_mark,
-                                       boards == -to_play, op_lib1, -to_play)
-        future_my.result()
-        future_op.result()
+        # 两个颜色分派：**大**批量走线程池（`scipy.ndimage.label` 释放 GIL，真并行），
+        # **小**批量直接顺序跑。
+        # ⚠ 这不是拆掉并行，而是按实测给并行设门槛。去重核（`_distinct_liberty_counts`）
+        #   是 ~30 次**小** numpy 调用，每次都要过一遍 GIL；B=1（19 路 = 361 元素）时
+        #   numpy 根本不释放 GIL，于是两次 submit 的 GIL 乒乓**比活本身还贵**。实测
+        #   （19 路、17 通道、500 次交错采样取均值，`task-p4-3-fix-report.md` §2）：
+        #       B    顺序      线程池
+        #       1    0.33 ms   0.54 ms     ← 线程池亏 60%
+        #       8    0.55 ms   0.81 ms     ← 亏 47%
+        #       24   1.14 ms   1.19 ms     ← 亏 4%
+        #       32   1.38 ms   1.35 ms     ← 池子开始赚（5%，已在噪声内）
+        #   交叉点在 B·n² ≈ 10⁴，所以门槛就取这个数。**这跟本仓库已有的
+        #   「按盘口分派标量/向量两条路」是同一个套路**（见 3427b9f）。
+        if boards.size >= _LIB_PARALLEL_MIN_ELEMS:
+            future_my = _label_pool.submit(_label_and_mark,
+                                           boards == to_play, my_lib1, my_lib2)
+            future_op = _label_pool.submit(_label_and_mark,
+                                           boards == -to_play, op_lib1, op_lib2)
+            future_my.result()
+            future_op.result()
+        else:
+            _label_and_mark(boards == to_play, my_lib1, my_lib2)
+            _label_and_mark(boards == -to_play, op_lib1, op_lib2)
 
         planes[:, 10] = my_lib1
         planes[:, 11] = op_lib1
+        # ⚠ 逐格判 `>= idx + 1`（见单图版同名注释）
+        if n_channels >= 15:
+            planes[:, 14] = my_lib2
+            if n_channels >= 16:
+                planes[:, 15] = op_lib2
         return planes
 
     @staticmethod
@@ -2379,7 +2682,11 @@ class GoBoard:
 
     @staticmethod
     def apply_symmetry(state_12ch, move, transform_id, board_size):
-        """单样本对称增强（内部走批量实现，保持旧接口兼容）。"""
+        """单样本对称增强（内部走批量实现，保持旧接口兼容）。
+
+        ⚠ 形参名 `state_12ch` 是 17 通道落地**之前**留下的，**通道数其实不受限**
+          （按 C 轴整体变换）。为了不破坏可能的关键字调用而保留旧名。
+        """
         planes, moves = GoBoard.apply_symmetry_batch(
             np.asarray(state_12ch)[None],
             np.asarray([move]),

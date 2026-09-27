@@ -157,11 +157,18 @@ def _make_dataset(n=len(SAMPLE_MOVES)):
 
 
 def _raw_features(ds, idxs):
-    """直接调 `GoBoard.feature_planes_batched` 拿原始 12 通道特征（独立参照系）。"""
+    """直接调 `GoBoard.feature_planes_batched` 拿原始 12 通道（不经增强）的输入。
+
+    ⚠ `n_channels=12` 是**显式钉住**的：P4.3 起该函数默认 17 通道（v21 stem 的
+      布局），而本文件守的是 P2.3「评估期不施加增强」的语义、输入侧固定是旧
+      12 通道布局（`_ASYM_WEIGHTS` 也是 12 维）。不钉住这里会与 dataset 的
+      默认 12 通道失配。本文件**不测**通道数本身 —— 那是
+      `tests/test_go_feature_planes_v21.py` 的职责。
+    """
     idxs = np.asarray(idxs)
     return GoBoard.feature_planes_batched(ds.boards[idxs], ds.my_hist[idxs],
                                           ds.op_hist[idxs], ds.to_play[idxs],
-                                          ds.ko[idxs])
+                                          ds.ko[idxs], n_channels=12)
 
 
 def _expected_moves(ds, idxs):

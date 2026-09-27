@@ -189,7 +189,13 @@ class MCTS:
         return list(h)
 
     def _planes1(self, board, my_hist, op_hist, to_play):
-        """单局面 12 通道特征，带 LRU + TTL 缓存（相同局面复用）。"""
+        """单局面 12 通道特征，带 LRU + TTL 缓存（相同局面复用）。
+
+        ⚠ P4.3 起 `feature_planes*` 的默认通道数是 17（v21 stem 需要的布局），而
+          MCTS 推的仍是 `in_channels=12` 的旧权重，所以此处**显式钉住 12** ——
+          不钉的话这里会静默产出 17 格并在 `predict_batch` 的前向里炸形状。
+          GoAI 双代落地后（P4.8/4.16）这一格改由权重形状推断的值驱动。
+        """
         # 缓存 key: 棋盘 hash + to_play（哈希 numpy 数组的 bytes）
         h_key = tuple(my_hist) if not my_hist or isinstance(my_hist[0], int) else tuple(tuple(h) for h in my_hist)
         oh_key = tuple(op_hist) if not op_hist or isinstance(op_hist[0], int) else tuple(tuple(h) for h in op_hist)
@@ -206,7 +212,7 @@ class MCTS:
                 self._plane_cache_ts.pop(cache_key, None)
         planes = board.feature_planes_batched(
             board.board[None], [list(my_hist)], [list(op_hist)],
-            [to_play], [board.ko_point])[0]
+            [to_play], [board.ko_point], n_channels=12)[0]
         # LRU: 超过上限时淘汰一半
         if len(self._plane_cache) >= self._plane_cache_max:
             keys = list(self._plane_cache.keys())
@@ -240,6 +246,7 @@ class MCTS:
 
         一次性组装整批 12 通道特征 + 单次 predict，最大化 CPU/ONNX 吞吐
         （替代 predict_batch 逐子建特征 + 碎片化单图前向）。
+        ⚠ 12 通道是**显式钉住**的（旧权重的输入分布，理由同 `_planes1`）。
         """
         if not nodes:
             return np.zeros((0, self.n_actions)), np.zeros(0)
@@ -248,7 +255,8 @@ class MCTS:
         op_hs = [n[2] for n in nodes]
         tps = [n[3] for n in nodes]
         kos = [n[0].ko_point for n in nodes]
-        planes = nodes[0][0].feature_planes_batched(arrays, my_hs, op_hs, tps, kos)
+        planes = nodes[0][0].feature_planes_batched(arrays, my_hs, op_hs, tps, kos,
+                                                    n_channels=12)
         states = [(None, my_hs[i], op_hs[i], tps[i], planes[i])
                   for i in range(len(nodes))]
         return self.ai.predict_batch(states)
@@ -420,9 +428,9 @@ class MCTS:
 
         if not child_meta:
             return []
-        # 向量化一次性构造整批子节点特征
+        # 向量化一次性构造整批子节点特征（12 通道 = 旧权重布局，显式钉住）
         planes_batch = board.feature_planes_batched(
-            np.stack(child_boards), my_hs, op_hs, to_plays, kos)
+            np.stack(child_boards), my_hs, op_hs, to_plays, kos, n_channels=12)
         states = [(None, list(mh), list(oh), ct, planes_batch[i])
                   for i, (mv, ct, mh, oh, rv) in enumerate(child_meta)]
         policies, values = self.ai.predict_batch(states)
@@ -886,7 +894,7 @@ class MCTS:
                         planes = pb.feature_planes_batched(
                             pb.board[None], [list(prefetch_leaf.my_hist)],
                             [list(prefetch_leaf.op_hist)], [prefetch_leaf.to_play],
-                            [pb.ko_point])[0]
+                            [pb.ko_point], n_channels=12)[0]
                         pol, val = self.ai.predict_batch(
                             [(None, list(prefetch_leaf.my_hist),
                               list(prefetch_leaf.op_hist),

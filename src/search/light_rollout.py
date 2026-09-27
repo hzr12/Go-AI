@@ -93,9 +93,13 @@ class FastPolicy:
         logit = np.where(legal, logit, np.float32(-1e9)).astype(np.float32)
         if self.weights is not None:
             # 仅在显式提供线性权重时才计算完整特征（默认 FastPolicy 不触发）
+            # ⚠ `n_channels=12` 与下面的 `reshape(12, -1)` / `weights.shape[0] == 12`
+            #   是同一个契约的三个面：P4.3 起 feature_planes* 默认 17 通道，而
+            #   FastPolicy 的权重向量是 12 维的旧布局。三个面必须一起改。
             fp = board.feature_planes_batched(
                 b[None], [[-1, -1, -3]], [[-1, -1, -3]],
-                [abs(board.current_player)], [board.ko_point]).reshape(12, -1)
+                [abs(board.current_player)], [board.ko_point],
+                n_channels=12).reshape(12, -1)
             if self.weights.ndim == 1 and self.weights.shape[0] == 12:
                 logit = logit + np.tensordot(self.weights, fp, axes=([0], [0])).reshape(-1).astype(np.float32)
         # 追加 pass 着法（索引 n*n），logit=0

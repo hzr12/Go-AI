@@ -189,9 +189,13 @@ def self_play_game(ai, board_size, sims, max_moves, temperature,
             board, hists[0], hists[1], to_play,
             simulations=sims, path_moves=path_moves)
         # 记录训练样本
+        # ⚠ n_channels=12：自对弈采集的 buffer 喂 `in_channels=12` 的旧模型（见
+        #   train_sft.py 的构造）。P4.3 起 feature_planes* 默认 17 通道，不显式钉住
+        #   会让 buffer 里的 planes 与模型 in_channels 不匹配（形状错，不是静默错值）。
+        #   ⚠ v21 训练要 17 通道时**这一格必须同步切**（P4.2/P4.8 的遗留项）。
         planes = np.ascontiguousarray(board.feature_planes_batched(
             board.board[None], [list(hists[0])], [list(hists[1])],
-            [to_play], [board.ko_point])[0])
+            [to_play], [board.ko_point], n_channels=12)[0])
         vt = np.zeros(n_actions)
         vs = visits.sum()
         if vs > 0:
