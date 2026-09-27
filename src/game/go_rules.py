@@ -149,6 +149,22 @@ def _zobrist_key(r: int, c: int, color: int) -> int:
 _NB4 = ((-1, 0), (1, 0), (0, -1), (0, 1))
 
 
+def _groups_desync_error(r, c):
+    """棋块/气表与盘面脱钩时的异常（就地改写 board 却没 resync_hash 的后果）。
+
+    P2.7a 之前这个契约违反**不抛**：查气走的是 flood fill，它直接读活盘面，
+    所以只有 PSK 那一半用的是陈旧哈希。改成查表之后，一颗没有块号的棋子会变成
+    `KeyError: -1` —— 对调用者毫无信息量。这里换成人话，并说清怎么修。
+
+    守卫是热路径上每次查表前的一次整数比较（`g < 0`），只在**真的脱钩**时才
+    走到构造异常那条路。
+    """
+    return RuntimeError(
+        f"棋块/气表与盘面脱钩：({r},{c}) 上有棋子却没有块号。"
+        "直接就地改写 board.board 之后必须调 resync_hash()"
+        "（见 GoBoard 类 docstring 的「局面状态字段的读写契约」）。")
+
+
 class _PassSlot:
     """`GoBoard.PASS` 的描述符：PASS 的动作值恒等于 `board_size * board_size`。
 
@@ -320,7 +336,8 @@ class GoBoard:
         nb._groups = dict(self._groups) if self._groups is not None else None
         nb._gid = self._gid.copy() if self._gid is not None else None
         nb._groups_valid = self._groups_valid
-        nb._group_undo = []      # 克隆体的撤销栈从空开始（与 _undo_stack 一致）
+        # 克隆体的撤销栈从空开始，所以「未记录落子」的计数也从 0 起算
+        nb._unrecorded_seq = 0
         nb._zobrist = self._zobrist
         nb._pos_zobrist = self._pos_zobrist
         # 哈希所对应的盘面对象 = 克隆体**自己**的 board 数组（否则 hash() 会把它
@@ -355,6 +372,9 @@ class GoBoard:
              判定只用邻接棋块的气数，见下面「自杀判定的等价变形」；
           3. **位置超级劫（PSK）** = TT 规则 6：落子后的染色若命中历史集合则非法。
 
+        P2.7a 起第 2 条走**增量棋块/气表**（O(1) 查气）而不是对邻块做 flood fill；
+        第 3 条的两段式与临时落子的历史见下面那段说明。
+
         **顺序：先禁自杀，再判 PSK。** 这是正确性要求而不是性能偏好：
         `position_hash_after_move()` 内部会**临时写 `self.board[r, c]`** 来推演提子，
         所以绝不能在「盘上已经放了子」的状态里调它。自杀点压根没有「落子后的染色」，
@@ -386,6 +406,8 @@ class GoBoard:
              不提子就没有别的染色变化，而 position 键只含棋盘染色（连行棋方翻转都
              不影响），所以 `position_hash() ^ _zobrist_key(r, c, color)` 就是候选键 ——
              **O(1)，不动棋盘**；
+             （P2.7a 之前这条也是「不动棋盘」的，但**提子**那一支要靠
+             `position_hash_after_move()` 临时落子再还原；现在那一支也不落子了。）
           3. **提子**的候选才走 `position_hash_after_move(mv)` 的完整推演（数量极少）；
           4. 命中历史 → 该点置 False。
         ⚠ **不许**用「只有提子才可能违反 PSK」这种剪枝：提子与否与「是否复现历史染色」
@@ -431,7 +453,7 @@ class GoBoard:
             # 掩码 2.53 ms → 0.26 ms（10x），而 tolist() 本身只要 0.003 ms。
             # 掩码是热路径（MCTS 每个展开节点、自对弈每手都要），这个便宜必须占。
             # 快照与 numpy 数组在本方法内**始终一致**：扫描过程不写盘，而
-            # position_hash_after_move() 的临时落子会立刻还原（它读的是 self.board）。
+            # position_hash_after_move() 只读盘面（P2.7a 起它连临时落子都没有了）。
             board = self.board.tolist()
             # 局部绑定：热循环里逐候选调用，属性查找与 _ensure_hash 的重复调用都省掉。
             # PSK 历史集合与 position 键在整轮扫描里不变（扫描不写盘、不换行棋方），
@@ -445,6 +467,7 @@ class GoBoard:
             self._ensure_groups()
             gids = self._gid.tolist()
             groups = self._groups
+            excl = self._libs_excluding_count
             zkey = _zobrist_key
 
             for i in np.flatnonzero(legal).tolist():
@@ -464,8 +487,10 @@ class GoBoard:
                         # 落点此刻是空点 -> 它必然在这个邻块的气里，于是
                         # 「除落点外的气数」一个整数就同时回答己方（非自杀）
                         # 与敌方（提子）两个问题。
-                        libs = groups[gids[nr][nc]][1]
-                        rest = len(libs) - (1 if i in libs else 0)
+                        g = gids[nr][nc]
+                        if g < 0:
+                            raise _groups_desync_error(nr, nc)
+                        rest = excl(groups[g][1], i)
                         if v == color:
                             if rest > 0:
                                 liberty = True
@@ -680,9 +705,12 @@ class GoBoard:
         本方法**不读** `_legal_cache`：复用缓存当然更快，但那样「绝不物化全掩码」
         这条保证就只在缓存冷时成立（依赖调用顺序），而本方法的成本模型要的是
         「与 n² 无关」这个无条件性质。⚠ 这条性质有个前提：表在 adopt 之后是失效的，
-        第一次调用要付一次 O(n²) 重建（19 路 0.7 ms，**每局一次**）—— 那次重建
-        由 `_ensure_hash()` 触发的采纳一并决定，不在本方法的 O(1) 承诺之内，
+        第一次调用要付一次 O(n²) 重建（19 路 0.7 ms，正常对局**每局一次**）——
+        那次重建由 `_ensure_hash()` 触发的采纳一并决定，不在本方法的 O(1) 承诺之内，
         因为它属于「换盘面」这个显式动作，而不是「问一个点」。
+        ⚠ 同一节开头那句「就地改写 board 后 `is_legal` 才是对的那个」在本表之后要补
+        一个前提：违反契约现在会**抛** `RuntimeError`（`_groups_desync_error`）而不是
+        给答案 —— 查表需要块号，而陈旧表里没有。修法不变：`resync_hash()`。
 
         ⚠ **`-1` 在动作空间里越界**，所以 `is_legal(-1) is False`；而 `play(-1)`
           是**合法**的 pass（棋盘方言）。两者**不可比**，别拿本方法的返回值去预判
@@ -719,8 +747,8 @@ class GoBoard:
         # np.int8 同义，查表也只做整数比较），所以**别顺手「对齐」**。
         # P2.7a：气的查询走增量表（O(1) 查表，不做 flood fill）。
         # ⚠ 「与 n² 无关」这条对外承诺**照样成立**：`_ensure_groups()` 只在表
-        # 失效时（即 adopt 之后）才重建，而重建是 O(n²) 但**每局一次**；
-        # 稳态下本方法只碰 <=4 个邻点。
+        # 失效时才重建（adopt 之后，或撤销链被 record=False 打断之后），
+        # 而重建是 O(n²) 但通常一局只发生一次；稳态下本方法只碰 <=4 个邻点。
         self._ensure_groups()
         groups = self._groups
         gid_of = self._gid
@@ -735,8 +763,10 @@ class GoBoard:
             if v == 0:
                 liberty = True               # 落点自身的气
                 continue
-            libs = groups[int(gid_of[nr, nc])][1]
-            rest = len(libs) - (1 if action in libs else 0)
+            g = int(gid_of[nr, nc])
+            if g < 0:
+                raise _groups_desync_error(nr, nc)
+            rest = self._libs_excluding_count(groups[g][1], action)
             if v == color:
                 if rest > 0:                 # 同色邻块除落点外还有气
                     liberty = True
@@ -936,11 +966,11 @@ class GoBoard:
 
         因为块的值是**不可变元组**，「换回去」只是换引用，不需要任何拷贝 ——
         这就是撤销记录能只存旧值的原因。
+
+        ⚠ **只在记录可信时调**（判据在 `undo()` 里）：`play(record=False)` 落子
+        会打断「撤销 = 回退一手」的前提（这是**哈希那边早就存在**的同一条限制，
+        本表只是继承了它），此时旧记录描述的已经不是当前表，必须改成作废重建。
         """
-        if record is None:
-            # 没有记录（例如表当时是失效的）：宁可作废等重建，也绝不留在错的状态。
-            self._groups_valid = False
-            return
         old_values, points, old_gids, _new_gids = record
         for g, val in old_values.items():
             if val is None:
@@ -1181,13 +1211,13 @@ class GoBoard:
         self._undo_stack = []
         self._legal_cache = None
         # 棋块/气表（P2.7a）同样作废：这张表是**增量维护**的，旧表属于旧盘面。
-        # ⚠ 这里**不**单独清 `_group_undo`：它与 `_undo_stack` 同生共死（一次 play
-        # 推一条、一次 undo 弹一条），而上面刚把 `_undo_stack` 清空，旧记录因此
-        # **无处可寻、天然作废** —— 不需要第二处真相源。
+        # ⚠ 撤销记录**不存在第二条栈**：它就存放在 `_undo_stack` 的每一项里
+        #   （第 6 个元素），而上面刚把 `_undo_stack` 清空，旧记录因此无处可寻、
+        #   天然作废 —— 不需要第二处生命周期，也就不可能出现两条栈错位。
         self._groups = None
         self._gid = None
         self._groups_valid = False
-        self._group_undo = []
+        self._unrecorded_seq = 0
         self._zobrist = self._hash_from_board()
         self._pos_zobrist = self._position_hash_from_board()
         self._zobrist_ref = self.board
@@ -1276,9 +1306,12 @@ class GoBoard:
     def _forecast_delta(self, move: int) -> int:
         """只读推演一手棋对**棋盘染色**的哈希增量（落子点提子），不含行棋方翻转。
 
-        **全程只读**（P2.7a）：提子探测走增量棋块/气表，既不临时落子也不写任何
-        状态，所以本方法**可重入**、对误传的占点/非法着法照样给出一个「按规则
-        推演」的值（是否合法由调用方判）。move == -1（pass）返回 0：pass 不改变染色。
+        **不改盘面、不改对局状态**（P2.7a）：提子探测走增量棋块/气表，既不临时落子
+        也不写棋盘，所以本方法**可重入**（唯一可能的写入是 `_ensure_groups()` 惰性
+        重建那张**纯派生**的表，见其 docstring）。move == -1（pass）返回 0：
+        pass 不改变染色。
+
+        对**非法**着法（占点 / 自杀 / 重复）返回值是未定义的，调用方须先过合法性检查。
         """
         if move == -1:
             return 0
@@ -1301,6 +1334,8 @@ class GoBoard:
             if int(self.board[nr, nc]) != opponent:
                 continue
             g = int(self._gid[nr, nc])
+            if g < 0:
+                raise _groups_desync_error(nr, nc)
             if g in seen_gids:      # 同一块可能被多个邻点触及，必须去重
                 continue            # （不去重会把该块的钥匙异或两次、抵消掉）
             seen_gids.add(g)
@@ -1322,7 +1357,7 @@ class GoBoard:
 
         只对合法着法（含 pass）有定义；占点 / 自杀 / 重复局面（PSK）等非法落子语义未定义，
         调用方须先过合法性检查（`get_legal_moves()` 掩码或 `play()` 的返回值）。
-        **只读**（P2.7a：`_forecast_delta()` 不再临时落子），故可重入。
+        **不改盘面**（P2.7a：`_forecast_delta()` 不再临时落子），故可重入。
         """
         self._ensure_hash()
         return self._zobrist ^ _ZOBRIST_TO_PLAY_XOR ^ self._forecast_delta(move)
@@ -1349,7 +1384,7 @@ class GoBoard:
 
         只对合法着法有定义；占点 / 自杀 / 重复局面（PSK）等非法落子语义未定义，调用方须先过
         合法性检查（`get_legal_moves()` 掩码或 `play()` 的返回值）。
-        **只读**（P2.7a：`_forecast_delta()` 不再临时落子，所以「盘面上已经放了子」
+        **不改盘面**（P2.7a：`_forecast_delta()` 不再临时落子，所以「盘面上已经放了子」
         这件事不再有任何技术后果）。但**语义**上仍要求传入的是「本手之前」的盘面 ——
         染色的定义就是如此。`get_legal_moves()` 的「先禁自杀、再判 PSK」顺序保留着，
         它保证推演发生在合法的候选上。
@@ -1506,7 +1541,11 @@ class GoBoard:
         if move == -1:
             # pass
             if record:
-                self._undo_stack.append((-1, None, self.ko_point, self.passes, self.current_player))
+                # pass 不改盘面，所以第 6 位（表记录）是 None；第 7 位照记，
+                # 让 undo() 能对「这条记录是不是可信」用同一把尺子量所有条目。
+                self._undo_stack.append(
+                    (-1, None, self.ko_point, self.passes, self.current_player,
+                     None, self._unrecorded_seq))
             self.passes += 1
             self.ko_point = -1
             self.move_history.append(-1)
@@ -1549,15 +1588,17 @@ class GoBoard:
                 liberty = True              # 落点自身的气
                 continue
             g = int(self._gid[nr, nc])
+            if g < 0:
+                raise _groups_desync_error(nr, nc)
             if g in seen_gids:              # 同一块可能被多个邻点触及，必须去重
                 continue
             seen_gids.add(g)
-            libs = self._groups[g][1]
+            rest = self._libs_excluding_count(self._groups[g][1], move)
             if v == color:
                 own_gids.append(g)
-                if len(libs) > 1:          # 除落点外还有气（p 在 libs 里，故 >1）
+                if rest > 0:              # 除落点外还有气 -> 合并后己方有气
                     liberty = True
-            elif len(libs) == 1:           # 敌块唯一的气就是落点 -> 提子
+            elif rest == 0:                # 敌块的气全被落点占掉 -> 提子
                 cap_gids.append(g)
         # 检查自身是否还有气（禁自杀）
         if not cap_gids and not liberty:
@@ -1587,13 +1628,24 @@ class GoBoard:
         group_record = self._update_groups_after_move(
             move, color, own_gids, cap_gids, seen_gids)
 
-        # 压撤销信息（此时 ko/passes/player 尚未更新）
+        # 压撤销信息（此时 ko/passes/player 尚未更新）。
+        # ⚠ 棋块表的撤销记录是**同一条记录里的第 6 个元素**，不是第二条栈 ——
+        #   两条栈会错位（`record=False` 的着法只推其中一条），而这里两者
+        #   由同一次 `if record:` 一起进出，结构上不可能错位。
+        #   第 7 个元素是「此刻的未记录落子计数」：撤销时用它判断这条记录
+        #   描述的还是不是当前表（见 undo()）。
         if record:
             self._undo_stack.append(
-                (move, captured, self.ko_point, self.passes, self.current_player))
-            # 棋块表的撤销记录与 _undo_stack **同步**：一次 play 推一条、
-            # 一次 undo 弹一条，绝不单独维护第二条生命周期。
-            self._group_undo.append(group_record)
+                (move, captured, self.ko_point, self.passes, self.current_player,
+                 group_record, self._unrecorded_seq))
+        else:
+            # `record=False` 的着法没有撤销记录，而它**改变了盘面与表** ——
+            # 于是撤销链上更早的那些记录从这一刻起全部失效。用单调计数标记，
+            # 旧记录在弹出时会自己发现「我这一段里有过未记录落子」。
+            # ⚠ 这不是本表引入的限制：哈希那边同样要求「撤销 = 回退一手」，
+            #   混用 record=False 与 undo 会让增量哈希与盘面脱钩。本表选择
+            #   **作废重建**（表是纯派生物，重建永远正确），而不是留在错的状态。
+            self._unrecorded_seq += 1
 
         # 打劫判定：提掉恰好 1 子，且落子子本身恰好只剩 1 气（即被提点）-> 形成劫
         if len(captured) == 1 and len(self._groups[move][1]) == 1:
@@ -1624,7 +1676,8 @@ class GoBoard:
         self._ensure_hash()
         if not self._undo_stack:
             return False
-        move, captured, ko, passes, player = self._undo_stack.pop()
+        (move, captured, ko, passes, player,
+         group_record, unrecorded_at) = self._undo_stack.pop()
         n = self.board_size
         if move != -1:
             r, c = divmod(move, n)
@@ -1633,11 +1686,15 @@ class GoBoard:
                 cap_color = -player  # 被提子为落子方对手
                 for (cr, cc) in captured:
                     self.board[cr, cc] = cap_color
-            # 棋块/气表回滚（P2.7a）：只对**实着**回滚。pass 根本没改盘面，
-            # 它的撤销记录栈里也没有对应条目 —— 这里若照弹，弹走的会是**上一手
-            # 实着**的记录，把表恢复到一个从未存在过的状态。
-            self._restore_groups_after_move(
-                self._group_undo.pop() if self._group_undo else None)
+            # 棋块/气表回滚（P2.7a）：只对**实着**回滚（pass 没改盘面，
+            # 它的记录里也没有表的部分）。
+            # ⚠ 可信性判据：`play(record=False)` 打断过撤销链时，这条记录
+            #   描述的已经不是当前表，回滚它会把表恢复到从未存在过的状态。
+            #   那就作废等重建 —— 表是盘面的纯派生物，重建永远正确。
+            if unrecorded_at == self._unrecorded_seq:
+                self._restore_groups_after_move(group_record)
+            else:
+                self._groups_valid = False
         self.move_history.pop()
         self.ko_point = ko
         self.passes = passes

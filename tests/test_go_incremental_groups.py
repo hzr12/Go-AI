@@ -23,6 +23,7 @@ import os
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -79,6 +80,14 @@ def _canonical(board):
 def assert_table_matches(board, ctx=""):
     got = _canonical(board)
     want = _reference_groups(board)
+    # ⚠ **块数也要比**：只比「以棋子集合为键的字典」看不见**同一批棋子的重复记录**
+    #   （字典键会互相覆盖），也看不见**查不到任何棋子的孤儿块**。这两种损坏在
+    #   「键相同但内容不同」那一栏里都是隐形的，而它们真的发生过：
+    #   `play(record=False)` 打断撤销链后，孤儿块就是这么留下的（见
+    #   `test_unrecorded_play_poisoning_undo`）。所以这一行不是冗余断言。
+    assert len(board._groups) == len(want), (
+        f"块数不一致（可能有重复记录或孤儿块）@ {ctx}: "
+        f"got={len(board._groups)} want={len(want)}")
     assert got == want, (
         f"增量棋块表与参考实现不一致 @ {ctx}\n"
         f"块数 got={len(got)} want={len(want)}\n"
@@ -282,6 +291,106 @@ def test_clone_shares_immutable_values_but_not_the_dict():
     assert cb._gid is not b._gid, "_gid 数组必须各自一份"
     shared = [k for k, v in cb._groups.items() if b._groups.get(k) is v]
     assert shared, "应存在被共享的不可变块记录（写时复制的意义所在）"
+
+
+# --------------------------------------------------------------------------- #
+# 4b. record=False 打断撤销链（review 抓到的真缺陷）
+# --------------------------------------------------------------------------- #
+def test_unrecorded_play_poisoning_undo():
+    """`play(record=False)` 之后 `undo()`：表必须**作废重建**，不能回滚成错的状态。
+
+    这里的要点不是「撤销对不对」（board / 哈希那边的 record=False 语义本来就是
+    「这一手不可撤销」，见 `play()` 的 docstring），而是**派生状态**：
+    撤销记录描述的是「本手之前那张表」，中间插一手不记录落子的着法之后，
+    那条记录已经张冠李戴。P2.7a 初版会照着回滚，于是留下一批**查不到任何棋子的
+    孤儿块**（`_gid` 说这些点属于新块，`_groups` 里却还留着它们的老块），
+    而且 `_groups_valid` 仍是 True —— 于是**永远不会重建**，泄漏一路累积。
+
+    修法是「记录不可信就作废等重建」：表是盘面的纯派生物，重建永远正确。
+    """
+    b = GoBoard(9, komi=7.5)
+    # 摆一个「黑一排、白两子」的形状，白落 (0,0) 会先长气再被下一手合并
+    for (r, c), v in {
+        (0, 1): -1, (0, 2): -1, (1, 0): -1, (1, 1): 1, (1, 2): 1, (2, 1): -1,
+    }.items():
+        b.board[r, c] = v
+    b.current_player = -1
+    b.resync_hash()
+    assert_table_matches(b, "毒化场景初始")
+
+    mv = 0
+    assert b.play(mv), "白 (0,0) 应合法"
+    assert_table_matches(b, "记录的一手之后")
+    nxt = int(np.flatnonzero(b.get_legal_moves())[0])
+    assert b.play(nxt, record=False), "不记录的一手也应合法"
+    assert_table_matches(b, "不记录的一手之后")
+    assert b.undo(), "撤销上一手**记录过**的着法"
+    # 撤销之后：板面被回退到「记录那手之前」再叠加不记录的那手，
+    # 表必须与**当前板面**一致 —— 无论走的是回滚还是重建那条路。
+    assert_table_matches(b, "撤销记录着法之后（record=False 打断过撤销链）")
+    assert not b._groups_valid or _canonical(b) == _reference_groups(b), (
+        "表要么已被重建、要么与参考一致；不允许停在错的状态上")
+
+
+def test_record_false_then_rebuild_keeps_everything_consistent():
+    """毒化之后继续走：表必须始终与盘面一致（重建路径的长期等价性）。"""
+    b, rng = _random_game(21)
+    for t in range(120):
+        pts = [int(i) for i in np.flatnonzero(b.get_legal_moves())]
+        if not pts:
+            break
+        mv = int(rng.choice(pts))
+        # 交替：记录 / 不记录 / 撤销，模拟「推演 + 回退」的混用
+        mode = t % 3
+        if mode == 2 and b._undo_stack:
+            b.undo()
+        else:
+            b.play(mv, record=(mode == 0))
+        assert_table_matches(b, f"混用模式 第 {t} 手（mode={mode}）")
+
+
+# --------------------------------------------------------------------------- #
+# 4c. 违反「就地改写要 resync」契约时的失败方式
+# --------------------------------------------------------------------------- #
+def test_inplace_board_write_without_resync_raises_clear_error():
+    """不就地改写盘面又没 resync：必须给一句能照着修的错，而不是 `KeyError: -1`。
+
+    P2.7a 之前这个契约违反是**不抛**的（查气走 flood fill，直接读活盘面，
+    只有 PSK 那一半用陈旧哈希）。改成查表之后，一颗没有块号的棋子在字典里
+    就是 `KeyError: -1`。这里锁住「人话 + 指出修法」。
+
+    ⚠ 故意**不**用 `get_legal_moves()` 做断言对象：它有 `_legal_cache`，而缓存检查
+    排在扫描之前（见该方法 docstring 的「入口收口」段），所以上一次算出的掩码会被
+    原样返回 —— 那是**既有设计**，与本表无关。要触发扫描就得先失效缓存。
+    """
+    b, rng = _random_game(22)
+    for _ in range(8):
+        if _step(b, rng) is None:
+            break
+    poisoned = int(np.flatnonzero(b.board == 0)[0])
+    pr, pc = divmod(poisoned, 9)
+    b.board[pr, pc] = 1               # 就地写，不 resync
+    # 要问的是**被污染点的空邻点**：问它自己会在「占点」那条检查就返回，
+    # 根本走不到查表，于是这个守卫也就永远没机会被测到。
+    probe = None
+    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        nr, nc = pr + dr, pc + dc
+        if 0 <= nr < 9 and 0 <= nc < 9 and b.board[nr, nc] == 0:
+            probe = nr * 9 + nc
+            break
+    assert probe is not None, "被污染点周围得有空的邻点才测得到查表路径"
+    for call in (lambda: b.is_legal(probe),
+                 lambda: b.play(probe)):
+        with pytest.raises(RuntimeError, match="resync_hash"):
+            call()
+    # 掩码那条路：先失效缓存，逼它真的扫一遍盘
+    b._legal_cache = None
+    with pytest.raises(RuntimeError, match="resync_hash"):
+        b.get_legal_moves()
+    # 照着提示修好之后，一切恢复正常
+    b.resync_hash()
+    assert_table_matches(b, "resync 之后")
+    assert b.is_legal(probe) in (True, False)   # 不再抛
 
 
 # --------------------------------------------------------------------------- #
