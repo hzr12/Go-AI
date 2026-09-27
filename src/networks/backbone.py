@@ -714,16 +714,65 @@ class SharedBackbone(nn.Module):
 
 
 # ============================================================================
-# v21 新块类（P4.1）
+# v21 新块类（P4.1；MambaLTI 块由 P4.1r 从 Mamba-1 换成 Mamba-2）
 #
 # 这三个类 + 两个头（P4.1 落 policy_network.py / value_network.py）只**新增**，
 # 既有 resnet / convnext 路径与既有类签名一字未改（D5）：v21 走自己的构建类
 # （P4.2 的 V21_CFG），不经过 SharedBackbone / AttentionResBlock。
 #
-# 权威结构 = 用户给定的逐层参数表（P4.1 brief §2）。本节所有类的参数量都被
-# tests/test_arch_v21_blocks.py 逐类**精确相等**锁住（113,528 / 224,480 /
-# 326,416），不是窗口 —— 全网预算窗口留给 P4.2 的 test_v21_budget。
+# 权威结构 = 用户给定的逐层参数表（P4.1 brief §2；MambaLTI 依次被 P4.1r（N 16→64、
+# A 改结构化低秩，129,240）与 **P4.1s**（A 改**逐 head 标量** `A_log` (4,)，**128,252**）
+# 取代）。本节所有类的参数量都被 tests/test_arch_v21_blocks.py 逐类**精确相等**锁住
+# （128,252 / 224,480 / 326,416），不是窗口 —— 全网预算窗口留给 P4.2 的
+# test_v21_budget。
 # ============================================================================
+
+# ⚠ `MambaLTI` 的扫描实现**没有选择**了（P4.1s-vec，用户 2026-09-27 裁决）
+# ---------------------------------------------------------------------------
+# P4.1s 一度保留 `MAMBA_SCAN_DEFAULT = 'auto'` 这个**活的运行时分派**（训练走分块、
+# eval 走顺序），理由是自对弈 MCTS 是大 batch 前向、而顺序递推的前向是
+# dispatch-bound。用户**覆盖**了那个判断：**向量化（= 分块 SSD）就是实现本身**，
+# 顺序路径在运行时不再可选。
+#
+# 「向量化」在这里只能指分块形式：线性递推**无法**沿 T 直接并行，向量化只能是
+# 「块内 (L,L) 衰减积矩阵做批量矩阵乘 + 仅 ⌈T/L⌉ 步块间状态传递」。
+#
+# 因此本文件**不再有** `MAMBA_SCAN_DEFAULT`、不再有 `MambaLTI(scan=...)`、不再有
+# `_scan_impl()`：`MambaLTI.forward` 无条件走 `self._chunked_scan`。
+# 原 `MAMBA_CHUNK_SIZE` 保留 —— 它是**分块扫描自己的**块长，不是分派开关，且
+# 绝不暴露成 CLI 参数（D1：v21 不新增任何训练参数）。
+#
+# 顺带**消掉**的问题：`'auto'` 曾让 train 与 eval 的输出差 ≈ 0.82 个 fp32 eps
+# （实测 max|ΔY| = 4.768e-07 / 相对 9.79e-08，**与 L 无关**；float64 下
+# 2.2e-16 ~ 4.4e-16）—— 同一类差异本仓库在 SDPA（flash vs math）上接受了。
+# 单一路径后该差异**归零**（同一输入下 train/eval 逐位相同，因为块内没有
+# dropout / BatchNorm 这类依赖 `self.training` 的层）。
+# 代价（整网实测，见 task-p4-1s-vec-report.md §2）：大 batch 前向变慢。
+#
+# 顺序递推的递推式**没有删** —— 它是分块路径唯一的独立对照系，作为
+# `MambaLTI._sequential_scan_oracle` **仅供测试**保留，生产路径不可达。
+
+# 分块扫描的块长 L。**训练与推理用同一个值**（单一路径 ⇒ 不必再为两个方向分别
+# 折中）。P4.1s-vec 重扫的整网实测（19×19 / fp32 / v21 主干 / min-of-N，
+# 全表见 task-p4-1s-vec-report.md §3）：
+#
+# | L | B=1 fwd | B=8 fwd | B=1 fwd+bwd | B=8 fwd+bwd | B=8 fwd+bwd 峰值 |
+# |---|---|---|---|---|---|
+# | 4 | 184 ms | 599 ms | 1,926 ms | 17,096 ms | 2,014 MB |
+# | 8 | 132 | 601 | 1,147 | 9,501 | 1,930 |
+# | 16 | 106 | 769 | 802 | 6,446 | 2,005 |
+# | **32（本值）** | **104** | 1,049 | 583 | 5,073 | 2,162 |
+# | 64 | 135 | 1,248 | **488** | **4,352** | 2,397 |
+#
+# ⇒ **L=32**。理由：L=64 只在反向快 1.16×，却要多付 235 MB 训练峰值、并在
+# B=1 前向上倒退 30%（135 vs 104 ms）；L=16 在 B=1 前向与 L=32 打平（106 vs 104），
+# 却让 B=8 前向慢 36%、反向慢 38%。**L=32 是唯一在「B=1 前向 / B=8 前向 / 反向 /
+# 训练峰值」四张表上都不垫底的取值**；L=8 的 B=8 训练峰值最省（1,930 MB，比 L=32
+# 少 232 MB），但 B=8 前向慢 1.75×、反向慢 1.87×，不值。单一路径之前，推理想用
+# L=8、训练想用 L=32；现在只有 L=32。
+# ⚠ P4.1r 时代的 L=64（1,878 ms fwd、184 MB/块、B=8 时 5.2 GB）在逐 head 标量
+# 衰减下已不再是怪物（2.9 MB/块 @B=1、23 MB/块 @B=8，快照降**恰好 N=64 倍**）。
+MAMBA_CHUNK_SIZE = 32
 
 
 class MHSA(MultiHeadSelfAttention):
@@ -790,99 +839,287 @@ class MHSA(MultiHeadSelfAttention):
 
 
 class MambaLTI(nn.Module):
-    """Mamba 风格的**线性时序（LTI）**块：dt 步长的因果累积递推（C=184, expand=2,
-    d_conv=4, d_state N=16, ddt rank=4），逐块 **113,528** 参数。
+    """Mamba-2 风格的**线性时序（LTI）**块：dt 步长的因果累积递推（C=184, expand=2,
+    d_conv=4, d_state N=64, ddt_rank=4, **逐 head 标量衰减** H=4 × head_dim=46），
+    逐块 **128,252** 参数。
 
     语义（x: (B, C, H, W) -> 同形；内部按 (B, T=H*W, ·) 的**行主序**序列看）：
 
         h  = LayerNorm(x)                                    # pre-LN（唯一一层）
         [xs, z] = split(in_proj(h), 2)                       # in_proj 184→368，各 184
         xc     = SiLU(causal_dwconv1d_k4(xs))                # 仅 x 路，深度卷积
-        [dt_raw, bc] = split(x_proj(xc), rank, 2N)           # 4 + 32 = 36
+        [dt_raw, bc] = split(x_proj(xc), rank, 2N)           # 4 + 128 = 132
         dt     = softplus(dt_proj(dt_raw))                   # (B,T,184)，逐通道 > 0
-        [Bm, Cm] = split(bc, N, N)                           # 各 16
-        y_t     = ( Σ_{s≤t} exp( A ⊙ (Σ_{r=s+1..t} dt_r) ) · dt_s·xc_s ⊙ Bm_s ) · Cm_t
-        y       = y + D * xc                                 # D：逐通道直通
+        [Bm, Cm] = split(bc, N, N)                           # 各 64
+        A      = −exp(A_log)                                # (4,) 逐 head 标量 < 0
+        # 通道 c 属于 head c//46：decay_t = exp(dt_t · A_{head(c)})，**与状态维 n 无关**
+        h_t     = decay_t ⊙ h_{t−1} + dt_t · (xc_t ⊗ Bm_t)   # 状态 (B, 4, 46, 64)
+        y_t     = ⟨h_t , Cm_t⟩_N                            # 读出
+        y       = y + D ⊙ xc                                 # D：逐通道直通
         out     = out_proj(y) * SiLU(z)                      # z 走 SiLU 门
         返回    x + out                                      # pre-norm 残差
 
     ⚠ `expand=2` 是 **in_proj 的扇出**（C→2C 拆 x/z），不是分支内宽度扩张 ——
-    见 `__init__` 里的注释（关系到 113,528 这个数）。
+    见 `__init__` 里的注释（关系到 128,252 这个数）。
 
-    LTI 递推（状态更新 + 输出投影）的闭式，见
-    `.superpowers/sdd/2026-09-25-v21-roadmap/task-p4-1-report.md` §3；
-    `tests/test_arch_v21_blocks.py` 用测试内独立写的双重 for 循环朴素参考逐步对齐。
+    为什么衰减是**逐 head 标量**（P4.1s 用户裁决，权威）
+    ----------------------------------------------------
+    P4.1r 把 A 做成逐 (c,n) 的结构化低秩（992 参数），后果是块内衰减积
+    `exp(σ_i − σ_j)` 的 σ **含 n** ⇒ (L,L) 矩阵跨不了状态维共享 ⇒ 分块要物化
+    `B·C·N` 个 (L,L)，B=8/L=64 时每块 1,472 MB，分块前向比顺序慢 3.5×(L=4)
+    ~ 46.6×(L=64)。逐 head 标量衰减把 σ 里的 n 整个去掉（A 只是 head 的
+    标量）⇒ `M` 只依赖 (b,h,p,i,j) ⇒ 整块只需 `B·H·P = B·C` 个 (L,L)、`M @ u`
+    是真正的 `(L,L)@(L,N)` GEMM，物化量降**恰好 N=64 倍**（B=8/L=64：1,472 MB
+    → 23 MB/块），分块前向在 B≤2 时**快于**顺序递推、反向**无条件快 13×**。
+    代价：衰减参数从 992（结构化低秩）降到 **4**（`A_log` 形状 (4,)，即稠密
+    184×64 的 1/2944），且同一 head 的 46 个通道 × 64 个状态维共享一个衰减率
+    —— 多尺度多样性从「逐状态维」退化为「逐 head」。A/B 实测（扫描段单独，
+    对顺序扫描的比值）：
+
+    | A 参数化 | 分块实现 | L=4 | L=8 | L=16 | L=32 | L=64 |
+    |---|---|---|---|---|---|---|
+    | 顺序（基线） | — | 1.00× | 1.00× | 1.00× | 1.00× | 1.00× |
+    | 逐 (C,N) 184×64（P4.1r） | `bmm` over `B·C·N` | 2.27× | 2.68× | 5.34× | 29.26× | 35.38× |
+    | 逐 head 标量 (4,) | `bmm` over `B·C·N`（**实现不动**） | 2.77× | 4.09× | 8.58× | 35.11× | 43.77× |
+    | 逐 head 标量 (4,) | **共享 (L,L) + 真 GEMM** | 0.83× | 0.56× | 0.54× | **0.43×** | 0.63× |
+
+    ⇒ **只改参数化不管实现是无效的**（第 3 行仍慢 35~44×），两处必须同时改。
+    全表（含 B=8、fwd+bwd、峰值内存）在 task-p4-1s-report.md §3。
+
+
+    Mamba-2 递推（状态更新 + 读出）与分块 SSD 扫描的闭式、等价性论证见
+    `task-p4-1s-report.md` §2。测试侧的 oracle 是 `tests/test_arch_v21_blocks.py`
+    里独立写的三重 for 循环朴素解与 cumsum 闭式（两条都在）。
 
     因果性：递推只用 s ≤ t 的量，深度卷积**左**填充 k-1=3，三处都没有未来信息。
     `test_ssm_is_causal_in_time` 直接钉这条（改 t 之后的输入不得影响 t 的输出），
     `test_ssm_scan_matches_naive_triple_loop` / `test_ssm_scan_equals_dt_strided_cumulative_form`
     从两个独立参考实现侧钉同一条性质。
 
-    实现选择（无参数开销、但影响梯度流，已在 report 里列为待用户确认项）：
-      * 递推按 T 步**顺序**扫描（内存 O(B·C·S)，19×19 → 361 步）。闭式的
-        (T,T) 衰减矩阵需要 B·T²·C·S 个数（184 通道 × 16 状态时 T=361 要 30e9），
-        不可物化；若将来要提速，方向是分块扫描 / 关联扫描（不是换语义）。
-      * `A` 以 log 形式 `A_log` 存储（`A = -exp(A_log)`，初值 log(1..N) ⇒
-        A ∈ {-1..-16}），与 Mamba 参考实现同；参数量与 `A` 直接存储完全相同
-        （184×16 = 2,944），但初值落在稳定区间而不是围绕 0 抖动。
+    相对 P4.1（rev1，Mamba-1）/ P4.1r（结构化低秩）的变化
+    ----------------------------------------------------
+    | 子模块 | rev1 | P4.1r | 本类（P4.1s） |
+    |---|---|---|---|
+    | 状态维 N | 16 | 64 | **64** |
+    | `x_proj` 输出 | 36 = 4+2·16 | 132 = 4+2·64 | **132** |
+    | A | 稠密 `A_log` 184×16 = 2,944 | 结构化低秩 992 | **逐 head 标量 `A_log` (4,) = 4** |
+    | 单块 | 113,528 | 129,240 | **128,252** |
+
+    实现选择（无参数开销、但影响梯度流）：
+      * **只有一条扫描路径**（P4.1s-vec，用户裁决）：`_chunked_scan`（分块 SSD）。
+        P4.1s 一度有 `scan='auto'` 的运行时分派（训练分块 / 推理顺序），已删除 ——
+        线性递推无法沿 T 直接并行，向量化只能取块内 (L,L) 矩阵乘 + ⌈T/L⌉ 步块间
+        传递这条形式。代价（大 batch 前向变慢）与收益（train/eval 逐位一致）见
+        文件头 `MAMBA_CHUNK_SIZE` 上方的注释与 task-p4-1s-vec-report.md §2。
+      * 顺序递推**没有删**，改名为 `_sequential_scan_oracle` 并**标注为测试专用**
+        —— 它是本实现唯一的独立对照系（推导 `_chunked_scan` 的闭式用的就是它），
+        删掉就等于没有 oracle。
+      * `A = −exp(A_log)`：符号约束**折进参数化**（对数域，同 rev1），
+        对**任意** `A_log` 都有 `A < 0` ⇒ `decay = exp(dt·A) ∈ (0,1]`，
+        构造上保证，不依赖初值符号。
+      * `A_log` 初值 = `log(1..n_heads)`，即 canonical Mamba-2 的 `A = −(1..H)`
+        （**不是** P4.1r/rev1 的 `−(1..N)` 斜坡按 head 取段平均）。理由与代价见
+        `_init_a_log` 的 docstring —— 那条斜坡平均在本规格下会让 4 个 head 的
+        记忆常数全部 < 0.2 步，并在 fp32 + 分块下产生**恒零梯度**（实测
+        37/288 组配置），canonical 初值下是 **0/288**。
       * `z` 的 SiLU 门作用在 **z** 上（Mamba 参考实现：`out_proj(y) * silu(z)`），
-        而不是作用在 y 上；见 report §3 的说明。
+        而不是作用在 y 上；P4.1r brief §2.1 的 `out_proj(SiLU(y) * z)` 与同段
+        「z 走 SiLU 门」自相矛盾，沿用 rev1 的读法（未被本次任务列入变更项），
+        并由 `test_ssm_gate_is_on_the_z_branch` 钉住。
     """
 
-    def __init__(self, channels=184, expand=2, d_conv=4, d_state=16,
-                 ddt_rank=4):
+    def __init__(self, channels=184, expand=2, d_conv=4, d_state=64,
+                 ddt_rank=4, n_heads=4, chunk_size=MAMBA_CHUNK_SIZE):
         super().__init__()
         # ⚠ `expand` 的含义以**权威表**为准，不是 Mamba 惯例。表里给的是
         #   `in_proj 184→368`（=67,712）、`dw conv1d Conv1d(184,184,...)`、
         #   `out_proj 184→184` ⇒ 每个分支的宽度就是 C=184，in_proj 的**扇出**
         #   才是 2×C（拆两半各 184：x 路 / z 路），即 d_inner = C。
         #   若按惯例理解成「分支内扩张 d_inner = 2C = 368」，in_proj 会变成
-        #   184→736（135,424），本块变 223,560 —— 比权威的 113,528 多 110,032。
+        #   184→736（135,424），本块会比权威多 67,712×2 个参数。
         assert expand == 2, (
             '权威表只定义 expand=2（in_proj 扇出 2C，拆 x/z 各 C）；'
             '其它 expand 值未在参数表里定义，不臆造。收到 {}'.format(expand))
+        if int(chunk_size) < 1:
+            raise ValueError('chunk_size 必须 ≥ 1，收到 {}'.format(chunk_size))
+        if channels % n_heads:
+            raise ValueError(
+                'channels={} 必须能被 n_heads={} 整除（P4.1s：4 head × 46 通道）'
+                .format(channels, n_heads))
         self.channels = channels
         self.expand = expand
         self.d_inner = channels                  # 184（= d_model，见上）
-        self.d_state = d_state                  # 16
+        self.d_state = d_state                    # 64
         self.d_conv = d_conv                    # 4
         self.ddt_rank = ddt_rank                # 4
-        self.dt_project_rank = ddt_rank + 2 * d_state   # 36 = x_proj 输出维
+        self.n_heads = n_heads                  # 4（P4.1s：head 数 = A 的标量个数）
+        self.head_dim = channels // n_heads     # 46（184/4）
+        # ⚠ 这里**曾经**有 `self.scan`（P4.1s 的 `scan='auto'` 运行时分派）。P4.1s-vec
+        #   把它删了：分块 SSD 是唯一实现，运行时没有第二条路可切。`chunk_size` 是
+        #   分块自己的块长，不是分派开关。
+        self.chunk_size = int(chunk_size)       # 32（单一路径实测，见 MAMBA_CHUNK_SIZE）
+        self.dt_project_rank = ddt_rank + 2 * d_state   # 132 = x_proj 输出维
 
         self.norm = LayerNorm2d(channels)                                   # 368
         self.in_proj = nn.Linear(channels, expand * channels, bias=False)  # 67,712
         # 深度因果卷积，**仅**作用于 x 路
         self.dw_conv = nn.Conv1d(self.d_inner, self.d_inner, d_conv,
                                  groups=self.d_inner, bias=True)            # 920
-        self.x_proj = nn.Linear(self.d_inner, self.dt_project_rank, bias=False)  # 6,624
+        self.x_proj = nn.Linear(self.d_inner, self.dt_project_rank, bias=False)  # 24,288
         self.dt_proj = nn.Linear(ddt_rank, self.d_inner, bias=True)         # 920
-        # A：逐通道 184×16 的状态转移率矩阵（log 形式存储，见类 docstring）
-        a_init = torch.arange(1, d_state + 1, dtype=torch.float32).log()
-        self.A_log = nn.Parameter(a_init.repeat(channels, 1))               # 2,944
+        # A = −exp(A_log)：**逐 head 标量**衰减，形状 (n_heads,) —— P4.1s 把
+        # P4.1r 的结构化低秩 U(184×4)·V(4×64)（992 参数）换成 4 个标量。
+        self.A_log = nn.Parameter(self._init_a_log(n_heads))               # 4
         self.D = nn.Parameter(torch.ones(channels))                         # 184
         self.out_proj = nn.Linear(self.d_inner, channels, bias=False)       # 33,856
 
-    def _selective_scan(self, decay, drive, cvec):
-        """顺序扫描的 dt 步长因果累积递推。
+    @staticmethod
+    def _init_a_log(n_heads):
+        """`A_log` (n_heads,) 初值 = `log(1..n_heads)`，即 canonical Mamba-2 的
+        `A = −(1..H)`（**不是** P4.1r/rev1 的 `−(1..N)` 斜坡）。
 
-        decay: (B, T, d_inner, N) = exp(dt_t ⊙ A)，元素 ∈ (0, 1]
-        drive: (B, T, d_inner, N) = dt_t · xc_t ⊙ B_t
-        cvec:  (B, T, N)         = C_t
+        shipped（n_heads=4）：`log([1, 2, 3, 4])` ⇒ `A = −([1, 2, 3, 4])`。
+        四个 head 初值互不相同 —— 若四个 head 同值，梯度也相同，对称性永远破不掉，
+        per-head 的自由度等于白给。
 
-        返回 (B, T, d_inner)。T 步的 Python 循环换来 O(B·d_inner·N) 的显存；
-        换成闭式 (T,T) 衰减矩阵会物化 T²·C·N 个元素，19×19 下不可接受。
+        为什么**不**沿用 `−(1..N)` 斜坡的段平均（P4.1r 的一版候选，实测否决）
+        ----------------------------------------------------------------------
+        `−(1..N)` 斜坡的作用是让**状态维 n** 有不同的时间常数。P4.1s 把 A 压成
+        4 个逐 head 标量之后，n 维的多样性已经没有了；若把斜坡按 4 段取算术平均
+        就得到 `A = −([8.5, 24.5, 40.5, 56.5])`，在 `dt ~ O(0.7)`（`softplus` 在
+        初始化附近）下每步衰减是 `2.6e-3 / 2.5e-8 / 7.0e-13 / 7.3e-18`，
+        **四个 head 的记忆常数 `1/(dt·|A|)` 全部 < 0.2 步**（0.168/0.057/0.036/
+        0.025）—— 也就是这块 SSM 在 T=361 的棋盘序列上几乎没有时间记忆。
+        canonical 初值给出 `exp(dt·A) = 0.50/0.24/0.13/0.061`、记忆常数
+        `1.43/0.70/0.48/0.36` 步，同样是逐 head 多尺度，但**每一档都可用**。
+
+        **代价（诚实记账）**：per-head 衰减的跨度从 6.6×（8.5→56.5）收窄到 4×
+        （1→4）。换来的是 fp32 下不再有恒零梯度（见类 docstring 的实现选择段
+        与 task-p4-1s-report.md §4：斜坡平均 37/288 组配置出现恒零梯度、
+        canonical 0/288），以及 4 个 head 的衰减梯度动态范围从 1.6e9~3.3e9
+        降到 19~152。
         """
-        B, T, d_inner, n = decay.shape
-        state = decay.new_zeros(B, d_inner, n)
+        return torch.log(torch.arange(1, n_heads + 1, dtype=torch.float32))
+
+    def _sequential_scan_oracle(self, log_decay, drive, cvec):
+        """⚠ **测试专用 oracle，生产路径不可达** —— 请不要在 `forward` 里调用它。
+
+        为什么保留（P4.1s-vec：顺序递推已从运行时退役，见文件头的说明）
+        --------------------------------------------------------------
+        向量化（分块 SSD）实现**没有任何独立参照**：它自己的推导就是
+        `task-p4-1s-report.md` §2.3 的闭式，而那条闭式又是从本方法这条递推
+        推出来的。删掉本方法就没有第二个实现了，也就没人能说清块内矩阵、块间
+        状态传递、上三角 mask 到底算对了没有。本方法就是那个「第二个实现」：
+        逐时间步 `for t in range(T)`，`T = 361` 时慢 1.2~3.8×（大 batch 前向），
+        且反向要在 361 个 4.25M 元素的状态张量上跑（fwd+bwd 慢 12.6~13.6×）。
+        **正因为它慢，生产路径不用它**；正因为它是唯一独立的oracle，测试必须能
+        调它 —— 所以保留，只是**改名**成一眼可辨的 `_…_oracle`，让任何残留的
+        运行时引用立刻 `AttributeError` 而不是静默走进慢路。
+
+        覆盖它的测试（一条都没删、没弱）：
+          * `test_ssm_chunked_scan_matches_sequential_oracle` — 15 组 `(T, L)`
+            上分块 ≡ 本方法（小 T 还要再压一层朴素三重循环）；
+          * `test_mamba2_state_shape_is_b_h_p_n` — one-hot 探针对两条路径都跑；
+          * `test_ssm_no_dead_state_components` / `test_mamba2_fp32_active_state_dims`
+            — fp32 下「本方法干净、分块死」是 fp32 **下溢**地板（而非结构死亡）
+            的一半判据。
+
+        递推本身
+        --------
+        log_decay: (B, T, H, P) = dt_t · A_{head(p)}（ℓ ≤ 0 ⇒ exp(·) ∈ (0, 1]）
+        drive:     (B, T, H, P, N) = dt_t · xc_t ⊗ B_t
+        cvec:      (B, T, N)       = C_t
+
+        状态 `(B, H, P, N)`；返回 `(B, T, H, P)`。T 步的 Python 循环换来
+        O(B·H·P·N) 的显存；换成闭式 (T,T) 衰减矩阵会物化 T²·H·P·N 个元素，
+        19×19 下不可接受。
+
+        与 `_chunked_scan` 的关系：数学上**逐项相同**（浮点结合律不同 ⇒ 非逐 bit
+        相同：float64 下 max|Δ| = 2.2e-16 ~ 4.4e-16，float32 下 2.384e-7 绝对 /
+        ≤6.0e-8 相对 ≈ 0.5 fp32 eps，**与 L 无关**）。测试按
+        `allclose(rtol=1e-10, atol=1e-12)` 断言而不是 `equal`。
+        """
+        B, T, Hh, P = log_decay.shape
+        N = drive.shape[-1]
+        state = drive.new_zeros(B, Hh, P, N)
         out = []
         for t in range(T):
-            state = state * decay[:, t] + drive[:, t]
-            out.append((state * cvec[:, t].unsqueeze(1)).sum(-1))
+            state = state * log_decay[:, t].exp().unsqueeze(-1) + drive[:, t]
+            out.append((state * cvec[:, t].view(B, 1, 1, N)).sum(-1))
         return torch.stack(out, dim=1)
+
+    def _chunked_scan(self, log_decay, drive, cvec, chunk_size=None):
+        """分块 SSD 扫描 —— Mamba-2 的**定义性**实现特征，也是本块**唯一**的扫描。
+
+        ⚠ 这里的「唯一」是 P4.1s-vec 之后的状态（用户 2026-09-27 裁决）：先前存在
+        的运行时分派（`scan='auto'`，训练走本方法、eval 走 `_sequential_scan_oracle`）
+        已删除。线性递推无法沿 T 直接并行 ⇒ 「向量化」**只能**是本方法这种形式：
+        块内 (L,L) 衰减积矩阵的批量矩阵乘 + 仅 ⌈T/L⌉ 步的块间状态传递。
+        对照系保留在 `_sequential_scan_oracle`（**仅测试**）。
+
+        闭式（task-p4-1s-report.md §2）。记 `ℓ_t = dt_t·A_{head} ≤ 0`、
+        `u_t = drive_t`、`S_t = Σ_{r≤t} ℓ_r`（单调不增 ⇒ 任何 `S_t − S_s ≤ 0`
+        恒成立，指数不溢出）。顺序递推 `h_t = Σ_{s≤t} exp(S_t − S_s)·u_s`
+        按 L 切块，块内用 σ（块内局部累积）与
+        `M[i,j] = exp(σ_i − σ_j)·1[j≤i]` 这个 (L,L) 衰减乘积矩阵做一次批量
+        矩阵乘，块间只递推 `T/L` 步状态：
+
+            h_{kL+i} = exp(σ_i)·H_k + Σ_{j≤i} M[i,j]·u_{kL+j}
+            H_{k+1}  = h_{kL+l−1}                    （块末状态 = 下一块的 H_k）
+
+        `exp(σ_i)·H_k` 是**块间状态传递**那一项（L 次乘法/块，不是 T 次）。
+        `H_0 = 0`、`S_{−1} = 0`，最后一块可以短于 L（`l = min(L, T−kL)`）。
+
+        ★ 逐 head 标量衰减让这里**真的塌成共享 (L,L)**（P4.1s 的核心收益）
+        ----------------------------------------------------------------------
+        `A` 只是 head 的标量 ⇒ `ℓ_t`、`σ_i` 都**不含状态维 n** ⇒
+        `M[b,h,p,i,j]` 与 n 无关 ⇒ 整块只需 `B·H·P = B·C` 个 (L,L) 矩阵，
+        `M @ u` 是真正的 `(L,L)@(L,N)` GEMM（批数 B·C=184）。对比 P4.1r 的
+        逐通道 `A_eff`（σ 逐 (c,n) 不同 ⇒ `B·C·N` 个瘦矩阵向量乘）：每块的
+        `M` 物化量降**恰好 N=64 倍**（B=8/L=64：1,472 MB/块 → 23 MB/块；
+        B=1/L=64：184 MB/块 → 2.9 MB/块）。**只改参数化、不改这里的实现是无效
+        的**（实测仍慢 35~44×，见类 docstring 的 A/B 表）。
+
+        本方法与 `_selective_scan` 数学上逐项相同（浮点结合律不同 ⇒ 非逐
+        bit 相同：float64 下 max|Δ| = 2.2e-16 ~ 4.4e-16，float32 下 2.384e-7
+        绝对 / ≤6.0e-8 相对 ≈ 0.5 fp32 eps，**与 L 无关**），由
+        `test_ssm_chunked_scan_matches_sequential` 在 15 组 (T, L) 上钉住。
+        """
+        L = int(self.chunk_size if chunk_size is None else chunk_size)
+        if L < 1:
+            raise ValueError('chunk_size 必须 ≥ 1，收到 {}'.format(L))
+        B, T, Hh, P = log_decay.shape
+        N = drive.shape[-1]
+        # S：全序列的对数衰减累积。ℓ ≤ 0 ⇒ S 单调不增且 ≤ 0 ⇒ 后续所有
+        # exp(·) 的指数都 ≤ 0，不会溢出（下溢到 0 是**正确**行为）。
+        S = torch.cumsum(log_decay, dim=1)                     # (B,T,H,P)
+        nb = B * Hh * P                                        # 批量矩阵乘的批数 = B·C
+        S_prev = log_decay.new_zeros(B, 1, Hh, P)             # S_{−1} ≡ 0
+        h_in = log_decay.new_zeros(B, Hh, P, 1, N)            # H_k：块入口状态
+        ys = []
+        for k0 in range(0, T, L):
+            sl = slice(k0, min(k0 + L, T))
+            sigma = (S[:, sl] - S_prev).permute(0, 2, 3, 1)   # (B,H,P,l) 局部累积
+            l = sigma.shape[-1]
+            # 块内衰减乘积矩阵 M[i,j] = exp(σ_i − σ_j)·1[j≤i]。
+            # ⚠ 上三角必须在 **exp 之前** 屏蔽：i<j 时 σ_i − σ_j ≥ 0，exp 会溢出。
+            lower = torch.ones(l, l, dtype=torch.bool, device=sigma.device).tril()
+            dd = sigma.unsqueeze(-1) - sigma.unsqueeze(-2)    # (B,H,P,l,l) = σ_i − σ_j
+            M = dd.masked_fill(~lower, float('-inf')).exp()    # exp(−inf) = 0
+            u = drive[:, sl].permute(0, 2, 3, 1, 4)            # (B,H,P,l,N)
+            h = torch.bmm(M.reshape(nb, l, l),
+                          u.reshape(nb, l, N)).reshape(B, Hh, P, l, N)
+            h = h + torch.exp(sigma).unsqueeze(-1) * h_in      # 块间状态传递
+            h_in = h[..., -1:, :]                              # (B,H,P,1,N) 块末状态
+            S_prev = S[:, sl][:, -1:]                          # (B,1,H,P)
+            ys.append((h.permute(0, 3, 1, 2, 4) *
+                       cvec[:, sl].unsqueeze(-2).unsqueeze(-2)).sum(-1))   # 读出
+        return ys[0] if len(ys) == 1 else torch.cat(ys, dim=1)
 
     def forward(self, x):
         B, C, H, W = x.shape
         T = H * W
+        Hh, P = self.n_heads, self.head_dim
 
         h = self.norm(x).flatten(2).transpose(1, 2)            # (B, T, C)
         hs, z = self.in_proj(h).split(self.d_inner, dim=-1)  # 各 (B, T, 184)
@@ -891,17 +1128,24 @@ class MambaLTI(nn.Module):
         xs = F.pad(hs.transpose(1, 2), (self.d_conv - 1, 0))
         xc = F.silu(self.dw_conv(xs).transpose(1, 2))        # (B, T, d_inner)
 
-        # x_proj 36 维拆成 ddt_rank(=4) + 2N(=32)：注意必须按「前 4 / 后 32」
-        # 切，不能用 split(4)（那会切成 9 块）。
+        # x_proj 132 维拆成 ddt_rank(=4) + 2N(=128)：注意必须按「前 4 / 后 128」
+        # 切，不能用 split(4)（那会切成 32 块 4 维的碎片，且**不会报错**）。
         proj_db = self.x_proj(xc)
         dt_raw, bc = proj_db[..., :self.ddt_rank], proj_db[..., self.ddt_rank:]
         dt = F.softplus(self.dt_proj(dt_raw))                # (B, T, d_inner) > 0
-        b_vec, c_vec = bc.split(self.d_state, dim=-1)        # 各 (B, T, 16)
+        b_vec, c_vec = bc.split(self.d_state, dim=-1)        # 各 (B, T, 64)
 
-        A = -torch.exp(self.A_log)                           # (d_inner, 16) < 0
-        decay = torch.exp(dt.unsqueeze(-1) * A)              # (B,T,d_inner,16)
-        drive = dt.unsqueeze(-1) * xc.unsqueeze(-1) * b_vec.unsqueeze(2)
-        y = self._selective_scan(decay, drive, c_vec)        # (B, T, d_inner)
+        A = -torch.exp(self.A_log)                           # (H,) < 0，逐 head 标量
+        # 每步的对数衰减 ℓ[b,t,h,p] = dt[b,t,h,p]·A[h] —— **与状态维 n 无关**
+        # （P4.1s 的逐 head 标量衰减），这正是块内 (L,L) 矩阵能跨 n 共享的原因。
+        log_decay = dt.view(B, T, Hh, P) * A[None, None, :, None]        # (B,T,H,P)
+        drive = (dt.view(B, T, Hh, P).unsqueeze(-1)
+                 * xc.view(B, T, Hh, P).unsqueeze(-1)
+                 * b_vec[:, :, None, None, :])               # (B,T,H,P,N)
+        # 唯一的扫描实现（P4.1s-vec：运行时分派已退役，线性递推无法沿 T 并行，
+        # 块内 (L,L) 矩阵乘 + ⌈T/L⌉ 步块间传递就是「向量化」本身）。
+        y = self._chunked_scan(log_decay, drive, c_vec)       # (B, T, H, P)
+        y = y.view(B, T, C)
         y = y + self.D * xc                                 # D 逐通道直通
 
         out = self.out_proj(y) * F.silu(z)                   # z 走 SiLU 门
