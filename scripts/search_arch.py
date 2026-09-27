@@ -23,7 +23,9 @@
 用法
 ----
     python scripts/search_arch.py --list
-    python scripts/search_arch.py --preset v12
+    python scripts/search_arch.py --preset            # 既有整表（= --preset all）
+    python scripts/search_arch.py --preset v12        # 既有预设单项
+    python scripts/search_arch.py --preset v21        # ANCHOR_V21 静态参数锚点
     python scripts/search_arch.py --grid
     python scripts/search_arch.py --sweep attn_window --sweep value_res_blocks
 
@@ -74,12 +76,106 @@ V12_CFG = dict(backbone_channels=192, backbone_res_blocks=17,
                value_channels=64, value_res_blocks=2,
                policy_channels=32, policy_layers=2)
 
+# v21 权威参数锚点（用户给定数值，逐字面写死）。
+#
+# 为什么必须是独立字面量常量：本锚点供 test_v21_budget（P4.2）与 C11 的
+# v21 显存投影做**仲裁**。若它从 src/networks/** 实测值推导，两个测试就只是
+# 互相印证，锚点失去意义。tests/test_search_arch.py::test_anchor_v21_is_
+# independent_of_network_code 用 AST 断言本赋值只含字面量（无 Name/Call/
+# Attribute/Subscript），钉死这条独立性。
+#
+# 版本：P4.9b 跟随 P4.1 详细结构表更新数值与键名。块13-14 408,664→448,960
+# （每块 224,480）、块15-16 613,272→652,832（每块 326,416）、
+# backbone_total 6,419,944→6,499,800、total_params 8,928,691→9,008,419，
+# FFN 中间维 276→240（ratio 1.5→1.304）。**旧值与 light_attn_* 键名作废。**
+#
+# 键名对齐 P4.1 的类名：MambaLTI / TransformerBlock / CrossAttnRes
+# （块13-14 旧称 LightAttn，用户本轮改称「Transformer 块」，旧称作废）。
+#
+# 权威表内有两处自相矛盾（见 P4.1 brief §3）。已按裁定取值，但**仍待用户
+# 最终裁决**，故显式记录在此——不可静默抹掉：
+#   (a) stem：表头文字写「7×7 Conv 17→184」，同给的参数量 28,152 却是 3×3
+#       的值（3×3: 9×17×184 = 28,152；7×7: 49×17×184 = 153,272）。
+#       28,152+368(BN) = 28,520 正好是现有 3×3 stem+BN，故本锚点**按 3×3
+#       记 28,152**。⚠ 硬依赖：若最终确认改 7×7，stem 合计变 153,640
+#       （+125,120），本表**整表作废**，backbone_total/total_params 必须重算。
+#       （表/裁定里把 7×7 写成 153,296 / stem 153,664，比精确值多 24，是同
+#       一处表内笔误；两个口径都记在 known_discrepancies 里待裁决。）
+#   (b) policy 头：表里写合计 2,366,730，但它自己的分项之和是 2,366,602，
+#       差 128。故本锚点**以分项实算 2,366,602 为权威**，total_params 据此
+#       得 9,008,419；表里的 2,366,730 保留在 known_discrepancies 待裁决。
+# 两条同时以结构化字面量记在 known_discrepancies，测试逐字段断言其存在。
+ANCHOR_V21 = {
+    'name': 'v21',
+    'in_channels': 17,               # 特征平面通道（P4.3 补齐后）
+    'backbone_channels': 184,
+    # 块布局：哪些块、几个。键名 = P4.1 的类名，勿再改回旧称
+    'layout': {
+        'stem': 'Conv3x3(17->184)+BN',   # 按 3×3 记 28,152，见上 (a)
+        'res_blocks': 8,             # ResBlock ×8 @184
+        'mamba_lti_blocks': 4,       # MambaLTI ×4 @184
+        'transformer_blocks': 2,     # TransformerBlock ×2 @184
+        'transformer_heads': 4,
+        'ffn_hidden': 240,           # FFN 184→240→184，块13-14/15-16 共用
+        'ffn_ratio': 1.304,          # 240/184 ≈ 1.304（旧表 1.5 作废）
+        'cross_attn_res_blocks': 2,  # CrossAttnRes ×2 @184
+        'cross_attn_concat_blocks': (1, 5, 9),
+        'out': '1x1 Conv+BN',
+    },
+    # 各部分参数量（权威给定，勿由网络代码反算）
+    'params': {
+        'stem': 28_520,
+        'res_blocks': 4_881_152,     # 8 × 610,144
+        'mamba_lti': 454_112,        # 4 × 113,528
+        'transformer': 448_960,      # 2 × 224,480
+        'cross_attn_res': 652_832,   # 2 × 326,416
+        'out': 34_224,
+    },
+    'backbone_total': 6_499_800,     # 主干合计（= params 六项之和，测试断言自洽）
+    # 头：权威表只给了参数量；维度钉 in/out 两端（隐藏维未给定，不臆造）
+    'heads': {
+        'in': 184,                   # 头喂入 = 主干输出通道
+        # policy 头：分项实算为权威值；用户表写的是 2,366,730，差 128，见上 (b)
+        'policy_params': 2_366_602,
+        'policy_out': 362,           # 19×19 + pass
+        'value_params': 142_017,     # value 头（新增部分）
+        'value_out': 1,
+    },
+    'total_params': 9_008_419,       # 主干 + 两头（测试断言自洽）
+    # 上文 (a)(b) 两条矛盾的机器可读记录。id/stated/recorded/delta/status
+    # 缺一不可：任一字段被静默改动/删除都会被
+    # test_anchor_v21_documents_known_discrepancies 抓住。
+    'known_discrepancies': (
+        {
+            'id': 'stem_kernel_3x3_vs_7x7',
+            'about': 'stem 卷积核：表头文字 7×7，给的参数量却是 3×3 的值',
+            'stated': 153_296,        # 7×7：表/裁定里写的口径
+            'stated_exact': 153_272,  # 7×7：49×17×184 精确值（表记多 24，同属表内笔误）
+            'recorded': 28_152,       # 3×3：9×17×184（本锚点采用）
+            'delta': 125_144,        # 153,296 - 28,152（按表记口径）
+            'status': '未裁决：按 3×3 实施；若改 7×7 则 stem 合计 153,640'
+                      '（精确口径）/153,664（表记口径），整表作废需重算',
+        },
+        {
+            'id': 'policy_total_128_off',
+            'about': 'policy 头：表里的合计比其自身分项之和多 128',
+            'stated': 2_366_730,      # 用户表写的合计
+            'recorded': 2_366_602,    # 分项实算（本锚点采用，total_params 据此）
+            'delta': 128,             # 2,366,730 - 2,366,602
+            'status': '未裁决：以分项实算 2,366,602 为权威，差 128 待用户确认',
+        },
+    ),
+}
 
-def measure(cfg, probe_bs=PROBE_BS, use_checkpoint=True):
-    """返回 (参数量, FLOPs@batch1, 保留激活字节@probe_bs)。"""
-    model = AlphaGoNet(in_channels=12, action_size=ACTION_SIZE, arch='resnet',
-                       attention_dropout=0.0, use_checkpoint=use_checkpoint,
-                       **cfg)
+
+def measure(cfg, probe_bs=PROBE_BS, use_checkpoint=True, in_channels=12):
+    """返回 (参数量, FLOPs@batch1, 保留激活字节@probe_bs)。
+
+    in_channels 默认 12 —— 既有调用方零回归；17ch（v21）显式传入即可测。
+    """
+    model = AlphaGoNet(in_channels=in_channels, action_size=ACTION_SIZE,
+                       arch='resnet', attention_dropout=0.0,
+                       use_checkpoint=use_checkpoint, **cfg)
     n_params = sum(p.numel() for p in model.parameters())
 
     # ---- FLOPs：必须 batch=1，否则被 batch 放大 ----
@@ -99,7 +195,7 @@ def measure(cfg, probe_bs=PROBE_BS, use_checkpoint=True):
     handles += [m.register_forward_hook(lf)
                 for m in model.modules() if isinstance(m, nn.Linear)]
     with torch.no_grad():
-        model(torch.zeros(1, 12, 19, 19))
+        model(torch.zeros(1, in_channels, 19, 19))
     for h in handles:
         h.remove()
 
@@ -125,7 +221,7 @@ def measure(cfg, probe_bs=PROBE_BS, use_checkpoint=True):
         return t
 
     model.train()          # checkpointing 只在 training 时生效
-    x = torch.randn(probe_bs, 12, 19, 19, requires_grad=True)
+    x = torch.randn(probe_bs, in_channels, 19, 19, requires_grad=True)
     with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
         policy, value = model(x)
         loss = policy.square().mean() + value.square().mean()
@@ -172,9 +268,9 @@ def calib_factor():
     return _CALIB
 
 
-def project(cfg, batch, anchor=ANCHOR):
-    """给出某配置在目标 batch 下的预测指标。"""
-    n, f, ret = measure(cfg)
+def project(cfg, batch, anchor=ANCHOR, in_channels=12):
+    """给出某配置在目标 batch 下的预测指标（in_channels 默认 12，零回归）。"""
+    n, f, ret = measure(cfg, in_channels=in_channels)
     act = act_gb(ret, batch) * calib_factor()
     total = act + overhead_gb(n)
     ratio = f / anchor['flops']
@@ -234,17 +330,102 @@ def preset_cfgs():
     return out
 
 
-def run_preset(batch=None):
+# --preset 的取值形态：all=既有整表（裸 --preset / 无参数时的默认），
+# v18/v12/b/f=既有预设单项，v21=ANCHOR_V21 静态锚点。
+PRESET_CHOICES = ('all', 'v18', 'v12', 'b', 'f', 'v21')
+_PRESET_INDEX = {'v18': 0, 'v12': 1, 'b': 2, 'f': 3}   # 对应 preset_cfgs() 下标
+
+
+def preset_entries(key='all'):
+    """把 --preset 的取值映射到 (name, cfg, bs, note) 列表（纯选择，不测量）。
+
+    'v21' 返回空列表：v21 结构 AlphaGoNet 造不出来，走 run_anchor_v21()
+    打印静态锚点表，不做实测投影。
+    """
+    if key == 'all':
+        return preset_cfgs()
+    if key == 'v21':
+        return []
+    return [preset_cfgs()[_PRESET_INDEX[key]]]
+
+
+def preset_in_channels(key):
+    """预设的输入通道数：**来源 = 预设推导**（非 CLI 自由参数）。
+
+    通道数是被测结构的固有属性，不是可随意拨动的旋钮：若开 `--in-channels`
+    这类显式旗标，12ch 训练的 cfg 配 17ch 输入能照跑不误，产出一张看似正常、
+    实际错位的对比表——而对比表正是本工具的全部价值。故每个预设自带通道数
+    （既有预设恒 12 = 改前行为），v21 的值直接取 ANCHOR_V21['in_channels']，
+    单一事实源，不在别处再写一遍 17。
+    """
+    return ANCHOR_V21['in_channels'] if key == 'v21' else 12
+
+
+def run_preset(batch=None, key='all'):
     print(HEADER)
     print(SEP)
     rows = []
-    for name, cfg, bs, note in preset_cfgs():
+    in_ch = preset_in_channels(key)
+    for name, cfg, bs, note in preset_entries(key):
         if batch:
             bs = batch
-        r = project(cfg, bs)
+        r = project(cfg, bs, in_channels=in_ch)
         print(fmt_row(name, r, note))
         rows.append((name, r))
     return rows
+
+
+def run_anchor_v21():
+    """陈列 v21 权威参数锚点（ANCHOR_V21，静态字面量，非本工具实测）。
+
+    P4.2 接线落地前 AlphaGoNet 还造不出 MambaLTI/TransformerBlock/
+    CrossAttnRes 结构，故 `--preset v21` 不做 forward 投影，只打印锚点表，
+    并当场核算主干合计与总合计——表内数字自相矛盾会直接暴露在输出里。
+    表内那两处**已知**矛盾（stem 3×3 vs 7×7、policy 合计差 128）不在此
+    判对错，只按 known_discrepancies 逐条陈列，避免看起来像被静默抹平。
+    """
+    A = ANCHOR_V21
+    lay, vh = A['layout'], A['heads']
+    ffn = 'ffn={}(ratio {})'.format(lay['ffn_hidden'], lay['ffn_ratio'])
+    label = {
+        'stem': 'stem {}'.format(lay['stem']),
+        'res_blocks': 'ResBlock ×{} @{}'.format(
+            lay['res_blocks'], A['backbone_channels']),
+        'mamba_lti': 'MambaLTI ×{} @{}'.format(
+            lay['mamba_lti_blocks'], A['backbone_channels']),
+        'transformer': 'TransformerBlock ×{} @{} heads={} {}'.format(
+            lay['transformer_blocks'], A['backbone_channels'],
+            lay['transformer_heads'], ffn),
+        'cross_attn_res': 'CrossAttnRes ×{} @{} concat={} {}'.format(
+            lay['cross_attn_res_blocks'], A['backbone_channels'],
+            '/'.join(str(i) for i in lay['cross_attn_concat_blocks']), ffn),
+        'out': 'out {}'.format(lay['out']),
+    }
+    print('v21 参数锚点（ANCHOR_V21，用户权威给定；**非**本工具实测）')
+    print(SEP)
+    total = 0
+    for k, v in A['params'].items():
+        print('{:<52}{:>12,}'.format(label[k], v))
+        total += v
+    print('{:<52}{:>12,}  {}'.format(
+        '主干合计', total,
+        'OK' if total == A['backbone_total'] else 'MISMATCH!'))
+    print('{:<52}{:>12,}'.format('policy 头（新增部分）', vh['policy_params']))
+    print('{:<52}{:>12,}'.format('value 头（新增部分）', vh['value_params']))
+    grand = total + vh['policy_params'] + vh['value_params']
+    print('{:<52}{:>12,}  {}'.format(
+        '总参数', grand, 'OK' if grand == A['total_params'] else 'MISMATCH!'))
+    print('in={} → backbone {}ch → 头 in={}，policy out={}，value out={}'.format(
+        A['in_channels'], A['backbone_channels'], vh['in'],
+        vh['policy_out'], vh['value_out']))
+    for d in A['known_discrepancies']:
+        print('⚠ 已知矛盾[{}]：{}（表记 {:,} / 本锚点采 {:,}，差 {:,}）{}'.format(
+            d['id'], d['about'], d['stated'], d['recorded'], d['delta'],
+            d['status']))
+    print('注：v21 结构在 P4.2 接线落地前不可实测；17ch measure 已支持'
+          '（measure/in_channels=17），--emit-flags 需 V21_CFG，暂不支持')
+    return dict(parts=dict(A['params']), backbone_total=total,
+                grand_total=grand)
 
 
 def run_sweep(keys, base=None, batch=2800, extra=None):
@@ -368,11 +549,14 @@ def run_speed_curve(batch_list=None):
           '保护，8->3 约省 2.3GB，近乎不损准确率——二分类输出）')
 
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(description='架构参数搜索（实测，非手算）')
     ap.add_argument('--calibrate', action='store_true', help='只做校准核对')
     ap.add_argument('--list', action='store_true', help='列出预设配置')
-    ap.add_argument('--preset', action='store_true', help='跑预设配置')
+    ap.add_argument('--preset', nargs='?', const='all', default=None,
+                    choices=PRESET_CHOICES,
+                    help='跑预设配置：all=既有整表（裸 --preset 或无参数的默认），'
+                         'v18/v12/b/f=既有预设单项，v21=ANCHOR_V21 静态锚点')
     ap.add_argument('--grid', action='store_true', help='跑粗网格搜索')
     ap.add_argument('--curve', action='store_true',
                     help='通道数 vs 可用最大 batch / 吞吐 的可行域曲线')
@@ -384,11 +568,15 @@ def main():
     ap.add_argument('--mix', action='store_true', help='扫描时用 mix 构建模式')
     ap.add_argument('--emit-flags', action='store_true',
                     help='为通过的候选输出 train_sft.py 参数')
-    args = ap.parse_args()
+    return ap
 
-    if not (args.calibrate or args.list or args.preset or args.grid
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    if not (args.calibrate or args.list or args.preset is not None or args.grid
             or args.sweep or args.curve):
-        args.preset = True
+        args.preset = 'all'
 
     if args.calibrate:
         err = calibrate()
@@ -398,6 +586,9 @@ def main():
         print('预设配置:')
         for name, cfg, bs, note in preset_cfgs():
             print('  {:<30} batch={:<5} {}'.format(name, bs, note))
+        print('  {:<30} batch={:<5} {}'.format(
+            'v21（ANCHOR_V21 锚点 17ch）', '-',
+            '静态参数锚点，P4.2 前不可实测'))
         print('\n可用扫描维度: attn_window num_attention_layers num_heads '
               'backbone_channels\n'
               '              backbone_res_blocks res_blocks convnext_blocks '
@@ -412,10 +603,15 @@ def main():
         run_speed_curve()
         return
 
+    if args.preset == 'v21':
+        # 静态锚点：不 calibrate、不 forward（v21 结构 P4.2 前造不出来）
+        run_anchor_v21()
+        return
+
     if args.preset:
         calibrate(verbose=True)
         print()
-        rows = run_preset(args.batch)
+        rows = run_preset(args.batch, key=args.preset)
         if args.emit_flags:
             print()
             for name, cfg, _, _ in preset_cfgs():

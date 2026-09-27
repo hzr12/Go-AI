@@ -9,8 +9,13 @@
 （反向保存大量视图，共享同一块 storage，被重复计数）；改按
 `untyped_storage().nbytes()` + `data_ptr()` 去重后误差降到 21%，剩余
 部分来自 checkpoint 重算临时量被按「同时存活」计入。
+
+P4.9 另覆盖三件事：`--preset` 取值修型（store_true -> choices，含 v21）、
+measure 的 17 通道支持（默认 12 零回归）、ANCHOR_V21 锚点的数值与独立性。
 """
 
+import ast
+import inspect
 import os
 import sys
 
@@ -157,3 +162,319 @@ def test_max_batch_respects_budget():
     if b < 4200:
         assert not S.project(cfg, b + 40)['fits'], \
             'batch={} 之后仍有大把余量，二分搜索没找准'.format(b)
+
+
+# ---------------------------------------------------------------------------
+# P4.9：--preset 修型（store_true -> 取值）/ measure 17ch / ANCHOR_V21
+# ---------------------------------------------------------------------------
+
+# 既有 4 个预设在**改前**的实测金标（params/flops 均为整数，机器无关；
+# 改前用 scripts/search_arch.py 逐一 project 采集）。任何使既有预设行为
+# 漂移的改动都会撞上它。
+GOLDEN_PRESETS = [
+    ('v18 原样（锚点）', 12_858_978, 8_489_705_920),
+    ('V12 原样', 12_652_834, 8_987_335_872),
+    ('B: ConvNeXt4→Res4', 14_315_874, 9_540_475_840),
+    ('F: V12块序+v18头', 14_056_866, 9_354_165_184),
+]
+
+
+def test_preset_accepts_v21(capsys):
+    """`--preset v21` 必须能被解析并路由到 v21 分支。
+
+    改前红：`--preset` 是 store_true，`--preset v21` 会把 `v21` 当成
+    unrecognized argument 直接 SystemExit(2)。
+    """
+    args = S.build_parser().parse_args(['--preset', 'v21'])
+    assert args.preset == 'v21'
+    S.main(['--preset', 'v21'])
+    out = capsys.readouterr().out
+    assert 'ANCHOR_V21' in out, 'v21 分支没有陈列 ANCHOR_V21'
+    assert '6,499,800' in out and '9,008,419' in out, \
+        'v21 分支没有输出合计，自洽核算缺失'
+    # v21 走静态锚点，不得触发 v18 校准/实测路径（P4.2 前造不出该结构）
+    assert '校准核对' not in out
+
+
+def test_preset_choices_contain_legacy_values(capsys):
+    """既有预设仍在 choices 里、旧命令行仍可用，且行为与改前逐项一致。"""
+    p = S.build_parser()
+    act = next(a for a in p._actions if a.dest == 'preset')
+    assert set(S.PRESET_CHOICES) == {'all', 'v18', 'v12', 'b', 'f', 'v21'}
+    for k in S.PRESET_CHOICES:
+        assert k in act.choices, '{} 不在 --preset choices 里'.format(k)
+        assert p.parse_args(['--preset', k]).preset == k
+    # 旧命令行 1：裸 --preset（store_true 时代的唯一形态）仍是整表
+    assert p.parse_args(['--preset']).preset == 'all'
+    # 旧命令行 2：完全无参数，由 main 兜底成整表
+    assert p.parse_args([]).preset is None
+
+    # 既有预设定义与改前逐项一致（golden 字面量，独立于 S.preset_cfgs 实现）
+    cfgA = dict(backbone_channels=192, backbone_res_blocks=17,
+                attention_mode='none', num_attention_layers=0, num_heads=4,
+                attn_mode='window_global', attn_window=5,
+                res_blocks=8, convnext_blocks=4, attn_blocks=5,
+                value_channels=96, value_res_blocks=8,
+                policy_channels=128, policy_layers=3)
+    cfgV = dict(backbone_channels=192, backbone_res_blocks=17,
+                attention_mode='mix', num_attention_layers=4, num_heads=4,
+                attn_mode='window_global', attn_window=5,
+                res_blocks=0, convnext_blocks=0, attn_blocks=0,
+                value_channels=64, value_res_blocks=2,
+                policy_channels=32, policy_layers=2)
+    golden_cfgs = [
+        ('v18 原样（锚点）', cfgA, 2800, '当前基线，显存超限'),
+        ('V12 原样', cfgV, 2800, '历史 top1≈50% 的结构'),
+        ('B: ConvNeXt4→Res4', {**cfgA, 'res_blocks': 12, 'convnext_blocks': 0},
+         2800, 'FLOPs 更高但显存更低'),
+        ('F: V12块序+v18头', {**cfgV, 'value_channels': 96,
+                             'value_res_blocks': 8, 'policy_channels': 128,
+                             'policy_layers': 3}, 2800, ''),
+    ]
+    assert S.preset_cfgs() == golden_cfgs, '既有预设定义被改动（与改前不一致）'
+
+    # 选择映射：整表 == 既有清单；单项 == 对应下标；v21 不进实测表
+    assert S.preset_entries('all') == S.preset_cfgs()
+    for i, k in enumerate(('v18', 'v12', 'b', 'f')):
+        assert S.preset_entries(k) == [golden_cfgs[i]], \
+            '{} 选错了预设'.format(k)
+    assert S.preset_entries('v21') == []
+
+    # 各跑一次，结果与改前实测金标一致（params/flops 为整数）
+    for (gname, gparams, gflops), k in zip(
+            GOLDEN_PRESETS, ('v18', 'v12', 'b', 'f')):
+        (name, r), = S.run_preset(key=k)
+        assert name == gname
+        assert r['params'] == gparams, \
+            '{} params {} != 改前 {}'.format(k, r['params'], gparams)
+        assert r['flops'] == gflops, \
+            '{} flops {} != 改前 {}'.format(k, r['flops'], gflops)
+
+    # 通道数来源 = 预设推导：既有预设恒 12（= 改前），v21 取自 ANCHOR_V21
+    for k in ('all', 'v18', 'v12', 'b', 'f'):
+        assert S.preset_in_channels(k) == 12
+    assert S.preset_in_channels('v21') == S.ANCHOR_V21['in_channels'] == 17
+
+    # --list：既有 4 行逐字节不变，v21 仅为新增行
+    S.main(['--list'])
+    out = capsys.readouterr().out
+    for gname, _, gbs, gnote in golden_cfgs:
+        line = '  {:<30} batch={:<5} {}'.format(gname, gbs, gnote)
+        assert line in out, '--list 既有行丢失/改动: {!r}'.format(line)
+    assert 'ANCHOR_V21' in out
+
+
+def test_measure_supports_17_channels():
+    """measure 必须能测 17 通道（改前红：in_channels 硬编码 12，kwarg 报错）。"""
+    n17, f17, r17 = S.measure(SMALL, probe_bs=2, in_channels=17)
+    n12, f12, r12 = S.measure(SMALL, probe_bs=2)
+    # 与输入通道相关的只有 stem 卷积：Conv3×3(12→32) vs (17→32)，BN 不变
+    assert n17 - n12 == (17 - 12) * SMALL['backbone_channels'] * 3 * 3, \
+        '17ch 参数增量不等于 stem 卷积增量'
+    # FLOPs 增量 = 多出的输入通道在 stem 上的 2·ic·oc·k·H·W
+    assert f17 - f12 == (17 - 12) * SMALL['backbone_channels'] * 9 * 19 * 19 * 2
+    assert r17 > 0 and r12 > 0
+    # 17ch 实测与直构模型一致（钉死 measure 内部没有第二处写死 12）
+    m17 = AlphaGoNet(in_channels=17, action_size=362, arch='resnet',
+                     attention_dropout=0.0, **SMALL)
+    assert n17 == sum(p.numel() for p in m17.parameters())
+    del m17
+
+
+def test_measure_default_unchanged():
+    """零回归：默认 in_channels=12，与显式 12 逐项相等；老调用形态可用。"""
+    assert inspect.signature(S.measure).parameters['in_channels'].default == 12
+    assert inspect.signature(S.project).parameters['in_channels'].default == 12
+    a = S.measure(SMALL, probe_bs=2)
+    b = S.measure(SMALL, probe_bs=2, in_channels=12)
+    assert a == b, '默认通道数与显式 12 结果不一致（零回归被破坏）'
+    # 既有调用方（test_run_py_sh / test_v19_budget）的形态：不传 in_channels
+    r1 = S.project(dict(SMALL), 2800)
+    r2 = S.project(dict(SMALL), 2800, in_channels=12)
+    assert r1 == r2
+
+
+def _anchor_source_with_comments():
+    """返回 ANCHOR_V21 赋值 + 其上方紧邻注释块的源码文本。
+
+    数值能被结构化字段钉住，「为什么这么取」的依赖说明只能活在注释里，
+    故单独取出来做断言——否则日后有人把注记删了，数字仍绿，理由却没了。
+    """
+    path = os.path.join(ROOT, 'scripts', 'search_arch.py')
+    with open(path, encoding='utf-8') as f:
+        src = f.read()
+    tree = ast.parse(src)
+    node = next(stmt.value for stmt in tree.body
+                if isinstance(stmt, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == 'ANCHOR_V21'
+                        for t in stmt.targets))
+    lines = src.splitlines()
+    i = node.lineno - 2                      # 赋值行的 0-based 前一行
+    while i >= 0 and lines[i].lstrip().startswith('#'):
+        i -= 1
+    return '\n'.join(lines[i + 1:node.end_lineno])
+
+
+def test_anchor_v21_constants():
+    """ANCHOR_V21 逐项等于 P4.1 详细结构表（权威），且合计自洽。"""
+    A = S.ANCHOR_V21
+    assert A['name'] == 'v21'
+    assert A['in_channels'] == 17
+    assert A['backbone_channels'] == 184
+    lay = A['layout']
+    assert lay['stem'] == 'Conv3x3(17->184)+BN'
+    assert lay['res_blocks'] == 8
+    assert lay['mamba_lti_blocks'] == 4
+    assert lay['transformer_blocks'] == 2
+    assert lay['transformer_heads'] == 4
+    assert lay['ffn_hidden'] == 240, 'FFN 中间维必须是 240（旧表 276 作废）'
+    assert abs(lay['ffn_ratio'] - 240 / 184) < 1e-3, \
+        'ffn_ratio 与 240/184 不符: {}'.format(lay['ffn_ratio'])
+    assert lay['cross_attn_res_blocks'] == 2
+    assert lay['cross_attn_concat_blocks'] == (1, 5, 9)
+    assert lay['out'] == '1x1 Conv+BN'
+    # 权威表逐项（P4.1 brief §2）
+    parts = dict(stem=28_520, res_blocks=4_881_152, mamba_lti=454_112,
+                 transformer=448_960, cross_attn_res=652_832, out=34_224)
+    assert A['params'] == parts, '各部分参数量与权威表不符'
+    # 每块单价也对得上（448,960 = 2×224,480；652,832 = 2×326,416）
+    assert parts['transformer'] == 2 * 224_480
+    assert parts['cross_attn_res'] == 2 * 326_416
+    assert parts['res_blocks'] == 8 * 610_144
+    assert parts['mamba_lti'] == 4 * 113_528
+    # 合计自洽：六项之和 == backbone_total == 6,499,800（权威表）
+    assert sum(parts.values()) == A['backbone_total'] == 6_499_800, \
+        '主干合计与各部分之和不自洽'
+    h = A['heads']
+    assert h['in'] == 184
+    assert h['policy_params'] == 2_366_602, 'policy 头以分项实算为权威（§3(b)）'
+    assert h['policy_out'] == 362
+    assert h['value_params'] == 142_017
+    assert h['value_out'] == 1
+    assert A['total_params'] == 9_008_419
+    assert A['backbone_total'] + h['policy_params'] + h['value_params'] \
+        == A['total_params'], '总合计与 主干+两头 不自洽'
+
+
+def test_anchor_v21_layout_names_match_p41_class_names(capsys):
+    """布局/参数键名与 P4.1 的类名逐项对齐：旧称 LightAttn 必须绝迹。
+
+    P4.1 brief §1 定的类名是 MambaLTI / TransformerBlock / CrossAttnRes
+    （块13-14 旧称 LightAttn 作废）。键名一旦与类名脱节，锚点表就会与被实现
+    的结构各说各话——而锚点正是 P4.2 预算仲裁的依据。
+    """
+    A = S.ANCHOR_V21
+    lay = A['layout']
+
+    def strings(obj):
+        """递归取出对象里所有字符串（键与值都算）。"""
+        if isinstance(obj, str):
+            yield obj
+        elif isinstance(obj, dict):
+            for k, v in obj.items():
+                yield from strings(k)
+                yield from strings(v)
+        elif isinstance(obj, (tuple, list)):
+            for v in obj:
+                yield from strings(v)
+
+    # 布局键 = P4.1 类名的 snake_case，三个注意力/序列块都在
+    assert {'mamba_lti_blocks', 'transformer_blocks',
+            'cross_attn_res_blocks'} <= set(lay), \
+        '布局缺 P4.1 的三个块类键: {}'.format(sorted(lay))
+    # 旧称 LightAttn / light_attn_* 全部消失（大小写不敏感）
+    for s in list(strings(lay)) + list(lay) + list(A['params']):
+        low = s.lower()
+        assert 'lightattn' not in low and 'light_attn' not in low, \
+            '布局/参数里还残留旧称 LightAttn: {!r}'.format(s)
+    assert 'transformer' in A['params'] and 'light_attn' not in A['params']
+
+    # 打印表用 P4.1 的类名（run_anchor_v21 的 label 跟着键名走）
+    S.main(['--preset', 'v21'])
+    out = capsys.readouterr().out
+    assert 'TransformerBlock ×2' in out, '打印表没有用 TransformerBlock'
+    assert 'LightAttn' not in out, '打印表仍出现旧称 LightAttn'
+    assert 'MambaLTI ×4' in out and 'CrossAttnRes ×2' in out
+    assert 'ffn=240' in out, '打印表没有陈列 FFN 中间维 240'
+
+
+def test_anchor_v21_documents_known_discrepancies():
+    """权威表的两处自相矛盾必须被记录在锚点里，不许静默抹掉。
+
+    (a) stem 表头写 7×7，参数却是 3×3 的值（28,152 vs 153,296）。锚点按 3×3
+        取值 —— 若日后确认改 7×7，stem 变 153,664，**整张预算表作废**。
+    (b) policy 表记合计 2,366,730，其自身分项之和 2,366,602，差 128。锚点以
+        分项实算为权威，total_params 据此。
+
+    这两条一旦被「顺手改整齐」，P4.2 的预算窗口就会在无人察觉下偏移
+    125,144 / 128 个参数。故既断言结构化字段，也断言锚点源码的注释里写了
+    依赖关系（防止只留数字、不留理由）。
+    """
+    A = S.ANCHOR_V21
+    d = {x['id']: x for x in A['known_discrepancies']}
+    assert set(d) == {'stem_kernel_3x3_vs_7x7', 'policy_total_128_off'}, \
+        'known_discrepancies 缺条目或多出条目: {}'.format(sorted(d))
+
+    # (a) stem：记录值必须就是 params 里采用的那个，且两个口径的算式对得上
+    stem = d['stem_kernel_3x3_vs_7x7']
+    assert stem['recorded'] == 3 * 3 * 17 * 184 == 28_152
+    # 7×7：表记 153,296，但 49×17×184 精确值是 153,272（表内笔误，多 24）。
+    # 两个口径都必须留着——日后真改 7×7 的人只有靠这条才知道该用哪个。
+    assert stem['stated'] == 153_296, '表记的 7×7 口径被改动'
+    assert stem['stated_exact'] == 7 * 7 * 17 * 184 == 153_272
+    assert stem['stated'] - stem['stated_exact'] == 24, '表内 24 的笔误未记录'
+    assert stem['delta'] == stem['stated'] - stem['recorded'] == 125_144
+    assert A['params']['stem'] == stem['recorded'] + 368, \
+        'params.stem 应 = 3×3 卷积 + BN，锚点却没采用 recorded 口径'
+    assert '3x3' in A['layout']['stem'].lower(), \
+        '布局未标明 stem 按 3×3 记'
+    assert '作废' in stem['status'] and '153,640' in stem['status'], \
+        'stem 记录的 status 必须写明「改 7×7 则整表作废」这个依赖'
+
+    # (b) policy：记录值必须就是 heads/total_params 采用的那个，差 128
+    pol = d['policy_total_128_off']
+    assert pol['stated'] == 2_366_730
+    assert pol['recorded'] == 2_366_602 == A['heads']['policy_params']
+    assert pol['delta'] == pol['stated'] - pol['recorded'] == 128
+    assert A['total_params'] == A['backbone_total'] + pol['recorded'] \
+        + A['heads']['value_params'], 'total_params 必须按分项实算而非表记值'
+
+    # 理由也必须留在锚点的注释里（防止只剩数字、丢掉依赖说明）
+    src = _anchor_source_with_comments()
+    for marker in ('3×3', '7×7', '28,152', '153,296', '153,640', '153,272',
+                   '2,366,730', '2,366,602', 'known_discrepancies'):
+        assert marker in src, '锚点注释里没有记下 {}'.format(marker)
+
+
+def test_anchor_v21_is_independent_of_network_code():
+    """ANCHOR_V21 必须是独立字面量常量，不得由 src/networks/** 推导。
+
+    若锚点由被测代码算出，test_v21_budget（P4.2）与本锚点就只是互相
+    印证——两边同时错也照样绿。故对 ANCHOR_V21 的赋值表达式做 AST 断言：
+    只允许字面量节点（Dict/Tuple/List/Constant），连 Name/Call/Attribute/
+    Subscript 都不许有。这比 brief 里「模块没有 src.networks import」的
+    字面读法**更强**且可行——本模块必须合法地 import AlphaGoNet 供
+    measure 用，但锚点一个名字都不许引用，更不许调用模型构造。
+    """
+    path = os.path.join(ROOT, 'scripts', 'search_arch.py')
+    with open(path, encoding='utf-8') as f:
+        tree = ast.parse(f.read())
+    node = None
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == 'ANCHOR_V21'
+                for t in stmt.targets):
+            node = stmt.value
+    assert node is not None, 'scripts/search_arch.py 缺少模块级 ANCHOR_V21'
+    assert isinstance(node, ast.Dict), 'ANCHOR_V21 应是字面量 dict'
+    allowed = (ast.Dict, ast.Tuple, ast.List, ast.Constant, ast.UnaryOp,
+               ast.Load)
+    offenders = sorted({type(n).__name__ for n in ast.walk(node)
+                        if not isinstance(n, allowed)})
+    assert not offenders, \
+        'ANCHOR_V21 不是纯字面量，疑似由被测代码推导: {}'.format(offenders)
+    # 兜底：显式点名三类最危险的节点（也含在上面的 offenders 检查里）
+    used = sorted({n.id for n in ast.walk(node) if isinstance(n, ast.Name)})
+    calls = [n for n in ast.walk(node) if isinstance(n, ast.Call)]
+    assert not used and not calls, \
+        'ANCHOR_V21 引用了名字 {} 或调用了 {} 个函数'.format(used, len(calls))
