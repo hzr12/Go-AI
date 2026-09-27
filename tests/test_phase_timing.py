@@ -15,6 +15,7 @@
 2. 累加器必须在打点处统一重置，否则跨区间累加导致数值虚高；
 3. save/eval 发生在其打点之后，因此计入下一区间（墙钟口径正确）。
 """
+import ast
 import os
 import re
 import sys
@@ -29,6 +30,89 @@ SRC = open(os.path.join(ROOT, 'scripts', 'train_sft.py'), encoding='utf-8').read
 CODE = '\n'.join(
     ln for ln in SRC.splitlines() if not ln.lstrip().startswith('#')
 )
+
+# --------------------------------------------------------------------------- #
+# AST 定位工具
+# --------------------------------------------------------------------------- #
+# ⚠ 为什么本文件的「顺序」类断言必须走 AST、不能走 SRC.index / 正则：
+# 顺序类测试要表达的是**代码节点之间的位置关系**，而原始文本里注释与
+# docstring 和真代码逐字同形。63345c7 给 compute_l2_report 写的说明里引了
+# 一次 `if _do_stdout or _do_swanlab:`，于是 SRC.index 取到的是 docstring 的
+# 偏移（1255 行）而非真正的打点块（2375 行），`assert init < blk` 直接变成
+# `94572 < 48651` 而红 —— 一段**解释代码的说明文字**把一个检查代码位置的测试
+# 打挂了。AST 里注释和 docstring 根本不是节点，所以下面的定位对「又有人写了
+# 一段解释」彻底免疫；这正是这两个测试本来想表达的不变量。
+
+_ZERO_CHAIN = ('_t_data', '_t_comp', '_t_save', '_t_eval')
+
+
+def _tree():
+    return ast.parse(SRC)
+
+
+def _parents(tree):
+    return {ch: par for par in ast.walk(tree)
+            for ch in ast.iter_child_nodes(par)}
+
+
+def _stmt_list_of(node, parents):
+    """(node 所在的那个语句列表, 它的父节点) —— 即 node 的同级列表。
+
+    从 node 往上找第一个「把 node 放在自己某个 list 字段里」的父节点；
+    找不到返回 (None, None)。
+    """
+    while node in parents:
+        par = parents[node]
+        for _, val in ast.iter_fields(par):
+            if isinstance(val, list) and any(v is node for v in val):
+                return val, par
+        node = par
+    return None, None
+
+
+def _uniques(nodes, what):
+    assert len(nodes) == 1, \
+        f'期望恰好 1 个{what}，实得 {len(nodes)} 个：' \
+        + ', '.join(f'第 {n.lineno} 行' for n in nodes)
+    return nodes[0]
+
+
+def _assigned_names(node):
+    """这条语句赋值给了哪些名字（链式赋值的全部 target 都算）。"""
+    if isinstance(node, ast.Assign):
+        return [t.id for t in node.targets if isinstance(t, ast.Name)]
+    if isinstance(node, (ast.AugAssign, ast.AnnAssign)) \
+            and isinstance(node.target, ast.Name):
+        return [node.target.id]
+    return []
+
+
+def _assign_value(node):
+    return ast.unparse(node.value) if isinstance(node, ast.Assign) else None
+
+
+def _if_nodes(tree, test_src):
+    return [n for n in ast.walk(tree)
+            if isinstance(n, ast.If) and ast.unparse(n.test) == test_src]
+
+
+def _metrics_if(tree):
+    """打点块 `if _do_stdout or _do_swanlab:`（stdout 与 swanlab 频率解耦）。"""
+    return _uniques(_if_nodes(tree, '_do_stdout or _do_swanlab'),
+                    '打点块 `if _do_stdout or _do_swanlab:`')
+
+
+def _stdout_print_if(tree):
+    """`if _do_stdout:` 里**含 spd_inst 打印行**的那一个。
+
+    main() 里有两处 `if _do_stdout:`（分段耗时行 / 剖析结束提示），靠「第一个」
+    定位会随排版漂移，所以按「体内含 spd_inst 的 logger.info」来认。
+    """
+    return _uniques(
+        [n for n in _if_nodes(tree, '_do_stdout')
+         if any('spd_inst' in ast.unparse(s) for s in n.body)],
+        '含 spd_inst 打印的 `if _do_stdout:` 分支',
+    )
 
 
 def test_no_synchronize_in_training_path():
@@ -76,25 +160,67 @@ def test_every_segment_is_measured():
 
 
 def test_accumulators_reset_together_at_logging():
-    """重置必须在打点处统一进行，且三行齐全。"""
-    assert re.search(
-        r'_t_data = _t_comp = _t_save = _t_eval = 0\.0\s*\n'
-        r'\s*_t_data_max = 0\.0\s*\n\s*_n_timed = 0',
-        SRC,
-    ), '累加器未在打点处统一重置（会跨区间累加，数值虚高）'
-    # 重置必须在打印之前、且在打点块内。
-    # 两个坑：
-    #  1) 不能用 SRC.index('if _do_stdout:')：它会匹配到
-    #     'if _do_stdout or _do_swanlab:' 的前缀，取到错误位置；
-    #  2) 重置语句出现两次（循环入口初始化 + 打点处重置），
-    #     必须从 blk 之后开始找，否则会拿到入口那处。
-    blk = SRC.index('if _do_stdout or _do_swanlab:')
-    out = SRC.index('\n            if _do_stdout:\n')
-    reset = SRC.index('_t_data = _t_comp = _t_save = _t_eval = 0.0', blk)
-    assert blk < reset < out, '重置位置应在打点块内、stdout 打印之前'
-    # 入口处也必须初始化一次（否则首区间用到未定义变量）
-    init = SRC.index('_t_data = _t_comp = _t_save = _t_eval = 0.0')
-    assert init < blk, '循环入口未初始化累加器'
+    """重置必须在打点处统一进行，且三行齐全；入口初始化在循环之外、之前。"""
+    tree = _tree()
+    parents = _parents(tree)
+    metrics = _metrics_if(tree)       # `if _do_stdout or _do_swanlab:`
+    out = _stdout_print_if(tree)      # `if _do_stdout:`（打印分段耗时那行）
+
+    # --- 1) 重置在打点块内，且三行齐全、紧邻 ---------------------------------
+    # 链式赋值 `_t_data = _t_comp = _t_save = _t_eval = 0.0` 的 4 个 target
+    # 必须一个不少、值是 0.0，且必须是打点块的**直接**语句（不是藏在
+    # 某个内层 if/try 里 —— 那样就不保证每次打点都重置了）。
+    chains = [s for s in metrics.body
+              if _assigned_names(s) == list(_ZERO_CHAIN)
+              and _assign_value(s) == '0.0']
+    assert len(chains) == 1, \
+        f'打点块内应有且仅有一处累加器重置，实得 {len(chains)} 处'
+    reset = chains[0]
+    j = metrics.body.index(reset)
+    # 「三行齐全」= 紧跟其后两条正是 _t_data_max / _n_timed（与原正则的
+    # 「三行相邻」同义，但按语句判定，注释与空行不再能插进来）。
+    assert j + 2 < len(metrics.body), '重置后缺少 _t_data_max / _n_timed 两行'
+    assert _assigned_names(metrics.body[j + 1]) == ['_t_data_max'] \
+        and _assign_value(metrics.body[j + 1]) == '0.0', \
+        '重置后第 2 行必须是 _t_data_max = 0.0'
+    assert _assigned_names(metrics.body[j + 2]) == ['_n_timed'] \
+        and _assign_value(metrics.body[j + 2]) == '0', \
+        '重置后第 3 行必须是 _n_timed = 0'
+
+    # --- 2) 打点块与 stdout 打印是同级的先后两条 -----------------------------
+    # 「同级」很关键：只有同级才能证明 out 紧跟在 metrics 之后，而不是恰好
+    # 落在文件更后面的某个无关分支里。
+    mlist, _ = _stmt_list_of(metrics, parents)
+    assert mlist is not None and out in mlist, \
+        'stdout 打印分支与打点块不在同一个语句列表里'
+    assert mlist.index(metrics) < mlist.index(out), \
+        '打点块必须排在 stdout 打印之前（reset 要覆盖到刚测完的这一段）'
+    assert reset.lineno < out.lineno, \
+        '重置位置应在打点块内、stdout 打印之前'
+
+    # --- 3) 入口初始化：在**循环之外、循环之前** -----------------------------
+    # 只比 lineno 是不够的：初始化若被挪进循环体，打点块之前也能满足
+    # `init < blk`，但那样每步都会被清零、分段计时直接失效。所以这里断言
+    # 「init 与 for 循环同级、且排在 for 之前」。
+    others = [n for n in ast.walk(tree)
+              if _assigned_names(n) == list(_ZERO_CHAIN)
+              and _assign_value(n) == '0.0' and n is not reset]
+    assert len(others) == 1, \
+        f'除打点处重置外应还有且仅有一处入口初始化，实得 {len(others)} 处'
+    init = others[0]
+
+    node, loop = metrics, None
+    while node in parents:
+        node = parents[node]
+        if isinstance(node, ast.For):
+            loop = node
+            break
+    assert loop is not None, '打点块不在任何 for 循环内，无法定义「循环入口」'
+    llist, _ = _stmt_list_of(loop, parents)
+    assert init in llist, \
+        '入口初始化必须与 for 循环同级（在被它保护的循环体内=每步清零）'
+    assert llist.index(init) < llist.index(loop), \
+        '循环入口未初始化累加器（初始化必须早于 for）'
 
 
 def test_data_wait_peak_is_tracked():

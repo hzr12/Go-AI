@@ -223,7 +223,7 @@ python scripts/selfplay_train.py \
   --out models/az_best.pth
 
 # ============================================================
-# ③' RL 完整参数表（selfplay_train.py，53 项；默认值均取自 --help/源码）
+# ③' RL 完整参数表（selfplay_train.py，56 项；默认值均取自 --help/源码）
 # ============================================================
 # 用法：完整命令加 --help；下表为默认值，命令行显式传入即覆盖。
 #
@@ -248,6 +248,11 @@ python scripts/selfplay_train.py \
 #                           batch×N、step÷N，建议 --lr 调高 1.4~2 倍）
 #   --use-ema {0,1}         EMA 权重；默认 0
 #   --no-augment {0,1}      关闭 8 对称增强；默认 0（开启）
+#   --ppo-clip F            PPO 裁剪范围 ε（策略侧代理目标；value clipping 复用同一 ε）；默认 0.2
+#   --kl-coef F             KL 惩罚系数 β 的初值（非常数，自适应朝 --kl-target 走）；默认 0.01
+#   --kl-target F           目标 KL（β 自适应目标；超 2× 提前中止本轮 minibatch）；默认 0.01
+# 注：上面这三个目前是「只声明未消费」——args 里已解析，但损失里还没读它们，
+#     传入不改变任何数值行为；接线见路线图 D13 的 P3-C（策略侧）/P3-D（value 侧）。
 #
 # --- MCTS 搜索质量 ---
 #   --expand-topk N         展开候选截断（CPU 推荐 32-64）；默认 64

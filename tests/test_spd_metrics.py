@@ -9,6 +9,7 @@
 实测 4 卡 910A 续训时该式输出 ``spd=1059 s/s``，而按日志时间戳反推
 的真实速率约为 2635 s/s（4.25 s/step × 有效 batch 11200），差 2.5 倍。
 """
+import ast
 import os
 import re
 import sys
@@ -23,6 +24,59 @@ SRC = open(os.path.join(ROOT, 'scripts', 'train_sft.py'), encoding='utf-8').read
 CODE = '\n'.join(
     ln for ln in SRC.splitlines() if not ln.lstrip().startswith('#')
 )
+
+# --------------------------------------------------------------------------- #
+# AST 定位工具
+# --------------------------------------------------------------------------- #
+# ⚠ 为什么本文件「基准推进在哪」这类断言必须走 AST、不能走正则：
+# 正则是在**整份原文**上扫的，注释与 docstring 和真代码逐字同形。63345c7 给
+# compute_l2_report 写的说明里引了一次 `if _do_stdout or _do_swanlab:`，
+# `re.search(r'if _do_stdout or _do_swanlab:(.*?)\n            if _do_stdout:')`
+# 就从那段 docstring 起扫，一路吞掉 365 行（把 resume 路径里合法的
+# `_last_stdout_step = step` 也吞了进去），于是「打点块内不得推进基准」被
+# 一段**解释代码的说明文字**判成失败。AST 里注释和 docstring 不是节点，
+# 定位对「又有人写了一段解释」彻底免疫。
+
+_BASELINE = {'_last_stdout_step': 'step', '_last_stdout_t': 'time.time()'}
+
+
+def _uniques(nodes, what):
+    assert len(nodes) == 1, \
+        f'期望恰好 1 个{what}，实得 {len(nodes)} 个：' \
+        + ', '.join(f'第 {n.lineno} 行' for n in nodes)
+    return nodes[0]
+
+
+def _if_nodes(tree, test_src):
+    return [n for n in ast.walk(tree)
+            if isinstance(n, ast.If) and ast.unparse(n.test) == test_src]
+
+
+def _metrics_if(tree):
+    """打点块 `if _do_stdout or _do_swanlab:`（stdout 与 swanlab 频率解耦）。"""
+    return _uniques(_if_nodes(tree, '_do_stdout or _do_swanlab'),
+                    '打点块 `if _do_stdout or _do_swanlab:`')
+
+
+def _stdout_print_if(tree):
+    """`if _do_stdout:` 里**含 spd_inst 打印行**的那一个。
+
+    main() 里有两处 `if _do_stdout:`（分段耗时行 / 剖析结束提示），靠「第一个」
+    定位会随排版漂移，所以按「体内含 spd_inst 的 logger.info」来认。
+    """
+    return _uniques(
+        [n for n in _if_nodes(tree, '_do_stdout')
+         if any('spd_inst' in ast.unparse(s) for s in n.body)],
+        '含 spd_inst 打印的 `if _do_stdout:` 分支',
+    )
+
+
+def _single_assign(stmt):
+    """`x = <值>` 返回 (x, 值源码)；链式赋值/非赋值返回 None。"""
+    if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)):
+        return stmt.targets[0].id, ast.unparse(stmt.value)
+    return None
 
 
 def test_spd_uses_effective_batch():
@@ -57,18 +111,30 @@ def test_instant_baseline_advanced_only_on_stdout():
     若基准跟着它推进，spd_inst 会变成 10 步口径，而打印行是 50 步
     区间，两者对不上、无法交叉验证。
     """
-    m = re.search(r'if _do_stdout:(.*?)\n\n', SRC, re.S)
-    assert m, '未找到 _do_stdout 分支'
-    assert '_last_stdout_step = step' in m.group(1), \
-        '_last_stdout_step 必须在 _do_stdout 分支内更新'
-    assert '_last_stdout_t = time.time()' in m.group(1), \
-        '_last_stdout_t 必须在 _do_stdout 分支内更新'
-    # 打点块（_do_stdout or _do_swanlab）内不得推进基准
-    m2 = re.search(r'if _do_stdout or _do_swanlab:(.*?)\n            if _do_stdout:',
-                   SRC, re.S)
-    assert m2, '未找到打点块'
-    assert '_last_stdout_step = step' not in m2.group(1), \
-        '瞬时速率基准不能在打点块内推进（会被 swanlab 频率带偏）'
+    tree = ast.parse(SRC)
+    out = _stdout_print_if(tree)      # `if _do_stdout:`（打印 spd_inst 那行）
+    metrics = _metrics_if(tree)       # `if _do_stdout or _do_swanlab:`
+
+    # --- ① 两个基准推进语句必须是 stdout 分支的**直接**语句 -----------------
+    # 「直接」= 不许藏在内层 if/try/with 里：藏起来就等于「不一定推进」，
+    # 打印行与基准又会跨口径。
+    got = {}
+    for stmt in out.body:
+        pair = _single_assign(stmt)
+        if pair and pair[0] in _BASELINE:
+            got[pair[0]] = pair[1]
+    assert got == _BASELINE, \
+        '瞬时速率基准必须在 _do_stdout 分支内直接更新，实际：' + repr(got)
+
+    # --- ② 打点块（_do_stdout or _do_swanlab）内不得推进基准 ----------------
+    # 查的是**整个子树里的写目标**（Store 上下文的 Name），而不是某一行的
+    # 逐字文本：写在打点块的任何嵌套层里都算违规。
+    bad = [w.lineno for w in ast.walk(metrics)
+           if isinstance(w, ast.Name) and isinstance(w.ctx, ast.Store)
+           and w.id in _BASELINE]
+    assert not bad, \
+        '瞬时速率基准不能在打点块内推进（会被 swanlab 频率带偏）：第 ' \
+        + ', '.join(map(str, bad)) + ' 行'
 
 
 def test_speed_inst_logged_and_uploaded():
