@@ -875,28 +875,35 @@ def _read_log_scalars(loss, policy_loss, value_loss):
     旧实现在同一打点里取了两遍（一次给 stdout、一次给 swanlab），共 6 次设备
     同步，其中 3 次完全重复。这里只取一次并返回给两处复用——数值逐位不变，
     同步次数减半。
+
+    ⚠ 第一个参数传的是 **`log_loss`（报告口径）**，不是被 backward 的
+    `opt_loss`。两者相差一个 `l2_report = c‖θ‖²`（P4.5b §3.1），故意不相等；
+    形参名沿用 `loss` 是为了不打乱本仓既有的调用/断言写法，含义以上行为准。
     """
     return loss.item(), policy_loss.item(), value_loss.item()
 
 
 # ---- D4（SFT 侧）：policy/value 损失口径 ------------------------------------------------
-# 三个 CLI 开关：--policy-loss {huber,ce}（默认 huber）、--value-loss {huber,mse}
-# （默认 huber）、--huber-beta（默认 0.5，既是 smooth L1 的 beta 也是拐点 delta）。
-# C8 修正：value 的 BCE 分支已删（见 compute_value_loss docstring）。
-# RL 侧（scripts/selfplay_train.py）的损失是 P3-C/P3-D，**不经过这里** —— 本文件
-# 的函数只服务 train_sft 自己的调用点，改语义不会波及 RL。
+# 三个 CLI 开关：--policy-loss {huber,ce}（**默认 ce**，P4.5b 由 huber 改回 ce）、
+# --value-loss {huber,mse}（默认 huber）、--huber-beta（默认 0.5，既是 smooth L1
+# 的 beta 也是拐点 delta）。C8 修正：value 的 BCE 分支已删（见
+# compute_value_loss docstring）。RL 侧（scripts/selfplay_train.py）的损失是
+# P3-C/P3-D，**不经过这里** —— 本文件的函数只服务 train_sft 自己的调用点，改语义
+# 不会波及 RL。
 #
 # 日志契约（不可动）：main() 打点仍用 loss / policy_loss / value_loss 三个键，
 # 下游 run.txt、看板与 tests/test_run_txt_sync.py 的消费者绑着它们，
 # tests/test_huber_loss.py::test_log_keys_unchanged 把三个键钉死。
+# `loss` 这个键的**含义**在 P4.5b 变过（多了 c‖θ‖²），键名没变 —— 跨新旧 run
+# 的曲线不可直接比，见 compute_l2_report docstring 与 report `## Fix2（b）增补`。
 #
-# ⚠ P4.5-fix 遗留的未解问题（**不是**已修复项，见 report `## Fix 增补`）：
-# policy 默认走 huber 时，其梯度天然比 value 弱 ~A 倍（Huber 在概率域的梯度
-# ∝ p(1−p) ≈ 1/A），修掉 1/A 归约 bug + 删掉 5.0 倍 value 补偿之后，实测
-# value:policy 仍差 250~360:1（老的 ce+bce 口径是 2.2:1）。**共享主干因此仍是
-# value-only 的**（实测主干上 value:policy ≈ 435:1）。要真正补平需要动
-# `--policy-loss` 的默认值（改回 ce）或重新定义 policy 的回归对象 —— 决定权在
-# 控制器，本任务不擅自改默认。
+# P4.5 遗留问题的收口（用户 2026-09-27 裁决 = P4.5b）：policy 默认从 huber 改回
+# ce 之后，「policy 梯度天生弱 ~A 倍、共享主干因此 value-only」这个结构性缺陷
+# 从根上消失（Huber 打在概率域，梯度带 softmax 雅可比的 p≈1/A；CE 打在 log-prob
+# 上，d(CE)/d(logit)=p−y 每坐标有界且与 A 无关）。实测 ce+huber、w=1 的
+# value:policy 梯度比 = 1.113:1（与 P4.5 报告记录的 ce 备选口径逐位一致），
+# 与老的 ce+5·bce（2.225:1）同一量级，**不需要补偿旋钮**。
+
 
 
 def huber_loss(pred, target, beta=0.5, reduction='mean'):
@@ -953,6 +960,10 @@ def compute_policy_loss(policy_logits, move_t, kind,
                         label_smoothing=0.1, huber_beta=0.5):
     """按 `--policy-loss` 分派 policy 损失；返回标量张量。
 
+    **默认 kind='ce'**（P4.5b 用户裁决）。`huber` 分支保留，仅供复现 D4/P4.5
+    的实验；它不是默认的理由写在 docstring 末尾的「P4.5b」一节（梯度尺度对
+    动作空间 A 的结构性依赖），别只看 `default=` 那一行就改回去。
+
     kind='ce'   —— **原口径原样保留**：`F.cross_entropy(logits, move_t,
         label_smoothing=...)`，与 D4 之前的调用逐字相同（默认 label_smoothing
         0.1 也照旧生效），数值行为不得改变。
@@ -993,6 +1004,38 @@ def compute_policy_loss(policy_logits, move_t, kind,
     + 360·二次段 ≈ **0.650**（旧 docstring 写的 ~1.5e-3 是 `mean over A` 口径的
     值，且 (0.9−0.25)/361 精确算是 **1.80e-03** 不是 1.5e-3），而 CE 起步
     ≈ ln(A) ≈ 5.89。`loss` 与 `policy_loss` 的数值与旧 run **不可直接比**。
+
+    ⚠⚠ **P4.5b：默认值已由 `huber` 改成 `ce`。`huber` 分支保留（可复现实验），
+    但它**不是**默认 —— 下面这段是留给下一个想把它改回去的人的：**
+
+    **定义在概率上的损失，其梯度尺度必然依赖动作空间 A。** 机制：CE 打在
+    log-prob 上，`d(CE)/d(logit_j) = p_j − y_j`，每坐标**有界且与 A 无关**；
+    而 Huber 打在概率上，链式法则要再乘一层 softmax 雅可比
+    `d p_k / d logit_j = p_k(δ_kj − p_j)`，专家坐标上就带一个 **p ≈ 1/A**：
+
+        Huber 的 logit 梯度 ≈ p_expert·(∂h/∂p) / B ≈ (1/A)·O(1) / B
+        CE    的 logit 梯度 ≈ 1/B（每坐标 O(1)，不随 A 缩）
+
+    ⇒ **归约只改一个 A 的幂，改不掉这个依赖**：`mean over A` 给 1/A²、
+    `sum over A` 给 A。本仓支持 9/13/19 路（A = 82/170/362），实测（生产
+    FCPolicyHead，B=8，one-hot，同一组特征/权重；量的是 `‖∂L/∂logits‖`，
+    见 `tests/test_huber_loss.py::test_ce_policy_gradient_is_action_space_independent`）：
+
+        A=82(9 路)      A=362(19 路)     362/82
+        CE                    0.3512     0.3530        **1.005**   ← 与 A 无关 ✓
+        Huber(p) sum over A   0.0046     0.0010        **0.223**   = 82/362 = 1/A
+
+    0.223 与 1/A = 0.2266 差 1.6%，即 Huber 的 logit 梯度**严格按 1/A 缩放**：
+    同一个学习率、同一个 batch，在 19 路上 policy 的有效步长只有 9 路的 1/4.4。
+    这不是可以靠 `--value-loss-weight` 补平的常数偏差 —— 它**随盘口变**，
+    9/13/19 三档要配三个不同的权重，且换 `--policy-loss` 之外的任何参数都不会
+    改变它。这条同时解释了 P4.5 修不掉的残余失衡：Huber 打在概率域时
+    policy 梯度天生弱 ~A 倍，共享主干因此是 value-only 的。
+
+    附带效果（已实测，`--value-loss-weight` 仍是 1.0、无补偿旋钮）：
+    `policy=ce + value=huber, w=1` 的 value:policy 梯度比 = **1.113 : 1**
+    （损失输入空间；P4.5 报告记录的 ce 备选口径同一个数，两次独立实测一致），
+    老的 `ce + 5·bce` 是 2.225:1 —— 同一量级，**不需要任何补偿旋钮**。
     """
     if kind == 'ce':
         return F.cross_entropy(policy_logits, move_t,
@@ -1035,6 +1078,19 @@ def compute_value_loss(value_pred, value_target, kind, huber_beta=0.5):
     squeeze 沿用旧实现（(B,1)→(B,)），保证 mse 分支连形状都与改前一致。
     value 侧**不涉及** P4.5-fix 修的那个 1/A 稀释：被替换的 `F.mse_loss` 本身
     就是 mean over B，与这里的归约逐位同口径。
+
+    ⚠ **为什么 value 侧留 Huber、而 policy 侧在 P4.5b 改回 CE**（简报 §2 的裁决）：
+    value 头是**单标量输出、没有 softmax**，链式法则里就不存在 policy 侧那个
+    「再乘一层 `∂p_k/∂logit_j = p_k(δ_kj−p_j)`」的雅可比因子，也就没有
+    「梯度尺度随动作空间 A 变」这个结构性缺陷（它的 A 相关差异只来自
+    `FCValueHead` 的 GAP 在 H·W 个位置上求平均，属结构性、与损失无关）。
+    policy 侧不同：CE 定义在 log-prob 上、`d(CE)/d(logit)=p−y` 每坐标有界且与 A
+    无关，Huber 定义在概率上则严格按 1/A 缩放（实测 A=82 vs 362 为 0.223；
+    见 compute_policy_loss docstring 末节与
+    tests/test_huber_loss.py::test_ce_policy_gradient_is_action_space_independent）。
+    留 Huber 的另一半理由是数值行为：|d| ≥ beta 段梯度有界（∝ sign(d)），
+    SFT 早期 value 误差很大（目标 ±1、初值 ~0 → |d| ~ 1）时 log 不会被一次
+    离群样本炸出天文数字（MSE 会：其梯度 ∝ 2|d|）。
     """
     pred = value_pred.squeeze()
     target = value_target.squeeze()
@@ -1126,6 +1182,84 @@ def _build_param_groups(model, args) -> list[dict]:
          'weight_decay': args.weight_decay},
         {'params': value_no_decay, 'lr': args.lr * args.value_lr_mult, 'weight_decay': 0.0},
     ]
+
+
+def compose_losses(policy_loss, value_loss, value_loss_weight, l2_report):
+    """总损失的两个口径，返回 `(opt_loss, log_loss)` —— **它们故意不相等**。
+
+    · `opt_loss = policy_loss + w·value_loss`：**被 backward** 的量。它**不含**
+      `c‖θ‖²`，因为正则走 AdamW 的**解耦** weight decay（`θ ← θ − lr·wd·θ`，在
+      参数更新里、按构造不进梯度）。
+    · `log_loss = opt_loss + l2_report`：写进日志 `loss` 键的量。多了
+      `c‖θ‖²`，是为了让用户裁决的恒等式 `L = L_policy + L_value + c‖θ‖²` 在日志
+      上字面成立（`l2_report` 由 `compute_l2_report` 给，纯 python float ⇒
+      **不进计算图**，所以即便对 log_loss 反向，L2 项也贡献不出任何梯度）。
+
+    为什么写成函数而不是在 main() 里手写两行：这两个量必须能被测试**按行为**
+      区分开（`tests/test_huber_loss.py::test_log_loss_identity` 断言
+      「log_loss.backward() 与 opt_loss.backward() 给出逐位相同的参数梯度」，
+      即 L2 项确实是纯报告）。只写在 main() 里就只能做源码子串检查 —— 而 P4.5
+      的教训正是「文案对了行为没对」。
+
+    ⚠ `value_loss_weight` 出现在**两项**里：报告口径必须与优化口径同权重，否则
+      `loss` 与被优化的目标在 `--value-loss-weight != 1` 时会差两项而不是一项。
+      默认 w=1.0 时它就是用户裁决里的 `L_policy + L_value`。
+    """
+    opt_loss = policy_loss + value_loss_weight * value_loss
+    log_loss = opt_loss + l2_report
+    return opt_loss, log_loss
+
+
+def compute_l2_report(param_groups):
+    """**只用于报告**的 c·Σ‖p‖²：恒等式 L = L_policy + L_value + c‖θ‖² 的第三项。
+
+    P4.5b 用户裁决（2026-09-27）：总损失按 `L = L_policy + L_value + c‖θ‖²`
+    报告，c 通常取 1e-4。**c 不是新参数** —— 它就是 `--weight-decay`（默认
+    1e-4，D1：不新增任何 CLI 参数），本函数**从优化器的 param_groups 里读回
+    真实的 `weight_decay`**，所以 `--weight-decay 0` ⇒ 本项恒 0，改成 2e-4
+    ⇒ 恰好翻倍。真正作用在参数上的仍是 AdamW 的**解耦** weight decay
+    （`θ ← θ − lr·wd·θ`，在参数更新里、不进梯度）；本函数既不参与 backward
+    也不改优化器。
+
+    ⚠⚠ **只对 `weight_decay != 0` 的组求和**（`_build_param_groups` 的两组
+    decay + 两组 no_decay）。no_decay 组（`param.ndim == 1`，即 norm 权重与
+    bias）在优化器里 `weight_decay=0.0`，**没有**被正则；若图省事对
+    `model.parameters()` 全量求和，日志就会报告一个仓库根本没有施加的正则
+    强度 —— 那比不报更糟（读者会以为 norm 权重也被收缩了）。故判据直接取
+    自 param_groups 本身，而不是重新实现一遍 ndim 判据：将来分组逻辑变了，
+    本函数自动跟着变，不会漂。
+
+    为什么这样切分（§3.1，最容易做错的一步）：训练循环里**两个变量**——
+    `opt_loss = policy + w·value`（被 backward，**不含**本项）与
+    `log_loss = policy + w·value + l2_report`（只写日志）。若把本项折进
+    backward，等于把**解耦**衰减变成**耦合** L2 塞进梯度：AdamW 自己的
+    weight decay 会与它叠加，训练行为立刻变化且没有任何报错。
+
+    DDP：`train_sft.py` 的日志标量（含 `loss`/`policy_loss`/`value_loss`）
+    **一律不做 all_reduce**（`_read_log_scalars` 直接 `.item()`，stdout 由
+    rank0 的 logger 过滤、swanlab 只在 is_main 建），本项跟随同一口径：本地
+    计算、本地 `.item()`、不加 collective。DDP 构造时把 rank0 的参数
+    broadcast 给所有 rank、每步再 all_reduce 梯度，故各 rank 的 θ 恒一致，
+    本项在各 rank 上是同一个数 —— 同一个日志键不会在不同 rank 上打架，
+    也就没有引入新的同步点/挂死风险。
+
+    代价：每步多一遍 decay 参数的平方和（v18 参考配置 12,838,112 个 fp32
+    参数 ≈ 51 MB 读/step）。实测每步增量见 report `## Fix2（b）增补` §3.4。
+    `p.detach()` 保证不建图、不占住反向图；每组一次 `float()` 同步（两组
+    decay ⇒ 2 次），与日志打点原有的 3 次同量级。
+    """
+    total = 0.0
+    for group in param_groups:
+        wd = float(group.get('weight_decay') or 0.0)
+        if wd == 0.0:
+            continue          # no_decay 组：优化器没在衰减它，报告里也不该有它
+        sq = None
+        for p in group['params']:
+            s = p.detach().pow(2).sum()
+            sq = s if sq is None else sq + s
+        if sq is not None:
+            total += wd * float(sq)     # 每组一次设备同步
+    return total
 
 
 def _param_group_sizes(source, key=None):
@@ -1362,18 +1496,32 @@ def main():
     # ---- D4（SFT 侧）：损失口径三参数 ------------------------------------
     # 只加这三个（D1：v21 不新增其他 CLI 参数）。RL 侧的对应拆分在 P3-C/P3-D，
     # scripts/selfplay_train.py 不在本任务范围。
-    ap.add_argument('--policy-loss', default='huber',
+    ap.add_argument('--policy-loss', default='ce',
                     choices=['huber', 'ce'],
-                    help='policy 损失：huber=对 label-smoothed one-hot 目标做 Huber'
+                    help='policy 损失：ce=原交叉熵口径（数值行为与 D4 之前逐位一致）'
+                         '，**默认**；huber=对 label-smoothed one-hot 目标做 Huber'
                          '(smooth L1, beta=--huber-beta，归约=类内 sum over A + '
-                         'batch mean)；ce=原交叉熵口径（数值行为与 D4 之前逐位一致）。'
-                         '默认 huber（D4）')
+                         'batch mean)，保留仅供复现实验。'
+                         '⚠ 默认**不是** huber（P4.5b 用户裁决）：定义在概率上的损失，'
+                         '梯度尺度必然依赖动作空间 A —— softmax 雅可比贡献 p≈1/A，'
+                         'mean over A 给 1/A²、sum over A 给 A，没有任何归约能消掉它；'
+                         '本仓支持 9/13/19 路（A=82/170/362），选 sum 等于让同一学习率'
+                         '在 9 路与 19 路之间差 4.4 倍。CE 定义在 log-prob 上，'
+                         'd(CE)/d(logit)=p−y 每坐标有界且与 A 无关（实测 A=82 vs 362 '
+                         '的 policy 梯度比 1.005，Huber 同条件 0.223=1/A）。'
+                         '详见 compute_policy_loss docstring')
     ap.add_argument('--value-loss', default='huber',
                     choices=['huber', 'mse'],
                     help='value 损失：huber=对 value_t∈[-1,1] 直接 Huber'
                          '(smooth L1, beta=--huber-beta)；mse=原均方误差口径'
                          '（数值行为与 D4 之前逐位一致）。默认 huber（D4/C8，'
-                         'BCE 分支已删）')
+                         'BCE 分支已删）。⚠ value 侧留 Huber 正是为了与 policy 侧'
+                         '相反：value 头是**单标量输出、无 softmax**，链式法则里'
+                         '没有 softmax 雅可比那层（p≈1/A），所以 policy 侧那个'
+                         '「梯度尺度随动作空间 A 变」的结构性缺陷在这里不存在；'
+                         '（value 侧仍有 A 相关的差异，但只来自 GAP 在 H·W 个位置上'
+                         '求平均，是结构性的、与损失选择无关。）且 |d|≥beta 段梯度'
+                         '有界、SFT 早期大误差不会把 log 炸飞')
     ap.add_argument('--huber-beta', default=0.5,
                     type=_positive_beta,
                     help='Huber(smooth L1) 的 beta，同时就是拐点位置 delta：'
@@ -2082,14 +2230,16 @@ def main():
                 with maybe_autocast(device, amp_dtype):
                     policy_logits, value_logit = model(state)
                     # D4：policy/value 损失由 --policy-loss / --value-loss 分派
-                    #（默认均为 huber），--huber-beta 同时供两处使用。
+                    # （默认 ce / huber），--huber-beta 同时供两处使用。
                     # C8：value 的 BCE 分支已删 —— 无 winrates 时也直接对
                     # value_t ∈ [-1,1] 回归；不再按数据字段分叉目标变换。
                     # P4.5-fix：--value-loss-weight 默认 1.0（BCE 时代的 5.0 倍
-                    # 补偿已按用户裁决删除）。⚠ 这只把 value:policy 的梯度比从
-                    # 443,808:1 拉到 ~250~360:1（老的 ce+bce 是 2.2:1），**远未
-                    # 补平** —— policy 走 huber 时梯度 ∝ p(1−p) ≈ 1/A 是结构性的。
-                    # 见 report `## Fix 增补` §残余比值。
+                    # 补偿已按用户裁决删除）。P4.5b：--policy-loss 默认由 huber
+                    # 改回 ce —— Huber 打在概率域时梯度带 softmax 雅可比的
+                    # p≈1/A，policy 梯度天生弱 ~A 倍且**随盘口变**；CE 打在
+                    # log-prob 上，d(CE)/d(logit)=p−y 每坐标有界、与 A 无关。
+                    # 见 compute_policy_loss docstring 末节与 report
+                    # `## Fix2（b）增补`。
                     policy_loss = compute_policy_loss(
                         policy_logits, move_t, args.policy_loss,
                         label_smoothing=args.label_smoothing,
@@ -2097,8 +2247,30 @@ def main():
                     value_loss = compute_value_loss(
                         value_logit, value_t, args.value_loss,
                         huber_beta=args.huber_beta)
-                    loss = policy_loss + args.value_loss_weight * value_loss
-                scaler.scale(loss / _accum_steps).backward()
+                    # ---- 被 backward 的量：不含 c‖θ‖² ------------------------
+                    # 为什么 opt_loss **不含** L2 项：正则走的是 AdamW 的**解耦**
+                    # weight decay（θ ← θ − lr·wd·θ，发生在参数更新里），按构造就
+                    # 不在梯度里。若把 c‖θ‖² 加进来，优化目标会从「解耦衰减」变成
+                    # 「耦合 L2 + 再次解耦衰减」的双重正则，训练行为立刻变化且不报错
+                    # —— 这是 P4.5b 最容易踩的坑，故 opt_loss / log_loss 分开命名。
+                    #
+                    # ---- 被写进日志 `loss` 键的量：加上 c‖θ‖² ----------------
+                    # 为什么 log_loss 与 opt_loss **不相等**：用户裁决的总损失口径
+                    # 是 L = L_policy + L_value + c‖θ‖²，要让恒等式在日志上字面成立。
+                    # l2_report 是**报告口径**的量（compute_l2_report：从
+                    # optimizer.param_groups 读回真实的 weight_decay，只覆盖
+                    # weight_decay != 0 的组，与优化器实际衰减同一批参数），在本次
+                    # optimizer.step() **之前**算，故与两个损失项取自同一个 θ。
+                    # 恒等式在一次 fp32 加法的精度内成立；⚠ 反过来用
+                    # `log_loss − policy − value` 反推 l2_report 时要记得 fp32
+                    # 舍入：两项都是 O(1)~O(10)，差值只剩 ~1e-7 的绝对精度
+                    # （test_log_loss_identity 按这个容差断言）。
+                    # ⚠ 读 loss 曲线的人必须知道：log_loss **不是**被优化的目标。
+                    l2_report = compute_l2_report(optimizer.param_groups)
+                    opt_loss, log_loss = compose_losses(
+                        policy_loss, value_loss, args.value_loss_weight, l2_report)
+                scaler.scale(opt_loss / _accum_steps).backward()
+
                 _t_comp += time.perf_counter() - _t_comp0
                 _n_timed += 1
                 if (i + 1) % _accum_steps == 0 or (i + 1) == n_batches:
@@ -2175,7 +2347,11 @@ def main():
                 step, args.log_every, args.swanlab_every,
                 swanlab_logger is not None)
             if _do_stdout or _do_swanlab:
-                _lv, _pv, _vv = _read_log_scalars(loss, policy_loss, value_loss)
+                # ⚠ 这里传的是 log_loss（报告口径，含 c‖θ‖²），**不是**上面被
+                # backward 的 opt_loss —— 日志的 `loss` 键按用户裁决报
+                # L_policy + L_value + c‖θ‖²，与优化器实际最小化的量差一个
+                # 纯报告项（见 compute_l2_report docstring 的 §3.1 说明）。
+                _lv, _pv, _vv = _read_log_scalars(log_loss, policy_loss, value_loss)
                 lr = optimizer.param_groups[0]['lr']
                 if _backend == 'cuda':
                     mem = torch.cuda.memory_reserved(device) / 1e9

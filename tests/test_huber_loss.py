@@ -9,7 +9,8 @@ P4.5-fix 追加（对应 task-p4-5-fix-brief.md）：
 * `test_policy_reduction_is_per_sample`  —— 钉住 §1 修掉的 1/A 归约 bug
   （D4 首版对 B×A 求均值，等于白吃一个 1/361 的稀释）。
 * `test_gradient_scale_not_collapsed`   —— 把 report `## Fix 增补` 的梯度实测
-  变成回归守卫（B=8, A=361, beta=0.5, targets ±1）。
+  变成回归守卫（B=8, A=361, beta=0.5, targets ±1）。**P4.5b 起降级为历史口径的
+  存档守卫**（policy 默认已改回 ce）。
 * `test_value_loss_weight_default_is_one_no_compensation` —— 钉住「删补偿」。
 * `test_huber_beta_rejects_non_positive` —— argparse 校验（0 / 负值 / 非数）。
 * `test_losses_under_bf16_autocast`     —— BF16 路径（既定 NPU 部署口径）。
@@ -17,6 +18,20 @@ P4.5-fix 追加（对应 task-p4-5-fix-brief.md）：
 * 加固：`test_huber_matches_torch_reference` 里近乎自指的默认 beta 断言改成
   手写公式对拍；`test_value_target_range_documented` 的两条纯 docstring 子串
   断言换成行为断言（梯度方向 + 未被重映射）。
+
+P4.5b 追加（对应 task-p4-5b-brief.md，用户裁决 2026-09-27）：
+* `test_policy_loss_default_is_ce`      —— 默认由 huber 改回 ce（**替代**
+  `test_default_args_are_huber`），并要求 help 文案写明「为什么默认不是它」。
+* `test_l2_report_uses_decay_group_only` —— c‖θ‖² 只覆盖 weight_decay != 0 的组。
+* `test_l2_report_scales_with_weight_decay` —— c 就是 --weight-decay，没被硬编码。
+* `test_log_loss_identity`               —— §3.1 的核心守卫：opt_loss / log_loss
+  是两个量，L2 项不进梯度（用「两个口径反向给出逐位相同的参数梯度」证明）。
+* `test_no_new_cli_params`               —— D1：选项名集合零新增（防 --l2-coef）。
+* `test_optimizer_param_groups_unchanged` —— 四组 weight_decay 仍是 {wd,0,wd,0}。
+* `test_policy_value_gradient_ratio`     —— 生产 FCPolicyHead/FCValueHead 上
+  policy:value 梯度比（**简报给的 5.4 复现不出来，见函数 docstring 与 report**）。
+* `test_ce_policy_gradient_is_action_space_independent` —— CE 的 policy 梯度与
+  动作空间 A 无关，而 Huber(p) 严格按 1/A（sum）/ 1/A²（mean）缩放。
 
 原则：
 * Huber 的正确性 oracle = torch 官方 `F.smooth_l1_loss(..., beta=...)`
@@ -39,6 +54,7 @@ import textwrap
 
 import pytest
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -54,10 +70,11 @@ from scripts.train_sft import (  # noqa: E402
 SRC_PATH = os.path.join(ROOT, 'scripts', 'train_sft.py')
 SRC = open(SRC_PATH, encoding='utf-8').read()
 
-
 # --------------------------------------------------------------------------- #
 # 源码/argparse 提取工具
 # --------------------------------------------------------------------------- #
+
+
 def _module_tree():
     return ast.parse(SRC)
 
@@ -97,9 +114,35 @@ def _replay_parser():
     return ap
 
 
+def _help_entry(ap, metavar):
+    """从 `--help` 的 options 段里取出**某一个**选项的整条 help（换行已压平）。
+
+    不能用「find 到下一个 `[--` 为止」那种切法：`format_help()` 的 usage 段里
+    也出现同样的 `[--xxx ...]` 字样，混进去会把**别的选项**的文案算进来
+    （本文件就踩过：`--policy-loss` 的断言读到了 `--value-loss` 的「默认 huber」）。
+    这里改成按缩进解析 options 段：从匹配 `  -` 开头的选项行起，到下一个选项行止。
+    """
+    txt = ap.format_help()
+    lines = txt[txt.rindex('\noptions:') + 1:].splitlines()
+    out, on = [], False
+    for ln in lines[1:]:
+        if ln.startswith('  -') and not ln.startswith('   '):
+            if on:
+                break
+            on = metavar in ln
+            if on:
+                out.append(ln)
+            continue
+        if on:
+            out.append(ln)
+    assert out, f'--help 的 options 段里找不到 {metavar}'
+    return ' '.join(' '.join(out).split())
+
 # --------------------------------------------------------------------------- #
 # 1. Huber 实现正确性 oracle：与 F.smooth_l1_loss 逐位相同 + 手写公式复核
 # --------------------------------------------------------------------------- #
+
+
 def test_huber_matches_torch_reference():
     g = torch.Generator().manual_seed(20260925)
     cases = [
@@ -160,10 +203,11 @@ def _manual_smooth_l1(pred, target, beta):
     return torch.where(d.abs() < beta, 0.5 * d * d / beta,
                        d.abs() - 0.5 * beta)
 
-
 # --------------------------------------------------------------------------- #
 # 2. 分段极限：二次段梯度 = d/beta，线性段梯度 = sign(d)/N（数值梯度验证）
 # --------------------------------------------------------------------------- #
+
+
 def test_huber_limits():
     beta = 0.5
 
@@ -227,18 +271,36 @@ def test_huber_gradient_is_divided_by_N():
         assert hl == pytest.approx(beta * sl, rel=1e-6), \
             f'beta={beta}: huber_loss(delta)={hl:.6f} 应 = beta·smooth_l1={beta * sl:.6f}'
 
+# --------------------------------------------------------------------------- #
+# 3. 三个旗的真实 argparse 定义：默认 ce / huber / 0.5
+# --------------------------------------------------------------------------- #
 
-# --------------------------------------------------------------------------- #
-# 3. 三个旗的真实 argparse 定义：默认 huber / huber / 0.5
-# --------------------------------------------------------------------------- #
-def test_default_args_are_huber():
+
+def test_policy_loss_default_is_ce():
+    """P4.5b 用户裁决：policy 默认由 `huber` 改回 **`ce`**，value 仍是 `huber`。
+
+    为什么默认不是 huber（这条断言的一半价值在**理由**上，所以下面同时查 help
+    文案有没有把理由写下来 —— 只钉 `default='ce'` 的话，下一个人照样能改回去）：
+
+    **定义在概率上的损失，梯度尺度必然依赖动作空间 A。** CE 打在 log-prob 上，
+    `d(CE)/d(logit_j) = p_j − y_j`，每坐标有界、与 A 无关；Huber 打在概率上，
+    链式法则要再乘一层 softmax 雅可比，专家坐标上带一个 `p ≈ 1/A`。于是
+    `mean over A` 给 1/A²、`sum over A` 给 A，**没有任何归约能消掉它**。本仓支持
+    9/13/19 路（A = 82/170/362）⇒ 同一学习率在 9 路与 19 路之间差 4.4 倍。
+    实测见 `test_ce_policy_gradient_is_action_space_independent`（A=82 vs 362：
+    CE 的 policy 梯度比 1.005，Huber 0.223 = 1/A）。
+
+    `huber` 选项**保留**（实验可复现），实现一字未改。
+    """
     kw = _add_argument_kwargs(_fn('main'))
     for flag in ('--policy-loss', '--value-loss', '--huber-beta'):
         assert flag in kw, f'main() 缺少 {flag}（D4 三参数之一）'
 
-    assert ast.literal_eval(kw['--policy-loss']['default']) == 'huber'
+    assert ast.literal_eval(kw['--policy-loss']['default']) == 'ce', \
+        '--policy-loss 默认必须是 ce（P4.5b 用户裁决）'
     assert ast.literal_eval(kw['--policy-loss']['choices']) == ['huber', 'ce']
-    assert ast.literal_eval(kw['--value-loss']['default']) == 'huber'
+    assert ast.literal_eval(kw['--value-loss']['default']) == 'huber', \
+        'value 侧默认仍是 huber（用户未裁决改它）'
     assert ast.literal_eval(kw['--value-loss']['choices']) == ['huber', 'mse']
     assert ast.literal_eval(kw['--huber-beta']['default']) == 0.5
     tnode = kw['--huber-beta']['type']
@@ -251,11 +313,11 @@ def test_default_args_are_huber():
     # 真 parser（重放 add_argument，不执行 main）：默认解析 + 显式覆盖 + 非法值被拒
     ap = _replay_parser()
     ns = ap.parse_args(['--data', 'dummy.npz'])
-    assert (ns.policy_loss, ns.value_loss, ns.huber_beta) == ('huber', 'huber', 0.5), \
+    assert (ns.policy_loss, ns.value_loss, ns.huber_beta) == ('ce', 'huber', 0.5), \
         f'默认解析结果错误: {(ns.policy_loss, ns.value_loss, ns.huber_beta)}'
-    ns2 = ap.parse_args(['--data', 'd', '--policy-loss', 'ce',
+    ns2 = ap.parse_args(['--data', 'd', '--policy-loss', 'huber',
                          '--value-loss', 'mse', '--huber-beta', '0.1'])
-    assert (ns2.policy_loss, ns2.value_loss, ns2.huber_beta) == ('ce', 'mse', 0.1)
+    assert (ns2.policy_loss, ns2.value_loss, ns2.huber_beta) == ('huber', 'mse', 0.1)
     for bad in (['--policy-loss', 'bce'], ['--value-loss', 'bce'],
                 ['--policy-loss', 'huber_v2']):
         err = io.StringIO()
@@ -263,6 +325,21 @@ def test_default_args_are_huber():
             ap.parse_args(['--data', 'd'] + bad)
         assert 'invalid choice' in err.getvalue(), \
             f'非法值 {bad} 未被 argparse 拒绝: {err.getvalue()!r}'
+
+    # help 文案必须记录「为什么默认不是 huber」，否则下一个人会再把它设成默认
+    ap = _replay_parser()
+    entry = _help_entry(ap, '--policy-loss {huber,ce}')
+    assert '默认**不是** huber' in entry, \
+        f'--policy-loss 的 help 没写明「默认不是 huber」: {entry}'
+    for token in ('1/A', '1/A²', 'A=82/170/362', '4.4'):
+        assert token in entry, \
+            f'--policy-loss 的 help 缺 A 依赖论证的 {token!r}: {entry}'
+    assert '默认 huber' not in entry, \
+        f'--policy-loss 的 help 仍把 huber 说成默认: {entry}'
+    # value 侧留 huber 的理由也要在文案里（单标量输出、无 softmax ⇒ 与 A 无关）
+    ventry = _help_entry(ap, '--value-loss {huber,mse}')
+    assert '无 softmax' in ventry, \
+        f'--value-loss 的 help 没写明「无 softmax 所以尺度与 A 无关」: {ventry}'
 
 
 def test_huber_beta_rejects_non_positive():
@@ -305,10 +382,13 @@ def test_value_loss_weight_default_is_one_no_compensation():
         '--value-loss-weight 的 type 应仍是 float'
     assert _replay_parser().parse_args(['--data', 'd']).value_loss_weight == 1.0
 
-    # 权重仍作用在 value 项上（只是默认值不再补偿）
+    # 权重仍作用在 value 项上（只是默认值不再补偿）。
+    # ⚠ P4.5b：组合式搬进了 compose_losses（为了让「L2 项不进梯度」能被**按行为**
+    # 测，见 test_log_loss_identity），所以断言跟着搬：main() 必须把 args 传进去。
+    assert 'opt_loss = policy_loss + value_loss_weight * value_loss' in \
+        inspect.getsource(t.compose_losses), \
+        'opt_loss 的组合式被改动（应仍是 policy_loss + w * value_loss）'
     main_src = inspect.getsource(t.main)
-    assert 'policy_loss + args.value_loss_weight * value_loss' in main_src, \
-        'loss 的组合式被改动（应仍是 policy_loss + w * value_loss）'
     assert 'args.value_loss_weight' in main_src, '--value-loss-weight 成了死参数'
 
     # help 文案不得再宣称默认 5.0（只看本选项自己的条目，不看下一项）
@@ -333,10 +413,11 @@ def test_value_loss_weight_default_is_one_no_compensation():
         assert 'value-loss-weight' not in body, \
             f'{rel} 显式传了 --value-loss-weight（report 已列为待复核传入点）'
 
-
 # --------------------------------------------------------------------------- #
 # 4. SFT 里不再有 BCE 分支（AST：挪了位置 ≠ 删干净）
 # --------------------------------------------------------------------------- #
+
+
 def test_sft_has_no_bce_branch():
     tree = _module_tree()
     forbidden = {'binary_cross_entropy', 'binary_cross_entropy_with_logits',
@@ -365,10 +446,11 @@ def test_sft_has_no_bce_branch():
     assert 'compute_policy_loss(' in main_src, 'main() 未调用 compute_policy_loss'
     assert 'compute_value_loss(' in main_src, 'main() 未调用 compute_value_loss'
 
-
 # --------------------------------------------------------------------------- #
 # 5. 日志键不变：loss / policy_loss / value_loss（有且仅有）
 # --------------------------------------------------------------------------- #
+
+
 def test_log_keys_unchanged():
     log_dicts = []
     for call in ast.walk(_fn('main')):
@@ -394,10 +476,11 @@ def test_log_keys_unchanged():
     assert 'return loss.item(), policy_loss.item(), value_loss.item()' in SRC, \
         '_read_log_scalars 的三元组变了'
 
-
 # --------------------------------------------------------------------------- #
 # 6. ce / mse 两条路径数值与改前一致（期望值全部手算）
 # --------------------------------------------------------------------------- #
+
+
 def _manual_log_softmax(x):
     m = x.max(dim=-1, keepdim=True).values
     z = x - m
@@ -455,10 +538,11 @@ def test_ce_and_mse_paths_unchanged():
     assert not torch.isclose(torch.tensor(m), torch.tensor(h), rtol=1e-3), \
         'mse 与 huber 分派疑似串了'
 
-
 # --------------------------------------------------------------------------- #
 # 7. 目标值域：value_t ∈ [-1,1] 原样回归（没有概率化 / 截断 / 取 log）
 # --------------------------------------------------------------------------- #
+
+
 def test_value_target_range_documented():
     """P4.5-fix 加固：前两条断言原来是纯 docstring 子串检查（`'[-1,1]' in doc`），
     任何**行为**改动下都恒真 —— 已被 review 点名为最弱用例之一。改成行为断言：
@@ -511,10 +595,11 @@ def test_value_target_range_documented():
     assert float(got_h) > float(inside), \
         '越界目标的损失不大于 clamp 后的损失（clamp 回潮）'
 
-
 # --------------------------------------------------------------------------- #
 # 8. 接线锁：三个旗真的接到损失调用点上（不是死参数）
 # --------------------------------------------------------------------------- #
+
+
 def test_flags_reach_loss_calls():
     calls = [c for c in ast.walk(_fn('main')) if isinstance(c, ast.Call)
              and isinstance(c.func, ast.Name)]
@@ -547,11 +632,12 @@ def test_flags_reach_loss_calls():
     assert isinstance(vc[0].args[1], ast.Name) and vc[0].args[1].id == 'value_t', \
         'value 损失的目标不是 value_t（中间插了变换？）'
 
-
 # --------------------------------------------------------------------------- #
 # 9. policy-huber 语义锁：Huber(softmax(logits), label-smoothed one-hot)
 #    归约 = 类内 sum over A + batch mean（P4.5-fix 修，见 §10）
 # --------------------------------------------------------------------------- #
+
+
 def test_policy_huber_semantics_pinned():
     g = torch.Generator().manual_seed(3)
     logits = torch.randn(4, 11, generator=g) * 3
@@ -597,13 +683,14 @@ def test_policy_huber_semantics_pinned():
                              label_smoothing=eps, huber_beta=beta)
     assert not torch.isclose(got, ce, rtol=1e-3), 'policy 分派疑似串了'
 
-
 # --------------------------------------------------------------------------- #
 # 10.（P4.5-fix）policy 归约 = 逐样本（类内 sum over A + batch mean）
 # --------------------------------------------------------------------------- #
 # §1 的 Critical 根因：D4 首版对 B×A 求均值，而被替换的 F.cross_entropy 是
 # 逐样本（类内已归一）再对 batch 求均值 —— 差一个 1/A 的稀释（A=361 → 361×），
 # 是实现 bug 不是设计选择。
+
+
 _GRAD_B, _GRAD_A, _GRAD_BETA, _GRAD_EPS = 8, 361, 0.5, 0.1
 _GRAD_MOVES = torch.tensor([0, 45, 90, 135, 180, 225, 270, 315])
 _GRAD_VT = torch.tensor([[1.], [-1.], [1.], [-1.], [1.], [-1.], [1.], [-1.]])
@@ -666,9 +753,9 @@ def test_gradient_scale_not_collapsed():
        首版实测 2.72e-06，修后 9.83e-04（+361×）。
     2. value:policy 梯度比必须落在一个显式的坏值区间里：修后 ≈ 360:1
        （精确均匀初值），比老口径 ce+bce 的 2.2:1 差两个数量级。
-       这条**不是**「已修好」的断言 —— 它是**残余失衡的守卫**：哪天 policy 梯度
-       再塌一个数量级，或有人用 `--value-loss-weight` 悄悄把它调平（= 把这个
-       结构性缺陷藏进一个调参值里），本测试会红。
+       **P4.5b 起 policy 默认改回 ce**，本段因此从「残余失衡的守卫」降级为
+       「历史口径的存档守卫」：那三个数字是 report §8.1 表的根据，不许漂；
+       当前默认的比值由 `test_policy_value_gradient_ratio` 钉。
     3. 老口径的 2.2:1 参照仍成立（证明 harness 没坏、参照系没漂）。
     """
     B, A, beta, eps = _GRAD_B, _GRAD_A, _GRAD_BETA, _GRAD_EPS
@@ -707,7 +794,10 @@ def test_gradient_scale_not_collapsed():
     assert gp_old == pytest.approx(0.317757, rel=5e-3), \
         f'ce 路径梯度不再逐位等于 D4 之前的量级：{gp_old:.6g}'
 
-    # 1+2. 修后口径（默认 huber + huber，--value-loss-weight 默认 1.0）
+    # 1+2. P4.5 的交付口径（**当时**的默认：huber + huber，w=1.0）
+    #    ⚠ P4.5b 起 `--policy-loss` 默认已改回 ce，本段从「残余失衡的守卫」变成
+    #    「历史口径的存档」：数字不许漂（它们是 report §8.1 表的根据），但不再
+    #    描述当前默认。当前默认的比值由 test_policy_value_gradient_ratio 钉。
     pl, gp, gv = grads('huber', 1.0)
     assert gp > 300 * broken_policy_grad(), \
         f'policy 梯度又塌了：{gp:.6g} vs 首版 {broken_policy_grad():.6g}'
@@ -720,12 +810,12 @@ def test_gradient_scale_not_collapsed():
         (f'value:policy 梯度比 = {ratio:.1f}:1 掉出 [200, 700] 区间。'
          '变好：policy 梯度被补回来了（可收紧上界）。'
          '变坏：policy 又被稀释/被补偿压下去了 —— 结构性缺陷回来了。'
-         '当前状态：仍是残余失衡，见 report `## Fix 增补` §残余比值。')
+         '当前状态：P4.5b 已把默认改回 ce 消除它；本断言现在只是存档守卫。')
 
-    # ce 备选：把 policy 默认换回 ce 就能回到 ~1.1:1（控制器尚未裁决）
+    # ce 口径：P4.5 记录它是 ~1.1:1（控制器当时未裁决），P4.5b 已把它设为默认
     _, gp_ce, gv_ce = grads('ce', 1.0)
     assert gv_ce / gp_ce == pytest.approx(1.113, rel=2e-2), \
-        f'ce 备选口径的参照漂了：{gv_ce / gp_ce:.4f}（应 ≈ 1.113）'
+        f'ce 口径的参照漂了：{gv_ce / gp_ce:.4f}（应 ≈ 1.113）'
 
 
 def test_huber_loss_api_truth_table():
@@ -829,3 +919,525 @@ def test_losses_under_bf16_autocast():
         'BF16 下 policy 反向产生了非有限梯度'
     # 梯度仍然非零（不是被低精度吃掉的全零）
     assert float(lp.grad.abs().max()) > 0.0, 'BF16 下 policy 梯度恒为 0'
+
+# --------------------------------------------------------------------------- #
+# 11.（P4.5b）总损失口径：L = L_policy + L_value + c‖θ‖²（c = --weight-decay）
+#
+#     用户裁决 2026-09-27：**解耦优化 + 日志口径补 c‖θ‖²**。
+#     本节锁三件事：
+#       (a) c 就是 --weight-decay、没有新增任何 CLI 参数（D1）；
+#       (b) l2_report 只覆盖优化器**真的在衰减**的那组参数；
+#       (c) 被 backward 的 opt_loss 与被记日志的 log_loss 是**两个量**，
+#           L2 项不进梯度（§3.1 —— 把解耦衰减折进梯度是最危险的一步）。
+# --------------------------------------------------------------------------- #
+
+
+_EPS = 0.1          # --label-smoothing 默认
+_BETA = 0.5         # --huber-beta 默认
+_WD = 1e-4          # --weight-decay 默认（= 裁决里的 c）
+_HEAD_SEED = 20260927
+
+
+class _Tiny(nn.Module):
+    """有 bias 的小 MLP：造出 decay（ndim=2）与 no_decay（ndim=1）两类参数。
+
+    必须带一个 `value` 子模块 —— `_build_param_groups` 按 `'value.'` 前缀把
+    value 头单列一组，没有它会直接 AttributeError。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(4, 3, bias=True)
+        self.value = nn.Linear(4, 1, bias=True)
+
+
+def _opt(net, weight_decay=_WD, lr=0.1, value_lr_mult=5.0):
+    class _A:
+        pass
+    a = _A()
+    a.lr, a.weight_decay, a.value_lr_mult = lr, weight_decay, value_lr_mult
+    return torch.optim.AdamW(t._build_param_groups(net, a), lr=lr)
+
+
+def test_l2_report_uses_decay_group_only():
+    """l2_report 只覆盖 `weight_decay != 0` 的参数（§3.2）。
+
+    判据来自 **optimizer.param_groups 本身**（与优化器实际衰减的集合同源），
+    不是重新实现一遍 `ndim == 1`。两条行为断言互相把靶子钉死：
+
+    · 往 **no_decay**（norm 权重 / bias）里塞大数 ⇒ l2_report **一字不变**；
+    · 往 **decay**（ndim=2 权重）里塞大数 ⇒ l2_report **按平方精确增加**。
+    """
+    torch.manual_seed(7)
+    net = _Tiny()
+    opt = _opt(net)
+    wds = [g['weight_decay'] for g in opt.param_groups]
+    assert wds == [_WD, 0.0, _WD, 0.0], f'分组 weight_decay 布局变了: {wds}'
+
+    base = t.compute_l2_report(opt.param_groups)
+    decay_p = opt.param_groups[0]['params'][0]        # fc.weight，ndim=2
+    nodecay_p = opt.param_groups[1]['params'][0]     # fc.bias，ndim=1
+    assert decay_p.ndim == 2 and nodecay_p.ndim == 1
+    ref = float(base)
+
+    # (1) no_decay 参数塞 1e3：l2_report 必须纹丝不动
+    with torch.no_grad():
+        nodecay_p.add_(torch.full_like(nodecay_p, 1e3))
+    assert t.compute_l2_report(opt.param_groups) == ref, \
+        'bias（no_decay 组）被算进 l2_report 了 —— 日志会报告一个仓库没施加的强度'
+
+    # (2) decay 参数塞 1e3：l2_report 恰好增加 wd·(‖p'‖² − ‖p‖²)
+    before_sq = float(decay_p.detach().pow(2).sum())
+    with torch.no_grad():
+        decay_p.add_(torch.full_like(decay_p, 1e3))
+    after_sq = float(decay_p.detach().pow(2).sum())
+    want = ref + _WD * (after_sq - before_sq)
+    got = t.compute_l2_report(opt.param_groups)
+    assert got == pytest.approx(want, rel=1e-9), \
+        f'L2 项没覆盖 decay 参数：got={got} want={want}'
+
+    # (3) 全量参数求和（**错误**口径）会明显更大 —— 证明上面的断言不是恒真
+    allsum = _WD * float(sum(float(p.detach().pow(2).sum())
+                             for p in net.parameters()))
+    assert allsum > got, '全量求和反而更小：本用例失去区分力'
+    assert _WD * float(nodecay_p.detach().pow(2).sum()) == pytest.approx(
+        allsum - got, rel=1e-6), 'no_decay 组的差值对不上'
+
+    # (4) 返回值必须是**纯 python float**：一旦变成与参数相连的张量，L2 项就
+    #     悄悄进了计算图，log_loss 反向会给参数加上一个 wd·2θ 的梯度 ——
+    #     那是把解耦衰减变成耦合 L2，且没有任何报错。
+    assert isinstance(got, float) and not isinstance(got, torch.Tensor), \
+        f'compute_l2_report 必须返回 python float（纯报告量），实得 {type(got)}'
+    assert isinstance(t.compute_l2_report(_opt(net, weight_decay=0.0).param_groups),
+                      float), '全 no_decay 时也必须返回 float 0.0'
+
+
+def test_l2_report_scales_with_weight_decay():
+    """c 就是 `--weight-decay`，没有被硬编码成别的常数（§4.3 / D1）。
+
+    `--weight-decay 0` ⇒ 恒 0（优化器不衰减 ⇒ 报告里也不该有）；翻倍 ⇒ 翻倍。
+    """
+    torch.manual_seed(7)
+    net = _Tiny()
+    seen = {}
+    for wd in (0.0, _WD, 2 * _WD, 0.05):
+        seen[wd] = t.compute_l2_report(_opt(net, weight_decay=wd).param_groups)
+    assert seen[0.0] == 0.0, '--weight-decay 0 时 l2_report 必须恒 0'
+    assert seen[_WD] == pytest.approx(seen[2 * _WD] / 2, rel=1e-9), \
+        'l2_report 与 --weight-decay 不成正比（c 被硬编码了？）'
+    assert seen[0.05] == pytest.approx(500 * seen[_WD], rel=1e-9), \
+        'l2_report 与 --weight-decay 不成正比（c 被硬编码了？）'
+
+    # c 只能来自 --weight-decay：模块里不许出现第二个 L2 系数
+    lit = [n.value for n in ast.walk(_fn('compute_l2_report'))
+           if isinstance(n, ast.Constant) and isinstance(n.value, float)
+           and 0 < n.value < 1]
+    assert not lit, f'compute_l2_report 里出现了硬编码浮点常数: {lit}'
+
+
+def test_log_loss_identity():
+    """`log_loss == policy + w·value + l2_report` 且 `opt_loss` **不含** L2（§3.1）。
+
+    这是防「把解耦衰减折进梯度」的核心守卫，用**行为**而不是源码子串：
+
+    1. 两个量的数值关系（浮点容差内）；
+    2. `log_loss.backward()` 与 `opt_loss.backward()` 给出**逐位相同**的参数
+       梯度 —— 即便对含 L2 项的 log_loss 反向，L2 项也贡献不出任何梯度
+       （l2_report 是 python float，不在计算图里）。这条一旦变红，说明有人把
+       `c‖θ‖²` 变成了可微张量接进 backward ⇒ 优化行为已经改变。
+
+    另外：w ≠ 1 时报告口径必须**同样带权**，否则 `loss` 与被优化的目标会差两项。
+    """
+    l2 = 0.588066
+    for w in (1.0, 2.5):
+        pol = torch.tensor(2.0, requires_grad=True)
+        val = torch.tensor(0.5, requires_grad=True)
+        opt_loss, log_loss = t.compose_losses(pol, val, w, l2)
+        opt_v, log_v = float(opt_loss.detach()), float(log_loss.detach())
+        assert opt_v == pytest.approx(2.0 + w * 0.5, rel=1e-6), \
+            'opt_loss 必须恰好是 policy + w·value（不含 L2）'
+        assert log_v == pytest.approx(2.0 + w * 0.5 + l2, rel=1e-6), \
+            'log_loss 必须恰好是 policy + w·value + l2_report'
+        assert log_v - opt_v == pytest.approx(l2, rel=1e-6), \
+            '两个口径之差必须**只有** L2 这一项'
+
+    grads = {}
+    for name, idx in (('opt', 0), ('log', 1)):
+        pol = torch.tensor(2.0, requires_grad=True)
+        val = torch.tensor(0.5, requires_grad=True)
+        pair = t.compose_losses(pol, val, 1.0, l2)
+        pair[idx].backward()
+        grads[name] = (pol.grad.clone(), val.grad.clone())
+    assert torch.equal(grads['opt'][0], grads['log'][0]), \
+        'log_loss 的梯度与 opt_loss 不同 ⇒ L2 项进了计算图（§3.1 被漏改）'
+    assert torch.equal(grads['opt'][1], grads['log'][1])
+    assert float(grads['opt'][0]) == 1.0 and float(grads['opt'][1]) == 1.0
+
+    # --- 端到端：喂**真的** l2_report 与真的参数进去（上面用的是手写常数，
+    #     抓不到「compute_l2_report 返回了可微张量」这类变异）---
+    def end_to_end(idx):
+        torch.manual_seed(5)
+        net = _Tiny()
+        x = torch.randn(4, 4, generator=torch.Generator().manual_seed(9))
+        pol_l = compute_policy_loss(net.fc(x), torch.tensor([0, 1, 2, 0]), 'ce',
+                                    label_smoothing=_EPS, huber_beta=_BETA)
+        val_l = compute_value_loss(net.value(x), torch.ones(4, 1), 'huber',
+                                   huber_beta=_BETA)
+        l2_real = t.compute_l2_report(_opt(net).param_groups)
+        opt_v, log_v = t.compose_losses(pol_l, val_l, 1.0, l2_real)
+        # 恒等式的**精度上限是 float32 的舍入**，不是 l2 的大小：log_loss 与
+        # opt_loss 都是 O(1)~O(10) 的 fp32，两数相减只剩 ~1e-7 的绝对精度，
+        # 而 l2_report 可以小到 1e-4 量级（刚初始化的权重）。所以容差按
+        # 「操作数的 float32 eps」给，而不是按 l2 的相对误差给。
+        gap = abs(float(log_v.detach() - opt_v.detach()) - l2_real)
+        tol = 8 * float(torch.finfo(torch.float32).eps) * abs(float(log_v.detach()))
+        assert gap <= tol, f'真值代入后恒等式不成立：差 {gap:.3e} > 容差 {tol:.3e}'
+        assert l2_real > 0.0, 'l2_report 应为正'
+        (opt_v, log_v)[idx].backward()
+        return [p.grad.clone() for p in net.parameters()], l2_real
+
+    g_opt, l2_real = end_to_end(0)
+    g_log, _ = end_to_end(1)
+    for a, b in zip(g_opt, g_log):
+        assert torch.equal(a, b), \
+            '真参数上两个口径的梯度不同 ⇒ L2 项进了计算图（§3.1 被漏改）'
+    assert any(float(g.abs().max()) > 0 for g in g_opt), '梯度全零，本用例无效'
+
+    # 接线：main() 必须 backward 第一个返回值、记日志第二个返回值，且
+    # l2_report 取自 optimizer.param_groups（不是 model.parameters()）
+    main_src = inspect.getsource(t.main)
+    assert 'compose_losses(' in main_src, 'main() 没用 compose_losses 拆两个口径'
+    assert 'scaler.scale(opt_loss / _accum_steps).backward()' in main_src, \
+        'backward 的必须是 opt_loss（含 L2 会把解耦衰减变成耦合 L2）'
+    assert '_read_log_scalars(log_loss, policy_loss, value_loss)' in main_src, \
+        '日志读的第一个标量必须是 log_loss'
+    assert 'compute_l2_report(optimizer.param_groups)' in main_src, \
+        'l2_report 必须从 optimizer.param_groups 取（与实际衰减同源）'
+    # 单个 `loss` 变量不许再同时承担两个角色
+    bare = [n.lineno for n in ast.walk(_fn('main'))
+            if isinstance(n, ast.Name) and n.id == 'loss'
+            and isinstance(n.ctx, ast.Store)]
+    assert not bare, f'main() 里仍有一个裸 `loss` 变量（既 backward 又记日志）: {bare}'
+
+
+def test_no_new_cli_params():
+    """D1：除既有 61 个选项外**零新增**（防「顺手加个 --l2-coef」）。
+
+    c 就是 `--weight-decay`（已默认 1e-4），裁决明确「不得新增任何 CLI 参数」。
+    这里冻结的是**选项名集合**（含顺序）：删一个、改名一个、插入一个都会红。
+    """
+    kw = _add_argument_kwargs(_fn('main'))
+    expected = [
+        '--data', '--max-games-per-tgz', '--device', '--use-amp', '--batch-size',
+        '--epochs', '--lr', '--weight-decay', '--board-size', '--save-every',
+        '--out', '--ver', '--backbone-channels', '--backbone-res-blocks',
+        '--attention-mode', '--num-attention-layers', '--num-heads',
+        '--attention-dropout', '--attn-mode', '--attn-window', '--eval-every',
+        '--eval-max-batches', '--log-every', '--log-file', '--res-blocks',
+        '--convnext-blocks', '--attn-blocks', '--value-res-blocks',
+        '--value-channels', '--policy-channels', '--policy-layers',
+        '--prefetch-workers', '--prefetch-depth', '--resume', '--model',
+        '--value-loss-weight', '--policy-loss', '--value-loss', '--huber-beta',
+        '--value-lr-mult', '--label-smoothing', '--use-checkpoint', '--use-ema',
+        '--gradient-accumulation-steps', '--scaler-init-scale',
+        '--scaler-growth-interval', '--npu-graph-compile', '--compile',
+        '--compile-mode', '--flash-attn', '--arch', '--export-onnx',
+        '--onnx-quantize', '--swanlab', '--swanlab-api-key', '--swanlab-every',
+        '--early-stop', '--early-stop-patience', '--early-stop-metric',
+        '--max-gpu-memory', '--c2net',
+    ]
+    assert list(kw) == expected, (
+        f'CLI 选项集合被改动（D1：零新增/零删除/零改名）。'
+        f'新增={sorted(set(kw) - set(expected))} 缺失={sorted(set(expected) - set(kw))}')
+    # 特别地：L2 系数不许有独立参数，label smoothing 也不许有第二个旋钮
+    for banned in ('--l2-coef', '--l2-weight', '--weight-decay-l2',
+                   '--l2-report', '--label-smoothing-ce'):
+        assert banned not in kw, f'新增了 L2 相关 CLI 参数 {banned}（D1 禁止）'
+    assert '--label-smoothing' in kw
+    assert sum(1 for k in kw if 'label-smoothing' in k) == 1, \
+        '--label-smoothing 出现了第二个入口（用户未要求）'
+
+
+def test_optimizer_param_groups_unchanged():
+    """四组的 `weight_decay` 仍是 `{wd, 0.0, wd, 0.0}` —— 防双重正则（§3.1）。
+
+    P4.5b 只动**报告**，优化器一个字节都没改：解耦衰减仍在 AdamW 里按
+    `{非 value, value} × {decay, no_decay}` 四组施加。若有人把 L2 塞进
+    `param_groups`（例如给 decay 组再加一个 `l2_coef`），本测试会红。
+    """
+    torch.manual_seed(3)
+
+    class _Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.back = nn.Linear(4, 4)          # ndim=2 → decay
+            self.backbn = nn.BatchNorm1d(4)     # ndim=1 → no_decay
+            self.value = nn.Linear(4, 1)         # value 头，独立 LR
+
+        def forward(self, x):
+            return self.back(self.backbn(x)), self.value(x)
+
+    net = _Net()
+    for wd in (_WD, 0.0, 0.02):
+        opt = _opt(net, weight_decay=wd, lr=0.01)
+        assert [g['weight_decay'] for g in opt.param_groups] == \
+            [wd, 0.0, wd, 0.0], \
+            f'wd={wd} 时四组 weight_decay 布局变了（双重正则？）'
+        lrs = [g['lr'] for g in opt.param_groups]
+        assert lrs[0] == lrs[1] == 0.01 and lrs[2] == lrs[3] == 0.01 * 5.0, \
+            f'per-group lr 布局变了: {lrs}'
+        assert all(p.ndim == 2 for p in opt.param_groups[0]['params'])
+        assert all(p.ndim == 1 for p in opt.param_groups[1]['params'])
+        assert all(p.ndim == 2 for p in opt.param_groups[2]['params'])
+        assert all(p.ndim == 1 for p in opt.param_groups[3]['params'])
+        assert len(opt.param_groups[3]['params']) > 0, \
+            'value 的 no_decay 组恒空（P4.5 修过一次的坑）'
+
+    # AdamW 仍是 AdamW（解耦衰减的载体），没有被换成裸 SGD / LBFGS，
+    # 且每一处构造都吃同一个 _build_param_groups 结果（本任务不得改优化器）
+    assert isinstance(_opt(net), torch.optim.AdamW)
+    main_src = inspect.getsource(t.main)
+    assert main_src.count('torch.optim.AdamW(') == \
+        main_src.count('AdamW(_opt_groups'), \
+        '有 AdamW 构造点没在用 _build_param_groups 的分组'
+    assert main_src.count('torch.optim.AdamW(') >= 1, 'AdamW 构造点不见了'
+    assert '_build_param_groups(model, args)' in main_src, \
+        'param_groups 的来源被换掉了'
+    assert 'compute_l2_report' not in ast.unparse(_fn('_build_param_groups')), \
+        'compute_l2_report 渗进了 _build_param_groups（优化器不得动）'
+
+# --------------------------------------------------------------------------- #
+# 12.（P4.5b 简报 §5 第 7/8 条）生产头上的梯度实测 —— 三次三个数的解药
+#
+#     harness（**必须逐字复现**，否则测的不是同一个量；这就是前几轮给出三个
+#     不同数字的原因：没人写下「在哪个空间量、用哪个头、什么初值」）：
+#       · 头 = **生产** FCPolicyHead(in_channels=184, board_size=19) /
+#               FCValueHead(in_channels=184)（P4.1 的 v21 两头，不是替身）
+#       · 权重 = torch.manual_seed(20260927) 之后实例化（默认初始化）
+#       · 特征 x ~ N(0,1)，取自 torch.Generator().manual_seed(20260927)，B=8
+#       · 目标 = one-hot moves（arange(8)·(A//8)，A 内不重复）；value_t 交替 ±1
+#       · beta=0.5；eps=0.1（--label-smoothing 默认）；w=1.0
+#
+#     三个「空间」都测，因为它们各自只看不同的东西（**这也是分歧的来源**）：
+#       · logit 空间 = ‖∂L/∂policy_logits‖ vs ‖∂L/∂value_pred‖：只看**损失**
+#         的选择，与头长什么样无关（换头它不变 ⇒ 测不出「换掉任一头」）。
+#       · 头参数空间 = 两个头各自全部参数上的梯度范数：AdamW 真正更新的量，
+#         对**头结构**与**损失归约**都敏感。
+#       · 共享输入空间 = ‖∂L/∂x‖：主干收到的信号（P4.5 报告 §8.3/§8.4 的要害）。
+# --------------------------------------------------------------------------- #
+
+
+def _prod_pair(board, seed=_HEAD_SEED, B=8):
+    from src.networks.policy_network import FCPolicyHead
+    from src.networks.value_network import FCValueHead
+    torch.manual_seed(seed)
+    pol = FCPolicyHead(in_channels=184, board_size=board)
+    val = FCValueHead(in_channels=184)
+    g = torch.Generator().manual_seed(seed)
+    x = torch.randn(B, 184, board, board, generator=g)
+    A = board * board + 1
+    moves = torch.arange(B) * (A // B)
+    vt = torch.ones(B, 1)
+    vt[1::2] = -1.0
+    return pol, val, x, moves, vt, A
+
+
+def _grad_spaces(board=19, pol_kind='ce', val_kind='huber', w=1.0,
+                 eps=_EPS, beta=_BETA, seed=_HEAD_SEED, B=8):
+    """返回 {'logit': (gp, gv), 'x': (gp, gv), 'param': (gp, gv)}。"""
+    pol, val, x, moves, vt, _ = _prod_pair(board, seed, B)
+    x = x.requires_grad_(True)
+    logits, vpred = pol(x), val(x)
+    L = compute_policy_loss(logits, moves, pol_kind,
+                            label_smoothing=eps, huber_beta=beta)
+    if val_kind == 'bce':            # D4 之前的口径
+        tgt = (vt + 1) / 2 * 0.8 + 0.1
+        V = F.binary_cross_entropy_with_logits(vpred.squeeze(), tgt.squeeze())
+    else:
+        V = compute_value_loss(vpred, vt, val_kind, huber_beta=beta)
+    gx_p = torch.autograd.grad(L, x, retain_graph=True)[0]
+    gx_v = torch.autograd.grad(V, x, retain_graph=True)[0]
+    g_logit = torch.autograd.grad(L, logits, retain_graph=True)[0]
+    g_vpred = torch.autograd.grad(V, vpred, retain_graph=True)[0]
+    (L + w * V).backward()
+    gp = torch.sqrt(sum((p.grad ** 2).sum() for p in pol.parameters()))
+    gv = torch.sqrt(sum((p.grad ** 2).sum() for p in val.parameters()))
+    return {
+        'logit': (float(g_logit.norm()), float(g_vpred.norm())),
+        'x': (float(gx_p.norm()), float(gx_v.norm())),
+        'param': (float(gp), float(gv)),
+    }
+
+
+def test_policy_value_gradient_ratio():
+    """当前默认（policy=ce + value=huber, w=1.0）在生产头上的 policy:value 梯度比。
+
+    **简报 §5 第 7 条给的参照 5.4 在本 harness 的三个空间里都复现不出来**
+    （实测 0.92 / 24.8 / 91.7，见 report `## Fix2（b）增补` §5），所以本测试钉的
+    是**本 harness 的实测值**，并把 harness 逐字写在上面的模块注释里 ——
+    「同一个量」只有在「量法」被钉死之后才存在。断言用区间而不是等值，
+    留 torch 版本 / 平台的初始化与浮点差异的余量。
+
+    两条设计约束（简报点名的「换掉任一头、或改任一损失的归约必须变红」）：
+
+    · 头参数空间对**头结构**敏感 ⇒ 换头会红（logit 空间不会，它与头无关，
+      见断言 (4)）；
+    · 归约敏感性由 `test_ce_policy_gradient_is_action_space_independent` 覆盖
+      （把 Huber 的 sum over A 换成 mean over A，policy 梯度再掉 4.4 倍）。
+    """
+    cur = _grad_spaces(19, pol_kind='ce', val_kind='huber', w=1.0)
+
+    # (1) 头参数空间：policy 强于 value。实测 91.70（eps=0.1）/ 101.92（one-hot）。
+    ratio = cur['param'][0] / cur['param'][1]
+    assert 40.0 < ratio < 200.0, (
+        f'头参数空间 policy:value = {ratio:.2f}:1 掉出 [40, 200]。'
+        f'变大：policy 侧被放大（损失或归约被换过？）'
+        f'变小：policy 梯度被稀释 —— A 依赖回来了（见下一个测试）。'
+        f'当前实测 91.70（eps=0.1）/ 101.92（one-hot）。')
+    assert cur['param'][0] == pytest.approx(4.8710, rel=5e-3), \
+        f'policy 头参数梯度漂了: {cur["param"][0]:.5f}（应 ≈ 4.8710）'
+    assert cur['param'][1] == pytest.approx(0.0531, rel=1e-2), \
+        f'value 头参数梯度漂了: {cur["param"][1]:.5f}（应 ≈ 0.0531）'
+
+    # (2) 损失输入空间：value:policy = 1.113 —— 与 P4.5 报告记录的 ce 备选口径
+    #     逐位一致（独立 harness 得到同一个数），即「不需要补偿旋钮」。
+    vr = cur['logit'][1] / cur['logit'][0]
+    assert vr == pytest.approx(1.113, rel=2e-2), \
+        f'损失输入空间 value:policy = {vr:.4f}（应 ≈ 1.113，老口径 ce+5·bce 是 2.225）'
+    assert 0.9 < vr < 1.4, 'policy/value 在损失输入空间应同量级（1:1 附近）'
+
+    # (3) 方向：P4.5 交付口径（huber+huber）里 value 是强的，现在反过来了 ——
+    #     这是「默认改 ce 真的生效了」的可执行证据。
+    old = _grad_spaces(19, pol_kind='huber', val_kind='huber', w=1.0)
+    old_ratio = old['param'][0] / old['param'][1]
+    assert old_ratio < 1.0, \
+        'P4.5 交付口径（huber）下 value 本该更强，比值却 > 1 —— 参照系坏了'
+    assert old_ratio == pytest.approx(0.29, rel=2e-2), \
+        f'P4.5 交付口径的头参数比漂了: {old_ratio:.3f}（应 ≈ 0.29）'
+    assert ratio > 10 * old_ratio, \
+        '换成 ce 之后 policy 梯度应放大约两个数量级（实测 316×）'
+
+    # (4) 换头的守卫：同样两个损失换 v18 的 PolicyNetwork/ValueNetwork，
+    #     头参数空间的比值必须明显不同 —— 否则本测试与「头」无关，等于没测。
+    from src.networks.policy_network import PolicyNetwork
+    from src.networks.value_network import ValueNetwork
+
+    def alt_pair(pm, vm, seed=_HEAD_SEED, B=8):
+        torch.manual_seed(seed)
+        g = torch.Generator().manual_seed(seed)
+        x = torch.randn(B, 184, 19, 19, generator=g).requires_grad_(True)
+        moves = torch.arange(B) * 45
+        vt = torch.ones(B, 1)
+        vt[1::2] = -1.0
+        L = compute_policy_loss(pm(x), moves, 'ce', label_smoothing=_EPS,
+                                huber_beta=_BETA)
+        V = compute_value_loss(vm(x), vt, 'huber', huber_beta=_BETA)
+        (L + V).backward()
+        gp = torch.sqrt(sum((p.grad ** 2).sum() for p in pm.parameters()))
+        gv = torch.sqrt(sum((p.grad ** 2).sum() for p in vm.parameters()))
+        return float(gp) / float(gv)
+
+    alt = alt_pair(PolicyNetwork(in_channels=184, hidden_channels=32,
+                                 action_size=362, num_layers=2),
+                   ValueNetwork(in_channels=184, hidden_channels=64,
+                                num_res_blocks=3, arch='resnet'))
+    assert abs(alt / ratio - 1.0) > 0.5, (
+        f'换成 v18 两头后比值几乎不变（{alt:.2f} vs {ratio:.2f}）'
+        f'—— 本测试对「头」不敏感，测不出换头')
+
+
+def test_ce_policy_gradient_is_action_space_independent():
+    """**为什么默认不是 huber**，钉成可执行的不变式（简报 §5 第 8 条）。
+
+    同一批特征（同一 seed 的同一 generator）、同一组权重（两个头在
+    `torch.manual_seed` 之后实例化；conv stem 的形状在 9/19 路下相同 ⇒ 逐位
+    相同，分类器 FC 因 flatten 维不同而必然不同 —— 那正是被测的 A 依赖），
+    分别在 A=82（9 路）与 A=362（19 路）下测 `‖∂L/∂policy_logits‖`：
+
+        CE              0.3512 → 0.3530    比值 1.005   ← 与 A 无关
+        Huber(p) sum    0.0046 → 0.0010    比值 0.223   = 82/362 = 1/A
+        Huber(p) mean                →     比值 0.051   = (1/A)²
+
+    机制：CE 打在 log-prob 上，`d(CE)/d(logit_j) = p_j − y_j`，每坐标有界；
+    Huber 打在概率上，要再乘一层 softmax 雅可比 `∂p_k/∂logit_j = p_k(δ_kj−p_j)`，
+    专家坐标上带一个 `p ≈ 1/A` ⇒ 梯度按 **1/A** 缩放。于是 `sum over A` 给 A、
+    `mean over A` 给 1/A²，**没有任何归约能消掉这个 A 依赖**；本仓支持
+    9/13/19 路 ⇒ 同一学习率在 9 路与 19 路之间差 **4.4 倍**。
+
+    量在 logit 空间而不是头参数空间：后者会同时混入「分类器参数量随 flatten
+    维变化」的结构差异（实测 CE 的头参数比是 2.128，与损失选择无关），把
+    要测的信号淹掉。
+    """
+    def logit_norm(board, kind, reduce='sum', eps=0.0):
+        pol, _, x, moves, _, A = _prod_pair(board)
+        x = x.requires_grad_(True)
+        logits = pol(x)
+        if kind == 'ce':
+            L = compute_policy_loss(logits, moves, 'ce',
+                                    label_smoothing=eps, huber_beta=_BETA)
+        else:
+            L = _huber_policy(logits, moves, eps, _BETA, reduce)
+        return float(torch.autograd.grad(L, logits)[0].norm()), A
+
+    # --- CE：与 A 无关 ---
+    c82, A82 = logit_norm(9, 'ce')
+    c362, A362 = logit_norm(19, 'ce')
+    assert (A82, A362) == (82, 362)
+    ratio_ce = c362 / c82
+    assert 0.8 < ratio_ce < 1.25, (
+        f'CE 的 policy 梯度不该依赖动作空间：实测 362/82 = {ratio_ce:.3f}'
+        f'（{c82:.4f} → {c362:.4f}）。> 1.25 说明 CE 也带上了 A 依赖，'
+        f'默认值的理由就不成立了。')
+
+    # --- Huber(p) sum over A：严格按 1/A 缩放 ---
+    h82, _ = logit_norm(9, 'huber', 'sum')
+    h362, _ = logit_norm(19, 'huber', 'sum')
+    ratio_h = h362 / h82
+    assert ratio_h < 0.5, (
+        f'Huber(p) sum over A 的梯度应当随 A 显著变小，实测 362/82 = {ratio_h:.3f}'
+        f' —— 若它也变成 A 无关了，本测试就不再证明「为什么默认不是 huber」。')
+    assert ratio_h == pytest.approx(A82 / A362, rel=0.05), (
+        f'Huber(p) sum over A 的梯度应按 1/A 缩放：实测 {ratio_h:.4f}，'
+        f'1/A = {A82 / A362:.4f}（差 {abs(ratio_h / (A82 / A362) - 1) * 100:.1f}%）')
+
+    # --- Huber(p) mean over A：按 1/A² 缩放（更糟，这正是 P4.5 修掉的归约）---
+    m82, _ = logit_norm(9, 'huber', 'mean')
+    m362, _ = logit_norm(19, 'huber', 'mean')
+    ratio_m = m362 / m82
+    assert ratio_m < 0.15, (
+        f'Huber(p) mean over A 应按 1/A² 缩放（≈ {(A82 / A362) ** 2:.4f}），'
+        f'实测 {ratio_m:.4f}')
+    assert ratio_m == pytest.approx((A82 / A362) ** 2, rel=0.1), (
+        f'Huber(p) mean over A 的 1/A² 律不成立：{ratio_m:.4f} vs '
+        f'{(A82 / A362) ** 2:.4f}')
+
+    # --- 相对强度：CE 远强于两种 Huber 归约（近均匀初值下 ∝ p≈1/A）---
+    assert c362 > 100 * h362, \
+        '同一初值下 CE 的 policy 梯度应比 Huber(p) sum 强两个数量级以上'
+    assert c362 > 10 * m362, \
+        '同一初值下 CE 的 policy 梯度应比 Huber(p) mean 强一个数量级以上'
+
+    # --- 实现不许偷换归约：默认的 `compute_policy_loss(kind='huber')` 必须就是
+    #     上面那个 `sum over A` 口径。否则本测试的 sum 行会与被保留的实验选项
+    #     脱节，「A 依赖是 1/A」这句话就不再描述真实可跑的代码。
+    pol, _, x, moves, _, _ = _prod_pair(19)
+    logits = pol(x)
+    impl = compute_policy_loss(logits, moves, 'huber', label_smoothing=0.0,
+                               huber_beta=_BETA)
+    assert torch.equal(impl, _huber_policy(logits, moves, 0.0, _BETA, 'sum')), \
+        'compute_policy_loss 的 huber 归约不再是「类内 sum over A」' \
+        '（1/A 依赖的实测会与实现脱节）'
+
+
+def _huber_policy(logits, moves, eps, beta, reduce):
+    """`compute_policy_loss(kind='huber')` 的显式复刻（sum / mean 两种归约）。
+
+    复刻而不是调用：默认口径只有 sum，mean 是**被 P4.5 修掉的那个实现**，
+    这里要拿它当「1/A² 律」的反例靶子。
+    """
+    A = logits.shape[-1]
+    with torch.no_grad():
+        y = torch.full_like(logits, eps / A)
+        y.scatter_(1, moves.long().view(-1, 1), 1.0 - eps + eps / A)
+    h = _manual_smooth_l1(F.softmax(logits, dim=-1), y, beta)
+    return h.sum(dim=-1).mean() if reduce == 'sum' else h.mean()
