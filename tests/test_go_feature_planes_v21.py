@@ -15,7 +15,7 @@
 「通道 8 = `get_legal_moves()`」这条**已声明的契约**（见 `test_channel8_*`），
 它比的是两个不同的生产函数（合法性 API vs 特征构造器），不是自己跟自己比。
 
-覆盖面（12 条，5 路 / 9 路，CPU、秒级）：
+覆盖面（18 个用例，5 路 / 9 路，CPU、秒级）：
   1. `test_plane_count_and_indices`              17 通道 / float32 / (17,n,n) / 边界值
   2. `test_channels_0_to_11_unchanged`           前 12 通道 == 本文件自写的参考实现
   3. `test_n_channels_prefix_is_invariant`       12 通道的输出 == 17 通道的前 12 格
@@ -33,6 +33,15 @@
  12. `test_liberty_count_is_distinct_not_incidence`
                                                   直接钉死口径：取「去重数」不取「入射数」
  13. `test_dataset_n_channels_*` / `test_n_channels_12_does_not_compute_the_new_planes`
+ 14. `test_group_liberty_count_called_once_per_group`
+                                                  **成本不变式**：每块只数一次气
+                                                  （O(k) 不是 O(k²)），flood fill 不许
+                                                  挪回 `nlibs == 1` 分支内
+ 15. `test_scalar_n_channels_12_does_not_allocate_liberty_two_buffers` /
+     `test_out_of_range_ko_agrees_across_paths`
+                                                  **资源/降级契约**：12 通道不为 14/15
+                                                  分配缓冲；越界 ko 两条路径同答案 +
+                                                  整个进程只告警一次
 
 **块气的口径（本文件第 10-12 条用例守的东西）**：
 `气数 = 与该块相邻的「去重」空点个数`。一个空点被**同一块**的两颗子夹住时，对该块
@@ -45,6 +54,11 @@
 **已文档化的分歧**（两条，逐条用测试钉住，见 `test_channel8_*` / `test_ko_plane` ④）：
   - 通道 8：单图走 `get_legal_moves()`（含禁自杀 + PSK），批量版 = 空点 ∧ 排除 ko。
   - 通道 16：依赖调用方传 `ko`；`ko=None` → 恒全零（单图版永远读得到 `ko_point`）。
+
+**ko 越界契约**（P4.3-fix2 起，不是分歧 —— 见 `test_out_of_range_ko_agrees_across_paths`）：
+越界 `ko`（既不是 -1 也不在 0..n²-1）两条路径**同答案、都不抛**：通道 16 全零、
+批量通道 8 不排除任何点，并**整个进程告警一次**。选「降级」而不是「都抛」，因为
+批量路径跑在训练预取线程上，抛异常会打挂预取。
 """
 import os
 import sys
@@ -1074,3 +1088,191 @@ def test_n_channels_12_does_not_compute_the_new_planes(monkeypatch):
     SupervisedDataset(data, n_channels=17).sample_batch_numpy(
         np.arange(8), augment=False)
     assert calls['n'] == 2, "17 通道的 dataset 路径应算两个颜色的眼位"
+
+
+# --------------------------------------------------------------------------- #
+# 16. 成本不变式（P4.3-fix2）：每块只数一次气 / 12 通道不为 14/15 分配              #
+# --------------------------------------------------------------------------- #
+
+def _two_liberty_board():
+    """5 路夹具：两个气≥3 的多子块（2×2 黑块 / 边上白两子）+ 两个气=2 的角单子。
+
+    气=2 的角单子是故意的 —— 它们让 17 通道路径**真的写**通道 14/15，
+    于是「12 通道 == 17 通道前 12 格」这条取值断言有实质对照，不是空转。
+    """
+    b = GoBoard(5)
+    for r, c in [(1, 1), (1, 2), (2, 1), (2, 2)]:
+        b.board[r, c] = 1            # 黑 2×2，8 气（≥3）
+    b.board[0, 0] = 1                # 黑角单子，2 气
+    for r, c in [(4, 0), (4, 1)]:
+        b.board[r, c] = -1           # 白边两子，3 气（≥3）
+    b.board[0, 4] = -1               # 白角单子，2 气
+    b.resync_hash()
+    return b
+
+
+def test_group_liberty_count_called_once_per_group(monkeypatch):
+    """**成本不变式（行为性）**：每块只数一次气 —— O(k)，不是每颗子数一次的 O(k²)。
+
+    为什么这条断言有意义、且纯值断言结构上抓不到：
+      P4.3 把 flood fill（连同 `seen` 的标记）从 `if nlibs == 1:` 分支里提到分支外。
+      任何把它挪回去的改动（或等价的「bucket 为 None 就跳过 flood」这种看似赚了的
+      优化）**不改变任何通道的取值** —— 气≥3 的块四个 bucket 本来就不标，输出逐位
+      相同，只是那类块被**每颗子重新枚举一遍**（k 颗子 → k 次 `_group_liberty_count`，
+      每次重扫整块）。夹具里 2×2 黑块有 4 颗子：退化版会数 4 次而不是 1 次。
+      这里数 `_group_liberty_count` 的调用次数，钉死「== 连通块数、与子数无关」。
+    """
+    b = _two_liberty_board()
+    calls = {'n': 0}
+    real = GoBoard._group_liberty_count
+
+    def counting(self, r, c):
+        calls['n'] += 1
+        return real(self, r, c)
+
+    monkeypatch.setattr(GoBoard, '_group_liberty_count', counting)
+    b.feature_planes([], [], 1)
+    assert calls['n'] == 4, (
+        f"5 路夹具有 4 个连通块（黑 2×2 / 黑角单子 / 白边两子 / 白角单子），"
+        f"每块应只数一次气，实得 {calls['n']} 次 —— "
+        f"多了说明有块被逐颗子重枚举（O(k²) 退化，取值不变、只有成本变）")
+
+
+def test_scalar_n_channels_12_does_not_allocate_liberty_two_buffers(monkeypatch):
+    """**资源不变式（行为性）**：标量 12 通道路径不许为通道 14/15 分配缓冲。
+
+    为什么这是有意义的不变式（不是「数某个内部函数调用」的实现细节 spy）：
+      · 纯值断言抓不到：「分配了但结果没进输出」在取值上完全等价，只有资源成本不同
+        —— 而 `n_channels=12` 正是旧权重 / MCTS 热路径每次都跑的那条；
+      · 批量路径早有 `n_channels >= 15` 守卫（12 通道不分配 `my_lib2`/`op_lib2`），
+        标量侧曾**无条件**分配并写入 —— 同一个 `n_channels` 两条路径的资源承诺
+        不一致，这正是要钉的契约；
+      · 这里数的是**分配行为本身**（`np.zeros` 出来的 `(n,n)` bool 数量）：守卫写错
+        一档（如 `> 15`）或删掉守卫都会立刻改变这个计数，而输出一个字节都不变。
+    断言（Fix3 放宽，见下）：通道数沿 12→17 **单调不减**；12/13/14 档**不因**通道数
+    多而多分配 `(n,n)` bool；**15 档必须严格多于 14 档** —— 这是守卫生效的最小充分
+    信号；15 档的增量**有上限**（≤4，当前实测 2），给将来再加一对同形状缓冲留余量。
+    同时钉「12 通道输出 == 17 通道前 12 格」（守卫不许改取值）。
+
+    ⚠ **为什么不再断言「恰好多 2 张」**（Fix3）：`+2` 把这条不变式焊死在了
+    `_distinct_liberty_counts` 当前的实现细节上 —— 将来任何人加一张**也**由
+    `n_channels` 门控的 `(n,n)` bool 缓冲（哪怕无害、哪怕该加），这条测试都会**假红**。
+    真正要守的是**方向**（低档不分配 / 15 档起才分配），不是**张数**。
+    放宽后**仍然能红**：变异 M-A（删掉标量 `n_channels` 守卫）实测把 12 档的计数
+    从 3 抬到 5，于是 15 档不再严格多于 14 档（5 == 5）→ 红。实测见
+    `task-p4-3-fix-report.md` 的「Fix3 增补」§M5。
+    """
+    import src.game.go_rules as gr
+
+    n = 5
+    b = _two_liberty_board()
+
+    def count_alloc(n_channels):
+        cnt = {'n': 0}
+        real = gr.np.zeros
+
+        def counting_zeros(*args, **kwargs):
+            shape = kwargs.get('shape', args[0] if args else None)
+            dtype = kwargs.get('dtype', args[1] if len(args) > 1 else None)
+            if (isinstance(shape, (tuple, list)) and tuple(shape) == (n, n)
+                    and dtype is not None and np.dtype(dtype) == np.dtype(bool)):
+                cnt['n'] += 1
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(np, 'zeros', counting_zeros)
+        try:
+            b.feature_planes([], [], 1, n_channels=n_channels)
+        finally:
+            monkeypatch.undo()
+        return cnt['n']
+
+    counts = {k: count_alloc(k) for k in (12, 13, 14, 15, 16, 17)}
+
+    # ① 沿 12→17 单调不减：通道数变多只可能多分配，不该反向少分配。
+    order = (12, 13, 14, 15, 16, 17)
+    for lo, hi in zip(order, order[1:]):
+        assert counts[hi] >= counts[lo], (
+            f"n_channels {lo}→{hi} 的 (n,n) bool 分配数不该下降：{counts}")
+
+    # ② 12/13/14 档**不因**通道数多而多分配（气=2 缓冲的守卫还没生效）。
+    base = counts[12]
+    for k in (13, 14):
+        assert counts[k] == base, (
+            f"n_channels={k} 不该多分配 bool (n,n)：{counts}")
+
+    # ③ **15 档必须严格多于 14 档** —— 守卫生效的最小充分信号，也是这条不变式的
+    #    核心。删掉/写错守卫（变异 M-A）时 12 档也会分配，计数变成全档相等
+    #    （实测 3 → 5），这里立刻变红。
+    assert counts[15] > counts[14], (
+        f"n_channels=15 应比 14 多分配气=2 缓冲（my/op_liberties2）：{counts}")
+
+    # ④ 增量有上限（当前 2 = my/op 一对），给将来再加一对同形状缓冲留余量 ——
+    #    同时挡住「15 档把 (n,n) bool 分配整批复制一遍」这种真正的资源回归。
+    assert counts[15] - counts[14] <= 4, (
+        f"n_channels=15 的增量应只是气=2 那一对，不该整批多分配：{counts}")
+
+    # 守卫不许改取值：12 通道输出 == 17 通道前 12 格（含真的写了 14/15 的盘面）
+    p12 = b.feature_planes([], [], 1, n_channels=12)
+    p17 = b.feature_planes([], [], 1, n_channels=17)
+    assert p17[14].sum() > 0 and p17[15].sum() > 0, \
+        "夹具必须真的造出气=2 的块，否则取值断言空转"
+    assert np.array_equal(p12, p17[:12]), "12 通道必须是 17 通道的前缀"
+
+
+# --------------------------------------------------------------------------- #
+# 17. ko 越界契约（P4.3-fix2）：两条路径同答案、都不抛、整个进程只告警一次           #
+# --------------------------------------------------------------------------- #
+
+def test_out_of_range_ko_agrees_across_paths():
+    """越界 `ko`：两条路径**同答案、都不抛**，且整个进程只告警一次。
+
+    契约（为什么是「降级 + 一次性告警」而不是抛）：
+      · 批量路径跑在**训练预取线程**上（`SupervisedDataset.sample_batch_numpy`），
+        那里抛 `IndexError` 会打挂预取、进而打挂训练；`ko` 是 npz 里的**外部数据**，
+        坏值应当降级；
+      · 旧实现两条路径分叉（批量 `np.divmod(ko, n)` 越界抛 `IndexError`、标量静默
+        得全零通道 16）—— 分叉成两种错比两条同错更难查，所以统一：
+        通道 16 全零（当无劫）、批量通道 8 不排除任何点、整个进程告警一次。
+      · 标量在 `n_channels < 17` 时不检查也不告警（既无通道 16、ch8 也不读
+        `ko_point`）—— 两边的告警条件恰好都是「这个字段对本次输出有可见影响」。
+    """
+    import warnings
+
+    import src.game.go_rules as gr
+
+    n = 5
+    b = _two_liberty_board()
+    bad_ko = n * n                     # 合法取值只有 -1 / 0..n²-1
+
+    # ① 标量：不抛、ch16 全零、ch8 走 get_legal_moves（本就不读 ko_point）
+    b.ko_point = bad_ko
+    gr._ko_range_warned = False
+    with pytest.warns(RuntimeWarning, match='ko'):
+        one = b.feature_planes([], [], 1)
+    assert one[16].sum() == 0.0, "越界 ko 应降级成无劫：通道 16 全零"
+    assert np.array_equal(one[8], b.get_legal_moves().reshape(n, n).astype(np.float32))
+
+    # ② 批量：不抛（旧实现这里 IndexError）、ch16 全零、ch8 = 全空点（不排除任何点）
+    gr._ko_range_warned = False
+    with pytest.warns(RuntimeWarning, match='ko'):
+        many = GoBoard.feature_planes_batched(
+            b.board[None], [[-1] * 3], [[-1] * 3], [1], [bad_ko])[0]
+    assert many[16].sum() == 0.0, "批量侧越界 ko 也应降级：通道 16 全零"
+    assert np.array_equal(many[8], (b.board == 0).astype(np.float32)), \
+        "批量通道 8 对坏 ko 不排除任何点"
+
+    # ③ 同答案：两条路径 ch16 逐位相同；批量坏 ko ≡ 传 -1（无劫）的输出
+    assert np.array_equal(one[16], many[16]), "两条路径的 ch16 必须同答案"
+    no_ko = GoBoard.feature_planes_batched(
+        b.board[None], [[-1] * 3], [[-1] * 3], [1], [-1])[0]
+    assert np.array_equal(many, no_ko), "坏 ko 的批量输出必须等价于无劫"
+
+    # ④ 一次性：闩锁已置起 → 两条路径第二次都不再告警（闩锁不生效这里会 warning-as-error）
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        b.feature_planes([], [], 1)
+        GoBoard.feature_planes_batched(
+            b.board[None], [[-1] * 3], [[-1] * 3], [1], [bad_ko])
+
+    # ⑤ 复位闩锁，不污染后续用例
+    gr._ko_range_warned = False

@@ -59,6 +59,8 @@ PASS 恒合法且**不查 PSK**：pass 不改变染色，`position_hash_after_mo
 """
 
 import hashlib
+import warnings
+
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from scipy.ndimage import label as _scipy_label
@@ -66,9 +68,31 @@ from scipy.ndimage import label as _scipy_label
 _label_pool = ThreadPoolExecutor(max_workers=2)
 
 # `feature_planes_batched` 里「两个颜色要不要分派到线程池」的门槛，按**元素数**
-# （= B·n²）而不是按 B 计 —— 真正决定 GIL 乒乓划不划算的是数组多大。数值来自实测
-# 交叉点，见 `feature_planes_batched` 里那段分派注释。
-_LIB_PARALLEL_MIN_ELEMS = 10_000
+# （= B·n²）而不是按 B 计 —— 真正决定 GIL 乒乓划不划算的是数组多大。
+#
+# ⚠ **这个数是「实测交叉点上界再放 ~10 倍」的保守值，不是任何一台机器的交叉点。**
+#   三台机器各自实测（方法：强制两分支各跑，同一进程内**逐次交错**，各取中位数 ——
+#   详见 `feature_planes_batched` 里的分派注释），交叉点互不一致，而 **≤17328
+#   元素（B≤48 @19 路）这一档 review 机与控制器机全部测到净亏、本机在大 batch
+#   附近正负不一**（本机 B=48 的三轮里两轮反而是净赚，故**不能**说三台一致）：
+#     · review 机（19 路 17ch）：B=1..48 **全部净亏**。
+#       ⚠ 这里**不给百分比**：拿到那组数字的人没留下出处，本任务的 brief 也只给了
+#         「全部净亏」，实现者本人从未在该机上跑过 —— 宁可少写，不可写一个查不到
+#         来源的区间。控制器机与本机的区间见下（那两台有可复现的测量方法）。
+#     · 控制器机（16 核，19 路 62% 密度 17ch，交错 200 次中位数）：
+#       B=1..48 **全部净亏**（+111% ~ +173%）。
+#     · 本机（Ryzen 7 5800H，8 核 16 线程，19 路 17ch，密度 0.62/0.35 × 3 轮）：
+#       B=1..32（≤11552 元素）**全部净亏**（+5.5% ~ +107%）；B=48（17328）在零
+#       附近摆动（-5.6% ~ +6.9%，三轮正负不一）；只有 B=64（23104）测到小幅净赚
+#       （-7.3% ~ -0.6%）。即本机交叉点 ≈ 1.7万~2.3万元素，且压在噪声边缘。
+#   「线程池在哪里开始赚」对**机器 + 盘面分布 + 库版本 + 当时的系统负载**都敏感
+#   （本机测量时并行批里还有其他任务在跑，绝对值偏高、对池的偏置不为零）。
+#   取 200_000（19 路约 B=555）≈ 观测到的最大交叉点的 10 倍，于是**真实使用规模下
+#   这条分支永不进入**：训练预取 B=32（11552 元素）、MCTS B=1（361 元素），都远在
+#   门槛之下。⚠ **换机器必须重测，别把这个数当事实**：重测方法写在
+#   `feature_planes_batched` 的分派注释里（强制两分支各跑一次、交错、中位数；
+#   两分支输出逐位相同，是纯性能开关）。
+_LIB_PARALLEL_MIN_ELEMS = 200_000
 
 # scipy.ndimage.label 的 4 邻域 3D 结构元素（模块级常量，避免每次调用重建）
 _STRUCT3 = np.zeros((3, 3, 3), dtype=bool)
@@ -202,6 +226,44 @@ def _distinct_liberty_counts(labelled, num, empty):
             np.logical_and(fresh, dup, out=fresh)
         lib += np.bincount(cur.ravel(), weights=fresh.ravel(), minlength=num + 1)
     return lib.astype(np.int64)
+
+
+def _warn_ko_out_of_range_once(bad, n):
+    """`ko` 越界时告警，**至多响一次**。返回 None（调用方直接忽略返回值）。
+
+    为什么不抛：`feature_planes_batched` 跑在训练预取线程上
+    （`SupervisedDataset.sample_batch_numpy`），在那里抛异常会打挂预取、进而打挂训练；
+    而 `ko` 是**外部数据**（npz 的一列），坏值应该被**降级**而不是让整批崩掉。
+    为什么不用 `warnings` 自带的去重：两个调用点是**两行代码**，Python 的 "default"
+    过滤器按「位置」去重，于是同进程里两条路径各告警一次 = 两次；这里用模块级
+    `_ko_range_warned` 闩锁，测试用它做复位。
+
+    ⚠ **「只响一次」是有条件的保证，不是无条件的**（Fix3 更正 —— 原 docstring 写
+    「整个进程只响一次」，代码并不严格兑现）：
+      · **单线程下**才严格成立：这里是「先读 `_ko_range_warned`、再置位」的
+        check-then-set，**没有锁**。两个预取线程同时撞上坏 `ko` 时可能都读到
+        False，于是**各响一次**（重复告警，无害）。
+      · **不再复位**：生产路径没有任何地方把它清回 False（只有测试会）。所以一个在
+        第 0 步就踩到坏 `ko` 的训练任务，**后面出现的新的坏值不会再有任何信号**。
+    两者都是有意接受：这里的目的是「别让告警刷屏/打挂训练」，不是「精确统计坏值」。
+    要精确统计就别依赖告警，去查数据。
+    """
+    global _ko_range_warned
+    if _ko_range_warned:
+        return
+    _ko_range_warned = True
+    bad = np.asarray(bad)
+    uniq = np.unique(bad)
+    shown = uniq[:4]
+    warnings.warn(
+        f"ko 越界（合法取值只有 -1 表示无劫，或 0..{n * n - 1} 的扁平坐标）："
+        f"{bad.size} 个样本，取值 {shown.tolist()}{' …' if uniq.size > 4 else ''}。"
+        f"已按「无劫」处理：通道 16 留全零，通道 8 不再排除该点。"
+        f"后续同类的坏值不再告警。",
+        RuntimeWarning, stacklevel=3)
+
+
+_ko_range_warned = False
 
 
 def _check_n_channels(n_channels):
@@ -2389,15 +2451,29 @@ class GoBoard:
 
         # 通道 10/11/14/15：块气掩码。口径是**整块**的气数 = 与该块相邻的**去重**空点
         # 个数（`_group_liberty_count` 用 `set` 收集气点坐标，同一个气点被同块两子共享
-        # 时只算 1 气），每块**只数一次**，`==1` / `==2` 是同一份结果的两个 bucket ——
-        # 改前是「数一次气 + 再 flood fill 一次标记」，这里合成一趟，而 `seen` 的标记
-        # 顺序与改前逐字一致，所以 10/11 的取值不可能变。
+        # 时只算 1 气），每块**只数一次**，`==1` / `==2` 是同一份结果的两个 bucket。
+        # ⚠ 循环体里 flood fill（连同 `seen` 的标记）在 `nlibs` 的分派**之外**：
+        #   它对**每个**块无条件跑，包括气数 ≥ 3 的块 —— 因为 `seen` 既是输出也是
+        #   「这个块已经数过」的记账。P4.3 之前 flood fill 缩在 `liberty_count == 1`
+        #   分支之内，于是任何气数 ≥ 2 的块会被**每颗子重新枚举一遍**：k 颗子的块要
+        #   `_group_liberty_count` 调 k 次，每次都重扫整块 ⇒ **O(k²)**（19 路 62%
+        #   密度的随机盘面上 k 动辄十几，这是 P4.3 的真实性能成本）。改成条件外 +
+        #   `seen` 无条件标记后是 **O(k)**。⚠ **取值逐位不变**（老写法在「只数一次」
+        #   的地方本来就没数错，变的只是重复的活干了几遍；review 用 120 个随机盘面核对
+        #   `old == new(12) == new(17)[:12]`，0 分叉），**变的是成本**：
+        #   19 路 2.83 ms → 1.78 ms（**-36.9%**）、9 路 0.465 → 0.357 ms（**-23.2%**）。
+        #   任何把 `while stack` 那段挪回条件里的改动都会把 O(k) 打回 O(k²)（取值仍然
+        #   一样，所以**纯值断言抓不到** —— 抓它的是
+        #   `test_group_liberty_count_called_once_per_group`，它数每块被数气的次数）。
+        # ⚠ `my_liberties2` / `op_liberties2` 与批量路径同样按 `n_channels` 加守卫
+        #   （`n_channels < 15` 时不分配、不写），两条路径口径一致：`n_channels=12`
+        #   不算 14/15 也不为它分配。
         # ⚠ 批量路径**共用同一口径**（`_distinct_liberty_counts`）：它曾用入射计数，
         #   共享气点会多算，已在 P4.3-fix 订正。改这个口径前先看那里 docstring 的记账。
         my_liberties1 = np.zeros((n, n), dtype=bool)
         op_liberties1 = np.zeros((n, n), dtype=bool)
-        my_liberties2 = np.zeros((n, n), dtype=bool)
-        op_liberties2 = np.zeros((n, n), dtype=bool)
+        my_liberties2 = np.zeros((n, n), dtype=bool) if n_channels >= 15 else None
+        op_liberties2 = np.zeros((n, n), dtype=bool) if n_channels >= 15 else None
         seen = np.zeros((n, n), dtype=bool)
         for r in range(n):
             for c in range(n):
@@ -2407,10 +2483,12 @@ class GoBoard:
                 nlibs = self._group_liberty_count(r, c)
                 if nlibs == 1:
                     bucket = my_liberties1 if v == to_play else op_liberties1
-                elif nlibs == 2:
+                elif nlibs == 2 and my_liberties2 is not None:
                     bucket = my_liberties2 if v == to_play else op_liberties2
                 else:
-                    bucket = None      # 气 >= 3：四个通道都不标，但仍要 flood 标记 seen
+                    # 气 >= 3（或 `n_channels < 15` 时气 == 2）：四个通道都不标，
+                    # 但仍然要 flood 一趟把 `seen` 标上 —— 漏了这一趟会退化成 O(k²)。
+                    bucket = None
                 stack = [(r, c)]
                 seen[r, c] = True
                 while stack:
@@ -2432,10 +2510,22 @@ class GoBoard:
                 planes[15] = op_liberties2
 
         # 通道 16：劫禁点。**只读信息位，不参与合法性判定**（PSK 已覆盖，裁定 ③）。
-        # 越界防御：`ko_point` 由 `play()` 写、恒为 -1 或合法扁平坐标；这里仍补一次
-        # 范围检查，因为批量路径的 `ko` 来自 npz（外部数据），而两条路径必须同答案。
-        if n_channels >= 17 and 0 <= self.ko_point < n * n:
-            planes[16].flat[self.ko_point] = 1.0
+        # ⚠ `ko_point` 越界**不抛、也不静默**：两条路径的约定是「降级成无劫」——
+        #   通道 16 留全零、通道 8 不排除任何点，并**整个进程告警一次**
+        #   （`_warn_ko_out_of_range_once`）。这么定是因为批量路径的 `ko` 来自 npz
+        #   （外部数据）而它跑在训练预取线程上，抛异常会打挂预取；两条路径取同一个
+        #   答案「全零」比一条抛一条不抛更安全（**取不到就当没有**，不会分叉成两种错）。
+        #   单图侧结构上不该出现越界（`ko_point` 由 `play()` 写，恒为 -1 或合法扁平
+        #   坐标），但检查保留 —— 契约要对齐，不能靠「本不该发生」。
+        #   ⚠ 检查只在 `n_channels >= 17` 里：更低档既没有通道 16、ch8 也不读
+        #     `ko_point`（走 `get_legal_moves()`）—— **不读就不告警**。批量侧任意档
+        #     `ko` 都进 ch8，所以任意档都查。两边的告警条件恰好都是
+        #     「这个字段对本次输出有可见影响」。
+        if n_channels >= 17:
+            if 0 <= self.ko_point < n * n:
+                planes[16].flat[self.ko_point] = 1.0
+            elif self.ko_point != -1:
+                _warn_ko_out_of_range_once([self.ko_point], n)
         return planes
 
     @staticmethod
@@ -2452,6 +2542,9 @@ class GoBoard:
             ko       : (B,) int16，劫禁着点扁平坐标（-1 无）；可选。
                        双重用途：① 通道 8 的遗留排除（**保留既有行为**，见下）；
                        ② 通道 16 的只读信息位（v21 新增）。
+                       ⚠ 越界值（既不是 -1 也不在 0..n²-1）**不抛**：按「无劫」降级
+                         —— 通道 8 不排除任何点、通道 16 留全零，并**整个进程告警
+                         一次**。与单图侧同一套约定（见下「通道 16」条）。
             n_channels: 12..17，通道表的前缀长度（越界抛 ValueError）。
         返回: (B, n_channels, n, n) float32
 
@@ -2470,6 +2563,11 @@ class GoBoard:
             而单图版永远能从 `GoBoard.ko_point` 读到。这不是算不出来，是**签名里
             根本没有那个信息**（裸 int8 board 不携带上一手）—— 与通道 8 的
             「无重复历史」同源。
+            ⚠ `ko` **越界时两条路径同答案**（P4.3-fix2 钉的契约）：都按「无劫」降级
+              —— 通道 16 全零、通道 8 不排除任何点，**都不抛**，都**整个进程告警一次**。
+              选「降级」而不是「两边都抛」是因为本方法跑在训练预取线程上（见
+              `_warn_ko_out_of_range_once` 的理由）；选「同答案」而不是「一条抛一条
+              不抛」是因为分叉成两种错更难查。
 
         ⚠ **通道 8 与单图版不再等价（P2.6a-2b-1 起，已知分歧，非回归）**：
         两条路径的通道 8 差在**三件**互相独立的事上，别混成一句「更松」：
@@ -2478,9 +2576,14 @@ class GoBoard:
              单图 `feature_planes()` 的通道 8 走 `get_legal_moves()`，含 PSK，取值更严。
           2. **禁自杀：算得出来，但本路径有意没做**（是**选择**，不是物理不可能）。
              它是纯局部判定（只看邻接块的气），`boards` 数组本身就够算；不做是为了
-             保持热路径成本（每节点一次批量前向的成本敏感）。这个分歧在本任务之前
-             就已存在（单图版在 `check_suicide=False` 默认下同样不查自杀），
-             P2.6a-2b-1 只是把它拉大。**可以直接向量化补上**（仍留给后续任务）。
+             保持热路径成本（每节点一次批量前向的成本敏感）。
+             ⚠ 单图侧**永远**禁自杀：它的通道 8 走 `get_legal_moves()`，而那个方法
+             **没有** `check_suicide` 形参、不查自杀本就是规则的一部分（TT 规则 6 的
+             完整合法点集 + 禁自杀这条有意偏离）。本路径既算不出 PSK 也不查自杀，
+             于是两边都「不查自杀」这件事**掩盖在**分歧 ① 之下 —— 真正的分歧是单图侧
+             禁、本路径不禁（填自己真眼处单图 0 / 批量 1）。
+             `tests/test_go_feature_planes_v21.py::test_channel8_batch_ignores_suicide_while_scalar_forbids_it`
+             钉的就是这一条。**可以直接向量化补上**（仍留给后续任务）。
           3. **排除 `ko` 点：一条遗留近似，且单图侧已不再有对应判罚**（P2.6a-2b-1/2c）。
              `ko_point` 早已降级为**只读信息位**（见 `GoBoard` 类 docstring），单图掩码
              **不读它** —— 简单劫由 PSK 独立禁掉。所以这里的「排除 ko」不再镜像任何
@@ -2500,11 +2603,17 @@ class GoBoard:
             `lib_counts`（只是多两次 `==2` 比较），12/13 是 4 次移位比较，16 是一次
             scatter。
             ⚠ **块气的去重**（`_distinct_liberty_counts`）是 O(B·n²) 的 4 方向链式比较。
-            19 路 62% 密度下整条函数相对「P4.3 之前（入射计数 + 恒开线程池）」的实测：
-            B=1 **-21%**、B=8 **+2%**、B=32 **+41%**。B=32 那档**超了 +30% 的目标**
-            （B=1/B=8 都在目标内或更快），取舍与实测数字见
-            `task-p4-3-fix-report.md` §2 —— 那一档落在**训练预取线程**上（被
-            multiprocessing prefetcher 掩盖），MCTS 热路径（B=1）反而快了 21%。
+            19 路 62% 密度下整条函数相对「P4.3 之前（入射计数 + 恒开线程池）」的实测
+            （`task-p4-3-fix-report.md` §2.4，同一进程内交错采样）：17 通道
+            B=1 **-22.6%**、B=8 **-4.2%**、B=32 **+31.7%**（run-to-run 噪声带
+            +31.7% ~ +43%）；**12 通道**（旧权重真正跑的那条，去重成本没有新通道可摊）
+            B=1 **-25.6%**、B=8 **-2.3%**、B=32 **+38.9%**。B=32 那档**超了 +30% 的
+            目标**（B=1/B=8 都在目标内或更快），取舍与完整数字见该报告 §2 —— 那一档
+            落在**训练预取线程**上（被 multiprocessing prefetcher 掩盖），MCTS 热路径
+            （B=1）反而快了 ~23%。⚠ 上述 B=32 两档是**门槛还在 10_000 时**测的
+            （B=32 = 11552 元素 ≥ 10_000 → 走线程池）；门槛提到 200_000 后 B=32 改走
+            顺序分支，本机实测该档线程池净亏 +5.5% ~ +19.0%，所以 +31.7% / +38.9%
+            都是**上界**（见 Fix2 增补）。
             实测原始数字另见 `task-p4-3-report.md`（12→17 通道的成本）。
         """
         _check_n_channels(n_channels)
@@ -2548,7 +2657,28 @@ class GoBoard:
         legal = empty.astype(np.float32)
         if ko is not None:
             ko = np.asarray(ko).reshape(B)
-            vk = ko >= 0
+            # ⚠ 范围守卫（P4.3-fix2）：`ko` 来自 npz（**外部数据**），损坏的
+            #   `ko >= n*n` 曾经直接进 `np.divmod(ko, n)` 再拿去索引 `legal`，抛
+            #   `IndexError` —— 而单图侧同一个坏值得到的是「通道 16 全零」，两条路径
+            #   分叉成两种错，且**抛异常会打挂训练预取线程**。现在两边统一成
+            #   「降级成无劫」：越界值不进 `vk`，通道 8 不排除任何点、通道 16 留全零，
+            #   并**整个进程告警一次**（约定与理由见 `_warn_ko_out_of_range_once`）。
+            # ⚠ Fix3：`badm` 是「合法 ko ∪ {-1}」的**精确补集**，逐元素可证：
+            #   `badm == (ko != -1) & ~vk == (ko < -1) | (ko >= n*n)`（整数 `ko`）。
+            #   旧写法 `ko[~((ko == -1) | vk)]` 要多一次取反 + 一次**布尔索引**，而且
+            #   越界集合的表达依赖 `vk` 的形状（改 `vk` 就可能改掉告警集合）。
+            #   新写法把越界掩码一次算清、只在真越界时才索引，与单图侧
+            #   `0 <= ko_point < n*n` / `elif ko_point != -1` 逐句同构。
+            #   ⚠ **代价诚实披露**（详见 `task-p4-3-fix-report.md`「Fix3 增补」§M6）：
+            #     段内单测 B=1 约 7.5→8.2 µs（**+0.7 µs，比 review 估的更贵**，
+            #     不是更便宜 —— 1 元素 int16 上每次 numpy 调用 ≈1.5 µs，省下一次
+            #     布尔索引正好抵掉多出的两次比较）；但整次调用 ≈270~350 µs，
+            #     端到端交错实测 **-1.4% ~ +0.7%（噪声内）**。选它是为了**更短 +
+            #     更少状态**，不是为了快。
+            vk = (ko >= 0) & (ko < n * n)
+            badm = (ko < -1) | (ko >= n * n)
+            if badm.any():
+                _warn_ko_out_of_range_once(ko[badm], n)
             if vk.any():
                 # 向量化：只处理真正有劫的样本，取代逐样本 Python 循环
                 bidx = np.nonzero(vk)[0]
@@ -2603,15 +2733,31 @@ class GoBoard:
         # **小**批量直接顺序跑。
         # ⚠ 这不是拆掉并行，而是按实测给并行设门槛。去重核（`_distinct_liberty_counts`）
         #   是 ~30 次**小** numpy 调用，每次都要过一遍 GIL；B=1（19 路 = 361 元素）时
-        #   numpy 根本不释放 GIL，于是两次 submit 的 GIL 乒乓**比活本身还贵**。实测
-        #   （19 路、17 通道、500 次交错采样取均值，`task-p4-3-fix-report.md` §2）：
-        #       B    顺序      线程池
-        #       1    0.33 ms   0.54 ms     ← 线程池亏 60%
-        #       8    0.55 ms   0.81 ms     ← 亏 47%
-        #       24   1.14 ms   1.19 ms     ← 亏 4%
-        #       32   1.38 ms   1.35 ms     ← 池子开始赚（5%，已在噪声内）
-        #   交叉点在 B·n² ≈ 10⁴，所以门槛就取这个数。**这跟本仓库已有的
-        #   「按盘口分派标量/向量两条路」是同一个套路**（见 3427b9f）。
+        #   numpy 根本不释放 GIL，于是两次 submit 的 GIL 乒乓**比活本身还贵**。
+        #   ⚠ **交叉点对机器/盘面分布/库版本/系统负载都敏感，且压在噪声边缘** ——
+        #   下面是本机（Ryzen 7 5800H，8 核 16 线程；19 路 17ch；密度 0.62/0.35 各
+        #   三轮，每轮逐次交错两分支、取中位数；测量时并行批里还有其他任务在跑）的
+        #   **三轮范围**，别当常量：
+        #       B   elems    池 vs 顺序（三轮范围）
+        #       1    361     +59.7% ~ +106.7%
+        #       8   2888     +42.6%  ~ +76.5%
+        #       16  5776     +27.9%  ~ +52.1%
+        #       24  8664     +10.4%  ~ +27.4%
+        #       32 11552     +5.5%   ~ +19.0%   （训练预取档 —— 净亏）
+        #       48 17328     -5.6%   ~ +6.9%    （零附近摆动，三轮正负不一）
+        #       64 23104     -7.3%   ~ -0.6%    （小幅净赚，仍在噪声边缘）
+        #   即 B≤32（真实使用规模）**三轮全部净亏**，交叉点 ≈ 1.7万~2.3万元素。
+        #   review 机与控制器机在 B≤48（≤17328 元素）上**全部净亏**
+        #   （+12%~+103%、+111%~+173%），见模块级 `_LIB_PARALLEL_MIN_ELEMS` 注释。
+        #   **重测方法**：把门槛临时设成 0（恒走池）与 1<<62（恒走顺序），在**同一
+        #   进程内逐次交错**（顺序一次、池一次地来回切），各跑若干轮取**中位数**
+        #   （本机漂移可达 ±20%，不交错必然测歪）：
+        #       old = gr._LIB_PARALLEL_MIN_ELEMS
+        #       gr._LIB_PARALLEL_MIN_ELEMS = 1 << 62   # 顺序
+        #       ... 每档 B 交错采样，取两组各自的中位数 ...
+        #       gr._LIB_PARALLEL_MIN_ELEMS = 0          # 线程池
+        #   两条分支的输出**逐位相同**（已核对），所以这个门是纯性能开关、不影响语义。
+        #   这跟本仓库已有的「按盘口分派标量/向量两条路」是同一个套路（见 3427b9f）。
         if boards.size >= _LIB_PARALLEL_MIN_ELEMS:
             future_my = _label_pool.submit(_label_and_mark,
                                            boards == to_play, my_lib1, my_lib2)
