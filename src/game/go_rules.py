@@ -335,6 +335,8 @@ class GoBoard:
         # 能付得起的关键：深拷贝整张块表会让每个候选都付 O(#块) 的重建。
         nb._groups = dict(self._groups) if self._groups is not None else None
         nb._gid = self._gid.copy() if self._gid is not None else None
+        # 扁平视图必须指向**克隆体自己**那份数组（否则写回会写进源棋盘的数组）
+        nb._gid_flat = nb._gid.reshape(-1) if nb._gid is not None else None
         nb._groups_valid = self._groups_valid
         # 克隆体的撤销栈从空开始，所以「未记录落子」的计数也从 0 起算
         nb._unrecorded_seq = 0
@@ -853,7 +855,12 @@ class GoBoard:
                             gid[nr][nc] = g
                             stack.append((nr, nc))
                 groups[g] = (v, frozenset(libs), frozenset(stones))
+        # ⚠ 数组必须在**填完** `gid` 之后才建（早一步建出来的是一张全 -1 的表）。
         self._gid = np.array(gid, dtype=np.int32)
+        # 扁平视图：增量写回一次只碰 1 + 合并 + 被提 个点，而 numpy 的
+        # fancy-index 在这个量级**比 Python 循环还慢**（实测 1 点 1.24 vs 0.71 µs、
+        # 8 点 1.73 vs 1.29 µs，交叉点在 ~20 点）。视图只在重建时取一次。
+        self._gid_flat = self._gid.reshape(-1)
         self._groups = groups
         self._groups_valid = True
 
@@ -939,8 +946,9 @@ class GoBoard:
         #   一个已不存在的块号，于是**整段长气被静默跳过** —— 表现为合并块的
         #   气莫名少掉几个（实测：白方合并后的块少了一口气 (7,6)，
         #   而那口气是被提黑子的位置）。
-        self._gid.reshape(-1)[np.array(points, dtype=np.intp)] = np.array(
-            new_gids, dtype=np.int32)
+        flat = self._gid_flat
+        for pt, g in zip(points, new_gids):
+            flat[pt] = g
 
         # ---- 5) 被提的每颗子：它现在的空位是周围存活块的新气 ----
         for flat in cap_stones:
@@ -977,8 +985,9 @@ class GoBoard:
                 self._groups.pop(g, None)
             else:
                 self._groups[g] = val
-        self._gid.reshape(-1)[np.array(points, dtype=np.intp)] = np.array(
-            old_gids, dtype=np.int32)
+        flat = self._gid_flat
+        for pt, g in zip(points, old_gids):
+            flat[pt] = g
 
     def _neighbor_groups(self, r, c):
         """返回 (r,c) 的 4 邻域内不同颜色的连通块列表。"""
@@ -1216,6 +1225,7 @@ class GoBoard:
         #   天然作废 —— 不需要第二处生命周期，也就不可能出现两条栈错位。
         self._groups = None
         self._gid = None
+        self._gid_flat = None
         self._groups_valid = False
         self._unrecorded_seq = 0
         self._zobrist = self._hash_from_board()
@@ -1612,7 +1622,20 @@ class GoBoard:
         #   这正是 `position_hash_after_move()` 唯一允许的前置状态 ——
         #   P2.7a 之前这里是靠「落子 -> 判提子 -> 把子拿掉 -> 推演 -> 再放回去」
         #   的手工 dance 达成的，现在那套 dance 整个删掉了。
-        if self._would_repeat(self.position_hash_after_move(move)):
+        # 两段式与掩码**逐字同源**（掩码 docstring 的「PSK 的两段式」）：
+        # 不提子的候选走**纯算术** —— 候选染色 = 落点从「空」变「己方子」，
+        # 不提子就没有别的染色变化，而 position 键只含棋盘染色，于是
+        # `position_hash() ^ zkey(r, c, color)` 就是候选键，**连推演都不用调**。
+        # 提子的候选才走 `position_hash_after_move()` 的完整推演。
+        # ⚠ 判据用 `cap_gids`（结构判定顺手算出来的）而不是「盘面上提没提子」：
+        #   此刻盘面还没改，两者同义，而前者白拿。
+        # 实测（P2.7b）: 19 路一次 `position_hash_after_move` 2.0 µs，占
+        # `clone+play+undo`（32.2 µs）的 6% —— 不大，但这是**每候选**都付的钱。
+        if cap_gids:
+            cand = self.position_hash_after_move(move)
+        else:
+            cand = self._pos_zobrist ^ _zobrist_key(r, c, color)
+        if self._would_repeat(cand):
             return False        # 盘面自始至终未改，无需还原
 
         # 到这里才真正改盘：落子 + 提子
@@ -1660,6 +1683,29 @@ class GoBoard:
         self.current_player = -self.current_player
         self._legal_cache = None
         return True
+
+    def apply_action(self, action: int, record: bool = True) -> bool:
+        """落子一个**动作空间编号** —— 动作空间的落子入口，落子请用本方法。
+
+        动作空间里 pass = `PASS`（= n*n），而 `play()` 的棋盘方言里 pass = -1。
+        两套编号并存，于是每个消费者都得自己写一遍
+        `play(-1 if a == board.PASS else a)`；漏掉 `a == PASS` 那一支的后果是
+        **`play(n*n)` 返回 False**（越界）——「想 pass 却什么都没发生」，
+        静默地少一手。所以本方法把那处换算收进**一处**，`play()` 保持只说
+        棋盘方言。
+
+        `mcts.py` 里原本有 **5 处**同样的换算（其中 4 处是复制粘贴），全部改走本方法。
+
+        边界与 `play()` 一致（**不抛**）：
+          - `action == PASS` → 落一个 pass（恒成功）；
+          - `action` 越界（含棋盘方言的 -1 与 `>= num_actions()`）→ False；
+          - 其余 → `play(action)`，返回是否成功（占点 / 自杀 / PSK 重复 → False）。
+        """
+        if action == self.PASS:
+            return self.play(-1, record=record)
+        if action < 0 or action >= self.PASS:     # PASS == board_size ** 2
+            return False
+        return self.play(action, record=record)
 
     def undo(self) -> bool:
         """撤销最近一次成功 play（须 play(record=True)）。

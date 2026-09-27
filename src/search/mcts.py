@@ -225,8 +225,7 @@ class MCTS:
         """
         out = []
         for mv in moves:
-            pmv = -1 if mv == self.n_actions - 1 else mv
-            if not board.play(pmv):
+            if not board.apply_action(mv):
                 continue
             child_to = -to_play
             cmy = list(op_hist)
@@ -401,8 +400,7 @@ class MCTS:
         """
         child_boards, my_hs, op_hs, to_plays, kos, child_meta = [], [], [], [], [], []
         for mv in moves:
-            pmv = -1 if mv == self.n_actions - 1 else mv
-            if not board.play(pmv):
+            if not board.apply_action(mv):
                 continue  # 理论不应发生（候选来自合法掩码）
             child_to = -to_play
             my_h = leaf.op_hist
@@ -652,8 +650,7 @@ class MCTS:
         # kept 列表，重写时遗漏了）。
         kept = []
         for mv in order:
-            pmv = -1 if mv == n - 1 else mv
-            if board.play(pmv):
+            if board.apply_action(mv):
                 board.undo()
                 kept.append(mv)
         if not kept:
@@ -723,7 +720,7 @@ class MCTS:
         board = self._cur_root_board.clone()
         for node in path[1:]:
             mv = node.move_int
-            if not board.play(-1 if mv == self.n_actions - 1 else mv):
+            if not board.apply_action(mv):
                 break  # 理论不应发生（着法来自展开时的合法集）
         return board
 
@@ -884,9 +881,7 @@ class MCTS:
                     try:
                         pb = self._cur_root_board.clone()
                         for nd in path[1:]:
-                            pmv = -1 if nd.move_int == self.n_actions - 1 \
-                                else nd.move_int
-                            if not pb.play(pmv):
+                            if not pb.apply_action(nd.move_int):
                                 break
                         planes = pb.feature_planes_batched(
                             pb.board[None], [list(prefetch_leaf.my_hist)],

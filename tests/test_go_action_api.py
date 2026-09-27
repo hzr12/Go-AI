@@ -17,6 +17,8 @@ GoBoard 动作空间 API 测试（P2.6a-2b-2，OpenSpiel 风格动作空间 + �
   6. `test_suicide_and_ko_stay_illegal_via_is_legal` 新 API 与新规则一致，没另开一套判定
   7. `test_string_roundtrip_matches_parse_move_str` 记法只有一套（不许造第二套）
   8. `test_legal_actions_matches_play_on_mutations` 随机合法着法序列上与 `play()` 对拍
+  9. `apply_action()`（P2.7b）: PASS 槽不静默落空 / 与方言换算逐手同答案 /
+     越界不抛 / 非法着法一样拒 / record 透传 —— 共 5 个用例
 
 三条最容易写错、因而单独钉住的不变量：
   - **`PASS = n*n`，而棋盘方言里 pass 是 `-1`**。两者**不可比**：
@@ -486,6 +488,90 @@ def test_legal_actions_matches_play_on_mutations():
     assert checked > 100, f"巡检点数太少（{checked}），夹具可能空转"
     assert elapsed < 20.0, f"巡检耗时 {elapsed:.1f}s，太慢（应当秒级）"
 
+
+# --------------------------------------------------------------------------- #
+# apply_action()（P2.7b）：动作空间的落子入口
+# --------------------------------------------------------------------------- #
+def test_apply_action_pass_slot_does_not_silently_do_nothing():
+    """**本方法存在的全部理由**：`play(PASS)` 返回 False（越界），不是 pass。
+
+    漏掉 `a == PASS` 那一支的消费者会写 `play(a)`，于是「想 pass」变成
+    「什么都没发生」—— 返回 False 还容易被当成「这手被判非法」，于是 pass
+    被静默吞掉、对局无法终局。所以这里逐格钉住 PASS 槽。
+    """
+    for n in (N5, N9):
+        b = GoBoard(n)
+        assert b.PASS == n * n
+        assert b.play(b.PASS) is False, "棋盘方言里 play(PASS) 必须仍是非法越界"
+        assert b.apply_action(b.PASS) is True, "apply_action 必须把 PASS 落成 pass"
+        assert b.num_passes == 1, "PASS 槽必须真的记成一次 pass"
+        assert b.move_number == 1
+
+
+def test_apply_action_matches_play_after_dialect_conversion():
+    """`apply_action(a)` 必须与 `play(-1 if a == PASS else a)` **逐手同答案**。
+
+    随机合法着法序列上逐步对拍：返回值、盘面、连续 pass 计数、落子数全都要一致。
+    """
+    for n, seed, n_moves in ((N5, 3, 12), (N9, 4, 10)):
+        rng = np.random.default_rng(seed)
+        a_board = GoBoard(n)
+        b_board = GoBoard(n)
+        for step in range(n_moves):
+            acts = [a for a in a_board.legal_actions() if a != a_board.PASS]
+            if not acts:
+                break
+            a = int(rng.choice(acts + [a_board.PASS]))
+            dialect = -1 if a == a_board.PASS else a
+            got = a_board.apply_action(a)
+            want = b_board.play(dialect)
+            assert got is want, f"{n} 路第 {step} 手 action={a}：apply={got} play={want}"
+            assert np.array_equal(a_board.board, b_board.board), (
+                f"{n} 路第 {step} 手 action={a} 之后盘面分叉")
+            assert a_board.num_passes == b_board.num_passes
+            assert a_board.move_number == b_board.move_number
+        assert a_board.move_number > 0, "夹具空转了？"
+
+
+def test_apply_action_rejects_out_of_range_without_raising():
+    """越界（含棋盘方言的 -1）→ False，**不抛**；与 is_legal 的边界口径一致。"""
+    b = GoBoard(N5)
+    for bad in (-1, -7, b.num_actions(), b.num_actions() + 3):
+        assert b.apply_action(bad) is False, f"越界动作 {bad} 应返回 False"
+        assert b.is_legal(bad) is False, f"越界动作 {bad} 的 is_legal 也应是 False"
+    assert b.move_number == 0 and b.num_passes == 0, "被拒不得留下任何状态变更"
+
+
+def test_apply_action_rejects_illegal_legal_space_moves_like_play():
+    """占点 / 自杀 / PSK 重复：apply_action 必须与 play() **一样拒**。
+
+    这里是「动作空间不许比棋盘方言更宽松」的守门人：apply_action 若图省事写成
+    `if action == PASS: ... else: self.play(action)` 之后又自己加判据，就会出现
+    第二套规则。
+    """
+    b = GoBoard(N9)
+    # 造一个占点：先落一子，再用同一个动作编号落第二次
+    mv = int(np.flatnonzero(b.get_legal_moves())[0])
+    assert b.apply_action(mv) is True
+    assert b.apply_action(mv) is False, "占点必须被拒"
+    # 随机巡检：对每个 legal_actions() 里的非 PASS 项，apply_action 的接受集合
+    # 必须与 play() 在克隆体上的一致
+    base = b.clone()
+    checked = 0
+    for a in base.legal_actions():
+        if a == base.PASS:
+            continue
+        assert b.clone().apply_action(a) is base.clone().play(a)
+        checked += 1
+    assert checked > 10, f"巡检点数太少（{checked}），夹具可能空转"
+
+
+def test_apply_action_is_record_aware():
+    """`record=False` 必须透传 —— 推演路径（record=False 后不撤销）依赖它。"""
+    b = GoBoard(N9)
+    b.apply_action(int(np.flatnonzero(b.get_legal_moves())[0]), record=False)
+    assert b._undo_stack == [], "record=False 不得压撤销栈"
+    assert b.undo() is False
 
 if __name__ == "__main__":
     for name, fn in sorted(list(globals().items())):
