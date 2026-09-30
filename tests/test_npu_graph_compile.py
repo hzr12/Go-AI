@@ -244,12 +244,23 @@ def test_linear_only_not_whole_model_compile():
 
 
 def test_cuda_compile_path_untouched():
-    """CUDA `--compile` 路径（D2 明确不动）仍是整模型 compile，形态与位置都不变。"""
+    """CUDA `--compile` 路径（D2 明确不动）仍是整模型 compile，形态与位置都不变。
+
+    区间下界用 `_wrap_fsdp1`（原为 `DistributedDataParallel`）作结束标记：这个
+    测试要圈的是「CUDA 分支自身的代码」，而分布式包裹紧随其后。**不要**把
+    标记改成一个可能消失的字符串后又让它悄悄变成全文件搜索 —— 那会让本测试
+    在标记缺失时抛 ValueError（collection 期就红）而不是给出可读的断言失败。
+    下方 `test_fsdp_boundary_marker_exists` 单独守住这个标记的存在性。
+    """
     assert 'model = torch.compile(model, dynamic=False, mode=args.compile_mode)' in CODE, \
         'CUDA --compile 路径不得被 D2 顺手改成 Linear-only'
     i_npu = CODE.index('if _npu_graph:')
     i_cuda = CODE.index('elif args.compile == 1:', i_npu)
-    cuda = CODE[i_cuda:CODE.index('torch.nn.parallel.DistributedDataParallel', i_npu)]
+    assert '_wrap_fsdp1' in CODE, \
+        'FSDP1 包裹点不见了（分布式改造被回退？）'
+    i_end = CODE.index('_wrap_fsdp1', i_npu)
+    assert i_end > i_cuda, 'FSDP 包裹点应在 CUDA compile 分支之后（compile 必须先于 FSDP）'
+    cuda = CODE[i_cuda:i_end]
     assert 'torch.compile(model' in cuda, \
         'CUDA 分支里整模型 compile 不见了（Linear-only 只限 backend == npu）'
     assert '_rollback_linear_submodules' not in cuda, \
