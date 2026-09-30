@@ -309,11 +309,20 @@ def test_self_play_game_rows_carry_post_temperature_logp_old(monkeypatch):
             return np.zeros(n_actions), probs, 0.25
 
     monkeypatch.setattr(st, 'MCTS', _StubMCTS)
+
+    class _StubAI:
+        """P4.2 起特征通道数随模型走（`ai.in_channels`），采集侧也要有这个属性。
+
+        仍钉 12ch：本用例测的是**行契约**（logp_old 锚在实际落子上），不是通道数；
+        12 是旧代权重的通道，与被钉住的 `planes.shape == (12, bs, bs)` 对应。
+        """
+        in_channels = 12
+
     state = np.random.get_state()
     try:
         np.random.seed(7)
         data, score = st.self_play_game(
-            None, board_size=bs, sims=1, max_moves=4, temperature=1.0,
+            _StubAI(), board_size=bs, sims=1, max_moves=4, temperature=1.0,
             expand_topk=4, expand_chunk=0)
     finally:
         np.random.set_state(state)

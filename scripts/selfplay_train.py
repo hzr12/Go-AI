@@ -235,13 +235,14 @@ def self_play_game(ai, board_size, sims, max_moves, temperature,
             board, hists[0], hists[1], to_play,
             simulations=sims, path_moves=path_moves)
         # 记录训练样本
-        # ⚠ n_channels=12：自对弈采集的 buffer 喂 `in_channels=12` 的旧模型（见
-        #   train_sft.py 的构造）。P4.3 起 feature_planes* 默认 17 通道，不显式钉住
-        #   会让 buffer 里的 planes 与模型 in_channels 不匹配（形状错，不是静默错值）。
-        #   ⚠ v21 训练要 17 通道时**这一格必须同步切**（P4.2/P4.8 的遗留项）。
+        # ⚠ 通道数**随模型走**（P4.2 接线后这一格不再写死 12）：自对弈采集的
+        #   buffer 必须与 `ai` 的 in_channels 一致 —— 旧权重走 12ch，v21 走 17ch。
+        #   P4.3 起 feature_planes* 默认 17 通道，钉死任意一个字面量都会让另一半
+        #   场景的 planes 与模型 in_channels 不匹配（形状错，不是静默错值）。
+        #   写 `ai.in_channels` 同时覆盖两代，v21 切换时无需再改这里。
         planes = np.ascontiguousarray(board.feature_planes_batched(
             board.board[None], [list(hists[0])], [list(hists[1])],
-            [to_play], [board.ko_point], n_channels=12)[0])
+            [to_play], [board.ko_point], n_channels=ai.in_channels)[0])
         # 合法掩码必须在落子**前**取：n² 来自 get_legal_moves()（无 pass 槽），
         # 拼上恒合法的 pass 槽 → n²+1，与网络 logits 同宽（P3-C-a）
         mask = np.concatenate((legal, np.array([True])))

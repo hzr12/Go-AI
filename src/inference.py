@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 from src.game.go_rules import GoBoard
-from src.networks.alphanet import AlphaGoNet
+from src.networks.alphanet import AlphaGoNet, build_v21_net
 
 
 def _ensure_torch_npu():
@@ -125,6 +125,10 @@ def _legacy_alpha_go_net(in_channels, **arch_kwargs):
 
 
 register_in_channels_builder(12, _legacy_alpha_go_net)
+# P4.2 接线：17ch = v21（D1 的唯一训练结构，结构只由 V21_CFG 决定）。
+# builder 收到的 arch_kwargs 里旧结构参数（backbone_channels/attention_mode…）
+# 按 D1 归档一律忽略，只保留 action_size / attention_dropout / grad_checkpoint。
+register_in_channels_builder(17, build_v21_net)
 
 
 class GoAI:
@@ -221,6 +225,13 @@ class GoAI:
         )
         self.model = _build_for_in_channels(self.in_channels, **net_kwargs).to(
             self.device)
+        # ⚠ 这里就进 eval，别等下面那行 —— torch.compile 的 warmup 前向在
+        # `self.model.eval()`（下面）**之前**就跑，而 v21 主干带 grad
+        # checkpointing（V21_CFG['grad_checkpoint']=1）：GC 只在 training 态
+        # 生效，warmup 时模型默认 training=True 会让 compile 撞上 GC 互斥守卫
+        # 并静默回退 eager（P4.6b §8.2④ 那组组合）。eval 下检查点恒关闭，
+        # compile 正常走。
+        self.model.eval()
         # torch.compile 融合算子（GPU 上约 20-40% 提速），不支持时回退 eager。
         # 注意：torch.compile 是惰性的，错误在首次前向才抛出，因此编译后用
         # dummy 输入做一次 warmup 以触发真实编译并捕获异常。
@@ -252,7 +263,14 @@ class GoAI:
         if state is not None:
             # 从权重形状自动推断架构参数，防止 mismatch
             inferred_bs = self._infer_board_size(state)
-            inferred_arch = self._infer_architecture(state)
+            if _IN_CHANNEL_BUILDERS.get(self.in_channels) is build_v21_net:
+                # v21：结构由 V21_CFG 唯一决定（D1），没有「可调的架构参数」。
+                # 若照常走 legacy 推断，会把 v21 的 16 个块误读成
+                # backbone_res_blocks=16（默认 12）→ 触发一次与初建完全相同的
+                # 重建 + 一条误导日志（v21 根本不认这个参数）。
+                inferred_arch = {}
+            else:
+                inferred_arch = self._infer_architecture(state)
             needs_rebuild = False
             if inferred_bs is not None and inferred_bs != self.board_size:
                 print(f"[GoAI] 权重按 {inferred_bs} 路训练（当前 board_size={self.board_size}），"

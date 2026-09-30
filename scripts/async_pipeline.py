@@ -221,11 +221,12 @@ class SelfPlayWorker(Process):
             
             # 记录样本（P3-C 7 元组，与 selfplay_train.self_play_game 同一契约：
             # (planes, action, logp_old, to_play, mc, root_value, mask)，见彼处 docstring）
-            # ⚠ n_channels=12：与 selfplay_train.py 同一契约（旧权重布局），
-            #   v21 训练切 17 通道时这一格必须同步切。
+            # ⚠ 通道数随模型走（P4.2 接线，与 selfplay_train 同一契约）：
+            #   旧权重 12ch / v21 17ch，钉死字面量会让另一半场景的 planes 与
+            #   ai.in_channels 不匹配。
             planes = np.ascontiguousarray(board.feature_planes_batched(
                 board.board[None], [list(hists[0])], [list(hists[1])],
-                [to_play], [board.ko_point], n_channels=12)[0])
+                [to_play], [board.ko_point], n_channels=ai.in_channels)[0])
             # 合法掩码必须在落子前取：n² 来自 get_legal_moves()（无 pass 槽），
             # 拼恒合法的 pass 槽 → n²+1，与网络 logits 同宽
             mask = np.concatenate((legal, np.array([True])))

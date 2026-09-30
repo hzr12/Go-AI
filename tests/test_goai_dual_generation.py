@@ -5,7 +5,8 @@
   2. test_mismatched_in_channels_raises_with_both_numbers — 构建器无视 in_channels → 期望/实际都进报错
   3. test_12ch_path_is_bit_identical            — 12ch 输出与改前关键路径逐位一致（自写参照）
   4. test_feature_plane_channel_count_follows_model — 特征通道数跟模型走（12/17 端到端）
-  5. test_17ch_branch_reports_missing_wiring    — 17 分支报错可操作（P4.2 接线指引）
+  5. test_17ch_branch_is_wired_end_to_end       — 17 = v21，端到端可用（P4.2 已接线）
+     test_unregistered_channel_reports_missing_wiring — 没接线的通道报错仍可操作
   6. test_no_checkpoint_defaults_to_12          — 无 checkpoint → 旧默认 12（零回归入口）
   7. test_out_of_range_in_channels_raises       — stem 越出 12..17 → 早失败
   8. test_precomputed_planes_channel_mismatch_raises — F5：预计算特征通道数不符 → 期望/实际进报错
@@ -232,15 +233,38 @@ def test_feature_plane_channel_count_follows_model(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 # 5. 17 分支报错可操作
 # --------------------------------------------------------------------------- #
-def test_17ch_branch_reports_missing_wiring(tmp_path):
-    """17ch 未注册时的报错必须说清：谁来接（P4.2）、怎么接（注册函数+签名）。"""
-    ck = _make_ckpt(tmp_path, 17)
+def test_17ch_branch_is_wired_end_to_end(tmp_path):
+    """P4.2 已接线：17ch = v21，端到端可用（17 构建器不再「缺接线」）。"""
+    from src import inference as inf
+    from src.networks.alphanet import V21Net, build_v21_net
+
+    assert inf._IN_CHANNEL_BUILDERS.get(17) is build_v21_net, \
+        "17ch 构建器不是 v21（P4.2 接线被顶掉了）"
+    ck = str(tmp_path / "v21_17ch.pth")
+    torch.manual_seed(11)
+    torch.save({"model": build_v21_net(action_size=N * N + 1).state_dict()}, ck)
+
+    ai = GoAI(model_path=ck, board_size=N, device="cpu")
+    assert ai.in_channels == 17
+    assert isinstance(ai.model, V21Net), "17ch 装出来的不是 v21"
+    pol, val = ai.predict(GoBoard(N), [-1, -1, -1], [-1, -1, -1], 1)
+    assert pol.shape == (N * N + 1,)
+    assert -1.0 <= val <= 1.0
+
+
+def test_unregistered_channel_reports_missing_wiring(tmp_path):
+    """**没**接线的通道数（16）报错仍须可操作：谁来接（P4.2）、怎么接。
+
+    17 本身已接线，这条守护的是报错路径本身 —— 换个没人注册的通道数，
+    文案一个字都不能少（否则下一次接线的人又要逆向猜契约）。
+    """
+    ck = _make_ckpt(tmp_path, 16)
     with pytest.raises(RuntimeError) as ei:
         GoAI(model_path=ck, board_size=N, device="cpu")
     msg = str(ei.value)
-    assert "17" in msg
+    assert "16" in msg
     assert "P4.2" in msg, f"报错没点名接线任务: {msg}"
-    assert "register_in_channels_builder(17" in msg, f"报错没给接线调用方式: {msg}"
+    assert "register_in_channels_builder(16" in msg, f"报错没给接线调用方式: {msg}"
     assert "in_channels" in msg and "arch_kwargs" in msg, \
         f"报错没给 builder 契约: {msg}"
 

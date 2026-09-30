@@ -163,7 +163,7 @@ def _check_training_env(logger):
 
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.networks.alphanet import AlphaGoNet
+from src.networks.alphanet import V21_CFG, build_v21_net
 from src.data.dataset import SupervisedDataset
 from scripts.build_dataset import build
 
@@ -528,7 +528,11 @@ def _positive_beta(text):
 def load_dataset(path):
     """加载单个 .npz 训练集。"""
     d = np.load(path, allow_pickle=False)
-    return SupervisedDataset({k: d[k] for k in d.files})
+    # 通道数必须与**模型侧同改**（D1：train_sft 的模型恒 v21 = 17 路）。
+    # SupervisedDataset 的默认 12 是给旧权重回归留的（dataset.py C7），这里
+    # 不显式传就会拿 12 路平面去喂 17 路 stem —— 第一个 batch 就形状错。
+    return SupervisedDataset({k: d[k] for k in d.files},
+                             n_channels=V21_CFG['in_channels'])
 
 
 # ---- eval 的确定性：固定采样源 + 与训练 RNG 流隔离 + 关闭数据增强 ----
@@ -823,7 +827,8 @@ def load_from_path(path, board_size, max_games_per_tgz=0):
                 f"目录 {path} 下未解析到任何有效棋谱，请检查 --board-size 是否与棋谱尺寸匹配")
         merged = _concat_dicts(dicts)
         print(f"[data] 合并后样本数 {merged['boards'].shape[0]}")
-        return SupervisedDataset(merged)
+        # 同 load_dataset：平面通道数随 V21_CFG 走（与模型侧同改）
+        return SupervisedDataset(merged, n_channels=V21_CFG['in_channels'])
     return load_dataset(path)
 
 
@@ -2098,27 +2103,39 @@ def main():
     else:
         train_sampler = None
 
-    model = AlphaGoNet(
-        in_channels=12,
-        backbone_channels=args.backbone_channels,
-        backbone_res_blocks=args.backbone_res_blocks,
-        attention_mode=args.attention_mode,
-        num_attention_layers=args.num_attention_layers,
-        num_heads=args.num_heads,
-        attention_dropout=args.attention_dropout,
-        attn_mode=args.attn_mode,
-        attn_window=args.attn_window,
+    # ---------------------------------------------------------------- D1 v2 ----
+    # 训练结构**唯一** = v21（结构硬编码在 src.networks.alphanet.V21_CFG）。
+    # 旧结构 flag（--arch / --backbone-channels / --res-blocks / --policy-layers …
+    # 与下面这一整串）**全部归档：不参与建网**，仍被 argparse 接受只为旧 shell
+    # 不必改命令行（忽略而非报错，是 D1 的硬约束 C11；运行日志里那句
+    # 「结构参数已归档」就是这里）。
+    # `--use-checkpoint` 同样归档：v21 的检查点开关 = V21_CFG['grad_checkpoint']
+    # （用户裁决：ResBlocks 必开）∧「未开图编译」，见下。
+    # 没有 `arch=='v21'` 分支、没有新增任何 CLI（D1）。
+    _v21_gc = V21_CFG['grad_checkpoint']
+    if args.compile == 1 or args.npu_graph_compile == 1:
+        # grad checkpointing 与 torch.compile / TorchAir 图编译互斥
+        # （P4.6b §8.2④：训练态 GC 会在第一次前向撞断言）。两者都要是
+        # **显式**决策：这里让图编译赢、检查点让位并打 warning，绝不静默
+        # 丢掉任何一边（显存会回升，日志必须能看出原因）。
+        _v21_gc = 0
+        logger.warning(
+            "[model] compile/npu-graph-compile=1 ⇒ 本次运行关闭 gradient "
+            "checkpointing（V21_CFG 的 %d 与图编译互斥，显存占用回升）",
+            V21_CFG['grad_checkpoint'])
+    elif args.use_checkpoint == 0:
+        logger.info("[model] --use-checkpoint 已归档（D1）：v21 的检查点开关由 "
+                    "V21_CFG[%r]=%d 决定，本次启用（如需关闭请用 --compile 1）",
+                    'grad_checkpoint', _v21_gc)
+    model = build_v21_net(
+        in_channels=V21_CFG['in_channels'],
         action_size=args.board_size * args.board_size + 1,  # +1 为 pass 类别
-        use_checkpoint=args.use_checkpoint == 1,
-        arch=args.arch,
-        res_blocks=args.res_blocks,
-        convnext_blocks=args.convnext_blocks,
-        attn_blocks=args.attn_blocks,
-        value_res_blocks=args.value_res_blocks,
-        policy_layers=args.policy_layers,
+        attention_dropout=args.attention_dropout,           # 行为参数，仍生效
+        grad_checkpoint=_v21_gc,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    logger.info("[model] 参数量=%.2fM | 设备=%s", n_params / 1e6, device)
+    logger.info("[model] v21 (V21_CFG) 参数量=%.2fM | grad_checkpoint=%d | 设备=%s",
+                n_params / 1e6, _v21_gc, device)
 
     # A100 上把卷积型特征（N,C,H,W）转 channels_last(NHWC)，卷积算子走更快内存布局。
     # 输入 state 也需同步转格式（见训练/评估循环），故这里仅转换模型权重布局。
@@ -2295,8 +2312,11 @@ def main():
             # flash-attn 只接受 fp16/bf16，导致图编译被误判为不可用而回退 eager，
             # 且这个误判极难排查。torch.compile 是惰性的，编译错误在这里才浮出来。
             with torch.no_grad(), maybe_autocast(device, amp_dtype):
-                _dummy = torch.zeros(1, 12, args.board_size, args.board_size,
-                                    device=device)
+                # 通道数走 V21_CFG 常量（C9 / P4.4）：D1 之后这里建的永远是 v21，
+                # 硬编码 12 会让图编译预热在 stem 上直接形状错 → 整条编译路径
+                # 静默回退 eager。
+                _dummy = torch.zeros(1, V21_CFG['in_channels'], args.board_size,
+                                      args.board_size, device=device)
                 model(_dummy)
             logger.info("[train] NPU TorchAir Linear-only 图编译已启用（已编译 %d 个 "
                         "nn.Linear，其余子模块仍 eager）", len(_npu_rollback))
@@ -2329,8 +2349,9 @@ def main():
                 # FP32 输入直灌会报 "FlashAttention only support fp16 and bf16 data
                 # type"，导致 compile 被误判为不可用而回退 eager。
                 with torch.no_grad(), maybe_autocast(device, amp_dtype):
-                    dummy = torch.zeros(1, 12, args.board_size, args.board_size,
-                                        device=device)
+                    # 同上：预热输入通道 = V21_CFG['in_channels']（C9 / P4.4）
+                    dummy = torch.zeros(1, V21_CFG['in_channels'], args.board_size,
+                                        args.board_size, device=device)
                     model(dummy)
                 logger.info("[train] 已启用 torch.compile 算子融合")
             except Exception as e:  # noqa: BLE001
