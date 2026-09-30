@@ -10,7 +10,7 @@
 
 本测试覆盖频率决策、单同步点、以及若干结构性不变量。
 """
-import inspect
+import ast
 import os
 import sys
 
@@ -20,6 +20,139 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from scripts.train_sft import _read_log_scalars, _should_log
+
+SRC = open(os.path.join(ROOT, 'scripts', 'train_sft.py'), encoding='utf-8').read()
+
+# --------------------------------------------------------------------------- #
+# AST 定位工具
+# --------------------------------------------------------------------------- #
+# ⚠ 为什么本文件「打点/上报在哪」这类断言必须走 AST、不能走 find / 正则 / 定长窗口：
+# 那三者都是在**整份原文**上扫的，注释与 docstring 和真代码逐字同形，所以「谁先
+# 出现」根本不是「谁在执行」。63345c7 给 compute_l2_report 写的说明里引了一次
+# `if _do_stdout or _do_swanlab:`，把 22f8f07 修好的两个测试重新打挂；本文件当时
+# 被记成「一个真实隐患」而未修。
+#
+# 本文件比那两个还脆一层：`main()` 里有 **4 处** `swanlab_logger.log(`——打点 /
+# eval / 早停 / 收尾——而 `src.find('swanlab_logger.log(')` 取的是**第一个**，
+# 今天取对纯属排版运气。往前加一条提到该串的注释，测试就改看别处：要么对着一段
+# 说明文字报红，要么把 400 字符窗口挪到不含真正调用体的位置、把真实缺陷放过去。
+#
+# AST 里注释与 docstring 不是节点，定位对「又有人写了一段解释」彻底免疫；而
+# 「4 处里我要哪一处」也必须**指名**，不能靠行序默认——下面的定位器一律
+# 「按内容认领 + 要求唯一」，唯一性不成立时直接报红并说清有哪几处、要认谁。
+
+_LOSS_KEYS = ('loss', 'policy_loss', 'value_loss')
+
+
+def _main_tree():
+    """main() 的语法树（只取这一个函数，断言范围与原 inspect.getsource 一致）。"""
+    for n in ast.parse(SRC).body:
+        if isinstance(n, ast.FunctionDef) and n.name == 'main':
+            return n
+    raise AssertionError('scripts/train_sft.py 里没有 main()')
+
+
+def _uniques(nodes, what):
+    assert len(nodes) == 1, \
+        f'期望恰好 1 个{what}，实得 {len(nodes)} 个：' \
+        + ', '.join(f'第 {n.lineno} 行' for n in nodes)
+    return nodes[0]
+
+
+def _parents(tree):
+    return {ch: par for par in ast.walk(tree)
+            for ch in ast.iter_child_nodes(par)}
+
+
+def _stmt_list_of(node, parents):
+    """(node 所在的语句列表, 父节点) —— 即 node 的同级列表。
+
+    从 node 往上找第一个「把 node 放进自己某个 list 字段里」的父节点；找不到
+    返回 (None, None)。用它断言「两条语句同级且有先后」，比文本偏移可靠。
+    """
+    while node in parents:
+        par = parents[node]
+        for _, val in ast.iter_fields(par):
+            if isinstance(val, list) and any(v is node for v in val):
+                return val, par
+        node = par
+    return None, None
+
+
+def _if_nodes(tree, test_src):
+    return [n for n in ast.walk(tree)
+            if isinstance(n, ast.If) and ast.unparse(n.test) == test_src]
+
+
+def _attr_uses(tree, obj, attr):
+    """`obj.attr` 形式的全部属性访问节点（不限于是否被调用）。"""
+    return [n for n in ast.walk(tree)
+            if isinstance(n, ast.Attribute) and n.attr == attr
+            and isinstance(n.value, ast.Name) and n.value.id == obj]
+
+
+def _calls_attr(tree, obj, attr):
+    """`obj.attr(...)` 的全部调用节点。"""
+    return [n for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr == attr and isinstance(n.func.value, ast.Name)
+            and n.func.value.id == obj]
+
+
+def _calls_name(node, name):
+    """裸函数名 `name(...)` 的全部调用节点（`node` 可以是语句树，也可以是任一表达式）。"""
+    return [n for n in ast.walk(node)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id == name]
+
+
+def _assign_names(stmt):
+    """这条赋值写入了哪些名字（解包 `a, b = ...` 的每个元素都算进去）。
+
+    注意 `_lv, _pv, _vv = ...` 在 AST 里是**一个** Tuple target，不是三个 target，
+    只看 `stmt.targets` 会拿到空列表。
+    """
+    return [n.id for tgt in stmt.targets
+            for n in ast.walk(tgt)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)]
+
+
+def _call_dict(call):
+    """调用首个位置实参是 dict 字面量时返回 {key: 值源码}；否则 None。"""
+    if not call.args:
+        return None
+    a0 = call.args[0]
+    if not (isinstance(a0, ast.Dict) and a0.keys):
+        return None
+    return {k.value: ast.unparse(v) for k, v in zip(a0.keys, a0.values)
+            if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+
+
+def _train_log_call(tree):
+    """**上报打点标量**的那次 `swanlab_logger.log(` —— 字典里带 loss 三项者。
+
+    main() 里有 4 处 `swanlab_logger.log(`：打点 / eval / 早停 / 收尾。只有
+    打点那处传 loss、policy_loss、value_loss，也就是「三个张量各被 .item()
+    取两次」这条不变式真正约束的那一次。按「带哪些 key」指名认领，不按行序取
+    第一个；哪天真的多出第二个带 loss 的上报点，这里会报红要求重新指名，而不会
+    静默改看别处。
+    """
+    return _uniques(
+        [c for c in _calls_attr(tree, 'swanlab_logger', 'log')
+         if all(k in (_call_dict(c) or {}) for k in _LOSS_KEYS)],
+        '带 loss/policy_loss/value_loss 的 swanlab_logger.log(',
+    )
+
+
+def _prof_print_if(tree):
+    """`if _do_stdout:` 里**打印内核剖析表**的那一个（体内含 _prof_ctx）。
+
+    main() 里有两处 `if _do_stdout:`（打点行 / 剖析表），靠「第一个」定位会随
+    排版漂移，所以按「体内含 _prof_ctx」来认——它就是打点区域的末端。
+    """
+    return _uniques([n for n in _if_nodes(tree, '_do_stdout')
+                     if any('_prof_ctx' in ast.unparse(s) for s in n.body)],
+                    '打印 [profile] 剖析表的 `if _do_stdout:` 分支')
 
 
 # --------------------------------------------------------------------------- #
@@ -99,26 +232,82 @@ def test_read_log_scalars_returns_plain_floats():
 # --------------------------------------------------------------------------- #
 def test_main_uses_helpers_and_no_longer_reads_tensors_twice():
     """main() 的打点应走上述两个 helper，stdout 与 swanlab 共用同一份标量。"""
-    import scripts.train_sft as t
-    src = inspect.getsource(t.main)
-    assert '_should_log(' in src, 'main() 未使用 _should_log 做频率决策'
-    assert '_read_log_scalars(' in src, 'main() 未使用 _read_log_scalars 做单同步'
+    tree = _main_tree()
+    parents = _parents(tree)
 
-    # 打点区域内 .item() 只应出现在 _read_log_scalars 的调用处
-    log_region = src[src.find('_should_log('):]
-    log_region = log_region[:log_region.find('if _prof_ctx')]
-    assert log_region.count('.item()') == 0, \
-        '打点区域不应再有裸 .item()（应全部经 _read_log_scalars）'
+    # 两个 helper 必须**真的被调用**。原文是 `'_should_log(' in src` 那种
+    # 子串判定，一条提到它的注释就足以满足 —— 断言强度不等于它的字面意思。
+    for helper in ('_should_log', '_read_log_scalars'):
+        assert _calls_name(tree, helper), f'main() 未调用 {helper}'
+
+    # --- 打点区域 = step 循环体里「频率决策 → 剖析表分支」这一段**同级语句** ----
+    # 原文是 `src[find('_should_log('):][:find('if _prof_ctx')]`：起点能被注释
+    # 钓走；而且 find 找不到时返回 -1，`[: -1]` 会**静默**砍掉最后一个字符、把
+    # 区域悄悄缩到别处。这里改按同级语句切，两端都是认出来的真节点。
+    should = _uniques(
+        [s for s in ast.walk(tree)
+         if isinstance(s, ast.Assign)
+         and _calls_name(s.value, '_should_log')],
+        '频率决策赋值 `_do_stdout, _do_swanlab = _should_log(...)`',
+    )
+    assert _assign_names(should) == ['_do_stdout', '_do_swanlab'], \
+        '频率决策应同时决定 stdout 与 swanlab 开关'
+    prof = _prof_print_if(tree)          # 区域内最后一个 stdout 分支
+
+    lst, _ = _stmt_list_of(should, parents)
+    assert lst is not None and prof in lst, \
+        '频率决策与剖析表分支不在同一个语句列表里，无法定义「打点区域」'
+    lo, hi = lst.index(should), lst.index(prof)
+    assert lo < hi, '剖析表分支应排在频率决策之后（它才是打点区域的末端）'
+    # 区间取 `lo:hi+1` = 连剖析分支**整条**一起算，比原文的
+    # `find('if _prof_ctx')` 多盖住 2443~2453，因此只会更宽、不会更窄。
+    region = lst[lo:hi + 1]
+
+    # 区域内不应再有裸 .item()：三个张量的取值必须全部经 _read_log_scalars
+    bad = sorted({n.lineno for stmt in region for n in ast.walk(stmt)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                  and n.func.attr == 'item'})
+    assert not bad, \
+        '打点区域不应再有裸 .item()（应全部经 _read_log_scalars），行：' \
+        + ', '.join(map(str, bad))
 
 
 def test_swanlab_log_uses_cached_scalars():
     """swanlab 上报必须用缓存的标量变量，而不是重新取张量。"""
-    import scripts.train_sft as t
-    src = inspect.getsource(t.main)
-    log_start = src.find('swanlab_logger.log(')
-    assert log_start != -1, 'main() 未调用 swanlab_logger.log'
-    region = src[log_start:log_start + 400]
-    assert '.item()' not in region, 'swanlab.log 内不得再取 .item()'
+    tree = _main_tree()
+    call = _train_log_call(tree)   # 带 loss/policy_loss/value_loss 的那次上报
+
+    # --- ① 整棵调用子树里不得再取张量 -----------------------------------------
+    # 原文是 `src[log_start:log_start + 400]`：起点是一段注释就能钓走的第一个
+    # 匹配；那个 400 的常数**连调用体都盖不满**（打点这次从 2421 铺到 2439，
+    # 窗口在 2430 就断了），末尾几个 key 从来没被检查过。改成「该调用节点的
+    # 整个子树」后两头都不漏，且注释/docstring 因为不是节点而无法参与。
+    got_item = sorted({n.lineno for n in ast.walk(call)
+                       if isinstance(n, ast.Attribute) and n.attr == 'item'})
+    assert not got_item, \
+        'swanlab.log 内不得再取 .item()，行：' + ', '.join(map(str, got_item))
+
+    # --- ② 上报的三项必须正是单同步点的返回值 ---------------------------------
+    # 这是「用缓存的标量」的正向表述。原文只查了「400 字符内没有 .item()」那
+    # 一半，于是 `float(log_loss)` 这种不含 .item()、却照样再同步一次设备的
+    # 写法能混过去 —— 它破坏的正是本文件要防的「一个打点只同步 3 次」。
+    d = _call_dict(call)
+    assert d is not None, 'swanlab.log 的首个实参不是 dict 字面量，无法核对上报内容'
+    got = tuple(d[k] for k in _LOSS_KEYS)
+    assert got == ('_lv', '_pv', '_vv'), \
+        f'上报的 loss 三项必须复用单同步点的 _lv/_pv/_vv，实得 {got}'
+
+    # --- ③ 那三个名字确实来自 _read_log_scalars，且早于本次上报 ---------------
+    # 光看名字不够：还得确认它就是那个单同步点的解包结果，且发生在上报之前。
+    unpack = _uniques(
+        [s for s in ast.walk(tree)
+         if isinstance(s, ast.Assign) and _calls_name(s.value, '_read_log_scalars')],
+        '把 _read_log_scalars 结果解包成 _lv/_pv/_vv 的赋值',
+    )
+    assert _assign_names(unpack) == ['_lv', '_pv', '_vv'], \
+        f'_lv/_pv/_vv 必须来自 _read_log_scalars 的解包，实得 {ast.unparse(unpack)}'
+    assert unpack.lineno < call.lineno, \
+        '上报必须晚于单同步点（否则又是一次独立取数）'
 
 
 def test_epoch_loss_removed():
@@ -130,25 +319,58 @@ def test_epoch_loss_removed():
 
 def test_swanlab_every_arg_exists_with_default_zero():
     """--swanlab-every 必须是合法参数且默认 0（保持现状）。"""
-    import argparse
-    import re
-    import scripts.train_sft as t
-    src = inspect.getsource(t.main)
-    m = re.search(r'add_argument\(\s*[\'"]--swanlab-every[\'"].*?default=([^\s,]+)',
-                  src, re.S)
-    assert m, 'train_sft.py 缺少 --swanlab-every'
-    assert m.group(1) == '0', f"--swanlab-every 默认应为 0，实得 {m.group(1)}"
+    tree = _main_tree()
+    flags = {}
+    decls = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+             and n.func.attr == 'add_argument' and n.args
+             and isinstance(n.args[0], ast.Constant)
+             and isinstance(n.args[0].value, str)]
+    for call in decls:
+        flags.setdefault(call.args[0].value, []).append(call)
+
+    assert '--swanlab-every' in flags, 'train_sft.py 缺少 --swanlab-every'
+    # 原文是 `add_argument\(\s*['"]--swanlab-every['"].*?default=([^\s,]+)`（re.S）：
+    # `.*?` 配 re.S 会跨行，于是只要有人**在任何位置**（比如 --swanlab-every 的
+    # help 文本里就含 `--log-every`）先提到这个旗名，正则就会从那儿起扫、把
+    # **后面另一个旗名**的 default 抓过来；反过来，一旦本次调用的 default 被
+    # 删掉，`.*?default=` 会继续往前找到下一个旗名的 default 而照样通过。
+    # 改按「首个实参就是那个旗名的 add_argument 调用」认领，default 只认它自己
+    # 的 keyword。
+    call = _uniques(flags['--swanlab-every'], '`--swanlab-every` 的 add_argument 调用')
+    kwargs = {k.arg: k.value for k in call.keywords if k.arg}
+    assert 'default' in kwargs, \
+        f'--swanlab-every 未显式给 default（实得 {ast.unparse(call)}）'
+    got = ast.unparse(kwargs['default'])
+    assert got == '0', f'--swanlab-every 默认应为 0，实得 {got}'
 
 
 def test_swanlab_every_logged_in_config():
     """启动日志应打印 swanlab 上报频率，便于确认加密是否生效。"""
-    import scripts.train_sft as t
-    src = inspect.getsource(t.main)
-    i = src.find('SwanLab: 启用=')
-    assert i != -1, 'main() 未打印 SwanLab 配置状态'
-    stmt = src[i:i + 500]
-    assert 'swanlab_every' in stmt, 'SwanLab 状态日志未包含 --swanlab-every'
-    assert 'log_every' in stmt, 'SwanLab 状态日志未说明与 --log-every 的关系'
+    tree = _main_tree()
+    # 原文是 `src.find('SwanLab: 启用=')` + 500 字符窗口：起点是一句提到该字样
+    # 的注释就能钓走的第一个匹配，而那个 500 的窗口**早已越过了本条语句**、伸进
+    # 后面的分布式初始化（见改前窗口内容），里面「出现过这两个名字」不再说明
+    # 本条日志打印了它们。改按「首个实参是含该字样的字符串字面量的调用」认领。
+    call = _uniques(
+        [c for c in ast.walk(tree)
+         if isinstance(c, ast.Call) and c.args
+         and isinstance(c.args[0], ast.Constant)
+         and isinstance(c.args[0].value, str)
+         and 'SwanLab: 启用=' in c.args[0].value],
+        '打印 SwanLab 配置状态的日志调用',
+    )
+    fmt = call.args[0].value
+    assert '--swanlab-every' in fmt, 'SwanLab 状态日志未包含 --swanlab-every'
+    assert '--log-every' in fmt, 'SwanLab 状态日志未说明与 --log-every 的关系'
+
+    # 实参里必须真的把两个频率打出来（只看窗口的话，help 文本里出现的旗名就够
+    # 让旧断言绿了，而那两个 %d 其实没喂任何频率）。
+    used = [ast.unparse(a) for a in call.args[1:]]
+    assert 'args.swanlab_every' in used, \
+        f'SwanLab 状态日志未打印实际 swanlab_every，实参={used}'
+    assert 'args.log_every' in used, \
+        f'SwanLab 状态日志未打印实际 log_every，实参={used}'
 
 
 # --------------------------------------------------------------------------- #
@@ -161,26 +383,42 @@ def test_main_logs_through_swanlab_logger_not_bare_swanlab():
     `swanlab.log(...)` 会变成未定义名——平时被 `if swanlab_logger is not None`
     挡住看不出来，但**一旦 swanlab 真能启用，首个打点就会 NameError 崩溃**。
     """
-    import scripts.train_sft as t
-    src = inspect.getsource(t.main)
-    assert 'swanlab.log(' not in src, \
-        "main() 不应直接引用 swanlab.log（swanlab 在此作用域未定义）"
-    assert 'swanlab.finish(' not in src, \
-        "main() 不应直接引用 swanlab.finish（同上）"
-    assert 'swanlab_logger.log(' in src, "main() 应通过 swanlab_logger 记录"
-    assert 'swanlab_logger.finish(' in src, "main() 应通过 swanlab_logger 收尾"
-    # 确认每个 log 调用都在 None 守卫之内。守卫有两种等价写法：
+    tree = _main_tree()
+    parents = _parents(tree)
+
+    # 不得直接引用未定义的 `swanlab`。查的是**属性访问**而非调用，
+    # 因此连 `f = swanlab.log` 这种只取不调也拦得住（比原文的逐字
+    # `'swanlab.log(' not in src` 略严），而注释里提到它不再误报。
+    for attr in ('log', 'finish'):
+        bad = _attr_uses(tree, 'swanlab', attr)
+        assert not bad, \
+            f'main() 不应直接引用 swanlab.{attr}（swanlab 在此作用域未定义）：' \
+            + ', '.join(f'第 {n.lineno} 行' for n in bad)
+
+    assert _calls_attr(tree, 'swanlab_logger', 'log'), \
+        'main() 应通过 swanlab_logger 记录'
+    _uniques(_calls_attr(tree, 'swanlab_logger', 'finish'),
+             'swanlab_logger.finish() 调用')
+
+    # 确认每个调用都在 None 守卫之内。守卫有两种等价写法：
     #   · if swanlab_logger is not None:   —— 直接判空
     #   · if _do_swanlab:                  —— 经 _should_log 判空（内部含
     #                                         `swanlab_on = swanlab_logger is not None`）
     # 后者见 test_swanlab_off_never_logs 验证其确实含判空语义。
-    src_lines = src.splitlines()
-    for i, line in enumerate(src_lines):
-        if 'swanlab_logger.log(' in line or 'swanlab_logger.finish(' in line:
-            window = '\n'.join(src_lines[max(0, i - 14):i + 1])
-            assert ('swanlab_logger is not None' in window
-                    or 'if _do_swanlab:' in window), \
-                f'swanlab_logger 调用缺少 None 守卫: {line.strip()}'
+    # 原文是「往前数 14 行找守卫字样」：一句提到 `swanlab_logger.log(` 的注释会
+    # 凭空造出一条要守卫的调用（假红），而守卫写在 15 行之上又会被漏判（假绿）。
+    # 改沿 AST 父链找**真正包围该调用的 If**——那就是判空本身。
+    ok_guards = ('swanlab_logger is not None', '_do_swanlab')
+    for attr in ('log', 'finish'):
+        for call in _calls_attr(tree, 'swanlab_logger', attr):
+            node, guard = call, None
+            while node in parents:
+                node = parents[node]
+                if isinstance(node, ast.If) and ast.unparse(node.test) in ok_guards:
+                    guard = node
+                    break
+            assert guard is not None, \
+                f'swanlab_logger.{attr} 调用（第 {call.lineno} 行）缺少 None 守卫'
 
 
 def test_init_returns_none_on_failure():
