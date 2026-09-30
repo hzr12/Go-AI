@@ -2,7 +2,7 @@
 # Go-AI 4卡 NPU SFT + 1卡 NPU RL + 24核 CPU 全流程命令
 # ============================================================
 # 架构:
-#   - SFT 训练: 4卡 NPU (DDP)
+#   - SFT 训练: 4卡 NPU (FSDP1：参数+梯度+优化器状态全分片, sharding=SHARD_GRAD_OP)
 #   - RL 训练:  1卡 NPU + 8进程 CPU (MCTS)
 #   - WebUI:    CPU + ONNX
 #   - 评估:     1卡 NPU
@@ -90,6 +90,65 @@ python -c "import numpy as np; d=np.load('data/sgf_19x19_full.npz'); print('game
 # ============================================================
 # ② SFT 监督训练
 # ============================================================
+# ------------------------------------------------------------
+# ②' 损失 / 日志键 / 输入通道（P4.3 · P4.5 · P4.5b · P4.8 · P4.13）
+#     命令行没变，**语义变过** —— 复现或对照历史 run 前先看这一节。
+#     逐条都对着 scripts/train_sft.py 的行号与 tests/test_huber_loss.py 核过。
+# ------------------------------------------------------------
+#
+# 【1】日志三个键的含义（键名被 tests/test_huber_loss.py::
+#      test_log_keys_unchanged 钉死，含义在 P4.5b 变过）
+#   · policy_loss / value_loss —— 两个分项本身，**不含**任何 L2
+#       （train_sft.py:2314 / :2318 各自的 compute_*_loss 调用）
+#   · loss = log_loss = policy_loss + w·value_loss + c‖θ‖²
+#       （compose_losses :1208-1210，:2346 组装，:2430 读标量，
+#        :2472 写进 swanlab 的 "loss" 键）—— 这个键**含**报告用的 L2 项
+#   · opt_loss = policy_loss + w·value_loss（:1208）是**唯一被 backward 的量**
+#       （:2348），**不含** L2
+#   · c‖θ‖² 由 compute_l2_report（:1213-1283）从 optimizer.param_groups 读回
+#     --weight-decay 算出，只覆盖 weight_decay != 0 的组（no_decay 的 norm/bias
+#     不算），返回纯 python float ⇒ 不进计算图。所以：
+#       **日志里的 loss 不是被优化的目标**；只有 w==1（默认）时
+#       loss − policy_loss − value_loss 才等于 c‖θ‖²，
+#       w≠1 时还多出 (w−1)·value_loss 这一项。
+#
+# 【2】损失默认值（P4.5 / P4.5b；tests/test_huber_loss.py 25 项测试钉住）
+#   · --policy-loss 默认 **ce**（曾短期默认 huber，已按用户裁决改回；:1575）
+#   · --value-loss 默认 **huber**（:1589）；value loss 权重默认 **1.0**
+#     （:1565 —— BCE 时代为平衡 policy/value 梯度加的 5.0 补偿已删）
+#   · --huber-beta 默认 **0.5**（:1601，须 > 0，policy/value 两侧 huber 共用）
+#   · **没有 --l2-coef 这个参数**（D1 不新增 CLI；test_no_new_cli_params 点名
+#     封杀）。唯一实际正则是 AdamW 的解耦 weight decay，--weight-decay 默认
+#     1e-4（:1507），它同时就是上面 L2 报告项的系数 c。
+#   · 下面三条 SFT 命令都不传损失旗 ⇒ 跑的就是这套默认。
+#   ⚠ 键名没变、含义变过（loss 多了 c‖θ‖²，policy 默认也由 huber 改回 ce）
+#     ⇒ **跨新旧 run 的 loss / policy_loss 曲线不可直接比**；
+#     top1 是纯 argmax 准确率（evaluate_top1 :459-502），不受损失口径影响。
+#
+# 【3】输入通道与两代 checkpoint（P4.3 / P4.8 / P4.13）
+#   · GoBoard.feature_planes 默认返回 **17** 通道（go_rules.py:2406），批量版同为
+#     17（:2534-2535）；n_channels 取 12..17 的**前缀**（_check_n_channels
+#     :269-280）。权威通道表 = go_rules.py:2353-2404：0-11 含义与下标不变，
+#     12-16 是新增五格（眼位×2、气==2 的块掩码×2、劫禁点掩码）；
+#     通道 8 = 合法点掩码（空点 ∧ 非自杀 ∧ 非 PSK 重复，**不含 PASS**）。
+#   · 训练侧目前仍是 12 通道：train_sft.py:1950-1951 按 in_channels=12 建网、
+#     SupervisedDataset 默认 n_channels=12（dataset.py:30）。实测
+#     models/sft_19x19_v12.pth 的 backbone.conv1.weight = (192, 12, 3, 3)。
+#   · **同为 12 通道，取值已经变过两处**（读旧 checkpoint / 对照旧日志必看）：
+#       1) 通道 8：P2.6 规则语义切换后取值变严（序号与含义不变）——
+#          go_rules.py:2360-2362；
+#       2) 通道 10/11 的气数：P4.3-fix 由「入射计数」改为「去重空点个数」
+#          （go_rules.py:164-177），U 形块不再多算 ⇒ 批量路径的 12 通道输出
+#          随之变化，旧权重看到的输入分布已与训练时不同。
+#   · 加载分派（src/inference.py）：从权重 stem 形状读 in_channels（:60-69）；
+#     读不到可识别 stem 键直接 raise（:194-202，**不静默回退 12**）、stem 通道
+#     越出 12..17 抛 ValueError（:407-410）；再按通道数查构建器注册表
+#     （:85-119）：**12 → AlphaGoNet**（:127，现有 checkpoint 走这条），
+#     **17 → 由路线图 P4.2 注册**，未注册前 RuntimeError 并打印接线方式
+#     （:98-105）；无 checkpoint 才用默认 12（:187）。特征端
+#     n_channels = ai.in_channels（:473），MCTS 向所挂模型要通道数、缺失即
+#     报错不回退（mcts.py:197-236）。
+#
 # 方案 A: 4卡 NPU (当前环境)
 # 注意: --swanlab 需已登录 swanlab.cn，训练结束后云端查看图表
 torchrun --nproc_per_node=4 scripts/train_sft.py \
@@ -239,7 +298,7 @@ python scripts/selfplay_train.py \
 #
 # --- 训练优化 ---
 #   --batch-size N          训练 batch（NPU 甜点）；默认 256
-#   --epochs N              每轮训练遍数；默认 2
+#   --epochs N              每轮训练遍数；PPO 语义下每遍内多轮 minibatch 更新；默认 2
 #   --lr F                  学习率；默认 1e-3
 #   --weight-decay F        权重衰减；默认 1e-4
 #   --value-lr-mult F       value head 学习率倍率；默认 0.5
@@ -251,8 +310,10 @@ python scripts/selfplay_train.py \
 #   --ppo-clip F            PPO 裁剪范围 ε（策略侧代理目标；value clipping 复用同一 ε）；默认 0.2
 #   --kl-coef F             KL 惩罚系数 β 的初值（非常数，自适应朝 --kl-target 走）；默认 0.01
 #   --kl-target F           目标 KL（β 自适应目标；超 2× 提前中止本轮 minibatch）；默认 0.01
-# 注：上面这三个目前是「只声明未消费」——args 里已解析，但损失里还没读它们，
-#     传入不改变任何数值行为；接线见路线图 D13 的 P3-C（策略侧）/P3-D（value 侧）。
+# 注：上面三个**策略侧旋钮已接线**（P3-C）：策略损失 = min(r·A, clip(r,1±ε)·A) + β·KL_k1，
+#     β 按 β←clamp(β·exp((KL_obs−kl_target)/kl_target), 1e-4, 10) 逐优化步自适应，
+#     running KL 超 2×kl_target 提前中止本轮。**value 侧接线属 P3-D，尚未落地。**
+#   --epochs N              训练遍数；PPO 语义下每遍内多轮 minibatch 更新；默认 2
 #
 # --- MCTS 搜索质量 ---
 #   --expand-topk N         展开候选截断（CPU 推荐 32-64）；默认 64
@@ -432,6 +493,9 @@ python scripts/eval_elo.py \
 #
 # ⚠ 容量比 v18 少 32%，**这是有代价的取舍**。准确率无法本地测量，
 #   首次跑务必与 v18 的 step-1800 快照（top1=0.2820）对比 loss / top1 轨迹。
+#   ⚠ 但 P4.5b 之后 `loss` 键的含义已变（多了报告项 c‖θ‖²，policy 默认也由
+#     huber 改回 ce，见 ②' 节）：**loss 曲线跨新旧 run 不可直接比**，
+#     这条对比只有 top1 轨迹仍可比。
 #
 # 9M 参数带内的其他候选（吞吐差异仅约 6%，故应按准确率因素而非速度选）:
 #   160ch 16块 r4c4a8   8.66M  4577 s/s   注意力最多
@@ -486,7 +550,8 @@ python scripts/eval_elo.py \
 # ============================================================
 # 1. SGF 元数据加权：解析 PB/PW 等级，高质量棋谱更高权重
 # 2. 手数比例软标签 (D)：tanh(score × alpha)，连续胜率
-# 3. MSE Loss：使用 winrates 时自动切换
+# 3. value 损失两口径：--value-loss {huber,mse}（默认 huber）+ --huber-beta；
+#    BCE / winrates 自动切换分支已删（test_sft_has_no_bce_branch），见 ②' 节
 # 4. ConvNeXt 风格：5x5 深度卷积 + LayerNorm + GELU (--arch convnext)
 # 5. 混合架构 Backbone：ResBlock (局部) + ConvNeXt (感受野) + Attention (全局)
 # 6. 动态 topk：早期8/中期16/后期32 (自动启用)

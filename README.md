@@ -17,7 +17,7 @@
 - [3. 项目结构](#3-项目结构)
 - [4. 核心概念](#4-核心概念)
   - [4.1 棋盘与规则引擎 GoBoard](#41-棋盘与规则引擎-goboard)
-  - [4.2 特征平面（12 通道）](#42-特征平面12-通道)
+  - [4.2 特征平面与通道表](#42-特征平面与通道表)
   - [4.3 网络架构 AlphaGoNet](#43-网络架构-alphagonet)
   - [4.4 MCTS 搜索](#44-mcts-搜索)
   - [4.5 LightPLS 轻量 rollout](#45-lightpls-轻量-rollout)
@@ -96,7 +96,7 @@ Go-AI/
 │   ├── __main__.py
 │   ├── inference.py              # GoAI 推理入口 + CLI（selfplay / human / analyze / ONNX 导出）
 │   ├── game/
-│   │   └── go_rules.py           # GoBoard 规则引擎 + 12 通道 feature_planes（ThreadPool 并行标注）
+│   │   └── go_rules.py           # GoBoard 规则引擎 + feature_planes（默认 17 通道，n_channels 可裁到 12）
 │   ├── networks/
 │   │   ├── alphanet.py           # AlphaGoNet（策略+价值双头）
 │   │   ├── backbone.py           # SharedBackbone（ResBlock + 注意力）
@@ -111,7 +111,7 @@ Go-AI/
 │   └── utils/
 │       └── helpers.py            # print_board 等
 ├── scripts/
-│   ├── train_sft.py              # 监督学习训练（CE + BCE，支持 DDP / NPU）
+│   ├── train_sft.py              # 监督学习训练（policy=CE / value=Huber，支持 DDP / NPU）
 │   ├── build_dataset.py          # SGF 目录/tgz -> npz 训练集
 │   ├── evaluate.py               # 评估（vs 随机 / 自对弈 / 速度基准）
 │   ├── eval_elo.py               # ELO 评分
@@ -150,7 +150,7 @@ Go-AI/
   - `action_to_coord(a)` / `coord_to_action(r, c)`：动作 ↔ 坐标，越界抛 `ValueError`。
   - `action_to_string(a)` / `string_to_action(s)`：动作 ↔ 文本记法（**列字母在前**的 SGF 风格，如 `"ee"`=天元、`"pass"`=虚着），
     非法输入抛 `ValueError`；记法与 `parse_move_str` 是**同一套**（`string_to_action` 直接委托它）。
-  - `feature_planes(my_hist, op_hist, to_play)` → `(12, n, n)` 特征（见 §4.2）。第 8 通道 = 合法点掩码。
+  - `feature_planes(my_hist, op_hist, to_play, n_channels=17)` → `(n_channels, n, n)` 特征（见 §4.2）。第 8 通道 = 合法点掩码。
   - `score()` → `float`：**黑 − 白** 面积分（`B_area − W_area − komi`，`>0` 黑胜）；`result()` 是其符号。
   - `is_terminal(max_moves=None)` → `bool`：连续两次 pass 或达到 `2*n*n` 手上限。
     ⚠ **重复局面不是终局条件**（TT 下它是非法手），本方法不查重复历史。
@@ -168,9 +168,10 @@ Go-AI/
   其中的面积分解是**独立实现**，用来交叉校验 `score()`）。
 - 克隆：无 `clone()` 方法，MCTS 用 `copy.deepcopy(board)` 复制局面。
 
-### 4.2 特征平面（12 通道）
+### 4.2 特征平面与通道表
 
-由 `GoBoard.feature_planes(my_hist, op_hist, to_play)` 产生，形状 `(12, n, n)`，单一真相来源（训练/推理/评估共用）：
+由 `GoBoard.feature_planes(my_hist, op_hist, to_play, n_channels=17)` 产生，形状 `(n_channels, n, n)`，单一真相来源（训练/推理/评估共用）。
+**权威通道表在 `src/game/go_rules.py:2353-2404`**（`feature_planes` 上方的段注释），下表与其逐格一致：
 
 | 通道 | 含义 |
 |------|------|
@@ -182,10 +183,28 @@ Go-AI/
 | 5 | 对手最近第 1 手 |
 | 6 | 对手最近第 2 手 |
 | 7 | 对手最近第 3 手 |
-| 8 | 合法着法掩码（1=合法）|
+| 8 | 合法着法掩码（1=合法，口径见下）|
 | 9 | 常量平面，值 = `to_play`（全 1 若黑 / 全 -1 若白）|
-| 10 | 己方「气=1」棋子掩码（送吃预警）|
-| 11 | 对手「气=1」棋子掩码 |
+| 10 | 己方「气=1」块掩码（送吃预警）|
+| 11 | 对手「气=1」块掩码 |
+| 12 | 己方眼位（空点 ∧ 严格内点 ∧ 4 邻全为己方）← 17 通道新增 |
+| 13 | 对方眼位（空点 ∧ 严格内点 ∧ 4 邻全为对方）← 17 通道新增 |
+| 14 | 己方「气=2」块掩码 ← 17 通道新增 |
+| 15 | 对方「气=2」块掩码 ← 17 通道新增 |
+| 16 | 劫禁点掩码（`ko_point` 单点，无劫则全零）← 17 通道新增 |
+
+**通道数口径（`n_channels` 是 12..17 的前缀契约，`_check_n_channels`，`go_rules.py:269-280`）**
+
+- `feature_planes(..., n_channels=17)` **默认 17**（`go_rules.py:2406`）；批量版 `feature_planes_batched` 同样**默认 17**（`go_rules.py:2534-2535`）。
+- `SupervisedDataset(..., n_channels=12)` **默认 12**（`src/data/dataset.py:30`），`train_sft.py:1950-1951` 也仍按 `in_channels=12` 建网 —— 即**训练侧至今产出/消费的都是 12 通道输入**；17 通道是路线图里 v21 的布局（P4.2/P4.3）。
+- 实测现有 checkpoint：`models/sft_19x19_v12.pth` 的 `backbone.conv1.weight` 形状 `(192, 12, 3, 3)` ⇒ stem `in_channels=12`。
+- 取 12 只是「不算尾部 5 格」，**0-11 的下标与含义在任何取值下都不变**（`go_rules.py:2409-2412`）。
+
+**读旧/新 checkpoint 时必须知道的三处「同形不同值」（12 通道的取值也已经变过）**
+
+1. **通道 8 = 合法点掩码**：`get_legal_moves()` 的口径 = 空点 ∧ 非自杀 ∧ 非 PSK 重复，**不含 PASS**（`go_rules.py:2360-2362`）。P2.6 规则语义切换后**取值变严**（序号与含义不变）——旧权重训练时看到的通道 8 与今天不是同一个分布（路线图 D14 登记项）。
+2. **气数口径（P4.3-fix）**：通道 10/11/14/15 的「气」= 与该块相邻的**去重空点个数**（`go_rules.py:2396-2401`）。批量路径曾用「入射计数」，U 形块被多算导致 10/11 漏标，已修（`go_rules.py:164-177`）——**连 12 通道的批量输出都因此变了**。
+3. **批量版通道 8 与单图版有已文档化的分歧**（批量侧无 `GoBoard` ⇒ 判不了 PSK、有意不禁自杀、遗留的 ko 排除，`go_rules.py:2572-2596`）。
 
 > 历史手用「最近 3 手」环形填充（不足 3 手用 `-1` 表示无）。`my_hist`/`op_hist` 为长度 3 的扁平坐标列表。
 
@@ -203,6 +222,7 @@ SharedBackbone(in_ch=12, ch=192, res_blocks=17, 注意力模式)
 ```
 
 - `forward(x)` → `(policy_logits, value)`；`policy_logits` 在推理时经 `softmax` 得概率。
+- 输入通道数 = 构造参数 `in_channels`（`alphanet.py:22`，**默认 12**，`train_sft.py:1950-1951` 也显式传 12）；17 通道由路线图 P4.2 接线，届时上图的 12 换成 17（§4.2）。
 - `action_size = n*n + 1`，**多出的 1 类是 pass**。
 - 注意力（可选，默认 `mix`）：`global`（全配对）/ `window`（滑动窗口，`--attn-window`）/
   `window_global`（窗口 + 全局 token）/ `axial`（轴向）；
@@ -225,7 +245,8 @@ SharedBackbone(in_ch=12, ch=192, res_blocks=17, 注意力模式)
   每个叶子只构造一次特征、只前向一次。`--num-threads 4` 即可。
 - **加速（跨叶子批量 leaf_ab）**：`_batch_leaf_ab` 将 N 个叶子的浅层 negamax 合并为 depth+1 次 predict（而非 N×(depth+1) 次），
   CPU/ONNX 场景下 predict 调用降低约 3×。
-- **加速（特征平面 LRU 缓存）**：`_planes1` 缓存 16384 个局面的 12 通道特征（key = board bytes + to_play + history + ko），
+- **加速（特征平面 LRU 缓存）**：`_planes1` 缓存 16384 个局面的特征（key = board bytes + to_play + history + ko），
+  **通道数 = 所挂模型的 `in_channels`**（`mcts.py:197-236`，旧代 12 / v21 17，缺失即报错、不回退 12），
   带 30 秒 TTL，MCTS 同一叶子深度路径中相同局面可复用，避免重复 flood-fill 计算。
 - **spec_prefetch 加速**：仅 `num_threads >= 4` 时启用，worker 线程异步预评估疑似叶子。
 - **leaf_ab 智能降级**：`sims < 64` 时自动 `leaf_ab_depth = 1`，避免低模拟数下过度展开。
@@ -285,7 +306,7 @@ python scripts/build_dataset.py --src <目录或 .tgz> --out data/sgf_19x19.npz 
 
 ### 5.3 训练集内存布局
 
-`SupervisedDataset`（`src/data/dataset.py`）以紧凑 numpy 保存，**运行时**才展开 12 通道 + 随机对称增广（等效 8× 静态增强，内存仅 1/8）：
+`SupervisedDataset`（`src/data/dataset.py`）以紧凑 numpy 保存，**运行时**才展开特征平面 + 随机对称增广（等效 8× 静态增强，内存仅 1/8）。通道数由构造参数 `n_channels` 决定，**默认 12**（`dataset.py:30`；12 = P4.3 之前的布局，`n_channels=17` 才是尾部补 5 格的 v21 布局，见 §4.2）：
 
 | 字段 | dtype | shape | 含义 |
 |------|-------|-------|------|
@@ -297,7 +318,7 @@ python scripts/build_dataset.py --src <目录或 .tgz> --out data/sgf_19x19.npz 
 | `values` | int8 | (N,) | 胜负标签（+1 黑 / -1 白）|
 | `to_play` | int8 | (N,) | 该样本轮到谁（1 黑 / -1 白）|
 
-- `sample_batch(idxs, device)` → `(state(B,12,H,W) fp32, move(B,) int64, value(B,1) fp32)`。
+- `sample_batch(idxs, device)` → `(state(B,n_channels,H,W) fp32, move(B,) int64, value(B,1) fp32)`。
   CUDA/NPU 自动 `pin_memory` + `non_blocking=True`，加速传输。
 - 对称增广：每样本随机选 8 种变换之一（旋转 0/90/180/270 × 翻转），同时作用于特征平面与着法坐标（`SYMMETRIES`）。
 
@@ -313,7 +334,7 @@ python scripts/train_sft.py --data data/sgf_19x19.npz --out models/sft_19x19.pth
     --board-size 19 --batch-size 512 --epochs 5 \
     --backbone-channels 192 --backbone-res-blocks 17 \
     --attention-mode mix --attn-mode window --attn-window 7 \
-    --value-loss-weight 5.0 --value-lr-mult 2.0
+    --value-loss-weight 1.0 --value-lr-mult 2.0
 ```
 
 **NPU 4 卡训练**（推荐）：
@@ -358,9 +379,13 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
 | `--device` | `auto` | `cuda` / `npu` / `cpu`；`auto`=有 GPU 用 cuda |
 | `--use-amp` | `0` | 启用混合精度训练（0=关闭, 1=开启）|
 | `--batch-size` | `512` | 每步批量 |
-| `--epochs` | `5` | 训练轮数 |
+| `--epochs` | `4` | 训练轮数 |
 | `--lr` | `2e-3` | 学习率（AdamW）|
-| `--weight-decay` | `1e-4` | 权重衰减 |
+| `--weight-decay` | `1e-4` | 权重衰减（AdamW **解耦** weight decay，**唯一实际正则**）|
+| `--policy-loss` | `ce` | policy 损失：`ce`（交叉熵）/ `huber`（label-smoothed 目标上的 Huber，仅供复现）|
+| `--value-loss` | `huber` | value 损失：`huber`（smooth L1）/ `mse`；BCE 分支已删 |
+| `--value-loss-weight` | `1.0` | value loss 权重（BCE 时代为平衡梯度的 `5.0` 补偿已删）|
+| `--huber-beta` | `0.5` | Huber 拐点 beta（须 > 0），policy/value 两侧的 `huber` 共用 |
 | `--backbone-channels` | `128` | 主干通道数（推荐 192，12.4M 参数）|
 | `--backbone-res-blocks` | `12` | 主干残差块数（推荐 17）|
 | `--res-blocks` | `0` | ResBlock 数量（0=使用默认 mix 模式）|
@@ -378,12 +403,27 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
 | `--early-stop` | `0` | 启用早停机制 |
 | `--early-stop-patience` | `3` | 早停耐心值 |
 | `--gradient-accumulation-steps` | `1` | 梯度累积步数（等效 batch = batch_size × steps）|
-| `--prefetch-depth` | `4` | 预取流水深度（提前造好数据，控制内存/吞吐）|
+| `--prefetch-depth` | `8` | 预取流水深度（提前造好数据，控制内存/吞吐）|
 | `--ver` | `v17` | 模型版本号（用于 swanlab name 和 --out 默认值）|
 | `--c2net` | `0` | 启用 C2NET（OpenI 启智平台）支持 |
 
 训练细节：
-- 损失：`L = CrossEntropy(policy_logits, move, label_smoothing) + value_loss_weight × BCEWithLogitsLoss(value, z)`
+
+- **损失分项**（`scripts/train_sft.py`，默认旗标，`tests/test_huber_loss.py` 钉住）：
+  - `policy_loss` = `F.cross_entropy(policy_logits, move_t, label_smoothing=0.1)`（`--policy-loss` 默认 **`ce`**，`train_sft.py:1575`；`huber` 分支保留仅供复现实验）；
+  - `value_loss` = Huber/smooth L1（`beta = --huber-beta`，默认 **0.5**，`:1601`）直接回归 `value_t ∈ [-1,1]`（`--value-loss` 默认 **`huber`**，`:1589`）；**BCE 分支已删除**（`test_sft_has_no_bce_branch`）；
+  - 权重 `--value-loss-weight` 默认 **1.0**（`:1565`），BCE 时代为平衡梯度加的 `5.0` 补偿已按裁决删除。
+- **日志三个键的语义（P4.5b；键名被 `test_log_keys_unchanged` 钉死，含义变过）**：
+
+  | 键 / 变量 | 内容 | 代码 |
+  |---|---|---|
+  | `policy_loss`、`value_loss` | 两个分项本身，**不含任何 L2** | `:2314`、`:2318` |
+  | `loss`（= `log_loss`） | `policy_loss + w·value_loss + c‖θ‖²` —— **含报告用的 L2 项** | `:2346-2347`、`:2430`、`:2472` |
+  | `opt_loss` | `policy_loss + w·value_loss`，**唯一被 backward 的量、不含 L2** | `:1208`、`:2348` |
+
+  - `c‖θ‖²` 由 `compute_l2_report`（`:1213-1283`）从 `optimizer.param_groups` 读回 `--weight-decay`（默认 `1e-4`）算出，只覆盖 `weight_decay != 0` 的组，返回**纯 Python float** ⇒ 不进计算图（`test_log_loss_identity` 断言对 `log_loss` 反向与对 `opt_loss` 反向梯度逐位相同）。
+  - ⇒ **日志里的 `loss` 不是被优化的目标**；`--weight-decay` 是唯一实际正则（AdamW 解耦），**没有 `--l2-coef` 这个参数**（`test_no_new_cli_params` 点名封杀）。
+  - ⚠ 键名没变、含义变过（多了一项 `c‖θ‖²`，且 policy 默认从 `huber` 改回 `ce`）：**跨新旧 run 的 `loss` / `policy_loss` 曲线不可直接比**。
 - 优化器：AdamW + `CosineAnnealingLR`；warmup 10%；价值网络头用 `value_lr_mult × base_lr`。
 - EMA（`--use-ema 1`）：指数移动平均权重，评估/保存时自动使用 EMA 参数。
 - NPU：`torch_npu` + HCCL 后端，fp16 autocast。
@@ -423,6 +463,17 @@ python src/inference.py --model models/sft_19x19.pth --board-size 19 \
 python src/inference.py --model models/sft_19x19.pth --board-size 19 \
     --mode analyze --onnx models/sft_19x19.onnx
 ```
+
+**两代 checkpoint 的加载分派（12 通道旧代 / 17 通道 v21，P4.8 + P4.13，`src/inference.py`）**
+
+- `GoAI` 从权重 **stem 卷积的形状**读输入通道数：`_stem_in_channels` 读 `_STEM_WEIGHT_KEYS` 的 `shape[1]`（`inference.py:60-69`），`_infer_in_channels` 校验范围（`:391-411`）。
+  - 读不到可识别的 stem 键 → **直接 `RuntimeError`**（`:194-202`），**不静默回退 12**（否则会拿随机 12ch 模型装一份陌生架构权重）；
+  - stem 通道不在 12..17 → `ValueError`（`:407-410`）。
+- 按通道数查构建器注册表 `_build_for_in_channels`（`:85-119`）：
+  - **12 通道 → `AlphaGoNet`**（模块导入时 `register_in_channels_builder(12, _legacy_alpha_go_net)`，`:127`）——现有 checkpoint（实测 `models/sft_19x19_v12.pth` stem = `(192, 12, 3, 3)`）走这条；
+  - **17 通道 → 由路线图 P4.2 注册**；未注册前 `_build_for_in_channels` 会 `RuntimeError` 并打印接线方式（`:98-105`）。
+- 无 checkpoint 时才用默认 12（`:187`）；`ai.in_channels` 是**只读 property**（`:448-457`），想换通道数只能换 checkpoint。
+- 特征与搜索侧同源：`feature_planes(..., n_channels=self.in_channels)`（`:473`）；`MCTS._in_channels()` 向所挂模型要通道数、缺失即 raise（`mcts.py:197-216`），外部只读视图 `MCTS.n_channels`（`mcts.py:218-236`）。
 
 ---
 
@@ -592,7 +643,7 @@ python scripts/evaluate.py --model models/sft_19x19_v17.pth \
   --board-size 19 --mode random --num-games 100 --use-mcts 1
 
 # ⑤ WebUI
-python scripts/webui.py --port 7860 --device cpu --priors-leaf 1 \
+python scripts/webui.py --port 7860 --device cpu --priors-leaf \
     --mode hybrid --hybrid-sims 32 --hybrid-blend 0.5 \
     --expand-topk 16 --num-threads 8
 ```
