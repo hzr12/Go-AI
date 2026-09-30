@@ -133,6 +133,38 @@ def test_checkpointing_reduces_retained_memory():
             ret_ckpt, ret_plain)
 
 
+def test_probe_owns_checkpoint_semantics(monkeypatch):
+    """计量口径必须由探针钉死，不随主干的检查点策略漂移（P4.6b 回归钉）。
+
+    背景：锚点 31.12GB（use_checkpoint 1）是 `checkpoint_sequential` 口径
+    实测的（逐块检查点、最后一块保留），k≈0.83 与 attn_window 显存敏感性
+    都建立在它上面。P4.6b 把主干 `use_checkpoint=True` 换成「每块都检查点」
+    后，同一探针 k 漂到 1.35、attn_window 敏感性消失——上两个测试因此变红。
+
+    修复契约：`measure()` 构造后**显式关掉主干自己的检查点开关**、自己包裹
+    `_ProbeCheckpointBlocks`。故无论子类在构造时把主干策略设成 True 还是
+    False，`measure(use_checkpoint=True)` 的结果都必须逐项相等。开/关两种
+    策略至少一种会在「探针继承主干策略」的旧实现上撞出差异。
+    """
+    baseline = S.measure(SMALL, probe_bs=2)
+
+    def force_policy(policy):
+        class ForceNet(S.AlphaGoNet):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.backbone.use_checkpoint = policy
+                if hasattr(self.backbone, 'set_grad_checkpointing'):
+                    self.backbone.set_grad_checkpointing(policy)
+        return ForceNet
+
+    for policy in (False, True):
+        monkeypatch.setattr(S, 'AlphaGoNet', force_policy(policy))
+        got = S.measure(SMALL, probe_bs=2)
+        assert got == baseline, \
+            '主干检查点策略={} 影响了计量（探针没有钉死语义）: {} != {}'.format(
+                policy, got, baseline)
+
+
 def test_attention_window_affects_memory():
     """attn_window 会改变窗口划分数，显存必须随之变化。
 

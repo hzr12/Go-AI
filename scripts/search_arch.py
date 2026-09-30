@@ -18,7 +18,10 @@
   * 激活显存  —— torch.autograd.graph.saved_tensors_hooks 精确计量
                  **真正被反向保留**的张量总量，因此天然正确反映
                  gradient checkpointing（backbone 开了 checkpoint 后
-                 只保留块输入，value head 未开则全量保留）
+                 只保留块输入，value head 未开则全量保留）。
+                 ⚠ 检查点的**语义由本探针钉死**（见 measure 的
+                 use_checkpoint 参数）：主干的 checkpoint 实现怎么改，
+                 计量口径都不动——否则 k 标定会随实现漂移。
 
 用法
 ----
@@ -43,6 +46,7 @@ import sys
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint  # noqa: F401  （探针自己包检查点，显式 import）
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.networks.alphanet import AlphaGoNet  # noqa: E402
@@ -297,14 +301,67 @@ ANCHOR_V21 = {
 }
 
 
+class _ProbeCheckpointBlocks(nn.Module):
+    """探针专属的检查点包裹：`use_checkpoint=True` 时替换 `backbone.blocks`。
+
+    为什么计量要自己包，而不是把 `use_checkpoint` 交给主干
+    -----------------------------------------------------
+    锚点 31.12GB（v18 / 4 卡 910A / use_checkpoint 1）是用
+    `torch.utils.checkpoint.checkpoint_sequential(blocks, len(blocks), x)`
+    实测出来的，该函数的**文档语义**就是「除最后一段外都不保留中间激活」
+    （源码注释 "the last chunk has to be non-volatile"）——最后一块的内部
+    激活在那次实测里是**保留**的。标定因子 k≈0.83（= 文档里的「高估 ~21%」）
+    与 `test_attention_window_affects_memory`（attn_window 影响显存）都建立
+    在这套口径上：锚点配置的块序是 res→convnext→attn，注意力块恰好是最后一块。
+
+    P4.6b 把主干的 `use_checkpoint=True` 换成了「每一块都检查点」（新
+    `run_grad_segment` 的逐块循环没有沿用「最后一段不检查点」），同一探针下
+    锚点保留量 115MB→70MB、k 0.83→1.35、attn_window 敏感性被抹平。教训：
+    **计量口径不能由被测实现决定**——主干的检查点策略一变，k 和所有绝对
+    预测就静默漂移（且方向是低估，会把装不下的配置判成 fits）。
+
+    所以：`measure()` 构造模型时恒传 `use_checkpoint=False` 并显式关掉主干
+    自己的开关，再由本类按锚点口径包裹。`use_checkpoint=False` 则完全不包。
+    """
+    def __init__(self, blocks):
+        super().__init__()
+        self.blocks = blocks
+
+    def forward(self, x):
+        # 与锚点实测同一函数、同一粒度：segments=len(blocks) ⇒ 逐块检查点，
+        # 最后一块保留（checkpoint_sequential 的文档语义，torch 2.12 实测
+        # 锚点保留量 115,197,536 B / k=0.8235 与 HEAD 逐字节一致）。
+        return torch.utils.checkpoint.checkpoint_sequential(
+            self.blocks, len(self.blocks), x, use_reentrant=False)
+
+
 def measure(cfg, probe_bs=PROBE_BS, use_checkpoint=True, in_channels=12):
     """返回 (参数量, FLOPs@batch1, 保留激活字节@probe_bs)。
 
     in_channels 默认 12 —— 既有调用方零回归；17ch（v21）显式传入即可测。
+
+    use_checkpoint 的语义由**本探针**钉死（确定性契约）
+    -----------------------------------------------------
+    * True（默认）：把 `model.backbone.blocks` 换成 `_ProbeCheckpointBlocks`
+      （锚点口径的 `checkpoint_sequential` 逐块检查点）；
+    * False：完全不检查点。
+    两种情况下主干自己的 `use_checkpoint` / `set_grad_checkpointing` 都被
+    显式关掉——探针**不继承**主干策略。理由见 `_ProbeCheckpointBlocks` 的
+    docstring：k 标定要求「计量口径 ≡ 锚点实测口径」，而主干的检查点实现
+    是会变的（P4.6b 就变了）；语义归探针，主干怎么改都不影响计量。
     """
     model = AlphaGoNet(in_channels=in_channels, action_size=ACTION_SIZE,
                        arch='resnet', attention_dropout=0.0,
-                       use_checkpoint=use_checkpoint, **cfg)
+                       use_checkpoint=False, **cfg)
+    backbone = getattr(model, 'backbone', None)
+    if backbone is None or not hasattr(backbone, 'blocks'):
+        raise RuntimeError(
+            'AlphaGoNet 没有 backbone.blocks —— 探针的检查点语义要挂在这上面，'
+            '请同步修改 scripts/search_arch.py 的 measure()')
+    # 主干自己的检查点开关：恒关（哪怕构造函数/子类把它打开）。语义归探针。
+    backbone.use_checkpoint = False
+    if use_checkpoint:
+        backbone.blocks = _ProbeCheckpointBlocks(backbone.blocks)
     n_params = sum(p.numel() for p in model.parameters())
 
     # ---- FLOPs：必须 batch=1，否则被 batch 放大 ----
