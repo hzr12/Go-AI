@@ -291,16 +291,37 @@ def test_selfplay_and_async_planes_follow_the_model_not_a_literal():
 
     写死 12 的后果是**形状错**（buffer 17 路 vs 模型 12 路），不是静默错值；
     写死 17 又会打死旧权重的自对弈。两边都兼容的唯一写法就是随模型驱动。
+
+    ⚠ 2026-09-30（RL 去 MCTS）后落点变了：selfplay 的 planes 构造搬进了
+    `src/search/policy_sampler.py`（与 minimax 推演**共用同一次特征计算**，不
+    再算两遍），所以扫描范围从两个 scripts 扩到「两个采集脚本 + 走子器」。
+    判据也相应放宽一档：允许 `n_channels=n_channels` 这种局部变量，但那个变量
+    必须**派生自 `ai.in_channels`**（下面单独断言），字面量仍然一律禁止。
     """
-    for name in ('selfplay_train.py', 'async_pipeline.py'):
-        calls = list(_planes_calls(os.path.join(ROOT, 'scripts', name)))
-        assert calls, f'{name} 找不到 feature_planes_batched 调用'
+    import ast as _ast
+    import re as _re
+    total = 0
+    for rel in ('scripts/selfplay_train.py', 'scripts/async_pipeline.py',
+                'src/search/policy_sampler.py'):
+        calls = list(_planes_calls(os.path.join(ROOT, rel)))
+        total += len(calls)
         for node, val in calls:
-            assert not (isinstance(val, ast.Constant)
+            assert not (isinstance(val, _ast.Constant)
                         and isinstance(val.value, int)), \
-                f'{name}:{node.lineno} 的 n_channels 还是字面量 {val.value}'
-            assert isinstance(val, ast.Attribute) and val.attr == 'in_channels', \
-                f'{name}:{node.lineno} 的 n_channels 应取 ai.in_channels'
+                f'{rel}:{node.lineno} 的 n_channels 还是字面量 {val.value}'
+            if isinstance(val, _ast.Attribute):
+                assert val.attr == 'in_channels', \
+                    f'{rel}:{node.lineno} 的 n_channels 应取 ai.in_channels'
+            else:
+                assert isinstance(val, _ast.Name), \
+                    f'{rel}:{node.lineno} 的 n_channels 表达式形态异常'
+    assert total > 0, '三个采集落点里一个 feature_planes_batched 调用都没找到'
+
+    # 走子器里的局部变量必须派生自 ai.in_channels（不能用 12/17 兜底成常量）
+    src = open(os.path.join(ROOT, 'src', 'search', 'policy_sampler.py'),
+               encoding='utf-8').read()
+    assert _re.search(r'n_channels\s*=\s*getattr\(\s*ai\s*,\s*[\'"]in_channels[\'"]',
+                     src), 'policy_sampler 的 n_channels 必须取自 ai.in_channels'
 
 
 def _dataset_calls(tree):

@@ -59,35 +59,46 @@ _BS = 9
 # 真实 argparse 默认值下，两条路径都应产出这一份 kwargs。
 _SPEC_TABLE = {
     'board_size': 9,
-    'sims': 400,
     'max_moves': 3 * 9 * 9,          # --max-moves 默认 None → 3*bs*bs
     'temperature': 1.0,
-    'expand_topk': 64,
-    'expand_chunk': 0,
-    'use_rollout': False,             # 0/1 → bool
-    'rollout_lambda': 0.25,
-    'rollout_steps': 60,              # ← 主证据：修复前 worker 根本没这个键
-    'leaf_ab_depth': 2,
-    'c_puct': 2.0,
-    'virtual_loss': 8.0,
-    'num_threads': 3,                 # 注意取 --mcts-threads，不是死的 --num-threads
-    'spec_prefetch': True,            # 0/1 → bool
-    'use_diverse_rollout': False,     # 0/1 → bool
-    'vector_backup': True,            # 0/1 → bool
+    # ---- N 步 minimax 推演（去 MCTS 后新增的行为参数）----
+    'lookahead_depth': 2,
+    'lookahead_topk': 12,
+    'lookahead_width': 4,
+    'lookahead_temp': 0.2,
+    'mix': 0.1,                     # --lookahead-mix 默认值（DEFAULT_MIX）
 }
+
+# ⚠ 2026-09-30（RL 去 MCTS）：`_SPEC_TABLE` 里**不再有任何 MCTS 参数**。
+# 原来 17 个（sims / expand_topk / expand_chunk / c_puct / virtual_loss /
+# mcts_threads / num_threads / spec_prefetch / use_rollout / rollout_lambda /
+# rollout_steps / leaf_ab_depth / use_diverse_rollout / mcts_vector_backup /
+# priors_leaf / dir_alpha / dir_eps …）**必须逐个消失**，而不是变成「默认值也
+# 照样转发」——RL 里已没有接收方，转发等于谎报生效。
+# 「忽略但留痕」由 `st.ARCHIVED_SEARCH_ARGS` + `_log_archived_search_args` 负责，
+# 由 `tests/test_rl_search_archived.py` 单独钉住。
 
 # `_selfplay_kwargs` 读取、且**必须**在 main() 的 argparse 块里真实存在的 dest 键。
 # 刻意写成字面清单（与 _SPEC_TABLE 无关、也不从 helper 源码反推）：本清单就是
 # 「helper 读了哪些 dest」这条契约本身，从实现反推会让「改成 args.x 直读」之类的
-# 改动把断言变空转。注意 `num_threads` 映射自 dest `mcts_threads`（--num-threads
-# 是死参数），`vector_backup` 映射自 dest `mcts_vector_backup`。
-# `board_size` 由入参 bs 供给、不走 getattr，但同样是 dest（worker 侧就取
-# `args.board_size`），一并锁住。
+# 改动把断言变空转。注意 `mix` 映射自 dest `lookahead_mix`（CLI 上带前缀，
+# kwargs 里是短名）。`board_size` 由入参 bs 供给、不走 getattr，但同样是 dest
+# （worker 侧就取 `args.board_size`），一并锁住。
 _MAPPED_DESTS = (
-    'board_size', 'sims', 'max_moves', 'temperature', 'expand_topk', 'expand_chunk',
-    'use_rollout', 'rollout_lambda', 'rollout_steps', 'leaf_ab_depth', 'c_puct',
-    'virtual_loss', 'mcts_threads', 'spec_prefetch', 'use_diverse_rollout',
-    'mcts_vector_backup',
+    'board_size', 'max_moves', 'temperature',
+    'lookahead_depth', 'lookahead_topk', 'lookahead_width',
+    'lookahead_temp', 'lookahead_mix',
+)
+
+
+#: 去 MCTS（2026-09-30）新增的 5 个推演参数：从 `_EXPECTED_PARAM_SURFACE` 里
+#: 扣掉它们才能还原 P3.0 之前的 53 项基线。
+_LOOKAHEAD_NEW_PARAMS = (
+    ('--lookahead-depth', 'int', 2),
+    ('--lookahead-topk', 'int', 12),
+    ('--lookahead-width', 'int', 4),
+    ('--lookahead-temp', 'float', 0.2),
+    ('--lookahead-mix', 'float', st.DEFAULT_MIX),
 )
 
 
@@ -112,9 +123,15 @@ def _real_argparse_defaults():
                 try:
                     defaults[flag.lstrip('-').replace('-', '_')] = ast.literal_eval(kw.value)
                 except ValueError:
-                    raise AssertionError(
-                        f'{flag} 的 default 不是字面量，本 helper 需跟进：'
-                        f'{ast.dump(kw.value)}')
+                    # 允许 default 引用模块常量（如 --lookahead-mix 的
+                    # DEFAULT_MIX）：从 st 的命名空间取值，而不是逼实现方把
+                    # 常量抄成字面量（那正是「两份真相源」的开始）。
+                    if isinstance(kw.value, ast.Name) and hasattr(st, kw.value.id):
+                        defaults[flag.lstrip('-').replace('-', '_')] = getattr(st, kw.value.id)
+                    else:
+                        raise AssertionError(
+                            f'{flag} 的 default 既不是字面量也不是 st 的模块常量，'
+                            f'本 helper 需跟进：{ast.dump(kw.value)}')
     return defaults
 
 
@@ -158,10 +175,11 @@ def _real_args(**overrides):
 
 
 def test_worker_path_forwards_full_search_params(monkeypatch):
-    """并行 worker 必须转发**全部**搜索参数，rollout_steps 尤其不能漏。
+    """并行 worker 必须转发**全部**落子参数，且不得再出现任何 MCTS 参数。
 
-    修复前：worker 逐个手写 kwargs（漏 rollout_steps，位置传 6 个），本断言
-    在 dict 比对上报出缺失键 —— 行为性红。
+    原断言守的是「worker 漏传 rollout_steps ⇒ 串行/并行跑出不同对局」。去 MCTS
+    后同一类洞换了形状：新增的 4 个 lookahead 参数（+ mix）任一漏传，都会让并行
+    与串行用不同的推演深度/宽度 ⇒ 又是两批不同的对局，而且是**静默**的。
     """
     captured = {}
 
@@ -186,11 +204,30 @@ def test_worker_path_forwards_full_search_params(monkeypatch):
         f"多键: {sorted(set(captured['kwargs']) - set(_SPEC_TABLE))}；"
         f"取值不符: { {k: (captured['kwargs'].get(k), v) for k, v in _SPEC_TABLE.items() if captured['kwargs'].get(k, object()) != v} }"
     )
-    assert captured['kwargs']['rollout_steps'] == 60, \
-        '并行 worker 曾漏传 rollout_steps → 落回 None(=2*N*N 步)，与串行跑出不同的对局'
     assert len(captured['args']) == 1, \
         (f"除 ai 外全部参数必须走 kwargs；留位置参数等于给映射再开一个分叉口子："
          f"{captured['args'][1:]}")
+
+
+def test_no_mcts_param_survives_in_kwargs():
+    """`_selfplay_kwargs` 的键里不得有任何 MCTS 参数（RL 里已无接收方）。
+
+    这是去 MCTS 的**核心**断言：留着它们会让「我 --sims 48 起得快」这种错觉
+    成立（现在每手只做 depth 次批量前向，与 sims 无关）。
+    """
+    keys = set(st._selfplay_kwargs(_real_args(), _BS))
+    forbidden = set(st.ARCHIVED_SEARCH_ARGS) | {
+        'expand_chunk_alpha', 'expand_chunk_beta', 'mcts_threads',
+        'num_threads', 'rollout_threads', 'dir_alpha', 'dir_eps', 'sims',
+    }
+    leaked = keys & forbidden
+    assert not leaked, (
+        '去 MCTS 后 kwargs 里仍有 MCTS 参数：%s（RL 不再构造 MCTS，转发即谎报）'
+        % sorted(leaked))
+    # 反向：新参数必须在
+    for need in ('lookahead_depth', 'lookahead_topk', 'lookahead_width',
+                 'lookahead_temp', 'mix'):
+        assert need in keys, '落子参数漏了 %s' % need
 
 
 def test_kwargs_cover_self_play_game_signature():
@@ -225,23 +262,40 @@ def test_both_call_sites_share_the_mapping():
 
 
 def test_flag_params_normalized_to_bool():
-    """四个 0/1 标志两条路径类型一致：都是 bool，不是一个 int 一个 bool。"""
-    cases = (
-        ({}, {'use_rollout': False, 'spec_prefetch': True,
-              'use_diverse_rollout': False, 'vector_backup': True}),
-        # 等价于命令行 --use-rollout 1 --spec-prefetch 0
-        #              --use-diverse-rollout 1 --mcts-vector-backup 0
-        ({'use_rollout': 1, 'spec_prefetch': 0, 'use_diverse_rollout': 1,
-          'mcts_vector_backup': 0},
-         {'use_rollout': True, 'spec_prefetch': False,
-          'use_diverse_rollout': True, 'vector_backup': False}),
-    )
-    for overrides, expect in cases:
-        kw = st._selfplay_kwargs(_real_args(**overrides), _BS)
-        for key in expect:
-            assert type(kw[key]) is bool, \
-                f'{key} 未归一化成 bool（实为 {type(kw[key]).__name__}）'
-        assert {k: kw[k] for k in expect} == expect, f'0/1 标志取值错误: {overrides}'
+    """落子参数的类型必须**稳定**：残缺 Namespace（int）与完整 Namespace 一致。
+
+    原断言守的是四个 0/1 搜索 flag 的 bool 归一化。去 MCTS 后那些 flag 已归档，
+    这里换成同一类风险的残留入口：`--temperature` 等**连续参数**若被写成 int
+    而下游按 float 用，症状是采样分布悄悄变差（不报错）。所以断言映射出来的
+    值与 argparse 默认**同类型**。
+    """
+    import argparse as _ap
+    ns = _real_args()
+    kw = st._selfplay_kwargs(ns, _BS)
+    for key in ('temperature', 'lookahead_temp', 'mix'):
+        val = kw[key]
+        dflt = getattr(ns, 'lookahead_mix' if key == 'mix' else key)
+        assert type(val) is type(dflt), \
+            (f'{key} 的类型随 Namespace 变化：{type(val).__name__} vs '
+             f'{type(dflt).__name__}（残缺 args 会走 getattr 兜底）')
+    # 四个 0/1 搜索 flag 已归档：必须**不在** kwargs 里，也不再需要 bool 归一化
+    for gone in ('use_rollout', 'spec_prefetch', 'use_diverse_rollout',
+                 'vector_backup'):
+        assert gone not in kw, '归档的 0/1 flag 又回来了：%s' % gone
+
+
+def test_archived_search_args_are_kept_but_inert():
+    """17 个搜索参数：argparse 里**仍可解析**（旧命令行不改），但不再进 kwargs。
+
+    「忽略但留痕」（D1 口径）：不能报错、也不能生效，只在启动时打一行汇总。
+    """
+    kw = st._selfplay_kwargs(_real_args(**{k: 7 for k in
+                                           st.ARCHIVED_SEARCH_ARGS}), _BS)
+    for name in st.ARCHIVED_SEARCH_ARGS:
+        assert name not in kw, '%s 已归档却仍在生效路径上' % name
+    # 归档参数显式传值也不改变落子参数（真·无效）
+    kw2 = st._selfplay_kwargs(_real_args(), _BS)
+    assert kw == kw2, '传了归档参数后落子参数变了 ⇒ 它们其实还在生效'
 
 
 def test_max_moves_fallback():
@@ -282,6 +336,12 @@ _EXPECTED_PARAM_SURFACE = (
     ('--sims', 'int', 400),
     ('--max-moves', 'int', None),
     ('--temperature', 'float', 1.0),
+    # ---- 2026-09-30 去 MCTS：新增 5 个 N 步 minimax 推演参数 ----
+    ('--lookahead-depth', 'int', 2),
+    ('--lookahead-topk', 'int', 12),
+    ('--lookahead-width', 'int', 4),
+    ('--lookahead-temp', 'float', 0.2),
+    ('--lookahead-mix', 'float', st.DEFAULT_MIX),
     ('--buffer-size', 'int', 500),
     ('--batch-size', 'int', 256),
     # --epochs：P3.0 起语义 = PPO 更新轮数（路线图 D13 ⑦，不新增 --ppo-epochs）
@@ -375,7 +435,12 @@ def _real_param_surface():
             if kw.arg == 'type':
                 type_name = getattr(kw.value, 'id', None)
             elif kw.arg == 'default':
-                default = ast.literal_eval(kw.value)
+                try:
+                    default = ast.literal_eval(kw.value)
+                except ValueError:
+                    # 允许 default 引用模块常量（--lookahead-mix 的 DEFAULT_MIX）
+                    default = (getattr(st, kw.value.id, _NO_DEFAULT)
+                               if isinstance(kw.value, ast.Name) else _NO_DEFAULT)
             elif kw.arg == 'help':
                 help_text = ast.literal_eval(kw.value)
         found.append((node.lineno, (flag, type_name, default, help_text)))
@@ -403,31 +468,37 @@ def test_param_surface_matches_itemised_list_exactly():
                        f'路线图 D11 只允许 P3.0 +3 个参数，不许顺手多加')
     assert not wrong, (f'这些参数的 type/default 与清单不符（实为 type, default, 期望）: '
                        f'{wrong}')
-    assert len(surface) == len(_EXPECTED_PARAM_SURFACE) == 56, \
-        f'参数面应恰好 56 项（P3.0 前 53 + 3），实为 {len(surface)}'
+    assert len(surface) == len(_EXPECTED_PARAM_SURFACE) == 61, \
+        f'参数面应恰好 61 项（P3.0 前 53 + 3，去 MCTS 后 +5 个推演参数），实为 {len(surface)}'
 
 
 def test_delta_is_exactly_three_ppo_kl_params():
-    """P3.0 的增量恰好是那 3 个 PPO/KL 参数：一个不多、一个不少、旧的一个没删。
+    """P3.0 的增量恰好是那 3 个 PPO/KL 参数；去 MCTS 的增量恰好是 5 个推演参数。
 
     把路线图 D11 的算式整条钉住：
-      53（P3.0 前） → 56（P3.0 后） →(P3-B 删 19)→ 37（P3.0 + P3-B 后）
-    故 P3-B 落地时，本测试的 56 - 19 必须等于 _ROADMAP_POST_P3_B_TOTAL。
+      53（P3.0 前） → 56（P3.0 后） →(去 MCTS +5 推演参数)→ 61（现在）
+    ⚠ 2026-09-30：MCTS 参数**没有**被删除 —— 它们按 D1「忽略但留痕」保留在
+    argparse 里（旧命令行一个字不用改），只是不再转发给任何接收方。所以这里
+    不再断言「56 − 19 = 37」，而是断言「旧参数一个没少 + 新增恰好 5 个」。
     """
     surface = _surface_by_flag()
-    before = set(_EXPECTED_PARAM_SURFACE) - set(_P3_0_NEW_PARAMS)
+    before = (set(_EXPECTED_PARAM_SURFACE) - set(_P3_0_NEW_PARAMS)
+              - set(_LOOKAHEAD_NEW_PARAMS))
     assert len(before) == 53, f'P3.0 前的基线应是 53 项，实为 {len(before)}'
     for flag, type_name, default in _P3_0_NEW_PARAMS:
         got = surface.get(flag, (None, _NO_DEFAULT))
         assert (got[0], got[1]) == (type_name, default), \
             f'{flag} 实为 type={got[0]} default={got[1]}，' \
             f'期望 type={type_name} default={default}'
-    assert len(surface) - len(before) == 3, \
-        f'增量不是 3 个（{len(surface)} - {len(before)}）'
+    for flag, type_name, default in _LOOKAHEAD_NEW_PARAMS:
+        got = surface.get(flag, (None, _NO_DEFAULT))
+        assert (got[0], got[1]) == (type_name, default), \
+            f'{flag} 实为 type={got[0]} default={got[1]}，' \
+            f'期望 type={type_name} default={default}'
+    assert len(surface) - len(before) == 8, \
+        f'增量应是 3 个 PPO/KL + 5 个推演参数（{len(surface)} - {len(before)}）'
     assert not {f for f, _, _ in before} - set(surface), \
-        'P3.0 不允许删任何既有参数（MCTS 参数由 P3-B 删）'
-    assert 56 - _MCTS_PARAMS_TO_DELETE == _ROADMAP_POST_P3_B_TOTAL, \
-        '路线图算式 56-19 应等于 37'
+        '不允许删任何既有参数（MCTS 参数按 D1 保留定义、只归档）'
 
 
 def test_ppo_clip_default_is_roadmap_epsilon():

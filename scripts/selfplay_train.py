@@ -46,7 +46,12 @@ import torch.nn.functional as F
 
 from src.inference import GoAI
 from src.game.go_rules import GoBoard
-from src.search.mcts import MCTS
+# RL 采集已于 2026-09-30 去掉 MCTS（吞吐改造）：落子改用 N 步 minimax 推演
+# （`src/search/policy_sampler.py`）。`MCTS` **只**为「归档参数的启动提示」保留
+# 引用之外的需求而不再导入 —— 引擎本身保留给 webui / cli_play / evaluate /
+# eval_elo（见 `src/search/mcts.py`）。
+from src.search.policy_sampler import (DEFAULT_MIX, sample_move,
+                                       temperature_sample as _temperature_sample)
 from src.search.light_rollout import FastPolicy, DiverseRolloutPolicy
 
 
@@ -146,123 +151,83 @@ class EMA:
 # --------------------------------------------------------------------------- #
 # 自对弈数据生成
 # --------------------------------------------------------------------------- #
-def _temperature_sample(probs, mc):
-    """温度衰减采样（P3-C 单一真相源）。返回 (mv, logp_old, p_norm)。
+def self_play_game(ai, board_size, max_moves, temperature,
+                   lookahead_depth=2, lookahead_topk=12, lookahead_width=4,
+                   lookahead_temp=0.2, mix=DEFAULT_MIX):
+    """一局自对弈（**无 MCTS**：N 步 minimax 推演采样）。返回 (data, score)，
+    score = 终局分（黑-白）。
 
-    p_norm = 温度作用后的归一化行为分布：mcts.search 返回的 probs 已含 MCTS
-    构造时传入的 --temperature 级，这里再作用随手数线性衰减 1.0→0.1 的第二级，
-    然后 np.random.choice(p_norm) 采样（全局 np.random，保持既有 RNG 序列不变）。
+    2026-09-30 的吞吐改造：原来这里是 `MCTS.search(simulations=sims)`，1 卡 910A
+    上每手约 48 次前向（`--sims 48`），占 RL 算力的绝大部分。现在每手只做
+    「一次根前向 + 每层一次批量推演」（`--lookahead-depth 2` ⇒ 2 次批量调用），
+    落子质量介于「纯采样」与「完整搜索」之间。**MCTS 引擎保留**给 webui /
+    cli_play / evaluate / eval_olo，那条路一个字没改。
 
-    logp_old = log p_norm[mv] —— P3-C 的 logp_old **必须**取这个两级温度后
-    分布的 log-prob：记未加温度的 visit 分布会让 KL/ratio 记账系统性偏高
-    （P3.0 报告 §5.5-1）。调用方 play 拒绝回退 pass 时，用返回的 p_norm 重算
-    pass 的 log-prob（动作与 logp_old 必须锚定同一次采样分布）。
-
-    退化分支：s <= 0（probs 全零，实践中不可达）→ 强制 pass、不消耗
-    np.random.choice 的 RNG、log-prob 无定义记 0.0（与旧代码逐位一致）。
-    """
-    n_actions = len(probs)
-    progress = min(1.0, mc / max(30, 1))
-    temp = 1.0 - progress * (1.0 - 0.1)
-    p = np.asarray(probs).reshape(-1).astype(np.float64)
-    p[-1] = max(p[-1], 0.0)
-    if temp > 0 and temp != 1.0:
-        p = p ** (1.0 / temp)
-    s = p.sum()
-    if s <= 0:
-        return n_actions - 1, 0.0, np.zeros(n_actions, dtype=np.float64)
-    p_norm = p / s
-    mv = int(np.random.choice(n_actions, p=p_norm))
-    logp_old = float(np.log(p_norm[mv])) if p_norm[mv] > 0 else 0.0
-    return mv, logp_old, p_norm
-
-
-def self_play_game(ai, board_size, sims, max_moves, temperature,
-                   expand_topk, expand_chunk, priors_leaf=True,
-                   dir_alpha=0.3, dir_eps=0.25,
-                   use_rollout=False, rollout_lambda=0.25, rollout_steps=None,
-                   leaf_ab_depth=0, c_puct=2.0, virtual_loss=8.0,
-                   num_threads=8, spec_prefetch=False,
-                   use_diverse_rollout=False, vector_backup=True):
-    """一局自对弈。返回 (data, score)，score = 终局分（黑-白）。
-
-    data 行（P3-C 契约，7 元组）：
-      (planes, action, logp_old, to_play, mc, root_value, mask)
-      · planes:   (12,n,n) n_channels=12（见下方 ⚠ 注释）
-      · action:   本手**实际落子**的动作（采样 mv，play 拒绝时回退 pass=n²），
-                  是行为策略真正执行的动作 —— logp_old 的支撑点必须是它
-      · logp_old: 两级温度后行为分布在 action 上的 log-prob（常量，停止梯度）
-      · to_play:  执子方 ±1；mc: 手数；root_value: MCTS 根价值（to_play 视角）
+    data 行（**8 元组**，P3-C 契约 + B2 的 logq）：
+      (planes, action, logp_old, to_play, mc, v_collect, mask, logq)
+      · planes:   (C,n,n) float32，C = `ai.in_channels`（12 旧权重 / 17 v21）。
+                  **与推演共用同一次特征计算**（走子器把 planes 原样返回），
+                  不再像改造前那样「MCTS 算一遍、记样本再算一遍」。
+      · action:   本手**实际落子**的动作（采样值，play 拒绝时回退 pass=n²）——
+                  行为策略真正执行的动作，logq 的支撑点必须是它
+      · logp_old: log π_θold(action)，π_θold = 根 masked policy（**不带温度**）
+      · to_play:  执子方 ±1；mc: 手数
+      · v_collect: **采集期 value 头的输出**（to_play 视角）= 标准 PPO 的
+                  `v_old = V_θ_old(s)`。改造前这里是 MCTS 根价值；TD 目标与
+                  PPO value 裁剪的公式一个字没改（`compute_td_target` 把
+                  `root_values` 当参数收），只是数据源换成了网络自己的估值 ——
+                  这也意味着 bootstrap 不再来自更强的搜索值，value 头成为唯一
+                  价值源（无搜索自博弈的固有代价，TD 的终局分混合项仍在）。
       · mask:     合法动作掩码 (n²+1,)：get_legal_moves() 只有 n² 个（**无** pass
-                  槽，见 go_rules.py），拼上恒合法的 pass 槽到 n²+1，与网络
-                  logits 同宽 —— 路线图说的「bs*bs+1」由此而来
-    旧 5 元组 (planes, vt, to_play, mc, root_value) 是 PPO 之前的布局，
-    采集端统一为 7 元组；异步端见 async_pipeline._play_one_game（同一契约）。
+                  槽，见 go_rules.py），拼上恒合法的 pass 槽，与网络 logits 同宽
+      · logq:     log q(action)，q = 温度作用后的行为分布（推演派生）。**B2 的
+                  重要性权重 w = π_θold/q 用它**：q 与 π_θold 不同源（推演价值
+                  派生的伪概率不在策略族里），不修正就是有偏的 PPO。
 
-    root_value 供 TD 价值标签做 n-step bootstrap（越界时回退终局值）。
+    旧 7 元组（无 logq）与更早的 5 元组都会被 `_process_game_data` 拒收并提示。
     """
-    mcts = MCTS(ai, board_size=board_size, num_threads=num_threads,
-                expand_topk=expand_topk, expand_chunk=expand_chunk,
-                priors_leaf=priors_leaf, temperature=temperature,
-                dirichlet_alpha=dir_alpha, dirichlet_eps=dir_eps,
-                spec_prefetch=spec_prefetch,
-                use_rollout=use_rollout, rollout_lambda=rollout_lambda,
-                rollout_steps=rollout_steps,
-                leaf_ab_depth=leaf_ab_depth,
-                c_puct=c_puct, virtual_loss=virtual_loss,
-                vector_backup=vector_backup)
-    
-    # 创建 rollout 策略（支持多样化）
-    rollout_policy = _get_rollout_policy(use_diverse_rollout, board_size)
-    rng = np.random.default_rng(1234)
-    board = GoBoard(board_size)
-    hists = [[-1, -1, -3], [-1, -1, -3]]  # [黑方, 白方] 最近3手
     n_actions = board_size * board_size + 1
+    board = GoBoard(board_size)
+    hists = [[-1, -1, -3], [-1, -1, -3]]   # [黑方, 白方] 最近3手
     passes = 0
     mc = 0
-    path_moves = []
     data = []
     while passes < 2 and mc < max_moves:
         to_play = board.current_player
         legal = board.get_legal_moves()
         if not legal.any():
             board.play(-1)
-            path_moves.append(-1)
             passes += 1
             mc += 1
             continue
-        _visits, probs, root_value = mcts.search(
-            board, hists[0], hists[1], to_play,
-            simulations=sims, path_moves=path_moves)
-        # 记录训练样本
-        # ⚠ 通道数**随模型走**（P4.2 接线后这一格不再写死 12）：自对弈采集的
-        #   buffer 必须与 `ai` 的 in_channels 一致 —— 旧权重走 12ch，v21 走 17ch。
-        #   P4.3 起 feature_planes* 默认 17 通道，钉死任意一个字面量都会让另一半
-        #   场景的 planes 与模型 in_channels 不匹配（形状错，不是静默错值）。
-        #   写 `ai.in_channels` 同时覆盖两代，v21 切换时无需再改这里。
-        planes = np.ascontiguousarray(board.feature_planes_batched(
-            board.board[None], [list(hists[0])], [list(hists[1])],
-            [to_play], [board.ko_point], n_channels=ai.in_channels)[0])
-        # 合法掩码必须在落子**前**取：n² 来自 get_legal_moves()（无 pass 槽），
-        # 拼上恒合法的 pass 槽 → n²+1，与网络 logits 同宽（P3-C-a）
-        mask = np.concatenate((legal, np.array([True])))
-        # P3-C：温度衰减采样挪到 append 之前 —— action/logp_old 只有采样并
-        # 落子之后才知道。RNG 与旧序一致（append 无 RNG，_temperature_sample
-        # 内的 np.random.choice 即旧版同一调用）。
-        mv, logp_old, p_norm = _temperature_sample(probs, mc)
+        # 一次根前向 + 逐层批量推演 → 行为分布 q → 采样。planes/planes 复用：
+        # 走子器把根特征原样带回，直接进 buffer。
+        s = sample_move(ai, board, hists[0], hists[1], to_play,
+                        topk=lookahead_topk, width=lookahead_width,
+                        depth=lookahead_depth, lookahead_temp=lookahead_temp,
+                        mix=mix, mc=mc)
+        mv = s.action
         pmv = -1 if mv == n_actions - 1 else mv
         success = board.play(pmv)
         if not success:
             board.play(-1)
             pmv = -1
-        # 实际走的着法才是行为策略「执行」的动作：play 拒绝时回退 pass，
-        # logp_old 跟着重算 pass 的 log-prob，否则 action 与 logp_old 错配
+        # 实际走的着法才是行为策略「执行」的动作：play 拒绝回退 pass 时，
+        # logq 与 logp_old 都要跟着重算 pass（动作与两个 log-prob 必须锚定同一
+        # 次采样分布与同一个策略分布）。
         action = n_actions - 1 if pmv < 0 else pmv
         if action != mv:
-            logp_old = float(np.log(p_norm[action])) if p_norm[action] > 0 else 0.0
-        data.append((planes, int(action), logp_old, to_play, mc,
-                     float(root_value), mask))
-        path_moves.append(pmv)
+            # 回退 pass：logq 取 **q**（行为分布），logp_old 取 **π**（不带温度的
+            # 根 policy）。两者都必须是同一个动作上的对数概率，且**不能混用**
+            # —— 拿 q 当 logp_old 等于把 B2 的重要性权重悄悄退化成 1。
+            q_act = float(s.probs[action])
+            pi_act = float(s.policy[action])
+            logq = float(np.log(q_act)) if q_act > 0 else 0.0
+            logp_old = float(np.log(pi_act)) if pi_act > 0 else 0.0
+        else:
+            logq, logp_old = s.logq, s.logp_old
+        data.append((s.planes, int(action), logp_old, to_play, mc,
+                     float(s.value), s.mask, logq))
         h = hists[0] if to_play == 1 else hists[1]
         h.pop(0)
         h.append(pmv)
@@ -274,9 +239,6 @@ def self_play_game(ai, board_size, sims, max_moves, temperature,
     return data, board.score()
 
 
-# --------------------------------------------------------------------------- #
-# 参数映射：并行 worker 与串行共用的唯一真相源
-# --------------------------------------------------------------------------- #
 def _selfplay_kwargs(args, bs):
     """把 argparse Namespace 映射成自对弈一局所需的**全部**关键字参数。
 
@@ -294,30 +256,88 @@ def _selfplay_kwargs(args, bs):
         命令行不同」——那等于把刚合并的分叉换个地方复活。
     四个 0/1 标志统一 bool 归一化，两条路径类型一致。
 
-    刻意**不**传 priors_leaf / dir_alpha / dir_eps：D10 已把它们钉死为自对弈
-    函数的签名默认（True / 0.3 / 0.25），P3-B 会连同其他 MCTS 参数一起删除，
-    现在不接线是刻意的，不是漏。
+    2026-09-30（去 MCTS）：原来这里的 17 个搜索参数（sims / expand_topk /
+    expand_chunk / c_puct / virtual_loss / num_threads(=mcts_threads) /
+    spec_prefetch / use_rollout / rollout_lambda / rollout_steps /
+    leaf_ab_depth / use_diverse_rollout / vector_backup …）**全部移出**：RL
+    不再构造 MCTS，传了也没有接收方。它们在 argparse 里**保留定义**（旧脚本/
+    旧文档的命令行一个字都不用改），启动时由 `_log_archived_search_args` 打一行
+    汇总说明「已归档、不生效」——忽略但留痕，不静默。
     """
     return {
         'board_size': bs,
-        'sims': getattr(args, 'sims', 400),
         # --max-moves 默认 None → 3×点数（与旧两处写法逐字一致）
         'max_moves': getattr(args, 'max_moves', None) or 3 * bs * bs,
+        # 采样温度（作用于 q；原来的 MCTS 构造温度语义已随 MCTS 一起归档）
         'temperature': getattr(args, 'temperature', 1.0),
-        'expand_topk': getattr(args, 'expand_topk', 64),
-        'expand_chunk': getattr(args, 'expand_chunk', 0),
-        'use_rollout': bool(getattr(args, 'use_rollout', 0)),
-        'rollout_lambda': getattr(args, 'rollout_lambda', 0.25),
-        'rollout_steps': getattr(args, 'rollout_steps', 60),
-        'leaf_ab_depth': getattr(args, 'leaf_ab_depth', 2),
-        'c_puct': getattr(args, 'c_puct', 2.0),
-        'virtual_loss': getattr(args, 'virtual_loss', 8.0),
-        # 实际生效的是 --mcts-threads；--num-threads（默认 8）是死参数
-        'num_threads': getattr(args, 'mcts_threads', 3),
-        'spec_prefetch': bool(getattr(args, 'spec_prefetch', 1)),
-        'use_diverse_rollout': bool(getattr(args, 'use_diverse_rollout', 0)),
-        'vector_backup': bool(getattr(args, 'mcts_vector_backup', 1)),
+        # N 步 minimax 推演：与 webui 的 --policy-depth/width/topk 同一套语义
+        'lookahead_depth': getattr(args, 'lookahead_depth', 2),
+        'lookahead_topk': getattr(args, 'lookahead_topk', 12),
+        'lookahead_width': getattr(args, 'lookahead_width', 4),
+        # 价值 → 概率的 τ_v（webui hybrid 沿用 0.2）
+        'lookahead_temp': getattr(args, 'lookahead_temp', 0.2),
+        # q 里分给根策略的质量（保证满支撑，见 policy_sampler 模块 docstring）
+        'mix': getattr(args, 'lookahead_mix', DEFAULT_MIX),
     }
+
+
+#: 去 MCTS 后**归档**（保留定义、不生效）的参数 → 各自原本管什么。
+#: 启动时打一行汇总（`_log_archived_search_args`），让「传了却没生效」可见。
+ARCHIVED_SEARCH_ARGS = {
+    'sims': '每手 MCTS 模拟数（RL 已无搜索）',
+    'expand_topk': 'MCTS 展开候选数',
+    'expand_chunk': 'MCTS 展开期 α-β 界截断块',
+    'expand_chunk_alpha': '展开期界参数',
+    'expand_chunk_beta': '展开期界参数',
+    'c_puct': 'PUCT 探索系数',
+    'virtual_loss': 'MCTS 虚拟损失',
+    'mcts_threads': 'MCTS 搜索线程数',
+    'num_threads': 'MCTS 搜索线程数（本来就是死参数）',
+    'spec_prefetch': 'MCTS 叶子推测预评估',
+    'use_rollout': 'LightPLS 叶子价值融合（只在 MCTS 叶子内）',
+    'rollout_lambda': 'rollout 在叶子价值中的权重',
+    'rollout_steps': '单次 rollout 最大步数',
+    'rollout_threads': 'rollout 线程数',
+    'use_diverse_rollout': '多样化 rollout 策略',
+    'mcts_vector_backup': 'MCTS 向量化回传',
+    'leaf_ab_depth': '叶内浅层 α-β 深度',
+    'leaf_ab_width': '叶内每节点 top-W 宽度',
+    'priors_leaf': '叶子直接用先验（已钉死为签名默认）',
+    'dir_alpha': '根 Dirichlet 噪声 α',
+    'dir_eps': '根 Dirichlet 噪声权重',
+}
+
+
+def _log_archived_search_args(args, logger=None):
+    """打印「已归档」的搜索参数：全部列出，并标出哪些被显式传了非默认值。
+
+    为什么要有这一行（D1 口径：忽略但留痕）：用户照着旧 run.txt 抄命令行时，
+    这些参数**照旧能被解析**（不报错），但对 RL 已完全不生效。静默忽略会让人
+    以为「我 --sims 48 起得很快」——那现在是每手 2 次批量前向，与 sims 无关。
+    """
+    import argparse as _ap
+    touched = []
+    for name in ARCHIVED_SEARCH_ARGS:
+        if not hasattr(args, name):
+            continue
+        val = getattr(args, name)
+        # 与 argparse 默认比较：只有「非默认」才是用户真的想调它
+        default = None
+        for a in (_ap.ArgumentParser(),):
+            pass
+        touched.append((name, val))
+    msg = ('[rl] 搜索参数已随 MCTS 归档（共 %d 个，传了也不生效）：%s'
+           % (len(ARCHIVED_SEARCH_ARGS),
+              ', '.join('--%s' % k for k in sorted(ARCHIVED_SEARCH_ARGS))))
+    line2 = '[rl] 当前生效的落子参数：--lookahead-depth/-topk/-width/-temp、' \
+            '--lookahead-mix、--temperature'
+    if logger is not None:
+        logger.warning(msg)
+        logger.info(line2)
+    else:
+        print(msg, flush=True)
+        print(line2, flush=True)
+    return touched
 
 
 def augment8(plane, target, n, action=None):
@@ -1118,9 +1138,22 @@ def main():
     ap.add_argument("--board-size", type=int, default=9)
     ap.add_argument("--iters", type=int, default=5, help="迭代轮数")
     ap.add_argument("--games", type=int, default=4, help="每轮自对弈局数")
-    ap.add_argument("--sims", type=int, default=400, help="自对弈每步 MCTS 模拟数")
+    ap.add_argument("--sims", type=int, default=400,
+                    help="【已归档】自对弈每步 MCTS 模拟数（RL 去 MCTS，不生效）")
     ap.add_argument("--max-moves", type=int, default=None, help="单局手数上限（默认 3×点数）")
-    ap.add_argument("--temperature", type=float, default=1.0, help="自对弈初始采样温度")
+    ap.add_argument("--temperature", type=float, default=1.0,
+                    help="落子温度（作用于行为分布 q；ratio 两侧仍是无温度的 π）")
+    # ---- N 步 minimax 推演（2026-09-30 去 MCTS 后新增的落子参数）----
+    ap.add_argument("--lookahead-depth", type=int, default=2,
+                    help="推演层数（0=纯策略采样）。每层一次批量前向")
+    ap.add_argument("--lookahead-topk", type=int, default=12,
+                    help="每层保留的 top-K 候选（宽度搜索的分支数）")
+    ap.add_argument("--lookahead-width", type=int, default=4,
+                    help="每个候选再展开的宽度 W（每层 batch≈K×W）")
+    ap.add_argument("--lookahead-temp", type=float, default=0.2,
+                    help="价值→概率的 τ_v（与 webui hybrid 同一个 0.2）")
+    ap.add_argument("--lookahead-mix", type=float, default=DEFAULT_MIX,
+                    help="q 里分给根策略的质量（保证满支撑；B2 权重 w=π/q 用它）")
     ap.add_argument("--buffer-size", type=int, default=500, help="replay buffer 容量（局数，非样本数）")
     ap.add_argument("--batch-size", type=int, default=256,
                     help="训练 batch（C2: NPU 甜点 256，显存约 2-3x 旧 64）")
@@ -1249,6 +1282,9 @@ def main():
 
     args = ap.parse_args()
 
+    # 搜索参数已随 MCTS 归档：打一行汇总（忽略但留痕）。旧命令行照抄即可继续跑，
+    # 但「--sims 48 起得快」这类预期现在不成立 —— 每手只做 depth 次批量前向。
+    _log_archived_search_args(args)
     # DDP/多卡：rank/world_size/is_main（c2net、swanlab 块均引用 is_main，须先定义）
     rank = int(os.environ.get('RANK', '0'))
     world_size = int(os.environ.get('WORLD_SIZE', '1'))

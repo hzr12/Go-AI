@@ -35,6 +35,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import scripts.selfplay_train as st  # noqa: E402
+from src.search.policy_sampler import MoveSample  # noqa: E402
 from scripts.selfplay_train import (  # noqa: E402
     _KL_BETA_MAX, _KL_BETA_MIN, _adapt_kl_coef, _compute_advantage,
     _ppo_policy_loss, _process_game_data, _standardize_advantage,
@@ -270,81 +271,120 @@ def test_advantage_is_z_minus_v_old():
 
 
 # --------------------------------------------------------------------------- #
-# 5b. 采集端：数据行里的 logp_old 真的锚定「温度作用后」分布
+# 5b. 采集端：行里的 logp_old（π 族）与 logq（q 族）各自锚定「实际落子」动作
 # --------------------------------------------------------------------------- #
-def _post_temperature_pnorm(probs, mc):
-    """独立复算两级温度后的行为分布（不复用 _temperature_sample，避免自证）。"""
-    p = np.asarray(probs, dtype=np.float64).reshape(-1).copy()
-    p[-1] = max(p[-1], 0.0)
-    temp = 1.0 - min(1.0, mc / max(30, 1)) * (1.0 - 0.1)
-    if temp > 0 and temp != 1.0:
-        p = p ** (1.0 / temp)
-    return p / p.sum()
+def _mk_stub_sampler(n_actions, seen, bs, ch, force_action=None):
+    """造一个假走子器：返回 π（无温度根 policy）与 q（温度后行为分布）两个族。
 
-
-def test_self_play_game_rows_carry_post_temperature_logp_old(monkeypatch):
-    """采集行契约：logp_old = log(温度作用后分布)[**实际落子**的 action]。
-
-    这是 P3-0 报告 §5.5-1 点名的陷阱：改记「未加温度的 visit 分布」会让 KL/ratio
-    系统性偏高且**不报错**。既有测试只钉住 _temperature_sample 这个 helper，
-    这里补上**调用点**（self_play_game → data.append）：变异把 append 里的
-    logp_old 换成原始 visit 分布 / 换成别的着法的 log-prob，本测试必红。
+    两族**故意不同**（q 由 minimax 推演派生）—— 这正是 B2 重要性修正的前提：
+    若它们恒等，w=π/q≡1，修正就成了摆设，测试也测不出东西。
     """
-    bs, n_actions = 5, 5 * 5 + 1
+    def _fake_sample_move(ai, board, h0, h1, to_play, **kw):
+        k = len(seen)
+        pi = np.full(n_actions, 1e-3, dtype=np.float64)
+        pi[(k * 3) % (n_actions - 1)] = 0.30
+        pi[-1] = 0.05
+        pi /= pi.sum()
+        q = np.full(n_actions, 1e-4, dtype=np.float64)
+        q[(k * 7 + 1) % (n_actions - 1)] = 0.50
+        q[-1] = 0.05
+        q /= q.sum()
+        seen.append((pi.copy(), q.copy()))
+        mv = force_action[k] if force_action is not None else int(
+            np.argmax(q[:n_actions - 1]))
+        mask = np.zeros(n_actions, dtype=np.bool_)
+        mask[:n_actions - 1] = True
+        mask[-1] = True
+        return MoveSample(
+            planes=np.zeros((ch, bs, bs), dtype=np.float32), action=int(mv),
+            logq=math.log(q[mv]), logp_old=math.log(pi[mv]), value=0.25,
+            mask=mask, probs=q, policy=pi)
+    return _fake_sample_move
+
+
+def test_self_play_game_rows_carry_policy_logp_and_logq(monkeypatch):
+    """采集行契约（B2）：`logp_old = log π(a)`、`logq = log q(a)`，各自锚定**实际落子**。
+
+    去 MCTS 后的分工：**π 是 ratio 两侧的同族**（不带温度），**q 是行为分布**
+    （带温度 + 推演混合），B2 的重要性权重 `w = π/q` 就靠这一对。把 `logp_old`
+    记成 q（族都错了）或记成别的着法，症状都是**不报错**的 PPO 偏差，所以这里
+    逐行显式比对。
+    """
+    bs, ch, n_actions = 5, 12, 5 * 5 + 1
     seen = []
-
-    class _StubMCTS:
-        def __init__(self, ai, **kw):
-            self.k = 0
-
-        def search(self, board, h0, h1, to_play, simulations, path_moves):
-            k = self.k
-            self.k += 1
-            # 逐步偏斜的固定分布（全部 > 0 → p**10 不下溢、logp 恒有定义）
-            probs = np.full(n_actions, 1e-3)
-            probs[(k * 3) % (n_actions - 1)] = 0.30
-            probs[(k * 7 + 1) % (n_actions - 1)] = 0.15
-            probs[-1] = 0.05
-            seen.append(probs.copy())
-            return np.zeros(n_actions), probs, 0.25
-
-    monkeypatch.setattr(st, 'MCTS', _StubMCTS)
+    monkeypatch.setattr(st, 'sample_move',
+                        _mk_stub_sampler(n_actions, seen, bs, ch))
 
     class _StubAI:
-        """P4.2 起特征通道数随模型走（`ai.in_channels`），采集侧也要有这个属性。
-
-        仍钉 12ch：本用例测的是**行契约**（logp_old 锚在实际落子上），不是通道数；
-        12 是旧代权重的通道，与被钉住的 `planes.shape == (12, bs, bs)` 对应。
-        """
-        in_channels = 12
+        in_channels = ch
 
     state = np.random.get_state()
     try:
         np.random.seed(7)
         data, score = st.self_play_game(
-            _StubAI(), board_size=bs, sims=1, max_moves=4, temperature=1.0,
-            expand_topk=4, expand_chunk=0)
+            _StubAI(), board_size=bs, max_moves=4, temperature=1.0)
     finally:
         np.random.set_state(state)
 
     assert len(data) == 4, f"应记录 4 步，实得 {len(data)}"
     for i, row in enumerate(data):
-        assert len(row) == 7, f"采集行应为 7 元组，实得 {len(row)}"
-        planes, action, logp_old, to_play, mc, root_value, mask = row
-        assert planes.shape == (12, bs, bs)
+        assert len(row) == 8, f"采集行应为 8 元组（含 logq），实得 {len(row)}"
+        planes, action, logp_old, to_play, mc, v_collect, mask, logq = row
+        assert planes.shape == (ch, bs, bs)
         assert mask.shape == (n_actions,) and mask.dtype == np.bool_
         assert mask[action], f"第 {i} 步落子 {action} 不在自身掩码内"
         assert 0 <= action < n_actions and to_play in (1, -1)
-        p_norm = _post_temperature_pnorm(seen[mc], mc)
-        # 核心断言：logp_old 锚定在**实际落子**动作上，不是别的着法、也不是原始 visit 分布
-        assert logp_old == pytest.approx(math.log(p_norm[action]), abs=1e-6), (
-            f"第 {i} 步 logp_old={logp_old} 与温度后分布 log(p_norm[{action}])="
-            f"{math.log(p_norm[action])} 不符")
-        # 反例：记成未温度化的 visit 分布（mc>0 时第二级温度才真的作用 → 必不同；
-        # mc=0 时 temp≡1，两级温度退化为恒等，该反例不成立，跳过）
-        raw = seen[mc] / seen[mc].sum()
-        if mc > 0:
-            assert logp_old != pytest.approx(math.log(raw[action]), abs=1e-6)
+        pi, q = seen[mc]
+        assert logp_old == pytest.approx(math.log(pi[action]), abs=1e-6), (
+            f"第 {i} 步 logp_old={logp_old} 与 log π[{action}]="
+            f"{math.log(pi[action])} 不符")
+        assert logq == pytest.approx(math.log(q[action]), abs=1e-6), (
+            f"第 {i} 步 logq={logq} 与 log q[{action}]={math.log(q[action])} 不符")
+        # B2 的前提：两族不是同一个东西（否则 w≡1，重要性修正形同虚设）
+        assert abs(logq - logp_old) > 1e-3, \
+            f'第 {i} 步 q 与 π 意外相同，B2 的权重将恒为 1'
+
+
+def test_self_play_game_pass_fallback_recomputes_both_families(monkeypatch):
+    """play 拒绝回退 pass 时，`logp_old` 取 **π(pass)**、`logq` 取 **q(pass)**。
+
+    这是 2026-09-30 修掉的真实缺陷：回退分支原先用 `s.probs`（那是 q）当
+    `logp_old`，等于把重要性权重悄悄退化成 1，PPO 从此有偏且**完全不报错**。
+    两族的取值必须锚定**回退后**的动作，不能沿用被拒动作的那一对。
+    """
+    bs, ch, n_actions = 5, 12, 5 * 5 + 1
+    seen = []
+    # 第 0 手落 (0,0)，第 1 手**再**采样 (0,0) → 已被占 → play 失败 → 回退 pass
+    monkeypatch.setattr(st, 'sample_move',
+                        _mk_stub_sampler(n_actions, seen, bs, ch,
+                                         force_action=[0, 0, 3, 4]))
+
+    class _StubAI:
+        in_channels = ch
+
+    state = np.random.get_state()
+    try:
+        np.random.seed(7)
+        data, score = st.self_play_game(
+            _StubAI(), board_size=bs, max_moves=3, temperature=1.0)
+    finally:
+        np.random.set_state(state)
+
+    assert len(data) >= 2, data
+    row = data[1]
+    planes, action, logp_old, to_play, mc, v_collect, mask, logq = row
+    assert action == n_actions - 1, (
+        f'第 1 手应回退成 pass（n²={n_actions - 1}），实得 {action}')
+    pi, q = seen[1]
+    assert logp_old == pytest.approx(math.log(pi[action]), abs=1e-6), \
+        f'回退后 logp_old 未按 π 重算：{logp_old} vs {math.log(pi[action])}'
+    assert logq == pytest.approx(math.log(q[action]), abs=1e-6), \
+        f'回退后 logq 未按 q 重算：{logq} vs {math.log(q[action])}'
+    # 反例：沿用被拒动作 0 的那一对（这是修复前的行为）
+    assert logp_old != pytest.approx(math.log(pi[0]), abs=1e-6), \
+        '回退后 logp_old 仍是原动作的 ⇒ 权重作用在错的支撑点上'
+    assert logq != pytest.approx(math.log(q[0]), abs=1e-6), \
+        '回退后 logq 仍是原动作的'
 
 
 # --------------------------------------------------------------------------- #
@@ -374,14 +414,18 @@ def test_train_epochs_source_wires_ppo_only():
     assert '"entropy": _ppo_stats["entropy"]' in msrc
     assert '"ppo_clip": args.ppo_clip' in msrc
 
-    # 采集端：logp_old 取自 _temperature_sample，play 回退后重算
+    # 采集端（2026-09-30 去 MCTS 后改）：温度采样搬进了 `policy_sampler`，
+    # `self_play_game` 走 `sample_move` 拿成对的 (logq, logp_old)。
     ssrc = inspect.getsource(st.self_play_game)
-    assert '_temperature_sample(' in ssrc
-    assert 'if action != mv:' in ssrc, "play 回退 pass 后未重算 logp_old"
-    # 回退分支必须重算**同一个 p_norm** 的 log-prob（动作与 logp_old 锚定同一次采样）
-    assert 'logp_old = float(np.log(p_norm[action]))' in ssrc
-    # append 进 data 的必须是那个 logp_old 变量本身
-    assert 'float(root_value), mask))' in ssrc
+    assert 'sample_move(' in ssrc, 'self_play_game 必须走走子器（不再构造 MCTS）'
+    assert 'MCTS(' not in ssrc, 'self_play_game 里不该再构造 MCTS'
+    assert 'logq' in ssrc and 'logp_old' in ssrc, '两个 log-prob 必须一起记录'
+    assert 'if action != mv:' in ssrc, "play 回退 pass 后未重算两个 log-prob"
+    # 回退分支必须分别按 π 与 q 重算（混用 ⇒ 重要性权重退化成 1）
+    assert 's.policy[action]' in ssrc, '回退后 logp_old 必须取 π（s.policy）'
+    assert 's.probs[action]' in ssrc, '回退后 logq 必须取 q（s.probs）'
+    # append 进 data 的必须是 8 元组，末位是 logq
+    assert 's.mask, logq))' in ssrc, '采集行末位必须是 logq（8 元组契约）'
     # async 端同一契约（路线图要求同步 async_pipeline.py 调用点）
     import scripts.async_pipeline as ap
     asrc = inspect.getsource(ap.SelfPlayWorker._play_one_game)

@@ -22,7 +22,13 @@ SFT_SRC = os.path.join(ROOT, 'scripts', 'selfplay_train.py')
 
 
 def _code_params():
-    """从源码抽出 {选项名: 默认值文本}（不实际运行 main，避免起训练）。"""
+    """从源码抽出 {选项名: 默认值文本}（不实际运行 main，避免起训练）。
+
+    `default=` 允许是**模块常量名**（如 `--lookahead-mix` 的 `DEFAULT_MIX`）：
+    这时从 selfplay_train 的模块命名空间把它的值取出来当默认值 —— 否则文档只能
+    跟着抄常量名，永远不会被「默认值漂移」这条测试保护。
+    """
+    import scripts.selfplay_train as st
     src = open(SFT_SRC, encoding='utf-8').read()
     out = {}
     # 匹配 ap.add_argument("--name", ... )  直到该调用的右括号
@@ -36,6 +42,8 @@ def _code_params():
         d = re.search(r'default=([^\n,]+(?:\([^)]*\))?)', seg)
         if d:
             val = d.group(1).strip().rstrip(')')
+            if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', val) and hasattr(st, val):
+                val = str(getattr(st, val))
         elif 'required=True' in seg:
             val = '(required)'
         else:

@@ -374,16 +374,34 @@ python scripts/selfplay_train.py \
   --out models/az_best.pth
 
 # ============================================================
-# ③' RL 完整参数表（selfplay_train.py，56 项；默认值均取自 --help/源码）
+# ③' RL 完整参数表（selfplay_train.py，61 项；默认值均取自 --help/源码）
 # ============================================================
 # 用法：完整命令加 --help；下表为默认值，命令行显式传入即覆盖。
+#
+# ⚠ 2026-09-30 RL 去 MCTS：17 个 MCTS 搜索参数（--sims / --expand-topk /
+#   --expand-chunk / --c-puct / --virtual-loss / --mcts-threads / --num-threads /
+#   --spec-prefetch / --use-rollout / --rollout-lambda / --rollout-steps /
+#   --leaf-ab-depth / --leaf-ab-width / --use-diverse-rollout / --mcts-vector-backup /
+#   --priors-leaf / --dir-alpha / --dir-eps）**仍在表里、仍能解析**（旧命令行
+#   一个字都不用改），但**不再生效**：RL 采集已换成 N 步 minimax 推演。启动时会
+#   打一行 "[rl] 搜索参数已随 MCTS 归档" 汇总，别把它当成还在起作用。
+#   ⇒ 「--sims 48 起得快」这类预期现在不成立：每手只做 --lookahead-depth 次批量前向。
+#   MCTS 引擎本身**保留**给 webui / cli_play / evaluate / eval_elo，那条路未改。
+# --- 落子参数（去 MCTS 后新增的 5 个，**当前真正生效**）---
+#   --lookahead-depth N       推演层数；默认 2（0 = 纯策略采样）
+#   --lookahead-topk N        每层保留的 top-K 候选；默认 12
+#   --lookahead-width N       每个候选再展开的宽度 W；默认 4
+#   --lookahead-temp F        价值→概率的 τ_v；默认 0.2（与 webui hybrid 同值）
+#   --lookahead-mix F         q 里分给根策略的质量；默认 0.1（保证满支撑；
+#                             B2 重要性权重 w = π/q 依赖它，置 0 会让 q 无支撑）
+#   每层前向的 batch ≈ K×W = 48，与「一次 MCTS 模拟」不可直接比较。
 #
 # --- 初始权重 / 对局规模 ---
 #   --model PATH            初始权重（如 SFT 预训练）；默认 None
 #   --board-size N          棋盘大小；默认 9
 #   --iters N               迭代轮数；默认 5
 #   --games N               每轮自对弈局数（串行模式）；默认 4
-#   --sims N                每步 MCTS 模拟数；默认 400
+#   --sims N                【已归档】每步 MCTS 模拟数；默认 400（不生效）
 #   --max-moves N           单局手数上限；默认 None = 3×点数
 #   --temperature F         初始采样温度；默认 1.0
 #   --buffer-size N         replay buffer 容量（局数，非样本数）；默认 500

@@ -25,6 +25,7 @@ import numpy as np
 
 from src.game.go_rules import GoBoard
 from src.search.light_rollout import FastPolicy, light_rollout
+from src.search import lookahead as lookahead_mod
 
 
 @dataclass
@@ -274,40 +275,22 @@ class MCTS:
     def _child_states(self, board, moves, my_hist, op_hist, to_play):
         """给定局面与候选着法，返回各子局面的 (GoBoard, my_h, op_h, to_play)。
 
-        子节点持有完整棋盘深拷贝，供后续「按层批量前向 / 再展开」复用；
-        在传入棋盘上 play/undo（调用方状态不破坏）。
+        薄转发：规范实现是 `src/search/lookahead.py::child_states`（2026-09-30
+        从这里搬出去）。搬出去是因为 **RL 采集要用同一套推演逻辑但不该构造
+        MCTS**；留在这里的方法名是为了不动搜索侧的调用点与既有测试
+        （`tests/test_mcts_in_channels.py` 直接调它）。
         """
-        out = []
-        for mv in moves:
-            if not board.apply_action(mv):
-                continue
-            child_to = -to_play
-            cmy = list(op_hist)
-            cop = list(my_hist)
-            cb = board.clone()
-            out.append((cb, cmy, cop, child_to))
-            board.undo()
-        return out
+        return lookahead_mod.child_states(board, moves, my_hist, op_hist, to_play)
 
     def _forward_level(self, nodes):
         """对一批节点批量前向，返回 (policies(B,A), values(B,))。
 
-        一次性组装整批特征（通道数 = 模型 `in_channels`）+ 单次 predict，最大化
-        CPU/ONNX 吞吐（替代 predict_batch 逐子建特征 + 碎片化单图前向）。
-        P4.13b 起通道数向所挂模型要（`_in_channels`），不再钉死 12。
+        薄转发（见 `_child_states` 的说明）：规范实现在
+        `src/search/lookahead.py::forward_level`。通道数向所挂模型要
+        （`_in_channels`，P4.13b 起不再钉死 12）。
         """
-        if not nodes:
-            return np.zeros((0, self.n_actions)), np.zeros(0)
-        arrays = np.stack([n[0].board for n in nodes])
-        my_hs = [n[1] for n in nodes]
-        op_hs = [n[2] for n in nodes]
-        tps = [n[3] for n in nodes]
-        kos = [n[0].ko_point for n in nodes]
-        planes = nodes[0][0].feature_planes_batched(arrays, my_hs, op_hs, tps, kos,
-                                                     n_channels=self._in_channels())
-        states = [(None, my_hs[i], op_hs[i], tps[i], planes[i])
-                  for i in range(len(nodes))]
-        return self.ai.predict_batch(states)
+        return lookahead_mod.forward_level(self.ai, nodes, self._in_channels(),
+                                          self.n_actions)
 
     def _select(self, node):
         """从根递归选到叶子（PUCT + 虚拟损失 + proven 剪枝）。返回路径。
@@ -677,96 +660,25 @@ class MCTS:
                   depth=2):
         """策略 N 步批量推演（minimax 展开 top-K/width 着法树，价值回传）。
 
-        depth 真正控制推演层数：2=根候选→对手最佳应手→评估（共 depth+1 次批量前向）；
-        3=再多一层我方应手，以此类推。根取 top-K 候选，之后各层取 top-W 应手，
-        交替最小化/最大化「根玩家视角价值」（对手层取 min，我方层取 max）。
+        **薄转发**（2026-09-30）：规范实现搬到 `src/search/lookahead.py`，因为
+        RL 采集路径要用同一套推演逻辑、但不该为此构造一个 MCTS（RL 已去掉搜索，
+        而引擎要留给 webui / cli_play / evaluate / eval_elo）。搬而不是复制，是为了
+        单一真相源 —— 两份实现一旦分叉，就会出现「webui 看到的推演与 RL 采到的动作
+        不是同一套逻辑」这种极难查的矛盾。
 
-        与 _leaf_ab 同样的「逐层批量」思路：每层节点拼一个 batch 一次前向，
-        既能吃到 ONNX 大 batch 吞吐，又让 depth 任意可调（旧 lookahead2 写死 2 步、
-        policy_depth 形同开关）。仅在传入棋盘上 play/undo（_child_states 用深拷贝）。
+        与搬迁前的行为差异**只有一处**：根特征由本方法用自己的 `_planes1`
+        （LRU + TTL 缓存）提供，纯函数侧则接受调用方传入的 `planes`（RL 侧本来
+        就要把 planes 写进 buffer，能只算一次）。搜索侧的缓存语义因此**逐字保留**。
 
-        返回 ({mv: 根玩家视角价值}, 根 masked policy, 最佳 mv, 最佳价值)。
+        返回 ({mv: 根玩家视角价值}, 根 masked policy, 最佳 mv, 最佳价值) ——
+        仍是 4 元组（纯函数侧多返回一个 `root_value`，webui 用不到，这里丢掉）。
         """
-        n = self.n_actions
-        legal = [int(m) for m in np.where(board.get_legal_moves())[0]] + [n - 1]
-
-        # 根前向取 policy 与 top-K 候选
-        planes = self._planes1(board, my_hist, op_hist, to_play)
-        pol, _ = self.ai.predict_batch(
-            [(None, list(my_hist), list(op_hist), to_play, planes)])
-        p = np.asarray(pol).reshape(-1)
-        masked = np.zeros(n)
-        masked[legal] = p[legal]
-        order = [int(m) for m in np.argsort(-masked)[:max(1, topk)]]
-        if not order:
-            return {}, masked, n - 1, 0.0
-
-        # ⚠ 修复 IndexError（实测对局 131 手触发）：_child_states 会跳过
-        # play() 拒绝的着法，因此 levels[0] 可能比 order 短，下方
-        # out[order[i]] = node_val[0][i] 的对位索引就越界。这里先用 play/undo
-        # 过滤出真正可下的 kept，与 levels[0] 一一对应（旧 lookahead2 就有
-        # kept 列表，重写时遗漏了）。
-        kept = []
-        for mv in order:
-            if board.apply_action(mv):
-                board.undo()
-                kept.append(mv)
-        if not kept:
-            return {}, masked, n - 1, 0.0
-
-        # 逐层生成子树（每层节点 = 上层节点按 policy 选出的 top-W 孩子）
-        levels = [self._child_states(board, kept, my_hist, op_hist, to_play)]
-        if not levels[0]:
-            return {}, masked, n - 1, 0.0
-        child_ranges = []  # levels[L] 中每个节点的子节点在 levels[L+1] 的 [s,e)
-        all_pols, all_vals = [], []
-        pol0, val0 = self._forward_level(levels[0])  # 取本层 policy + 静态价值
-        all_pols.append(pol0)
-        all_vals.append(val0)
-        for _ in range(1, depth):
-            prev = levels[-1]
-            pols = all_pols[-1]
-            nxt, ranges = [], []
-            for i, nd in enumerate(prev):
-                cb, cmy, cop, cto = nd
-                pp = np.asarray(pols[i]).reshape(-1)
-                lleg = [int(m) for m in np.where(cb.get_legal_moves())[0]] + [n - 1]
-                porder = sorted(lleg, key=lambda m: -pp[m])[:max(1, width)]
-                s = len(nxt)
-                nxt.extend(self._child_states(cb, porder, cmy, cop, cto))
-                ranges.append((s, len(nxt)))
-            levels.append(nxt)
-            child_ranges.append(ranges)
-            if not nxt:
-                break
-            pnxt, vnxt = self._forward_level(nxt)
-            all_pols.append(pnxt)
-            all_vals.append(vnxt)
-
-        # 各层静态价值转到「根玩家视角」（forward 返回的是该节点 to_play 视角）
-        node_val = []
-        for L, lvl in enumerate(levels):
-            node_val.append([
-                (float(all_vals[L][i]) if lvl[i][3] == to_play
-                 else -float(all_vals[L][i]))
-                for i in range(len(lvl))
-            ])
-
-        # 自底向上传播：奇数层（我方）取 max，偶数层（对手）取 min
-        for L in reversed(range(len(levels) - 1)):
-            ranges = child_ranges[L]
-            is_max = (L % 2 == 1)
-            for i in range(len(levels[L])):
-                s, e = ranges[i]
-                ch = node_val[L + 1][s:e]
-                if ch:  # 有孩子 → 按层性质聚合；无孩子 → 保留自身静态价值
-                    node_val[L][i] = (max if is_max else min)(ch)
-
-        # 根每个候选的最终价值 = 其对应子节点（对手层）的根视角价值
-        out = {kept[i]: node_val[0][i] for i in range(len(kept))}
-        best_mv = max(out, key=lambda m: out[m]) if out else (n - 1)
-        best_v = out[best_mv] if out else 0.0
-        return out, masked, best_mv, best_v
+        res = lookahead_mod.lookahead(
+            self.ai, board, my_hist, op_hist, to_play,
+            n_actions=self.n_actions, n_channels=self._in_channels(),
+            topk=topk, width=width, depth=depth,
+            planes=self._planes1(board, my_hist, op_hist, to_play))
+        return res.values, res.policy, res.best_move, res.best_value
 
     def _replay_path(self, path):
         """从根局面沿 path 重放着法，返回 leaf 局面的独立棋盘副本。
