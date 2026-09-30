@@ -407,7 +407,9 @@ def test_bn_guard_is_actually_entered_only_on_recompute():
         o.sum().backward()
     finally:
         _BatchNormStatGuard.__enter__ = orig
-    n_seg = sum(1 for k in (GC_RES, GC_MAMBA, GC_TRANSFORMER)
+    # 被检查点的段数（cross_attn_res 自 2026-09-30「全用GC」起也在内；它不含
+    # BN，守卫对它空转，但「每个被检查点的段进一次」这个口径不变）
+    n_seg = sum(1 for k in (GC_RES, GC_MAMBA, GC_TRANSFORMER, GC_CROSS_ATTN_RES)
                 if m.grad_checkpointing_for(k))
     assert len(seen) == n_seg, \
         '重算期间守卫进入次数应为「被检查点的段数」%d，实得 %d' % (n_seg, len(seen))
@@ -585,15 +587,20 @@ def test_inference_zero_overhead():
 def test_defaults_match_the_ruling():
     assert V21_GRAD_CHECKPOINT_DEFAULTS == {
         GC_RES: True, GC_MAMBA: True, GC_TRANSFORMER: True,
-        GC_CROSS_ATTN_RES: False, GC_LEGACY: False,
-    }, '默认值与用户 2026-09-27 裁决不符：%s' % V21_GRAD_CHECKPOINT_DEFAULTS
+        GC_CROSS_ATTN_RES: True, GC_LEGACY: False,
+    }, ('默认值与用户裁决不符（2026-09-27 三段必开/建议开 + 2026-09-30「全用GC」'
+        '把 cross_attn_res 也打开；legacy 因 D5 仍默认关）：%s'
+        % V21_GRAD_CHECKPOINT_DEFAULTS)
     m = _small()
     assert m.grad_checkpointing is True
     assert m.grad_checkpointing_kinds() == V21_GRAD_CHECKPOINT_DEFAULTS
     assert m.grad_checkpointing_for(GC_RES) is True
     assert m.grad_checkpointing_for(GC_MAMBA) is True
     assert m.grad_checkpointing_for(GC_TRANSFORMER) is True
-    assert m.grad_checkpointing_for(GC_CROSS_ATTN_RES) is False
+    # 2026-09-30 起 cross_attn_res 也默认开（原来这里是 False）
+    assert m.grad_checkpointing_for(GC_CROSS_ATTN_RES) is True
+    assert m.grad_checkpointing_for(GC_LEGACY) is False, \
+        'legacy 必须仍默认关（D5：不得改变旧路径行为）'
     with pytest.raises(ValueError):
         m.grad_checkpointing_for('nope')
     with pytest.raises(ValueError):
@@ -769,7 +776,8 @@ def test_each_block_type_is_covered():
     m.train()
     segs = {GC_RES: RES_SLICE, GC_MAMBA: MAMBA_SLICE,
             GC_TRANSFORMER: TRANS_SLICE, GC_CROSS_ATTN_RES: CROSS_SLICE}
-    enabled = (GC_RES, GC_MAMBA, GC_TRANSFORMER)
+    # cross_attn_res 自 2026-09-30「全用GC」起也在覆盖集合内
+    enabled = (GC_RES, GC_MAMBA, GC_TRANSFORMER, GC_CROSS_ATTN_RES)
 
     def run(kinds):
         m.set_grad_checkpointing(True, **kinds)
@@ -783,7 +791,11 @@ def test_each_block_type_is_covered():
                 h.remove()
         return counts
 
-    off = run(dict(res=False, mamba=False, transformer=False))
+    # 「未开检查点」这行必须把四个 kind **全部**显式关掉：cross_attn_res 的
+    # 默认自 2026-09-30「全用GC」起是 True，只关前三个会让它接着走检查点，
+    # 于是这行基线不再是真正的基线（实测 CrossAttnRes.14 跑了 2 次）。
+    off = run(dict(res=False, mamba=False, transformer=False,
+                   cross_attn_res=False))
     assert set(off.values()) == {1}, '未开检查点时每块应只跑 1 次：%s' % off
 
     on = run({})
@@ -1249,15 +1261,24 @@ def measure(batch=1, board=BOARD, channels=CH, in_channels=IN_CH,
     configs = [
         ('off/all', {'res': False, 'mamba': False, 'transformer': False,
                      'cross_attn_res': False}),
-        ('on/res', {'res': True, 'mamba': False, 'transformer': False}),
-        ('on/mamba', {'res': False, 'mamba': True, 'transformer': False}),
-        ('on/trans', {'res': False, 'mamba': False, 'transformer': True}),
-        ('on/res+mamba', {'res': True, 'mamba': True, 'transformer': False}),
-        ('on/res+trans', {'res': True, 'mamba': False, 'transformer': True}),
-        ('on/mamba+trans', {'res': False, 'mamba': True, 'transformer': True}),
-        ('on/all', {'res': True, 'mamba': True, 'transformer': True}),
-        ('on/all+cross', {'res': True, 'mamba': True, 'transformer': True,
-                          'cross_attn_res': True}),
+        # ⚠ 每行都**显式**写全四个 kind：cross_attn_res 的默认在 2026-09-30
+        # 从 False 改成了 True，留空会继承默认值 ⇒ 行的标签就不再等于实际组合。
+        ('on/res', {'res': True, 'mamba': False, 'transformer': False,
+                    'cross_attn_res': False}),
+        ('on/mamba', {'res': False, 'mamba': True, 'transformer': False,
+                      'cross_attn_res': False}),
+        ('on/trans', {'res': False, 'mamba': False, 'transformer': True,
+                      'cross_attn_res': False}),
+        ('on/res+mamba', {'res': True, 'mamba': True, 'transformer': False,
+                          'cross_attn_res': False}),
+        ('on/res+trans', {'res': True, 'mamba': False, 'transformer': True,
+                          'cross_attn_res': False}),
+        ('on/mamba+trans', {'res': False, 'mamba': True, 'transformer': True,
+                            'cross_attn_res': False}),
+        ('on/3seg', {'res': True, 'mamba': True, 'transformer': True,
+                     'cross_attn_res': False}),
+        ('on/all4', {'res': True, 'mamba': True, 'transformer': True,
+                     'cross_attn_res': True}),
     ]
     rows = []
     for name, kinds in configs:
@@ -1322,7 +1343,14 @@ def test_measurement_ordering_is_stable():
         'Mamba 段省下的激活没有远超 ResBlock 段：%s（比例 %.1f×）' \
         % (saved, saved['mamba'] / max(saved['res'], 1e-9))
     assert min(saved.values()) > 0, saved
-    assert by['on/all']['saved_mb'] < by['off/all']['saved_mb']
+    assert by['on/3seg']['saved_mb'] < by['off/all']['saved_mb'], \
+        '三段全开必须比全关省激活'
+    # 2026-09-30「全用GC」后 cross_attn_res 也在内。`saved_mb` 是前向驻留的
+    # **峰值**（越小越好）：@B=1/19路/184ch 实测 291.8 → 26.2 → 2.5 MB，
+    # 即这两块正是 v21 激活的大头（全局 N×N 注意力），量化了改判依据。
+    assert by['on/all4']['saved_mb'] < by['on/3seg']['saved_mb'], \
+        'cross_attn_res 纳入检查点后峰值驻留没有继续下降：%s' % (
+            {k: by[k]['saved_mb'] for k in ('off/all', 'on/3seg', 'on/all4')},)
 
 
 if __name__ == '__main__':

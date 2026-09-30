@@ -378,9 +378,11 @@ def test_grad_checkpointing_defaults_match_user_ruling():
     assert b.grad_checkpointing_for(GC_RES) is True
     assert b.grad_checkpointing_for(GC_MAMBA) is True
     assert b.grad_checkpointing_for(GC_TRANSFORMER) is True
-    # 性价比不合算的两格（P4.6b 裁决）：默认不开
-    assert b.grad_checkpointing_for(GC_CROSS_ATTN_RES) is False
-    assert b.grad_checkpointing_for(GC_LEGACY) is False
+    # 2026-09-30 用户改判「全用GC」：cross_attn_res 也纳入（全局 N×N 注意力是
+    # v21 的激活大头）。legacy 因 D5 仍默认关。
+    assert b.grad_checkpointing_for(GC_CROSS_ATTN_RES) is True
+    assert b.grad_checkpointing_for(GC_LEGACY) is False, \
+        'legacy 必须仍默认关（D5：不得改变 12ch 旧路径行为）'
 
 
 def test_grad_checkpointing_off_when_compile_wins():

@@ -103,7 +103,14 @@ V21_GRAD_CHECKPOINT_DEFAULTS = {
     GC_RES: True,
     GC_MAMBA: True,
     GC_TRANSFORMER: True,
-    GC_CROSS_ATTN_RES: False,
+    # 2026-09-30 用户改判：**全开**。原裁决（2026-09-27）是 False，理由见本节
+    # 末尾；4×910A 上 16 块里唯独这 2 块不受检查点保护，而它们的恒等腿是**全局**
+    # MHSA（math 路径物化 N×N），实测 2.1 MB @B=1/块 ⇒ @B=2800 两块 ≈ 11.8 GB，
+    # 是 v21 比 12ch/192ch 的 v18 更吃显存的主因。batch 上墙时那个权衡就反过来了：
+    # 「每字节省的激活对应最多重算」成立，但重算成本是一次全局注意力前向，
+    # 而收益是省掉整段激活 —— 换 batch 时这笔交易划算。
+    # 要临时关掉：`model.set_grad_checkpointing(cross_attn_res=False)`。
+    GC_CROSS_ATTN_RES: True,
     GC_LEGACY: False,
 }
 
@@ -395,8 +402,9 @@ class GradCheckpointMixin:
     * 不带任何 CLI 参数（D1：v21 不新增训练参数），由模型属性控制。
     * 默认值见 `V21_GRAD_CHECKPOINT_DEFAULTS`：`res`/`mamba`/`transformer` = True
       （用户 2026-09-27 裁决：ResBlocks 必开，Mamba/Transformer 建议开），
-      `cross_attn_res` = False（裁决与理由见本节末尾），`legacy` = False（D5：
-      旧路径默认关，不得改变现有行为）。
+      `cross_attn_res` = **True**（2026-09-30 用户改判「全用GC」；原为 False，
+      理由与改判依据见本节末尾），`legacy` = False（D5：旧路径默认关，
+      不得改变现有行为）。
     * `set_grad_checkpointing()` 可以在**不重建模型**的情况下切换 —— 属性不进
       `state_dict`（既不是 parameter 也不是 buffer），所以切换前后存档逐位相同。
 
@@ -489,22 +497,32 @@ class GradCheckpointMixin:
         )
 
 
-# `CrossAttnRes` 默认**不开**的裁决与理由（P4.6b §2）
+# `CrossAttnRes` 的检查点裁决：**2026-09-27 默认 False → 2026-09-30 改判全开**
 # ---------------------------------------------------------
-# 1. brief 给的理由（「段边界会切断抽头路径」）**技术上不成立**，必须说清：
-#    `checkpoint` 的段函数**可以返回多个出参**，把 `s1`/`s5` 当额外出参返回即可，
-#    它们的反向路径完好。实测（`test_taps_survive_a_checkpointed_segment`）保留它们
-#    的代价只有 2 × (B,184,19,19) fp32 ≈ 0.5 MB @B=1、4.0 MB @B=8。
-# 2. 真正的理由是**性价比**，不是「不能」：
-#    - `CrossAttnRes` 明确**不含 BatchNorm**（见类 docstring），本节最脏的
-#      `running stats` 问题对它不存在；
-#    - 它的激活大头是 MHSA 的 N×N 注意力矩阵（19×19 下 2.1 MB @B=1/块），
-#      量级与 `TransformerBlock` 相同，而 v21 里两者紧邻 —— 只开其一会留下
-#      一个不成比例的空洞；
-#    - 反过来，重算它要重跑 2 次**全局**注意力（`_sdpa` 默认 math 路径会物化
-#      N×N 矩阵），是全部段里「每字节省下的激活对应最多重算」的一段。
-# 3. 因此默认 False；要开的话 `model.set_grad_checkpointing(cross_attn_res=True)`
-#    即可，无需改代码 —— 实测收益见 `task-p4-6b-report.md` §5。
+# 技术前提（两条都仍成立，不因改判而变）：
+# 1. brief 给的原理由（「段边界会切断抽头路径」）**技术上不成立**：
+#    `checkpoint` 的段函数**可以返回多个出参**，把 `s1`/`s5`/`s9` 当额外出参返回
+#    即可，反向路径完好。实测（`test_taps_survive_a_checkpointed_segment`）保留它们
+#    的代价只有 3 × (B,184,19,19) fp32 ≈ 0.75 MB @B=1。
+# 2. `CrossAttnRes` 明确**不含 BatchNorm**（见类 docstring），所以检查点最脏的
+#    `running stats` 双更新问题对它不存在（BN 守卫会正确地空转）。
+#
+# 改判理由（2026-09-30，用户裁决「全用GC」）
+# ------------------------------------------------
+# 原裁决是按「性价比不合算」关掉它的：它的激活大头是 MHSA 的 N×N 矩阵
+# （19×19、math 路径物化，2.1 MB @B=1/块），而重算它要重跑 2 次**全局**注意力 ——
+# 在全部段里「每字节省的激活对应最多重算」。这个账在**参数/激活总量**层面是对的，
+# 但 4×910A 的实际约束是 **batch 显存**：
+#   · 16 块里只有这 2 块不受检查点保护，却各自带着全局 N×N 注意力；
+#   · 2.1 MB @B=1 ⇒ @B=2800 两块 ≈ **11.8 GB**，@B=1500 也有 ≈ 6.3 GB；
+#   · 12ch/192ch 的 v18 没有这种块，所以「V18 能到 2800」不能直接搬到 v21。
+# 把 2 块纳入检查点 = 每步多 2 次全局注意力重算，换回这十几个 GB，用来顶 batch
+# 是划算的（重算成本是固定的，收益随 batch 线性）。
+#
+# 怎么关掉：`model.set_grad_checkpointing(cross_attn_res=False)`（不重建模型，
+# 属性不进 state_dict，切换前后存档逐位相同）。想看实际收益对照：
+# `tests/test_grad_checkpointing.py::test_measurement_ordering_is_stable` 里的
+# `on/3seg` vs `on/all4` 两行就是按真实尺寸（B=1 / 19 路 / 184ch）量的。
 #
 # ⚠ 段粒度裁决：同类型连续块**合并成一个段**（brief §2 的 (b)），不是逐块 (a)。
 # 理由：(a) 会让每块边界激活都留下（8 个 ResBlock = 8 × (B,184,19,19)），

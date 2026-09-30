@@ -222,8 +222,9 @@ class V21Backbone(GradCheckpointMixin, nn.Module):
         # 开关必须在 super().__init__() 之后、第一次 forward 之前开（§8.2-2）
         self._init_grad_checkpointing(
             res=bool(gc), mamba=bool(gc), transformer=bool(gc),
-            cross_attn_res=False,   # §2 裁决：性价比不合算，且默认不开（P4.6b）
-            legacy=False)
+            # 2026-09-30 用户改判「全用GC」：这 2 块也纳入检查点（全局 N×N 注意力
+            # 是 v21 的激活大头，@B=2800 约 11.8 GB，见 backbone.py 的裁决注释）。
+            cross_attn_res=bool(gc), legacy=False)
 
     def forward(self, x):
         x = F.relu(self.stem_bn(self.stem(x)))   # = harness 的 F.relu(stem(x))

@@ -2201,8 +2201,17 @@ def main():
         grad_checkpoint=_v21_gc,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
+    # 逐段开关也打出来：「grad_checkpoint=1」只说明**总开关**，看不出哪几段真的在
+    # 走检查点（per-kind 默认可以不同；且训练态闸门还要求 self.training +
+    # grad enabled）。这段日志的用处是让「GC 到底生效没有」不必翻代码，也不必
+    # 在云端日志里靠猜 —— 4×910A 首跑要看的就是它。
+    _gc_kinds = getattr(getattr(model, 'backbone', None),
+                        'grad_checkpointing_kinds', None)
+    _gc_kinds = _gc_kinds() if callable(_gc_kinds) else {}
     logger.info("[model] v21 (V21_CFG) 参数量=%.2fM | grad_checkpoint=%d | 设备=%s",
                 n_params / 1e6, _v21_gc, device)
+    logger.info("[model] GC 逐段开关=%s | 生效还需 training 态+grad enabled"
+                "（eval/推理恒不检查点，零开销）", _gc_kinds or 'n/a')
 
     # A100 上把卷积型特征（N,C,H,W）转 channels_last(NHWC)，卷积算子走更快内存布局。
     # 输入 state 也需同步转格式（见训练/评估循环），故这里仅转换模型权重布局。
