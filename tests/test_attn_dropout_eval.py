@@ -31,9 +31,12 @@
     都 `.eval()`、同输入 → 输出**逐位相等**（= eval 阶段的输出与 dropout 无关）。
     任何一处站点漏改都会红 —— 这是最强的完备性检查。
   - 单元锁（用例 4）：`attn_drop_p` 派生属性 `.eval()` → 0.0、`.train()` → `self.attn_drop`。
-  - 覆盖锁（用例 5，AST 扫描）：文件里不得再出现 `dropout_p=self.attn_drop,` 这类
-    无闸门的直接透传，也不得出现不带 `self.training` 的 `if self.attn_drop > 0.0:` 内联门。
-    修复前必红（当前 4 处直接透传 + 1 处内联无 training 门）。
+  - 覆盖锁（用例 5，AST **逐站点**扫描）：枚举 backbone.py 里每一个 `_sdpa(...)` **调用点**
+    （定义里的默认值不算站点），要求每处的 dropout 实参都取 `self.attn_drop_p`
+    —— 既挡无闸门直传（`dropout_p=self.attn_drop`），也挡位置参数绕过（`_sdpa(q, k, v, 0.1)`）；
+    并要求文件里没有读不到 `self.training` 的内联 `if self.attn_drop ...` 门。
+    断言语义里**不含任何具体计数**，站点身份用「宿主类.函数[.嵌套函数]」而不是行号，
+    所以红的时候能直接指名**哪条路径**漏了闸门；新增合法站点不会让本文件变红。
 
 空转守卫（防假绿）
 ----------------
@@ -258,19 +261,149 @@ def test_attn_drop_p_property_respects_training():
 
 
 # --------------------------------------------------------------------------- #
-# 5. 覆盖锁：5 个站点一个不漏（AST 扫描，修复前必红）
+# 5. 覆盖锁：每个注意力站点都受 self.training 闸门管住（AST 逐站点扫描）
 # --------------------------------------------------------------------------- #
-def _sdpa_dropout_arg_values(tree):
-    """抽出 `_sdpa(...)` 调用里 `dropout_p=` 关键字的实参（源码形式）。
 
-    按「调用点」而不是「出现次数」统计：函数定义里的形参默认值不算站点。
+# 站点登记表：今天 backbone.py 里的注意力路径，**按「类.函数[.嵌套函数]」逐个列出**，
+# 而不是写死一个计数。
+#
+# 这条锁要回答的是「**哪一条**注意力路径漏了闸门」，不是「有几条路径」。计数回答的是后者，
+# 代价很具体：将来多一条合法站点（例如某个 v21 块决定自己独立注册一条注意力路径）会让
+# 本文件误报一次，而对误报最省事的错误反应就是「把 4 改成 5」——锁就这么被掏空了。
+#
+# 新增注意力路径时**在这里登记一行，并写一句它为什么同样受 self.training 管住**：
+#   · 下面只做**子集**校验（登记 ⊆ 实际站点），所以**新增站点不会让本文件变红** ——
+#     反过来，某条登记路径被删掉或改名会让登记条目变陈旧并变红，逼一次有意的动作。
+#   · 「为什么同样受管」由真正的锁回答：这里登记的每个 scope 都必须出现在
+#     `_sdpa_call_sites()` 的结果里，而那里扫到的**每一个**站点都必须取 `self.attn_drop_p`。
+SDPA_SITES_GATED_BY = (
+    # global 路径：_sdpa(q, k, v, dropout_p=self.attn_drop_p, scale=self.scale)
+    'MultiHeadSelfAttention._global_attn',
+    # window 路径：窗口切分后逐窗 _sdpa(... dropout_p=self.attn_drop_p ...)
+    'MultiHeadSelfAttention._window_attn',
+    # window+global 路径：全局支路 _sdpa(q_p, k_full, v_full, dropout_p=self.attn_drop_p ...)
+    'MultiHeadSelfAttention._window_global_attn',
+    # axial 路径：嵌套的 attn_1d 里 _sdpa(t, t, t, dropout_p=self.attn_drop_p, ...)
+    'MultiHeadSelfAttention._axial_attn.attn_1d',
+)
+
+
+def _parent_map(tree):
+    return {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+
+def _scope_of(node, parent):
+    """节点所在的「宿主类.函数[.嵌套函数]」；模块级返回 `'<module>'`。
+
+    站点身份用**类名 + 函数名**而不是行号：行号会随别的改动整体漂移（每加一行注释
+    就全错），而类/函数名不会；红的时候也才答得出「哪条路径没被管住」——
+    这正是这条锁存在的唯一理由。嵌套函数进名字链（`..._axial_attn.attn_1d`），
+    因为同一方法里不同嵌套函数的注意力站点是**不同的**路径。
     """
+    fns = []
+    cur = parent.get(node)
+    while cur is not None:
+        if isinstance(cur, ast.ClassDef):
+            return '.'.join([cur.name] + list(reversed(fns)))
+        if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            fns.append(cur.name)
+        cur = parent.get(cur)
+    return '<module>'
+
+
+def _sdpa_dropout_param_index(tree):
+    """`_sdpa` 签名里 `dropout_p` 形参的位置序号（从函数定义里读，不写死序号）。
+
+    必须从定义读，因为 `def _sdpa(q, k, v, dropout_p=0.0, ...)` 里那个 `0.0`
+    **不是站点**（是默认值，不是调用）。读定义既拿到位置序号，又把「默认值不算站点」
+    这件事显式化。定义被改名/挪走，或签名里没有 `dropout_p` 形参时返回 None，由调用方报错。
+    """
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == '_sdpa':
+            for i, arg in enumerate(node.args.args):
+                if arg.arg == 'dropout_p':
+                    return i
+    return None
+
+
+def _sdpa_call_sites(tree, parent=None):
+    """backbone.py 里**每一个** `_sdpa(...)` **调用点**，连同它的宿主 scope 与 AST 节点。
+
+    只认 `ast.Call`，所以函数定义里的形参默认值天然不算站点（见上一条 docstring）。
+    裸名 `_sdpa(...)` 和属性访问 `self._sdpa(...)` 都认 —— 后者是位置参数绕过闸门的
+    自然藏身处，只扫裸名会漏掉它。
+    """
+    parent = _parent_map(tree) if parent is None else parent
+    sites = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        named = getattr(fn, 'id', None) == '_sdpa' or (
+            isinstance(fn, ast.Attribute) and fn.attr == '_sdpa')
+        if named:
+            sites.append((_scope_of(node, parent), node))
+    return sites
+
+
+def _sdpa_dropout_arg(site, index):
+    """取一个 `_sdpa` 站点上**真正生效**的 dropout 实参（源码形式），没传就返回 `(None, None)`。
+
+    位置参数优先：Python 语法不允许同一个形参既按位置又按关键字传，两者互斥。
+    关键字扫描会漏掉位置实参，所以这里两条路都得走一遍。
+    """
+    _, node = site
+    if index is not None and len(node.args) > index:
+        return ast.unparse(node.args[index]), f'第 {index + 1} 个位置参数 dropout_p'
+    kw = next((k for k in node.keywords if k.arg == 'dropout_p'), None)
+    if kw is None:
+        return None, None
+    return ast.unparse(kw.value), 'dropout_p='
+
+
+def _sdpa_gate_faults(tree):
+    """返回 `[(scope, 原因, 行号)]`：每一条是一处**没被 self.training 闸门管住**的注意力路径。
+
+    合规判据只有一个：dropout 实参里出现 `self.attn_drop_p`（那个 `.eval()` → 0.0 的派生物）。
+    这一条判据同时挡得住三种失败形态，缺一不可：
+      ① 无闸门直传 `dropout_p=self.attn_drop`（值里有 `attn_drop` 但不是 `attn_drop_p`）；
+      ② 位置参数绕过关键字扫描：`_sdpa(q, k, v, 0.1)`；
+      ③ 任何与派生物无关的实参（字面量、别的变量）—— 值里看不到闸门就等于没闸门。
+    判据里**不含「有几条站点」**，所以新增一条合法站点不会让本文件变红。
+    """
+    index = _sdpa_dropout_param_index(tree)
+    faults = []
+    for site in _sdpa_call_sites(tree):
+        scope, node = site
+        given, where = _sdpa_dropout_arg(site, index)
+        if given is None:
+            # 这个站点压根没传 dropout（吃默认 0.0）→ 天然不漏
+            continue
+        if 'self.attn_drop_p' in given:
+            continue
+        if 'self.attn_drop' in given:
+            reason = f'{where} 无闸门直传 {given}'
+        else:
+            reason = f'{where} 传的是 {given}，不是 self.attn_drop_p（值里看不到闸门）'
+        faults.append((scope, reason, node.lineno))
+    return faults
+
+
+def _ungated_inline_gates(tree, parent=None):
+    """文件里所有「提到 `self.attn_drop` 却不提 `self.training`」的 `if` 判据。
+
+    按**属性名**判而不是按子串判：`self.attn_drop_p` 派生物本身已经读过 `self.training`
+    （见 `attn_drop_p` 的 property），子串匹配会把 `if self.attn_drop_p > 0.0:` 这种
+    合法的、已经受管的内联门误报成无闸门。
+    """
+    parent = _parent_map(tree) if parent is None else parent
     out = []
     for node in ast.walk(tree):
-        if (isinstance(node, ast.Call) and getattr(node.func, 'id', None) == '_sdpa'):
-            for kw in node.keywords:
-                if kw.arg == 'dropout_p':
-                    out.append(ast.unparse(kw.value))
+        if not isinstance(node, ast.If):
+            continue
+        attrs = {a.attr for a in ast.walk(node.test) if isinstance(a, ast.Attribute)}
+        if 'attn_drop' in attrs and 'training' not in attrs:
+            out.append((_scope_of(node, parent), ast.unparse(node.test), node.lineno))
     return out
 
 
@@ -304,40 +437,70 @@ def _sparse_attn_inline_gates(tree):
 
 
 def test_all_five_attn_dropout_sites_are_gated():
-    """AST 扫描：`_sdpa` 的 4 个 `dropout_p` 全部走 `attn_drop_p`，内联门带 `self.training`。
+    """AST **逐站点**扫描：每个 `_sdpa` 站点的 dropout 都取 `self.attn_drop_p`，
+    任何内联 `if self.attn_drop ...` 门都带 `self.training`。
 
-    4 处 `_sdpa` 调用分别服务 `_global_attn`(`backbone.py:286`) / `_window_attn`(`:353`) /
-    `_window_global_attn`(`:490`) / `_axial_attn` 的 `attn_1d`(`:511`)，第 5 处是
-    `_sparse_attn` 里的内联 `F.dropout`（`:413-414`，行号按**修复后**的 backbone.py）。
-    缺任何一个，行为用例 1/3 都会红；这条再加一层静态锁，让「漏改」在 review 与 CI 里
-    都直接可见。
+    （测试名保留 `five` 是因为 `src/networks/backbone.py:791` 按节点 id 引用了它；
+     断言本身与站点数量无关。）
 
-    下面三段查的是**同一个站点的三种失败形态**，缺一不可：
-      ① `_sdpa` 的 `dropout_p` 直接透传 `self.attn_drop`（4 处 `_sdpa` 站点）
-      ② `_sparse_attn` 的函数体里根本没有带 `self.training` 的内联门
-      ③ 该内联门存在，但**不在** `_sparse_attn` 里（被挪到别的函数/别的类）
+    这条锁**按站点**回答「哪一条注意力路径漏了闸门」，而不是回答「有几条路径」：
+      · 站点身份是「宿主类.函数[.嵌套函数]」，不是行号 —— 行号会随无关改动整体漂移；
+        红的时候能直接指名是哪条路径，这才是这条锁存在的理由。
+      · 断言语义里**不含任何具体站点计数**：多一条合法站点不会让本文件变红
+        （新增路径请在 `SDPA_SITES_GATED_BY` 里登记一行并说明它为什么同样受管），
+        少一条（某条路径被删/改名）会让登记条目变陈旧并变红。
+
+    下面查的是**同一处闸门的多种失败形态**，缺一不可：
+      ① `_sdpa` 的 dropout 实参没走 `self.attn_drop_p`：既包括无闸门直传
+        （`dropout_p=self.attn_drop`），也包括位置参数从关键字扫描下滑过去
+        （`_sdpa(q, k, v, 0.1)`）；
+      ② 文件里出现读不到 `self.training` 的内联门 `if self.attn_drop > 0.0:`
+        （`self.attn_drop` 永远是构造期的常量，读不到 eval 语义）；
+      ③ 该内联门存在，但**不在** `_sparse_attn` 里（被挪到别的函数/别的类）。
     ②③ 都需要站点级的定位，见 `_sparse_attn_inline_gates` 的 docstring。
     """
     src = open(BACKBONE_PY, encoding='utf-8').read()
     tree = ast.parse(src)
 
-    passthrough = [v for v in _sdpa_dropout_arg_values(tree) if v == 'self.attn_drop']
-    assert not passthrough, (
-        f'_sdpa 的 dropout_p 仍在直接透传 self.attn_drop（{len(passthrough)} 处）—— '
-        f'functional API 的 training 默认 True，eval 下关不掉')
+    assert _sdpa_dropout_param_index(tree) is not None, (
+        'backbone.py 里找不到 `def _sdpa(...)`，或它的签名里没有 dropout_p 形参 —— '
+        '本条锁靠这个签名定位 dropout 形参的位置序号（好让位置参数也逃不掉），'
+        '无法继续逐站点核对；站点清单需重新核对')
 
-    gated = [v for v in _sdpa_dropout_arg_values(tree) if v == 'self.attn_drop_p']
-    assert len(gated) == 4, (
-        f'应恰好有 4 处 _sdpa 调用取 self.attn_drop_p（global/window/window_global/axial），'
-        f'实得 {len(gated)} 处：{_sdpa_dropout_arg_values(tree)}')
+    # ① 每个站点的 dropout 实参都必须是受 training 闸门管住的派生物
+    faults = _sdpa_gate_faults(tree)
+    assert not faults, (
+        '以下注意力路径的 dropout 没走 self.attn_drop_p 闸门（逐站点指名）：\n'
+        + '\n'.join(f'  · {scope}（backbone.py:{lineno}）：{reason}'
+                    for scope, reason, lineno in faults)
+        + '\n  —— 函数式 dropout API 的 training 参数默认 True，模块的 self.training '
+          '传不进去，model.eval() 关不掉，SFT 评估不可复现。'
+          '修法：实参改取 self.attn_drop_p；若这是新增的合法路径，'
+          '请在 SDPA_SITES_GATED_BY 里登记一行并说明它为什么同样受管。')
 
-    # 第 5 处：_sparse_attn 里的内联门必须带 self.training，且必须就在 _sparse_attn 里
-    bare_gates = [ast.unparse(n.test) for n in ast.walk(tree)
-                  if isinstance(n, ast.If) and ast.unparse(n.test) == 'self.attn_drop > 0.0']
-    assert not bare_gates, (
-        f'仍有不带 self.training 的内联 dropout 门（{bare_gates}）—— sparse 模式的'
-        f'注意力 dropout 在 eval 下照旧生效')
+    # 空转守卫：扫到一个站点都扫不到的话，上面那条断言就恒真了（= 假绿）
+    sites = [scope for scope, _ in _sdpa_call_sites(tree)]
+    assert sites, (
+        'backbone.py 里一处 `_sdpa(...)` 调用点都没扫到 —— 本条锁已经空转，'
+        '「逐站点核对」没有核对任何东西（是不是 _sdpa 被改名或挪走了？）')
 
+    # 子集校验：登记过的路径必须还在（**只挡删改/改名，不挡新增** —— 新增请先登记）
+    stale = [s for s in SDPA_SITES_GATED_BY if s not in sites]
+    assert not stale, (
+        f'SDPA_SITES_GATED_BY 里登记的这些注意力路径在 backbone.py 里已经找不到：{stale}'
+        f'；实际扫到的站点是 {sites}。要么是被删了/改了名，要么是挪进了别的类或函数 —— '
+        f'前者要先确认这条路径的消失是故意的，后者请更新登记表')
+
+    # ② 文件里任何提到 self.attn_drop 却不提 self.training 的内联门
+    ungated = _ungated_inline_gates(tree)
+    assert not ungated, (
+        '以下内联 dropout 门读不到 self.training：\n'
+        + '\n'.join(f'  · {scope}（backbone.py:{lineno}）：if {test} →'
+                    for scope, test, lineno in ungated)
+        + '\n  —— self.attn_drop 是构造期算死的常量，功能式 dropout 也不看模块的 '
+          'self.training，这类门在 eval 下照旧放行')
+
+    # sparse 这一处：_sparse_attn 里的内联门必须带 self.training，且必须就在 _sparse_attn 里
     sparse_gates = _sparse_attn_inline_gates(tree)
     assert sparse_gates is not None, \
         ('MultiHeadSelfAttention 上找不到 _sparse_attn 方法 —— 站点被挪走或改了名，'
