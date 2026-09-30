@@ -9,10 +9,16 @@
 # ============================================================
 
 # ============================================================
-# ⓪ 推荐训练参数（与 run.py 内置配置一致）
+# ⓪ 推荐训练参数（P4.2 之后：v21 视角）
 # ============================================================
-# 下表是"当前推荐"，与 run.py 的 default_argv 保持一致（run.py 是代码入口，
-# 以它为准）。下方 ②③④ 的方案 A/B/C 是不同硬件配置的变体，不是推荐值。
+# 下表是"当前推荐"。⚠ 与 run.py 的 default_argv **已经不一致**：run.py 那份还是
+# 旧代默认（batch 4096 / lr 0.00256 / --value-res-blocks 11 /
+# --compile-mode reduce-overhead），照抄会踩两个坑 ——
+#   1) reduce-overhead 正是方案 B 点名的 OOM 元凶；
+#   2) 结构旗自 D1 起已归档（见【3】），传什么都不会改变建出来的网络。
+# 本节的 batch/lr 以**下方方案 B 的实测值**为准（tests/test_run_txt_sync.py
+# 钉住：⓪ 声明的 batch/lr 必须等于方案 B 命令，且满足 2500/0.00356 的平方根
+# 缩放律）。下方 ②③④ 的方案 A/B/C 是不同硬件配置的变体，不是推荐值。
 #
 # 【硬件前提，务必先看】
 #   · 910A 无 BF16  → NPU 一律 FP16 + GradScaler（代码已自动处理，勿手改）
@@ -20,33 +26,80 @@
 #   · NPU 注意力走手写 math（sdpa_force_math=True），CANN 的 Flash 后端不稳
 #   · NPU 的 pin_memory 关闭 → 双缓冲 H2D 只在 CUDA 生效
 #
-# 【SFT 推荐（单卡 A100 40G，BF16 + flash-attn）= 下方方案 B】
-#   以下即 A100 40G 上实测可跑的配置（--batch-size 3500 实测通过）：
+# 【SFT 推荐】—— P4.2 起训练出来的一定是 **v21**：17 通道 / 16 块 @184ch /
+#   主干 6,558,696、全网 9,067,443 参数（= scripts/search_arch.py 的
+#   ANCHOR_V21）。形状写死在 src/networks/alphanet.py 的 **V21_CFG**，
+#   **没有 --arch v21 这种开关**（D1：不新增 CLI、无分支选择器），
+#   由 tests/test_v21_budget.py 逐段钉住。
+#
+#   · 4×910A（NPU）推荐入口 = 现成脚本（P4.10）：
+#       python run.py --sh shell/train_sft_npu_4card_v21.sh
+#     脚本内 BATCH=3000（×4 卡 = 有效 12000）、LR=0.00780
+#     （= 0.00356×√(12000/2500)，同一套平方根缩放律）、
+#     OUT=models/sft_19x19_v21_npu4.pth。⚠ 3000 是**推理档不是实测值**
+#     （脚本里写了推导，以及「先过 C11 显存投影 + 50 步 smoke」的前置要求）。
+#
+#   · 单卡 A100 40G（BF16 + flash-attn）= 下方方案 B，以下即实测可跑的配置
+#     （--batch-size 3500 实测通过）：
 #   --batch-size 3500          与 --lr 0.00421 配套（由 2500/0.00356 按平方根
 #                              缩放律换算：0.00356×√(3500/2500)=0.00421）。
 #                              显存不足再降 batch 时须同步降 lr，或用
 #                              --gradient-accumulation-steps 补回等效 batch
 #   --lr 0.00421               勿单独改 batch 或 lr
-#   --value-res-blocks 8       ⚠ ValueNetwork 的 ResBlock **不受
-#                              --use-checkpoint 保护**，是最大一块常驻激活，
-#                              11→8 是降显存的关键之一
 #   --compile 1（不加 --compile-mode）  默认 default 模式。**不要**用
 #                              reduce-overhead：它走 CUDA Graphs，会维持一个
 #                              不归还的私有内存池，临界 batch 下直接 OOM
-#   --attn-mode window_global --attn-window 7
-#   ⚠ 降显存不要动 --attn-window（要往**大**调，详见方案 B 的说明）
-#   --use-amp 1 --use-ema 1 --use-checkpoint 1 --flash-attn 1
+#                              （⚠ run.py 的 default_argv 仍带着
+#                               --compile-mode reduce-overhead，是旧代残留，
+#                               照抄会 OOM）
+#   --use-amp 1 --use-ema 1 --flash-attn 1         混合精度 / EMA / A100 FA 后端
+#   --attention-dropout 0.1 --label-smoothing 0.1   行为参数，仍生效
 #   --prefetch-workers 32 --prefetch-depth 32    数据预取
 #   --eval-every 2000 --save-every 500           省时间与磁盘
 #   --swanlab-every 10         SwanLab 上报频率与 --log-every 解耦：stdout 仍
 #                              每 50 步一行（不刷屏），曲线每 10 步一个点。
 #                              默认 0 = 跟随 --log-every（旧行为）
+#
+#   **已归档（D1：保留定义、不参与建网，传了也不生效）**，完整口径见【3】：
+#     --arch / --backbone-channels / --backbone-res-blocks / --res-blocks /
+#     --convnext-blocks / --attn-blocks / --value-channels / --value-res-blocks /
+#     --policy-channels / --policy-layers / --attention-mode /
+#     --num-attention-layers / --num-heads / --attn-mode / --attn-window /
+#     --use-checkpoint。
+#     · 旧命令原样可跑（这正是保留它们的理由），但**别拿这组数字推算 v21 的
+#       形状、显存或参数量** —— 那是 ANCHOR_V21 / V21_CFG 的事。
+#     · --value-res-blocks 11→8 曾是旧代 value head 最大的一块常驻激活
+#       （ResBlock 不受 --use-checkpoint 保护）；v21 是 FCValueHead、无 ResBlock，
+#       这条只解释历史 run。
+#     · --use-checkpoint 已归档：v21 的检查点开关 = V21_CFG['grad_checkpoint']=1
+#       ∧ 未开 --compile/--npu-graph-compile（互斥时让图编译赢并打 warning）。
+#     · --attn-window 的老经验（要往**大**调、ws 越小反而越差）只对旧代
+#       window_global 成立，v21 已归档该旗。
+#     ⚠ 训练日志里那行 `注意力: mode=... attn_mode=... window=... heads=...`、
+#       以及 SwanLab config 的 backbone_channels / res_blocks 等键，打的是
+#       **归档参数的原值**，不是 v21 的实际形状；v21 真值看日志里
+#       `[model] v21 (V21_CFG) 参数量=9.07M` 那一行。
+#
+#   ⚠ 上面的 batch/lr/显存结论都是**旧代**（12 通道 / 192ch / 11 块）在
+#     A100/910A 上量的；v21 尚未在 910A/A100 实测（P5 阻塞）。换硬件前按
+#     ⓪ 末尾的显存结论重新标定，并先跑 50 步 smoke 看显存 —— 注意
+#     tests/test_run_py_sh.py 的显存预算目前只按旧 shell 的结构旗算
+#     （v21 分支尚未接入），那个绿灯对 v21 还不算数。
+#   ⚠ --model / --resume 传 12 通道旧权重会 strict load 直接报错（见【3】）；
+#     新训把 --out 换成 v21 新名（如 models/sft_19x19_v21_npu4.pth），
+#     别覆盖旧代 checkpoint。
 #   注意：方案 A（4 卡 NPU）与方案 C（4 卡 A100）仍是早期 batch 较大的旧配置，
 #         换硬件前请按 ⓪ 节的显存结论重新标定。
 #
-# 【RL 推荐（1 卡 910A 训练 + 8 进程 CPU 搜索）】
+# 【RL 推荐（**1 卡 910A** 训练 + 8 进程 CPU 搜索）】—— 完整命令见 ③ 节
+#   ⚠ 硬件分工别搞混：SFT 是 4 卡 910A（方案 A），RL 是**单卡** 910A + 8 进程
+#     CPU 搜索；下面的 --batch-size 256 是**单卡**甜点，不是 SFT 的 2800。
 #   标注 [默认] 的即代码默认值，不传也是这个值；标注 [刻意下调] 的需要显式传，
 #   是为 19 路 + 8 进程 CPU 预算主动压低的（改了会显著变慢）。
+#   ⚠ 输入通道跟着 --model 的权重走（GoAI 双代加载）：12 通道权重 → 旧代网络、
+#     17 通道 v21 权重 → v21；**不传 --model 的全新起手仍是 12 通道旧代**
+#     （selfplay_train 的 fresh 默认）。要让 RL 接着 v21 继续训，就用 --model
+#     传 v21 的 SFT 权重（如 models/sft_19x19_v21_npu4.pth）。
 #   --td 1 [默认]                TD C+E 价值标签；--td 0 为旧 tanh 基线
 #   --batch-size 256 [默认]      NPU 甜点（显存约 2-3x 旧 64）
 #   --mcts-vector-backup 1 [默认] 回传 numpy 批量（数值等价原实现）
@@ -125,32 +178,64 @@ python -c "import numpy as np; d=np.load('data/sgf_19x19_full.npz'); print('game
 #     ⇒ **跨新旧 run 的 loss / policy_loss 曲线不可直接比**；
 #     top1 是纯 argmax 准确率（evaluate_top1 :459-502），不受损失口径影响。
 #
-# 【3】输入通道与两代 checkpoint（P4.3 / P4.8 / P4.13）
+# 【3】输入通道与两代 checkpoint（P4.3 / P4.8 / P4.13 / **P4.2**）
 #   · GoBoard.feature_planes 默认返回 **17** 通道（go_rules.py:2406），批量版同为
 #     17（:2534-2535）；n_channels 取 12..17 的**前缀**（_check_n_channels
 #     :269-280）。权威通道表 = go_rules.py:2353-2404：0-11 含义与下标不变，
 #     12-16 是新增五格（眼位×2、气==2 的块掩码×2、劫禁点掩码）；
 #     通道 8 = 合法点掩码（空点 ∧ 非自杀 ∧ 非 PSK 重复，**不含 PASS**）。
-#   · 训练侧目前仍是 12 通道：train_sft.py:1950-1951 按 in_channels=12 建网、
-#     SupervisedDataset 默认 n_channels=12（dataset.py:30）。实测
-#     models/sft_19x19_v12.pth 的 backbone.conv1.weight = (192, 12, 3, 3)。
+#   · **训练侧自 P4.2 起建 v21 = 17 通道**：train_sft 的建网改走 build_v21_net，
+#     结构写死在 src/networks/alphanet.py 的 **V21_CFG**（in_channels=17、184 宽、
+#     8 Res + 4 Mamba-2 + 2 Transformer + 2 CrossAttn + 1×1 out，主干
+#     6,558,696 / 全网 9,067,443，与 search_arch 的 ANCHOR_V21 逐键对账，由
+#     tests/test_v21_budget.py 钉住）；数据侧两处 SupervisedDataset 同步传
+#     n_channels=V21_CFG['in_channels']（dataset 的**默认仍为 12**——那是给旧权重
+#     回归留的，只改一侧 = 第一个 batch 就形状错）。
+#   · **旧结构旗全部归档（D1）**：--arch / --backbone-channels / --res-blocks /
+#     --policy-layers / --attention-mode … **保留定义但不参与构造**（旧 shell 的
+#     命令行一个字都不用改，建出来的却一定是 V21_CFG 那张网）；--use-checkpoint
+#     同样归档 —— v21 的检查点开关 = V21_CFG['grad_checkpoint']=1（用户裁决必开）
+#     ∧ 未开 --compile/--npu-graph-compile（两者互斥时关检查点并打 warning）。
+#     ⚠ 12 通道旧权重**不能再**当 --model / --resume 载入：strict load 不匹配即报错。
+#   · 实测 models/sft_19x19_v12.pth 的 backbone.conv1.weight = (192, 12, 3, 3)
+#     —— 那是旧代权重，仍在 eval/推理侧**正常可用**（GoAI 双代加载，见下）。
 #   · **同为 12 通道，取值已经变过两处**（读旧 checkpoint / 对照旧日志必看）：
 #       1) 通道 8：P2.6 规则语义切换后取值变严（序号与含义不变）——
 #          go_rules.py:2360-2362；
 #       2) 通道 10/11 的气数：P4.3-fix 由「入射计数」改为「去重空点个数」
 #          （go_rules.py:164-177），U 形块不再多算 ⇒ 批量路径的 12 通道输出
 #          随之变化，旧权重看到的输入分布已与训练时不同。
-#   · 加载分派（src/inference.py）：从权重 stem 形状读 in_channels（:60-69）；
-#     读不到可识别 stem 键直接 raise（:194-202，**不静默回退 12**）、stem 通道
-#     越出 12..17 抛 ValueError（:407-410）；再按通道数查构建器注册表
-#     （:85-119）：**12 → AlphaGoNet**（:127，现有 checkpoint 走这条），
-#     **17 → 由路线图 P4.2 注册**，未注册前 RuntimeError 并打印接线方式
-#     （:98-105）；无 checkpoint 才用默认 12（:187）。特征端
-#     n_channels = ai.in_channels（:473），MCTS 向所挂模型要通道数、缺失即
-#     报错不回退（mcts.py:197-236）。
+#   · 加载分派（src/inference.py）：从权重 stem 形状读 in_channels
+#     （_stem_in_channels，键序 backbone.conv1 / backbone.stem / stem / conv1）；
+#     读不到可识别 stem 键直接 raise（**不静默回退 12**）、stem 通道越出 12..17
+#     抛 ValueError；再按通道数查构建器注册表（_build_for_in_channels）：
+#     **12 → AlphaGoNet**（_legacy_alpha_go_net，现有旧 checkpoint 走这条）、
+#     **17 → build_v21_net（P4.2 已注册，v21）**，构建后还会回读 stem 通道校验；
+#     其它未注册通道数 RuntimeError 并打印接线方式（谁来接、builder 签名）；
+#     无 checkpoint 才用默认 12。v21 加载时**跳过 legacy 架构推断**（16 个块会被
+#     误读成 backbone_res_blocks=16）。特征端 n_channels = ai.in_channels，
+#     MCTS 向所挂模型要通道数、缺失即报错不回退（mcts.py）；RL 采集侧
+#     （selfplay_train / async_pipeline）同样改读 ai.in_channels（P4.2 释放了
+#     那两处 n_channels=12 的钉子）。
 #
-# 方案 A: 4卡 NPU (当前环境)
+# ⚠ 读下面三条命令前先看【3】：**结构旗已归档（D1）**。--backbone-channels /
+#   --res-blocks / --arch / --use-checkpoint … 仍然解析（旧命令原样可跑），
+#   但不再参与建网 —— 训练出来的一定是 V21_CFG 的 v21（17 通道、9,067,443）。
+#   仍在生效的是超参：--batch-size / --lr / --weight-decay / --epochs / 评估与
+#   保存间隔 / --attention-dropout（行为参数）。4 卡 NPU 的 v21 推荐命令就是下面
+#   的**方案 A**；shell/train_sft_npu_4card_v21.sh（P4.10）是它的脚本化版本。
+#
+# 【硬件分工：SFT 4 卡 910A，RL 1 卡 910A + 8 进程 CPU】
+#   · SFT：torchrun --nproc_per_node=4（下面方案 A）。每卡 batch 2800 ⇒ 有效
+#     11200，lr 0.00754 = 0.00356×√(11200/2500)（同一套平方根缩放律）。
+#   · RL ：**单卡** python scripts/selfplay_train.py（③ 节有完整命令，1 卡 910A
+#     训练 + 8 进程 CPU 搜索）。SFT 的 4 卡与 RL 的 1 卡不要混用同一组参数：
+#     RL 的 --batch-size 默认 256 是**单卡**甜点。
+#
+# 方案 A: 4卡 NPU —— **SFT 推荐命令**（910A ×4）
 # 注意: --swanlab 需已登录 swanlab.cn，训练结束后云端查看图表
+# ⚠ --out 已从 v17 改成 v21 的名字：v21 是 17 通道权重，与旧 12 通道 v17 权重
+#   不能混用（strict load 会炸），别互相覆盖。
 torchrun --nproc_per_node=4 scripts/train_sft.py \
   --data data/sgf_19x19_full.npz \
   --device npu --board-size 19 \
@@ -168,9 +253,9 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
   --prefetch-workers 6 --prefetch-depth 16 \
   --log-every 50 --eval-every 500 --save-every 500 \
   --early-stop 1 --early-stop-patience 3 \
-  --out models/sft_19x19_v17.pth \
+  --out models/sft_19x19_v21_npu4.pth \
   --export-onnx 1 --use-checkpoint 1 \
-  --swanlab 1
+  --swanlab 1 --ver v21_npu4
 
 # 方案 B: 单卡 A100 40G (当前实跑配置)
 # pip install flash-attn --no-build-isolation
@@ -182,6 +267,8 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
 #     · --value-res-blocks 11 → 8
 #       ValueNetwork 的 ResBlock **不受 --use-checkpoint 保护**
 #       （backbone 有 checkpoint，value head 没有），是最大一块常驻激活。
+#       （此为**旧代** value head 的语义；D1 后 --use-checkpoint 已归档，
+#        v21 的 FCValueHead 无 ResBlock，此条只解释历史 run。）
 #     · --attn-window 5 → 7（见下）
 #
 # ⚠ 不要靠调小 --attn-window 省显存：window_global 的显存正比于
@@ -244,8 +331,13 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
 # --batch-size 1600 --gradient-accumulation-steps 2
 
 # ============================================================
-# ③ RL 自对弈训练（1卡 NPU + 8进程 CPU）
+# ③ RL 自对弈训练（**1 卡 910A** + 8 进程 CPU 搜索）
 # ============================================================
+# 硬件分工：SFT 用 4 卡 910A（方案 A），RL 用**单卡** 910A + 8 进程 CPU ——
+#   下面的 --batch-size 256 是**单卡**甜点，别照抄 SFT 的 2800。
+# ⚠ --model 指向 **v21** 权重（SFT 方案 A 的输出）：通道数跟着权重走
+#   （17 通道 → v21 / 12 通道 → 旧代，见【3】）。要接旧代 RL 就把路径换回
+#   models/sft_19x19_v17.pth（两代不能混，strict load 会炸）。
 # 注意：--td 默认 1（TD C+E 价值标签，--td 0 为旧 tanh 软化基线）；
 #       --batch-size 默认 256（NPU 甜点，显存 ~2-3x 旧 64）；
 #       --spec-prefetch 默认 1（worker 推测预评估）；
@@ -266,7 +358,7 @@ python scripts/selfplay_train.py \
   --buffer-size 500 \
   --use-rollout 1 --leaf-ab-depth 2 \
   --c-puct 2.0 --virtual-loss 8.0 \
-  --model models/sft_19x19_v17.pth \
+  --model models/sft_19x19_v21_npu4.pth \
   --out models/az_best.pth
 
 # 异步模式：生成与训练完全并行（额外 1.5-2x 提速）
@@ -278,7 +370,7 @@ python scripts/selfplay_train.py \
   --batch-cap 64 \
   --td 1 \
   --games-per-iter 20 \
-  --model models/sft_19x19_v17.pth \
+  --model models/sft_19x19_v21_npu4.pth \
   --out models/az_best.pth
 
 # ============================================================
@@ -404,13 +496,13 @@ python scripts/webui.py --port 7860 --device cpu --priors-leaf \
 # ⑤ 评估棋力
 # ============================================================
 python scripts/evaluate.py \
-  --model models/sft_19x19_v17.pth \
+  --model models/sft_19x19_v21_npu4.pth \
   --board-size 19 --device npu \
   --mode random --num-games 100 \
   --use-mcts 1 --simulations 400 --num-threads 4
 
 python scripts/eval_elo.py \
-  --model models/sft_19x19_v17.pth \
+  --model models/sft_19x19_v21_npu4.pth \
   --board-size 19 --device npu \
   --num-games 50 --simulations 400
 
