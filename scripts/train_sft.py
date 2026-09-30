@@ -119,6 +119,119 @@ def _auto_select_device():
     return f'{backend}:{idx}'
 
 
+def _dist_debug_level():
+    """当前 `TORCH_DISTRIBUTED_DEBUG` 的取值（大写；未设置返回 ''）。"""
+    return (os.environ.get('TORCH_DISTRIBUTED_DEBUG') or '').strip().upper()
+
+
+def _downgrade_npu_dist_debug(logger):
+    """NPU 后端下把 `TORCH_DISTRIBUTED_DEBUG=DETAIL` 降为 `OFF`。
+
+    为什么（NPU 专属，2026-09-30）：DETAIL 会让 FSDP1 启用「执行顺序自检」
+    （`fsdp/_exec_order_utils.py`：`_checking_order = debug_level == DETAIL`），
+    它在**每个被包裹模块的每次前向**都额外做一次 `all_gather_into_tensor` 跨 rank
+    比对参数句柄。在 HCCL 上这是纯负担：多几十次小 collective，换来一个只用于
+    「FSDP 开发者排查 all-gather 顺序」的自检。本仓库的正确性由
+    tests/test_fsdp1_conversion.py 的静态不变量 + 本文件的通信自检兜着，不依赖
+    它。
+
+    ⚠ **实测更正**：曾怀疑 DETAIL 是 4 卡 HCCL 报错的元凶（后来查到的真因是
+    上一次崩掉的进程留下 HCCP 状态，`EJ0001 ... Maybe the last training process
+    is running`）。降级仍然保留，理由只剩上面那条「纯负担 + 诊断功能」，但
+    **它不是修那个错的原因**，别再拿它当根因。
+
+    在 `init_process_group` **之前**调用：通信域与 FSDP 状态都还没建立。CUDA/
+    CPU 后端不动（inductor/nccl 上 DETAIL 的开销可接受，且它是排查 nccl hang 的
+    正统手段）。
+    """
+    if _dist_debug_level() != 'DETAIL':
+        return
+    os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'OFF'
+    try:
+        import torch.distributed as dist
+        setter = getattr(dist, 'set_debug_level', None)
+        if setter is not None:
+            setter(dist.DebugLevel.OFF)
+    except Exception as e:  # noqa: BLE001 — 老版本没有这个 setter，不该因此拦住启动
+        logger.warning("[dist] 降级 debug level 失败（忽略）：%s", e)
+    logger.info("[dist] NPU 后端：TORCH_DISTRIBUTED_DEBUG DETAIL → OFF"
+                "（FSDP1 的 exec-order 自检每次前向多一次 all_gather，"
+                "在 HCCL 上是纯负担；它只是诊断功能，不影响训练正确性）")
+
+
+def _dist_env_snapshot():
+    """通信相关环境快照（失败诊断用；全部是只读查询）。"""
+    import torch as _t
+    import torch.distributed as dist
+    bits = ['torch={}'.format(_t.__version__)]
+    try:
+        import torch_npu  # noqa: F401
+        bits.append('torch_npu={}'.format(getattr(torch_npu, '__version__', '?')))
+        bits.append('可见NPU数={}'.format(_t.npu.device_count()))
+    except Exception:  # noqa: BLE001
+        try:
+            bits.append('可见GPU数={}'.format(_t.cuda.device_count()))
+        except Exception:  # noqa: BLE001
+            bits.append('设备数=?')
+    bits.append('ASCEND_RT_VISIBLE_DEVICES={!r}'.format(
+        os.environ.get('ASCEND_RT_VISIBLE_DEVICES')))
+    bits.append('RANK={}'.format(dist.get_rank()))
+    bits.append('WORLD_SIZE={}'.format(dist.get_world_size()))
+    bits.append('LOCAL_RANK={}'.format(os.environ.get('LOCAL_RANK')))
+    bits.append('MASTER_ADDR={}:{}'.format(os.environ.get('MASTER_ADDR'),
+                                           os.environ.get('MASTER_PORT')))
+    return ' | '.join(bits)
+
+
+def _dist_preflight_check(backend, device, logger):
+    """通信域自检：立刻试**一发** all_reduce，把通信问题从「训练途中」提前到「启动时」。
+
+    为什么必需：HCCL / NCCL 的通信域是**惰性**创建的 —— `init_process_group`
+    只登记后端，真正建链发生在**第一发 collective**。不主动试一发，失败就落在
+    「第一个 batch 的前向」里，而且报成 HCCL 的通用错误
+    （`ProcessGroupHCCL.cpp:64` + `HCCL error`），真因藏在日志更前面的
+    `EJ0001 ... Maybe the last training process is running` 里 —— 2026-09-30 的
+    4 卡事故就是这样查了 20 分钟才发现是**上一次崩掉的进程留下 HCCP 状态**。
+
+    失败时抛的异常自带：环境快照 + **可执行的处置步骤**（残留进程 / 等待 /
+    逐卡复位），而不是让人去猜。
+    """
+    import torch.distributed as dist
+    rank = dist.get_rank()
+    world = dist.get_world_size()
+    expect = world * (world - 1) / 2.0
+    t = torch.ones(1, device=torch.device(device)) * float(rank)
+    try:
+        dist.all_reduce(t)
+        got = float(t.item())
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            '[dist] 通信域自检失败（backend=%s）：%s\n'
+            '  环境: %s\n'
+            '  最常见真因（2026-09-30 实测）：上一次崩掉的训练进程仍在占用设备，'
+            'HCCP 初始化被拒 —— 日志里真正的报错是\n'
+            '    EJ0001: Failed to initialize the HCCP process. Reason: '
+            'Maybe the last training process is running.\n'
+            '  处置（按顺序，别跳步）：\n'
+            '    1) ps -ef | grep -E "train_sft|torchrun" | grep -v grep   '
+            '# 找残留\n'
+            '    2) npu-smi info                                       '
+            '# Processes 表应为空\n'
+            '    3) pkill -f train_sft.py; pkill -f torchrun; sleep 30    '
+            '# HCCP 清理需要时间（报错里的 Solution 是 10s，实测 30s 更稳）\n'
+            '    4) 仍失败：npu-smi info -t reset -i <0..3> -c 0         '
+            '# 逐卡复位（确认无进程占用）'
+            % (backend, e, _dist_env_snapshot())) from e
+    if abs(got - expect) > 1e-6:
+        raise RuntimeError(
+            '[dist] 通信域自检数值不符（backend=%s）：期望 %.1f，实得 %.1f'
+            '（all_reduce 结果被污染，常见于设备被别的 rank/进程同时占用）\n'
+            '  环境: %s'
+            % (backend, expect, got, _dist_env_snapshot()))
+    logger.info("[dist] 通信域自检通过 | backend=%s world_size=%d | 环境: %s",
+                backend, world, _dist_env_snapshot())
+
+
 def _check_training_env(logger):
     """启动时检查三大加速能力并打印诊断：flash-attn 库 / torch.compile / 混合精度。
 
@@ -1988,6 +2101,10 @@ def main():
         _dist_backend = (args.device.split(':')[0]
                          if args.device not in ('auto', '') else
                          ('npu' if npu_is_available() else 'cuda'))
+        # ⚠ 必须在 init_process_group **之前**：DETAIL 会让 FSDP1 开启 exec-order
+        # 自检（每次前向多一次 all_gather），NPU 上是纯负担 → 降为 OFF。
+        if _dist_backend == 'npu':
+            _downgrade_npu_dist_debug(logger)
         if _dist_backend == 'npu':
             import torch_npu  # noqa: F401 — 注册 HCCL 后端
             dist.init_process_group('hccl')
@@ -1996,6 +2113,10 @@ def main():
             dist.init_process_group('nccl')
             torch.cuda.set_device(local_rank)
         device = f'{_dist_backend}:{local_rank}'
+        # 通信域是**惰性**创建的（上面两行只登记后端），所以主动试一发 all_reduce：
+        # 否则通信建不起来要等到第一个 batch 的前向才炸，且报成 HCCL 通用错误
+        # （真因藏在日志前面的 EJ0001 里）。见 _dist_preflight_check 的 docstring。
+        _dist_preflight_check(_dist_backend, device, logger)
         if is_main:
             logger.info("[fsdp] 初始化分布式训练 | backend=%s world_size=%d | 策略=FSDP1"
                         "（参数+梯度+优化器状态全分片）", _dist_backend, world_size)
