@@ -352,10 +352,11 @@ def test_train_epochs_source_wires_ppo_only():
     assert 'F.mse_loss' not in src, "策略侧回退成 MSE 回归"
     assert 'logq' not in src, "旧 CE 回归的 logq 残留"
     assert 'pi_t' not in src, "PPO 后 pi_t 目标已移除"
-    # value 侧保持 BCE（语义错归 P3-D），且只出现在 value 行
-    assert 'binary_cross_entropy_with_logits' in src
-    bce_lines = [l for l in src.splitlines() if 'binary_cross_entropy' in l]
-    assert len(bce_lines) == 1 and 'loss_v' in bce_lines[0]
+    # value 侧：P3-D 已把 BCE 换成 MSE + PPO value clipping（helper 实现，见
+    # test_rl_ppo_value.py）。这里锁「BCE 已彻底消失」+「loss_v 走新 helper」——
+    # 回退成 BCE 会让下面两条同时红（本文件此前锁的是反面：BCE 必须还在）。
+    assert 'binary_cross_entropy' not in src, "value 侧回退成 BCE（P3-D 已删）"
+    assert '_ppo_value_loss(' in src, "loss_v 未走 _ppo_value_loss"
 
     msrc = inspect.getsource(st.main)
     for flag in ('--ppo-clip', '--kl-coef', '--kl-target'):
@@ -511,9 +512,11 @@ def test_ratio_and_kl_anchor_behavior_logp():
 def test_buffer_columns_wired_to_right_tensors():
     """变异防线：把 logp_old 读成 z（列错位）必须变红。
 
-    做法：把网络 value head 清零 → loss_v 恒为 log2（target=1）；v_old 恒 0、
-    z 恒 1 → A 标准化后全 0 → 代理目标项恒 0。于是返回的 loss 精确等于
-    `log2 - β·mean(logp_old - logp_new[a])`，每一列的接线都参与这个数：
+    做法：把网络 value head 清零 → v_new ≡ 0、z ≡ 1、v_old ≡ 0、ε=0.2 →
+    L_v = max((0-1)², (clip(0, 0±0.2)-1)²) = max(1, 0.64) = 1.0（P3-D 的
+    MSE+clip，常数项，与 BCE 时代的 log2 无关）；z 恒 1 → A 标准化后全 0 →
+    策略代理项恒 0。于是返回的 loss 精确等于
+    `1.0 - β·mean(logp_old - logp_new[a])`，每一列的接线都参与这个数：
     logp_old 读错列 / action 读错列 / mask 读错列 → 立刻对不上。
     """
     n, board, actions = 8, 3, 5
@@ -529,7 +532,7 @@ def test_buffer_columns_wired_to_right_tensors():
                     np.ones(actions, dtype=bool)))    # 列 5: mask
     args = _args(batch_size=n, epochs=1, kl_coef=0.01, kl_target=1e6)
     ai = _make_ai(seed=3, board=board, actions=actions)
-    ai.model.v.weight.data.zero_()      # value logit ≡ 0 → BCE(0, 1) = log 2
+    ai.model.v.weight.data.zero_()      # value ≡ 0 → L_v = max(1, 0.64) = 1.0（P3-D）
     ai.model.v.bias.data.zero_()
 
     state = np.random.get_state()
@@ -549,7 +552,9 @@ def test_buffer_columns_wired_to_right_tensors():
                 policy.float().masked_fill(~mask, float('-inf')), -1)
             lp_new_a = lp_new.gather(1, actions_t.view(-1, 1)).squeeze(1)
         expect_kl = float((lp_old - lp_new_a).mean().item())
-        expect_loss = math.log(2.0) - 0.01 * expect_kl
+        # 策略项（A≡0 → 代理项恒 0）只剩 -β·KL；value 项 = 1.0（P3-D 的 MSE+clip，
+        # 见 docstring 手算）。旧公式的 log2 其实是 BCE 的 value 项，已被 1.0 取代。
+        expect_loss = 1.0 - 0.01 * expect_kl
 
         np.random.seed(3)
         loss = train_epochs(ai, buf, args, 'cpu')

@@ -6,7 +6,8 @@
      根先验混 Dirichlet 噪声 + 温度采样保证探索）
   2. 数据 8 对称增强（4 旋转 × 2 镜像，动作↔掩码同一置换）入 replay buffer
   3. PPO 更新 --epochs 轮（P3-C：裁剪代理目标 + k1 KL 惩罚 + β 自适应 + 信任域
-     提前中止，读 --ppo-clip/--kl-coef/--kl-target；value 侧仍 BCE，语义错归 P3-D），
+     提前中止；P3-D：value 侧 = MSE + PPO value clipping，ε 复用 --ppo-clip。
+     三个 P3.0 参数 --ppo-clip/--kl-coef/--kl-target 在此真正被消费），
      value 标签按手数位置做 tanh 软化（开局弱信号、终局强信号）
 
 50GB 空间约束：
@@ -757,20 +758,73 @@ def _adapt_kl_coef(beta, kl_obs, kl_target):
     return float(min(max(beta * math.exp(x), _KL_BETA_MIN), _KL_BETA_MAX))
 
 
+def _ppo_value_loss(value, z, v_old, clip_eps):
+    """P3-D value 侧：L_v = E[ max( (v_new - z)², (clip(v_new, v_old ± ε) - z)² ) ]。
+
+    路线图 P3-D：`loss_v = F.mse_loss(value, z)`（tanh∈[-1,1] 直接回归 z∈[-1,1]，
+    删 BCE 分支 → 消灭 C8 的 RL 侧语义错）＋ **PPO value clipping**，ε 复用
+    `--ppo-clip`（不新增参数，D1）、`v_old` = 行内 root_value（= buffer 第 4 列）。
+
+    参数：
+      value     (B,) 或 (B,1)  网络当前的价值 v_new（v21 的 value head 末层是
+                                  tanh，值域 [-1,1]；旧 ValueNetwork 是裸线性输出）
+      z         (B,) 或 (B,1)  n-step TD 目标 ∈ [-1,1]（compute_td_target 产出）
+      v_old     (B,) 或 (B,1)  **采集时**的 root_value = 行为策略的价值（buffer
+                                  常量、停止梯度）。它是信任域的**锚点**
+      clip_eps  --ppo-clip（与策略侧同一个 ε）
+
+    返回 (loss, stats)，stats = {'v_mse', 'v_clip_frac'}（detach 后的 float）。
+
+    三处口径选择（路线图未展开，实现固定下来并由 tests/test_rl_ppo_value.py 钉死）：
+    1. **max 是逐样本的**，之后才取 mean。批级 max(两个 mean) 会让「一个样本
+       越界」被另一个样本的正常损失平均掉，信任域就成了**软**约束；逐样本 max
+       才是 PPO 原文的悲观目标（per-sample pessimistic）。
+    2. **clip 对称**：`clip(v_new, v_old-ε, v_old+ε)`。z 与 v 都落在 [-1,1]，
+       价值头在 v21 是 tanh 有界的，ε=0.2 ≈ 值域的 20% —— 这个宽度偏大，
+       报告里标为规格歧义（路线图没给 value 侧单独的 ε），暂按文档契约复用。
+    3. **v_new 绝不回流进优势**：A = standardize(z - v_old) 只依赖采集期的
+       （z, v_old）这一对，裁剪后不重算 —— v_new 是「当前网络」的值，进 A 会让
+       优势与策略损失互相耦合（P3-C 的 A 公式被 34 个测试钉死，不动）。
+
+    形状/精度：内部一律 reshape(-1) 后升 fp32（与 _ppo_policy_loss 同策），故调用
+    方传 (B,1) 或 (B,) 都得到同一个数；autocast 下 value 可能是 fp16/bf16，
+    平方差与 clamp 都在 fp32 里做。
+    """
+    v_new = value.reshape(-1).float()
+    z = z.reshape(-1).float()
+    v_old = v_old.reshape(-1).float()
+    # 信任域：v_new 最多被允许偏离**行为价值** v_old ± ε
+    v_clipped = torch.clamp(v_new, v_old - clip_eps, v_old + clip_eps)
+    unclipped = (v_new - z) ** 2
+    clipped = (v_clipped - z) ** 2
+    loss = torch.maximum(unclipped, clipped).mean()
+    with torch.no_grad():
+        stats = {
+            # 未裁剪的纯 MSE：与 loss 的差值就是 clip 的「悲观加价」
+            'v_mse': float(unclipped.mean().item()),
+            # 越出信任域的样本占比（策略侧 clip_frac 的 value 版；v_mse == loss 时
+            # 说明目标都落在信任域内，clip 虽触发但没改变目标函数）
+            'v_clip_frac': float((unclipped != clipped).float().mean().item()),
+        }
+    return loss, stats
+
+
 def train_epochs(ai, buffer, args, device):
     """在 replay buffer 上训练 PPO 更新 --epochs 轮。返回平均 loss。
 
     P3-C：策略侧 = 裁剪代理目标 + k1 KL 惩罚（--ppo-clip / --kl-coef /
-    --kl-target 三个 P3.0 参数在此真正被消费）；value 侧保持现状（BCE，
-    语义错归 P3-D）。buffer 行 = 6 元组 (planes, action, logp_old, z, v_old, mask)。
+    --kl-target 三个 P3.0 参数在此真正被消费）；P3-D：value 侧 = MSE +
+    PPO value clipping（_ppo_value_loss，ε 复用 --ppo-clip，BCE 分支已删）。
+    buffer 行 = 6 元组 (planes, action, logp_old, z, v_old, mask)。
 
-    - A = z - v_old，按 minibatch 标准化（_standardize_advantage）；
+    - A = z - v_old，按 minibatch 标准化（_standardize_advantage）。v_new **不**
+      进 A：裁剪后不重算优势（价值回归与策略目标解耦）；
     - 每次 optimizer step 后：β 自适应（窗口均值 KL 朝 --kl-target 走，状态挂
       ai._kl_beta 跨迭代持续，**不**每轮从 --kl-coef 重读），再检查
       running-KL（本轮累计均值）> 2×kl-target → 打印截断日志并 break **本轮**
       剩余 minibatch（外层 epochs 继续）；
-    - 统计挂 ai._ppo_stats = {kl, clip_frac, entropy, kl_coef, early_stop, steps}
-      供 main() 写 swanlab（缺省不动任何既有键）。
+    - 统计挂 ai._ppo_stats = {kl, clip_frac, entropy, kl_coef, early_stop,
+      steps, v_mse, v_clip_frac} 供 main() 写 swanlab（既有键一个不动）。
 
     N1: 910A 无 BF16，FP16 autocast 配 GradScaler 防下溢（对齐 train_sft 的
         npu_grad_scaler）；CUDA 旧卡 FP16 同样需要。
@@ -884,8 +938,9 @@ def train_epochs(ai, buffer, args, device):
     _slot_i = 0
 
     accum_counter = 0
-    # P3-C 统计（本调用累计 → ai._ppo_stats；空 buffer 提前返回时不动旧值）
+    # P3-C/P3-D 统计（本调用累计 → ai._ppo_stats；空 buffer 提前返回时不动旧值）
     stat_kl = stat_clip = stat_ent = 0.0
+    stat_vmse = stat_vclip = 0.0
     stat_steps = 0
     early_stop_any = False
     for epoch in range(args.epochs):
@@ -956,8 +1011,8 @@ def train_epochs(ai, buffer, args, device):
                 adv = _compute_advantage(z, v_old)
                 loss_pi, ppo = _ppo_policy_loss(
                     policy, mask_t, action_t, logp_old_t, adv, ppo_clip, beta)
-                value_target = (z.squeeze(-1) + 1) / 2
-                loss_v = F.binary_cross_entropy_with_logits(value.squeeze(-1), value_target)
+                # P3-D：value 侧 = MSE + PPO value clipping（ε 复用 ppo_clip）
+                loss_v, vstat = _ppo_value_loss(value, z, v_old, ppo_clip)
                 loss_raw = loss_pi + loss_v
 
             # 梯度累积：仅 backward，累积满 accum 才 step
@@ -970,6 +1025,8 @@ def train_epochs(ai, buffer, args, device):
             stat_kl += ppo['kl']
             stat_clip += ppo['clip_frac']
             stat_ent += ppo['entropy']
+            stat_vmse += vstat['v_mse']
+            stat_vclip += vstat['v_clip_frac']
             stat_steps += 1
             epoch_kl += ppo['kl']
             epoch_kl_n += 1
@@ -1015,7 +1072,8 @@ def train_epochs(ai, buffer, args, device):
     if accum_counter > 0:
         opt.zero_grad()
 
-    # P3-C：统计挂 ai 供 main() 写 swanlab（缺省不动任何既有键）
+    # P3-C/P3-D：统计挂 ai 供 main() 写 swanlab（既有键一个不动；P3-D 的两键
+    # 目前**不**上报，见 task-p3-d-report.md 的 open item）
     ai._ppo_stats = {
         'kl': stat_kl / max(stat_steps, 1),
         'clip_frac': stat_clip / max(stat_steps, 1),
@@ -1023,6 +1081,8 @@ def train_epochs(ai, buffer, args, device):
         'kl_coef': beta,
         'early_stop': early_stop_any,
         'steps': stat_steps,
+        'v_mse': stat_vmse / max(stat_steps, 1),
+        'v_clip_frac': stat_vclip / max(stat_steps, 1),
     }
 
     # eval 时用 EMA 权重
@@ -1168,11 +1228,10 @@ def main():
                     help="启用 C2NET (OpenI 启智平台) 支持 (0=关闭, 1=开启)")
 
     # ---- PPO / KL（路线图 D13）----
-    # P3.0 **只声明不消费**：本组三个参数在损失里的精确读法、β 自适应状态挂在哪、
-    # 2×target 提前中止读哪个值，都写在
-    # .superpowers/sdd/2026-09-25-v21-roadmap/task-p3-0-report.md 的「接线契约」一节。
-    # 策略侧（PPO 裁剪代理目标 + KL 惩罚）由 P3-C 接入，value 侧（value clipping）由
-    # P3-D 接入；**在它们落地前这三个参数不改变任何数值行为**。
+    # P3.0 **只声明不消费**；P3-C（策略侧：PPO 裁剪代理目标 + KL 惩罚 + β 自适应
+    # + 2×target 提前中止）与 P3-D（value 侧：MSE + PPO value clipping，ε 复用
+    # --ppo-clip）已分别接入，三者现在都在损失里真正被消费。精确读法见
+    # .superpowers/sdd/2026-09-25-v21-roadmap/task-p3-{c,d}-report.md 的公式一节。
     ap.add_argument("--ppo-clip", type=float, default=0.2,
                     help="PPO 裁剪范围 ε：r=exp(logp_new-logp_old)，代理目标 "
                          "L_pi=-min(r·A, clip(r,1-ε,1+ε)·A)。"
@@ -1466,8 +1525,8 @@ def main():
                         "td/z_std": float(z_arr.std()),
                         "td/enabled": args.td,
                     }
-                    # P3-C：策略侧统计（缺省 ai 上没有 _ppo_stats 时不加键，
-                    # 任何既有键都不动）
+                    # P3-C：策略侧统计；P3-D：value 侧两键（缺省 ai 上没有
+                    # _ppo_stats 时不加键，任何既有键都不动）
                     _ppo_stats = getattr(ai, '_ppo_stats', None)
                     if _ppo_stats:
                         swanlab_log.update({
@@ -1475,6 +1534,11 @@ def main():
                             "clip_frac": _ppo_stats["clip_frac"],
                             "entropy": _ppo_stats["entropy"],
                         })
+                        if "v_mse" in _ppo_stats:
+                            swanlab_log.update({
+                                "v_mse": _ppo_stats["v_mse"],
+                                "v_clip_frac": _ppo_stats["v_clip_frac"],
+                            })
                     swanlab.log(swanlab_log, step=it)
 
                 # 同步模式：每轮训练完成后重置 buffer（训完即清，避免旧局
