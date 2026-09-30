@@ -1386,10 +1386,19 @@ def measure(batch=1, board=BOARD, channels=CH, in_channels=IN_CH,
 
 
 def test_measurement_ordering_is_stable():
-    """非空转：真实尺寸（B=1 / 19 路 / 184 通道）下 Mamba 段的激活远大于 ResBlock 段。
+    """非空转：真实尺寸（B=1 / 19 路 / 184 通道）下各段的激活量同一量级。
 
-    这是报告 §5 用来**反驳**「ResBlocks 占 74% 参数 ⇒ 必须开」那条推理的数据：
-    参数量与激活量在 v21 里几乎不相关。
+    ⚠ 2026-09-30 改判：这条断言**原来**是「Mamba 段省下的激活 > 5× ResBlock
+    段」，用来反驳「ResBlocks 占 74% 参数 ⇒ 必须开」。块内检查点（`_scan_chunk`
+    走 `checkpoint`，4 卡 OOM 的第二个原因）落地后，那个前提**不再成立**：
+    Mamba 的 `u`/`M`/`h` 不再随段级开关被留住，Mamba 与 ResBlock 的保留量掉到
+    同一量级（实测 B=1：res 28.79 / mamba 19.04 / trans 19.54 MB）。
+
+    换成钉住两条**当前真实**的不变量：
+      1. 三段的节省都为正（段级检查点仍然有效、仍然值得开）；
+      2. 全开 < 3 段全开 < 全关（单调），且 cross_attn_res 纳入后继续下降。
+    「Mamba 段特别吃激活」这条经验现在只对**未做块内检查点**的实现成立，
+    由 `tests/test_mamba_drive_memory.py` 单独钉住。
     """
     rows = measure(batch=1, board=BOARD, channels=CH, in_channels=IN_CH,
                    do_timing=False, do_mem=False)
@@ -1397,10 +1406,10 @@ def test_measurement_ordering_is_stable():
     base = by['off/all']['saved_mb']
     saved = {k: round(base - by['on/' + k]['saved_mb'], 2)
              for k in ('res', 'mamba', 'trans')}
-    assert saved['mamba'] > 5 * saved['res'], \
-        'Mamba 段省下的激活没有远超 ResBlock 段：%s（比例 %.1f×）' \
-        % (saved, saved['mamba'] / max(saved['res'], 1e-9))
-    assert min(saved.values()) > 0, saved
+    assert min(saved.values()) > 0, \
+        '有段开了检查点却没有省下激活：%s' % saved
+    assert max(saved.values()) < 3 * min(saved.values()), \
+        '各段保留量应当同一量级（块内检查点后 Mamba 不再是异类）：%s' % saved
     assert by['on/3seg']['saved_mb'] < by['off/all']['saved_mb'], \
         '三段全开必须比全关省激活'
     # 2026-09-30「全用GC」后 cross_attn_res 也在内。`saved_mb` 是前向驻留的

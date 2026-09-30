@@ -1048,6 +1048,24 @@ class _BatchPrefetcher:
     """
 
     def __init__(self, dataset, num_workers=4, prefetch=2, seed=1234):
+        # ⚠ 护栏：**绝不能在设备运行时初始化之后**构造本类（4 卡 910A 的 OOM
+        # 直接原因，2026-09-30）。`mp.Process` 默认 fork，子进程会整份继承父
+        # 进程的 CANN/CUDA 上下文与已分配显存映射 ⇒ 每卡被旁挂 4 份 ≈ 24 GiB，
+        # 而 PyTorch 自己只记 6.3 GB（实测 HBM 94% / AICore 0%）。GC 管不到
+        # 别的进程继承来的映射。正确做法见 main()：数据集加载与本类的构造都在
+        # `init_process_group` / `set_device` **之前**。
+        for _dev in ('npu', 'cuda'):
+            _is_init = getattr(getattr(torch, _dev, None), 'is_initialized', None)
+            try:
+                _already = bool(_is_init()) if _is_init is not None else False
+            except Exception:  # noqa: BLE001 — 拿不到就当作没初始化，不拦
+                _already = False
+            if _already:
+                raise RuntimeError(
+                    '_BatchPrefetcher 不能在 torch.{0} 初始化之后构造：'
+                    'fork 出的 worker 会继承设备上下文，4 卡实测每卡凭空多占 '
+                    '~24 GiB（OOM）。请把它挪到 init_process_group / '
+                    'set_device 之前。'.format(_dev))
         self.dataset = dataset
         self.k = max(1, int(num_workers))
         self.prefetch = max(1, int(prefetch))
@@ -2094,6 +2112,24 @@ def main():
                     bool(use_swanlab), swanlab_logger is not None,
                     _se_eff, args.swanlab_every, args.log_every)
 
+    # ---- 数据集 + 预取 worker：**必须在设备初始化之前**（2026-09-30）----
+    # 顺序是硬要求，不是风格问题：本段的 `mp.Process` 默认 fork，若排在
+    # `init_process_group` / `torch.npu.set_device` 之后，4 个 worker 会各自
+    # 继承一份父进程的 CANN 设备上下文与显存映射 ⇒ 每卡 6.3 GB 的训练被旁挂到
+    # 4×6 GB，实测 HBM 94% 而 AICore 0%，紧接着就是 OOM。数据集加载是纯
+    # numpy（与 rank 无关），提前无语义影响；反向顺序（dist 初始化后再 fork）
+    # 才是 HCCL 的危险方向，提前 fork 是安全的那一侧。
+    dataset = load_from_path(args.data, args.board_size, args.max_games_per_tgz)
+    pf = None
+    if args.prefetch_workers > 1:
+        pf = _BatchPrefetcher(dataset, num_workers=args.prefetch_workers,
+                              prefetch=args.prefetch_depth)
+        logger.info("[data] 预取器已启用（在设备初始化之前 fork）| workers=%d depth=%d",
+                    args.prefetch_workers, args.prefetch_depth)
+    else:
+        logger.info("[data] 预取器已关闭（--prefetch-workers=%d ≤ 1）",
+                    args.prefetch_workers)
+
     # ---- 分布式训练：设备由 LOCAL_RANK 决定，忽略 --device 卡号 ----
     # 后端选择：NPU 走 hccl，CUDA 走 nccl。多卡前必须 init_process_group，
     # 否则后续 .to(device) / FSDP 包裹会失败或各卡不互通。
@@ -2260,7 +2296,6 @@ def main():
     logger.info("启动训练 | torch=%s | device=%s | amp_dtype=%s scaler=%s channels_last=%s",
                 torch.__version__, device, amp_dtype, use_scaler, use_channels_last)
 
-    dataset = load_from_path(args.data, args.board_size, args.max_games_per_tgz)
     n = len(dataset)
     # 按棋局分割 train/eval（避免同一棋局的相邻位置同时出现在 train 和 eval）
     if dataset.game_ids is not None:
@@ -2583,14 +2618,11 @@ def main():
         logger.info("[train] 开始训练 | steps/epoch=%d | 总 steps≈%d | warmup=%d",
                     n_batches, total_steps, warmup_steps)
 
-    # 数据预取器：后台多线程并行造特征，与 GPU 前向/反向重叠（workers<=1 时关闭）
-    pf = None
-    if args.prefetch_workers > 1:
-        pf = _BatchPrefetcher(dataset, num_workers=args.prefetch_workers,
-                              prefetch=args.prefetch_depth)
-        if is_main:
-            logger.info("[data] 预取器已启用 | workers=%d depth=%d",
-                        args.prefetch_workers, args.prefetch_depth)
+    # 预取器 pf 已在**设备初始化之前**构造（见上方「数据集 + 预取 worker」段：
+    # fork 晚于 set_device 会让每个 worker 继承 CANN 上下文，4 卡实测每卡凭空
+    # 多占 ~24 GiB ⇒ OOM）。此处刻意不再构造，避免顺序被无意改回去。
+    assert (pf is not None) == (args.prefetch_workers > 1), \
+        '预取器构造与 workers 设置不一致：构造顺序被改动了？'
 
     for epoch in range(start_epoch, args.epochs):
         # DDP：每卡取本 rank 的不相交分片；set_epoch 让每 epoch 重新洗牌

@@ -1378,6 +1378,51 @@ class MHSA(MultiHeadSelfAttention):
         return out
 
 
+def _scan_chunk(sigma, dt_k, xc_k, bv_k, u_k, cv_k, h_in, use_ckpt):
+    """分块 SSD 的**块内一步**：返回 `(y, h_last)`。
+
+    参数二选一：
+      - 因子形式：给 `dt_k`/`xc_k`/`bv_k`，本函数内相乘出 `u`（省掉整条物化）；
+      - 物化形式：给 `u_k`，直接用（测试与对照路径）。
+    两者数学相同。
+
+    `use_ckpt` 为真**且**在训练/有 grad 时用 `checkpoint(use_reentrant=False)`
+    包住：块内的 `M`/`u`/`h` 于是**不留到反向**（它们是 bmm/mul 的输入，按
+    autograd 规则本来会被留住）。这是 4 卡 910A 放不下 batch 的直接原因 ——
+    不包的话一个 MambaLTI 块的反向重算要 ~39 GiB（fp16@B=2000），详见
+    `MambaLTI._chunked_scan` 的 docstring。
+    """
+    B, Hh, P, l = sigma.shape
+
+    def _body(sigma, dt_k, xc_k, bv_k, u_k, cv_k, h_in):
+        # dt_k is None ⇒ 物化形态（N 取自 u_k）；否则因子形态（N 取自 bv_k）
+        N = (u_k if dt_k is None else bv_k).shape[-1]
+        if dt_k is None:
+            u = u_k
+        else:
+            u = (dt_k.unsqueeze(-1) * xc_k.unsqueeze(-1)
+                 * bv_k[:, :, None, None, :])
+        u = u.permute(0, 2, 3, 1, 4)                     # (B,H,P,l,N)
+        # 块内衰减乘积矩阵 M[i,j] = exp(σ_i − σ_j)·1[j≤i]。
+        # ⚠ 上三角必须在 **exp 之前** 屏蔽：i<j 时 σ_i − σ_j ≥ 0，exp 会溢出。
+        lower = torch.ones(l, l, dtype=torch.bool, device=sigma.device).tril()
+        dd = sigma.unsqueeze(-1) - sigma.unsqueeze(-2)  # (B,H,P,l,l) = σ_i − σ_j
+        M = dd.masked_fill(~lower, float('-inf')).exp()  # exp(−inf) = 0
+        nb = B * Hh * P                                   # 批量矩阵乘的批数 = B·C
+        h = torch.bmm(M.reshape(nb, l, l),
+                      u.reshape(nb, l, N)).reshape(B, Hh, P, l, N)
+        h = h + torch.exp(sigma).unsqueeze(-1) * h_in   # 块间状态传递
+        y = (h.permute(0, 3, 1, 2, 4)
+             * cv_k.unsqueeze(-2).unsqueeze(-2)).sum(-1)          # 读出
+        return y, h[..., -1:, :]                        # 块末状态 = 下一块的 h_in
+
+    if use_ckpt and torch.is_grad_enabled():
+        return torch.utils.checkpoint.checkpoint(
+            _body, sigma, dt_k, xc_k, bv_k, u_k, cv_k, h_in,
+            use_reentrant=False)
+    return _body(sigma, dt_k, xc_k, bv_k, u_k, cv_k, h_in)
+
+
 class MambaLTI(nn.Module):
     """Mamba-2 风格的**线性时序（LTI）**块：dt 步长的因果累积递推（C=184, expand=2,
     d_conv=4, d_state N=64, ddt_rank=4, **逐 head 标量衰减** H=4 × head_dim=46），
@@ -1498,6 +1543,11 @@ class MambaLTI(nn.Module):
         #   把它删了：分块 SSD 是唯一实现，运行时没有第二条路可切。`chunk_size` 是
         #   分块自己的块长，不是分派开关。
         self.chunk_size = int(chunk_size)       # 32（单一路径实测，见 MAMBA_CHUNK_SIZE）
+        # 扫描「块内一步」是否用检查点（2026-09-30，4 卡 OOM 的第二个原因）。
+        # 见 `_scan_chunk` 的 docstring：关掉它，一个 Mamba 块的反向重算要
+        # ~39 GiB（fp16@B=2000），任何 batch 都放不下。默认跟随 `self.training`
+        # 与 grad 是否开启（推理路径恒为 False ⇒ 零开销、逐位不变）。
+        self.scan_checkpoint = True
         self.dt_project_rank = ddt_rank + 2 * d_state   # 132 = x_proj 输出维
 
         self.norm = LayerNorm2d(channels)                                   # 368
@@ -1580,6 +1630,11 @@ class MambaLTI(nn.Module):
         `allclose(rtol=1e-10, atol=1e-12)` 断言而不是 `equal`。
         """
         B, T, Hh, P = log_decay.shape
+        if isinstance(drive, tuple):
+            # 因子形式（与 `_chunked_scan` 同一契约）：本方法是**测试对照 oracle**，
+            # 不参与训练路径的显存预算，直接整条物化即可。
+            _dt, _xc, _bv = drive
+            drive = _dt.unsqueeze(-1) * _xc.unsqueeze(-1) * _bv[:, :, None, None, :]
         N = drive.shape[-1]
         state = drive.new_zeros(B, Hh, P, N)
         out = []
@@ -1624,12 +1679,37 @@ class MambaLTI(nn.Module):
         bit 相同：float64 下 max|Δ| = 2.2e-16 ~ 4.4e-16，float32 下 2.384e-7
         绝对 / ≤6.0e-8 相对 ≈ 0.5 fp32 eps，**与 L 无关**），由
         `test_ssm_chunked_scan_matches_sequential` 在 15 组 (T, L) 上钉住。
+
+        ★ 块内一步走检查点（2026-09-30，4 卡 910A OOM 的第二个原因）
+        ------------------------------------------------------------
+        「逐块物化」只降**前向瞬时峰值**，不降**反向要重取/仍活着的量**：每个块
+        的 `u`(B,H,P,l,N)、`M`(B,H,P,l,l)、`h`(B,H,P,l,N) 都是 bmm/mul 的
+        输入，被 autograd 留住直到反向。fp16@B=2000 实测（ckpt=OFF 口径）：
+
+            (736,32,64)  ×44   1.44 GiB/块  ← u
+            (4,32,4,46,64)×44  1.44 GiB/块  ← h
+            (4,4,46,32,32)×44  0.72 GiB/块  ← M
+            ⇒ 一个 MambaLTI 块 = 11 块 × 3.6 GiB ≈ **39 GiB**
+
+        加上前向留下的 8.78 GiB 就超了 32 GiB 卡 ⇒ 云端实测
+        `20.13 GiB already allocated` + `Tried to allocate 2.81 GiB`
+        （2.81 GiB ≈ 又一个块的 u）。所以这里把**块内一步**整体交给
+        `_scan_chunk` 并用 `checkpoint(..., use_reentrant=False)` 包住：每块只留
+        y（(B,l,H,P)，~50 MB）与块末状态，`u`/`M`/`h` 在反向逐块重算 ⇒
+        每块保留量降到 ~1/40。
+
+        代价：反向多一遍块内计算（Mamba 反向的 flops 约 ×1.4）。这是明确接受的
+        交换 —— 吞吐换 batch，而 batch 才是这里真正的瓶颈。推理路径
+        （`not self.training` 或无 grad）**完全不走检查点**，逐位不变、零开销。
+        两条路径（因子 / 物化）共用 `_scan_chunk`，数学完全相同。
         """
         L = int(self.chunk_size if chunk_size is None else chunk_size)
         if L < 1:
             raise ValueError('chunk_size 必须 ≥ 1，收到 {}'.format(L))
         B, T, Hh, P = log_decay.shape
-        N = drive.shape[-1]
+        # N（状态维）：物化形式取 drive 的最后一维；因子形式 `(dt, xc, b_vec)`
+        # 取 b_vec 的最后一维（两者恒等 —— drive = dt ⊗ xc ⊗ b_vec）。
+        N = (drive[2] if isinstance(drive, tuple) else drive).shape[-1]
         # S：全序列的对数衰减累积。ℓ ≤ 0 ⇒ S 单调不增且 ≤ 0 ⇒ 后续所有
         # exp(·) 的指数都 ≤ 0，不会溢出（下溢到 0 是**正确**行为）。
         S = torch.cumsum(log_decay, dim=1)                     # (B,T,H,P)
@@ -1640,20 +1720,27 @@ class MambaLTI(nn.Module):
         for k0 in range(0, T, L):
             sl = slice(k0, min(k0 + L, T))
             sigma = (S[:, sl] - S_prev).permute(0, 2, 3, 1)   # (B,H,P,l) 局部累积
-            l = sigma.shape[-1]
-            # 块内衰减乘积矩阵 M[i,j] = exp(σ_i − σ_j)·1[j≤i]。
-            # ⚠ 上三角必须在 **exp 之前** 屏蔽：i<j 时 σ_i − σ_j ≥ 0，exp 会溢出。
-            lower = torch.ones(l, l, dtype=torch.bool, device=sigma.device).tril()
-            dd = sigma.unsqueeze(-1) - sigma.unsqueeze(-2)    # (B,H,P,l,l) = σ_i − σ_j
-            M = dd.masked_fill(~lower, float('-inf')).exp()    # exp(−inf) = 0
-            u = drive[:, sl].permute(0, 2, 3, 1, 4)            # (B,H,P,l,N)
-            h = torch.bmm(M.reshape(nb, l, l),
-                          u.reshape(nb, l, N)).reshape(B, Hh, P, l, N)
-            h = h + torch.exp(sigma).unsqueeze(-1) * h_in      # 块间状态传递
-            h_in = h[..., -1:, :]                              # (B,H,P,1,N) 块末状态
-            S_prev = S[:, sl][:, -1:]                          # (B,1,H,P)
-            ys.append((h.permute(0, 3, 1, 2, 4) *
-                       cvec[:, sl].unsqueeze(-2).unsqueeze(-2)).sum(-1))   # 读出
+            # 块内这一步（`M` 的 exp、`u` 的相乘、bmm、块间传递、读出）整体
+            # 交给 `_scan_chunk` 并**用检查点包住**（2026-09-30，4 卡 OOM 的
+            # 第二个原因）：不这样做的话，逐块物化只降「前向瞬时峰值」，每个块的
+            # `u`(B,H,P,l,N) / `M`(B,H,P,l,l) / `h` 仍要**活到反向** —— fp16
+            # @B=2000 下一个 Mamba 块就是 11×(1.44+1.44+0.72) GiB ≈ 39 GiB，
+            # 任何 batch 都放不下（实测 `20.13 GiB already allocated` +
+            # `Tried to allocate 2.81 GiB`）。包上之后每块只留 y 与块末状态
+            # （各 ~50 MB），`u`/`M`/`h` 在反向时逐块重算。
+            _dt_k = _xc_k = _bv_k = None
+            _u_k = None
+            if isinstance(drive, tuple):
+                _dt, _xc, _bv = drive
+                _dt_k, _xc_k, _bv_k = _dt[:, sl], _xc[:, sl], _bv[:, sl]
+            else:
+                _u_k = drive[:, sl]
+            y, h_last = _scan_chunk(
+                sigma, _dt_k, _xc_k, _bv_k, _u_k, cvec[:, sl], h_in,
+                bool(self.scan_checkpoint) and self.training)
+            h_in = h_last                                         # (B,H,P,1,N) 块末状态
+            S_prev = S[:, sl][:, -1:]                            # (B,1,H,P)
+            ys.append(y)
         return ys[0] if len(ys) == 1 else torch.cat(ys, dim=1)
 
     def forward(self, x):
@@ -1679,12 +1766,15 @@ class MambaLTI(nn.Module):
         # 每步的对数衰减 ℓ[b,t,h,p] = dt[b,t,h,p]·A[h] —— **与状态维 n 无关**
         # （P4.1s 的逐 head 标量衰减），这正是块内 (L,L) 矩阵能跨 n 共享的原因。
         log_decay = dt.view(B, T, Hh, P) * A[None, None, :, None]        # (B,T,H,P)
-        drive = (dt.view(B, T, Hh, P).unsqueeze(-1)
-                 * xc.view(B, T, Hh, P).unsqueeze(-1)
-                 * b_vec[:, :, None, None, :])               # (B,T,H,P,N)
+        # ⚠ **不要**在这里整条物化 drive：(B,T,H,P,N) 每样本 17.0 MB
+        # （B=2000 → 31.67 GiB，4 卡 910A 实测 OOM 的**直接原因**，且梯度检查点
+        # 管不到它 —— 它是块内部临时量，重算还要再物化一次）。改为把三个因子
+        # 交给 `_chunked_scan`，由它在**块内**相乘：峰值降到 B·L·H·P·N
+        # （L = chunk_size，默认 32）≈ B × 1.5 MB。逐块与整条乘法逐位相同。
+        drive_factors = (dt.view(B, T, Hh, P), xc.view(B, T, Hh, P), b_vec)
         # 唯一的扫描实现（P4.1s-vec：运行时分派已退役，线性递推无法沿 T 并行，
         # 块内 (L,L) 矩阵乘 + ⌈T/L⌉ 步块间传递就是「向量化」本身）。
-        y = self._chunked_scan(log_decay, drive, c_vec)       # (B, T, H, P)
+        y = self._chunked_scan(log_decay, drive_factors, c_vec)  # (B, T, H, P)
         y = y.view(B, T, C)
         y = y + self.D * xc                                 # D 逐通道直通
 
