@@ -7,6 +7,7 @@
 
 只跑本文件 + `tests/test_arch_v21_blocks.py` + `tests/test_npu_graph_compile.py`。
 """
+import contextlib
 import os
 import sys
 import threading
@@ -218,6 +219,44 @@ def _fwd_calls(mod):
     return counts, handles
 
 
+@contextlib.contextmanager
+def _count_block_forwards(blocks):
+    """可靠的重算计数：**包 `type(blk).forward`**，yield {块名: 次数}。
+
+    为什么不能只靠 `register_forward_hook`（`_fwd_calls` 用的那个）：实测在
+    `torch.utils.checkpoint(use_reentrant=False)` 的**重算路径**上，模块 forward
+    hook 不触发 —— 逐块粒度下 hook 读数是「每块 1 次」（看着像没重算），而同一场景
+    下 BN 守卫进入次数（16 = 16 次重算）、包 forward 计数（8→16）、以及 fwd+bwd
+    峰值（低 8.8 倍）三件独立证据都显示重算确实发生。只有 hook 异常 ⇒
+    「证明重算发生过」这类断言一律改用本计数器；`_fwd_calls` 保留给不依赖重算的
+    用途（如「谁被调用过」）。
+    """
+    counts = {}
+    patched = {}
+    # 同类多实例共享类属性 ⇒ 每个类只 patch 一次；但**计数必须按实例归属**，
+    # 否则 8 个 ResBlock 的调用会全记到第一个名字上（读数 8 而不是各 1）。
+    name_of = {id(b): '%s.%d' % (type(b).__name__, i) for i, b in enumerate(blocks)}
+    try:
+        for b in blocks:
+            cls = type(b)
+            if cls in patched:
+                continue
+            orig = cls.forward
+
+            def spy(self, *a, _o=orig, **k):
+                n = name_of.get(id(self))
+                if n is not None:
+                    counts[n] = counts.get(n, 0) + 1
+                return _o(self, *a, **k)
+
+            cls.forward = spy
+            patched[cls] = orig
+        yield counts
+    finally:
+        for cls, orig in patched.items():
+            cls.forward = orig
+
+
 def _private_bytes():
     """本进程的 private commit（字节）。取不到就返回 None。
 
@@ -407,12 +446,16 @@ def test_bn_guard_is_actually_entered_only_on_recompute():
         o.sum().backward()
     finally:
         _BatchNormStatGuard.__enter__ = orig
-    # 被检查点的段数（cross_attn_res 自 2026-09-30「全用GC」起也在内；它不含
-    # BN，守卫对它空转，但「每个被检查点的段进一次」这个口径不变）
-    n_seg = sum(1 for k in (GC_RES, GC_MAMBA, GC_TRANSFORMER, GC_CROSS_ATTN_RES)
-                if m.grad_checkpointing_for(k))
-    assert len(seen) == n_seg, \
-        '重算期间守卫进入次数应为「被检查点的段数」%d，实得 %d' % (n_seg, len(seen))
+    # 被检查点的**块**数（不是段数！）：2026-09-30 起 v21 四个 kind 都是**逐块**
+    # 粒度（= V18 旧机制，见 GC_PER_BLOCK_DEFAULT 的「粒度改判」），所以守卫
+    # 在重算期进入的次数 = 被检查点的块数。cross_attn_res 不含 BN，守卫对它空转，
+    # 但「每个被检查点的段进一次」这个口径不变。
+    slices = {GC_RES: RES_SLICE, GC_MAMBA: MAMBA_SLICE,
+              GC_TRANSFORMER: TRANS_SLICE, GC_CROSS_ATTN_RES: CROSS_SLICE}
+    n_ckpt = sum(len(m.blocks[sl]) for k, sl in slices.items()
+                 if m.grad_checkpointing_for(k))
+    assert len(seen) == n_ckpt, \
+        '重算期间守卫进入次数应为「被检查点的段数」%d，实得 %d' % (n_ckpt, len(seen))
 
 
 # ============================================================================ #
@@ -486,14 +529,10 @@ def test_dropout_mask_reproduced_under_checkpointing():
         m.set_grad_checkpointing(on)
         for p in m.parameters():
             p.grad = None
-        counts, handles = _fwd_calls(m)
-        try:
+        with _count_block_forwards(m.blocks) as counts:
             torch.manual_seed(101)
             out = m(x)
             out.sum().backward()
-        finally:
-            for h in handles:
-                h.remove()
         return out, {n: p.grad.detach().clone() for n, p in m.named_parameters()}, counts
 
     off, g_off, c_off = fwd_bwd(False)
@@ -656,13 +695,11 @@ def test_switch_owner_must_be_the_module_that_calls_run_segment():
     wrapper.train()
 
     def fwd_counts():
-        counts, handles = _fwd_calls(wrapper.backbone)
-        try:
+        # 用**包 forward**的计数器而非 hook：hook 在非重入重算路径上不触发
+        # （见 _count_block_forwards 的 docstring），而这里要的正是「有没有重算」
+        with _count_block_forwards(wrapper.backbone.blocks) as counts:
             torch.manual_seed(3)
             wrapper(x).sum().backward()
-        finally:
-            for h in handles:
-                h.remove()
         return counts
 
     def reset():
@@ -782,13 +819,9 @@ def test_each_block_type_is_covered():
     def run(kinds):
         m.set_grad_checkpointing(True, **kinds)
         _reset_bn(m)
-        counts, handles = _fwd_calls(m)
-        try:
+        with _count_block_forwards(m.blocks) as counts:
             torch.manual_seed(2)
             m(x).sum().backward()
-        finally:
-            for h in handles:
-                h.remove()
         return counts
 
     # 「未开检查点」这行必须把四个 kind **全部**显式关掉：cross_attn_res 的
@@ -803,34 +836,53 @@ def test_each_block_type_is_covered():
         names = ['%s.%d' % (type(m.blocks[i]).__name__, i)
                  for i in range(sl.start, len(m.blocks) if sl.stop is None else sl.stop)]
         for j, n in enumerate(names):
-            if kind in enabled and j < len(names) - 1:
+            # 逐块粒度（V18 旧机制）下每个块都是独立 checkpoint 段，**没有**
+            # 「段尾那块因 early_stop 而不重算」的豁免（那是段级 + uncapped_last
+            # 才有的语义）：开了就必须真的重算，没开就一次都不该跑第二次。
+            if kind in enabled:
                 assert on[n] == 2, '%s 未被检查点覆盖（前向调用 %d 次）' % (n, on[n])
             else:
                 assert on[n] == 1, '%s 不该重算，实际前向 %d 次' % (n, on[n])
         if kind in enabled:
-            assert sum(1 for n in names if on[n] >= 2) >= len(names) - 1, \
-                '%s 段几乎没有块被重算：%s' % (kind, {n: on[n] for n in names})
+            assert sum(1 for n in names if on[n] >= 2) == len(names), \
+                '%s 段并非每块都被重算：%s' % (kind, {n: on[n] for n in names})
 
 
 def test_cross_attn_res_can_be_turned_on_and_is_then_covered():
+    """cross_attn_res 段：默认已开（2026-09-30「全用GC」），仍可显式开关。
+
+    逐块粒度下两块 CrossAttnRes 都是独立 checkpoint 段 ⇒ 两块都必须重算
+    （段级 + early_stop 时只有前一块会重算，那正是本条要区分的两种语义）。
+    """
     m = _small()
     _reset_bn(m)
     x = _x(batch=1, board=5, seed=53, ch=8)
     m.train()
-    m.set_grad_checkpointing(True, cross_attn_res=True)
-    counts, handles = _fwd_calls(m)
-    try:
-        torch.manual_seed(4)
-        m(x).sum().backward()
-    finally:
-        for h in handles:
-            h.remove()
-    assert counts['CrossAttnRes.14'] == 2, counts
-    assert counts['CrossAttnRes.15'] >= 1, counts
+    for on in (True, False):
+        m.set_grad_checkpointing(True, cross_attn_res=on)
+        with _count_block_forwards(m.blocks) as counts:
+            torch.manual_seed(4)
+            m(x).sum().backward()
+        want = 2 if on else 1
+        for i in range(CROSS_SLICE.start, len(m.blocks)):
+            name = 'CrossAttnRes.%d' % i
+            assert counts[name] == want, \
+                'cross_attn_res=%s 时 %s 前向 %d 次（期望 %d）' % (
+                    on, name, counts[name], want)
 
 
-def test_grouping_is_one_segment_per_run_not_per_block():
-    """粒度 = (b)：同类型连续块合并成一段 ⇒ 只留 1 个边界激活（逐块会留 n−1 个）。"""
+def test_granularity_is_per_block_and_segment_keeps_its_advantage():
+    """粒度：**逐块**（2026-09-30 改判 = V18 旧机制），但两种粒度的差别要说准。
+
+    逐块：每块一个 checkpoint 段 ⇒ 留 n−1 个边界激活（存储多），**重算峰值按块**
+    计（省得多）。
+    段级：整段一个 checkpoint ⇒ 只留 1 个边界激活（存储少），但**重算时整段内部
+    同时活着**，峰值按段计 —— v21 的 Mamba 段 4 块，这正是 4 卡 OOM 的成因。
+
+    这里钉住「段级仍然更省**存储**」这一条（它是段级唯一剩下的优势，别在改判时
+    把它也一起否掉），重算峰值那一面由 `tmp/measure_granularity.py` 的实测负责
+    （B=32/184ch：段级 1306.6MB vs 逐块 149.0MB，耗时相同）。
+    """
     m = _small()
     _reset_bn(m)
     stem_out = F.relu(m.stem(_x(batch=2, board=5, seed=57, ch=8)))
@@ -852,6 +904,12 @@ def test_grouping_is_one_segment_per_run_not_per_block():
     assert (b_blk - b_mrg) >= (N_RES - 1) * elem * 0.5, \
         ('合并段比逐块段只省了 %d 字节，理论下限约 %d（少留 %d 个边界激活）'
          % (b_blk - b_mrg, (N_RES - 1) * elem, N_RES - 1))
+    # 改判的落点：v21 的默认粒度必须是**逐块**，否则 4 卡会 OOM
+    from src.networks.backbone import GC_PER_BLOCK_DEFAULT
+    for kind in (GC_RES, GC_MAMBA, GC_TRANSFORMER, GC_CROSS_ATTN_RES):
+        assert GC_PER_BLOCK_DEFAULT.get(kind) is True, \
+            '%s 段的默认粒度必须是逐块（V18 旧机制），实得 %r' % (
+                kind, GC_PER_BLOCK_DEFAULT.get(kind))
 
 
 def test_tap_position_is_that_blocks_output():

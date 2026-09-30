@@ -126,7 +126,35 @@ V21_GRAD_CHECKPOINT_DEFAULTS = {
 #: 并段本身是更好的显存策略，但它是一次**需要重标 k** 的行为变化，不能混在
 #: 「机制重构」里做。见 `tests/test_grad_checkpointing.py::
 #: test_legacy_granularity_is_pinned_to_checkpoint_sequential`。
-GC_PER_BLOCK_DEFAULT = {GC_LEGACY: True}
+#: 见上面那段裁决：**v21 四个 kind 逐块**（2026-09-30 实测后改判）、legacy 逐块。
+#: 段级（并段）对 v21 是错的，理由见本表下方「粒度改判」。
+GC_PER_BLOCK_DEFAULT = {
+    GC_RES: True, GC_MAMBA: True, GC_TRANSFORMER: True, GC_CROSS_ATTN_RES: True,
+    GC_LEGACY: True,
+}
+
+
+# 粒度改判（2026-09-30，用户 4×910A OOM 之后实测）
+# --------------------------------------------------------
+# 原裁决：v21 用**段级**（同类型连续块合并成一个 checkpoint 段，brief §2 的 (b)），
+# 理由是「(a) 会在每块边界留激活、(b) 只留 1 个；重算的调度开销两者相同，(b) 的
+# autograd 钩子还少 4/5」。
+#
+# 那个比较**只看了留给反向的存储，没看重算期的峰值** —— 而 OOM 是被后者打爆的：
+# 段级把整段包进**一个** `checkpoint`（`run_grad_segment` 的 `if not per_block:`
+# 分支），于是反向重算时**整段内部所有块的中间激活同时活着**，峰值按「段」计。
+# v21 最重的是 Mamba 段（4 块、d_inner=736），它的重算峰值就是 4 块之和。
+#
+# 实测（tests 同款 harness，B=32 / 19 路 / 184ch / fp32 CPU，区间峰值增量）：
+#     段级   fwd 292.9 MB   fwd+bwd 1306.6 MB   fwd+bwd 26.36 s
+#     逐块   fwd 189.9 MB   fwd+bwd  149.0 MB   fwd+bwd 26.08 s
+# 逐块在**两个峰值上都更低**（B=8 时前向驻留反而高 91.7 vs 72.5，那是 16 个段的开销
+# 还压得住的小 batch 情形），而**耗时不增**（重算总量本来就一样，只是峰值从「一段」
+# 降到「一块」）。线性外推到 fp16 NPU：段级 ≈ 20 MB/样本 ⇒ B=1000 约 20 GB
+# （32GB 卡上必 OOM，与实测一致）；逐块 ≈ 2.3 MB/样本 ⇒ B=1000 约 2.3 GB。
+#
+# 与 FSDP1 的关系：auto_wrap 本来就按块类切（每个块是一个 FSDP unit），逐块检查点
+# 与它 1:1 对齐，重算时只重新 all-gather 一个 unit —— 段级则会让重算横跨多个 unit。
 
 
 class _BatchNormStatGuard:
