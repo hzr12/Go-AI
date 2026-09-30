@@ -1317,8 +1317,13 @@ def main():
     session.mcts.rollout_lambda = args.rollout_lambda
     session.mcts.rollout_steps = args.rollout_steps
     if args.use_rollout:
+        # 通道数向**模型**要，且与搜索侧建特征同一个源：`mcts.n_channels`
+        # 直接就是 `_in_channels()`（P4.13b 起「12 通道」在本路径上不再
+        # 出现）。这里绝不写默认值：模型问不到通道数就该响亮地报错，而不是
+        # 让 rollout 悄悄按 12 通道造特征——那正是 P4.13b 拆掉的静默错配。
         session.mcts._fast_policy = __import__(
-            "src.search.light_rollout", fromlist=["FastPolicy"]).FastPolicy(args.board_size)
+            "src.search.light_rollout", fromlist=["FastPolicy"]).FastPolicy(
+                args.board_size, n_channels=session.mcts.n_channels)
 
     html_page = (HTML_PAGE
                  .replace("__SEL_HYBRID__", "selected" if args.mode == "hybrid" else "")

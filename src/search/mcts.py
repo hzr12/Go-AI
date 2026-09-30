@@ -214,6 +214,27 @@ class MCTS:
                 f"的 stem 形状推断），或给这个对象补上同契约的 in_channels 属性。")
         return int(n)
 
+    @property
+    def n_channels(self) -> int:
+        """特征平面通道数的**只读**外部视图 = `_in_channels()`（P4.8b）。
+
+        给「不在本模块内、但要按同一契约造特征」的调用方用——目前只有
+        `scripts/webui.py`：它在 `Session` 建好之后才打开 `use_rollout`，
+        那时 `MCTS.__init__` 已经过去了（`use_rollout=False` 时构造期刻意
+        不向模型要通道数，见上面 `_fast_policy` 那行注释），于是只能来问
+        这个属性。
+
+        之所以不给个**缓存的实例属性**：那会把「构造期就要问模型」变成硬性
+        要求，正是上面那条注释刻意避免的（不开 rollout 的用户不该因为模型
+        没暴露 `in_channels` 而连 MCTS 都建不出来）。
+
+        之所以让外部读它、而不是让 webui 自己去 `getattr(ai, "in_channels", 12)`：
+        抄一份就多一个可能悄悄退回 12 的地方，且丢掉「问不到就报错」的契约
+        （webui 侧只会得到一个含糊的 AttributeError）。单源 + 响亮，只有让
+        契约的主人（MCTS）回答才做得到。
+        """
+        return self._in_channels()
+
     def _planes1(self, board, my_hist, op_hist, to_play):
         """单局面特征（通道数 = 模型 `in_channels`），带 LRU + TTL 缓存。
 
