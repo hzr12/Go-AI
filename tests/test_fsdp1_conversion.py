@@ -27,9 +27,13 @@ FSDP1 相对 DDP 的三处改动，每一处都能**静默**产出错误训练�
 静态不变量，比跑一次前向更能防住未来的误改。
 """
 import ast
+import inspect
 import pathlib
 import subprocess
 import sys
+
+import pytest
+import torch
 
 SRC_PATH = pathlib.Path(__file__).resolve().parents[1] / 'scripts' / 'train_sft.py'
 SRC = SRC_PATH.read_text(encoding='utf-8')
@@ -93,16 +97,21 @@ def _kwargs_of(call):
 
 
 def test_fsdp_wrapper_uses_orig_params():
-    """`use_orig_params=True` 是硬需求（见模块 docstring 第 1 条）。"""
-    node = _func('_wrap_fsdp1')
-    calls = [c for c in ast.walk(node)
-             if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
-             and c.func.id == 'FullyShardedDataParallel']
-    assert calls, '_wrap_fsdp1 里没有调用 FullyShardedDataParallel'
-    kws = _kwargs_of(calls[0])
-    assert 'use_orig_params' in kws, 'FSDP 构造漏了 use_orig_params，默认 False 会毁掉 param 分组'
-    val = kws['use_orig_params']
-    assert isinstance(val, ast.Constant) and val.value is True, \
+    """`use_orig_params=True` 是硬需求（见模块 docstring 第 1 条）。
+
+    2026-09 起这些断言改读 `_fsdp_ctor_kwargs` 的返回 dict（构造参数的唯一
+    真相源），不再读调用点 —— 调用点是 `FSDP(model, **kwargs)`，`**` 的键在
+    AST 里不可见。
+    """
+    node = _func('_fsdp_ctor_kwargs')
+    entry = None
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Return) and isinstance(sub.value, ast.Dict):
+            for k, v in zip(sub.value.keys, sub.value.values):
+                if isinstance(k, ast.Constant) and k.value == 'use_orig_params':
+                    entry = v
+    assert entry is not None, 'FSDP 构造漏了 use_orig_params，默认 False 会毁掉 param 分组'
+    assert isinstance(entry, ast.Constant) and entry.value is True, \
         'use_orig_params 必须是 True（False 会把参数换成 FlatParameter）'
 
 
@@ -119,14 +128,13 @@ def test_fsdp_wrapper_targets_fsdp1_class():
 
 def test_fsdp_wrapper_uses_shard_grad_op():
     """训练态显存 ∝ 1/world_size 靠的是 SHARD_GRAD_OP。"""
-    node = _func('_wrap_fsdp1')
+    node = _func('_fsdp_ctor_kwargs')
     strategy = None
-    for c in ast.walk(node):
-        if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) \
-                and c.func.id == 'FullyShardedDataParallel':
-            v = _kwargs_of(c).get('sharding_strategy')
-            if v is not None:
-                strategy = ast.get_source_segment(SRC, v) or ''
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Return) and isinstance(sub.value, ast.Dict):
+            for k, v in zip(sub.value.keys, sub.value.values):
+                if isinstance(k, ast.Constant) and k.value == 'sharding_strategy':
+                    strategy = ast.get_source_segment(SRC, v) or ''
     assert strategy is not None, 'FSDP 构造缺 sharding_strategy，会退化成默认的 NO_SHARD'
     # 判 AST 属性链，不做文本匹配：函数体里有一段解释「为什么不用 SHARD_OP」的
     # 注释，纯文本搜索会把它当成「用了 SHARD_OP」而误报。
@@ -298,3 +306,281 @@ def test_train_sft_still_compiles():
     r = subprocess.run([sys.executable, '-m', 'py_compile', str(SRC_PATH)],
                        capture_output=True, text=True)
     assert r.returncode == 0, 'train_sft.py 语法错误: {}'.format(r.stderr)
+
+
+# --------------------------------------------------------------------------- #
+# 6. FSDP 调用的 kwarg 必须是**真实 API**（2026-09 云端事故）
+# --------------------------------------------------------------------------- #
+# 本文件前面的断言全是「源码里必须出现某段结构」，它们查不出**参数名拼错 /
+# 根本不属于该类**：kwarg 名字对不对，只有被调用的类自己知道。而 FSDP 包裹
+# 只在 world_size>1 时执行 → 单机单卡的本地测试永远走不到，4 卡一启动就崩：
+#
+#   File "train_sft.py", line 243, in _wrap_fsdp1
+#     mp = MixedPrecision(
+#   TypeError: __init__() got an unexpected keyword argument
+#              'cast_forward_precision'
+#
+# `cast_forward_precision` / `cast_root_forward_precision` /
+# `keep_low_precision_grads` / `cast_forward_inputs` 是
+# `FullyShardedDataParallel` 构造参数（或根本不存在），`MixedPrecision` 只收
+# `param_dtype` / `reduce_dtype` / `buffer_dtype` / `keep_low_precision_module_wrapper`。
+#
+# 下面三条断言把「kwarg 名」交给**真实安装的 torch** 去判：AST 取代码里实际
+# 传的 kwarg，对 `inspect.signature` 的参数表求差集。⚠ 本地 torch 版本可能
+# 比云端新，所以另配一条**版本无关**的白名单断言（只允许三个 dtype 参数），
+# 两条合起来才能覆盖「本地过、云端炸」的方向。
+def _call_kwargs_by_name(callee):
+    """train_sft.py 里对 `callee(...)` 的调用点：{kwarg: 字面值源码}。
+
+    ⚠ FSDP 构造的 kwargs 不走这里 —— `_wrap_fsdp1` 用
+    `FullyShardedDataParallel(model, **kwargs)` 展开，`**` 的键在 AST 里看不见。
+    那份由 `_dict_literal_keys('_fsdp_ctor_kwargs')` 从**返回的 dict 字面量**
+    里读，与运行时读的是同一份源码。
+    """
+    out = {}
+    for sub in ast.walk(TREE):
+        if not isinstance(sub, ast.Call):
+            continue
+        fn = sub.func
+        name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, 'id', None)
+        if name != callee:
+            continue
+        for kw in sub.keywords:
+            if kw.arg is None:      # **kwargs 展开，不参与静态判定
+                continue
+            out[kw.arg] = ast.get_source_segment(SRC, kw.value)
+    return out
+
+
+def _dict_literal_keys(func_name):
+    """取 `func_name` 里 return 的 dict 字面量的键名集合。"""
+    node = _func(func_name)
+    keys = None
+    for sub in ast.walk(node):
+        if not isinstance(sub, ast.Return) or not isinstance(sub.value, ast.Dict):
+            continue
+        got = {k.value for k in sub.value.keys if isinstance(k, ast.Constant)
+               and isinstance(k.value, str)}
+        assert got, '{} 的 return 不是 dict 字面量或键非字面量，无法静态判定'.format(func_name)
+        keys = got if keys is None else (keys & got)
+    assert keys, '{} 里找不到 return dict'.format(func_name)
+    return keys
+
+
+def test_mixed_precision_kwargs_are_supported_by_installed_torch():
+    from torch.distributed.fsdp import MixedPrecision
+
+    kwargs = _call_kwargs_by_name('MixedPrecision')
+    assert kwargs, 'MixedPrecision 调用点不见了（_wrap_fsdp1 应显式构造它）'
+    params = set(inspect.signature(MixedPrecision.__init__).parameters) - {'self'}
+    unknown = sorted(set(kwargs) - params)
+    assert not unknown, (
+        '这些 kwarg 不是 MixedPrecision 的参数（云端 4 卡会直接 TypeError）：'
+        '{}\n实际签名: {}'.format(unknown, sorted(params)))
+    # 真能构造出来：MixedPrecision 是纯配置对象，单机即可实例化
+    MixedPrecision(**{k: _literal(v) for k, v in kwargs.items()})
+
+
+def test_mixed_precision_only_passes_dtype_kwargs():
+    """版本无关的白名单：混合精度由 autocast 承担，FSDP 侧只允许「不设」三档。
+
+    这条比签名比对更耐版本差异：`cast_forward_precision` 这类参数即便某个
+    torch 版本碰巧加进 `MixedPrecision`，按本仓库的意图（autocast 负责精度，
+    FSDP 不做转换 —— 见 `_wrap_fsdp1` 的注释）也**不该**传。
+    """
+    kwargs = _call_kwargs_by_name('MixedPrecision')
+    allowed = {'param_dtype', 'reduce_dtype', 'buffer_dtype'}
+    assert set(kwargs) <= allowed, (
+        'MixedPrecision 只应传 {}（值取 None = FSDP 不做精度转换），实际传了 {}'
+        .format(sorted(allowed), sorted(kwargs)))
+    for k, v in kwargs.items():
+        assert v.strip() == 'None', \
+            'MixedPrecision 的 {} 应保持 None（精度交给 autocast），实际 {}'.format(k, v)
+
+
+def test_fsdp_ctor_kwargs_are_supported_by_installed_torch():
+    from torch.distributed.fsdp import FullyShardedDataParallel
+
+    kwargs = _dict_literal_keys('_fsdp_ctor_kwargs')
+    assert kwargs, '读不到 _fsdp_ctor_kwargs 的返回 dict'
+    params = set(inspect.signature(FullyShardedDataParallel.__init__).parameters) - {'self'}
+    unknown = sorted(kwargs - params)
+    assert not unknown, (
+        '这些 kwarg 不是 FullyShardedDataParallel 的参数：{}\n实际签名: {}'
+        .format(unknown, sorted(params)))
+
+
+def test_fsdp_wrapper_still_passes_the_expected_kwargs():
+    """`_wrap_fsdp1` 必须经 `**kwargs` 展开调用构造（不许散装写 kwarg）。
+
+    这是防「有人把 dict 展开改成直接写在构造调用里」——那样静态守护立刻失明
+    （`**d` 的键在 AST 里看不见），只能退回云端炸。判 AST 的 `keyword(arg=None)`
+    而不是文本搜 `**`（docstring 里出现 `**` 会造成假绿：变异实测过）。
+    """
+    node = _func('_wrap_fsdp1')
+    assert '_fsdp_ctor_kwargs' in (ast.get_source_segment(SRC, node) or ''), \
+        '_wrap_fsdp1 应通过 _fsdp_ctor_kwargs(...) 构造参数'
+    calls = [c for c in ast.walk(node)
+             if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+             and c.func.id == 'FullyShardedDataParallel']
+    assert calls, '_wrap_fsdp1 里没有 FullyShardedDataParallel 调用'
+    unpacked = [k for k in calls[-1].keywords if k.arg is None]
+    explicit = [k.arg for k in calls[-1].keywords if k.arg]
+    assert unpacked, \
+        'FSDP 构造必须以 **kwargs 展开调用（当前改成了散装 kwarg：{}），否则静态守护失明'.format(
+            explicit)
+    assert not explicit, \
+        'FSDP 构造里出现了散装 kwarg {}，参数集就多了一份真相源'.format(explicit)
+
+
+def _literal(src):
+    """把极小的字面量源码求值（只认 None/True/False/数字/字符串）。"""
+    import ast as _ast
+    return _ast.literal_eval(src.strip())
+
+
+def test_fsdp_ctor_kwargs_are_whitelisted():
+    """传进 FSDP1 构造的 kwarg 必须在白名单里，且白名单 ⊆ 已安装 torch 的签名。
+
+    为什么白名单还要再钉一层：`_wrap_fsdp1` 现在按**已安装签名**过滤未知参数
+    （开发机 torch 2.12 / 云端 2.1 两头都不保证），过滤让「云端崩」降级成
+    「功能降级 + 告警」。但过滤是**兜底**，不是许可证 —— 白名单保证我们只依赖
+    「2.0 起就存在」的那几个参数，不去碰 2.x 中途新增的 API。
+    """
+    sys.path.insert(0, str(SRC_PATH.parents[1]))
+    from scripts.train_sft import FSDP_CTOR_KWARGS_WHITELIST
+    from torch.distributed.fsdp import FullyShardedDataParallel
+
+    used = set(_dict_literal_keys('_fsdp_ctor_kwargs'))
+    assert used == set(FSDP_CTOR_KWARGS_WHITELIST), (
+        '实际传入的 kwarg {} 与白名单 {} 不一致 —— 新增参数前请先确认它在云端 '
+        'torch 2.1 上也存在'.format(sorted(used), sorted(FSDP_CTOR_KWARGS_WHITELIST)))
+    params = set(inspect.signature(FullyShardedDataParallel.__init__).parameters) - {'self'}
+    missing = sorted(set(FSDP_CTOR_KWARGS_WHITELIST) - params)
+    assert not missing, '白名单里的 {} 在当前 torch 上不存在'.format(missing)
+    # 白名单必须含两个硬需求：漏了任何一条都会静默毁掉训练语义
+    assert {'use_orig_params', 'sharding_strategy'} <= set(FSDP_CTOR_KWARGS_WHITELIST)
+
+
+def test_drop_unsupported_kwargs_filters_and_reports():
+    """`_drop_unsupported_kwargs`：不认的丢掉并报告，认得的一个不动。"""
+    sys.path.insert(0, str(SRC_PATH.parents[1]))
+    from scripts.train_sft import _drop_unsupported_kwargs
+
+    class _New(torch.nn.Linear):
+        def __init__(self, in_features, out_features, bias=True,
+                     device=None, dtype=None, new_fancy_kwarg=None):
+            super().__init__(in_features, out_features, bias=bias,
+                             device=device, dtype=dtype)
+            self.new_fancy_kwarg = new_fancy_kwarg
+
+    class _Old(torch.nn.Linear):
+        def __init__(self, in_features, out_features, bias=True,
+                     device=None, dtype=None):
+            super().__init__(in_features, out_features, bias=bias,
+                             device=device, dtype=dtype)
+
+    kwargs = {'bias': False, 'new_fancy_kwarg': 1}
+    dropped = _drop_unsupported_kwargs(_Old, kwargs, 'x', None)
+    assert kwargs == {'bias': False}, '未被识别的参数应被移出 kwargs'
+    assert dropped == ['new_fancy_kwarg'], dropped
+
+    kwargs = {'bias': False, 'new_fancy_kwarg': 1}
+    dropped = _drop_unsupported_kwargs(_New, kwargs, 'x', None)
+    assert kwargs == {'bias': False, 'new_fancy_kwarg': 1}, '认得的参数不能被丢掉'
+    assert dropped == []
+
+
+# --------------------------------------------------------------------------- #
+# 7. 真跑一次 FSDP1（world_size=1、gloo、CPU）
+# --------------------------------------------------------------------------- #
+# 前面所有断言都是 AST —— 而 2026-09 那次事故（`MixedPrecision(
+# cast_forward_precision=...)` → TypeError）之所以能一路活到云端，正是因为
+# **FSDP 包裹在本地从未被执行过**（world_size=1 不进这条分支），AST 又只查
+# 「有没有 use_orig_params」这类结构在不在，查不出参数名是不是真 API。
+#
+# 这里用 world_size=1 的 gloo 进程组把包裹真跑一遍：MixedPrecision 构造 →
+# auto_wrap → 前向/反向 → FULL_STATE_DICT 汇聚 → optimizer 状态汇聚。
+# 不起多进程（Windows 上 spawn 慢且易挂），但覆盖了「参数集被真 API 接受」
+# 「use_orig_params 下原始 param 引用仍可用」「汇聚后的键名与未包裹时一致」
+# 这三件只有执行才暴露的事。真正的多卡语义仍由云端实测负责。
+@pytest.fixture(scope='module')
+def _gloo_pg():
+    """world_size=1 的 gloo 进程组；环境不支持时 skip（不假装通过）。"""
+    import os
+    import socket
+    import torch.distributed as dist
+    if dist.is_initialized():
+        yield
+        return
+    if not (dist.is_available() and dist.is_gloo_available()):
+        pytest.skip('本机 torch 无 gloo，跳过 FSDP 执行测试')
+    sock = socket.socket()
+    sock.bind(('127.0.0.1', 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
+    os.environ['MASTER_PORT'] = str(port)
+    try:
+        dist.init_process_group(backend='gloo', rank=0, world_size=1)
+    except Exception as e:  # noqa: BLE001
+        pytest.skip('本机无法初始化 gloo 进程组（跳过 FSDP 执行测试）：{}'.format(e))
+    yield
+    dist.destroy_process_group()
+
+
+def test_fsdp1_wrap_actually_runs(_gloo_pg):
+    """FSDP1 包裹 + 前向/反向 + 完整 state_dict 汇聚，真跑一遍（1 rank）。
+
+    ⚠ 需要**非 CPU 加速器**：torch 2.12 的 FSDP1 在纯 CPU 上直接
+    `RuntimeError: FSDP needs a non-CPU accelerator device`（本仓库开发机是
+    `torch 2.12.0+cpu`，所以这里如实 skip）。有卡的环境（云端 910A / CI 的
+    CUDA 机）上这条会真跑 —— 那正是它存在的意义：AST 断言看不见「参数集被真
+    API 接受」这种事。
+    """
+    if not (torch.cuda.is_available()
+            or (hasattr(torch, 'npu') and torch.npu.is_available())):
+        pytest.skip('本机无非 CPU 加速器（torch FSDP1 硬性要求），跳过 FSDP 执行测试')
+    sys.path.insert(0, str(SRC_PATH.parents[1]))
+    import torch.nn as nn
+    from scripts.train_sft import _fsdp_ctor_kwargs, _drop_unsupported_kwargs
+    from torch.distributed.fsdp import (FullyShardedDataParallel, MixedPrecision,
+                                        ShardingStrategy)
+
+    class _Block(nn.Module):
+        def __init__(self, c):
+            super().__init__()
+            self.fc = nn.Linear(c, c)
+            self.bn = nn.BatchNorm1d(c)
+
+        def forward(self, x):
+            return self.bn(self.fc(x))
+
+    torch.manual_seed(0)
+    model = nn.Sequential(_Block(8), nn.Linear(8, 4))
+    reference_keys = set(model.state_dict())
+
+    mp = MixedPrecision(param_dtype=None, reduce_dtype=None, buffer_dtype=None)
+    kwargs = _fsdp_ctor_kwargs(model, None, mp)
+    assert not _drop_unsupported_kwargs(FullyShardedDataParallel, kwargs,
+                                        'FullyShardedDataParallel', None), \
+        '本机 torch 上就有构造参数不被支持（先修白名单/过滤器再谈云端）'
+
+    wrapped = FullyShardedDataParallel(model, **kwargs)
+    assert isinstance(wrapped, FullyShardedDataParallel)
+    assert kwargs['sharding_strategy'] == ShardingStrategy.SHARD_GRAD_OP
+
+    # use_orig_params=True 的核心承诺：optimizer 仍能用**未包裹前**的参数对象
+    params = [p for p in model.parameters()]
+    assert params, '参数引用为空'
+    opt = torch.optim.SGD(params, lr=0.1)
+    out = wrapped(torch.randn(4, 8)).sum()
+    out.backward()
+    opt.step()
+
+    from scripts.train_sft import _fsdp_full_optimizer_state, _fsdp_full_state_dict
+    full = _fsdp_full_state_dict(wrapped)
+    assert set(full) == reference_keys, \
+        '汇聚后的键名与未包裹时不一致：多 {} 少 {}'.format(
+            sorted(set(full) - reference_keys), sorted(reference_keys - set(full)))
+    assert _fsdp_full_optimizer_state(opt, wrapped) is not None

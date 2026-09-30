@@ -237,33 +237,100 @@ def _wrap_fsdp1(model, local_rank, logger):
     from torch.distributed.fsdp import CPUOffload
 
     # 混合精度策略交给 autocast 承担（`_backend` 分支已经包了
-    # `maybe_autocast`），这里 cast_forward_precision 保持 None：
-    # 打开它会让 FSDP 在 all-gather 时做一次 fp32→bf16 转换，与 autocast
-    # 叠加成两次转换，且 P4.7 的 Linear-only 编译边界会被这条插入打断。
-    mp = MixedPrecision(
-        param_dtype=None, reduce_dtype=None, buffer_dtype=None,
-        cast_forward_precision=None, cast_root_forward_precision=False,
-        keep_low_precision_grads=True, cast_forward_inputs=False)
+    # `maybe_autocast`），FSDP 侧**一个 dtype 都不设**：打开 FSDP 的 cast 会让
+    # 它在 all-gather 时做一次 fp32→fp16/bf16 转换，与 autocast 叠加成两次
+    # 转换，且 P4.7 的 Linear-only 编译边界会被这条插入打断。
+    #
+    # ⚠ 这里只允许传 `param_dtype` / `reduce_dtype` / `buffer_dtype` 三个
+    #   （都取 None）。`cast_forward_precision` / `cast_root_forward_precision` /
+    #   `keep_low_precision_grads` / `cast_forward_inputs` **不是 MixedPrecision
+    #   的参数**（前两个是 FullyShardedDataParallel 的构造参数），传进去在
+    #   torch 2.1 上直接
+    #   `TypeError: __init__() got an unexpected keyword argument
+    #   'cast_forward_precision'`，4 卡启动第一步就崩。本地 world_size=1
+    #   走不到这条路径、AST 测试又只查「有没有 use_orig_params」，于是这个错
+    #   一路活到云端才炸（2026-09）。守护见
+    #   tests/test_fsdp1_conversion.py::test_mixed_precision_*。
+    mp = MixedPrecision(param_dtype=None, reduce_dtype=None, buffer_dtype=None)
 
-    handle = FullyShardedDataParallel(
-        model,
-        auto_wrap_policy=_fsdp_wrap_policy(model),
+    # FSDP1 的构造参数在 torch 版本间**增删过**（本地开发机 torch 2.12、云端
+    # 910A torch 2.1，两头都不保证）。这里按**已安装的**签名过滤：认得的照传，
+    # 不认的丢掉并**显式打印**（不静默 —— 静默丢掉一个 kwarg 意味着你以为开了
+    # 的东西没开）。认得的全部落进 FSDP_CTOR_KWARGS_WHITELIST 白名单测试，防止
+    # 以后又写出一个「本地这版恰好有、云端那版没有」的参数。
+    _ctor_kwargs = _fsdp_ctor_kwargs(model, local_rank, mp)
+    _dropped = _drop_unsupported_kwargs(
+        FullyShardedDataParallel, _ctor_kwargs, 'FullyShardedDataParallel', logger)
+    if _dropped:
+        logger.warning("[fsdp] 当前 torch %s 的 FSDP1 构造不支持 %s，已忽略"
+                       "（功能降级，不是静默）：本仓库开发机 torch 2.12 / 云端 "
+                       "torch 2.1 两侧 API 有差异，属预期。",
+                       torch.__version__, _dropped)
+
+    handle = FullyShardedDataParallel(model, **_ctor_kwargs)
+    logger.info("[fsdp] 已包裹 FullyShardedDataParallel(FSDP1) | sharding=SHARD_GRAD_OP"
+                " | use_orig_params=True | auto_wrap=按块类切"
+                " | mixed_precision=由 autocast 承担（FSDP 侧全 None）"
+                " | 构造参数被忽略=%s", _dropped or "无")
+    return handle
+
+
+#: `_wrap_fsdp1` 允许传给 `FullyShardedDataParallel` 的 kwarg 全集。
+#: 守护见 tests/test_fsdp1_conversion.py::test_fsdp_ctor_kwargs_are_whitelisted。
+FSDP_CTOR_KWARGS_WHITELIST = frozenset({
+    'auto_wrap_policy', 'sharding_strategy', 'device_id', 'mixed_precision',
+    'use_orig_params', 'limit_all_gathers', 'forward_prefetch',
+})
+
+
+def _fsdp_ctor_kwargs(model, local_rank, mixed_precision):
+    """FSDP1 构造参数（**单一真相源**：运行与 AST 守护读的是同一份 dict）。
+
+    单独抽成函数而不是就地写在构造调用里：AST 守护要读出「实际传了哪些
+    kwarg」，就地写就只能在 `FullyShardedDataParallel(model, **d)` 这种
+    `**d` 展开处放弃静态判定（展开的 kwarg 在 AST 里看不见）。抽出来后
+    `tests/test_fsdp1_conversion.py` 既能读源码、也能直接 import 调用。
+    """
+    from torch.distributed.fsdp import ShardingStrategy
+    return {
+        'auto_wrap_policy': _fsdp_wrap_policy(model),
         # SHARD_GRAD_OP = 参数分片 + 梯度分片 + 反向后算子分片，是 FSDP1
         # 的默认策略，也是「训练态显存 ∝ 1/world_size」的那一个。
         # SHARD_OP 把前向也算子切分，激活也降，但与梯度检查点叠加后重算
         # 成本翻倍，收益不抵。
-        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
-        device_id=local_rank,
-        mixed_precision=mp,
-        # 见上文第 1 条：必须 True。
-        use_orig_params=True,
+        'sharding_strategy': ShardingStrategy.SHARD_GRAD_OP,
+        'device_id': local_rank,
+        'mixed_precision': mixed_precision,
+        # 见 `_wrap_fsdp1` docstring 第 1 条：必须 True（optimizer / EMA /
+        # scheduler 都持有**原始 param 对象**）。
+        'use_orig_params': True,
         # 缓存 all-gather 来的参数，供前向与反向复用。
-        limit_all_gathers=True,
-        forward_prefetch=False,
-    )
-    logger.info("[fsdp] 已包裹 FullyShardedDataParallel(FSDP1) | sharding=SHARD_GRAD_OP"
-                " | use_orig_params=True | auto_wrap=按块类切")
-    return handle
+        'limit_all_gathers': True,
+        'forward_prefetch': False,
+    }
+
+
+def _drop_unsupported_kwargs(cls, kwargs, label, logger):
+    """按 `cls.__init__` 的**已安装签名**过滤 kwargs，返回被丢掉的名字。
+
+    为什么要它：FSDP1 是 torch 2.0~2.12 之间参数增删最频繁的 API 之一，而本仓库
+    的开发机（CPU/torch 2.12）与云端 910A（torch 2.1）**版本不同**。硬传一个
+    云端那版没有的参数 = 4 卡启动第一步 TypeError（2026-09 真发生过一次：
+    `MixedPrecision(cast_forward_precision=...)`）。过滤 + 告警把「崩溃」降级成
+    「功能降级且日志可见」。
+
+    只丢**不认**的参数；认得的一个不丢，也不改值 —— 宁可少一个优化，也不能
+    悄悄换掉 `use_orig_params` 这种硬需求。
+    """
+    import inspect
+    try:
+        params = set(inspect.signature(cls.__init__).parameters) - {'self'}
+    except (TypeError, ValueError):  # pragma: no cover - 签名不可 introspect
+        return []
+    unknown = sorted(set(kwargs) - params)
+    for name in unknown:
+        kwargs.pop(name, None)
+    return unknown
 
 
 def _fsdp_full_state_dict(model):
