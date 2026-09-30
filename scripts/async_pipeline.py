@@ -169,9 +169,10 @@ class SelfPlayWorker(Process):
                 time.sleep(0.1)
     
     def _play_one_game(self, ai, n_actions, max_moves):
-        """运行一局自对弈。"""
+        """运行一局自对弈。行契约与 selfplay_train.self_play_game 一致（P3-C 7 元组）。"""
         from src.search.mcts import MCTS
         from src.game.go_rules import GoBoard
+        from scripts.selfplay_train import _temperature_sample
         
         mcts = MCTS(
             ai, 
@@ -212,44 +213,39 @@ class SelfPlayWorker(Process):
                 mc += 1
                 continue
             
-            visits, probs, root_value = mcts.search(
+            _visits, probs, root_value = mcts.search(
                 board, hists[0], hists[1], to_play,
                 simulations=self.args.sims,
                 path_moves=path_moves
             )
             
-            # 记录样本
+            # 记录样本（P3-C 7 元组，与 selfplay_train.self_play_game 同一契约：
+            # (planes, action, logp_old, to_play, mc, root_value, mask)，见彼处 docstring）
             # ⚠ n_channels=12：与 selfplay_train.py 同一契约（旧权重布局），
             #   v21 训练切 17 通道时这一格必须同步切。
             planes = np.ascontiguousarray(board.feature_planes_batched(
                 board.board[None], [list(hists[0])], [list(hists[1])],
                 [to_play], [board.ko_point], n_channels=12)[0])
-            
-            vt = np.zeros(n_actions)
-            vs = visits.sum()
-            if vs > 0:
-                vt[:n_actions - 1] = visits[:n_actions - 1] / vs
-                vt[n_actions - 1] = visits[n_actions - 1] / vs
-            
-            data.append((planes, vt, to_play, mc, float(root_value)))
-            
-            # 温度衰减
-            progress = min(1.0, mc / max(30, 1))
-            temp = 1.0 - progress * (1.0 - 0.1)
-            p = np.asarray(probs).reshape(-1).astype(np.float64)
-            p[-1] = max(p[-1], 0.0)
-            
-            if temp > 0 and temp != 1.0:
-                p = p ** (1.0 / temp)
-            
-            s = p.sum()
-            mv = n_actions - 1 if s <= 0 else int(np.random.choice(n_actions, p=p / s))
+            # 合法掩码必须在落子前取：n² 来自 get_legal_moves()（无 pass 槽），
+            # 拼恒合法的 pass 槽 → n²+1，与网络 logits 同宽
+            mask = np.concatenate((legal, np.array([True])))
+            # 温度衰减采样：单一真相源 _temperature_sample（两级温度后分布，
+            # logp_old 必须取它的 log-prob —— P3.0 §5.5-1）
+            mv, logp_old, p_norm = _temperature_sample(probs, mc)
             pmv = -1 if mv == n_actions - 1 else mv
             
             success = board.play(pmv)
             if not success:
                 board.play(-1)
                 pmv = -1
+            
+            # 实际走的着法才是行为策略「执行」的动作；play 拒绝回退 pass 时
+            # logp_old 跟着重算 pass 的 log-prob（动作与 logp_old 锚定同一分布）
+            action = n_actions - 1 if pmv < 0 else pmv
+            if action != mv:
+                logp_old = float(np.log(p_norm[action])) if p_norm[action] > 0 else 0.0
+            data.append((planes, int(action), logp_old, to_play, mc,
+                         float(root_value), mask))
             
             path_moves.append(pmv)
             h = hists[0] if to_play == 1 else hists[1]
@@ -367,28 +363,16 @@ class AsyncSelfPlayPipeline:
         return collected
     
     def _process_game_data(self, game_data, score, bs, n_actions):
-        """处理一局游戏数据（TD 价值标签 + 8 对称增强，与 selfplay_train 共享逻辑）。"""
-        from scripts.selfplay_train import compute_td_target, augment8
-        td = getattr(self.args, 'td', 0) == 1
-        td_steps = getattr(self.args, 'td_steps', 3)
-        td_ai = getattr(self.args, 'td_alpha_init', 0.2)
-        td_ae = getattr(self.args, 'td_alpha_end', 0.9)
-        players = np.asarray([row[2] for row in game_data])
-        root_values = np.asarray([row[4] if len(row) > 4 else 0.0
-                                  for row in game_data])
-        for mc_idx, row in enumerate(game_data):
-            planes, vt = row[0], row[1]
-            z, _z_raw, _alpha = compute_td_target(
-                players, root_values, score, mc_idx,
-                td, td_steps, td_ai, td_ae)
-            if getattr(self.args, 'no_augment', False):
-                self.buffer.append((planes, vt, z))
-            else:
-                for pl, tv in augment8(planes, vt, bs):
-                    self.buffer.append((pl, tv, z))
+        """处理一局游戏数据（P3-C：唯一实现委托 selfplay_train._process_game_data）。
+
+        行契约 7 元组 / buffer 契约 6 元组见该函数 docstring。此前这里是手抄
+        副本，会与主实现静默分叉（buffer 布局一变就 KeyError/错位）——委托共享。
+        """
+        from scripts.selfplay_train import _process_game_data as _shared_process
+        _shared_process(game_data, score, bs, n_actions, self.buffer, self.args)
     
     def get_batch(self, batch_size):
-        """获取一个训练 batch。"""
+        """获取一个训练 batch：(planes, action, z)（P3-C：pi_t 已随 PPO 移除）。"""
         if len(self.buffer) < batch_size:
             return None
         
@@ -396,10 +380,10 @@ class AsyncSelfPlayPipeline:
         batch = [self.buffer[i] for i in idx]
         
         planes = np.stack([b[0] for b in batch])
-        pi_t = np.stack([b[1] for b in batch])
-        z = np.stack([b[2] for b in batch])
+        action = np.stack([b[1] for b in batch])
+        z = np.stack([b[3] for b in batch])
         
-        return planes, pi_t, z
+        return planes, action, z
     
     def get_stats(self):
         """获取统计信息。"""

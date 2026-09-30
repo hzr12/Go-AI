@@ -42,21 +42,28 @@ def _args(**over):
     base = dict(
         batch_size=4, epochs=1, lr=1e-2, weight_decay=1e-4, value_lr_mult=0.5,
         clip_grad=1.0, use_ema=0, use_rollout=0,
+        # 本文件测的是梯度管线，不是 PPO 信任域：把 2×kl-target 提前中止的
+        # 阈值抬到不可达，保底「整轮 minibatch 都跑」的多步语义不被截断
+        kl_target=1e9,
     )
     base.update(over)
     return argparse.Namespace(**base)
 
 
 def _buffer(n=16, board=3, actions=5, seed=0):
-    """构造 n 条合法 buffer 样本 (planes, pi, z)。"""
+    """构造 n 条合法 buffer 样本（P3-C 6 元组：planes, action, logp_old, z, v_old, mask）。"""
     rng = np.random.default_rng(seed)
     out = []
     for _ in range(n):
         planes = rng.random((12, board, board), dtype=np.float32)
-        pi = rng.random(actions, dtype=np.float32)
-        pi /= pi.sum()
+        action = int(rng.integers(0, actions))
+        probs = rng.random(actions, dtype=np.float64)
+        probs /= probs.sum()
+        logp_old = float(np.log(probs[action]))
         z = np.float32(rng.uniform(-1, 1))
-        out.append((planes, pi, z))
+        v_old = np.float32(rng.uniform(-1, 1))
+        mask = np.ones(actions, dtype=bool)
+        out.append((planes, action, logp_old, z, v_old, mask))
     return out
 
 
