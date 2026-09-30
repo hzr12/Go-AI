@@ -147,6 +147,47 @@ def test_fsdp_auto_wrap_policy_is_class_based():
         '按 size 切会随 batch 漂移，破坏 search_arch 的标定口径'
 
 
+def test_fsdp_wrap_policy_resolves_every_block_class():
+    """元组里的名字必须**逐个**在 backbone 里解析成 Module 子类。
+
+    实现用 `getattr(_bb, _name, None)` 逐名取类，取不到就跳过。这条静默路径的
+    后果是：某天 `MambaLTI` 改名，Mamba 块不再被单独切分片，激活峰值反弹，
+    而 FSDP 照常启动、不抛任何异常 —— 正是本文件开头说的那种「静默产出错误
+    训练结果」。它还有一条更糟的兜底：`classes` 全空时退化成 `[nn.Module]`，
+    于是整模型一个 unit，与 ModuleWrapPolicy 的设计意图相反。
+
+    断言名字集合与实际解析结果，改名任一侧都会转红。
+    """
+    import ast as _ast
+    import torch
+
+    node = _func('_fsdp_wrap_policy')
+    names = []
+    for sub in _ast.walk(node):
+        if isinstance(sub, (ast.Tuple, ast.List)):
+            if all(isinstance(e, ast.Constant) and isinstance(e.value, str) for e in sub.elts) \
+                    and sub.elts:
+                names = [e.value for e in sub.elts]
+                break
+    assert names, '没在 _fsdp_wrap_policy 里找到块类名元组'
+
+    sys.path.insert(0, str(SRC_PATH.parent.parent))
+    from src.networks import backbone as _bb
+
+    resolved = []
+    for name in names:
+        cls = getattr(_bb, name, None)
+        assert isinstance(cls, type) and issubclass(cls, torch.nn.Module), \
+            'backbone 里没有块类 {}（改名了？）—— 静默跳过会让该块不被 FSDP 单独切分'.format(name)
+        resolved.append(cls)
+
+    assert len(set(names)) == len(names), '元组里有重复类名'
+    expected = {'ResBlock', 'CrossAttnRes', 'MambaLTI', 'TransformerBlock'}
+    assert set(names) == expected, \
+        '块类集合漂移：当前 {}，期望 {}'.format(sorted(names), sorted(expected))
+    assert len(resolved) == len(names)
+
+
 # ---------------------------------------------------------------- 2. 存档与续训
 
 def test_save_model_uses_full_state_dict():
