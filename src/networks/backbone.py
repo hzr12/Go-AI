@@ -107,7 +107,18 @@ V21_GRAD_CHECKPOINT_DEFAULTS = {
     GC_LEGACY: False,
 }
 
-#: 旧路径（`checkpoint_sequential` 的粒度）逐块检查点；v21 走整段合并。
+#: 旧路径的**段粒度**：`checkpoint_sequential(blocks, len(blocks), x)` 的粒度
+#: 就是「每块一段」，所以旧路径必须逐块，不能并段。
+#:
+#: ⚠ 这**不是**一个可以随手「顺手统一」的默认值 —— 它是旧路径显存口径的一部分。
+#: v18 形状（17 块、192 通道）实测留给反向的字节：
+#:     逐块（本值）  16 个段入口   ≈ 与 HEAD 的 `checkpoint_sequential` 一致
+#:     并段                1 个段入口   ≈ 省 16×
+#: 换句话说：把本表清空（`{}`）会让旧路径的真实训练显存**静默大降**，而
+#: `search_arch` 的标定因子 k 是照着「逐块」那一档锚在 v18 的 31.12GB 实测上的。
+#: 并段本身是更好的显存策略，但它是一次**需要重标 k** 的行为变化，不能混在
+#: 「机制重构」里做。见 `tests/test_grad_checkpointing.py::
+#: test_legacy_granularity_is_pinned_to_checkpoint_sequential`。
 GC_PER_BLOCK_DEFAULT = {GC_LEGACY: True}
 
 
@@ -251,7 +262,8 @@ def _segment_runner(blocks, taps_want):
 
 
 def run_grad_segment(blocks, args, use_checkpoint=False, tap_positions=(),
-                     per_block=None, kind=None, guard_root=None):
+                     per_block=None, uncapped_last=False, kind=None,
+                     guard_root=None):
     """把 `blocks` 当作**一个段**跑；`use_checkpoint` 时整段走梯度检查点。
 
     Args:
@@ -267,6 +279,14 @@ def run_grad_segment(blocks, args, use_checkpoint=False, tap_positions=(),
         per_block: 逐块检查点（`True`）还是整段合并（`False`）。默认按 kind 取
             `GC_PER_BLOCK_DEFAULT`（只有旧路径为 True，与 `checkpoint_sequential`
             的既有粒度一致）。
+        uncapped_last: **段的最后一块不检查点**。这是
+            `torch.utils.checkpoint.checkpoint_sequential` 的文档语义
+            （"All segments except the last will not store the intermediate
+            activations" / 源码注释 "the last chunk has to be non-volatile"），
+            旧路径必须照搬，否则 `use_checkpoint=True` 就是一次**未声明的既有
+            行为变化**（见 `SharedBackbone.forward` 的注释与
+            `task-p4-6b-fix-report.md` B1）。v21 的段**不要**开这个选项 ——
+            合并段下豁免末块等于白放弃整段的收益。
         kind: 仅用于取默认粒度与报错信息。
         guard_root: 传模块则每次前向做一次 compile 互斥检查（便宜：一个模型 ~100
             个子模块，微秒级；换来「编译发生在构造之后」也能被抓住）。
@@ -296,32 +316,53 @@ def run_grad_segment(blocks, args, use_checkpoint=False, tap_positions=(),
     if per_block is None:
         per_block = GC_PER_BLOCK_DEFAULT.get(kind, False)
 
+    # `active` 里的 `torch.is_grad_enabled()` **不是**死代码，但**在经
+    # `GradCheckpointMixin.run_segment` 的路径上确实观察不到**（mixin 的
+    # `grad_checkpointing_for` 已经先算过一遍同样的条件，见下）。它守的是
+    # `run_grad_segment` 这个**公开函数被直接调用**的路径 —— 那条路上没有 mixin
+    # 也没有 `self.training`，`use_checkpoint` 是调用者自己传的。这不是理论上的
+    # 假设：`tests/test_grad_checkpointing.py::
+    # test_run_grad_segment_itself_never_checkpoints_under_no_grad` 就走这条路，
+    # 而把本行删掉会让那条测试变红。两条门必须**都**在：mixin 的门负责
+    # eval/推理的零行为变化，本行的门负责直接调用者的 no_grad 契约。
     active = bool(use_checkpoint) and torch.is_grad_enabled()
     if active and guard_root is not None:
         assert_grad_checkpoint_compile_compatible(
             guard_root, 'kind=%s' % kind if kind else '')
 
-    runner = _segment_runner(blocks, taps_want)
-    if not active:
-        ret = runner(*tuple(args))
+    # `uncapped_last`：最后一块**不进**任何检查点段（`checkpoint_sequential`
+    # 的文档语义）。段长 <= 1 时于是「无可检查点」，与 torch 在单段时的
+    # 落空行为（`range(0, 0, 1)` 空循环 → 直接跑 `functions[-1]`）一致。
+    capped = blocks[:-1] if uncapped_last else blocks
+
+    if not active or not capped:
+        ret = _segment_runner(blocks, taps_want)(*tuple(args))
         if taps_want:
             return ret[0], tuple(ret[1])
         return ret, ()
 
     if not per_block:
-        out = _checkpointed(runner, args, _collect_batchnorms(blocks))
+        out = _checkpointed(_segment_runner(capped, taps_want), args,
+                            _collect_batchnorms(capped))
         if taps_want:
             return out[0], tuple(out[1])
         return out, ()
 
+    want = set(taps_want)
     cur = tuple(args)
     captured = {}
     for i, blk in enumerate(blocks):
-        new_x = _checkpointed(_segment_runner([blk], ()), cur,
+        if i < len(capped):
+            o = _checkpointed(_segment_runner([blk], ()), cur,
                               _collect_batchnorms([blk]))
-        if i in set(taps_want):
-            captured[i] = new_x[0] if isinstance(new_x, tuple) else new_x
-        cur = (new_x,) + cur[1:]
+        else:
+            o = blk(*cur)
+        new_x = o[0] if isinstance(o, tuple) else o
+        if i in want:
+            captured[i] = new_x
+        cur = tuple(o) if isinstance(o, tuple) else (new_x,) + cur[1:]
+    if not want:
+        return cur[0], ()
     return cur[0], tuple(captured[i] for i in taps_want)
 
 
@@ -429,16 +470,22 @@ class GradCheckpointMixin:
             return False
         return bool(self.training) and torch.is_grad_enabled()
 
-    def run_segment(self, blocks, args, kind, tap_positions=(), per_block=None):
+    def run_segment(self, blocks, args, kind, tap_positions=(), per_block=None,
+                    uncapped_last=False):
         """跑一段。`kind` 决定是否检查点；返回 `(out, taps)`，语义同
-        `run_grad_segment`。这是 P4.2 的主干 forward 唯一要调的入口。"""
+        `run_grad_segment`。这是 P4.2 的主干 forward 唯一要调的入口。
+
+        `uncapped_last=True` 只给**旧路径**用（照搬 `checkpoint_sequential`
+        的「最后一块不检查点」）；v21 的段不要传。"""
+        on = self.grad_checkpointing_for(kind)
         return run_grad_segment(
             blocks, args,
-            use_checkpoint=self.grad_checkpointing_for(kind),
+            use_checkpoint=on,
             tap_positions=tap_positions,
             per_block=per_block,
+            uncapped_last=uncapped_last,
             kind=kind,
-            guard_root=self if self.grad_checkpointing_for(kind) else None,
+            guard_root=self if on else None,
         )
 
 
@@ -965,7 +1012,7 @@ class AttentionResBlock(nn.Module):
         return x
 
 
-class SharedBackbone(nn.Module, GradCheckpointMixin):
+class SharedBackbone(GradCheckpointMixin, nn.Module):
     """共享表示网络：将棋盘状态编码为隐藏状态。
 
     注意力模式（attention_mode 控制主干如何堆叠注意力块）：
@@ -976,6 +1023,15 @@ class SharedBackbone(nn.Module, GradCheckpointMixin):
 
     注意力块内部的计算模式由 attn_mode 控制（全局/窗口/轴向），
     通过 --attn-mode 配置；窗口大小由 --attn-window 控制。
+
+    ⚠ mixin 写在 `nn.Module` **前面**（P4.6b fix B5）
+    ------------------------------------------------
+    mixin 优先于 `nn.Module`。本类的方法名（`_init_grad_checkpointing` /
+    `grad_checkpointing` / `set_grad_checkpointing` / `run_segment` /
+    `use_checkpoint`）**全部**可能被 `nn.Module` 将来新增的同名成员静默劫持 ——
+    `nn.Module` 优先时，mixin 的实现会被 `nn.Module.__getattr__` 之前的正常属性
+    查找挡住，症状是「方法不见了」或「调到了 nn.Module 的实现」，而不是报错。
+    `run_segment` 这种通用名尤其危险。反过来写（mixin 在后）没有任何好处。
     """
 
     def __init__(self, in_channels=12, channels=128, num_res_blocks=12,
@@ -1004,7 +1060,7 @@ class SharedBackbone(nn.Module, GradCheckpointMixin):
         # P4.6b：走 v21 同一套机制，但默认关（D5：旧路径行为一字不变）。
         # `use_checkpoint=True` 与 `set_grad_checkpointing(True)` 等价 ——
         # 赋这个属性就是走 `use_checkpoint` 的 property setter（见类末尾），
-        # 它会同时把 `GC_LEGACY` 打开并同步总开关，不会与真实行为分叉。
+        # 它把总开关与 `GC_LEGACY` 段开关**一起**设成同一个值，不会分叉。
         self.use_checkpoint = use_checkpoint
         self.arch = arch
 
@@ -1095,7 +1151,15 @@ class SharedBackbone(nn.Module, GradCheckpointMixin):
             # （`per_block=True`），但换成本节的新实现 —— 于是多了 BN
             # running stats 的重算保护（旧的 `checkpoint_sequential` 会把
             # `num_batches_tracked` 翻倍、污染 `running_mean/var`）。
-            out, _ = self.run_segment(self.blocks, (out,), GC_LEGACY)
+            # `uncapped_last=True` 是 B1：`checkpoint_sequential` 的文档语义
+            # 是「除最后一段外都检查点」（源码注释 "the last chunk has to be
+            # non-volatile"）。不传它，`use_checkpoint=True` 的显存口径就从
+            # 「16 段入口」变成「16 个段入口且末块也重算」，v18/v19 的真实
+            # 训练显存会低于 31.12GB 锚点（`search_arch.py:63` 的 k 标定基准），
+            # 而锚点重测已由业主裁决取消（D15 同期裁决：不重测）⇒ 这里必须
+            # 逐字还原旧行为，让锚点与 k=0.8235 继续有效。
+            out, _ = self.run_segment(self.blocks, (out,), GC_LEGACY,
+                                      uncapped_last=True)
         else:
             out = self.blocks(out)
         if self.arch == "convnext":
@@ -1105,8 +1169,15 @@ class SharedBackbone(nn.Module, GradCheckpointMixin):
         return out
 
     def set_grad_checkpointing(self, enabled=None, **kinds):
-        """旧路径的开关入口。`use_checkpoint` 是本类的 property（读 `_gc_enabled`），
-        所以不需要额外同步 —— 见下面那个 setter 的说明。"""
+        """旧路径的开关入口。`use_checkpoint` 是本类的 property，它读的
+        **不是**总开关，而是「总开关 ∧ `legacy` 段开关」—— 见下面 getter。
+
+        `kinds.setdefault(GC_LEGACY, True)` 只在没显式传 `legacy=` 时补
+        `legacy=True`：`SharedBackbone` 只用得到 legacy 段，`set_grad_checkpointing(True)`
+        若不补，就会变成「总开关 True 而什么都不检查点」（P4.6b fix B4 的
+        反面），而 `V21_GRAD_CHECKPOINT_DEFAULTS[GC_LEGACY] is False` 是
+        **默认**（D5：不传就关）不是本方法的语义。
+        """
         kinds.setdefault(GC_LEGACY, True)
         super(SharedBackbone, self).set_grad_checkpointing(enabled, **kinds)
         return self
@@ -1120,8 +1191,16 @@ class SharedBackbone(nn.Module, GradCheckpointMixin):
         `_gc_enabled`，那么 `model.backbone.use_checkpoint = True`（既有代码里
         常见的写法）就会变成**看起来开了、其实没开**的静默回退。setter 把赋值
         路由进 mixin，读写两侧因此永远一致。
+
+        读的是「总开关 ∧ legacy 段开关」（P4.6b fix B4）：只读总开关会在
+        `set_grad_checkpointing(True, legacy=False)` 时读出 True 而实际什么都不
+        检查点 —— property 必须等于**本类 forward 真正生效的状态**，否则
+        `if self.use_checkpoint` 与属性读数就会分叉。要看全部五类的逐项状态
+        用 `grad_checkpointing_kinds()`；eval 下 `grad_checkpointing_for` 的
+        training/no_grad 门不影响这里（读的是**开关状态**，不是"此刻是否生效"）。
         """
-        return self.grad_checkpointing
+        return (bool(getattr(self, '_gc_enabled', False))
+                and bool(self.grad_checkpointing_kinds().get(GC_LEGACY, False)))
 
     @use_checkpoint.setter
     def use_checkpoint(self, value):

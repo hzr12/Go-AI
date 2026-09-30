@@ -25,6 +25,7 @@ from src.networks.backbone import (  # noqa: E402
     GC_CROSS_ATTN_RES,
     GC_LEGACY,
     GC_MAMBA,
+    GC_PER_BLOCK_DEFAULT,
     GC_RES,
     GC_TRANSFORMER,
     V21_GRAD_CHECKPOINT_DEFAULTS,
@@ -66,7 +67,7 @@ def _n(mod):
     return sum(p.numel() for p in mod.parameters())
 
 
-class V21BackboneHarness(nn.Module, GradCheckpointMixin):
+class V21BackboneHarness(GradCheckpointMixin, nn.Module):
     """P4.2 将要建的 v21 主干的等价物：stem + 8/4/2/2 段 + out。
 
     段划分（= 报告 §2 的 (b) 粒度：同类型连续块合并成一段）：
@@ -109,7 +110,7 @@ class V21BackboneHarness(nn.Module, GradCheckpointMixin):
         return F.relu(self.out(x))
 
 
-class V21Net(nn.Module, GradCheckpointMixin):
+class V21Net(GradCheckpointMixin, nn.Module):
     """主干 + 两个 v21 头，全网 9,067,443。"""
 
     def __init__(self, **kw):
@@ -123,9 +124,11 @@ class V21Net(nn.Module, GradCheckpointMixin):
         h = self.backbone(x)
         return self.policy(h), self.value(h)
 
-    def run_segment(self, blocks, args, kind, tap_positions=(), per_block=None):
+    def run_segment(self, blocks, args, kind, tap_positions=(), per_block=None,
+                    uncapped_last=False):
         return run_grad_segment(blocks, args, use_checkpoint=False,
                                 tap_positions=tap_positions, per_block=per_block,
+                                uncapped_last=uncapped_last,
                                 kind=kind, guard_root=None)
 
     def grad_checkpointing_for(self, kind):
@@ -620,7 +623,7 @@ def test_switch_without_rebuilding_the_model():
     assert m.grad_checkpointing_for(GC_RES) is False
 
 
-class _Wrapper(nn.Module, GradCheckpointMixin):
+class _Wrapper(GradCheckpointMixin, nn.Module):
     """父级持有 mixin、`forward` 只调子模块 —— 正是 P4.2 的 `AlphaGoNet` 形状。"""
 
     def __init__(self):
@@ -1029,14 +1032,17 @@ def test_run_grad_segment_multi_input_signature():
 
 
 def test_no_grad_path_never_checkpoints():
-    """`no_grad` 下**连 `torch.utils.checkpoint` 都不许被调用**。
+    """`no_grad` 下**连 `torch.utils.checkpoint` 都不许被调用**（mixin 路径）。
 
-    判据用「checkpoint 函数本身的调用次数」而不是 forward hook 次数：实测
-    mutation `active = bool(use_checkpoint)`（去掉 `torch.is_grad_enabled()`）
-    在 `no_grad` 下**完全无害** —— 段函数只跑一次，输出与梯度都对，forward hook
-    也只数到 1 次，所以任何基于「跑了几次」的判据都抓不到它（实测：30 个测试
-    全绿）。它唯一的实际后果是白付一次 checkpoint 框架开销 + 一次 BN 守卫的
-    快照/还原，所以这里直接盯调用点。
+    ⚠ P4.6b fix B3 更正了这里原先的自相矛盾：本测试**抓不到**
+    `run_grad_segment` 里 `active = bool(use_checkpoint) and torch.is_grad_enabled()`
+    的后半段 —— mixin 的 `grad_checkpointing_for()` 在更早的地方就用同一个
+    `torch.is_grad_enabled()` 把 `use_checkpoint=False` 传下来了，所以删掉
+    `active` 里的那一项，本测试依然全绿（实测：30 个测试无变化）。它守的是
+    「经 `run_segment` 的路径在 no_grad 下零调用」这条**契约本身**；`active`
+    里那一项是给**绕过 mixin 直接调 `run_grad_segment` 的公开调用者**兜底的，
+    由下面的 `test_direct_call_under_no_grad_never_checkpoints` 钉住（那条
+    才是能打红该变异的测试）。两个测试各守一条门，别再混为一谈。
     """
     m = _small()
     _reset_bn(m)
@@ -1059,6 +1065,155 @@ def test_no_grad_path_never_checkpoints():
     finally:
         torch.utils.checkpoint.checkpoint = orig
     assert calls == [], 'no_grad / inference_mode 下仍然调用了 checkpoint：%d 次' % len(calls)
+
+
+def test_direct_call_under_no_grad_never_checkpoints():
+    """B3 的**另一半**：绕过 mixin 直接调 `run_grad_segment` 时，
+    `active = bool(use_checkpoint) and torch.is_grad_enabled()` 里的
+    `torch.is_grad_enabled()` 是唯一的门（mixin 的预门不存在）。
+
+    这是唯一能打红 `active = bool(use_checkpoint)` 变异的测试；上面那条
+    `test_no_grad_path_never_checkpoints` 走 mixin 路径，抓不到它（B3）。
+    对照组（grad 开着）必须走 checkpoint，否则本测试空转也绿。
+    """
+    m = _small()
+    _reset_bn(m)
+    m.train()
+    seg = m.blocks[RES_SLICE]
+    with torch.no_grad():
+        stem_out = F.relu(m.stem(_x(batch=1, board=5, seed=73, ch=8)))
+    calls = []
+    orig = torch.utils.checkpoint.checkpoint
+
+    def spy(*a, **k):
+        calls.append(1)
+        return orig(*a, **k)
+
+    torch.utils.checkpoint.checkpoint = spy
+    try:
+        with torch.no_grad():
+            run_grad_segment(seg, (stem_out,), use_checkpoint=True,
+                             per_block=True, kind=GC_RES)
+        assert calls == [], \
+            '直调 + no_grad 仍调用了 checkpoint：%d 次' % len(calls)
+        with torch.enable_grad():
+            run_grad_segment(seg, (stem_out.detach().requires_grad_(),),
+                             use_checkpoint=True, per_block=True, kind=GC_RES)
+        assert calls, '对照组空转：grad 开着时没走 checkpoint，本测试无效'
+    finally:
+        torch.utils.checkpoint.checkpoint = orig
+
+
+def test_legacy_granularity_is_pinned_to_checkpoint_sequential():
+    """B2/M4：旧路径粒度 = **逐块 + 末块豁免**（= `checkpoint_sequential` 语义）。
+
+    判据 = checkpoint 调用次数：N 个块必须恰好 N-1 次（每次一个块）。
+    一次调用同时钉住两件事，两个变异各自都能打红它：
+      * `GC_PER_BLOCK_DEFAULT = {}`（粒度被「顺手统一」成并段）→ 只调 1 次；
+      * 删掉 `forward` 里的 `uncapped_last=True`（B1 回归）→ 调 N 次。
+    这条测试守的是 31.12GB 锚点的显存口径（`search_arch.py:63` 的 k 标定基准）：
+    粒度改动会把 v18 形状上「留给反向的字节」改 17×（50,274,304 vs 2,957,312），
+    而锚点重测已被业主裁决取消 —— 口径必须逐字锁死。
+    """
+    m = SharedBackbone(in_channels=12, channels=32, num_res_blocks=4,
+                       attention_mode='none', arch='resnet')
+    n = len(m.blocks)
+    assert n == 4
+    m.train()
+    m.set_grad_checkpointing(True)
+    x = torch.randn(1, 12, 5, 5)
+    calls = []
+    orig = torch.utils.checkpoint.checkpoint
+
+    def spy(*a, **k):
+        calls.append(1)
+        return orig(*a, **k)
+
+    torch.utils.checkpoint.checkpoint = spy
+    try:
+        m(x)
+    finally:
+        torch.utils.checkpoint.checkpoint = orig
+    assert len(calls) == n - 1, (
+        '旧路径的 checkpoint 调用次数 %d != 块数-1=%d（逐块粒度或末块豁免被改）'
+        % (len(calls), n - 1))
+    # 常量面再钉一层（调用次数是对行为，常量是对默认表）
+    assert GC_PER_BLOCK_DEFAULT[GC_LEGACY] is True, \
+        'legacy 粒度默认表被改（并段会让保留量差 17×，k 失效）'
+    assert V21_GRAD_CHECKPOINT_DEFAULTS[GC_LEGACY] is False, \
+        'legacy 默认必须关（D5：不传 use_checkpoint 就是旧行为）'
+
+
+def test_legacy_retention_bytes_equal_checkpoint_sequential():
+    """B1 的口径证明：新 legacy 路径「留给反向的字节」与原实现**逐字节相等**。
+
+    原实现（v19，`b262755~1` 的 forward）：
+        torch.utils.checkpoint.checkpoint_sequential(
+            self.blocks, len(self.blocks), out, use_reentrant=False)
+    它的文档语义是「除最后一段外都检查点」。B1 用 `uncapped_last=True` 恢复
+    同一语义 ⇒ 31.12GB 锚点（`search_arch.py:63`）与 k=0.8235 的标定基准继续
+    有效（业主已裁决**取消锚点重测**，口径只能靠这条相等断言守住）。
+    变异：删 `uncapped_last=True` → 留存字节变多 → 红。
+    """
+    m = SharedBackbone(in_channels=12, channels=32, num_res_blocks=4,
+                       attention_mode='none', arch='resnet')
+    m.train()
+    x = torch.randn(1, 12, 5, 5)
+    with torch.no_grad():
+        stem_out = F.relu(m.bn1(m.conv1(x)))
+
+    m.set_grad_checkpointing(True)
+    _, c_new, b_new = _saved_stats(
+        lambda: run_grad_segment(m.blocks, (stem_out,), use_checkpoint=True,
+                                 per_block=True, uncapped_last=True,
+                                 kind=GC_LEGACY))
+    _, c_old, b_old = _saved_stats(
+        lambda: torch.utils.checkpoint.checkpoint_sequential(
+            m.blocks, len(m.blocks), stem_out, use_reentrant=False))
+    assert (c_new, b_new) == (c_old, b_old), (
+        '留存口径与原 checkpoint_sequential 不一致：新 (%d, %d) B vs 旧 (%d, %d) B '
+        '—— 锚点/k 标定会失效' % (c_new, b_new, c_old, b_old))
+
+
+def test_use_checkpoint_property_equals_effective_legacy_state():
+    """B4：`use_checkpoint` 的读数必须 == `forward` 真正生效的状态。
+
+    变异（B4 的原始现象）：getter 只读总开关 →
+    `set_grad_checkpointing(True, legacy=False)` 时读数 True 而 legacy 段实际
+    关着，`if self.use_checkpoint` 与属性读数分叉。
+    """
+    m = SharedBackbone(in_channels=12, channels=32, num_res_blocks=4,
+                       attention_mode='none', arch='resnet')
+    m.train()
+    m.set_grad_checkpointing(True, legacy=False)
+    assert m.grad_checkpointing is True
+    assert m.grad_checkpointing_for(GC_LEGACY) is False
+    assert m.use_checkpoint is False, \
+        'B4 回归：读数 True 而 legacy 段实际不检查点'
+
+    m.set_grad_checkpointing(True, legacy=True)
+    assert m.grad_checkpointing_for(GC_LEGACY) is True
+    assert m.use_checkpoint is True
+    # 写路径往返（既有代码的写法）也必须一致
+    m.use_checkpoint = False
+    assert m.use_checkpoint is False and m.grad_checkpointing is False
+    m.use_checkpoint = True
+    assert m.use_checkpoint is True and m.grad_checkpointing_for(GC_LEGACY) is True
+
+
+def test_mixin_precedes_nn_module_in_mro():
+    """B5：mixin 必须排在 `nn.Module` **之前**（`run_segment` 等通用名防劫持）。"""
+    for cls in (SharedBackbone, V21BackboneHarness, V21Net):
+        mro = cls.__mro__
+        assert mro.index(GradCheckpointMixin) < mro.index(nn.Module), \
+            '%s 的 MRO 里 mixin 落到 nn.Module 之后（B5 回归）' % cls.__name__
+    # 解析到 mixin 的实现（`V21Net` 例外：它**有意**覆写 run_segment 强制
+    # use_checkpoint=False，是 switch-owner 测试的夹具，不算 B5）
+    for cls in (SharedBackbone, V21BackboneHarness):
+        assert cls.run_segment is GradCheckpointMixin.run_segment, \
+            '%s.run_segment 没解析到 mixin 的实现' % cls.__name__
+    assert 'run_segment' not in vars(nn.Module), \
+        'nn.Module 新增了 run_segment —— 必须复查全部 mixin 挂载点（B5 的前提变了）'
 
 
 def test_batchnorm_stat_guard_ignores_missing_buffers():
