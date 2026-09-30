@@ -34,10 +34,13 @@
 #
 #   · 4×910A（NPU）推荐入口 = 现成脚本（P4.10）：
 #       python run.py --sh shell/train_sft_npu_4card_v21.sh
-#     脚本内 BATCH=3000（×4 卡 = 有效 12000）、LR=0.00780
-#     （= 0.00356×√(12000/2500)，同一套平方根缩放律）、
-#     OUT=models/sft_19x19_v21_npu4.pth。⚠ 3000 是**推理档不是实测值**
-#     （脚本里写了推导，以及「先过 C11 显存投影 + 50 步 smoke」的前置要求）。
+#     ⚠ 2026-09-30 起脚本默认 BATCH/LR **不再等于推荐值**：脚本是「脚本化版本」
+#     而推荐档在下方【v21 显存上限】表里（首跑每卡 2000 / lr 0.00637）。要用
+#     推荐档就显式覆盖：
+#       python run.py --sh shell/train_sft_npu_4card_v21.sh \
+#           --batch-size 2000 --lr 0.00637
+#     脚本默认 3000/0.00780（= 0.00356×√(12000/2500)）属于**很紧的一档**，
+#     投影占用已贴卡边界，且 C11 显存投影测试对 v21 尚未接入（见下）。
 #
 #   · 单卡 A100 40G（BF16 + flash-attn）= 下方方案 B，以下即实测可跑的配置
 #     （--batch-size 3500 实测通过）：
@@ -226,8 +229,10 @@ python -c "import numpy as np; d=np.load('data/sgf_19x19_full.npz'); print('game
 #   的**方案 A**；shell/train_sft_npu_4card_v21.sh（P4.10）是它的脚本化版本。
 #
 # 【硬件分工：SFT 4 卡 910A，RL 1 卡 910A + 8 进程 CPU】
-#   · SFT：torchrun --nproc_per_node=4（下面方案 A）。每卡 batch 2800 ⇒ 有效
-#     11200，lr 0.00754 = 0.00356×√(11200/2500)（同一套平方根缩放律）。
+#   · SFT：torchrun --nproc_per_node=4（下面方案 A）。**首跑每卡 batch 2000**
+#     ⇒ 有效 8000，lr 0.00637 = 0.00356×√(8000/2500)（同一套平方根缩放律）。
+#     为什么不直接上 2800：见下面【v21 显存上限】—— 2800 的投影峰值已贴到卡
+#     边界，而投影**不是实测**；先跑通 2000，再按表往上试。
 #   · RL ：**单卡** python scripts/selfplay_train.py（③ 节有完整命令，1 卡 910A
 #     训练 + 8 进程 CPU 搜索）。SFT 的 4 卡与 RL 的 1 卡不要混用同一组参数：
 #     RL 的 --batch-size 默认 256 是**单卡**甜点。
@@ -236,6 +241,11 @@ python -c "import numpy as np; d=np.load('data/sgf_19x19_full.npz'); print('game
 # 注意: --swanlab 需已登录 swanlab.cn，训练结束后云端查看图表
 # ⚠ --out 已从 v17 改成 v21 的名字：v21 是 17 通道权重，与旧 12 通道 v17 权重
 #   不能混用（strict load 会炸），别互相覆盖。
+# ⚠ 下面这行**结构 flag 全是归档项**（--backbone-channels / --res-blocks /
+#   --convnext-blocks / --attn-blocks / --value-* / --policy-* / --attn-* /
+#   --use-checkpoint / --export-onnx）：D1 之下建出来的**一定是 v21**
+#   （17ch / 8Res+4Mamba+2Trans+2Cross / 184ch / 9.07M 参数），它们只为了让旧
+#   命令行原样可跑而保留在文档里。**别照着它们推算 v21 的形状或显存。**
 torchrun --nproc_per_node=4 scripts/train_sft.py \
   --data data/sgf_19x19_full.npz \
   --device npu --board-size 19 \
@@ -243,8 +253,8 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
   --res-blocks 8 --convnext-blocks 4 --attn-blocks 5 \
   --value-channels 96 --value-res-blocks 8 \
   --policy-channels 128 --policy-layers 3 \
-  --batch-size 2800 --epochs 1 \
-  --lr 0.00754 --weight-decay 0.0001 \
+  --batch-size 2000 --epochs 1 \
+  --lr 0.00637 --weight-decay 0.0001 \
   --attention-mode mix --num-attention-layers 4 --num-heads 4 \
   --attn-mode window_global --attn-window 5 \
   --attention-dropout 0.1 --label-smoothing 0.1 \
@@ -256,6 +266,45 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
   --out models/sft_19x19_v21_npu4.pth \
   --export-onnx 1 --use-checkpoint 1 \
   --swanlab 1 --ver v21_npu4
+
+# ------------------------------------------------------------------
+# 【v21 显存上限】4 卡 910A（每卡 32 GiB）—— 2026-09-30 实测重标定
+# ------------------------------------------------------------------
+# 三个 OOM 根因（都是**可复算**的数字，不是猜测；详见 commit 741b051）：
+#   1. MambaLTI 的 drive 整条物化：(B,T,H,P,N) 每样本 361×4×46×64×4B = 17.0 MB
+#      ⇒ B=2000 时**一次就申请 31.67 GiB**（与云端报错逐位吻合）。梯度检查点
+#      管不到它 —— 它是块内部临时量，重算还要再物化一次。
+#   2. 扫描块内的 u/M/h 活到反向：按块物化只降**前向瞬时峰值**，bmm/mul 的
+#      输入照样被 autograd 留住。fp16@B=2000 单个 MambaLTI 块 = 52.6 GiB
+#      ⇒ 云端 `20.13 GiB already allocated` + `Tried to allocate 2.81 GiB`
+#      （2.81 GiB ≈ 又一个块的 u）。
+#   3. 预取 worker fork 晚于设备初始化：`mp.Process` 默认 fork，4 个 worker
+#      各继承一份 CANN 上下文与显存映射 ⇒ PyTorch 只记 6.30 GiB 而卡上 94%、
+#      AICore 0%（6.3 + 4×6 ≈ 30 GiB）。
+# 三条修复后同一口径的保留量（fp16@B=2000 折算）：
+#   前向结束仍需存活   8.78 GiB   （16 个块边界 + 抽头特征 + 两个头）
+#   最重的一块重算     4.9 GiB   （MambaLTI，修复前 52.6；注意力约 4~6）
+#   ⇒ 活跃峰值 ≈ 14~15 GiB，另加分配器缓存（实测 20.13 活跃时 reserved 26.98，
+#     约 6.9 GiB 空洞）⇒ 实际占用 ≈ 21~23 GiB / 32 GiB
+#
+#   每卡 batch   有效 batch   投影占用      lr（=0.00356×√(有效/2500)）   判定
+#   ─────────────────────────────────────────────────────────────────────────
+#     1500         6000        ~16~18 GiB      0.00552                  稳（保底档）
+#     2000         8000        ~21~23 GiB      0.00637                  ★首跑推荐
+#     2500        10000        ~26~28 GiB      0.00712                  可试（未实测）
+#     2800        11200        ~29~31 GiB      0.00754                  很紧（未实测）
+#
+# ⚠ 上表是**投影**，来源见上；三次 OOM 说明投影会错，所以按「低一档先跑通、
+#   再一档一档往上」的方式用，不要直接拿 2800 起步。
+# ⚠ 降 batch 必须同步降 lr（同一套平方根缩放律），否则 8000 有效 batch 配
+#   2800 的 lr 会把早期训练打飞。
+# ⚠ 别为了省显存去动 --attn-window（window_global 的显存 ∝ nW×(ws²+ng)，
+#   ws 变小时 ng 暴涨）；也别关检查点（见根因 2，那不是检查点能救的东西）。
+#
+# 【预取器的硬约束】`--prefetch-workers > 1` 会在**设备初始化之前** fork
+#   worker 进程（train_sft.py 里已加运行时护栏：设备已初始化就构造 ⇒ 直接抛
+#   错）。这是根因 3 的修复，**顺序不要改回去**：fork 早于 CANN 才是安全的那
+#   侧（反方向才是 HCCL 的危险区）。workers=1 等于关掉预取器。
 
 # 方案 B: 单卡 A100 40G (当前实跑配置)
 # pip install flash-attn --no-build-isolation
