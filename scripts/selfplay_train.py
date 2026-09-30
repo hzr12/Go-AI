@@ -724,43 +724,95 @@ def _compute_advantage(z, v_old):
     return _standardize_advantage(z.reshape(-1) - v_old.reshape(-1))
 
 
-def _ppo_policy_loss(logits, mask, action, logp_old, adv, clip_eps, kl_coef):
-    """P3-C 策略侧损失：L = -E[min(r·A, clip(r,1-ε,1+ε)·A)] - β·KL_k1。
+def _importance_weight(logp_old, logq, w_max):
+    """B2 重要性权重 w = π_θold(action) / q(action)，双向截断到 [1/w_max, w_max]。
+
+    为什么要它（这是 2026-09-30 去 MCTS 之后才出现的问题）：采集的行为分布 q 是
+    「温度 + minimax 推演派生」的，而 PPO 的 ratio 两侧都是 π 族（不带温度）。
+    两者**不是同一个分布** —— q 里那份推演派生的伪概率根本不在策略族里。不修正
+    就是拿 off-policy 数据做 on-policy 的比值，偏差不报错、只表现为「训练不收敛
+    或收敛到奇怪的地方」。
+
+    三个细节，每个都有代价：
+      · 用 log 域算（`exp(logp_old - logq)`）而不是先 exp 再除：q 的尾部可以低到
+        1e-30，直接除会溢出/下溢成 inf/nan。
+      · **双向**截断：w>w_max 说明 q 采了 π 认为极不可能的动作（推演在骗人），
+        该降权；w<1/w_max 说明 q 压低了 π 的主峰，同样不可信。下限不截的话，
+        「几乎没被采到」的样本会拿到巨大的权重，单个样本就能主导一次更新。
+      · 截断而非丢弃：丢掉等于改了有效 batch（还与 buffer 容量、`--epochs`
+        的语义耦合）；截断把方差限制住，代价是引入一点偏差 —— 这是重要性采样
+        方差-偏差的标准取舍，`--importance-weight-max` 就是这个取舍点。
+    """
+    logw = logp_old.reshape(-1).float() - logq.reshape(-1).float()
+    hi = math.log(float(w_max))
+    return torch.exp(logw.clamp(-hi, hi))
+
+
+def _ppo_policy_loss(logits, mask, action, logp_old, adv, clip_eps, kl_coef,
+                     logq=None, w_max=20.0):
+    """B2 策略侧损失：L = -E[w·min(r·A, clip(r,1±ε)·A)] - β·KL_k1。
 
     参数：
       logits   (B, A_logits) 网络原始策略 logits（内部升 fp32 再掩码，
                              防 autocast fp16 下 -inf/softmax 精度坑）
       mask     (B, A_logits) bool 合法动作掩码（False处置 -inf → 概率 0）
       action   (B,) long      采集时实际落子的动作
-      logp_old (B,)           行为策略在 action 上的 log-prob（两级温度后，
-                             buffer 常量 / 停止梯度 —— ratio 与 KL 都锚定它，
-                             **不是**当前网络输出）
+      logp_old (B,)           log π_θold(action)（**不带温度**，buffer 常量 /
+                             停止梯度 —— ratio 与 KL 都锚定它）
       adv      (B,)           已标准化优势（_standardize_advantage）
       clip_eps / kl_coef      --ppo-clip / β（当前自适应值，非 argparse 初值）
+      logq     (B,) or None   log q(action)（行为分布）。给了就算 B2 权重
+      w_max    float          --importance-weight-max（w 的截断上下界倒数）
 
-    返回 (loss, stats)，stats = {'kl', 'clip_frac', 'entropy'}（detach 后的 float）。
+    返回 (loss, stats)，stats = {'kl', 'clip_frac', 'entropy', 'w_mean', 'w_clip_frac'}
+    （detach 后的 float）。
 
-    KL 用 k1 估计：KL_k1 = mean(logp_old - logp_new)[action] —— 采样式 k1，
-    old 侧是常量，new 侧带梯度（惩罚把当前策略往行为策略拉）。mean 不是 sum
-    （sum 会按 batch 放大 β 一个量级 —— 测试用封闭形式 KL 钉死）。
+    ★ B2（2026-09-30）：surrogate 的**两项都乘 w**，KL **不乘**。
+      - 乘 w：surrogate 估的是 E_{q}[w·min(...)]，正是 J(π_θ) 的无偏（截断后有偏）
+        估计。w 是常量（buffer 字段、无梯度），乘进 min 内部是对的 —— 不能先
+        平均再乘，两个 surrogate 分支的 min 是**逐样本**取的。
+      - 不乘 w：KL_k1 = mean(logp_old - logp_new) 是「把当前策略拉回**旧策略**」
+        的正则，锚点是 π_θold 而不是行为分布 q。乘上 w 会让它变成「拉回 q」——
+        q 里有推演派生的部分，那不是策略，拉回去就是在学一个非策略族的东西。
+        这是 B2 相对「两项都乘」的判断依据。
     """
     logits = logits.float()
     mask = mask.to(torch.bool)
     logp_new = F.log_softmax(logits.masked_fill(~mask, float('-inf')), dim=-1)
     logp_new_a = logp_new.gather(1, action.view(-1, 1)).squeeze(1)
     ratio = torch.exp(logp_new_a - logp_old)
+    if logq is None:
+        w = None
+        w_t = torch.ones_like(ratio)
+    else:
+        w = _importance_weight(logp_old, logq, w_max)
+        w_t = w
     surr1 = ratio * adv
     surr2 = ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps) * adv
-    loss = -torch.min(surr1, surr2).mean() - kl_coef * (logp_old - logp_new_a).mean()
+    loss = -(w_t * torch.min(surr1, surr2)).mean() \
+        - kl_coef * (logp_old - logp_new_a).mean()
     with torch.no_grad():
         probs = logp_new.exp()
         # 掩码位置 logp=-inf → 先置 0 再乘（0·(-inf)=NaN），p 本身是 0，熵不受影响
         logp_ent = torch.where(mask, logp_new, torch.zeros_like(logp_new))
+        # w_clip_frac 按**截断前**的 logw 判定：截断后 w 恰好**等于**上界/下界，
+        # 用 `w > W` 判会永远判不出「被截断」（w == W 不满足 >）。这正是统计量的
+        # 语义 —— 「多少样本真的被截断了」，不是「多少样本超过 W」。
+        if logq is None:
+            logw = torch.zeros_like(ratio)
+        else:
+            logw = logp_old.reshape(-1).float() - logq.reshape(-1).float()
+        hi = math.log(float(w_max))
         stats = {
             'kl': float((logp_old - logp_new_a).mean().item()),
             'clip_frac': float(((ratio < 1.0 - clip_eps)
                                 | (ratio > 1.0 + clip_eps)).float().mean().item()),
             'entropy': float((-(probs * logp_ent).sum(dim=-1).mean()).item()),
+            # w 的分布要看得见：w≡1 说明 π≈q（修正形同虚设），w 顶到上界说明
+            # 行为分布在系统性偏离策略族 —— 两者都该在日志里出现而不是静默。
+            'w_mean': float(w_t.mean().item()),
+            'w_clip_frac': float(((logw < -hi) | (logw > hi))
+                                 .float().mean().item()),
         }
     return loss, stats
 
@@ -845,7 +897,8 @@ def train_epochs(ai, buffer, args, device):
       running-KL（本轮累计均值）> 2×kl-target → 打印截断日志并 break **本轮**
       剩余 minibatch（外层 epochs 继续）；
     - 统计挂 ai._ppo_stats = {kl, clip_frac, entropy, kl_coef, early_stop,
-      steps, v_mse, v_clip_frac} 供 main() 写 swanlab（既有键一个不动）。
+      steps, v_mse, v_clip_frac, w_mean, w_clip_frac} 供 main() 写 swanlab
+      （既有键一个不动；w_* 两个是 B2 新增）。
 
     N1: 910A 无 BF16，FP16 autocast 配 GradScaler 防下溢（对齐 train_sft 的
         npu_grad_scaler）；CUDA 旧卡 FP16 同样需要。
@@ -853,10 +906,11 @@ def train_epochs(ai, buffer, args, device):
         shadow 轨迹），LR scheduler 每轮按当前 buffer 大小重建。
     N4: pin_memory 收窄为仅 CUDA（NPU 直传，对齐 train_sft）。
     """
-    if buffer and len(buffer[0]) != 6:
+    if buffer and len(buffer[0]) != 7:
         raise ValueError(
-            f"buffer 行应为 P3-C 6 元组 (planes, action, logp_old, z, v_old, mask)，"
-            f"实得 {len(buffer[0])} 元组 —— 3 元组 (planes, vt, z) 是 PPO 之前的布局，"
+            f"buffer 行应为 7 元组 (planes, action, logp_old, z, v_old, mask, logq)，"
+            f"实得 {len(buffer[0])} 元组 —— 6 元组是 2026-09-30 之前的布局（无 logq，"
+            f"即去 MCTS 之前），3 元组 (planes, vt, z) 是 PPO 之前的布局，"
             f"请检查采集端是否还是旧 self_play_game")
     model = ai.model
     model.train()
@@ -868,6 +922,11 @@ def train_epochs(ai, buffer, args, device):
     beta = float(ai._kl_beta)
     ppo_clip = float(getattr(args, 'ppo_clip', 0.2))
     kl_target = float(getattr(args, 'kl_target', 0.01))
+    # B2 权重上限（--importance-weight-max）。w ≡ 1 时（logq 与 logp_old 相等）
+    # 退化成改造前的 PPO，所以这个参数**不**改变「行为分布 = 策略」时的行为。
+    w_max = float(getattr(args, 'importance_weight_max', 20.0))
+    if w_max < 1.0:
+        raise ValueError(f'--importance-weight-max 必须 ≥ 1，实得 {w_max}')
 
     device_prefix = device.split(':')[0] if isinstance(device, str) else str(device)
 
@@ -954,6 +1013,9 @@ def train_epochs(ai, buffer, args, device):
                 torch.empty((_bs,), dtype=torch.float32, pin_memory=True),
                 torch.empty((_bs, 1), dtype=torch.float32, pin_memory=True),
                 torch.empty((_bs, 1), dtype=torch.float32, pin_memory=True),
+                # B2：logq 单独一槽（B,）。它是**常量**（buffer 字段、无梯度），
+                # 但必须逐样本进 policy loss —— 不能像 z/v_old 那样折进别处。
+                torch.empty((_bs,), dtype=torch.float32, pin_memory=True),
                 _ev,
             ))
     _slot_i = 0
@@ -962,6 +1024,7 @@ def train_epochs(ai, buffer, args, device):
     # P3-C/P3-D 统计（本调用累计 → ai._ppo_stats；空 buffer 提前返回时不动旧值）
     stat_kl = stat_clip = stat_ent = 0.0
     stat_vmse = stat_vclip = 0.0
+    stat_wmean = stat_wclip = 0.0
     stat_steps = 0
     early_stop_any = False
     for epoch in range(args.epochs):
@@ -981,7 +1044,7 @@ def train_epochs(ai, buffer, args, device):
 
             if _slots:
                 m = len(batch)
-                sp, sm, sa, sl, sz, sv, ev = _slots[_slot_i]
+                sp, sm, sa, sl, sz, sv, ev, sq = _slots[_slot_i]
                 ev.synchronize()   # 只等本槽 H2D，不阻塞计算
                 torch.from_numpy(np.stack([b[0] for b in batch])).copy_(sp[:m])
                 torch.from_numpy(np.stack([b[5] for b in batch])).copy_(sm[:m])
@@ -993,12 +1056,15 @@ def train_epochs(ai, buffer, args, device):
                                             dtype=np.float32).reshape(m, 1)).copy_(sz[:m])
                 torch.from_numpy(np.asarray([b[4] for b in batch],
                                             dtype=np.float32).reshape(m, 1)).copy_(sv[:m])
+                torch.from_numpy(np.asarray([b[6] for b in batch],
+                                            dtype=np.float32)).copy_(sq[:m])
                 planes = sp[:m].to(device, non_blocking=True)
                 mask_t = sm[:m].to(device, non_blocking=True)
                 action_t = sa[:m].to(device, non_blocking=True)
                 logp_old_t = sl[:m].to(device, non_blocking=True)
                 z = sz[:m].to(device, non_blocking=True)
                 v_old = sv[:m].to(device, non_blocking=True)
+                logq_t = sq[:m].to(device, non_blocking=True)
                 ev.record()
                 _slot_i ^= 1
             else:
@@ -1012,6 +1078,8 @@ def train_epochs(ai, buffer, args, device):
                                                 dtype=np.float32)).unsqueeze(1)
                 v_old = torch.from_numpy(np.asarray([b[4] for b in batch],
                                                     dtype=np.float32)).unsqueeze(1)
+                logq_t = torch.from_numpy(np.asarray([b[6] for b in batch],
+                                                     dtype=np.float32))
                 if pin_mem:
                     planes = planes.pin_memory()
                     mask_t = mask_t.pin_memory()
@@ -1019,19 +1087,22 @@ def train_epochs(ai, buffer, args, device):
                     logp_old_t = logp_old_t.pin_memory()
                     z = z.pin_memory()
                     v_old = v_old.pin_memory()
+                    logq_t = logq_t.pin_memory()
                 planes = planes.to(device, non_blocking=pin_mem)
                 mask_t = mask_t.to(device, non_blocking=pin_mem)
                 action_t = action_t.to(device, non_blocking=pin_mem)
                 logp_old_t = logp_old_t.to(device, non_blocking=pin_mem)
                 z = z.to(device, non_blocking=pin_mem)
                 v_old = v_old.to(device, non_blocking=pin_mem)
+                logq_t = logq_t.to(device, non_blocking=pin_mem)
 
             with maybe_autocast(device):
                 policy, value = model(planes)
                 # P3-C-c：A = z - v_old，按 minibatch 标准化（std 夹紧防 0 除）
                 adv = _compute_advantage(z, v_old)
                 loss_pi, ppo = _ppo_policy_loss(
-                    policy, mask_t, action_t, logp_old_t, adv, ppo_clip, beta)
+                    policy, mask_t, action_t, logp_old_t, adv, ppo_clip, beta,
+                    logq=logq_t, w_max=w_max)
                 # P3-D：value 侧 = MSE + PPO value clipping（ε 复用 ppo_clip）
                 loss_v, vstat = _ppo_value_loss(value, z, v_old, ppo_clip)
                 loss_raw = loss_pi + loss_v
@@ -1048,6 +1119,8 @@ def train_epochs(ai, buffer, args, device):
             stat_ent += ppo['entropy']
             stat_vmse += vstat['v_mse']
             stat_vclip += vstat['v_clip_frac']
+            stat_wmean += ppo['w_mean']
+            stat_wclip += ppo['w_clip_frac']
             stat_steps += 1
             epoch_kl += ppo['kl']
             epoch_kl_n += 1
@@ -1104,6 +1177,11 @@ def train_epochs(ai, buffer, args, device):
         'steps': stat_steps,
         'v_mse': stat_vmse / max(stat_steps, 1),
         'v_clip_frac': stat_vclip / max(stat_steps, 1),
+        # B2：w 的均值与触顶比例。w_mean ≈ 1 且 w_clip_frac ≈ 0 ⇒ 行为分布与
+        # 策略同族、修正形同虚设（正常情况）；w_clip_frac 高 ⇒ 采集在系统性偏离，
+        # 该看 --lookahead-mix / --importance-weight-max，而不是加大 --epochs。
+        'w_mean': stat_wmean / max(stat_steps, 1),
+        'w_clip_frac': stat_wclip / max(stat_steps, 1),
     }
 
     # eval 时用 EMA 权重
@@ -1154,6 +1232,9 @@ def main():
                     help="价值→概率的 τ_v（与 webui hybrid 同一个 0.2）")
     ap.add_argument("--lookahead-mix", type=float, default=DEFAULT_MIX,
                     help="q 里分给根策略的质量（保证满支撑；B2 权重 w=π/q 用它）")
+    ap.add_argument("--importance-weight-max", type=float, default=20.0,
+                    help="B2 重要性权重 w=π/q 的截断上界（双向：w∈[1/W, W]）。"
+                         "1.0 = 不修正（退化成去 MCTS 之前的 PPO）")
     ap.add_argument("--buffer-size", type=int, default=500, help="replay buffer 容量（局数，非样本数）")
     ap.add_argument("--batch-size", type=int, default=256,
                     help="训练 batch（C2: NPU 甜点 256，显存约 2-3x 旧 64）")
@@ -1576,6 +1657,13 @@ def main():
                                 "v_mse": _ppo_stats["v_mse"],
                                 "v_clip_frac": _ppo_stats["v_clip_frac"],
                             })
+                        # B2：w 的分布。w_mean≈1 且 w_clip_frac≈0 ⇒ π≈q（修正
+                        # 形同虚设）；w_clip_frac 高 ⇒ 采集系统性偏离策略族。
+                        if "w_mean" in _ppo_stats:
+                            swanlab_log.update({
+                                "w_mean": _ppo_stats["w_mean"],
+                                "w_clip_frac": _ppo_stats["w_clip_frac"],
+                            })
                     swanlab.log(swanlab_log, step=it)
 
                 # 同步模式：每轮训练完成后重置 buffer（训完即清，避免旧局
@@ -1606,37 +1694,45 @@ def main():
 def _process_game_data(game_data, score, bs, n_actions, buffer, args):
     """处理一局自对弈数据（TD 价值标签 + 8 对称增强），加入 buffer。
 
-    P3-C 行契约：
-      输入行 7 元组 (planes, action, logp_old, to_play, mc, root_value, mask) ——
-        采集端 self_play_game / async _play_one_game 共用（旧 5 元组
-        (planes, vt, to_play, mc, root_value) 直接拒收，提示跑旧采集端）；
-      输出行 6 元组 (planes, action, logp_old, z, v_old, mask) ——
-        z 由 compute_td_target 现算（index 3），v_old = root_value（index 5
-        采集行原值），action/logp_old/mask 原样。
+    2026-09-30（去 MCTS + B2）行契约：
+      输入行 **8 元组** (planes, action, logp_old, to_play, mc, v_collect, mask,
+      logq) —— 采集端 self_play_game / async _play_one_game 共用；
+      输出行 **7 元组** (planes, action, logp_old, z, v_old, mask, logq)：
+        z 由 compute_td_target 现算（index 3）；
+        v_old = **v_collect**（index 5）= 采集期 value 头的输出 = 标准 PPO 的
+          V_θ_old(s)。改造前这里是 MCTS 根价值；位置没变、语义变了 —— 无搜索
+          自博弈里 value 头是**唯一**价值源（TD 的终局分混合项仍在）；
+        logq = log q(action)（index 7），B2 重要性权重 w = π_θold/q 靠它。
+      旧 6 元组（无 logq）与更早的 5 元组一律拒收并提示。
     增强时动作与掩码走 augment8 的同一 D4 置换（动作亦被置换，见 augment8）。
     """
-    if game_data and len(game_data[0]) != 7:
+    if game_data and len(game_data[0]) != 8:
         raise ValueError(
-            f"采集行应为 P3-C 7 元组 (planes, action, logp_old, to_play, mc, "
-            f"root_value, mask)，实得 {len(game_data[0])} 元组 —— 旧 5 元组是 "
-            f"PPO 之前的采集布局（self_play_game / async _play_one_game 需同步升级）")
+            f"采集行应为 8 元组 (planes, action, logp_old, to_play, mc, "
+            f"v_collect, mask, logq)，实得 {len(game_data[0])} 元组 —— "
+            f"旧 7 元组是 2026-09-30 之前的布局（去 MCTS 前无 logq），"
+            f"6 元组是 P3-C 的 buffer 布局，5 元组是 PPO 之前的采集布局"
+            f"（self_play_game / async _play_one_game 需同步升级）")
     td = getattr(args, 'td', 0) == 1
     td_steps = getattr(args, 'td_steps', 3)
     td_ai = getattr(args, 'td_alpha_init', 0.2)
     td_ae = getattr(args, 'td_alpha_end', 0.9)
     players = np.asarray([row[3] for row in game_data])
-    root_values = np.asarray([row[5] for row in game_data])
+    v_collect = np.asarray([row[5] for row in game_data])
     for mc_idx, row in enumerate(game_data):
-        planes, action, logp_old, mask = row[0], int(row[1]), float(row[2]), row[6]
+        planes, action = row[0], int(row[1])
+        logp_old, mask, logq = float(row[2]), row[6], float(row[7])
+        # 第 5 列的语义：MCTS 根价值 → 采集期 V_θ_old(s)。TD 公式一个字没改
+        # （compute_td_target 仍按 root_values 收），只是数据源换了。
         z, _z_raw, _alpha = compute_td_target(
-            players, root_values, score, mc_idx,
+            players, v_collect, score, mc_idx,
             td, td_steps, td_ai, td_ae)
-        v_old = float(root_values[mc_idx])
+        v_old = float(v_collect[mc_idx])
         if getattr(args, 'no_augment', 0) == 1:
-            buffer.append((planes, action, logp_old, z, v_old, mask))
+            buffer.append((planes, action, logp_old, z, v_old, mask, logq))
         else:
             for pl, mk, ac in augment8(planes, mask, bs, action=action):
-                buffer.append((pl, int(ac), logp_old, z, v_old, mk))
+                buffer.append((pl, int(ac), logp_old, z, v_old, mk, logq))
 
 
 if __name__ == "__main__":

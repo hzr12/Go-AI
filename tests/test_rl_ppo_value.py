@@ -351,7 +351,7 @@ def _make_ai(seed=0, board=3, actions=5, value_const=None):
 
 
 def _flat_buffer(n=8, board=3, actions=5, seed=0, z=0.75, v_old=0.0):
-    """buffer 行 = P3-C 6 元组 (planes, action, logp_old, z, v_old, mask)。
+    """buffer 行 = 7 元组 (planes, action, logp_old, z, v_old, mask, logq)。
 
     **每行的 z 与 v_old 相同**、且 z - v_old 是常数 → A = z - v_old 经 minibatch
     标准化后**恒为 0**（不是「减掉 v_old 之前为 0」，而是标准化把它压平）。再配
@@ -373,11 +373,15 @@ def _flat_buffer(n=8, board=3, actions=5, seed=0, z=0.75, v_old=0.0):
     rng = np.random.default_rng(seed)
     rows = []
     for _ in range(n):
+        # logq = logp_old（w ≡ 1）：本文件的断言是「train_epochs 返回值精确等于
+        # L_v」，任何非 1 的 w 都会给策略项加上一项而破坏那个精确等式。B2 权重
+        # 本身由 tests/test_rl_b2_importance.py 单独钉。
+        _lpo = float(math.log(rng.uniform(0.1, 0.9)))
         rows.append((rng.random((12, board, board), dtype=np.float32),
                      int(rng.integers(0, actions)),
-                     float(math.log(rng.uniform(0.1, 0.9))),
+                     _lpo,
                      np.float32(z), np.float32(v_old),
-                     np.ones(actions, dtype=bool)))
+                     np.ones(actions, dtype=bool), _lpo))
     adv = st._compute_advantage(
         torch.tensor([r[3] for r in rows]).unsqueeze(1),
         torch.tensor([r[4] for r in rows]).unsqueeze(1))
@@ -444,7 +448,7 @@ def test_value_loss_wires_buffer_columns_and_eps(monkeypatch):
     buf = [(rng.random((12, board, board), dtype=np.float32),
             int(rng.integers(0, actions)), float(math.log(0.5)),
             np.float32(z_col[i]), np.float32(vo_col[i]),
-            np.ones(actions, dtype=bool)) for i in range(n)]
+            np.ones(actions, dtype=bool), float(math.log(0.5))) for i in range(n)]
     seen = []
     real = st._ppo_value_loss
 
@@ -507,7 +511,7 @@ def test_advantage_is_not_recomputed_from_new_value(monkeypatch):
     buf = [(rng.random((12, board, board), dtype=np.float32),
             int(rng.integers(0, actions)), float(math.log(0.5)),
             np.float32(z_col[i]), np.float32(vo_col[i]),
-            np.ones(actions, dtype=bool)) for i in range(n)]
+            np.ones(actions, dtype=bool), float(math.log(0.5))) for i in range(n)]
     calls = []
     real = st._compute_advantage
 

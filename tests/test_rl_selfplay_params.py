@@ -99,6 +99,8 @@ _LOOKAHEAD_NEW_PARAMS = (
     ('--lookahead-width', 'int', 4),
     ('--lookahead-temp', 'float', 0.2),
     ('--lookahead-mix', 'float', st.DEFAULT_MIX),
+    # B2：重要性权重截断上界（w = π/q ∈ [1/W, W]）
+    ('--importance-weight-max', 'float', 20.0),
 )
 
 
@@ -342,6 +344,8 @@ _EXPECTED_PARAM_SURFACE = (
     ('--lookahead-width', 'int', 4),
     ('--lookahead-temp', 'float', 0.2),
     ('--lookahead-mix', 'float', st.DEFAULT_MIX),
+    # B2：重要性权重截断上界（w = π/q ∈ [1/W, W]）
+    ('--importance-weight-max', 'float', 20.0),
     ('--buffer-size', 'int', 500),
     ('--batch-size', 'int', 256),
     # --epochs：P3.0 起语义 = PPO 更新轮数（路线图 D13 ⑦，不新增 --ppo-epochs）
@@ -468,8 +472,8 @@ def test_param_surface_matches_itemised_list_exactly():
                        f'路线图 D11 只允许 P3.0 +3 个参数，不许顺手多加')
     assert not wrong, (f'这些参数的 type/default 与清单不符（实为 type, default, 期望）: '
                        f'{wrong}')
-    assert len(surface) == len(_EXPECTED_PARAM_SURFACE) == 61, \
-        f'参数面应恰好 61 项（P3.0 前 53 + 3，去 MCTS 后 +5 个推演参数），实为 {len(surface)}'
+    assert len(surface) == len(_EXPECTED_PARAM_SURFACE) == 62, \
+        f'参数面应恰好 62 项（P3.0 前 53 + 3，去 MCTS 后 +5 推演 +1 权重），实为 {len(surface)}'
 
 
 def test_delta_is_exactly_three_ppo_kl_params():
@@ -495,8 +499,8 @@ def test_delta_is_exactly_three_ppo_kl_params():
         assert (got[0], got[1]) == (type_name, default), \
             f'{flag} 实为 type={got[0]} default={got[1]}，' \
             f'期望 type={type_name} default={default}'
-    assert len(surface) - len(before) == 8, \
-        f'增量应是 3 个 PPO/KL + 5 个推演参数（{len(surface)} - {len(before)}）'
+    assert len(surface) - len(before) == 9, \
+        f'增量应是 3 个 PPO/KL + 6 个推演/权重参数（{len(surface)} - {len(before)}）'
     assert not {f for f, _, _ in before} - set(surface), \
         '不允许删任何既有参数（MCTS 参数按 D1 保留定义、只归档）'
 

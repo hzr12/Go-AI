@@ -67,9 +67,13 @@ def _args(**over):
     return argparse.Namespace(**base)
 
 
-def _buffer(n=16, board=3, actions=5, seed=0, logp_old=0.0):
-    """P3-C 6 元组 buffer。logp_old=0.0（声称 p≈1）→ 与网络 logp 差出大正 KL，
-    专供提前中止测试；其他场景传自己的值。"""
+def _buffer(n=16, board=3, actions=5, seed=0, logp_old=0.0, logq=None):
+    """7 元组 buffer（2026-09-30 起：末位是 logq）。
+
+    logp_old=0.0（声称 p≈1）→ 与网络 logp 差出大正 KL，专供提前中止测试；
+    logq=None 时取 logp_old − 0.25（造出一个**温和**的 w 偏离，专门看 B2 权重
+    在真实训练循环里被正确装配，而不是恒等于 1 的退化情形）。
+    """
     rng = np.random.default_rng(seed)
     out = []
     for _ in range(n):
@@ -78,7 +82,8 @@ def _buffer(n=16, board=3, actions=5, seed=0, logp_old=0.0):
         z = np.float32(rng.uniform(-1, 1))
         v_old = np.float32(rng.uniform(-1, 1))
         mask = np.ones(actions, dtype=bool)
-        out.append((planes, action, float(logp_old), z, v_old, mask))
+        _lq = float(logp_old) - 0.25 if logq is None else float(logq)
+        out.append((planes, action, float(logp_old), z, v_old, mask, _lq))
     return out
 
 
@@ -397,9 +402,13 @@ def test_train_epochs_source_wires_ppo_only():
     assert '_compute_advantage(' in src, "A 未走 _compute_advantage（z - v_old）"
     assert '_adapt_kl_coef(' in src, "缺 β 自适应"
     assert '2.0 * kl_target' in src, "缺 2×kl-target 提前中止条件"
-    # 旧实现残留 = 变异红
+    # 旧实现残留 = 变异红。⚠ 'logq' 这一格在 2026-09-30 **反转**：B2 之后 logq
+    # 正是该出现在训练循环里的东西（旧的 CE 回归才是「logq 残留」）。现在要防的
+    # 反面是「B2 被悄悄摘掉」—— 即 logq 采到了却没进 policy loss。
     assert 'F.mse_loss' not in src, "策略侧回退成 MSE 回归"
-    assert 'logq' not in src, "旧 CE 回归的 logq 残留"
+    assert 'binary_cross_entropy' not in src, \
+        "策略侧回退成 CE 回归（旧实现用 logq 做过 CE，那是 B2 之前的历史）"
+    assert 'logq=logq_t' in src, 'logq 采到了却没传进 _ppo_policy_loss'
     assert 'pi_t' not in src, "PPO 后 pi_t 目标已移除"
     # value 侧：P3-D 已把 BCE 换成 MSE + PPO value clipping（helper 实现，见
     # test_rl_ppo_value.py）。这里锁「BCE 已彻底消失」+「loss_v 走新 helper」——
@@ -429,8 +438,11 @@ def test_train_epochs_source_wires_ppo_only():
     # async 端同一契约（路线图要求同步 async_pipeline.py 调用点）
     import scripts.async_pipeline as ap
     asrc = inspect.getsource(ap.SelfPlayWorker._play_one_game)
-    assert '_temperature_sample(' in asrc
-    assert 'mask = np.concatenate' in asrc
+    assert 'sample_move(' in asrc, 'async 采集未走走子器（应与串行同一实现）'
+    assert 'MCTS(' not in asrc, 'async 采集仍在构造 MCTS'
+    assert 's.policy[action]' in asrc and 's.probs[action]' in asrc, \
+        'async 回退分支必须分别按 π 与 q 重算'
+    assert 'mask, logq))' in asrc, 'async 采集行末位必须是 logq（8 元组）'
     # async 模式 logp_old 来自冻结生成策略（P3-0 §5.5-5）→ 必须有一次性告警，
     # 否则 ratio 起点≠1 与 KL 记账退化是**静默**的
     assert '_ppo_async_warned' in msrc, "async 模式缺 off-policy logp_old 告警"
@@ -575,14 +587,19 @@ def test_buffer_columns_wired_to_right_tensors():
     n, board, actions = 8, 3, 5
     rng = np.random.default_rng(3)
     logp_old_col = np.log(np.array([0.05, 0.07, 0.11, 0.13, 0.2, 0.3, 0.4, 0.5]))
+    # logq ≡ logp_old ⇒ B2 权重 w ≡ 1：本测试断言的是「返回值 = 1.0 − β·KL」这个
+    # 精确等式，任何非 1 的 w 都会往策略项里加一项而破坏它。权重语义另由
+    # tests/test_rl_b2_importance.py 钉。
+    logq_col = np.log(np.array([0.05, 0.07, 0.11, 0.13, 0.2, 0.3, 0.4, 0.5]))
     buf = []
     for i in range(n):
         buf.append((rng.random((12, board, board), dtype=np.float32),
                     int(rng.integers(0, actions)),   # 列 1: action
-                    float(logp_old_col[i]),           # 列 2: logp_old（行为值）
+                    float(logp_old_col[i]),           # 列 2: logp_old（π 族）
                     np.float32(1.0),                  # 列 3: z → target=1、adv≡0
                     np.float32(0.0),                  # 列 4: v_old → 0
-                    np.ones(actions, dtype=bool)))    # 列 5: mask
+                    np.ones(actions, dtype=bool),     # 列 5: mask
+                    float(logq_col[i])))              # 列 6: logq（q 族）
     args = _args(batch_size=n, epochs=1, kl_coef=0.01, kl_target=1e6)
     ai = _make_ai(seed=3, board=board, actions=actions)
     ai.model.v.weight.data.zero_()      # value ≡ 0 → L_v = max(1, 0.64) = 1.0（P3-D）
@@ -625,6 +642,7 @@ def test_buffer_columns_wired_to_right_tensors():
 # 11. 全链路冒烟：7 元组行 → buffer → train_epochs → stats + β 持久化
 # --------------------------------------------------------------------------- #
 def _game_rows(bs=5, steps=4, seed=9):
+    """8 元组采集行（2026-09-30：末位 logq，第 5 列语义改为采集期 V_θold）。"""
     n_actions = bs * bs + 1
     rng = np.random.default_rng(seed)
     rows = []
@@ -633,18 +651,21 @@ def _game_rows(bs=5, steps=4, seed=9):
         action = int(rng.integers(0, n_actions))
         logp_old = float(np.log(rng.random() + 1e-3))
         player = 1 if i % 2 == 0 else -1
-        root_value = float(rng.uniform(-1, 1))
+        v_collect = float(rng.uniform(-1, 1))
+        # logq 与 logp_old **不同族**：这里给一个系统性的偏移（-0.2），
+        # 让 B2 权重在该链路测试里真的非 1（w = exp(0.2) ≈ 1.22）。
+        logq = logp_old - 0.2
         mask = np.ones(n_actions, dtype=bool)
         cell = int(rng.integers(0, n_actions - 1))   # 不碰恒合法的 pass 槽
         mask[cell] = False
         if not mask[action]:
             mask[action] = True                      # 行为动作必须合法
-        rows.append((planes, action, logp_old, player, i, root_value, mask))
+        rows.append((planes, action, logp_old, player, i, v_collect, mask, logq))
     return rows, n_actions
 
 
 def test_full_chain_7tuple_to_train_and_beta_persists(monkeypatch):
-    """7 元组行 → 6 元组 buffer → 训练；β 挂 ai 不从 --kl-coef 重读。"""
+    """8 元组行 → 7 元组 buffer → 训练；β 挂 ai 不从 --kl-coef 重读。"""
     rows, n_actions = _game_rows()
     args = _args(no_augment=0, td=0, td_steps=3, td_alpha_init=0.2,
                  td_alpha_end=0.9)
@@ -654,11 +675,13 @@ def test_full_chain_7tuple_to_train_and_beta_persists(monkeypatch):
     assert len(buf) == 8 * len(rows)
     zs = []
     for i, r in enumerate(buf):
-        assert len(r) == 6, f"buffer 行应为 6 元组，实得 {len(r)}"
-        planes, action, logp_old, z, v_old, mask = r
+        assert len(r) == 7, f"buffer 行应为 7 元组，实得 {len(r)}"
+        planes, action, logp_old, z, v_old, mask, logq = r
         assert mask.shape == (n_actions,) and mask.dtype == np.bool_
         assert 0 <= action < n_actions and mask[action], "增强后动作不在掩码内"
         assert np.isfinite(logp_old) and -1.0 <= z <= 1.0
+        # logq 原样进 buffer（8 份增强共享同一值 —— 对称不改变概率）
+        assert logq == pytest.approx(rows[i // 8][7]), f'第 {i} 行的 logq 不对'
         zs.append(z)
     # 同一行的 8 份增强共享同一 z（z 与增强无关）
     assert len(set(zs)) == len(rows)

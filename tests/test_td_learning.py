@@ -253,9 +253,9 @@ def test_augment8_matches_legacy():
 def _process_game_data_regression():
     """_process_game_data 在 td=0 时与旧公式一致；td=1 时接入 TD。
 
-    P3-C 行契约：输入 7 元组 (planes, action, logp_old, player, mc, root_value,
-    mask)，输出 6 元组 (planes, action, logp_old, z, v_old, mask) —— z 在
-    index 3（旧布局 index 2），v_old = root_value。
+    行契约（2026-09-30 起）：输入 **8** 元组 (planes, action, logp_old, player,
+    mc, v_collect, mask, logq)，输出 **7** 元组 (planes, action, logp_old, z,
+    v_old, mask, logq) —— z 在 index 3（旧布局 index 2），v_old = v_collect。
     """
     import argparse
     n = 5
@@ -270,7 +270,10 @@ def _process_game_data_regression():
         player = 1 if i % 2 == 0 else -1
         root_value = float(rng.uniform(-1, 1))
         mask = np.ones(n_actions, dtype=bool)
-        game_data.append((planes, action, logp_old, player, i, root_value, mask))
+        # logq 与 logp_old 刻意不同（B2 权重 w=exp(0.2)）：TD 回归与权重正交，
+        # 权重的语义由 tests/test_rl_b2_importance.py 单独钉。
+        game_data.append((planes, action, logp_old, player, i, root_value, mask,
+                          logp_old - 0.2))
 
     args0 = argparse.Namespace(td=0, td_steps=3, td_alpha_init=0.2,
                                td_alpha_end=0.9, no_augment=1)
@@ -280,11 +283,12 @@ def _process_game_data_regression():
     assert len(buf0) == n
     for i, row in enumerate(game_data):
         out = buf0[i]
-        assert len(out) == 6, f"buffer 行应为 P3-C 6 元组，实得 {len(out)}"
-        # action/logp_old/mask 原样透传；z 在 index 3；v_old = root_value
+        assert len(out) == 7, f"buffer 行应为 7 元组，实得 {len(out)}"
+        # action/logp_old/mask/logq 原样透传；z 在 index 3；v_old = v_collect
         assert out[1] == row[1] and out[2] == row[2]
         assert np.array_equal(out[5], row[6])
-        assert out[4] == row[5], f"v_old 应等于采集行 root_value t={i}"
+        assert out[6] == row[7], f"logq 应原样透传 t={i}"
+        assert out[4] == row[5], f"v_old 应等于采集行 v_collect t={i}"
         z_expect = _old_z_soft(_z_raw_for(1, row[3]), i, n)
         assert out[3] == z_expect, f"td=0 回归 t={i}"
 
@@ -308,10 +312,10 @@ def _process_game_data_regression():
         sp._process_game_data([legacy_row], score=1, bs=bs,
                               n_actions=n_actions, buffer=[], args=args0)
     except ValueError as e:
-        assert "7 元组" in str(e)
+        assert "8 元组" in str(e)
     else:
         raise AssertionError("旧 5 元组采集行未被拒收")
-    print("PASS _process_game_data td=0 回归 + td=1 接入（P3-C 7→6 行契约）")
+    print("PASS _process_game_data td=0 回归 + td=1 接入（8→7 行契约）")
 
 
 def test_process_game_data_p3c_layout():

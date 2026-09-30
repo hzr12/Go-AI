@@ -11,11 +11,11 @@
 └─────────────────────────────────────────────────────────────┘
                             ↓
 ┌─────────────────────────────────────────────────────────────┐
-│              Worker Processes (8× ONNX + MCTS)               │
+│              Worker Processes (8× ONNX + 推演采样)              │
 │  ┌──────────┐ ┌──────────┐ ... ┌──────────┐                │
 │  │ Worker 1 │ │ Worker 2 │     │ Worker 8 │                │
 │  │ ONNX     │ │ ONNX     │     │ ONNX     │                │
-│  │ MCTS(3t) │ │ MCTS(3t) │     │ MCTS(3t) │                │
+│  │ minimax  │ │ minimax  │     │ minimax  │                │
 │  └──────────┘ └──────────┘     └──────────┘                │
 └─────────────────────────────────────────────────────────────┘
 
@@ -134,7 +134,6 @@ class SelfPlayWorker(Process):
                 use_amp=True
             )
         
-        from src.search.mcts import MCTS
         from src.game.go_rules import GoBoard
         
         n_actions = self.args.board_size * self.args.board_size + 1
@@ -169,96 +168,78 @@ class SelfPlayWorker(Process):
                 time.sleep(0.1)
     
     def _play_one_game(self, ai, n_actions, max_moves):
-        """运行一局自对弈。行契约与 selfplay_train.self_play_game 一致（P3-C 7 元组）。"""
-        from src.search.mcts import MCTS
+        """运行一局自对弈（**无 MCTS**：N 步 minimax 推演采样）。
+
+        行契约与 `selfplay_train.self_play_game` **逐项一致**（2026-09-30 去 MCTS
+        后的 8 元组）：(planes, action, logp_old, to_play, mc, v_collect, mask,
+        logq)。两条采集路径的契约必须一模一样 —— 不一致就是「异步与串行跑出
+        不同的对局/不同的 buffer 布局」，且症状是静默的。
+        """
         from src.game.go_rules import GoBoard
-        from scripts.selfplay_train import _temperature_sample
-        
-        mcts = MCTS(
-            ai, 
-            board_size=self.args.board_size,
-            num_threads=self.args.mcts_threads,
-            expand_topk=self.args.expand_topk,
-            expand_chunk=self.args.expand_chunk,
-            priors_leaf=True,
-            temperature=self.args.temperature,
-            dirichlet_alpha=self.args.dir_alpha if hasattr(self.args, 'dir_alpha') else 0.3,
-            dirichlet_eps=self.args.dir_eps if hasattr(self.args, 'dir_eps') else 0.25,
-            spec_prefetch=bool(getattr(self.args, 'spec_prefetch', False)),
-            use_rollout=getattr(self.args, 'use_rollout', False),
-            rollout_lambda=getattr(self.args, 'rollout_lambda', 0.25),
-            leaf_ab_depth=getattr(self.args, 'leaf_ab_depth', 2),
-            c_puct=getattr(self.args, 'c_puct', 2.0),
-            virtual_loss=getattr(self.args, 'virtual_loss', 8.0),
-            dynamic_topk=getattr(self.args, 'dynamic_topk', True),
-            dynamic_virtual_loss=getattr(self.args, 'dynamic_virtual_loss', True),
-            vector_backup=getattr(self.args, 'mcts_vector_backup', 1) == 1
-        )
-        
+        from src.search.policy_sampler import sample_move
+
         board = GoBoard(self.args.board_size)
         hists = [[-1, -1, -3], [-1, -1, -3]]
         passes = 0
         mc = 0
         path_moves = []
         data = []
-        
+
         while passes < 2 and mc < max_moves:
             to_play = board.current_player
             legal = board.get_legal_moves()
-            
+
             if not legal.any():
                 board.play(-1)
                 path_moves.append(-1)
                 passes += 1
                 mc += 1
                 continue
-            
-            _visits, probs, root_value = mcts.search(
-                board, hists[0], hists[1], to_play,
-                simulations=self.args.sims,
-                path_moves=path_moves
-            )
-            
-            # 记录样本（P3-C 7 元组，与 selfplay_train.self_play_game 同一契约：
-            # (planes, action, logp_old, to_play, mc, root_value, mask)，见彼处 docstring）
-            # ⚠ 通道数随模型走（P4.2 接线，与 selfplay_train 同一契约）：
-            #   旧权重 12ch / v21 17ch，钉死字面量会让另一半场景的 planes 与
-            #   ai.in_channels 不匹配。
-            planes = np.ascontiguousarray(board.feature_planes_batched(
-                board.board[None], [list(hists[0])], [list(hists[1])],
-                [to_play], [board.ko_point], n_channels=ai.in_channels)[0])
-            # 合法掩码必须在落子前取：n² 来自 get_legal_moves()（无 pass 槽），
-            # 拼恒合法的 pass 槽 → n²+1，与网络 logits 同宽
-            mask = np.concatenate((legal, np.array([True])))
-            # 温度衰减采样：单一真相源 _temperature_sample（两级温度后分布，
-            # logp_old 必须取它的 log-prob —— P3.0 §5.5-1）
-            mv, logp_old, p_norm = _temperature_sample(probs, mc)
+
+            # 走子器一次给出 planes / 行为分布 q / 根估值 / 根 policy π，
+            # planes 与推演**共用同一次**特征计算（不再像改造前那样算两遍）。
+            s = sample_move(
+                ai, board, hists[0], hists[1], to_play,
+                topk=getattr(self.args, 'lookahead_topk', 12),
+                width=getattr(self.args, 'lookahead_width', 4),
+                depth=getattr(self.args, 'lookahead_depth', 2),
+                lookahead_temp=getattr(self.args, 'lookahead_temp', 0.2),
+                mix=getattr(self.args, 'lookahead_mix', 0.1),
+                mc=mc)
+            mv = s.action
+            mask = s.mask
             pmv = -1 if mv == n_actions - 1 else mv
-            
+
             success = board.play(pmv)
             if not success:
                 board.play(-1)
                 pmv = -1
-            
-            # 实际走的着法才是行为策略「执行」的动作；play 拒绝回退 pass 时
-            # logp_old 跟着重算 pass 的 log-prob（动作与 logp_old 锚定同一分布）
+
+            # 实际走的着法才是行为策略「执行」的动作：play 拒绝回退 pass 时，
+            # logq 取 **q(pass)**、logp_old 取 **π(pass)**（混用会让 B2 的
+            # 重要性权重悄悄退化成 1）。
             action = n_actions - 1 if pmv < 0 else pmv
             if action != mv:
-                logp_old = float(np.log(p_norm[action])) if p_norm[action] > 0 else 0.0
-            data.append((planes, int(action), logp_old, to_play, mc,
-                         float(root_value), mask))
-            
+                q_act = float(s.probs[action])
+                pi_act = float(s.policy[action])
+                logq = float(np.log(q_act)) if q_act > 0 else 0.0
+                logp_old = float(np.log(pi_act)) if pi_act > 0 else 0.0
+            else:
+                logq, logp_old = s.logq, s.logp_old
+            data.append((s.planes, int(action), logp_old, to_play, mc,
+                         float(s.value), mask, logq))
+
             path_moves.append(pmv)
             h = hists[0] if to_play == 1 else hists[1]
             h.pop(0)
             h.append(pmv)
-            
+
             if pmv >= 0:
                 passes = 0
             else:
                 passes += 1
             mc += 1
-        
+
         return data, board.score()
 
 
@@ -366,7 +347,7 @@ class AsyncSelfPlayPipeline:
     def _process_game_data(self, game_data, score, bs, n_actions):
         """处理一局游戏数据（P3-C：唯一实现委托 selfplay_train._process_game_data）。
 
-        行契约 7 元组 / buffer 契约 6 元组见该函数 docstring。此前这里是手抄
+        行契约 8 元组 / buffer 契约 7 元组见该函数 docstring。此前这里是手抄
         副本，会与主实现静默分叉（buffer 布局一变就 KeyError/错位）——委托共享。
         """
         from scripts.selfplay_train import _process_game_data as _shared_process

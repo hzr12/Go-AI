@@ -50,18 +50,20 @@ def _args(**over):
 def _game(board=2, moves=10):
     """构造一局自对弈数据。
 
-    采集行契约是 **7 元组**（P3-C）：`(planes, action, logp_old, to_play, mc,
-    root_value, mask)`。PPO 之前是 5 元组 `(planes, vt, to_play, mc, root_value)` ——
-    第二位从「visit 分布向量」换成了「实际动作 + 该动作的 log-prob」，因为 PPO 的
-    importance ratio 需要行为策略在**采集时**的 log-prob，而不是事后从 visit 数反推。
-    `mask` 是合法着法掩码（n²+1，含恒合法的 pass 槽）。
+    采集行契约是 **8 元组**（2026-09-30 去 MCTS 起）：`(planes, action, logp_old,
+    to_play, mc, v_collect, mask, logq)`。倒数第二、三代是 7 元组（无 logq）与
+    5 元组（PPO 之前的 `(planes, vt, to_play, mc, root_value)`）—— 第二位从
+    「visit 分布向量」换成了「实际动作 + 该动作的 log-prob」，因为 PPO 的
+    importance ratio 需要策略在**采集时**的 log-prob，而不是事后从 visit 数反推。
+    `mask` 是合法着法掩码（n²+1，含恒合法的 pass 槽）；`logq` 是行为分布
+    （B2 权重 w = π/q 靠它）。
     """
     n_actions = board * board + 1
     rows = []
     for t in range(moves):
         planes = np.zeros((12, board, board), dtype=np.float32)
         mask = np.ones(n_actions, dtype=bool)
-        rows.append((planes, 0, -0.5, 1, t, 0.1, mask))
+        rows.append((planes, 0, -0.5, 1, t, 0.1, mask, -0.7))
     return rows
 
 

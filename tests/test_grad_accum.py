@@ -51,7 +51,7 @@ def _args(**over):
 
 
 def _buffer(n=16, board=3, actions=5, seed=0):
-    """构造 n 条合法 buffer 样本（P3-C 6 元组：planes, action, logp_old, z, v_old, mask）。"""
+    """构造 n 条合法 buffer 样本（P3-C 7 元组：planes, action, logp_old, z, v_old, mask, logq）。"""
     rng = np.random.default_rng(seed)
     out = []
     for _ in range(n):
@@ -63,7 +63,9 @@ def _buffer(n=16, board=3, actions=5, seed=0):
         z = np.float32(rng.uniform(-1, 1))
         v_old = np.float32(rng.uniform(-1, 1))
         mask = np.ones(actions, dtype=bool)
-        out.append((planes, action, logp_old, z, v_old, mask))
+        # 7 元组（2026-09-30 起末位是 logq）。这里取 logq = logp_old ⇒ w ≡ 1，
+        # 本文件只验梯度清零/累积语义，不该被 B2 权重干扰。
+        out.append((planes, action, logp_old, z, v_old, mask, logp_old))
     return out
 
 

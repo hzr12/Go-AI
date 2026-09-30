@@ -423,7 +423,7 @@ python scripts/selfplay_train.py \
   --out models/az_best.pth
 
 # ============================================================
-# ③' RL 完整参数表（selfplay_train.py，61 项；默认值均取自 --help/源码）
+# ③' RL 完整参数表（selfplay_train.py，62 项；默认值均取自 --help/源码）
 # ============================================================
 # 用法：完整命令加 --help；下表为默认值，命令行显式传入即覆盖。
 #
@@ -443,6 +443,12 @@ python scripts/selfplay_train.py \
 #   --lookahead-temp F        价值→概率的 τ_v；默认 0.2（与 webui hybrid 同值）
 #   --lookahead-mix F         q 里分给根策略的质量；默认 0.1（保证满支撑；
 #                             B2 重要性权重 w = π/q 依赖它，置 0 会让 q 无支撑）
+#   --importance-weight-max F B2 权重 w=π/q 的截断上界；默认 20（w∈[1/20,20]）。
+#                             1.0 = 不修正（退化成去 MCTS 之前的 PPO）。
+#                             日志看 w_mean / w_clip_frac：w_mean≈1 且
+#                             w_clip_frac≈0 ⇒ π≈q（修正形同虚设，正常）；
+#                             w_clip_frac 高 ⇒ 采集系统性偏离，调 --lookahead-mix
+#                             或本参数，**不要**靠加 --epochs 硬扛。
 #   每层前向的 batch ≈ K×W = 48，与「一次 MCTS 模拟」不可直接比较。
 #
 # --- 初始权重 / 对局规模 ---
