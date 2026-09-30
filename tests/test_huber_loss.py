@@ -52,6 +52,16 @@ P4.5b-fix3 追加（对应 task-p4-5b-fix-brief.md 的 review 修复轮）：
 * 删掉 `assert isinstance(_opt(net), torch.optim.AdamW)`（`_opt` 自己就构造
   AdamW，该断言**永远为真**、不可证伪）。
 
+P4.6 追加（对应 task-p4-6-optimizer-brief.md §4/§5）：
+* `test_opt_log_separation_holds_under_fused_optimizer` —— fused 构造（P4.6 的
+  `build_adamw`）**不改变** `{wd,0,wd,0}` 布局、`c‖θ‖²` 报告口径（同权重下与标准
+  构造**逐位相等**）以及 opt_loss/log_loss 恒等式与梯度分离 —— 复用本文件既有
+  `_Tiny/_opt/_WD` 与 fp32 容差口径，不另起炉灶。
+* `test_optimizer_param_groups_unchanged` 的构造点断言随 P4.6 改写：AdamW 构造从
+  main() 移进 `build_adamw`（设备策略/回退契约的唯一入口），扫描范围改为
+  「全模块 + 构造点必须落在 build_adamw 内 + 吃它的入参」；意图（AdamW 仍是
+  AdamW、每处构造都吃 `_build_param_groups` 的产物）一字不变。
+
 原则：
 * Huber 的正确性 oracle = torch 官方 `F.smooth_l1_loss(..., beta=...)`
   逐位对拍 + 一份手写公式的独立复核；**不 import 任何「旧实现」**。
@@ -1497,15 +1507,109 @@ def test_optimizer_param_groups_unchanged():
     #   **永远为真**、永远不可能变红（review 的 Minor 第 1 条：不可证伪断言）。
     #   真正想说的「解耦衰减的载体还是 AdamW」由下面两条**可证伪**的检查承担：
     #   构造点数量与分组来源，以及 `_build_param_groups` 里没有渗进 L2。
+    # ⚠ P4.6 改写构造点断言（意图不变，见本文件 docstring「P4.6 追加」）：
+    #   AdamW 构造从 main() 移进 `build_adamw`（fused 设备策略/回退契约的唯一
+    #   入口），故扫描范围从「main() 内」改为「**全模块**」，并钉三点——
+    #   构造点没有丢（≥1）、每个都落在 build_adamw 内（绕过设备策略 ⇒ 红）、
+    #   每个都吃它的入参 param_groups（丢分组 ⇒ 红）。
     main_src = inspect.getsource(t.main)
-    assert main_src.count('torch.optim.AdamW(') == \
-        main_src.count('AdamW(_opt_groups'), \
-        '有 AdamW 构造点没在用 _build_param_groups 的分组'
-    assert main_src.count('torch.optim.AdamW(') >= 1, 'AdamW 构造点不见了'
+    tree = _module_tree()
+    builder = next((n for n in tree.body if isinstance(n, ast.FunctionDef)
+                    and n.name == 'build_adamw'), None)
+    assert builder is not None, \
+        'build_adamw 不见了（P4.6：fused 设备策略/回退契约的唯一构造入口）'
+
+    def _is_adamw(node):
+        f = getattr(node, 'func', None)
+        return (isinstance(f, ast.Attribute) and f.attr == 'AdamW'
+                and isinstance(f.value, ast.Attribute) and f.value.attr == 'optim'
+                and isinstance(f.value.value, ast.Name)
+                and f.value.value.id == 'torch')
+
+    all_calls = [c for c in ast.walk(tree)
+                 if isinstance(c, ast.Call) and _is_adamw(c)]
+    in_builder = [c for c in ast.walk(builder)
+                  if isinstance(c, ast.Call) and _is_adamw(c)]
+    assert all_calls, 'AdamW 构造点不见了'
+    assert len(in_builder) == len(all_calls), (
+        f'有 AdamW 构造点没落在 build_adamw 里（绕过设备策略/回退契约）：'
+        f'模块内 {len(all_calls)} 处、build_adamw 内 {len(in_builder)} 处')
+    for c in in_builder:
+        a0 = c.args[0] if c.args else None
+        assert isinstance(a0, ast.Name) and a0.id == 'param_groups', (
+            f'构造点没吃 build_adamw 的入参 param_groups：{ast.unparse(c)}')
+    assert 'build_adamw(_opt_groups' in main_src, \
+        'main() 没有把 _build_param_groups 的产物交给 build_adamw'
     assert '_build_param_groups(model, args)' in main_src, \
         'param_groups 的来源被换掉了'
     assert 'compute_l2_report' not in ast.unparse(_fn('_build_param_groups')), \
         'compute_l2_report 渗进了 _build_param_groups（优化器不得动）'
+
+
+def test_opt_log_separation_holds_under_fused_optimizer():
+    """P4.6：fused 构造**不改变** opt_loss/log_loss 分离与 c‖θ‖² 口径。
+
+    复用本文件既有口径（`_Tiny/_opt/_WD`、`compose_losses`、fp32 恒等式容差），
+    把 `test_log_loss_identity` 的核心守卫放到 **fused 优化器的真实 l2** 上复跑：
+
+    (1) fused 构造后四组 wd 布局仍是 `{wd, 0, wd, 0}`、per-group lr 与标准构造
+        一致 —— fused 只换 kernel 不换超参（fused 分组被改 ⇒ 这里红）；
+    (2) 同权重下 fused 与标准构造的 `compute_l2_report` **逐位相等**且为纯
+        `float` —— 报告口径与优化器实现无关（fused 侧 wd 被改 ⇒ 这里红）；
+    (3) `log − opt == l2`（fp32 容差）+ 两口径梯度 `torch.equal` —— §3.1 的
+        「L2 不进梯度」在 fused 优化器在场时照样成立（l2 被折进 opt_loss ⇒ 红）。
+    """
+    class _A:
+        lr, weight_decay, value_lr_mult = 0.1, _WD, 5.0
+
+    torch.manual_seed(_HEAD_SEED)
+    net_f = _Tiny()
+    opt_f, mode = t.build_adamw(t._build_param_groups(net_f, _A()), 'cuda')
+    torch.manual_seed(_HEAD_SEED)
+    net_s = _Tiny()
+    opt_s = _opt(net_s)                     # HEAD 口径的标准构造
+
+    # (1) 分组布局与 per-group lr：fused 不得碰超参
+    assert mode == 'fused', f"device='cuda' 未选中 fused，实得 {mode!r}"
+    wds = [g['weight_decay'] for g in opt_f.param_groups]
+    assert wds == [_WD, 0.0, _WD, 0.0], \
+        f'fused 构造改变了四组 weight_decay 布局: {wds}'
+    lrs_f = [g['lr'] for g in opt_f.param_groups]
+    lrs_s = [g['lr'] for g in opt_s.param_groups]
+    assert lrs_f == lrs_s, f'fused 构造改变了 per-group lr: {lrs_f} vs {lrs_s}'
+    assert [len(g['params']) for g in opt_f.param_groups] == \
+        [len(g['params']) for g in opt_s.param_groups], \
+        'fused 构造改变了分组的参数归属'
+
+    # (2) 同权重 ⇒ c‖θ‖² 报告逐位相等，且仍是纯 float（报告量不进图）
+    l2_f = t.compute_l2_report(opt_f.param_groups)
+    l2_s = t.compute_l2_report(opt_s.param_groups)
+    assert isinstance(l2_f, float) and not isinstance(l2_f, torch.Tensor), \
+        f'fused 优化器的 l2_report 不是 python float: {type(l2_f)}'
+    assert l2_f == l2_s, (
+        f'同权重下 fused 与标准构造的 c‖θ‖² 报告不逐位相等: '
+        f'{l2_f!r} vs {l2_s!r}（fused 改了衰减/报告口径？）')
+    assert l2_f > 0.0, 'l2_report 应为正（同 test_log_loss_identity 的探针有效性要求）'
+
+    # (3) 恒等式 + 梯度分离（容差公式与 test_log_loss_identity 同口径）
+    eps32 = float(torch.finfo(torch.float32).eps)
+    pol = torch.tensor(2.0, requires_grad=True)
+    val = torch.tensor(0.5, requires_grad=True)
+    opt_l, log_l = t.compose_losses(pol, val, 1.0, l2_f)
+    gap = abs(float(log_l.detach() - opt_l.detach()) - l2_f)
+    tol = 8 * eps32 * abs(float(log_l.detach()))
+    assert gap <= tol, (
+        f'fused 优化器在场时恒等式不成立: |log−opt−l2|={gap:.3e} > {tol:.3e}')
+    grads = []
+    for idx in (0, 1):
+        pol = torch.tensor(2.0, requires_grad=True)
+        val = torch.tensor(0.5, requires_grad=True)
+        pair = t.compose_losses(pol, val, 1.0, l2_f)
+        pair[idx].backward()
+        grads.append((pol.grad.clone(), val.grad.clone()))
+    assert torch.equal(grads[0][0], grads[1][0]), \
+        '两口径梯度不同 ⇒ L2 项进了计算图（§3.1 在 fused 路径上被漏改）'
+    assert torch.equal(grads[0][1], grads[1][1])
 
 # --------------------------------------------------------------------------- #
 # 12.（P4.5b 简报 §5 第 7/8 条）生产头上的梯度实测 —— 三次三个数的解药
