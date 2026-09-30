@@ -15,6 +15,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import math
+import re
 import time
 import numpy as np
 import torch
@@ -80,6 +81,75 @@ def _state_key_sample(state, limit=6):
         return [str(k) for k in list(state)[:limit]]
     except TypeError:  # pragma: no cover - state 不是可迭代映射
         return [type(state).__name__]
+
+
+#: 旧代 value 残差块的键名前缀（`value.resN.*`，N 从 1 起）。
+_LEGACY_VALUE_BLOCK_RE = re.compile(r'^value\.res(\d+)\.(.+)$')
+#: 当前 value 残差块的键名前缀（`value.res_blocks.N.*`，N 从 0 起）。
+_VALUE_BLOCK_RE = re.compile(r'^value\.res_blocks\.(\d+)\.')
+
+
+def remap_legacy_value_keys(sd):
+    """把旧版 `ValueNetwork` 的键名归一到当前代码；返回 (state_dict, 移动数)。
+
+    当前 `value_network.py` 用 `self.res_blocks = nn.ModuleList([...])`
+    → `value.res_blocks.0.*`；`e2d0b57` 之前直接在 value 下挂 `res1 / res2 / ...`
+    → `value.res1.*`。现役 `models/sft_19x19_v12.pth` 就是那一代的权重（2 块）。
+
+    只改键名、**不动任何数值**：块类（`_ValueResBlock`）、顺序、通道数都没变，
+    所以重映射后与源模型逐位等价。块数由 `_infer_architecture` 另外从权重
+    推断（`value_res_blocks`）—— 只重映射不改块数的话，建出来的 3 块 head 里
+    第 3 块仍然没有权重可载，那块还是随机的（这正是本函数存在的另一半理由）。
+
+    `scripts/inspect_ckpt.py` 复用本函数（同一份正则与口径），避免「加载能过
+    但 inspect 说缺键」这类两份实现互相打架的毛病。
+    """
+    if any(k.startswith('value.res_blocks.') for k in sd):
+        return sd, 0            # 已是当前命名：幂等
+    if not any(_LEGACY_VALUE_BLOCK_RE.match(k) for k in sd):
+        return sd, 0            # 没有旧版键也没得可映射
+    out = {}
+    moved = 0
+    for k, v in sd.items():
+        m = _LEGACY_VALUE_BLOCK_RE.match(k)
+        if m:
+            out['value.res_blocks.%d.%s' % (int(m.group(1)) - 1, m.group(2))] = v
+            moved += 1
+        else:
+            out[k] = v
+    return out, moved
+
+
+def infer_value_head(state):
+    """从 state_dict 读 value 头的两个形状参数：**两种命名都认**。
+
+    返回 `{'value_channels': int|None, 'value_res_blocks': int|None}`（读不到的
+    键给 None，调用方据此跳过重建）。
+
+    - `value_channels`：`value.downsample.0.weight` 的 out 维。两代都在，形状
+      不会说谎。⚠ 旧实现查的是 `value.value_head.0.weight` —— 那个键**两代都
+      不存在**（value 头一直是 `downsample` Sequential + 残差块 + `fc`），
+      所以过去这条推断等于没跑，value_channels 恒为默认 64。
+    - `value_res_blocks`：`res_blocks.N` 的最大 N+1（旧命名 `resN` 折成 N-1）。
+      不推断的后果就是「权重 2 块、模型 3 块 ⇒ 第 3 块随机初始化」。
+    """
+    out = {'value_channels': None, 'value_res_blocks': None}
+    for k, v in state.items():
+        if k == 'value.downsample.0.weight' and isinstance(v, torch.Tensor):
+            out['value_channels'] = int(v.shape[0])
+            break
+    idx = set()
+    for k in state:
+        m = _VALUE_BLOCK_RE.match(k)
+        if m:
+            idx.add(int(m.group(1)))
+            continue
+        m = _LEGACY_VALUE_BLOCK_RE.match(k)
+        if m:
+            idx.add(int(m.group(1)) - 1)
+    if idx:
+        out['value_res_blocks'] = max(idx) + 1
+    return out
 
 
 def _build_for_in_channels(in_channels, **arch_kwargs):
@@ -153,7 +223,7 @@ class GoAI:
                  backbone_channels=128, backbone_res_blocks=12, policy_channels=32, value_channels=64,
                  attention_mode="mix", num_attention_layers=4, num_heads=4, attention_dropout=0.0,
                  attn_mode="global", attn_window=7, compile=False, tf32=False,
-                 channels_last=True, policy_layers=2):
+                 channels_last=True, policy_layers=2, value_res_blocks=3):
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else (
                 "npu" if _ensure_torch_npu() and torch.npu.is_available() else "cpu")
@@ -208,6 +278,14 @@ class GoAI:
             if inferred_ic != 12:
                 print(f"[GoAI] 权重 stem 推断 in_channels={inferred_ic}，"
                       f"特征/前向通道数随模型驱动")
+            # 旧代 value 头命名（value.res1/res2/...）归一到当前命名（e2d0b57
+            # 之前 vs 之后）。纯键名重映射，数值不动 —— 不做这一步的话旧权重
+            # 的 value 块会被 strict=False 报成 unexpected 丢掉、模型里的
+            # value 块则停在随机初始化，而这一切**不报错**。
+            state, _moved_value_keys = remap_legacy_value_keys(state)
+            if _moved_value_keys:
+                print(f"[GoAI] 旧版 value 头键名（value.res1/res2/...）已归一为 "
+                      f"value.res_blocks.*：{_moved_value_keys} 个张量（数值未改）")
 
         net_kwargs = dict(
             backbone_channels=backbone_channels,
@@ -220,6 +298,7 @@ class GoAI:
             attn_window=attn_window,
             policy_channels=policy_channels,
             value_channels=value_channels,
+            value_res_blocks=value_res_blocks,
             action_size=board_size * board_size + 1,  # +1 = 虚着
             policy_layers=policy_layers,
         )
@@ -302,7 +381,17 @@ class GoAI:
                 needs_rebuild = True
             if inferred_arch.get("value_channels") and \
                     inferred_arch["value_channels"] != value_channels:
+                print(f"[GoAI] 权重 value_channels={inferred_arch['value_channels']}"
+                      f"（默认 {value_channels}），已自动调整")
                 net_kwargs["value_channels"] = inferred_arch["value_channels"]
+                needs_rebuild = True
+            if inferred_arch.get("value_res_blocks") and \
+                    inferred_arch["value_res_blocks"] != value_res_blocks:
+                # 少一块就是「value 头有一块停在随机初始化」：形状全对、不报错，
+                # 但 value 估值是噪声。这条以前根本没推断过（块数恒默认 3）。
+                print(f"[GoAI] 权重 value 残差块={inferred_arch['value_res_blocks']}"
+                      f"（默认 {value_res_blocks}），已自动调整")
+                net_kwargs["value_res_blocks"] = inferred_arch["value_res_blocks"]
                 needs_rebuild = True
             if inferred_arch.get("policy_layers") and \
                     inferred_arch["policy_layers"] != policy_layers:
@@ -391,11 +480,10 @@ class GoAI:
             if k == "policy.conv1.weight" and isinstance(v, torch.Tensor):
                 info["policy_channels"] = v.shape[0]
                 break
-        # value_channels: value.value_head.0.weight shape = [V, C, 1, 1]
-        for k, v in state.items():
-            if k == "value.value_head.0.weight" and isinstance(v, torch.Tensor):
-                info["value_channels"] = v.shape[0]
-                break
+        # value_channels / value_res_blocks: value 头形状（两代命名都认，见
+        # infer_value_head）。旧实现查的 `value.value_head.0.weight` 两代都不存在，
+        # 等于没查 ⇒ value_channels 恒默认、块数恒默认 3。
+        info.update(infer_value_head(state))
         # policy_layers: 检查是否有 conv3 和 bn2
         has_conv3 = any(k == "policy.conv3.weight" for k in state)
         has_bn2 = any(k == "policy.bn2.weight" for k in state)
@@ -437,11 +525,16 @@ class GoAI:
         叫别的名字（例如 v21 的 `backbone.patch_embed.weight`），推断层仍可能读到
         另一个候选键而给出正确 in_channels，缺口正好落在 stem 上。
 
-        不拦的部分（只告警）：本仓库现役 `models/sft_19x19_v12.pth` 实测带
-        30 个 `value.res_blocks.*` missing + 24 个 `value.res1.*` unexpected
-        （旧 value 头命名，改前就这么加载的）；把它当错误会让 webui 连自己的
-        存量模型都开不起来，收益不抵代价。但「哪些层是随机的」必须打印出来，
-        不能继续靠 strict=False 静默咽下。
+        不拦的部分（只告警）：非 stem 的缺键，例如 checkpoint 里缺了某个
+        value/policy 层的张量。**这类缺口一律打印出来**（哪些键、缺几个），
+        不能靠 strict=False 静默咽下。
+
+        注：旧版 value 头命名（`value.res1/res2/...`，`e2d0b57` 之前）过去
+        长期落在这一类里 —— 本仓库现役 `models/sft_19x19_v12.pth` 实测带 36 个
+        `value.res_blocks.*` missing + 24 个 `value.res1.*` unexpected，也就是
+        「模型跑得动、value 头却有一整块是随机初始化」。现已由
+        `remap_legacy_value_keys` + `infer_value_head` 修掉（加载前归一键名、
+        按权重推断块数与通道），不再依赖这条告警兜底。
         """
         missing = list(incompatible.missing_keys)
         unexpected = list(incompatible.unexpected_keys)

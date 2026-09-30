@@ -26,36 +26,22 @@ import torch
 
 sys.path.insert(0, __file__.rsplit('scripts', 1)[0])
 from src.networks.alphanet import AlphaGoNet  # noqa: E402
+from src.inference import remap_legacy_value_keys as _remap_legacy_value_keys  # noqa: E402
 
 
 def remap_legacy_value_keys(sd):
-    """把旧版 ValueNetwork 的键名归一到当前代码。
+    """把旧版 ValueNetwork 的键名归一到当前代码（**实现已上移**到 src.inference）。
 
-    当前 src/networks/value_network.py:79-85 用
+    当前 src/networks/value_network.py 用
         self.res_blocks = nn.ModuleList([...])      -> value.res_blocks.0.*
     早期版本直接在 value 下挂 res1 / res2 / ...      -> value.res1.*
 
-    V12 checkpoint 就是旧命名，直接 load_state_dict(strict=True) 会因
-    「ckpt 缺失 value.res_blocks.0.* / ckpt 多余 value.res1.*」而失败。
-    这里做纯键名重映射，不动任何数值。
+    这里保留同名薄封装、转发到 src.inference 的那一份：加载侧（GoAI）与检查侧
+    （本脚本）必须共用同一份正则与口径，各写一份迟早出现「加载能过但 inspect
+    说缺键」这种最难查的矛盾。回归测试 tests/test_legacy_value_head.py 里
+    `test_inspect_ckpt_shares_the_same_remap` 钉住这层转发不是复制。
     """
-    # 已是当前命名则无需处理
-    if any(k.startswith('value.res_blocks.') for k in sd):
-        return sd, 0
-    # 没有旧版键也没得可映射
-    if not any(re.match(r'^value\.res\d+\.', k) for k in sd):
-        return sd, 0
-    out = {}
-    moved = 0
-    pat = re.compile(r'^value\.res(\d+)\.(.+)$')
-    for k, v in sd.items():
-        m = pat.match(k)
-        if m:
-            out['value.res_blocks.%d.%s' % (int(m.group(1)) - 1, m.group(2))] = v
-            moved += 1
-        else:
-            out[k] = v
-    return out, moved
+    return _remap_legacy_value_keys(sd)
 
 
 def infer_config(sd, board_size=19):
