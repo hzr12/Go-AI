@@ -2363,6 +2363,18 @@ def main():
         n_batches = (per_rank + args.batch_size - 1) // args.batch_size
     else:
         n_batches = (n_train + args.batch_size - 1) // args.batch_size
+    # ⚠ 调度器的步数口径必须是 **optimizer step**，不是 micro-batch（2026-10-01 修）。
+    #   `scheduler.step()` 只在每个 optimizer.step() 之后调一次（见训练循环），而
+    #   `n_batches` 是 micro-batch 数。accum=1 时两者相等，accum>1 时差 accum 倍：
+    #   原来 total_steps/warmup/T_max 全按 micro-batch 算 ⇒ SequentialLR 的
+    #   milestone 提前到达（甚至在 epoch 内就切进 cosine），而 CosineAnnealingLR 的
+    #   T_max 却是真实步数的 accum 倍 ⇒ **余弦只走完 1/accum 就到 epoch 末**。
+    #   实测后果：lr 在 epoch 末仍停在峰值的 ~77%（accum=2），本该退火到 ~0。
+    #   这个 bug 只在用 `--gradient-accumulation-steps` 时出现，所以 accum=1 的
+    #   历史 run 完全正常 —— 也因此更容易漏掉。
+    micro_per_epoch = n_batches
+    n_batches = (micro_per_epoch + max(1, args.gradient_accumulation_steps) - 1) \
+        // max(1, args.gradient_accumulation_steps)
     total_steps = max(1, args.epochs * n_batches)
     warmup_steps = max(1, int(total_steps * 0.10))
     after_warmup = max(1, total_steps - warmup_steps)
@@ -2595,8 +2607,12 @@ def main():
         model = DistributedDataParallel(model, device_ids=[local_rank])
 
     if is_main:
-        logger.info("[train] 开始训练 | steps/epoch=%d | 总 steps≈%d | warmup=%d",
-                    n_batches, total_steps, warmup_steps)
+        # 两个口径都打：调度器按 optimizer step 走，读日志的人常按 micro-batch 想。
+        # 差别就是 gradient_accumulation_steps 倍（accum=1 时相等）。
+        logger.info("[train] 开始训练 | optimizer-steps/epoch=%d | micro-batches/epoch=%d"
+                    " | 总 steps≈%d | warmup=%d | accum=%d",
+                    n_batches, micro_per_epoch, total_steps, warmup_steps,
+                    max(1, args.gradient_accumulation_steps))
 
     # 预取器 pf 已在**设备初始化之前**构造（见上方「数据集 + 预取 worker」段：
     # fork 晚于 set_device 会让每个 worker 继承 CANN 上下文，4 卡实测每卡凭空
