@@ -153,6 +153,19 @@ def test_sync_and_assert_are_both_called():
         'main() 里没有调用 _assert_init_weights_identical：广播完不验证等于没做'
 
 
+def test_sync_call_precedes_assert_call():
+    """自检必须在广播**之后** —— 拿广播前的 checksum 比对，必然抛。"""
+    sync = _main_body_calls('_sync_init_weights_from_rank0')
+    chk = _main_body_calls('_assert_init_weights_identical')
+    assert sync, 'main() 里没有调用 _sync_init_weights_from_rank0'
+    assert chk, 'main() 里没有调用 _assert_init_weights_identical'
+    assert min(sync) < min(chk), (
+        '自检（L%d）必须在广播（L%d）之后：自检拿的是**本地** checksum 去跨 rank '
+        '比对，而广播前各 rank 的随机初始化本来就不同 ⇒ from-scratch 起手必然抛 '
+        'RuntimeError，启动即挂。这是个能挡住真实 run 的硬闸门，不是洁癖。'
+        % (min(chk), min(sync)))
+
+
 # ---- 护栏（真行为）------------------------------------------------------- #
 
 def test_dist_active_real_body_decision_table():
@@ -182,11 +195,15 @@ def test_dist_active_real_body_decision_table():
         def is_available():
             raise RuntimeError('老版本 / 驱动缺失路径')
 
+    # 第 4 行的 `initialized=True` 是**故意的**，别"简化"回 False：`available=False`
+    # 与 `initialized=False` 会短路到同一个 False，删掉 `dist.is_available()` 那道门
+    # 它照样过 ⇒ 这一行就不判别了。只有把 initialized 置 True、让两道门给出**不同**
+    # 的短路结果，删掉 `is_available()` 才会露出来。
     cases = [
         ((True, False, 4), False, 'PG 未建（from-scratch 起手前的那一瞬）'),
         ((True, True, 1), False, 'world_size==1（单卡路径必须 no-op）'),
         ((True, True, 4), True, 'PG 已建且多卡（该广播了）'),
-        ((False, False, 4), False, 'torch.distributed 不可用（无 torch_npu 环境）'),
+        ((False, True, 4), False, 'torch.distributed 不可用（无 torch_npu 环境）'),
     ]
     real_dist = mod.dist
     try:
@@ -335,19 +352,44 @@ def _captured_checksum(mod, model):
 
 
 def test_checksum_depends_on_every_parameter():
-    """checksum 必须真的由**全部**参数决定，否则自检是空转的。"""
+    """checksum 必须真由**全部**参数决定，且是**有符号的精确**求和。
+
+    这里断言的是**精确值**而不是「变了」。`_ThreeParam` 基线是全 0 ⇒ checksum 恰好
+    `0.0`；只把某一个参数 `add_(-1.0)`，checksum 就必须**恰好**等于该参数的
+    `−numel`。逐个参数核对精确值，一次钉住四类退化：
+
+    · 「只算最后一个」/「只算第一个」/「`acc + s * 0.0`」⇒ 实得 0.0，与期望不符；
+    · 「`acc + s * 0.5`」⇒ 实得期望值的一半；
+    · 「`acc + s.abs()`」⇒ 实得**正**的绝对值。
+
+    ⚠ 偏移量取**负数**是刻意的：`_ThreeParam` 的基线是全 0，若用 `+1.0` 则所有输入
+    非负，`abs()` 变成恒等 —— 符号不敏感的 checksum 就混过去了，而它会放过一个
+    「权重恰好是 rank0 取负」的 rank。负偏移让 abs()/取负类变异无处躲。
+
+    期望值是 `-numel`（`-4.0 / -15.0 / -1.0`），全部是 fp64 里的**精确整数**，
+    所以用 `==` 判定、无需容差。
+    """
     mod = _load_module()
     dtype, base = _captured_checksum(mod, _ThreeParam())
     assert dtype == torch.float64, (
         'checksum 标量必须是 fp64（docstring 承诺），实得 %s' % dtype)
     assert base.numel() == 1, 'all_gather 的载荷应是 1 个标量：%s' % base.shape
-    for name in ('a', 'b', 'c'):
+    assert base.item() == 0.0, (
+        '全 0 参数的 checksum 应恰好 0.0（fp64 精确，无需容差），实得 %.17g'
+        % base.item())
+
+    # 参数名 -> 只把它 add_(-1.0) 之后 checksum 应**恰好**变成的值（= −元素数）
+    expected = {'a': -4.0, 'b': -15.0, 'c': -1.0}
+    for name in sorted(expected):
+        want = expected[name]
         m2 = _ThreeParam()
-        getattr(m2, name).data.add_(1.0)          # 只动一个参数
+        getattr(m2, name).data.add_(-1.0)          # 只动一个参数，且取**负**偏移
         _, got = _captured_checksum(mod, m2)
-        assert not torch.equal(base, got), (
-            '只改 %s 时 checksum 不变 ⇒ 这个参数根本没进 checksum（自检漏掉它 ⇒ '
-            '4 卡拼错权重也检测不出来）' % name)
+        assert got.item() == want, (
+            '只把 %s（%d 个元素）加 -1.0 时，checksum 应恰好 %.8g，实得 %.17g —— '
+            '该参数没进 checksum（漏算 ⇒ 4 卡拼错权重也检测不出来）、权重被折算'
+            '（如 *0.5）、或求和不是有符号精确求和（如 .abs()）'
+            % (name, -int(want), want, got.item()))
 
 
 def test_checksum_accumulates_in_fp64_not_fp32():
