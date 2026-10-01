@@ -34,13 +34,9 @@
 #
 #   · 4×910A（NPU）推荐入口 = 现成脚本（P4.10）：
 #       python run.py --sh shell/train_sft_npu_4card_v21.sh
-#     ⚠ 2026-09-30 起脚本默认 BATCH/LR **不再等于推荐值**：脚本是「脚本化版本」
-#     而推荐档在下方【v21 显存上限】表里（首跑每卡 2000 / lr 0.00637）。要用
-#     推荐档就显式覆盖：
-#       python run.py --sh shell/train_sft_npu_4card_v21.sh \
-#           --batch-size 2000 --lr 0.00637
-#     脚本默认 3000/0.00780（= 0.00356×√(12000/2500)）属于**很紧的一档**，
-#     投影占用已贴卡边界，且 C11 显存投影测试对 v21 尚未接入（见下）。
+#     脚本默认 BATCH=1000 / GRAD_ACCUM=2（有效 8000）/ LR=0.00637 —— 与下面
+#     方案 A 逐项一致。⚠ 脚本默认**不要**往上调每卡 batch：2000 实测 OOM，
+#     口径见下面【v21 显存上限】。
 #
 #   · 单卡 A100 40G（BF16 + flash-attn）= 下方方案 B，以下即实测可跑的配置
 #     （--batch-size 3500 实测通过）：
@@ -229,10 +225,9 @@ python -c "import numpy as np; d=np.load('data/sgf_19x19_full.npz'); print('game
 #   的**方案 A**；shell/train_sft_npu_4card_v21.sh（P4.10）是它的脚本化版本。
 #
 # 【硬件分工：SFT 4 卡 910A，RL 1 卡 910A + 8 进程 CPU】
-#   · SFT：torchrun --nproc_per_node=4（下面方案 A）。**首跑每卡 batch 2000**
-#     ⇒ 有效 8000，lr 0.00637 = 0.00356×√(8000/2500)（同一套平方根缩放律）。
-#     为什么不直接上 2800：见下面【v21 显存上限】—— 2800 的投影峰值已贴到卡
-#     边界，而投影**不是实测**；先跑通 2000，再按表往上试。
+#   · SFT：torchrun --nproc_per_node=4（下面方案 A）。**每卡 batch 1000 +
+#     累积 2** ⇒ 有效 8000，lr 0.00637 = 0.00356×√(8000/2500)。
+#     每卡那一格不能往上加 —— 见下面【v21 显存上限】（2000 实测 OOM）。
 #   · RL ：**单卡** python scripts/selfplay_train.py（③ 节有完整命令，1 卡 910A
 #     训练 + 8 进程 CPU 搜索）。SFT 的 4 卡与 RL 的 1 卡不要混用同一组参数：
 #     RL 的 --batch-size 默认 256 是**单卡**甜点。
@@ -253,12 +248,12 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
   --res-blocks 8 --convnext-blocks 4 --attn-blocks 5 \
   --value-channels 96 --value-res-blocks 8 \
   --policy-channels 128 --policy-layers 3 \
-  --batch-size 2000 --epochs 1 \
+  --batch-size 1000 --epochs 1 \
   --lr 0.00637 --weight-decay 0.0001 \
   --attention-mode mix --num-attention-layers 4 --num-heads 4 \
   --attn-mode window_global --attn-window 5 \
   --attention-dropout 0.1 --label-smoothing 0.1 \
-  --gradient-accumulation-steps 1 \
+  --gradient-accumulation-steps 2 \
   --use-amp 1 --use-ema 1 \
   --prefetch-workers 6 --prefetch-depth 16 \
   --log-every 50 --eval-every 500 --save-every 500 \
@@ -268,43 +263,46 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
   --swanlab 1 --ver v21_npu4
 
 # ------------------------------------------------------------------
-# 【v21 显存上限】4 卡 910A（每卡 32 GiB）—— 2026-09-30 实测重标定
+# 【v21 显存上限】4 卡 910A（每卡 32 GiB，容器可用 ~27.6 GiB）
+# ⚠ 2026-10-01 重写：下面全部是**云端实测**，不是投影。上一版（据 CPU fp32
+#   投影写的「2000 可跑、~21~23 GiB」）**已被证伪**，据此配的 batch 会 OOM。
 # ------------------------------------------------------------------
-# 三个 OOM 根因（都是**可复算**的数字，不是猜测；详见 commit 741b051）：
-#   1. MambaLTI 的 drive 整条物化：(B,T,H,P,N) 每样本 361×4×46×64×4B = 17.0 MB
-#      ⇒ B=2000 时**一次就申请 31.67 GiB**（与云端报错逐位吻合）。梯度检查点
-#      管不到它 —— 它是块内部临时量，重算还要再物化一次。
-#   2. 扫描块内的 u/M/h 活到反向：按块物化只降**前向瞬时峰值**，bmm/mul 的
-#      输入照样被 autograd 留住。fp16@B=2000 单个 MambaLTI 块 = 52.6 GiB
-#      ⇒ 云端 `20.13 GiB already allocated` + `Tried to allocate 2.81 GiB`
-#      （2.81 GiB ≈ 又一个块的 u）。
-#   3. 预取 worker fork 晚于设备初始化：`mp.Process` 默认 fork，4 个 worker
-#      各继承一份 CANN 上下文与显存映射 ⇒ PyTorch 只记 6.30 GiB 而卡上 94%、
-#      AICore 0%（6.3 + 4×6 ≈ 30 GiB）。
-# 三条修复后同一口径的保留量（fp16@B=2000 折算）：
-#   前向结束仍需存活   8.78 GiB   （16 个块边界 + 抽头特征 + 两个头）
-#   最重的一块重算     4.9 GiB   （MambaLTI，修复前 52.6；注意力约 4~6）
-#   ⇒ 活跃峰值 ≈ 14~15 GiB，另加分配器缓存（实测 20.13 活跃时 reserved 26.98，
-#     约 6.9 GiB 空洞）⇒ 实际占用 ≈ 21~23 GiB / 32 GiB
+# 实测账本（每卡，从 OOM 报错逐项算出来 —— 这是唯一可信的口径）：
+#     32.00 GiB 总量 = 20.09  活数据(63%)
+#                      + 6.93  PyTorch 缓存但用不上的碎片(22%)
+#                      + 4.36  torch 之外（CANN/HCCL/运行时上下文，14%）
+#                      + 0.62  空闲(2%)
+#   ⇒ **容器可用容量只有 ~27.6 GiB**，不是 32 GiB。平台面板的「HBM 98%」就是
+#     27.02/27.6 —— 分母是可用容量，所以面板到 98% 时 PyTorch reserved 才 27 GiB。
 #
-#   每卡 batch   有效 batch   投影占用      lr（=0.00356×√(有效/2500)）   判定
-#   ─────────────────────────────────────────────────────────────────────────
-#     1500         6000        ~16~18 GiB      0.00552                  稳（保底档）
-#     2000         8000        ~21~23 GiB      0.00637                  ★首跑推荐
-#     2500        10000        ~26~28 GiB      0.00712                  可试（未实测）
-#     2800        11200        ~29~31 GiB      0.00754                  很紧（未实测）
+# 三个曾经被误判的「根因」（留档以免重犯）：
+#   1. MambaLTI 的 drive 整条物化 = 一次 31.67 GiB 申请。**真实存在、已修**
+#      （commit 741b051），那个报错消失了。但它**不是** 20 GiB 峰值的成因。
+#   2. 「扫描块内 u/M/h 活到反向」：块内检查点确已生效（本地实测 96 次调用全部
+#      use_ckpt=True，单块 52.6 → 4.9 GiB），但修前修后的 OOM 数字几乎不变
+#      （20.13 → 20.09 GiB）⇒ 20 GiB 里主角不是它。CPU fp32 投影低估约 35%
+#      （漏了 autocast 的 fp16 副本、BN 保存的输入平面、NPU 注意力 math 后端
+#      瞬时量）。**别再拿 CPU 投影当实测写进文档。**
+#   3. 「面板 94% + AICore 0% ⇒ 预取 worker 继承 CANN 上下文」——**错**。面板
+#      是节点级视图（同一面板画了 6 张卡、其中只有 2 张是我们的），AICore 0%
+#      只是采样落在算子编译期。预取 fork 顺序仍按安全侧提前了（有运行时护栏），
+#      但它不是 94% 的原因。
 #
-# ⚠ 上表是**投影**，来源见上；三次 OOM 说明投影会错，所以按「低一档先跑通、
-#   再一档一档往上」的方式用，不要直接拿 2800 起步。
-# ⚠ 降 batch 必须同步降 lr（同一套平方根缩放律），否则 8000 有效 batch 配
-#   2800 的 lr 会把早期训练打飞。
-# ⚠ 别为了省显存去动 --attn-window（window_global 的显存 ∝ nW×(ws²+ng)，
-#   ws 变小时 ng 暴涨）；也别关检查点（见根因 2，那不是检查点能救的东西）。
+# 每卡BATCH  累积  有效batch  活数据  合计     LR=0.00356×√(有效/2500)  判定
+#   1000        2       8000      ~10 GiB   ~18.4 GiB      0.00637      ★推荐
+#   1500        2      12000      ~15 GiB   ~23.5 GiB      0.00771      可试
+#   2000        1       8000      ~20 GiB   ~31.4 GiB      0.00637      ✗ OOM
+#   2000        2      16000      ~20 GiB   ~31.4 GiB      0.00897      ✗ OOM
 #
-# 【预取器的硬约束】`--prefetch-workers > 1` 会在**设备初始化之前** fork
-#   worker 进程（train_sft.py 里已加运行时护栏：设备已初始化就构造 ⇒ 直接抛
-#   错）。这是根因 3 的修复，**顺序不要改回去**：fork 早于 CANN 才是安全的那
-#   侧（反方向才是 HCCL 的危险区）。workers=1 等于关掉预取器。
+# 为什么只能靠「降每卡 batch + 加累积」：激活量与**每卡 batch** 成正比（不是与
+#   有效 batch），而累积步不产生新激活。所以想换更大的有效 batch，正确的旋钮是
+#   乘积 BATCH×WORLD×ACCUM，**每卡那一格必须留在 1000~1500**。
+# ⚠ 那 6.93 GiB 碎片是「生生死线」：活数据+runtime 已经 24.5 GiB，碎片若能压住
+#   2000 也许能塞进去，但**步内无法回收**缓存段 ⇒ 别指望靠调参救 2000。
+#
+# 【预取器的硬约束】`--prefetch-workers > 1` 会在**设备初始化之前** fork worker
+#   进程（train_sft.py 有运行时护栏：设备已初始化就构造 ⇒ 直接抛错）。fork 早于
+#   CANN 才是安全的那一侧（反方向才是 HCCL 的危险区）。workers=1 等于关掉预取器。
 
 # 方案 B: 单卡 A100 40G (当前实跑配置)
 # pip install flash-attn --no-build-isolation

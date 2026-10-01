@@ -380,10 +380,13 @@ def test_one_sft_step_on_17ch_planes_trains_v21():
 
     m = build_v21_net(action_size=9 * 9 + 1)
     m.train()
-    logits, value = m(torch.from_numpy(states))
+    # planes 是 fp16（2026-10-01 低精度化），权重是 fp32 —— 必须走 autocast，
+    # 这正是 train_sft.py 三条路径的做法（NPU/CUDA 用 AMP，CPU 显式升回 fp32）。
+    with torch.autocast(device_type='cpu', dtype=torch.bfloat16):
+        logits, value = m(torch.from_numpy(states))
     loss = (torch.nn.functional.cross_entropy(
-                logits, torch.from_numpy(moves.astype(np.int64)))
-            + (value.squeeze(-1) - torch.from_numpy(vals[:, 0])).pow(2).mean())
+                logits.float(), torch.from_numpy(moves.astype(np.int64)))
+            + (value.float().squeeze(-1) - torch.from_numpy(vals[:, 0])).pow(2).mean())
     loss.backward()
     grads = [p.grad for p in m.parameters() if p.grad is not None]
     assert grads, '反向后没有任何梯度 —— 图没接上'

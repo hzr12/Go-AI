@@ -302,10 +302,17 @@ def test_swanlab_install_failure_does_not_abort_training():
 # 学习率标定：统一按平方根缩放律，从「有效 batch」推导
 # --------------------------------------------------------------------------- #
 def _sft_env(txt):
-    """从 SFT 脚本抽出 (WORLD_SIZE, BATCH, LR) 三个变量。"""
+    """从 SFT 脚本抽出 (WORLD_SIZE, BATCH, LR, ACCUM) 变量。
+
+    ACCUM 是 2026-09-30 起的必需项：`--gradient-accumulation-steps` 直接进有效
+    batch（BATCH × WORLD_SIZE × ACCUM），漏掉它会让平方根律断言在「脚本用了梯度
+    累积」时给出**错误的绿灯** —— 那正是 4 卡 OOM 之后换档时最容易踩的一格。
+    没有 ACCUM 行的旧脚本按 1 兜底（保持旧脚本仍可被校验）。
+    """
     env = {}
-    for m in re.finditer(r'^(WORLD_SIZE|BATCH|LR)=([0-9.]+)', txt, re.M):
+    for m in re.finditer(r'^(WORLD_SIZE|BATCH|LR|GRAD_ACCUM)=([0-9.]+)', txt, re.M):
         env[m.group(1)] = m.group(2)
+    env.setdefault('GRAD_ACCUM', '1')
     return env
 
 
@@ -313,8 +320,14 @@ def _sft_env(txt):
 def test_sft_scripts_lr_follows_sqrt_scaling_of_effective_batch():
     """每个 SFT 脚本的 LR 必须等于 0.00356×√(有效batch/2500)。
 
-    有效 batch = BATCH × WORLD_SIZE。改变卡数或每卡 batch 时 LR 必须同步调整，
-    否则等效学习率漂移（多卡尤其明显：2 卡有效 6400、4 卡有效 12800）。
+    有效 batch = BATCH × WORLD_SIZE × GRAD_ACCUM。改变卡数、每卡 batch 或梯度
+    累积时 LR 必须同步调整，否则等效学习率漂移（多卡尤其明显）。
+
+    ⚠ 2026-09-30 起 batch 档位换过：v21 在 4 卡 910A 上每卡 2000 会 OOM
+    （活数据 20.09 GiB + 碎片 6.93 + runtime 4.36 ≈ 31.4 GiB / 32 GiB 可用
+    27.6 GiB），改为每卡 1000 + 累积 2：**有效 batch 与 LR 都不变**，
+    只有「每卡 batch」这一格变了 —— 所以本断言的等式必须含 ACCUM，否则它
+    会把这次降档误判成 LR 漂移。
     """
     import math
     sft = [f for f in _existing_sh() if f.startswith('train_sft')]
@@ -322,13 +335,15 @@ def test_sft_scripts_lr_follows_sqrt_scaling_of_effective_batch():
     for f in sft:
         txt = open(os.path.join(SHELL_DIR, f), encoding='utf-8').read()
         env = _sft_env(txt)
-        assert set(env) == {'WORLD_SIZE', 'BATCH', 'LR'}, \
-            f"{f} 缺少 WORLD_SIZE/BATCH/LR 变量定义（实得 {sorted(env)}）"
+        assert set(env) == {'WORLD_SIZE', 'BATCH', 'LR', 'GRAD_ACCUM'}, \
+            f"{f} 缺少 WORLD_SIZE/BATCH/LR/GRAD_ACCUM 变量定义（实得 {sorted(env)}）"
         ws, batch, lr = int(env['WORLD_SIZE']), int(env['BATCH']), float(env['LR'])
-        eff = batch * ws
+        accum = int(env['GRAD_ACCUM'])
+        eff = batch * ws * accum
         expect = 0.00356 * math.sqrt(eff / 2500)
         assert abs(lr - expect) < 5e-5, \
-            f"{f} LR={lr} 与有效 batch={eff} 的平方根缩放预期 {expect:.5f} 不符"
+            (f"{f} LR={lr} 与有效 batch={eff}（BATCH {batch}×WS {ws}×ACCUM "
+             f"{accum}）的平方根缩放预期 {expect:.5f} 不符")
 
 
 # --------------------------------------------------------------------------- #

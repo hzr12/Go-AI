@@ -238,6 +238,37 @@ def test_segments_logged_and_uploaded():
         assert key in SRC, f'swanlab 未上报 {key}'
 
 
+def test_memory_line_splits_live_from_cached():
+    """`[step]` 行必须同时给 alloc 与 peak，不能只有 reserved。
+
+    为什么（2026-10-01 补）：4 卡 OOM 那轮排查绕了三次，根因是日志只有
+    `mem=`（= reserved）一个数，从它分不清「活数据 / 分配器碎片 / torch 之外」。
+    从报错能算出的真实账本是 20.09 活 + 6.93 碎片 + 4.36 CANN/HCCL + 0.62 空闲
+    ⇒ 容器可用只有 ~27.6 GiB。判读规则：alloc 跟着涨 = 泄漏；只有 reserved 涨 =
+    碎片（`empty_cache` / expandable_segments 能治）。
+    """
+    assert re.search(r'mem=%\.2fGB \(alloc %\.2f/peak %\.2f\)', SRC), \
+        'mem 行必须拆出 alloc 与 peak（只有 reserved 无法区分活数据与碎片）'
+    for call in ('torch.npu.memory_allocated', 'torch.npu.max_memory_allocated'):
+        assert call in SRC, f'缺少 {call}'
+
+
+def test_effective_batch_for_throughput_includes_accumulation():
+    """吞吐口径的有效 batch 必须含梯度累积，否则日志把速度报成一半。
+
+    `_eff_bs = bs * world_size` 漏乘 accumulation steps ⇒ 用了
+    `--gradient-accumulation-steps 2` 时 `spd`/`spd_inst` 只有真实值的一半。
+    而 2026-10-01 的降档方案（每卡 batch 减半 + 累积 2）**正是** accum=2，
+    所以这条不修就会误导那次降档的判读。
+    """
+    m = re.search(r'_eff_bs = (.+)', SRC)
+    assert m, '未找到 _eff_bs'
+    expr = m.group(1)
+    for factor in ('bs', 'world_size', '_accum_steps'):
+        assert factor in expr, \
+            f'_eff_bs 漏乘 {factor}：{expr.strip()}（accum>1 时吞吐会被报成假值）'
+
+
 def test_eval_timing_wraps_the_dominant_cost():
     """eval 计时只包住 evaluate_metrics（主导开销），避免大段重排缩进。"""
     m = re.search(

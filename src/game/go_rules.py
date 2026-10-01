@@ -2415,7 +2415,9 @@ class GoBoard:
         if to_play is None:
             to_play = self.current_player
         _check_n_channels(n_channels)
-        planes = np.zeros((n_channels, n, n), dtype=np.float32)
+        # 与 `feature_planes_batched` 同一个 dtype（fp16）：两路必须一致，否则
+        # RL/推理（走单图）与训练（走批量）会拿到不同精度的 planes。
+        planes = np.zeros((n_channels, n, n), dtype=np.float16)
         opp = -to_play
 
         mine = (self.board == to_play)
@@ -2619,7 +2621,13 @@ class GoBoard:
         _check_n_channels(n_channels)
         boards = np.asarray(boards)
         B, n, _ = boards.shape
-        planes = np.zeros((B, n_channels, n, n), dtype=np.float32)
+        # 特征平面用 **fp16** 而不是 fp32（2026-10-01）：
+        # 平面里的值全是 **计数与布尔**（棋盘 int8 的 -1/0/1、四个组合权
+        # 掩码 0/1、捕获计数），没有任何除法/比值（已逐行核过
+        # feature_planes_batched）。fp16 对 ≤2048 的整数逐位精确，低精度**不改任何数值**。
+        # 为什么不用 bf16：bf16 只有 8 位尾数，整数精确到 256 为止。
+        # 收益：主机内存（预取队列）+ H2D 字节 + 设备侧输入张量全部减半。
+        planes = np.zeros((B, n_channels, n, n), dtype=np.float16)
         to_play = np.asarray(to_play).reshape(B, 1, 1)
         opp = -to_play  # (B,1,1)
 
@@ -2705,10 +2713,11 @@ class GoBoard:
                 planes[:, 13] = _neighbor_all(theirs) & empty
 
         # 通道 10/11/14/15: 气数=1 / =2 掩码（整批向量化连通块标注 + **去重**气数）
-        my_lib1 = np.zeros((B, n, n), dtype=np.float32)
-        op_lib1 = np.zeros((B, n, n), dtype=np.float32)
-        my_lib2 = np.zeros((B, n, n), dtype=np.float32) if n_channels >= 15 else None
-        op_lib2 = np.zeros((B, n, n), dtype=np.float32) if n_channels >= 15 else None
+        # 同上：组合权掩码只是 0/1，fp16 逐位精确
+        my_lib1 = np.zeros((B, n, n), dtype=np.float16)
+        op_lib1 = np.zeros((B, n, n), dtype=np.float16)
+        my_lib2 = np.zeros((B, n, n), dtype=np.float16) if n_channels >= 15 else None
+        op_lib2 = np.zeros((B, n, n), dtype=np.float16) if n_channels >= 15 else None
         # ⚠ 这里**不再**算「每颗子的空邻点数」（旧的 `neigh_empty`）：那个量数的是
         #   「(子, 气) 关联次数」而不是「去重气点数」，U 形块会被多算（曾经的气数口径
         #   bug，见 `_distinct_liberty_counts` 的 docstring）。去重直接在块号层面做，

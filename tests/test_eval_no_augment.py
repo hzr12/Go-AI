@@ -312,7 +312,7 @@ def test_augment_false_returns_raw_features_and_moves():
 
     states, moves_out, values = ds.sample_batch_numpy(idxs, augment=False)
 
-    assert states.dtype == np.float32 and states.shape == (len(idxs), 12, BOARD, BOARD), \
+    assert states.dtype == np.float16 and states.shape == (len(idxs), 12, BOARD, BOARD), \
         f'shapes/dtype 不符: {states.dtype} {states.shape}'
     assert np.array_equal(states, raw), (
         f'augment=False 的 states 与原始特征平面不逐位相等 —— 特征侧仍被变换过；'

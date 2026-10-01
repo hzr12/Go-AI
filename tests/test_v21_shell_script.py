@@ -112,17 +112,31 @@ def test_script_documents_the_fsdp1_facts(txt):
 
 
 def test_torchrun_invocation_is_unchanged_from_v19(txt):
-    """torchrun 行与 v19 逐字相同（只允许 --out / --ver 取值不同）。
+    """torchrun 行与 v19 逐字相同（只允许 --out / --ver / 累积档位不同）。
 
     换 FSDP1 不改启动方式：`--nproc_per_node=N` 照旧注入
     RANK/WORLD_SIZE/LOCAL_RANK，`train_sft.py` 读的是同一套环境变量契约。
     任何对这一行的改动都必须先有代码侧的契约变更。
+
+    ⚠ 2026-10-01 起的唯一例外：`--gradient-accumulation-steps`。v21 每卡 2000
+    实测 OOM（详见 run.txt【v21 显存上限】），降档的唯一手段是「每卡 batch 减半
+    + 累积 2」，而有效 batch 与 LR 都保持不变 —— 所以这一格**必须**与 v19 不同。
+    比对时把两边的累积值都归一化成 <ACCUM>，其余仍要求逐字相同。
     """
     if not os.path.isfile(os.path.join(SHELL_DIR, V19)):
         pytest.skip('{} 不在，无法比对'.format(V19))
-    assert _torchrun_block(txt) == _torchrun_block(_read(V19)), \
-        'torchrun 调用与 v19 不一致（只允许 --out/--ver 不同）：\n{}\n vs \n{}'.format(
-            _torchrun_block(txt), _torchrun_block(_read(V19)))
+
+    def _norm(block):
+        return re.sub(r'--gradient-accumulation-steps \S+',
+                      '--gradient-accumulation-steps <ACCUM>', block)
+
+    ours, v19 = _torchrun_block(txt), _torchrun_block(_read(V19))
+    assert _norm(ours) == _norm(v19), \
+        'torchrun 调用与 v19 不一致（只允许 --out/--ver/累积档位不同）：\n{}\n vs \n{}'.format(
+            ours, v19)
+    # 反过来钉住「累积确实被调高」：降档的意义就在这里，悄悄回到 1 等于没降。
+    assert '--gradient-accumulation-steps "$GRAD_ACCUM"' in ours, \
+        'v21 必须用 $GRAD_ACCUM 变量传累积步数（硬编码 1 就退回 OOM 档了）'
 
 
 # --------------------------------------------------------------------------- #
@@ -208,14 +222,23 @@ def test_exposes_npu_graph_compile_switch(txt):
 
 
 def test_lr_follows_sqrt_scaling_of_effective_batch(txt):
-    """有效 batch = BATCH × WORLD_SIZE；LR = 0.00356×√(有效batch/2500)±5e-5。"""
+    """有效 batch = BATCH × WORLD_SIZE × GRAD_ACCUM；LR = 0.00356×√(有效batch/2500)±5e-5。
+
+    ⚠ 2026-10-01：v21 每卡 2000 实测 OOM（活数据 20.09 GiB + 碎片 6.93 +
+    CANN/HCCL 4.36 ≈ 31.4 GiB，容器可用只有 ~27.6 GiB），改为每卡 1000 +
+    累积 2 ⇒ **有效 batch 与 LR 都不变**。所以等式必须含 GRAD_ACCUM，否则这次
+    降档会被误判成 LR 漂移（v19 无累积变量，按 1 兜底）。
+    """
     import math
     env = {m.group(1): m.group(2)
-           for m in re.finditer(r'^(WORLD_SIZE|BATCH|LR)=([0-9.]+)', txt, re.M)}
-    assert set(env) == {'WORLD_SIZE', 'BATCH', 'LR'}, \
+           for m in re.finditer(
+               r'^(WORLD_SIZE|BATCH|LR|GRAD_ACCUM)=([0-9.]+)', txt, re.M)}
+    env.setdefault('GRAD_ACCUM', '1')
+    assert set(env) == {'WORLD_SIZE', 'BATCH', 'LR', 'GRAD_ACCUM'}, \
         '实得 {}'.format(sorted(env))
-    eff = int(env['BATCH']) * int(env['WORLD_SIZE'])
+    accum = int(env['GRAD_ACCUM'])
+    eff = int(env['BATCH']) * int(env['WORLD_SIZE']) * accum
     expect = 0.00356 * math.sqrt(eff / 2500)
     assert abs(float(env['LR']) - expect) < 5e-5, \
-        'LR={} 与有效 batch={} 的平方根缩放预期 {:.5f} 不符'.format(
-            env['LR'], eff, expect)
+        'LR={} 与有效 batch={}（BATCH×WS×ACCUM={}）的平方根缩放预期 {:.5f} 不符'.format(
+            env['LR'], eff, accum, expect)

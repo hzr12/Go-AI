@@ -50,31 +50,42 @@ python -m pip install swanlab -q || \
 
 # ---- 可调参数 ----
 WORLD_SIZE=4
-# ⚠ 2026-09-30：BATCH 已从 3000 降到 **2000**（首跑推荐档），并把定档依据
-# 从「推理」换成「实测重标定」。此前 3000 的理由是「v21 显存投影算不出来」
-# （P4.2 接线前的历史），现在算出来了 —— 而且算出来的是三个 OOM 根因：
-#   1. MambaLTI 的 drive 整条物化：(B,T,H,P,N) 每样本 17.0MB ⇒ B=2000 时
-#      **一次申请 31.67 GiB**（与云端报错逐位吻合）。梯度检查点管不到它。
-#   2. 扫描块内 u/M/h 活到反向：fp16@B=2000 单个 MambaLTI 块 52.6 GiB ⇒
-#      `20.13 GiB already allocated` + `Tried to allocate 2.81 GiB`。
-#   3. 预取 worker fork 晚于设备初始化：4 个 worker 各继承一份 CANN 上下文
-#      ⇒ PyTorch 只记 6.30 GiB 而卡上 94%、AICore 0%（6.3 + 4×6 ≈ 30 GiB）。
-# 三条都已在 commit 741b051 修掉。修完后同口径保留量（fp16@B=2000）：
-#   前向结束仍需存活 8.78 GiB + 最重的一块重算 4.9 GiB ⇒ 活跃峰值 14~15 GiB，
-#   加分配器缓存（实测 20.13 活跃时 reserved 26.98）⇒ 实际占用 ~21~23 GiB。
+# ⚠ 2026-10-01：BATCH 从 2000 降到 **1000 + GRAD_ACCUM=2**，**有效 batch 与 LR
+# 都不变**（1000×4×2 = 8000 ⇒ LR 仍是 0.00637）。降的只是「每卡 batch」。
 #
-# 每卡 BATCH   有效 batch   投影占用     LR = 0.00356×√(有效/2500)   判定
-#   1500         6000        ~16~18 GiB        0.00552              稳（保底）
-#   2000         8000        ~21~23 GiB        0.00637              ★本脚本默认
-#   2500        10000        ~26~28 GiB        0.00712              可试（未实测）
-#   3000        12000        ~31~33 GiB        0.00780              ✗ 会 OOM
+# 为什么必须降（**这一段是云端实测，不是投影**）：
+#   4 卡 / 每卡 2000 的两次 OOM 数字几乎一样（修前/修后）：
+#       Tried to allocate 2.81 GiB | 20.1 GiB allocated | 27.0 GiB reserved
+#   完整账本（从报错直接算出来）：
+#       32.00 GiB 总量 = 20.09 活数据(63%) + 6.93 碎片(22%) + 4.36 CANN/HCCL(14%)
+#                       + 0.62 空闲(2%) ⇒ 容器可用容量只有 ~27.6 GiB
+#   ⇒ 就算碎片全回收也要 24.5 GiB，只剩 3 GiB 余量；步内无法回收碎片 ⇒ 必挂。
+#   激活量与每卡 batch 成正比（4096 实验：减半 ⇒ 减半），累积步不进激活。
 #
-# ⚠ 上面是**投影**。三次 OOM 说明投影会错，所以逐档往上试，别跳档。
-# ⚠ 降 BATCH 必须同步降 LR（平方根缩放律；tests/test_run_py_sh.py 会拦）。
-# ⚠ 不要再靠「加大 BATCH」或「DDP→FSDP 省显存」找空间：FSDP1 分片的模型状态
-#   每 rank 约 45MB（参数+梯度+Adam+EMA 全分片），相对 20GB 级激活可忽略。
-BATCH=2000
-LR=0.00637            # 0.00356 × √(8000/2500) 平方根缩放律
+# 三个曾经被误判的「根因」，留档以免重犯：
+#   1. MambaLTI 的 drive 整条物化 = 一次 31.67 GiB 申请（真实存在，已修，
+#      那个报错消失了）。但它**不是**下面这个 20 GiB 峰值的成因。
+#   2. 扫描块内 u/M/h 活到反向：块内检查点确已生效（本地实测 96 次调用全部
+#      use_ckpt=True，52.6 → 4.9 GiB/块），但 20.09 GiB 里主角不是它 ⇒
+#      CPU fp32 投影低估了约 35%（漏了 autocast 的 fp16 副本、BN 保存的输入
+#      平面、NPU 注意力 math 后端瞬时量）。**别再拿 CPU 投影当实测。**
+#   3. 「面板 94% + AICore 0% = 预取 worker 继承 CANN 上下文」——**错**。面板是
+#      节点级视图且分母是容器可用容量（27.6 GiB，非 32），AICore 0% 只是采样
+#      在算子编译期。预取 fork 顺序仍按安全侧提前了（有运行时护栏），但它不是
+#      94% 的原因。
+#
+# 每卡 BATCH  累积  有效batch  活数据(实测口径)  合计(~27.6可用)  LR=0.00356×√(有效/2500)
+#   1000        2       8000        ~10 GiB          ~18.4 GiB        0.00637   ★本脚本默认
+#   1500        2      12000        ~15 GiB          ~23.5 GiB        0.00771   可试
+#   2000        1       8000        ~20 GiB          ~31.4 GiB        0.00637   ✗ OOM
+#
+# ⚠ 想换更高有效 batch：动 BATCH 与 GRAD_ACCUM 的乘积，**LR 必须同步**
+#   （tests/test_run_py_sh.py 的平方根律断言会拦，它已把 ACCUM 计入有效 batch）。
+# ⚠ 不要再靠「加大 BATCH」或「FSDP 省显存」找空间：模型状态分片后每 rank 约
+#   45MB，相对 20GB 级激活可忽略（0.2%）。
+BATCH=1000
+GRAD_ACCUM=2          # 有效 batch = BATCH × WORLD_SIZE × GRAD_ACCUM = 8000
+LR=0.00637            # 0.00356 × √(8000/2500) 平方根缩放律（累积计入有效 batch）
 PREFETCH_W=6          # 每 rank 6 个，4 卡合计 24（对齐 24 核）
 PREFETCH_D=16         # 在途 batch 数；每个约 49MB，16→约0.78GB/rank
 DATA=data/sgf_19x19_full.npz
@@ -138,7 +149,7 @@ torchrun --nproc_per_node="$WORLD_SIZE" scripts/train_sft.py \
   --attention-mode mix --num-attention-layers 4 --num-heads 4 \
   --attn-mode window_global --attn-window 5 \
   --attention-dropout 0.1 --label-smoothing 0.1 \
-  --gradient-accumulation-steps 1 \
+  --gradient-accumulation-steps "$GRAD_ACCUM" \
   --use-amp 1 --use-ema 1 \
   --npu-graph-compile "$NPU_GRAPH_COMPILE" \
   --scaler-init-scale "$SCALER_INIT" --scaler-growth-interval "$SCALER_GROWTH" \

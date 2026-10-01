@@ -973,7 +973,11 @@ def evaluate_metrics(model, dataset, idxs, bs, device, amp_dtype, max_batches=50
             if len(sel) == 0:
                 break
             states_np, moves_np, values_np = dataset.sample_batch_numpy(sel, rng=eval_rng, augment=False)
-            state = torch.from_numpy(states_np).to(device)
+            # 全精度评估（CPU）才升 fp32；AMP 下 planes 的 fp16 直接用
+            state = torch.from_numpy(states_np)
+            if amp_dtype == torch.float32:
+                state = state.float()
+            state = state.to(device)
             if use_channels_last:
                 state = state.to(memory_format=torch.channels_last)
             move_t = torch.from_numpy(moves_np).to(device)
@@ -2782,20 +2786,32 @@ def main():
                         # pin_memory 需要 contiguous 且为 CPU 内存
                         moves_np = np.ascontiguousarray(moves_np)
                         values_np = np.ascontiguousarray(values_np)
+                        # ⚠ 只有全精度（autocast 关着）才升 fp32。AMP 下权重会被
+                        #   autocast 转成 fp16/bf16，输入保持 planes 的原 dtype
+                        #   （fp16）即可 —— 强升 fp32 会让设备侧输入张量与 H2D
+                        #   字节数都白带一倍（2026-10-01）。
+                        _in32 = (amp_dtype == torch.float32)
                         if use_channels_last:
                             # A3: NHWC 物理布局——numpy 端一次性转置（比 torch
                             # .to(memory_format) 的主线程重排 memcpy 快），permute
                             # 得 channels_last 视图；pin 后异步 H2D，免每 step 重排
-                            state = (torch.from_numpy(np.ascontiguousarray(
-                                        states_np.transpose(0, 2, 3, 1)))
-                                     .float().pin_memory().permute(0, 3, 1, 2))
+                            _t = torch.from_numpy(np.ascontiguousarray(
+                                states_np.transpose(0, 2, 3, 1)))
+                            state = (_t.float() if _in32 else _t).pin_memory().permute(
+                                0, 3, 1, 2)
                         else:
                             states_np = np.ascontiguousarray(states_np)
-                            state = torch.from_numpy(states_np).float().pin_memory()
+                            _t = torch.from_numpy(states_np)
+                            state = (_t.float() if _in32 else _t).pin_memory()
                         move_t = torch.from_numpy(moves_np).long().pin_memory()
                         value_t = torch.from_numpy(values_np).float().pin_memory()
                     else:
+                        # 同上：全精度才升 fp32。NPU 走 AMP（amp_dtype=fp16）⇒ 保持
+                        # planes 的 fp16；CPU 是 fp32 ⇒ 这里升回去，否则 fp16 输入
+                        # 喂 fp32 权重会报 dtype 不匹配。
                         state = torch.from_numpy(states_np.copy())
+                        if amp_dtype == torch.float32:
+                            state = state.float()
                         move_t = torch.from_numpy(moves_np.copy())
                         value_t = torch.from_numpy(values_np.copy())
                     state = state.to(device, non_blocking=True)
@@ -2943,14 +2959,28 @@ def main():
                 # 纯报告项（见 compute_l2_report docstring 的 §3.1 说明）。
                 _lv, _pv, _vv = _read_log_scalars(log_loss, policy_loss, value_loss)
                 lr = optimizer.param_groups[0]['lr']
+                    # ⚠ 2026-10-01：只打 reserved 是不够的 —— 4 卡 OOM 那轮排查
+                    # 绕了三次，就是因为这一个数分不清「活数据 / 分配器碎片 /
+                    # torch 之外的占用」。从报错能直接算出的真实账本（每卡 32 GiB）：
+                    #     20.09 活(63%) + 6.93 碎片(22%) + 4.36 CANN/HCCL(14%) + 0.62 空闲
+                    # 三个数一起打，判读规则：alloc 跟着涨 = 泄漏；只有 reserved 涨
+                    # = 碎片（`empty_cache` / expandable_segments 能治）；两者都远低于
+                    # 面板 = 差额在 torch 之外。
                 if _backend == 'cuda':
                     mem = torch.cuda.memory_reserved(device) / 1e9
+                    mem_alloc = torch.cuda.memory_allocated(device) / 1e9
+                    mem_peak = torch.cuda.max_memory_allocated(device) / 1e9
                 elif _backend == 'npu':
                     mem = npu_memory_reserved(device) / 1e9
+                    mem_alloc = float(torch.npu.memory_allocated(device)) / 1e9
+                    mem_peak = float(torch.npu.max_memory_allocated(device)) / 1e9
                 else:
-                    mem = 0.0
+                    mem = mem_alloc = mem_peak = 0.0
                 _now = time.time()
-                _eff_bs = bs * max(1, world_size)
+                # ⚠ 有效 batch 必须含梯度累积：原来写的是 bs×world_size，漏乘
+                # accumulation ⇒ 用了 `--gradient-accumulation-steps 2` 时日志把
+                # 吞吐**报成实际的一半**（2026-10-01 修）。
+                _eff_bs = bs * max(1, world_size) * max(1, _accum_steps)
                 speed = (step - _step_at_start) * _eff_bs / max(1e-6, _now - t0)
                 # 瞬时速率：距上一次 stdout 打点。与分段耗时同口径，
                 # 二者相乘即该区间理论样本数，可直接核对时间丢在哪。
@@ -2971,11 +3001,13 @@ def main():
 
             if _do_stdout:
                 logger.info("[step %d/%d] loss=%.4f (p=%.4f v=%.4f) lr=%.2e "
-                            "scale=%.0f mem=%.2fGB spd=%.0f spd_inst=%.0f s/s "
+                            "scale=%.0f mem=%.2fGB (alloc %.2f/peak %.2f) "
+                            "spd=%.0f spd_inst=%.0f s/s "
                             "elapsed=%.0fs skip=%d | "
                             "d=%.0f c=%.0f s=%.0f e=%.0f dmax=%.0f ms",
                             step, total_steps, _lv, _pv, _vv,
-                            lr, _scale, mem, speed, spd_inst, _now - t0, _n_skipped,
+                            lr, _scale, mem, mem_alloc, mem_peak,
+                            speed, spd_inst, _now - t0, _n_skipped,
                             _dms, _cms, _sms, _ems, _dmax)
                 _last_stdout_t = time.time()
                 _last_stdout_step = step
@@ -3046,6 +3078,19 @@ def main():
                 _t_eval += time.perf_counter() - _t_eval0
                 if ema is not None:
                     ema.restore()
+                # ⚠ 周期性把分配器缓存段还给驱动（2026-10-01）。为什么放这里：
+                #   实测账本里 `reserved − allocated` 高达 6.93 GiB（活数据的
+                #   34%），那是尺寸对不上的旧块 —— 步内没法回收，但**步边界可以**。
+                #   eval 本来就是同步点（前面刚跑完 no_grad 前向），在这里加一次
+                #   回收的开销可忽略（每 --eval-every 步一次，默认 500 步 ≈ 35 分钟）。
+                #   不加会怎样：reserved 单调爬升（实测 93% → 98%），面板一路涨到
+                #   顶死，然后 OOM —— 而报错里 allocated 只有 20 GiB，看不出是谁占的。
+                #   ⚠ 它**不能**救「活数据本身就超卡」：20.09+4.36 = 24.5 GiB 已经
+                #   超过可用 27.6 GiB 的一半太多，那种情况只能降每卡 batch。
+                if _backend == 'npu':
+                    torch.npu.empty_cache()
+                elif _backend == 'cuda':
+                    torch.cuda.empty_cache()
                 if is_main:
                     # 不打 seed：评估固定 `augment=False`，`EVAL_SAMPLING_SEED` 与 `rng=`
                     # 都不被消费，指标与种子无关。打出它等于宣称「这批数字依赖这个常量」，

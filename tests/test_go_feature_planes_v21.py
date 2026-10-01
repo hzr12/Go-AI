@@ -360,7 +360,7 @@ def test_plane_count_and_indices():
         my_mv, op_mv = 3, 7 % (n * n)
         p = b.feature_planes([my_mv, -1, -1], [-1, -1, op_mv], 1)
         assert p.shape == (17, n, n), f"{n} 路形状错: {p.shape}"
-        assert p.dtype == np.float32, f"{n} 路 dtype 错: {p.dtype}"
+        assert p.dtype == np.float16, f"{n} 路 dtype 错: {p.dtype}"
         # 值域只允许 {0,1}（通道 9 是 ±1 的常数，单独断言）
         for idx in list(range(8)) + list(range(10, 17)):
             vals = set(np.unique(p[idx]).tolist())
@@ -378,7 +378,7 @@ def test_plane_count_and_indices():
     pb = GoBoard.feature_planes_batched(
         np.zeros((3, 5, 5), np.int8), np.full((3, 3), -1, np.int16),
         np.full((3, 3), -1, np.int16), np.array([1, -1, 1], np.int8))
-    assert pb.shape == (3, 17, 5, 5) and pb.dtype == np.float32
+    assert pb.shape == (3, 17, 5, 5) and pb.dtype == np.float16
 
     # 越界
     for bad in (11, 18, 0, -1):
@@ -1004,7 +1004,7 @@ def test_dataset_n_channels_default_is_12():
 
     # ① 形状
     states, moves, values = ds.sample_batch_numpy(idxs, augment=False)
-    assert states.shape == (16, 12, 9, 9) and states.dtype == np.float32
+    assert states.shape == (16, 12, 9, 9) and states.dtype == np.float16
     assert moves.shape == (16,) and values.shape == (16, 1)
 
     # ② augment=False 的契约：states **原样**就是 feature_planes_batched 的输出

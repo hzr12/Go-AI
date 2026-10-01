@@ -401,11 +401,55 @@ def run_grad_segment(blocks, args, use_checkpoint=False, tap_positions=(),
     return cur[0], tuple(captured[i] for i in taps_want)
 
 
+def _autocast_like(t):
+    """按**区域输入张量的 dtype** 造一个等价的 autocast 上下文（重算期间用）。
+
+    为什么不用「查 autocast 状态」：2026-10-01 的 OOM 根因就是重算不在 autocast
+    里（`backward()` 时前向的 `with autocast(...)` 早已退出），而查状态这条路
+    不可靠 —— `torch.is_autocast_enabled()` 只反映 **CUDA** 的 autocast，对
+    `device_type='npu'` 读不到（torch_npu 自己实现 autocast），实测在本地就抓到
+    None ⇒ 修复静默失效。
+
+    输入张量的 dtype 反而是**最准**的信号：它就是前向在该边界实际产出的精度。
+      输入 fp16/bf16 ⇒ 前向在低精度下 ⇒ 重算也该在低精度下；
+      输入 fp32      ⇒ 前向本来就是全精度 ⇒ 不需要任何 autocast。
+    dtype 沿参数推进时可能被提升（如 Mamba 的 `A_log` 是 fp32 参数，
+    `dt(fp16) * A(fp32)` → fp32），这由 ops 自己的类型提升处理，与 autocast 无关。
+
+    抓不到 / 构造失败一律退回 `nullcontext` ⇒ 最坏是「没改善」，不会更差。
+    """
+    if not isinstance(t, torch.Tensor):
+        return contextlib.nullcontext()
+    if t.dtype not in (torch.float16, torch.bfloat16):
+        return contextlib.nullcontext()
+    try:
+        return torch.autocast(device_type=t.device.type, dtype=t.dtype)
+    except Exception:  # noqa: BLE001
+        return contextlib.nullcontext()
+
+
 def _checkpointed(runner, args, bns):
     guard = _BatchNormStatGuard(bns)
+    _ac = _autocast_like(next((a for a in args
+                               if isinstance(a, torch.Tensor)), None))
+
+    @contextlib.contextmanager
+    def _recompute_ctx():
+        # 重算期间依次做两件事，**两者都不能省**：
+        #   1. 恢复前向的精度（fp16/bf16）—— 否则整段退回 fp32，体积翻倍，
+        #      这是 4 卡 910A OOM 的直接原因（`Tried to allocate 1.40 GiB`
+        #      恰是 (1000,4,46,32,64) 的 fp32 体积）；
+        #   2. BN guard 把统计还回去 —— P4.5b 为 `determinism_check` 装的
+        #      （前向与重算保存的张量数必须一致，否则 CheckpointError）。
+        with _ac:
+            with guard:
+                yield
 
     def context_fn():
-        return contextlib.nullcontext(), guard
+        # 第二个 context 只在**重算期间**进入（实测进入 1 次），第一个包原前向。
+        # ⚠ 传的是 `_recompute_ctx()` —— **实例**不是工厂：checkpoint 拿到的
+        #   是「已构造好的上下文管理器」，直接 `with` 它。
+        return contextlib.nullcontext(), _recompute_ctx()
 
     return torch.utils.checkpoint.checkpoint(
         runner, *tuple(args),
@@ -1762,7 +1806,13 @@ class MambaLTI(nn.Module):
         dt = F.softplus(self.dt_proj(dt_raw))                # (B, T, d_inner) > 0
         b_vec, c_vec = bc.split(self.d_state, dim=-1)        # 各 (B, T, 64)
 
-        A = -torch.exp(self.A_log)                           # (H,) < 0，逐 head 标量
+        # `A_log` 是 nn.Parameter（AMP 下参数主权重必须 fp32），而 dt 是 autocast
+        # 出来的 fp16/bf16。直接相乘会按类型提升把**整条扫描**拉回 fp32 ——
+        # 2026-10-01 的 4 卡 OOM 就死在这：块内重算时 `h = h + exp(sigma)*h_in`
+        # 要 `(B,Hh,P,l,N) = (1000,4,46,32,64)` 的 **fp32** 体积 = 1.40 GiB。
+        # 按 dt 的精度转一次：A 是 4 个 head 的标量衰减（值域 −1..−4），fp16/bf16
+        # 对它是精确的，而指数/衰减的误差量级本来就远大于 fp16 eps。
+        A = -torch.exp(self.A_log).to(dt.dtype)          # (H,) < 0，逐 head 标量
         # 每步的对数衰减 ℓ[b,t,h,p] = dt[b,t,h,p]·A[h] —— **与状态维 n 无关**
         # （P4.1s 的逐 head 标量衰减），这正是块内 (L,L) 矩阵能跨 n 共享的原因。
         log_decay = dt.view(B, T, Hh, P) * A[None, None, :, None]        # (B,T,H,P)
