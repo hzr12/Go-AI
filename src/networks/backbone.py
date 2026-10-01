@@ -658,6 +658,28 @@ def _sdpa(q, k, v, dropout_p=0.0, use_math=False, scale=None):
         # 手写注意力：math 路径需手动缩放 q
         if scale is not None:
             q = q * scale
+        step = _attn_query_chunk
+        nq = q.shape[-2]
+        # ⚠ query 分块（2026-10-01）：**峰值**显存由「同时活着的最大张量」决定，
+        # 不是总量。整条 (B,Hh,N,N) 分数矩阵在 N=361、4 head、fp16 下是
+        #   1000×4×361×361×2B = 0.97 GiB/份，softmax+dropout 再各留一份 ⇒
+        # 一次调用峰值约 2.9 GiB、反向要重取约 2 份。
+        # 而 softmax 沿 **key 轴**（dim=-1），每行 query 只跟自己那 N 个 key
+        # 有关 ⇒ 按 query 切块在数学上**精确**，峰值变成 ∝ chunk 而不是 ∝ N。
+        # chunk=64 时每份 0.97 → 0.17 GiB（5.6×）。
+        #
+        # ⚠ 唯一的**行为**变化：`dropout_p > 0`（训练态）时 mask 的随机取样位置
+        # 会变（分布等价、**不逐位相同**）。eval 态 dropout 恒为 0（见
+        # `attn_drop_p`），故评估指标不受影响。
+        if step and nq > step:
+            kt = k.transpose(-2, -1)
+            outs = []
+            for i in range(0, nq, step):
+                a = (q[..., i:i + step, :] @ kt).softmax(dim=-1)
+                if dropout_p > 0.0:
+                    a = torch.nn.functional.dropout(a, p=dropout_p)
+                outs.append(a @ v)
+            return torch.cat(outs, dim=-2)
         attn = (q @ k.transpose(-2, -1))
         attn = attn.softmax(dim=-1)
         if dropout_p > 0.0:
@@ -705,6 +727,24 @@ def set_sdpa_force_math(flag: bool) -> None:
     """由训练脚本在启动时按 GPU 能力设置。flag=True 强制手写 math（V100）。"""
     global _sdpa_force_math
     _sdpa_force_math = bool(flag)
+
+
+# 模块级开关：手写 math 注意力的 **query 分块长度**（0 = 关闭，走整条 N×N）。
+#
+# 为什么粒度要在**算子内部**：Mamba 那边外层循环本来就按 chunk 走，但 `drive`
+# 是在进循环之前整条物化的 ⇒ 外层分块对峰值毫无帮助，赢在把乘法搬进循环内部。
+# 注意力没有外层循环，整个 N×N 是一次算子，所以必须新增一层循环。
+#
+# 默认 64：19 路棋盘 N=361 ⇒ 6 块，每份 (B,4,64,361) fp16 在 B=1000 下
+# 0.17 GiB（原 0.97）。设 0 或 ≥N 即退回原路径（逐位不变）。
+_attn_query_chunk = 64
+
+
+def set_attn_query_chunk(n: int) -> None:
+    """设置 query 分块长度（0/负数 = 关闭）。由训练脚本启动时调用。"""
+    global _attn_query_chunk
+    n = int(n)
+    _attn_query_chunk = n if n > 0 else 0
 
 
 # 模块级开关：是否将 window/sparse 注意力排除出 torch.compile 图。

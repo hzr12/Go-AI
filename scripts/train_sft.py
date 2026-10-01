@@ -2370,6 +2370,12 @@ def main():
     from src.networks import backbone as _backbone
     _backbone.set_sdpa_force_math(sdpa_force_math)
     _backbone.set_compile_disable_sparse(compile_disable_sparse)
+    # 注意力 query 分块（2026-10-01）：math 路径下整条 (B,Hh,N,N) 分数矩阵
+    # @N=361/4head/fp16 在 B=1000 时 0.97 GiB 一份、softmax+dropout 再各一份。
+    # softmax 沿 key 轴 ⇒ 按 query 切块**数学精确**，峰值 ∝ chunk（默认 64 ⇒ 5.6×）。
+    # 只加在 math 分支（NPU 恒走 math），SDPA/flash 路径不受影响。
+    _attn_chunk = int(os.environ.get('GOAI_ATTN_QUERY_CHUNK', '64') or 0)
+    _backbone.set_attn_query_chunk(_attn_chunk)
 
     # flash-attn 独立库启用决策：仅「Ampere+ CUDA 且走非 math 路径」时尝试加载。
     # 加载失败自动回退内置 SDPA，不影响训练启动。
@@ -2390,6 +2396,10 @@ def main():
             logger.info("[env] 注意力内核: %s",
                         "手写 math（%s 不支持 Flash）" % (_backend.upper(),)
                         if sdpa_force_math else "内置 SDPA")
+            logger.info("[env] 注意力 query 分块: %s",
+                        "关闭" if _attn_chunk <= 0 else
+                        "%d（峰值 ∝ chunk；eval 逐位不变，训练态 dropout 取样位置变）"
+                        % _attn_chunk)
 
     logger.info("启动训练 | torch=%s | device=%s | amp_dtype=%s scaler=%s channels_last=%s",
                 torch.__version__, device, amp_dtype, use_scaler, use_channels_last)
