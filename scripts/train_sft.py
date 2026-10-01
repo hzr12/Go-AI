@@ -24,6 +24,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel
 
 
 # ---- NPU(Ascend/CANN) 后端兼容辅助 ----
@@ -127,20 +128,23 @@ def _dist_debug_level():
 def _downgrade_npu_dist_debug(logger):
     """NPU 后端下把 `TORCH_DISTRIBUTED_DEBUG=DETAIL` 降为 `OFF`。
 
-    为什么（NPU 专属，2026-09-30）：DETAIL 会让 FSDP1 启用「执行顺序自检」
-    （`fsdp/_exec_order_utils.py`：`_checking_order = debug_level == DETAIL`），
-    它在**每个被包裹模块的每次前向**都额外做一次 `all_gather_into_tensor` 跨 rank
-    比对参数句柄。在 HCCL 上这是纯负担：多几十次小 collective，换来一个只用于
-    「FSDP 开发者排查 all-gather 顺序」的自检。本仓库的正确性由
-    tests/test_fsdp1_conversion.py 的静态不变量 + 本文件的通信自检兜着，不依赖
-    它。
+    为什么（NPU 专属，2026-09-30 建立、2026-10-01 改写理由）：DDP 下
+    `TORCH_DISTRIBUTED_DEBUG=DETAIL` 启用的是 **reducer 的 bookkeeping 日志**
+    （`_get_ddp_logging_data`），**不额外发 collective**；但本仓库从未在 NPU 上
+    验证过它的开销（910A + HCCL 下 DETAIL 的实测数据缺失），所以保持 OFF。
+
+    （历史，已退役：这条降级最初的理由是当时那套包裹层的「执行顺序自检」——
+    FSDP1 的 `fsdp/_exec_order_utils.py` 里 `_checking_order = debug_level ==
+    DETAIL`，它在**每个被包裹模块的每次前向**都额外做一次 `all_gather_into_tensor`
+    跨 rank 比对参数句柄，在 HCCL 上是纯负担。那套包裹层在 2026-10-01 被 DDP
+    取代，该理由随之失效；「保持 OFF」的决定不变。）
 
     ⚠ **实测更正**：曾怀疑 DETAIL 是 4 卡 HCCL 报错的元凶（后来查到的真因是
     上一次崩掉的进程留下 HCCP 状态，`EJ0001 ... Maybe the last training process
-    is running`）。降级仍然保留，理由只剩上面那条「纯负担 + 诊断功能」，但
+    is running`）。降级仍然保留，理由只剩上面那条「未验证开销、保持 OFF」，但
     **它不是修那个错的原因**，别再拿它当根因。
 
-    在 `init_process_group` **之前**调用：通信域与 FSDP 状态都还没建立。CUDA/
+    在 `init_process_group` **之前**调用：那时通信域还没建立。CUDA/
     CPU 后端不动（inductor/nccl 上 DETAIL 的开销可接受，且它是排查 nccl hang 的
     正统手段）。
     """
@@ -155,8 +159,8 @@ def _downgrade_npu_dist_debug(logger):
     except Exception as e:  # noqa: BLE001 — 老版本没有这个 setter，不该因此拦住启动
         logger.warning("[dist] 降级 debug level 失败（忽略）：%s", e)
     logger.info("[dist] NPU 后端：TORCH_DISTRIBUTED_DEBUG DETAIL → OFF"
-                "（FSDP1 的 exec-order 自检每次前向多一次 all_gather，"
-                "在 HCCL 上是纯负担；它只是诊断功能，不影响训练正确性）")
+                "（DDP 下 DETAIL 只加 reducer bookkeeping、不额外发 collective；"
+                "本仓库未在 NPU 上验证过其开销，保持 OFF）")
 
 
 def _dist_env_snapshot():
@@ -235,22 +239,31 @@ def _dist_preflight_check(backend, device, logger):
 # --------------------------------------------------------------------------- #
 # from-scratch 初始权重同步（2026-10-01）
 #
-# 事故形状：`_wrap_fsdp1` 的 docstring（本文件上方）要求 from-scratch 也必须
-# 同步初始权重 ——「各 rank 独立、各自不同，这里必须同步，否则第一步
-# all-gather 出来的就是拼错的权重」。但 `sync_module_states` 从未被传
-# （`_fsdp_ctor_kwargs` 与 `FSDP_CTOR_KWARGS_WHITELIST` 都没有），**修复前**全文件
-# 唯一的 `dist.broadcast` 是 `_sync_stop_flag` 的 stop_flag —— **没有任何参数广播**。
+# 事故形状：当时的分布式包裹层（**历史：FSDP1，已退役**）的 docstring 要求
+# from-scratch 也必须同步初始权重 ——「各 rank 独立、各自不同，不同步的话第一步
+# 拿到的就是拼错的权重」。但它的 `sync_module_states=True` **从未被传**
+# （当时的构造参数白名单里也没有），**修复前**全文件唯一的 `dist.broadcast`
+# 是 `_sync_stop_flag` 的 stop_flag —— **没有任何参数广播**。
 # `shell/train_sft_npu_4card_v21.sh` 不传 `--resume`/`--model` ⇒ from-scratch
-# ⇒ `SHARD_GRAD_OP` 的第一步 all-gather 把 4 份不同的随机权重拼成一个逻辑权重。
+# ⇒ 第一步之后各 rank 的权重就永久分叉：梯度虽然被 all-reduce 拉齐，但被拉齐的
+# 是「起点不同」的同一份梯度，从 step 0 起两份权重就不是同一个模型了。
 #
-# 为什么用显式 broadcast 而不是 `sync_module_states=True`
+# 为什么用显式 broadcast 而不是包裹层自带的 `sync_module_states`
 # --------------------------------------------------------
-# 1. 后者在 torch 2.1 上需要 `param_init_fn` 配套（本文件 `sync_module_states`
-#    处的注释就写了），会直接撞 `_drop_unsupported_kwargs` 那套版本兼容雷区。
+# 1. 后者在 torch 2.1 上需要 `param_init_fn` 配套（未初始化的参数会留在 CPU），
+#    而本文件所有参数在包裹前已 `.to(device)`；当时为绕这条还要维护一层
+#    「按已安装签名过滤未知 kwarg」的版本兼容（**历史：随 FSDP1 包裹层一并删除的
+#    `_drop_unsupported_kwargs`**）。
 # 2. buffer 不需要额外同步：`BatchNorm2d` 的 `running_mean`/`running_var`/
 #    `num_batches_tracked` 是确定性 0/1 初始化，各 rank 本来就逐位一致。
 # 3. 显式 broadcast 是**无条件**的 —— 不依赖「resume 路径已经同步了」这类推理，
 #    运行时可验证，且能被 AST 测试直接钉住顺序。
+#
+# ⚠ 与 DDP 自带同步的关系（**顺序的硬理由**，详见 main() 里包裹点上方的注释）：
+#   `DistributedDataParallel.__init__` 在**它自己构造时**也会把 rank0 的
+#   params/buffers 广播出去（`_ddp_init_helper` → `_sync_module_states`），但那时
+#   EMA 已经构造完、把各 rank 自己的随机权重 clone 进了 shadow。所以必须由本组
+#   函数把广播放在 EMA 之前，包裹层自带的那次只能当第二道保险。
 #
 # 代价：36.3 MB 一次性广播 + 167 次小 collective（= `build_v21_net` 的参数张量数，
 # 实测 167 个 / 9,067,443 参数），**只在启动时发生一次**。
@@ -375,223 +388,16 @@ from src.data.dataset import SupervisedDataset
 from scripts.build_dataset import build
 
 
-def _fsdp_wrap_policy(model):
-    """FSDP1 的 auto_wrap_policy：按**块**切，不按整模型切。
-
-    粒度决定了两件事：切太粗（整模型一个 unit）就没有 all-gather 粒度可言，
-    激活峰值退化成「全模型激活全量常驻」；切太细（每个 Linear）则每层前后各一次
-    all-gather/reduce-scatter，通信量被放大一个量级。
-
-    这里选「主干里每个 stage / 每个 block 自身」——即用 module_cls=ResBlock
-    之类的**类**切，让 FSDP 把同类 block 各切一份，边界落在 block 之间。
-    block 内部（含 BN、以及 P4.6b 的梯度检查点段）不切，理由有三：
-      1. block 内含残差与 BN，二次切分会让 BN 统计在 all-gather 边界外更新，
-         与 P4.6b 的 `_BatchNormStatGuard` 语义打架；
-      2. P4.1s 的 Mamba chunked scan 有跨块状态语义，块边界是天然安全点；
-      3. 16 块 v21 主干切成 ~16 份，每份激活量已经是原来的 1/16 量级，
-         相对通信开销可接受。
-
-    头尾（stem / policy / value）各自成 unit：它们参数小而激活大
-    （policy 头 2.37M 参数、19x19 空间上的动作张量），单独切一刀能显著削峰。
-
-    判据用「不切任何东西」的自定义函数表达比 `size_based_auto_wrap_policy`
-    的参数阈值稳：后者随 batch_size 漂移，同一份配置在 batch 8 与 2800 下
-    会得到不同的切分形状，这与 search_arch.py 的 `PROBE_BS` 语义冲突。
-    """
-    from torch.distributed.fsdp.wrap import ModuleWrapPolicy
-
-    from src.networks import backbone as _bb
-
-    # 逐个类取：P4.1s 之后 block 类名可能随任务演进（MambaLTI / TransformerBlock
-    # 都是 v21 主干里的真实类名，但 Mamba2 布局是否保留该类名取决于实现阶段）。
-    # 取不到就退化为 ResBlock 一个类，ModuleWrapPolicy 至少不会因缺类而崩。
-    classes = []
-    for _name in ('ResBlock', 'CrossAttnRes', 'MambaLTI', 'TransformerBlock'):
-        _cls = getattr(_bb, _name, None)
-        if isinstance(_cls, type) and issubclass(_cls, torch.nn.Module):
-            classes.append(_cls)
-    if not classes:
-        classes = [torch.nn.Module]
-    return ModuleWrapPolicy(set(classes))
-
-
-def _wrap_fsdp1(model, local_rank, logger):
-    """用 FSDP1（`FullyShardedDataParallel`）包裹 model。
-
-    FSDP1 = `use_orig_params` 可选、auto_wrap_policy 粒度由调用方给的经典
-    FullyShardedDataParallel。**不是** FSDP2（`fully_shard` 那套 composable
-    API，torch 2.4+ 才可与 DTensor 互操作）。选 FSDP1 的理由：本文件已经把
-    optimizer / EMA / scheduler 全部绑在**原始 param 对象**上（见 `_wrap_fsdp1`
-    docstring 的第 1 条），FSDP1 的 `use_orig_params=True` 正是为这种「外部
-    持有引用」的代码路径准备的；换成 FSDP2 就得把这些全部重写成 DTensor 语义，
-    那是另一个数量级的改动，不在本次范围。
-
-    `sync_module_states` 只在**从 checkpoint 恢复**时才有意义（把 rank0 的
-    权重广播给其余 rank，保证分片后各 rank 起点一致）；from-scratch 训练
-    走的是 `module.parameters()` 的随机初始化，各 rank 独立、各自不同，
-    这里必须同步，否则第一步 all-gather 出来的就是拼错的权重。
-    调用方负责在 resume 之后包裹（与 compile 同样的位置理由）。
-    """
-    from torch.distributed.fsdp import FullyShardedDataParallel
-    from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
-
-    # sync_module_states=True 需要 param_init_fn，否则未初始化的参数会留在
-    # CPU 上；本文件所有参数在包裹前已 .to(device)，用 module.to 让
-    # `torch.distributed.fsdp._common_utils` 的 no_init 路径跳过即可。
-    import functools
-
-    from torch.distributed.fsdp import FullStateDictConfig
-    from torch.distributed.fsdp import CPUOffload
-
-    # 混合精度策略交给 autocast 承担（`_backend` 分支已经包了
-    # `maybe_autocast`），FSDP 侧**一个 dtype 都不设**：打开 FSDP 的 cast 会让
-    # 它在 all-gather 时做一次 fp32→fp16/bf16 转换，与 autocast 叠加成两次
-    # 转换，且 P4.7 的 Linear-only 编译边界会被这条插入打断。
-    #
-    # ⚠ 这里只允许传 `param_dtype` / `reduce_dtype` / `buffer_dtype` 三个
-    #   （都取 None）。`cast_forward_precision` / `cast_root_forward_precision` /
-    #   `keep_low_precision_grads` / `cast_forward_inputs` **不是 MixedPrecision
-    #   的参数**（前两个是 FullyShardedDataParallel 的构造参数），传进去在
-    #   torch 2.1 上直接
-    #   `TypeError: __init__() got an unexpected keyword argument
-    #   'cast_forward_precision'`，4 卡启动第一步就崩。本地 world_size=1
-    #   走不到这条路径、AST 测试又只查「有没有 use_orig_params」，于是这个错
-    #   一路活到云端才炸（2026-09）。守护见
-    #   tests/test_fsdp1_conversion.py::test_mixed_precision_*。
-    mp = MixedPrecision(param_dtype=None, reduce_dtype=None, buffer_dtype=None)
-
-    # FSDP1 的构造参数在 torch 版本间**增删过**（本地开发机 torch 2.12、云端
-    # 910A torch 2.1，两头都不保证）。这里按**已安装的**签名过滤：认得的照传，
-    # 不认的丢掉并**显式打印**（不静默 —— 静默丢掉一个 kwarg 意味着你以为开了
-    # 的东西没开）。认得的全部落进 FSDP_CTOR_KWARGS_WHITELIST 白名单测试，防止
-    # 以后又写出一个「本地这版恰好有、云端那版没有」的参数。
-    _ctor_kwargs = _fsdp_ctor_kwargs(model, local_rank, mp)
-    _dropped = _drop_unsupported_kwargs(
-        FullyShardedDataParallel, _ctor_kwargs, 'FullyShardedDataParallel', logger)
-    if _dropped:
-        logger.warning("[fsdp] 当前 torch %s 的 FSDP1 构造不支持 %s，已忽略"
-                       "（功能降级，不是静默）：本仓库开发机 torch 2.12 / 云端 "
-                       "torch 2.1 两侧 API 有差异，属预期。",
-                       torch.__version__, _dropped)
-
-    handle = FullyShardedDataParallel(model, **_ctor_kwargs)
-    logger.info("[fsdp] 已包裹 FullyShardedDataParallel(FSDP1) | sharding=SHARD_GRAD_OP"
-                " | use_orig_params=True | auto_wrap=按块类切"
-                " | mixed_precision=由 autocast 承担（FSDP 侧全 None）"
-                " | 构造参数被忽略=%s", _dropped or "无")
-    return handle
-
-
-#: `_wrap_fsdp1` 允许传给 `FullyShardedDataParallel` 的 kwarg 全集。
-#: 守护见 tests/test_fsdp1_conversion.py::test_fsdp_ctor_kwargs_are_whitelisted。
-FSDP_CTOR_KWARGS_WHITELIST = frozenset({
-    'auto_wrap_policy', 'sharding_strategy', 'device_id', 'mixed_precision',
-    'use_orig_params', 'limit_all_gathers', 'forward_prefetch',
-})
-
-
-def _fsdp_ctor_kwargs(model, local_rank, mixed_precision):
-    """FSDP1 构造参数（**单一真相源**：运行与 AST 守护读的是同一份 dict）。
-
-    单独抽成函数而不是就地写在构造调用里：AST 守护要读出「实际传了哪些
-    kwarg」，就地写就只能在 `FullyShardedDataParallel(model, **d)` 这种
-    `**d` 展开处放弃静态判定（展开的 kwarg 在 AST 里看不见）。抽出来后
-    `tests/test_fsdp1_conversion.py` 既能读源码、也能直接 import 调用。
-    """
-    from torch.distributed.fsdp import ShardingStrategy
-    return {
-        'auto_wrap_policy': _fsdp_wrap_policy(model),
-        # SHARD_GRAD_OP = 参数分片 + 梯度分片 + 反向后算子分片，是 FSDP1
-        # 的默认策略，也是「训练态显存 ∝ 1/world_size」的那一个。
-        # SHARD_OP 把前向也算子切分，激活也降，但与梯度检查点叠加后重算
-        # 成本翻倍，收益不抵。
-        'sharding_strategy': ShardingStrategy.SHARD_GRAD_OP,
-        'device_id': local_rank,
-        'mixed_precision': mixed_precision,
-        # 见 `_wrap_fsdp1` docstring 第 1 条：必须 True（optimizer / EMA /
-        # scheduler 都持有**原始 param 对象**）。
-        'use_orig_params': True,
-        # 缓存 all-gather 来的参数，供前向与反向复用。
-        'limit_all_gathers': True,
-        'forward_prefetch': False,
-    }
-
-
-def _drop_unsupported_kwargs(cls, kwargs, label, logger):
-    """按 `cls.__init__` 的**已安装签名**过滤 kwargs，返回被丢掉的名字。
-
-    为什么要它：FSDP1 是 torch 2.0~2.12 之间参数增删最频繁的 API 之一，而本仓库
-    的开发机（CPU/torch 2.12）与云端 910A（torch 2.1）**版本不同**。硬传一个
-    云端那版没有的参数 = 4 卡启动第一步 TypeError（2026-09 真发生过一次：
-    `MixedPrecision(cast_forward_precision=...)`）。过滤 + 告警把「崩溃」降级成
-    「功能降级且日志可见」。
-
-    只丢**不认**的参数；认得的一个不丢，也不改值 —— 宁可少一个优化，也不能
-    悄悄换掉 `use_orig_params` 这种硬需求。
-    """
-    import inspect
-    try:
-        params = set(inspect.signature(cls.__init__).parameters) - {'self'}
-    except (TypeError, ValueError):  # pragma: no cover - 签名不可 introspect
-        return []
-    unknown = sorted(set(kwargs) - params)
-    for name in unknown:
-        kwargs.pop(name, None)
-    return unknown
-
-
-def _fsdp_full_state_dict(model):
-    """分片态下取出**完整**（未分片）的 state_dict。
-
-    FSDP1 的 `model.state_dict()` 返回的是本 rank 的分片片段（键名带
-    `_fsdp_wrapped_module.` 与 `.` 分片后缀），直接 `torch.save` 存出来
-    的存档只有 1/world_size 的参数，`evaluate.py` / `inference` / `webui`
-    / P4.8 的两代加载会全部 `load_state_dict` 失败。
-
-    `FullStateDictConfig(offload_to_cpu=True, rank0_only=True)` 让 rank0
-    汇聚完整权重到 CPU、其余 rank 拿到 `{}`（省一次多余的 all-gather）。
-    键名会被还原成包裹前的原样（`_fsdp_wrapped_module` 与分片后缀都被
-    FSDP 剥掉），所以 `save_model` 的 `module.` 前缀剥离逻辑仍需保留 ——
-    FSDP 的 top-level wrapper 在某些版本下仍会给顶层加 `module.`
-    """
-    from torch.distributed.fsdp import FullStateDictConfig
-    from torch.distributed.fsdp import FullyShardedDataParallel, StateDictType
-
-    if not isinstance(model, FullyShardedDataParallel):
-        return model.state_dict()
-    cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-    with FullyShardedDataParallel.state_dict_type(
-            model, StateDictType.FULL_STATE_DICT, cfg):
-        return model.state_dict()
-
-
-def _fsdp_full_optimizer_state(optimizer, model):
-    """分片态下取出**完整**的 optimizer.state_dict。
-
-    与 state_dict 同理：分片后 `optimizer.state` 是每 rank 各自那一份
-    分片动量，rank0 直接存会得到残缺的动量，续训的 AdamW 等于丢了历史。
-    `FullOptimStateDictConfig(rank0_only=True, offload_to_cpu=True)` 在
-    rank0 汇聚。**键名是参数名而非 FSDP 内部分片名**，与本文件
-    `_load_optimizer_state` 的预期一致。
-    """
-    from torch.distributed.fsdp import FullOptimStateDictConfig
-    from torch.distributed.fsdp import FullyShardedDataParallel, OptimStateDictType
-
-    if not isinstance(model, FullyShardedDataParallel):
-        return optimizer.state_dict()
-    cfg = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
-    with FullyShardedDataParallel.optim_state_dict_type(
-            model, OptimStateDictType.FULL_OPTIM_STATE_DICT, cfg):
-        return optimizer.state_dict()
-
-
 def save_model(model, path):
-    """保存模型权重，并剥离 DDP/FSDP 包裹产生的 'module.' 前缀与 torch.compile 产生的
-    '_orig_mod.' 段，保证存档无论是否经 DDP/FSDP/compile 都能被后续普通加载/resume 使用。
+    """保存模型权重，并剥离 DDP 包裹产生的 'module.' 前缀与 torch.compile 产生的
+    '_orig_mod.' 段，保证存档无论是否经 DDP/compile 都能被后续普通加载/resume 使用。
 
-    ⚠ FSDP1 下必须走 `_fsdp_full_state_dict`：直接 `model.state_dict()` 只含本 rank
-    的分片片段（1/world_size 的参数），存出来的存档任何普通加载都读不了。
-    该 helper 对非 FSDP 模型退化为 `model.state_dict()`，单卡/DDP 行为不变。
+    ⚠ DDP 下**直接** `model.state_dict()` 就是完整权重，不需要任何汇聚 helper：
+    DDP 每 rank 各持一份完整模型、只同步梯度，`state_dict()` 本身**不是
+    collective**（没有 all-gather）。所以调用方把它放在 `is_main` 分支里既安全
+    也没有额外开销 —— 键名形如 'module.backbone.…'，剥掉 'module.' 之后与包裹前
+    完全同形，`src/inference.py` / `scripts/evaluate.py` / `webui.py` /
+    `_load_model_state` 一行都不用改，旧 checkpoint 继续可读。
 
     ⚠ '_orig_mod.' 出现在**路径任意层级**，不只在开头。两种 compile 形态落点不同：
     整模型 compile（CUDA `--compile 1`）把**顶层**包成 OptimizedModule
@@ -603,7 +409,7 @@ def save_model(model, path):
     会原样留下中段前缀，存档键与 evaluate.py / inference / webui / convert_ckpt
     期待的未编译布局对不上，load_state_dict 直接失败。
     """
-    sd = _fsdp_full_state_dict(model)
+    sd = model.state_dict()
     if any(k.startswith('module.') for k in sd.keys()):
         sd = {k.replace('module.', '', 1): v for k, v in sd.items()}
     if any('_orig_mod.' in k for k in sd.keys()):
@@ -1610,14 +1416,17 @@ def _build_param_groups(model, args) -> list[dict]:
     value 归属按**前缀** `'value.'` 判定而非子串 `'value' in n`：子串判定会把未来
     v21 新增的 `backbone.value_proj` 之类（非 value 头、名字里带 value）误归到 value 组。
 
-    调用前提：`model` 必须是**裸模块**。FSDP 包装后 `named_parameters()` 的名字会带
+    调用前提：`model` 必须是**裸模块**。DDP 包裹后 `named_parameters()` 的名字会带
     `module.` 前缀，`startswith('value.')` 就不再成立。main() 里本函数在
-    FSDP1（`_wrap_fsdp1`）包装之前调用（分组只依赖模块自身结构，与 is_dist 无关），
+    DDP 包裹之前调用（分组只依赖模块自身结构，与 is_dist 无关），
     改调用顺序时留意这一条。
 
-    FSDP1 下这一条**比 DDP 更硬**：必须配 `use_orig_params=True`，否则 FSDP 会把
-    参数换成扁平的 `FlatParameter`，这里抓到的就是分片视图，`p.ndim == 1` 的
-    no_decay 判据恒为 False、value 组与 other 组的划分随之失效。
+    DDP **不扁平化参数**，所以本函数抓到的分组对象与 optimizer 绑定的始终是同一批
+    `nn.Parameter`：包裹层只在顶层加一层 wrapper，内部 `model.value` / 每个
+    `p.ndim` 都保持原样。`p.ndim == 1` 的 no_decay 判据与 `'value.'` 的前缀判据
+    因此在包裹前后等价 —— 这正是「分组必须在包裹前建、但语义不会被包裹改坏」的
+    依据（历史：上一代分片式包裹层会把参数换成扁平的 `FlatParameter`，那才是会让
+    这两条判据双双失效的东西）。
     """
     no_decay_params = {p for p in model.parameters() if p.ndim == 1}
     value_decay = [p for p in model.value.parameters() if p not in no_decay_params]
@@ -2230,13 +2039,14 @@ def main():
 
     # ---- 分布式训练：设备由 LOCAL_RANK 决定，忽略 --device 卡号 ----
     # 后端选择：NPU 走 hccl，CUDA 走 nccl。多卡前必须 init_process_group，
-    # 否则后续 .to(device) / FSDP 包裹会失败或各卡不互通。
+    # 否则后续 .to(device) / DDP 包裹会失败或各卡不互通。
     if is_dist:
         _dist_backend = (args.device.split(':')[0]
                          if args.device not in ('auto', '') else
                          ('npu' if npu_is_available() else 'cuda'))
-        # ⚠ 必须在 init_process_group **之前**：DETAIL 会让 FSDP1 开启 exec-order
-        # 自检（每次前向多一次 all_gather），NPU 上是纯负担 → 降为 OFF。
+        # ⚠ 必须在 init_process_group **之前**：DETAIL 在 NPU 上未验证过开销
+        # （DDP 下它只加 reducer bookkeeping、不额外发 collective，但仍降为 OFF）。
+        # 见 _downgrade_npu_dist_debug 的 docstring。
         if _dist_backend == 'npu':
             _downgrade_npu_dist_debug(logger)
         if _dist_backend == 'npu':
@@ -2252,8 +2062,9 @@ def main():
         # （真因藏在日志前面的 EJ0001 里）。见 _dist_preflight_check 的 docstring。
         _dist_preflight_check(_dist_backend, device, logger)
         if is_main:
-            logger.info("[fsdp] 初始化分布式训练 | backend=%s world_size=%d | 策略=FSDP1"
-                        "（参数+梯度+优化器状态全分片）", _dist_backend, world_size)
+            logger.info("[dist] 初始化分布式训练 | backend=%s world_size=%d | 策略=DDP"
+                        "（各 rank 各持完整模型，梯度每步 all-reduce 一次）",
+                        _dist_backend, world_size)
     else:
         if args.device == 'auto':
             device = _auto_select_device()
@@ -2468,7 +2279,8 @@ def main():
     # ⚠ 位置是硬要求：**必须在 EMA 构造（本文件下方 `EMA(model, ...)`）之前** ——
     # EMA 在构造时就把参数 `clone()` 进 `shadow`，放晚了 shadow 会持有广播前的
     # 随机权重，之后每个 step 的 `ema.update()` 都往这个陈旧 shadow 上混。
-    # 也必须在 FSDP 包裹之前 —— 包裹后参数存储被替换成 flat shard，广播无意义。
+    # 也必须在 DDP 包裹之前：先建 EMA 再包裹，EMA 持有的引用就正好是 DDP 的
+    # `module`，键空间一致（见下方包裹点上方的注释）。
     _sync_init_weights_from_rank0(model, logger)
     _assert_init_weights_identical(model, logger)
     n_params = sum(p.numel() for p in model.parameters())
@@ -2708,26 +2520,54 @@ def main():
         else:
             logger.info("[train] 当前 torch 版本不支持 torch.compile，跳过")
 
-    # 分布式：FSDP1 包裹需在 torch.compile 之后（算子融合与分片可共存；反过来
-    # compile 会被 FSDP 的动态边界吞掉，拿到的是未融合图）。
+    # 分布式：DDP 包裹需在 torch.compile 之后（算子融合与梯度同步可共存；反过来
+    # compile 会被 wrapper 的动态边界吞掉，拿到的是未融合图）。
     #
-    # FSDP1 vs DDP 的三点关键差异，都不是风格问题而是正确性/容量问题：
-    #  1. `use_orig_params=True` —— **硬需求**，本文件多处持有原始 param 引用：
-    #     `_build_param_groups` 抓的是裸模块的 param 对象（分组依赖
-    #     `named_parameters()` 的 `'value.'` 前缀判定），`EMA` 持 shadow 与
-    #     同一批对象。FSDP 默认 `use_orig_params=False` 会把参数换成扁平的
-    #     `FlatParameter`，optimizer 里的就是分片视图；后续 `ema.shadow` 的
-    #     逐参对照、`_locate_overflow` 的分组遍历都会错位，且 `p.ndim == 1`
-    #     的 no_decay 判据在扁平张量上恒为 False。
-    #  2. 分片后 `state_dict()` 只含**本 rank 的切片**。存档必须走
-    #     `FullStateDictConfig(offload_to_cpu=True, rank0_only=True)` 在
-    #     rank0 汇聚成完整权重，否则存出来的是 1/world_size 的碎片，
-    #     `evaluate.py` / `inference` / `webui` / P4.8 的两代加载全部读不了。
-    #  3. optimizer.state 在分片后是**每卡各自的分片**，`torch.save` 直接存
-    #     会被 rank0 的那一份覆盖全局。同样要 `FullOptimStateDictConfig`
-    #     汇聚，否则续训的动量是错的。
+    # 为什么现在用 DDP（2026-10-01 换轨；**历史：换轨前用的是 FSDP1，已退役**）
+    # ------------------------------------------------------------------
+    # 触发事件：4 卡 910A 训练崩在 `ema.update()` 的
+    # `KeyError: 'backbone.stem_bn._fsdp_wrapped_module.weight'`。那套分片式
+    # 包裹层会把**内部**模块就地换成 wrapper（wrapper 又把自己的 `_fsdp_wrapped_module`
+    # 注册进父模块的 `_modules`），于是「包裹前建好的 EMA shadow」与
+    # 「包裹后 named_parameters() 遍历出来的键」不再是同一个键空间 ⇒ 每步都
+    # KeyError。DDP 只在**顶层**加一层 wrapper（键只是多一个 `module.` 前缀），
+    # 内部模块树原样不动 ⇒ 这整类崩溃消失，不需要任何针对它的补丁。
+    #
+    # 两个数字（9,067,443 参数 = fp32 36.3 MB / 32 GiB 卡）：
+    #   1. 显存：FSDP1 每 rank 约 145 MB（参数分片 + 梯度分片 + Adam 两矩分片），
+    #      DDP 每 rank 约 36.3 MB × 4（参数 + 梯度 + Adam 两矩各一份全量），
+    #      差约 109 MB = 0.33% 的卡。参数本来就装得下，分片省下的这点余量
+    #      不值得拿正确性风险换。
+    #   2. 通信：FSDP1 每步是「16 个分片单元 × 2 次 collective」（前向 all-gather
+    #      参数、反向 reduce-scatter 梯度），DDP 每步只有 1 次梯度 all-reduce。
+    #      通信量小到不像瓶颈，而本仓库的实际瓶颈在算子（见 `[profile]` 日志）。
+    #
+    # 为什么 Task 1 的两个同步函数必须留在包裹点**之前**（顺序的硬要求）：
+    # `DistributedDataParallel.__init__` 在**它自己构造时**（`_ddp_init_helper` →
+    # `_sync_module_states`）把 rank0 的 params/buffers 广播出去，而构造发生在
+    # **EMA 构造之后**。所以若依赖 DDP 自带的同步：rank0 的 EMA shadow = rank0
+    # 自己的随机权重（正确），rank1~3 的 shadow = 各自被丢弃的随机权重（陈旧）
+    # ⇒ `ema.update()` 每步都把正确权重混进陈旧 shadow ⇒ **EMA 跨 rank 发散**，
+    # 且不报错。`main()` 里 `_sync_init_weights_from_rank0` /
+    # `_assert_init_weights_identical` 在 `.to(device)` 之后、EMA 之前，恰好堵住它。
+    #
+    # 构造参数**只有** `device_ids`，其余全默认（不新增任何 CLI flag）：
+    #   · `find_unused_parameters=False`（默认）：两个头（policy/value）每个 step
+    #     都参与 loss ⇒ 所有参数都有梯度。⚠ 这是**隐含前提**：将来若出现「某个头
+    #     不参与 loss」的分支，DDP 会抛
+    #     `Expected to have finished reduction in the prior iteration`
+    #     —— 好在它是**响亮**地失败，不会安静地错。
+    #   · `broadcast_buffers=True`（默认）：BN 的 `running_mean`/`running_var`
+    #     跨卡一致靠它；上一代分片式包裹层默认也是 True ⇒ 行为不变。
+    #   · `gradient_as_bucket_view=False`（默认）：本文件用
+    #     `optimizer.zero_grad(set_to_none=True)`，bucket view 的别名每轮被销毁，
+    #     省不掉拷贝，收益仅 ~27 MB/rank（0.08% 的卡）；真正的风险是混用
+    #     view / 非 view 的 grad 状态触发
+    #     `Expected to mark a variable ready only once`。收益配不上这类风险。
+    #   · `static_graph=False`（默认）：打开会禁止「iteration 边界内参数集合
+    #     变化」，收益未验证。
     if is_dist:
-        model = _wrap_fsdp1(model, local_rank, logger)
+        model = DistributedDataParallel(model, device_ids=[local_rank])
 
     if is_main:
         logger.info("[train] 开始训练 | steps/epoch=%d | 总 steps≈%d | warmup=%d",
@@ -2934,7 +2774,7 @@ def main():
                 if is_main:
                     save_model(model, args.out + '.latest')
                     torch.save({
-                        'optimizer': _fsdp_full_optimizer_state(optimizer, model),
+                        'optimizer': optimizer.state_dict(),
                         'scheduler': scheduler.state_dict(),
                         'scaler': scaler.state_dict(),
                         'step': step,
@@ -3063,7 +2903,7 @@ def main():
                 _t_save0 = time.perf_counter()
                 save_model(model, args.out + '.latest')
                 _state = {
-                    'optimizer': _fsdp_full_optimizer_state(optimizer, model),
+                    'optimizer': optimizer.state_dict(),
                     'scheduler': scheduler.state_dict(),
                     'scaler': scaler.state_dict(),
                     'step': step,
@@ -3148,7 +2988,7 @@ def main():
                         save_model(model, args.out)
                         # 保存 train_state 到最佳模型路径，确保 --resume 最佳模型时状态一致
                         _state = {
-                            'optimizer': _fsdp_full_optimizer_state(optimizer, model),
+                            'optimizer': optimizer.state_dict(),
                             'scheduler': scheduler.state_dict(),
                             'scaler': scaler.state_dict(),
                             'step': step,

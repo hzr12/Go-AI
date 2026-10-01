@@ -176,7 +176,14 @@ def test_downgrade_only_touches_detail(monkeypatch):
 
 
 def test_downgrade_is_before_init_and_preflight_after():
-    """顺序即语义：DETAIL 降级在通信域建立**之前**，自检在**之后**。"""
+    """顺序即语义：DETAIL 降级在通信域建立**之前**，自检在**之后**。
+
+    ⚠ 这条**与包裹层无关**：判据是「环境变量必须在通信域建立前改掉」，而不是
+    「哪种包裹层在 DETAIL 下更贵」。2026-10-01 FSDP1 → DDP 换轨时降级**保留**、
+    理由被改写（spec §5.4：旧理由是上一代包裹层的 exec-order 自检会在每次前向多发
+    `all_gather_into_tensor`；DDP 下 DETAIL 只加 reducer bookkeeping，不发 collective，
+    但本仓库从未在 NPU 上验证过其开销，故仍保持 OFF）。**决定不变 ⇒ 断言不变。**
+    """
     main = _func('main')
     seg = ast.get_source_segment(SRC, main) or ''
     i_down = seg.find('_downgrade_npu_dist_debug(')
@@ -184,7 +191,8 @@ def test_downgrade_is_before_init_and_preflight_after():
     i_pre = seg.find('_dist_preflight_check(')
     assert -1 not in (i_down, i_init, i_pre), \
         'main 里三步必须都在：downgrade=%d init=%d preflight=%d' % (i_down, i_init, i_pre)
-    assert i_down < i_init, 'DETAIL 降级必须早于 init_process_group（否则通信域/FSDP 已按 DETAIL 建好）'
+    assert i_down < i_init, \
+        'DETAIL 降级必须早于 init_process_group（否则通信域与分布式包裹层已按 DETAIL 建好）'
     assert i_pre > i_init, '通信自检必须晚于 init_process_group（要先有通信域才试得起来）'
 
 

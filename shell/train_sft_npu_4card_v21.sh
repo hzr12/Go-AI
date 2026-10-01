@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# SFT 四卡 910A —— v21：17 通道 Mamba-2/Transformer/CrossAttn 档（FSDP1 / HCCL）
+# SFT 四卡 910A —— v21：17 通道 Mamba-2/Transformer/CrossAttn 档（DDP / HCCL）
+#
+# ⚠ 分布式包裹层换过两次轨，读下面的注释前先看这一行：
+#     2026-09-30  DDP → FSDP1（当时模型更大、真实参数量尚未测出）
+#     2026-10-01  FSDP1 → DDP（EMA 崩溃 + 规模测算；现行）
+#   两段论证都保留在本文件里（历史不删），现行口径见「2026-10-01 的换轨」一节。
 #
 # 用法:
 #   python run.py --sh shell/train_sft_npu_4card_v21.sh
@@ -22,31 +27,109 @@ python -m pip install swanlab -q || \
 #   1. 网络结构换成 v21（17 通道，Mamba-2 ×4 + TransformerBlock ×2 +
 #      CrossAttnRes ×2 + ResBlock ×8，184 通道），权威参数锚点见
 #      scripts/search_arch.py 的 ANCHOR_V21（9,067,443 参数）。
-#   2. 分布式从 DDP 换成 **FSDP1**（见下面「FSDP1 vs DDP」一节）。
+#   2. 分布式包裹层。**历史：2026-09-30 从 v19 的 DDP 换成 FSDP1；2026-10-01 又
+#      换回 DDP**（现行 = DistributedDataParallel）。两次换轨的理由分别记在下面
+#      「2026-09-30 的决策」与「2026-10-01 的换轨」两节，一节都没删。
+
+# ---- 现行：分布式是 DDP（2026-10-01 换轨后的口径）----
+# scripts/train_sft.py 现在用 DistributedDataParallel 包裹模型，构造是
+# `DistributedDataParallel(model, device_ids=[local_rank])` —— **除 device_ids
+# 之外全部默认**，且**没有新增任何 CLI flag**（依据：
+# docs/superpowers/specs/2026-10-01-ddp-instead-of-fsdp-design.md §5.1）。
+# 这些不变量由 tests/test_dist_wrap.py 钉住（只传 device_ids；包裹点在 EMA、
+# _sync_init_weights_from_rank0、torch.compile 之后，在训练循环之前）。
 #
-# ---- FSDP1 vs DDP：不要按 DDP 的直觉读这个脚本 ----
-# scripts/train_sft.py 现在用 FullyShardedDataParallel 包裹模型
-# （_wrap_fsdp1），配置是 sharding=SHARD_GRAD_OP、use_orig_params=True、
-# auto_wrap 按**块类**切（ResBlock / CrossAttnRes / MambaLTI / TransformerBlock）。
+# 读这个脚本时对分布式只需知道四件事，都是 DDP「完整复制 + 一步 all-reduce」的
+# 直接后果：
+#   · **参数不分片**：每 rank 持有完整模型（params + grads + Adam 两矩 ≈ 145 MB，
+#     算术见「2026-10-01 的换轨」一节）。所以「卡数越多、每卡模型越省」这个
+#     直觉**从来没有成立过** —— 4 卡分的是 batch，不是模型状态。
+#   · **每步只同步梯度**：1 次 all-reduce（约 36 MB/步，fp32 梯度）。
+#   · **存档无需汇聚**：每 rank 的 `state_dict()` 本身就是完整权重，键形如
+#     `module.backbone.…`，save_model 剥掉 `module.` 之后与**包裹前同形**
+#     ⇒ **旧 checkpoint 继续可读，新 checkpoint 的键名与 FSDP1 时代一致**
+#     （spec §5.5）。脚本侧无需任何额外动作。
+#   · **启动方式与 v19 逐字相同**：`--nproc_per_node=N` 照旧注入
+#     RANK / WORLD_SIZE / LOCAL_RANK，train_sft.py 读的是同一套环境变量契约。
+#     本文件的 torchrun 行与 v19 逐字相同，这不是遗漏。
+#     ⚠ 正因为逐字相同，**别用 torchrun 行去判断当前用的是哪种包裹层**。
+
+# ---- 2026-09-30 的决策：为什么当时选 FSDP1（历史，已退役；保留不删）----
+# ⚠ 以下整段描述的是**当时**的代码状态（scripts/train_sft.py 用
+#   FullyShardedDataParallel 包裹，即已删除的 _wrap_fsdp1），配置是
+#   sharding=SHARD_GRAD_OP、use_orig_params=True、auto_wrap 按**块类**切
+#   （ResBlock / CrossAttnRes / MambaLTI / TransformerBlock）。
+#   **2026-10-01 已换回 DDP**（理由见下一节）—— 别按这段推算今天的显存，
+#   但也别删：它记的是「当时那个决定为什么站得住」。
 #   ⚠ 这一层耦合到**类名**：_fsdp_wrap_policy 逐个 getattr 取，取不到就**静默跳过**
 #     （不报错）。而 ANCHOR_V21 / 路线图已把 MambaLTI 改称 Mamba2（旧称作废）。
 #     若 P4.2 落地时把类真改名成 Mamba2 而没同步那个名字元组，4 个 Mamba 块会**不再
 #     单独切**，粒度退化成「整模型一个 unit」→ 激活峰值反弹（正是该函数 docstring
 #     里点名的失败模式）。改名前请核 `_fsdp_wrap_policy` 的类名元组。
-# 与 DDP 的差别，都是正确性/容量问题，不是风格问题：
+# 当时的论证是「与 DDP 的差别，都是正确性/容量问题，不是风格问题」：
 #   · **参数、梯度、优化器状态三项全部分片**。所以「每卡显存 = DDP 那套算法」
 #     的直觉是错的：DDP 只同步梯度，FSDP1 连参数和 Adam 动量都切。
+#     ⚠ **2026-10-01 复盘结论：三条逐条检查后发现，它们全是 FSDP 自己制造的
+#     问题，不是 DDP 的缺陷** ——
+#       (1) use_orig_params=True 是硬需求：否则参数被换成 FlatParameter，
+#           EMA 的 shadow 逐参对照与 no_decay 判据 p.ndim==1 都会错位；
+#       (2) 分片后 state_dict() 只含本 rank 切片，必须靠 FullStateDictConfig
+#           （offload_to_cpu=True, rank0_only=True）在 rank0 汇聚，否则存出来是
+#           1/world_size 的碎片（当时由 train_sft.py 的 _fsdp_full_state_dict
+#           处理，脚本侧无需额外动作）；
+#       (3) optimizer.state 分片后 torch.save 会被 rank0 那份覆盖，必须靠
+#           FullOptimStateDictConfig 汇聚。
+#     换 DDP 之后这三条的**成因直接消失**（DDP 从不扁平化参数；每 rank 持有完整
+#     模型与完整且一致的 optimizer state）。⇒ 原决策在当时是站得住的，它解决的
+#     是「FSDP 自带的三个坑」；换 DDP 不是绕过论证，而是让那三个坑不再存在。
 #   · 但**激活不分片** —— 每 rank 仍按自己那份 local batch 常驻全部激活。
-#     分片省的是模型状态（见下面 BATCH 段的量级算术：约 0.5%，可忽略），
-#     每卡显存的**大头仍然是激活**，所以它仍由 BATCH 决定。
-#   · 存档必须在 rank0 汇聚成完整权重（FullStateDictConfig, offload_to_cpu=True,
-#     rank0_only=True），否则存出来的是 1/world_size 的碎片。train_sft.py 内部
-#     已经处理（_fsdp_full_state_dict），脚本侧无需额外动作。
-#   · torchrun 调用方式**没变**：--nproc_per_node=N 照旧注入
-#     RANK / WORLD_SIZE / LOCAL_RANK，train_sft.py 读的是同一套环境变量契约。
-#     本文件的 torchrun 行与 v19 逐字相同，这不是遗漏。
-# run.txt 头部也记了同一件事（"FSDP1：参数+梯度+优化器状态全分片,
-# sharding=SHARD_GRAD_OP"），两份文档以代码为准、互为交叉引用。
+#     分片省的是模型状态（当时估「约 0.5%，可忽略」；2026-10-01 按真实参数量
+#     重算过，见下一节），每卡显存的**大头仍然是激活**，所以它仍由 BATCH 决定。
+#     ⚠ **这一条今天依然成立，且是 2000 会 OOM 的根本原因。**
+#   · run.txt 头部曾记同一件事（"FSDP1：参数+梯度+优化器状态全分片,
+#     sharding=SHARD_GRAD_OP"）—— 那是历史记述，2026-10-01 已同步改成 DDP。
+#     两份文档以代码为准、互为交叉引用。
+
+# ---- 2026-10-01 的换轨：FSDP1 → DDP ----
+# 触发事件（2026-10-01，云端 4 卡 910A 实测）：SFT 崩在**第一个 step**
+#     ema.update() → KeyError: 'backbone.stem_bn._fsdp_wrapped_module.weight'
+# 根因（torch 源码层面确认，不是推断）：FSDP1 在
+# fully_sharded_data_parallel.py:500 有一句 `self._fsdp_wrapped_module = module`，
+# 把原模块注册进了 `_modules`。于是
+#   · EMA 构造时（**包裹前**）shadow 的键 = `backbone.stem_bn.weight`
+#   · ema.update() 时（**包裹后**，第一个 step）遍历拿到的键 =
+#     `backbone.stem_bn._fsdp_wrapped_module.weight`
+#   · 而 `_ema_key` 只剥 `_orig_mod.`，不剥这一段 ⇒ **第一个 step 必崩**
+# 业主裁决：**全换 DDP**，不采用「只给 `_ema_key` 加一行」的最小修法。
+# 换 DDP 后这一类崩溃整类消失（EMA 建的 shadow 键与 update 遍历的键同形）。
+#
+# 规模测算（这才是决定性理由）：ANCHOR_V21 = 9,067,443 参数（fp32 = 36.27 MB）
+#   · DDP 每 rank：params + grads + Adam 两矩 ≈ **145 MB**
+#     （4 份 36.27 MB；EMA 的 shadow 是**另一份** 36.27 MB，不在这个口径里）
+#   · FSDP1 分片后 ≈ **36.3 MB/rank**
+#   · 差额 **+109 MB/rank** = 32 GiB 的 **0.33%**
+#   FSDP 的适用区间是「32 GB 卡上 params + grads + optimizer 超过约 20 GB」。
+#   本模型 145 MB 离那个门槛差**两个数量级** ⇒ **这个规模就是 DDP 的场景。**
+#   ⇒ 换轨前 BATCH 段那套量级算术（分片也只省 0.2~0.5%）方向是对的，但它的
+#     结论应该是「分片本来就没帮上忙」，而不是「所以该开 FSDP」。
+#
+# 通信量：DDP 每 step **1 次** all-reduce（约 36 MB）；FSDP1 是 16 个 wrap 单元
+# × 4 rank，每单元前向 1 次 all-gather + 反向 1 次 all-gather + 1 次
+# reduce-scatter。
+#
+# 附带收益（**预期，尚未验证 —— 别当结论引用**）：那 109 MB 分片换来的是分配器
+# 里额外的 all-gather 缓存。去掉后 `reserved − allocated` 的差额（实测
+# 6.85 GiB，占卡 22%）**应当变小**，但这需要配套的显存记账（上游
+# npu-vram-utilization 的 Task 2）才能量化，**目前没有任何数据**。
+#
+# 换轨后**没有变**的东西（与 BATCH 段直接相关，别混为一谈）：
+#   · 每卡显存的**大头仍然是激活**，仍然只由 BATCH 决定 ⇒ 下面那张
+#     1000 / 1500 / 2000 的表与「2000 实测 OOM」的结论**全部照旧有效**。
+#   · checkpoint 键名（save_model 剥 `module.` 后与 FSDP1 时代一致）。
+#   · `broadcast_buffers=True` 是 DDP 与 FSDP1 的**共同默认** ⇒ BN 的
+#     running_mean / running_var 跨卡一致这个语义不变，这块通信量持平。
+#   · **最大的未知**：DDP 同步路径在 HCCL 上**从未验证过**（本仓库 4 卡一直是
+#     FSDP1）。本地测试全绿不构成证据，必须上云冒烟（spec §9 风险表第 1 条）。
 
 # ---- 可调参数 ----
 WORLD_SIZE=4
@@ -81,8 +164,14 @@ WORLD_SIZE=4
 #
 # ⚠ 想换更高有效 batch：动 BATCH 与 GRAD_ACCUM 的乘积，**LR 必须同步**
 #   （tests/test_run_py_sh.py 的平方根律断言会拦，它已把 ACCUM 计入有效 batch）。
-# ⚠ 不要再靠「加大 BATCH」或「FSDP 省显存」找空间：模型状态分片后每 rank 约
-#   45MB，相对 20GB 级激活可忽略（0.2%）。
+# ⚠ 不要再靠「加大 BATCH」或「分布式省显存」找空间：**换回 DDP（2026-10-01）之后
+#   模型状态是每 rank 完整复制的**（params + grads + Adam 两矩 ≈ 145 MB），相对
+#   20GB 级激活仍然可忽略（约 0.7%）—— 也就是说这条禁令在换轨前后**同样成立**，
+#   只是理由从「分片也只省 0.2%」换成「DDP 连分片都没有，而 145 MB 本来就不算
+#   什么」。要省显存只能动激活 ⇒ 只能动 BATCH。
+#   （历史：FSDP1 时代这里写的是「模型状态分片后每 rank 约 45MB / 0.2%」；
+#   2026-10-01 按 ANCHOR_V21 的 9,067,443 参数重算，分片后是 36.3 MB、
+#   差额 +109 MB/rank —— 结论不变。）
 BATCH=1000
 GRAD_ACCUM=2          # 有效 batch = BATCH × WORLD_SIZE × GRAD_ACCUM = 8000
 LR=0.00637            # 0.00356 × √(8000/2500) 平方根缩放律（累积计入有效 batch）
@@ -119,11 +208,20 @@ NPU_GRAPH_COMPILE=0
 # ---- 其它注意 ----
 # · 910A 无 BF16 → 代码自动走 FP16 + GradScaler
 # · 不传 --compile：NPU 无 inductor，代码自动禁用（D2 只影响 TorchAir 那条路）
+#   · 若将来开 D2 的 Linear-only 图编译：它**作用在裸模块上，且发生在 DDP 包裹
+#     之前**（train_sft.py 里 torch.compile 在 :2506、DDP 构造在 :2570），这个
+#     相对顺序由 tests/test_dist_wrap.py::test_wrapping_happens_after_compile
+#     钉住 —— 换轨前后这个顺序**没变**，图编译看到的是未包裹的 nn.Linear。
+#   · 顺带一条常被忘的耦合：v21 的检查点开关 = V21_CFG['grad_checkpoint']=1
+#     ∧ **未开** --compile / --npu-graph-compile（互斥时关检查点并打 warning）
+#     ⇒ 开图编译会同时把块内检查点关掉。
 # · 不传 --flash-attn：NPU 上自动禁用，注意力走手写 math
 # · NPU 的 pin_memory 关闭 → 训练侧双缓冲 H2D 不生效（那只对 CUDA 有效）
-# · 4 卡 FSDP1 的 all-gather/reduce-scatter 仍是每步硬同步，任一卡通信抖动都会
-#   拖住全部 rank。此前记录过 4×910A 卡间网络不稳，若吞吐骤降或 hang，
+# · 4 卡 DDP 的那 1 次 all-reduce 仍是每步硬同步，任一卡通信抖动都会拖住全部
+#   rank。此前记录过 4×910A 卡间网络不稳，若吞吐骤降或 hang，
 #   先用 shell/train_sft_npu_1card.sh 或 _2card.sh 验证通信。
+#   （FSDP1 时代这里是「16 个单元 × all-gather/reduce-scatter」，同步点更多；
+#   2026-10-01 换 DDP 后减到每步 1 次 all-reduce，但**仍然是硬同步**。）
 # · 输入通道从 12 变 17（P4.3 补齐 ko 通道）。数据侧必须能出 17 通道，
 #   否则数据集构造会与网络 in_channels 对不上。
 # · C2NET：prepare() 与 --data 覆盖**故意**在所有 rank 上执行（每个 rank 都要

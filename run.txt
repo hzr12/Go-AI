@@ -2,7 +2,27 @@
 # Go-AI 4卡 NPU SFT + 1卡 NPU RL + 24核 CPU 全流程命令
 # ============================================================
 # 架构:
-#   - SFT 训练: 4卡 NPU (FSDP1：参数+梯度+优化器状态全分片, sharding=SHARD_GRAD_OP)
+#   - SFT 训练: 4卡 NPU (DDP: DistributedDataParallel, device_ids=[local_rank],
+#                其余构造参数全默认, 无新增 CLI flag)
+#     · 历史：2026-09-30 ~ 2026-10-01 这一段是 FSDP1（"参数+梯度+优化器状态全分片,
+#       sharding=SHARD_GRAD_OP"）。2026-10-01 因下述两点换回 DDP，论证见
+#       shell/train_sft_npu_4card_v21.sh 的「2026-09-30 的决策」与
+#       「2026-10-01 的换轨」两节（历史不删）以及
+#       docs/superpowers/specs/2026-10-01-ddp-instead-of-fsdp-design.md。
+#       ① 崩溃：4 卡 910A 实测崩在第一个 step ——
+#          ema.update() → KeyError: 'backbone.stem_bn._fsdp_wrapped_module.weight'。
+#          根因是 FSDP1 把原模块注册进 _modules，EMA 包裹前建的 shadow 键与包裹后
+#          遍历到的键不同形，而 _ema_key 只剥 _orig_mod.。
+#       ② 规模：ANCHOR_V21 只有 9,067,443 参数（fp32 = 36.27 MB）。DDP 每 rank
+#          params+grads+Adam 两矩 ≈ 145 MB，FSDP1 分片后 ≈ 36.3 MB，差额
+#          +109 MB/rank = 32 GiB 的 0.33% —— 离 FSDP 的适用区间（32 GB 卡上
+#          params+grads+optimizer 超过约 20 GB）差两个数量级。**这个规模是 DDP
+#          的场景。**（附带收益：`reserved − allocated` 的 6.85 GiB 差额**预期**
+#          会变小，但配套的显存记账还没做，无数据，别当结论。）
+#       ⚠ **不变的部分**：每卡显存的大头仍然是激活、仍只由 BATCH 决定 ⇒ 下面
+#         【v21 显存上限】那一整套实测账本与 2000 OOM 的结论**照旧有效**。
+#         torchrun 调用方式两代都没变（--nproc_per_node=N 注入同一套
+#         RANK/WORLD_SIZE/LOCAL_RANK）—— 别用 torchrun 行判断用的是哪种包裹层。
 #   - RL 训练:  1卡 NPU + 8进程 CPU (MCTS)
 #   - WebUI:    CPU + ONNX
 #   - 评估:     1卡 NPU
@@ -36,7 +56,8 @@
 #       python run.py --sh shell/train_sft_npu_4card_v21.sh
 #     脚本默认 BATCH=1000 / GRAD_ACCUM=2（有效 8000）/ LR=0.00637 —— 与下面
 #     方案 A 逐项一致。⚠ 脚本默认**不要**往上调每卡 batch：2000 实测 OOM，
-#     口径见下面【v21 显存上限】。
+#     口径见下面【v21 显存上限】。⚠ 分布式是 **DDP**（不是 FSDP1），换轨的
+#     理由与历史记述见本文件【架构】段与脚本头部。
 #
 #   · 单卡 A100 40G（BF16 + flash-attn）= 下方方案 B，以下即实测可跑的配置
 #     （--batch-size 3500 实测通过）：

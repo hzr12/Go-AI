@@ -57,6 +57,7 @@ D2：为什么是 Linear-only
     跑真的。
 """
 
+import ast
 import copy
 import os
 import re
@@ -73,6 +74,71 @@ import scripts.train_sft as t  # noqa: E402
 
 SRC = open(os.path.join(ROOT, 'scripts', 'train_sft.py'), encoding='utf-8').read()
 CODE = '\n'.join(l for l in SRC.splitlines() if not l.lstrip().startswith('#'))
+TREE = ast.parse(SRC)
+_LINES = SRC.splitlines()
+_FULL_LINE_COMMENTS = {i for i, l in enumerate(_LINES, 1) if l.lstrip().startswith('#')}
+
+
+def _main_fn():
+    for node in TREE.body:
+        if isinstance(node, ast.FunctionDef) and node.name == 'main':
+            return node
+    raise AssertionError('train_sft.py 里没有找到 main()')
+
+
+def _code_span(lo, hi):
+    """SRC 坐标的半开区间 `[lo, hi)`，剥掉整行注释但**保留行号对齐**。
+
+    剥注释是为了不让「解释这件事的注释」冒充断言对象；保留行号对齐是为了让这里
+    返回的行号仍能与 AST 的 `lineno` 直接比较 —— `CODE`（全文件去注释）做不到这点，
+    混用两套坐标会得出看似合理、实际错位的区间边界。
+    """
+    return '\n'.join('' if i in _FULL_LINE_COMMENTS else _LINES[i - 1]
+                     for i in range(lo, hi))
+
+
+def _dist_wrap_lineno():
+    """分布式包裹点的源码行号：`main()` 体内 `DistributedDataParallel(...)` 的调用节点。
+
+    ⚠ **必须走 AST 的 `Call` 节点，不能在源码文本里搜 `DistributedDataParallel(`**。
+    那个字符串在 `train_sft.py` 里有四处，其中三处不是调用点：
+      · L27   `from torch.nn.parallel import DistributedDataParallel`（在 `main()` 之前
+              ⇒ 拿它当下界会让「包裹点在编译分支之后」这条断言**恒假**）；
+      · L263 / L2546  包裹点上方解释换轨理由的 docstring / 注释（⇒ 「出现过就算」
+              这类判据**恒真**）。
+    限定在 `main()` 子树 + `isinstance(n.func, ast.Name)` 才能把这两类都排除掉；
+    这与 `tests/test_init_weight_sync.py` 的 `_main_body_calls`、
+    `tests/test_dist_wrap.py` 的 `_ddp_construct_calls` 是同一个坑、同一种解法。
+    """
+    main = _main_fn()
+    hits = [n.lineno for n in ast.walk(main)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == 'DistributedDataParallel']
+    assert len(hits) == 1, (
+        'main() 里 DistributedDataParallel 的**调用**节点应恰好 1 个（实得 %d：%s）—— '
+        '0 个说明分布式包裹被删了，多个说明有一处在错误的位置被包裹。'
+        '⚠ 别改成在源码文本里搜这个名字，见本函数 docstring。' % (len(hits), hits))
+    return hits[0]
+
+
+def _cuda_compile_branch_lineno():
+    """`elif args.compile == 1:`（CUDA `--compile` 分支）的起始行，源码坐标。
+
+    按 AST 取 `if _npu_graph:` 的 **orelse**，而不是文本搜 `elif args.compile == 1:`：
+    `main()` 里至少还有两处 `args.compile == 1`（开头的 `--compile` 总开关、
+    NPU 禁用 inductor 的那处），文本搜可能圈到不属于这个分支的区间。
+    """
+    main = _main_fn()
+    for node in ast.walk(main):
+        if not (isinstance(node, ast.If)
+                and isinstance(node.test, ast.Name)
+                and node.test.id == '_npu_graph'):
+            continue
+        for sub in node.orelse:
+            if isinstance(sub, ast.If):
+                return sub.lineno
+    raise AssertionError('没找到 `if _npu_graph:` 的 elif 分支（结构被改了？）')
 
 
 def _graph_block():
@@ -246,21 +312,29 @@ def test_linear_only_not_whole_model_compile():
 def test_cuda_compile_path_untouched():
     """CUDA `--compile` 路径（D2 明确不动）仍是整模型 compile，形态与位置都不变。
 
-    区间下界用 `_wrap_fsdp1`（原为 `DistributedDataParallel`）作结束标记：这个
-    测试要圈的是「CUDA 分支自身的代码」，而分布式包裹紧随其后。**不要**把
-    标记改成一个可能消失的字符串后又让它悄悄变成全文件搜索 —— 那会让本测试
-    在标记缺失时抛 ValueError（collection 期就红）而不是给出可读的断言失败。
-    下方 `test_fsdp_boundary_marker_exists` 单独守住这个标记的存在性。
+    区间下界用 `_dist_wrap_lineno()`（`main()` 体内的 `DistributedDataParallel(...)`
+    **调用节点**）作结束标记：这个测试要圈的是「CUDA 分支自身的代码」，而分布式
+    包裹紧随其后。
+
+    ⚠ 换轨记录：2026-10-01 之前这里锚的是 `_wrap_fsdp1`（FSDP1 时代），再往前是
+    `DistributedDataParallel`（DDP 时代）。**两次都因为同一个原因坏掉**：按源码文本
+    找一个「可能消失也可能被注释/docstring 命中」的字符串当下界，在换轨后要么恒假
+    （命中 `main()` 之前的 import 行）要么恒真（命中解释性文字）。所以现在两端都
+    走 AST：`ast.Call` + `isinstance(n.func, ast.Name)` + 限定 `main()` 子树。
+    标记的存在性由 `_dist_wrap_lineno()` 里的 `len(hits) == 1` 守住（不再另立一条
+    测试 —— 旧 docstring 里提到的 `test_fsdp_boundary_marker_exists` 从来不存在）。
     """
     assert 'model = torch.compile(model, dynamic=False, mode=args.compile_mode)' in CODE, \
         'CUDA --compile 路径不得被 D2 顺手改成 Linear-only'
     i_npu = CODE.index('if _npu_graph:')
-    i_cuda = CODE.index('elif args.compile == 1:', i_npu)
-    assert '_wrap_fsdp1' in CODE, \
-        'FSDP1 包裹点不见了（分布式改造被回退？）'
-    i_end = CODE.index('_wrap_fsdp1', i_npu)
-    assert i_end > i_cuda, 'FSDP 包裹点应在 CUDA compile 分支之后（compile 必须先于 FSDP）'
-    cuda = CODE[i_cuda:i_end]
+    assert i_npu != -1, '找不到 _npu_graph 分支'
+    i_cuda = _cuda_compile_branch_lineno()
+    i_end = _dist_wrap_lineno()
+    assert i_end > i_cuda, (
+        '分布式包裹点（L%d）应在 CUDA compile 分支（L%d）**之后**：compile 必须先于包裹'
+        '（反过来整模型 compile 会被 wrapper 的动态边界吞掉，拿到未融合图）'
+        % (i_end, i_cuda))
+    cuda = _code_span(i_cuda, i_end)
     assert 'torch.compile(model' in cuda, \
         'CUDA 分支里整模型 compile 不见了（Linear-only 只限 backend == npu）'
     assert '_rollback_linear_submodules' not in cuda, \

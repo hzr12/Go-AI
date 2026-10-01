@@ -2,14 +2,22 @@
 
 事故形状
 --------
-`scripts/train_sft.py` 的 `_wrap_fsdp1` docstring 要求 from-scratch 也要同步初始
-权重：「各 rank 独立、各自不同，这里必须同步，否则第一步 all-gather 出来的就是
-拼错的权重」。但 `sync_module_states` 从未被传（`_fsdp_ctor_kwargs` 与
-`FSDP_CTOR_KWARGS_WHITELIST` 都没有），**修复前**全文件唯一的 `dist.broadcast`
-是 `_sync_stop_flag` 的 stop_flag —— **没有任何参数广播**。
+**已退役的包裹层时代（FSDP1，2026-10-01 换轨前的现场）**：`scripts/train_sft.py`
+当时的 `_wrap_fsdp1` docstring 要求 from-scratch 也要同步初始权重：「各 rank 独立、
+各自不同，这里必须同步，否则第一步 all-gather 出来的就是拼错的权重」。但
+`sync_module_states` 从未被传（`_fsdp_ctor_kwargs` 与 `FSDP_CTOR_KWARGS_WHITELIST`
+都没有），**修复前**全文件唯一的 `dist.broadcast` 是 `_sync_stop_flag` 的 stop_flag
+—— **没有任何参数广播**。
 
 `shell/train_sft_npu_4card_v21.sh` 不传 `--resume`/`--model` ⇒ from-scratch
-⇒ `SHARD_GRAD_OP` 的第一步 all-gather 把 4 份不同的随机权重拼成一个逻辑权重。
+⇒ 当时 `SHARD_GRAD_OP` 的第一步 all-gather 把 4 份不同的随机权重拼成一个逻辑权重。
+
+⚠ 换轨（2026-10-01，FSDP1 → DDP）**没有作废这个 bug，也没有作废 Task 1 的修复**：
+DDP 的 `DistributedDataParallel.__init__` 在**它自己构造时**也会把 rank0 的
+params/buffers 广播出去（`_ddp_init_helper` → `_sync_module_states`），而那个构造点
+在 EMA 构造**之后** —— 依赖它会让 rank1~3 的 EMA shadow 抓住各自被丢弃的随机权重，
+`ema.update()` 每步把正确权重混进陈旧 shadow，**EMA 跨 rank 发散且不报错**。
+所以显式广播仍必须留在 EMA 之前，本文件钉的顺序不变量一字未改。
 
 测试分两组：**顺序**靠源码位置（唯一能证明时机的手段，真机上观察不到
 「谁先谁后」），**护栏**用 monkeypatch 的假通信域验证真行为（含「checksum 的
@@ -23,7 +31,10 @@
 行号时走 AST 现算的 `_call_lines` / `_main_body_calls`，那两个是**自维护**的。
 
 只有下面这张表必须锚在具体 commit 上 —— 因为「事故现场」指的是一个**历史
-commit**，不是当前文件。下次改 `train_sft.py` 后右列会变，**左列不会**：
+commit**，不是当前文件。下次改 `train_sft.py` 后右列会变，**左列不会**。表里
+`_wrap_fsdp1` / `FSDP_CTOR_KWARGS_WHITELIST` / `_fsdp_ctor_kwargs` /
+`FullyShardedDataParallel` 四个符号已于 2026-10-01 随换轨删除，**保留它们是为了
+让下一次事故能查到当时的现场**，不是暗示它们还在：
 
 | 现场                                        | 修复前 3dc9672 | 590f267 |
 |---------------------------------------------|---------------:|--------:|
@@ -33,15 +44,27 @@ commit**，不是当前文件。下次改 `train_sft.py` 后右列会变，**左
 | `_sync_stop_flag` 的 stop_flag 广播            |           :1495 |     :1580 |
 | `FullyShardedDataParallel` 唯一裸名字调用      |           :383 |      :468 |
 
-关于「FSDP 包裹点」为什么不能用 `FullyShardedDataParallel`
---------------------------------------------------------
-`FullyShardedDataParallel` 在 `train_sft.py` 里只有一个裸名字调用点，且它在
-`_wrap_fsdp1` **函数体内**（`handle = FullyShardedDataParallel(model, **_ctor_kwargs)`），
-文本上早于 `def main()`（590f267 里 :1934，3dc9672 里 :1849 —— 两者都不是原先
-docstring 写的 `L2300+`）。而广播点按契约必须落在 `main()` 里 ⇒ 断言
-`sync < 那个行号` **恒假**，与同步点放哪无关。真正代表「FSDP 包裹发生在这里」的
-是**运行期**的调用点 `_wrap_fsdp1(...)`（在 `main()` 里、且在广播点之后）。
-见 `test_sync_call_precedes_fsdp_wrap`。
+关于「分布式包裹点」为什么不能用**文本搜索**（这一节在换轨前后各踩过一次）
+--------------------------------------------------------------------
+包裹点是本文件唯一必须锚定的「下游事件」：广播必须早于它。但「它叫什么」换过两次：
+
+* **换轨前（FSDP1 时代）**：`train_sft.py` 里 `FullyShardedDataParallel` 只有一个裸
+  名字调用点，且它在 `_wrap_fsdp1` **函数体内**（`handle =
+  FullyShardedDataParallel(model, **_ctor_kwargs)`），文本上早于 `def main()`
+  （590f267 里 :1934，3dc9672 里 :1849 —— 两者都不是原先 docstring 写的 `L2300+`）。
+  而广播点按契约必须落在 `main()` 里 ⇒ 断言 `sync < 那个行号` **恒假**，与同步点放哪
+  无关。当时真正代表「包裹发生在这里」的是运行期调用点 `_wrap_fsdp1(...)`。
+* **换轨后（DDP，2026-10-01）**：`_wrap_fsdp1` 已删除，包裹点是 `main()` 里的
+  `DistributedDataParallel(model, device_ids=[local_rank])`。此时**换成文本搜索同样
+  恒假**，而且更隐蔽 —— `DistributedDataParallel` 这个名字在文件里还有两处非调用点：
+  顶部那行 `from torch.nn.parallel import DistributedDataParallel`（在 `main()` 之前）
+  以及包裹点上方那段解释换轨理由的注释/docstring。用 `SRC.find('DistributedDataParallel')`
+  会命中 import（早于 `main()`）⇒ `sync < import 行号` 恒假；用全文计数 / 出现即真
+  之类的判据则恒真。**两种写法都不会因为同步点放错而红。**
+
+⇒ 唯一可靠的锚点是 **AST 的 `Call` 节点 + 限定在 `main()` 函数体内**，也就是本文件
+既有的 `_main_body_calls`（见下方 §`坐标约定`）。这与 `test_dist_wrap.py` 里
+`_ddp_construct_calls()` 的做法一致。
 
 ⚠ 相对实现计划的一处修正（是**原测试自己不可满足**，不是削弱断言）
 ------------------------------------------------------------------
@@ -128,21 +151,39 @@ def test_sync_call_precedes_ema_construction():
         % (sync[0], min(ema)))
 
 
-def test_sync_call_precedes_fsdp_wrap():
-    """同步点必须早于 FSDP 包裹：包裹后参数存储被替换成 flat shard。
+def test_sync_call_precedes_dist_wrap():
+    """同步点必须早于分布式包裹（DDP 构造点）。
 
-    取 `_wrap_fsdp1(` 而不是 `FullyShardedDataParallel(`：后者在本文件里只出现
-    在 `_wrap_fsdp1` **函数体内**（构造那一行，文本上早于 `main()`），拿它当
-    「包裹发生在这里」的代理是恒假的判据；`_wrap_fsdp1(` 才是 `main()` 里真正
-    发生包裹的位置。见本文件 docstring 的「关于『FSDP 包裹点』」一节。
+    锚点取 **`main()` 体内的 `DistributedDataParallel(` AST `Call` 节点**，
+    而不是源码文本里的字符串 —— 见本文件 docstring 的「关于『分布式包裹点』」
+    一节：文本搜索会命中顶部那行 `from torch.nn.parallel import
+    DistributedDataParallel`（在 `main()` 之前 ⇒ 判据恒假）以及包裹点上方的注释
+    （⇒ 「出现过就算」类判据恒真）。`_main_body_calls` 走的正是
+    `isinstance(n.func, ast.Name) and n.func.id == fname`，且**限定在 `main()`
+    子树**，所以 helper 里的引用不会被算进来。
+
+    ⚠ 判据本身（`sync < wrap`）**没有**因为换轨而放宽：2026-10-01 之前这里锚的是
+    已删除的 `_wrap_fsdp1(`。之所以还要单独钉这一条（而不只靠
+    `sync < EMA < wrap` 传递推出），是因为它是**不依赖其它测试文件**的直接断言 ——
+    `EMA < wrap` 那半条在 `tests/test_dist_wrap.py` 里，两边任一被改坏都能定位到。
+
+    换轨后这条为什么仍然有意义（不是因为「参数被展平成 flat shard」了 —— DDP 不
+    展平参数）：DDP 在**构造那一刻**做一次性的 params/buffers 广播，且它发生在 EMA
+    构造之后。若把本函数挪到包裹之后，就等于把「同步」交给 DDP 自己那次广播 ——
+    那时 EMA 的 shadow 已经抓住了各 rank 被丢弃的随机权重 ⇒ EMA 跨 rank 发散、
+    不报错（spec §5.3 / §5.4）。
     """
     sync = _main_body_calls('_sync_init_weights_from_rank0')
     assert len(sync) == 1, '同步点应唯一：%s' % sync
-    wrap = _main_body_calls('_wrap_fsdp1')
-    assert wrap, 'main() 里没找到 _wrap_fsdp1( 调用点'
+    wrap = _main_body_calls('DistributedDataParallel')
+    assert wrap, (
+        'main() 里没找到 DistributedDataParallel( 的**调用**节点（包裹点不见了？）'
+        '—— 注意别改成在源码文本里搜这个名字：会命中 import 行与注释，判据恒假')
     assert sync[0] < min(wrap), (
-        '同步点（L%d）必须早于 FSDP 包裹（L%d）：包裹后参数存储被替换成 flat '
-        'shard，broadcast 无意义' % (sync[0], min(wrap)))
+        '同步点（L%d）必须早于 DDP 包裹（L%d）：DDP 在构造那一刻就把 rank0 的 '
+        'params/buffers 广播出去，而那一刻已在 EMA 构造之后 ⇒ 把同步挪到包裹之后就'
+        '等于交给 DDP 自带的那次广播，EMA 的 shadow 会抓住各 rank 被丢弃的随机权重'
+        % (sync[0], min(wrap)))
 
 
 def test_sync_and_assert_are_both_called():
@@ -224,7 +265,7 @@ def test_dist_active_is_false_on_this_test_machine():
     """本机（pytest 单进程、无 4 卡 PG）真调一次必须 False。
 
     防的是「上面的判定表把某个分支钉死了，但真实 `dist` 上的整体接线是错的」。
-    注意本仓库另有测试（`test_dist_preflight.py` / `test_fsdp1_conversion.py`）
+    注意本仓库另有测试（`test_dist_preflight.py` / `test_dist_wrap.py`）
     会用 gloo `init_process_group(world_size=1)`，所以这里**只断言结果**、
     不预设「PG 未建」——world_size==1 分支同样必须 False。
     """

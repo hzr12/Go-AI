@@ -11,9 +11,13 @@
 AICore 0% 说明它们只占显存不干活（纯 numpy 取数）。
 
 根因：`_BatchPrefetcher` 用 `mp.Process`（Linux 默认 fork）构造于
-`init_process_group` / `torch.npu.set_device` / FSDP 包裹**之后**。fork 复制
+`init_process_group` / `torch.npu.set_device` / 分布式包裹**之后**。fork 复制
 地址空间 ⇒ CANN 设备上下文与显存映射被整份继承。GC 只管 torch 张量，管不到
 别的进程继承来的映射，所以任何 GC / batch / chunk 调整都治不了它。
+
+⚠ 2026-10-01：包裹层从 FSDP1 换成 DDP（FSDP1 已退役）。本文件钉的是「fork 必须
+早于**任何**设备初始化与分布式初始化」，与用哪种包裹层无关 ⇒ 断言不变，只有这
+句历史指涉改成中性表述。
 
 这两个测试分别钉住「顺序」与「护栏」：顺序靠源码位置（这是**唯一**能证明
 fork 时机的手段 —— 运行时真机上没法观察继承），护栏用假设备运行时验证真的会拦。
