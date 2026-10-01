@@ -1462,7 +1462,8 @@ class MHSA(MultiHeadSelfAttention):
         return out
 
 
-def _scan_chunk(sigma, dt_k, xc_k, bv_k, u_k, cv_k, h_in, use_ckpt):
+def _scan_chunk(sigma, dt_k, xc_k, bv_k, u_k, cv_k, h_in, use_ckpt,
+                _scan_batch_split=250):
     """分块 SSD 的**块内一步**：返回 `(y, h_last)`。
 
     参数二选一：
@@ -1476,9 +1477,14 @@ def _scan_chunk(sigma, dt_k, xc_k, bv_k, u_k, cv_k, h_in, use_ckpt):
     不包的话一个 MambaLTI 块的反向重算要 ~39 GiB（fp16@B=2000），详见
     `MambaLTI._chunked_scan` 的 docstring。
     """
-    B, Hh, P, l = sigma.shape
+    B = sigma.shape[0]      # ⚠ 只有切分分支用；块内一律现取（见 _body 里的说明）
 
     def _body(sigma, dt_k, xc_k, bv_k, u_k, cv_k, h_in):
+        # ⚠ `B`/`Hh`/`P`/`l` 全部从**本次调用的** `sigma` 现取，不能用外层闭包里的：
+        #   下面按 batch 切分后每个子块的 B 是 `min(BS, B-i0)`，用整批的 `nb`
+        #   reshape 会直接炸（实测 `shape '[16, 9, 9]' is invalid for input of
+        #   size 648` —— 正是子批）。
+        _B, _Hh, _P, l = sigma.shape
         # dt_k is None ⇒ 物化形态（N 取自 u_k）；否则因子形态（N 取自 bv_k）
         N = (u_k if dt_k is None else bv_k).shape[-1]
         if dt_k is None:
@@ -1492,19 +1498,72 @@ def _scan_chunk(sigma, dt_k, xc_k, bv_k, u_k, cv_k, h_in, use_ckpt):
         lower = torch.ones(l, l, dtype=torch.bool, device=sigma.device).tril()
         dd = sigma.unsqueeze(-1) - sigma.unsqueeze(-2)  # (B,H,P,l,l) = σ_i − σ_j
         M = dd.masked_fill(~lower, float('-inf')).exp()  # exp(−inf) = 0
-        nb = B * Hh * P                                   # 批量矩阵乘的批数 = B·C
+        nb = _B * _Hh * _P                                # 批量矩阵乘的批数 = B·C
         h = torch.bmm(M.reshape(nb, l, l),
-                      u.reshape(nb, l, N)).reshape(B, Hh, P, l, N)
+                      u.reshape(nb, l, N)).reshape(_B, _Hh, _P, l, N)
         h = h + torch.exp(sigma).unsqueeze(-1) * h_in   # 块间状态传递
         y = (h.permute(0, 3, 1, 2, 4)
              * cv_k.unsqueeze(-2).unsqueeze(-2)).sum(-1)          # 读出
         return y, h[..., -1:, :]                        # 块末状态 = 下一块的 h_in
 
-    if use_ckpt and torch.is_grad_enabled():
-        return torch.utils.checkpoint.checkpoint(
-            _body, sigma, dt_k, xc_k, bv_k, u_k, cv_k, h_in,
-            use_reentrant=False)
-    return _body(sigma, dt_k, xc_k, bv_k, u_k, cv_k, h_in)
+    # ⚠⚠ **沿 batch 维再切一刀**（2026-10-01 云端 OOM 的修法）。
+    #
+    # 事故：`Tried to allocate 1.40 GiB ... 28.00 GiB already allocated;
+    #        741.02 MiB free`，栈指向本函数的 `h = h + exp(sigma)*h_in`。
+    #
+    # 为什么 `chunk_size=32`（T=361 ⇒ 12 块）救不了：峰值**不是**「逐块物化
+    # 多少」，而是「**单块内同时活着的字节**」。块内三个 5 维张量都是
+    #     (B, Hh, P, l, N) = (1000, 4, 46, 32, 64)      ← N = d_state = 64
+    # 每个 3.77 亿元素 ⇒ **单个 fp16 副本 719 MiB**；那一行同时活着
+    # `bmm` 输出 + `exp(sigma)*h_in` + 求和结果 ⇒ **瞬时 ~2.1 GiB**。
+    # checkpoint 只保证这些**不留到反向**，对**单块前向瞬时峰值**无效。
+    #
+    # ⚠ 顺手记一个曾经的误判，免得再犯：我一度把 N 读成 368（其实是
+    #   `d_inner`）并据此写「比 docstring 的 N=64 放大 5.75 倍，单副本 4.03 GiB」
+    #   —— 那是**从 `bv_k` 的广播形状倒推错了**，`N` 取的是 `bv_k` 的**最后一维**
+    #   = `d_state` = 64（`MambaLTI.__init__` 默认 `d_state=64`，backbone.py:1654）。
+    #   本 docstring 原有的 N=64 推导口径是**对的**，没有「文档过时」这回事。
+    #   顺带一提，那次误判还导致我两次给出相反的结论（先说「降 norm 精度对 OOM
+    #   无效」，纠正后又说「省 7.6 GiB」）—— 容量数字必须从真模型取，不能倒推。
+    #
+    # 为什么不改 `N` 去降峰值：`N` 是状态维（`_body` 末尾 `sum(-1)` 读出那一维），
+    # 改它要动 MambaLTI 的参数化与已训练权重的兼容性。所以**不改 N，改峰值**：
+    # 沿 batch 切。
+    #
+    # 为什么切 batch 是**精确**的而不是近似：`torch.bmm` 的批维彼此独立
+    # （`nb = B·Hh·P`，M 与 u 批内一一对应），块入口状态 `h_in` 也是按 batch
+    # 独立携带的，`sum(-1)` 只沿 `N`。逐 batch 子块算完按 dim 0 拼回，与整批
+    # 一次算**逐位相同** —— 没有任何跨 batch 的归约顺序变化。
+    # （`tests/test_scan_batch_split.py` 用 `torch.equal` 钉住，不是 allclose。）
+    #
+    # 峰值口径：切完后单次分配的 `u`/`h` 降到 1/ceil(B/BS) ⇒
+    #     BS=250 → 719/4 ≈ 180 MiB/副本，那一行瞬时 ~0.53 GiB。
+    # 选 250：它是 1000 的整除数（`cat` 后形状与整批完全一致），且 4 个子块
+    # 仍能把 AI Core 的矩阵流水喂满。
+    BS = max(1, int(_scan_batch_split))
+    if BS >= B:
+        if use_ckpt and torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(
+                _body, sigma, dt_k, xc_k, bv_k, u_k, cv_k, h_in,
+                use_reentrant=False)
+        return _body(sigma, dt_k, xc_k, bv_k, u_k, cv_k, h_in)
+
+    # 因子形式：`u` 由 `_body` 内部现算，切 batch 要把**因子**一起切；
+    # 物化形式：`u_k` 已物化，同样按 batch 切。两条路径数学相同。
+    outs, houts = [], []
+    for i0 in range(0, B, BS):
+        i1 = min(i0 + BS, B)
+        sl_b = slice(i0, i1)
+        y_i, h_i = _body(
+            sigma[sl_b],
+            None if dt_k is None else dt_k[sl_b],
+            None if xc_k is None else xc_k[sl_b],
+            None if bv_k is None else bv_k[sl_b],
+            None if u_k is None else u_k[sl_b],
+            cv_k[sl_b], h_in[sl_b])
+        outs.append(y_i)
+        houts.append(h_i)
+    return torch.cat(outs, dim=0), torch.cat(houts, dim=0)
 
 
 class MambaLTI(nn.Module):
@@ -1785,8 +1844,20 @@ class MambaLTI(nn.Module):
         代价：反向多一遍块内计算（Mamba 反向的 flops 约 ×1.4）。这是明确接受的
         交换 —— 吞吐换 batch，而 batch 才是这里真正的瓶颈。推理路径
         （`not self.training` 或无 grad）**完全不走检查点**，逐位不变、零开销。
-        两条路径（因子 / 物化）共用 `_scan_chunk`，数学完全相同。
-        """
+两条路径（因子 / 物化）共用 `_scan_chunk`，数学完全相同。
+
+    ⚠⚠ **单块前向瞬时峰值**（`_scan_batch_split`，2026-10-01 云端 OOM）
+    ------------------------------------------------------------------
+    `chunk_size` 只管「逐块物化多少」，**不管单块内同时活着的字节**。
+    块内三个 5 维张量都是 `(B, Hh, P, l, N)`，v21 @B=1000 是
+    `(1000, 4, 46, 32, 64)`（`N = d_state = 64`）—— **每个 fp16 副本 719 MiB**，
+    `h + exp(σ)·h_in` 一行同时活着三份 ⇒ **瞬时 ~2.1 GiB**，checkpoint 对此
+    无效（它只管「留不留到反向」）。实测撞墙：
+    `Tried to allocate 1.40 GiB / 28.00 GiB already allocated / 741.02 MiB free`。
+    故沿 **batch** 维切（`_scan_batch_split=250`，降到 180 MiB/副本）：
+    `bmm` 的批维独立、块入口状态按 batch 携带、`sum(-1)` 只沿 `N` ⇒
+    **逐位相同**，不是近似。详见 `_scan_chunk` 里的完整推导。
+    """
         L = int(self.chunk_size if chunk_size is None else chunk_size)
         if L < 1:
             raise ValueError('chunk_size 必须 ≥ 1，收到 {}'.format(L))

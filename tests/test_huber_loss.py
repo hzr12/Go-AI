@@ -1159,12 +1159,22 @@ def test_l2_report_uses_decay_group_only():
     #     被放大：在 NPU/A100 上每次 `float()` 都是一次排空设备流水线的阻塞
     #     读回，而 CPU 上它几乎免费 —— **耗时测不出来，个数测得出来**。
     #     Fix2 是逐组 `float()` ⇒ 两个 decay 组 = 2 次；这里钉住 1 次。
+    #     ⚠ 2026-10-01 起断言从 `== 1` 放宽为 `<= 1`，并**不是**放弃了这条不变量：
+    #       读回改成了 `torch.stack(_sqs).tolist()`（一发 D2H），而
+    #       `torch.stack([a,b]).tolist()` 在 CPU 上**只派发 `aten.stack.default`** ——
+    #       `.tolist()` 本身连算子都不派发（纯内存读），`_count_host_syncs` 只匹配
+    #       `item`/`_local_scalar_dense`，对它**结构性地看不见**（实测探针报 0）。
+    #       所以它现在只能证明「**不超过** 1 次代理可见同步」（逐组 `float()` 会是 2、
+    #       仍被抓），而真正的「恰好一次设备→主机读回」由
+    #       `tests/test_no_aicpu_ops_in_startup_check.py::
+    #           test_l2_report_reads_device_to_host_exactly_once` 用结构检查钉住 ——
+    #       那条对「2× float()」和「float()+tolist() 混用」的覆盖比这里更严。
     groups4 = _opt(net).param_groups
     with _count_host_syncs() as counter:
         again = t.compute_l2_report(groups4)
-    assert counter.n == 1, (
-        f'compute_l2_report 每次调用应恰好一次设备同步（把平方和在设备上累加、'
-        f'末尾一次 float()），实得 {counter.n} 次')
+    assert counter.n <= 1, (
+        f'compute_l2_report 每次调用最多一次设备同步（把平方和在设备上累加、'
+        f'末尾一次读回），实得 {counter.n} 次 —— 退化成逐组读回了？')
     assert again == got, '同步点改造把返回值改了（必须逐位相同）'
 
 

@@ -407,16 +407,20 @@ def test_checksum_depends_on_every_parameter():
     非负，`abs()` 变成恒等 —— 符号不敏感的 checksum 就混过去了，而它会放过一个
     「权重恰好是 rank0 取负」的 rank。负偏移让 abs()/取负类变异无处躲。
 
-    期望值是 `-numel`（`-4.0 / -15.0 / -1.0`），全部是 fp64 里的**精确整数**，
-    所以用 `==` 判定、无需容差。
+    期望值是 `-numel`（`-4.0 / -15.0 / -1.0`），在 fp32 里同样是**精确整数**，所以用
+    `==` 判定、无需容差。
     """
     mod = _load_module()
     dtype, base = _captured_checksum(mod, _ThreeParam())
-    assert dtype == torch.float64, (
-        'checksum 标量必须是 fp64（docstring 承诺），实得 %s' % dtype)
+    # ⚠ fp32 不是「精度没写对」，是 **910A 没有 fp64**（2026-10-01 云端实测：
+    #   `Device do not support double dtype now` + AICPU kernel 挂掉）。见下面
+    #   `test_checksum_contract_after_losing_fp64`。期望值 −4 / −15 / −1 在
+    #   **fp32 里也是精确整数**，所以下面所有 `==` 判定仍然严格，无需容差。
+    assert dtype == torch.float32, (
+        'checksum 标量应在 fp32 上累加（fp64 会让 910A 挂 AICPU），实得 %s' % dtype)
     assert base.numel() == 1, 'all_gather 的载荷应是 1 个标量：%s' % base.shape
     assert base.item() == 0.0, (
-        '全 0 参数的 checksum 应恰好 0.0（fp64 精确，无需容差），实得 %.17g'
+        '全 0 参数的 checksum 应恰好 0.0（精确，无需容差），实得 %.17g'
         % base.item())
 
     # 参数名 -> 只把它 add_(-1.0) 之后 checksum 应**恰好**变成的值（= −元素数）
@@ -433,22 +437,76 @@ def test_checksum_depends_on_every_parameter():
             % (name, -int(want), want, got.item()))
 
 
-def test_checksum_accumulates_in_fp64_not_fp32():
-    """累加必须真在 fp64 上做 —— fp32 会在大数上把小量整个吃掉。"""
+def test_checksum_contract_after_losing_fp64():
+    """checksum 的真实契约：**逐位相同的权重 ⇒ 逐位相同的 fp32 checksum**。
+
+    这条替换掉原 `test_checksum_accumulates_in_fp64_not_fp32` —— 后者的**全部**
+    前提（「必须在 fp64 上累加」）已被硬件证伪。那不是参数没写对，是 910A 压根没有
+    fp64（实测报 `Device do not support double dtype now`，并让 AICPU kernel 挂掉）。
+
+    换成 fp32 到底损失了什么，写清楚，别让它藏在换轨里：
+
+    · **不损失**的：本检查要判的是「广播有没有生效」。DDP 构造时 rank0 的参数被
+      broadcast 给所有 rank，θ 因此**逐位相同**；相同输入 + 相同形状 + 相同归约
+      顺序 ⇒ fp32 的和也逐位相同。检测能力来自「不同 ⇒ 不同」这一侧存在真实差异。
+    · **损失**的：**微小**差异的可见性。fp32 只有 24 位尾数，若某 rank 的 θ 与
+      rank0 的差值小于「累加到当前量级时的一个 fp32 ulp」，这个检查会漏。原 fp64
+      版本在 1e8 量级能分辨 1.0，fp32 在那里 ulp=8、分辨不了。
+    · 为什么可以接受：要漏的前提是「广播**部分**生效，或 θ 被后续随机数污染到差
+      1 个 ulp 以内」。而广播要么整份生效要么整份没生效；真出现不同，量级也是
+      「一次重新随机初始化」那种**整体**差异，不是 1e-8 的微差 —— 那种情况 fp32
+      一样抓得到（下面用真实量级验证）。
+
+    `test_checksum_detects_divergence` 钉的是「不同 ⇒ 一定抓到」；这条钉的是
+    「相同 ⇒ 一定不误报」，两者缺一不可：前者防漏报，后者防误报。
+    """
     mod = _load_module()
 
-    class _Big(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            # 1e8 本身在 fp32 里是精确的（390625×2^8，19 位尾数放得下），但 1e8+1
-            # 需要 27 位 ⇒ fp32 的 ulp=8 会把后面的 1 全部舍掉：fp32 累加得
-            # 100000000.0，fp64 累加得精确的 100000003.0。两个值差 3，一测就分得开。
-            self.v = torch.nn.Parameter(torch.tensor([1e8, 1.0, 1.0, 1.0]))
+    def _checksum_of(t):
+        m = torch.nn.Module()
+        m.register_parameter('v', torch.nn.Parameter(t.clone()))
+        _, got = _captured_checksum(mod, m)
+        return got.item()
 
-    _, got = _captured_checksum(mod, _Big())
-    assert got.item() == 100000003.0, (
-        'checksum 是 %.8g，说明累加没在 fp64 上做（或输入没按 fp64 提升）：'
-        'fp32 会在 1e8 级别把尾数吃掉' % got.item())
+    # v21 真实量级：9.07M 参数、典型初值 ~1e-2 ⇒ checksum 量级 ~1e3~1e8。
+    torch.manual_seed(0)
+    big = torch.randn(4_000_000) * 1e-2
+    a = _checksum_of(big)
+    b = _checksum_of(big)                       # 逐位相同的输入
+    assert a == b, (
+        '逐位相同的权重必须给出逐位相同的 fp32 checksum（这是本检查赖以成立的前提），'
+        '实得 %.17g vs %.17g —— 说明归约顺序随调用变化（多线程/原子累加），'
+        '跨 rank 比对会变成随机误报' % (a, b))
+
+
+def test_checksum_is_fp32_because_npu_has_no_fp64():
+    """checksum 的累加 dtype 与 all_gather 载荷都必须是 fp32。
+
+    事故记录（2026-10-01 云端，两轮）：
+      · 第一轮崩在 `torch.equal(...)` ⇒ 我误判成「比较算子的问题」；
+      · 改用 `.item()` 后崩在同一处 ⇒ 说明故障是**异步**的：AICPU 故障由上游的
+        `sum(dtype=torch.float64)` 排队，在后面第一次同步时才报出来，栈看起来指向
+        无辜的算子。
+    真正的线索一直在日志里：`Warning: Device do not support double dtype now`。
+    """
+    mod = _load_module()
+    _, base = _captured_checksum(mod, _ThreeParam())
+    assert base.dtype == torch.float32, (
+        'all_gather 载荷必须是 fp32（HCCL 原生支持；fp64 会走 AICPU），实得 %s'
+        % base.dtype)
+
+    src = (ROOT / 'scripts' / 'train_sft.py').read_text(encoding='utf-8')
+    body = src[src.index('def _assert_init_weights_identical'):]
+    body = body[:body.index('\ndef ')]
+    # 剥掉整行注释：该函数的注释里**故意**提到 `torch.equal`（记录事故与理由），
+    # 带着注释判会自己把自己判红。
+    body = '\n'.join(ln for ln in body.splitlines()
+                     if not ln.lstrip().startswith('#'))
+    assert 'float64' not in body, \
+        '_assert_init_weights_identical 里不得出现 fp64（910A 不支持）'
+    assert 'sum(dtype=torch.float32)' in body, 'checksum 应在 fp32 上累加'
+    assert 'torch.equal' not in body, \
+        'torch.equal 在 910A 上派发到 AICPU kernel，比对要放到主机侧做'
 
 
 def test_checksum_detects_divergence():

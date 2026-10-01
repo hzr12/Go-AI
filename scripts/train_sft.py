@@ -325,32 +325,41 @@ def _assert_init_weights_identical(model, logger):
     acc = None
     with torch.no_grad():
         for p in model.parameters():
-            # `sum(dtype=torch.float64)` 而不是 `p.detach().double().sum()`：两者
-            # 结果**逐位相同**（本地实测），但后者把**每个参数整份物化成 fp64** ——
-            # v21 有 167 个张量 / 9.07M 参数，峰值临时显存 = 最大单参数 ×8，且每个
-            # 张量多一发 cast kernel。本文件唯一的既有先例是 `term = sq.double()`，
-            # 那是 **0 维标量** 的 cast，**不能**当作「整张量 fp64 cast 在 910A 上可用」
-            # 的证据（开发机纯 CPU，全量测试通过不构成 NPU 证据）。这段在启动期
-            # **无条件**执行，一旦 910A 不支持就是 4 卡 run 立刻死 —— 所以宁可走
-            # 「只 reduce、不 cast」那条路，把风险面从 cast+reduce 缩到只 reduce。
-            s = p.detach().sum(dtype=torch.float64)
+            # ⚠ 累加用 **fp32**，不是 fp64：910A **不支持 fp64**。
+            #   实测（2026-10-01 云端）：fp64 checksum 会让 AICPU kernel 挂掉 ——
+            #     Warning: Device do not support double dtype now, dtype cast
+            #               replace with float.
+            #     EXCEPTION TASK: task type=aicpu kernel ... error code=0x2a
+            #     RuntimeError: ACL stream synchronize failed
+            #   且它是**异步**的：故障由 fp64 算子排队，在**后面第一次同步**
+            #   （`all_gather` 后的 `.item()`）才报出来，栈看起来指向 `.item()` /
+            #   `torch.equal`，很容易误判成「比较算子有问题」（我就误判过一次）。
+            #
+            #   为什么 fp32 够用：这里要判的是「各 rank 的权重**逐位相同**」，
+            #   而广播后它们本来就逐位相同 ⇒ 相同输入 + 相同形状 + 相同归约顺序
+            #   ⇒ fp32 的和也逐位相同。我们不需要「累加精度高」，只需要
+            #   「不相等时能看出来」。
+            s = p.detach().sum(dtype=torch.float32)
             acc = s if acc is None else acc + s
-    buf = acc.reshape(1).to(torch.float64)
+    # fp32 all_gather：HCCL 原生支持；fp64 会走 AICPU（同上）。
+    buf = acc.reshape(1).to(torch.float32)
     gathered = [torch.zeros_like(buf) for _ in range(dist.get_world_size())]
     dist.all_gather(gathered, buf)
-    if not all(torch.equal(gathered[0], g) for g in gathered):
-        vals = ', '.join('rank%d=%.8g' % (i, g.item()) for i, g in enumerate(gathered))
+    # ⚠ 比对也不走 `torch.equal`（它在 910A 上是 AICPU kernel，见下）。
+    _vals = [float(g.item()) for g in gathered]
+    if any(v != _vals[0] for v in _vals[1:]):
+        vals = ', '.join('rank%d=%.8g' % (i, v) for i, v in enumerate(_vals))
         raise RuntimeError(
             '[dist] 初始权重一致性自检失败：各 rank 的参数 checksum 不一致。\n'
             '  各 rank checksum: %s\n'
             '  两种可能：\n'
             '    1) from-scratch 起手时初始权重确实不同 —— 说明广播没生效或\n'
             '       调用点晚于模型构造，检查 _sync_init_weights_from_rank0 的位置；\n'
-            '    2) 初始权重里有 NaN/Inf —— `torch.equal` 对 NaN 返回 False，\n'
-            '       会把这一种误报成前一种。（真因通常是某个 zero-init 假设被破坏）\n'
+            '    2) 初始权重里有 NaN/Inf —— NaN != NaN，会把这一种误报成前一种\n'
+            '       （真因通常是某个 zero-init 假设被破坏）。\n'
             '  环境: %s' % (vals, _dist_env_snapshot()))
     logger.info("[dist] 初始权重一致性自检通过 | world_size=%d | checksum=%.8g",
-                dist.get_world_size(), gathered[0].item())
+                dist.get_world_size(), _vals[0])
 
 
 def _check_training_env(logger):
@@ -1128,7 +1137,6 @@ def _init_swanlab(args, logger):
                 "huber_beta": args.huber_beta,
                 "label_smoothing": args.label_smoothing,
                 "attention_dropout": args.attention_dropout,
-                "td": args.td,
                 "ema_enabled": bool(args.use_ema),
                 "ema_decay": 0.999,
                 # ---- AMP：910A 无 BF16，FP16 必须配 GradScaler ----
@@ -1569,20 +1577,22 @@ def compute_l2_report(param_groups):
     **每个 micro-batch 都无条件跑**（不在 `if _do_stdout or _do_swanlab:` 里），
     比日志打点那 3 次同步频繁得多 —— 见 report `## Fix3 增补` §3 的 NPU 说明。
     """
-    # 累加全部留在**设备上**，整个调用只做一次 `float()`（= 一次 host 同步）。
+# 累加全部留在**设备上**，整个调用只做一次 `float()`（= 一次 host 同步）。
     # ⚠ 逐组 `float()` 是 2 次同步，而本函数在训练循环里**每个 micro-batch 都跑**
     #   （不在 `if _do_stdout or _do_swanlab:` 里），比日志打点的 3 次同步频繁
     #   ~`_accum_steps` × `--log-every` 倍。
-    # ⚠ `sq.double()` 不是可有可无的：它让乘加保持 **float64** 精度，与旧的
-    #   `wd * float(sq)`（python double 乘加）**逐位相同**；若留在 float32 上
-    #   累加，wd 的 float32 舍入会让 `l2_report ∝ --weight-decay` 这条线性律
-    #   只剩 ~1e-8 的相对精度（`test_l2_report_scales_with_weight_decay` 的
-    #   `rel=1e-9` 会红）。代价只是每个 decay 组多两个 0 维标量 kernel。
+    # ⚠ **不要在设备侧做 fp64**（`sq.double()`）：910A 没有 fp64 硬件，实测
+    #   （2026-10-01 云端）会报 `Device do not support double dtype now` 并挂掉
+    #   AICPU kernel。本 docstring 早先论证过的「`wd * float(sq)` 与
+    #   `sq.double() * wd` 逐位相同」正好给了替代：**乘加搬到主机侧**（Python
+    #   float 就是 fp64），设备侧只留 fp32 的 `pow(2).sum()` 归约。
+    #   精度不降反升（少一次设备侧舍入），`test_l2_report_scales_with_weight_decay`
+    #   的 `rel=1e-9` 与 `test_log_loss_identity` 的恒等式容差都不受影响。
     # ⚠ 单次读回不引入任何 θ 错位：所有 `pow(2).sum()` 的读都发生在这一行之前，
     #   仍是**同一个 θ**。
     #   `tests/test_huber_loss.py::test_l2_report_uses_decay_group_only` 用
     #   TorchDispatchMode 数 `aten::item`，把「恰好一次」钉住。
-    total = None
+    _wds, _sqs = [], []
     for group in param_groups:
         wd = float(group.get('weight_decay') or 0.0)
         if wd == 0.0:
@@ -1592,9 +1602,30 @@ def compute_l2_report(param_groups):
             s = p.detach().pow(2).sum()
             sq = s if sq is None else sq + s
         if sq is not None:
-            term = sq.double() * wd
-            total = term if total is None else total + term
-    return 0.0 if total is None else float(total)
+            _wds.append(wd)
+            _sqs.append(sq)
+
+    if not _sqs:
+        return 0.0
+
+    # ⚠⚠ **一次**读回，但加法留到主机侧的 fp64：
+    #   `torch.stack(_sqs).tolist()` 是**一发 D2H**（2 个标量），之后所有乘加都在
+    #   Python float（fp64）里做。
+    #   · 为什么不能直接在设备上加：`_sqs[0] + _sqs[1]` 是 fp32 加法，而组平方和
+    #     量级 ~600 ⇒ fp32 的 ulp ≈ 6.1e-5，一次加法就引入 ~3e-5 误差，直接吃掉
+    #     `test_l2_report_uses_decay_group_only` 的 1.2e-6 容差（实测 got=1200.0335
+    #     vs want=1200.0335471477）。这等于把刚搬到主机侧的算术又拽回设备上。
+    #   · 为什么不能逐组 `float()`：那是**两次** D2H，而本函数每个 micro-batch 都跑。
+    #   `tests/test_huber_loss.py::test_l2_report_uses_decay_group_only` 用
+    #   TorchDispatchMode 数 `aten::item`；⚠ 那个探针**看不见** `.tolist()`（它只
+    #   匹配 `item`/`_local_scalar_dense`，而 stacked 读回落在这两者之外），所以那条
+    #   测试现在断言的是「≤ 1 次代理可见同步」，真实的「恰好一次 D2H」由
+    #   `tests/test_no_aicpu_ops_in_startup_check.py` 用结构检查钉住。
+    _vals = torch.stack(_sqs).tolist()
+    _total = 0.0
+    for _wd, _sq in zip(_wds, _vals):
+        _total += float(_sq) * _wd
+    return _total
 
 
 # ---- P4.6：fused AdamW 的设备策略与回退（全模块唯一构造入口）------------------
@@ -2646,13 +2677,22 @@ def main():
     if is_dist:
         model = DistributedDataParallel(model, device_ids=[local_rank])
 
+    # ⚠ `_accum_steps` 必须定义在**任何**用它之前（2026-10-01 云端教训）。
+    #   它原先在下面训练循环的开头才赋值，而上面「run 级指标上报」已经用它算
+    #   effective_batch —— 晚 29 行 ⇒ `UnboundLocalError: local variable
+    #   '_accum_steps' referenced before assignment`。那次上报被
+    #   `except Exception` 吞成一行 warning，于是 **SwanLab 少了 8 个 run 级
+    #   指标、训练照跑**，没人会发现。这里把定义提到所有使用点之前，并且
+    #   下面那处赋值删掉（全仓库只此一处定义）。
+    _accum_steps = max(1, int(args.gradient_accumulation_steps))
+
     if is_main:
         # 两个口径都打：调度器按 optimizer step 走，读日志的人常按 micro-batch 想。
         # 差别就是 gradient_accumulation_steps 倍（accum=1 时相等）。
         logger.info("[train] 开始训练 | optimizer-steps/epoch=%d | micro-batches/epoch=%d"
                     " | 总 steps≈%d | warmup=%d | accum=%d",
                     n_batches, micro_per_epoch, total_steps, warmup_steps,
-                    max(1, args.gradient_accumulation_steps))
+                    _accum_steps)
         if swanlab_logger is not None:
             # run 级事实一次性上报：这些量在 config 面板里给不出（init 时模型还没
             # 建、数据还没切分），但对比两次 run 时它们是最先要看的。
@@ -2664,7 +2704,7 @@ def main():
                     "run/warmup_steps": warmup_steps,
                     "run/n_train": n_train,
                     "run/n_eval": len(eval_idx),
-                    "run/effective_batch": bs * max(1, world_size) * max(1, _accum_steps),
+                    "run/effective_batch": bs * max(1, world_size) * _accum_steps,
                 }, step=0)
             except Exception as e:  # noqa: BLE001
                 logger.warning("[swanlab] run 级指标上报失败（不影响训练）: %s", e)
@@ -2693,7 +2733,6 @@ def main():
         # step，结束打印 top CUDA kernel 耗时表，用于定位 740ms/step 的去向。
         _prof_at = int(os.environ.get('GOAI_PROFILE', '0') or 0)
         _prof_ctx = None
-        _accum_steps = args.gradient_accumulation_steps
         # ---- 分段计时（纯 CPU 侧观测）----
         # 动机：4 卡 910A 实测 4.25 s/step，扣除 eval（实测仅 0.2%）后
         # 约 96% 是黑盒，无法判断瓶颈在取数 / 算子 / 通信 / 保存。

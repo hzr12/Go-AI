@@ -170,6 +170,209 @@ def test_effective_batch_includes_accumulation():
         f'effective_batch 表达式缺累积因子：{expr}'
 
 
+def test_every_args_attribute_used_in_config_exists():
+    """`_init_swanlab` 里引用的每个 `args.X` 都必须是**真实存在的 argparse 参数**。
+
+    这条是被真事件打出来的：2026-10-01 我往 config 面板加了 `"td": args.td`，
+    而 `--td`/`--td-steps` 只存在于 RL 侧 `selfplay_train.py`，SFT 的 argparse
+    里没有 ⇒ `args.td` 抛 AttributeError ⇒ **整个 swanlab init 失败**
+    （`except` 降级成 None，训练照跑但**一条曲线都没有**）。
+
+    那个 except 救的是训练、不是跟踪：静默降级让「跟踪没了」这件事只在日志里
+    留一行。所以用测试把「config 里引用的 dest 必须存在」钉死。
+    """
+    init = SRC[SRC.index('def _init_swanlab'):SRC.index('def _should_log')]
+    used = set(re.findall(r'args\.([a-z_0-9]+)', init))
+
+    # argparse 声明的 dest 全集
+    dests = set()
+    for node in ast.walk(TREE):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == 'add_argument' and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)):
+            dests.add(node.args[0].value.lstrip('-').replace('-', '_'))
+    assert dests, '解析不到任何 add_argument（测试自身失效）'
+
+    missing = sorted(used - dests)
+    assert not missing, \
+        f'config/swanlab 引用了不存在的 args 属性：{missing} —— 会让整个 ' \
+        f'swanlab init 抛异常降级成 None（跟踪全丢，而训练照跑、看不出原因）'
+
+
+def _namespace_from_argparse():
+    """从 main() 的 add_argument 调用重建一个 Namespace（dest + 字面量默认值）。
+
+    parser 是内联构造在 main() 里的（没有独立的 parse_args），所以这里走 AST：
+    收集 flag 与能静态求值的 default，其余填占位。**目的不是复现 argparse 语义**
+    （required / type 转换都不管），而是给 config 表达式一个「属性名与真实 CLI
+    一致」的求值环境 —— 缺一个属性就抛 AttributeError，正是要挡的那个失败。
+    """
+    import argparse
+    fn = next(f for f in ast.walk(TREE)
+              if isinstance(f, ast.FunctionDef) and f.name == 'main')
+    ns = argparse.Namespace()
+    for node in ast.walk(fn):
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == 'add_argument' and node.args
+                and isinstance(node.args[0], ast.Constant)):
+            continue
+        flag = node.args[0].value
+        dest = flag.lstrip('-').replace('-', '_')
+        default = None
+        for kw in node.keywords:
+            if kw.arg == 'default':
+                try:
+                    default = ast.literal_eval(kw.value)
+                except (ValueError, SyntaxError):
+                    default = None       # 非字面量（引用模块常量）→ 占位
+        setattr(ns, dest, default)
+    return ns
+
+
+def _fn_node(fn):
+    tree = ast.parse(SRC)
+    return next(f for f in ast.walk(tree)
+                if type(f) is ast.FunctionDef and f.name == fn)
+
+
+import builtins
+
+# ⚠ 必须用 `builtins` 模块，不能用 `dir(__builtins__)`：在**被 import** 的测试
+#   模块里 `__builtins__` 是一个 dict，`dir(dict)` 给的是 dict 的方法
+#   （keys/values/get…），`len`/`max` 一个都不在里面 ⇒ 顺序检查把它们全误报成
+#   「从未赋值」。这不是假设：这个 bug 让本文件第一次跑就红。
+_BUILTINS = frozenset(dir(builtins))
+
+
+def _first_assign_lines(fn_node):
+    """{名字: 该函数里第一次赋值的行号}（函数参数不算赋值）。"""
+    out = {}
+    for n in ast.walk(fn_node):
+        if isinstance(n, (ast.For, ast.AsyncFor)):
+            # 循环变量也是绑定：`for epoch in range(...)`（L2718）—— 本文件的
+            # `epoch` 就是这么来的，漏掉它这条检查会一直误报。
+            # ⚠ 不含 `ast.comprehension`：推导式在 Python 3 是**独立作用域**，
+            #   它的目标不会成为函数局部变量。
+            for nm in _bound_names(n.target):
+                out.setdefault(nm, n.lineno)
+            continue
+        if not isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            continue
+        tgts = n.targets if isinstance(n, ast.Assign) else [n.target]
+        for t in tgts:
+            # ⚠ 必须递归进 Tuple/List：`opt_loss, log_loss = _loss_terms(...)`
+            #   是本文件最常见的赋值形式，只认 Name 会把它们全误报成「从未赋值」
+            #   —— 让这条检查一上来就红，等于没有检查。
+            for nm in _bound_names(t):
+                out.setdefault(nm, n.lineno)
+    return out
+
+
+def _bound_names(tgt):
+    """赋值目标里绑定的全部名字（穿透 tuple/list 解包与下标/属性目标）。"""
+    if isinstance(tgt, ast.Name):
+        return [tgt.id]
+    if isinstance(tgt, (ast.Tuple, ast.List)):
+        return [nm for el in tgt.elts for nm in _bound_names(el)]
+    if isinstance(tgt, ast.Starred):
+        return _bound_names(tgt.value)
+    return []          # Subscript / Attribute：绑定的是容器/字段，不是新名字
+
+
+def _assigned_before(fn, use_line, names):
+    """断言 `names` 里每个名字在 `use_line` 行**之前**已在 `fn` 里被赋值。
+
+    为什么需要这一条（2026-10-01 云端两次踩坑）：
+      · `args.td`      —— 属性不存在，AttributeError 被 `except Exception` 吞掉
+      · `_accum_steps` —— 名字**确实存在**，只是赋值在 29 行**之后** ⇒
+        `UnboundLocalError: local variable ... referenced before assignment`。
+        同样被 `except Exception` 吞成一行 warning，于是 SwanLab 少 8 个 run 级
+        指标、训练照跑，**没有任何报错**。
+
+    前者靠「属性存在」静态检查能抓到；后者只能靠**顺序**检查 —— Python 自己的
+    静态工具（pyflakes/ruff）都不会报：它是个合法局部变量，只是用早了。
+
+    ⚠ 用 `if type(f) is ast.FunctionDef` 而非 `isinstance`：后者会把**嵌套**在
+    `main()` 里的 `def`（例如 _build_param_groups 的内层闭包）也算进来，于是内层
+    的局部名被误判成「main() 里已赋值」，正好放行我们要抓的那类 bug。
+    """
+    first = _first_assign_lines(_fn_node(fn))
+    names = {nm for nm in names if nm not in _BUILTINS}
+    missing = {nm: first.get(nm) for nm in names
+               if first.get(nm) is None or first[nm] >= use_line}
+    assert not missing, (
+        '%s() 里 %s 在使用点（第 %d 行）之前**未赋值** ⇒ 运行时 UnboundLocalError，'
+        '又会被 except Exception 吞掉：%s'
+        % (fn, sorted(missing), use_line,
+           {k: ('从未赋值' if v is None else '第 %d 行才赋值' % v)
+            for k, v in missing.items()}))
+
+
+def test_init_swanlab_defines_ws_and_accum_before_config():
+    """`_init_swanlab` 的 config 块用 `_ws`/`_accum`，两者必须在它之前赋值。"""
+    line = SRC[:SRC.index('config={')].count('\n') + 1
+    _assigned_before('_init_swanlab', line, {'_ws', '_accum'})
+
+
+def test_run_level_metrics_dict_uses_only_names_defined_earlier():
+    """`swanlab_logger.log({...})` 里每个名字都必须在同一函数里**先赋值后使用**。
+
+    这条直接钉死 `_accum_steps` 那次事故：它在 run 级上报里被引用，而赋值在
+    29 行之后。`except Exception` 把 UnboundLocalError 变成一行 warning，
+    SwanLab 静默少 8 个指标而训练照跑。
+    """
+    fn_node = _fn_node('main')
+    calls = [n for n in ast.walk(fn_node)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+             and n.func.attr == 'log' and n.args
+             and isinstance(n.args[0], ast.Dict)]
+    assert calls, 'main() 里找不到 swanlab_logger.log({...}) 调用'
+    for call in calls:
+        used = {n.id for n in ast.walk(call.args[0]) if isinstance(n, ast.Name)}
+        # `args` 是 main() 的参数（不是局部赋值），交给「属性存在」那条检查
+        _assigned_before('main', call.lineno, used - {'args'})
+
+
+def test_config_expression_actually_evaluates():
+    """把 config 表达式用**真实 dest 集合**的 Namespace 真 eval 一遍。
+
+    静态检查挡得住「属性不存在」，挡不住别的：表达式里除 args 还引用了
+    `V21_CFG` / `os` / `_ws` / `_accum` 等局部名，任何一个拼错或漏定义都会在
+    `swanlab.init(...)` 那一步抛异常 —— 而那一步被 `except Exception` 吞掉，
+    结果是**跟踪静默全丢、训练照跑**（2026-10-01 真发生过一次：`args.td`）。
+
+    所以这里不满足于静态：把表达式抠出来实跑，并断言它产出预期内容。
+    """
+    import scripts.train_sft as tsf
+
+    ns = _namespace_from_argparse()
+    ns.data = 'x.npz'
+    ns.board_size = 19
+    ns.batch_size = 1000
+    ns.lr = 0.0045
+    ns.epochs = 1
+    ns.use_ema = 1
+    ns.scaler_init_scale = 1024.0
+    ns.scaler_growth_interval = 100000
+
+    body = SRC[SRC.index('config={'):]
+    expr = body[body.index('{') + 1:body.index('},\n')]
+    env = {'args': ns, 'V21_CFG': tsf.V21_CFG, 'os': os, '_ws': 2, '_accum': 2}
+    cfg = eval('{' + expr + '}', env)   # noqa: S307 — 测试内显式求值
+
+    assert isinstance(cfg, dict) and len(cfg) >= 25, \
+        f'config 键数异常：{len(cfg) if isinstance(cfg, dict) else type(cfg)}'
+    for k in ('v21/in_channels', 'v21/blocks', 'effective_batch',
+              'grad_accum', 'world_size', 'lr', 'amp_dtype',
+              'attn_query_chunk', 'ema_decay'):
+        assert k in cfg, f'config 实跑后缺 {k}'
+    assert cfg['effective_batch'] == 1000 * 2 * 2, cfg['effective_batch']
+    for dead in ('backbone_channels', 'res_blocks', 'policy_layers'):
+        assert dead not in cfg, f'归档 flag {dead} 混进了 config'
+
+
 # --------------------------------------------------------------------------- #
 # 3. run 级事实（config 给不出的那些）
 # --------------------------------------------------------------------------- #
