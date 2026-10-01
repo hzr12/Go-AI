@@ -602,9 +602,14 @@ def test_log_keys_unchanged():
         f'应恰好找到 1 个训练损失日志字典，实得 {len(log_dicts)} 个'
     keys = log_dicts[0]
     loss_keys = [k for k in keys if 'loss' in k]
-    assert sorted(loss_keys) == ['loss', 'policy_loss', 'value_loss'], \
+    # 2026-10-01 起多了 opt_loss 与 l2_report：`loss`（= log_loss）此前**不可分解**，
+    # 看曲线的人无法知道 policy / value / 正则各占多少。三项齐了才看得出「在降」
+    # 是模型在学还是正则项在缩。opt_loss 尤其重要：它是**真正被 backward 的量**
+    # （不含 L2 —— 正则走 AdamW 的解耦衰减，按构造不在梯度里）。
+    assert sorted(loss_keys) == ['loss', 'opt_loss', 'policy_loss', 'value_loss'], \
         f'损失键集合被改动（改名/新增/删除都会打红）: {sorted(loss_keys)}'
-    for required in ('loss', 'policy_loss', 'value_loss'):
+    for required in ('loss', 'policy_loss', 'value_loss', 'opt_loss',
+                     'l2_report'):
         assert required in keys, f'日志字典缺少 {required}'
 
     # stdout 打点行与单同步点 helper 一起钉住（下游解析的是这些字面量）

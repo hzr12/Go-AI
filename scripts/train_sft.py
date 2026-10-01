@@ -11,6 +11,7 @@
 
 import argparse
 import logging
+import math
 import multiprocessing as mp
 import os
 import queue
@@ -1089,22 +1090,61 @@ def _init_swanlab(args, logger):
         if api_key:
             swanlab.login(api_key=api_key, save=True)
             logger.info("[swanlab] API key 已设置，自动登录")
+        # ⚠ config 面板此前记的是 9 个 **D1 已归档**的结构 flag
+        # （backbone_channels / res_blocks / convnext_blocks / attn_blocks /
+        #  value_channels / value_res_blocks / policy_channels / policy_layers …），
+        # 它们**完全不参与建网** —— v21 恒为 V21_CFG 那个形状。而 config 面板正是
+        # 对比两次 run 时第一个看的东西，记虚构值比不记更糟。2026-10-01 换成真值。
+        _ws = max(1, int(os.environ.get('WORLD_SIZE', '1') or '1'))
+        _accum = max(1, int(args.gradient_accumulation_steps))
         swanlab.init(
             project="go-ai",
             name=f"sft_{args.board_size}x{args.board_size}_{args.ver}",
             config={
-                "backbone_channels": args.backbone_channels,
-                "backbone_res_blocks": args.backbone_res_blocks,
-                "res_blocks": args.res_blocks,
-                "convnext_blocks": args.convnext_blocks,
-                "attn_blocks": args.attn_blocks,
-                "value_channels": args.value_channels,
-                "value_res_blocks": args.value_res_blocks,
-                "policy_channels": args.policy_channels,
-                "policy_layers": args.policy_layers,
-                "batch_size": args.batch_size,
+                # ---- 结构：v21 真值（唯一真相源是 V21_CFG，不是这些 flag）----
+                "v21/in_channels": V21_CFG['in_channels'],
+                "v21/channels": V21_CFG['channels'],
+                "v21/blocks": "res%d_mamba%d_trans%d_cross%d" % (
+                    V21_CFG['n_res'], V21_CFG['n_mamba'],
+                    V21_CFG['n_trans'], V21_CFG['n_cross']),
+                "v21/ffn_hidden": V21_CFG['ffn_hidden'],
+                "v21/num_heads": V21_CFG['num_heads'],
+                "v21/params_total": V21_CFG['params_total'],
+                "v21/params_backbone": V21_CFG['params_backbone'],
+                "grad_checkpoint": V21_CFG['grad_checkpoint'],
+                # ---- batch/lr：有效 batch 含累积（漏乘会把学习率口径搞错）----
+                "batch_size_per_card": args.batch_size,
+                "grad_accum": _accum,
+                "world_size": _ws,
+                "effective_batch": args.batch_size * _ws * _accum,
                 "lr": args.lr,
                 "epochs": args.epochs,
+                "weight_decay": args.weight_decay,
+                "clip_grad_max_norm": 1.0,
+                # ---- 数值/正则 ----
+                "policy_loss": args.policy_loss,
+                "value_loss": args.value_loss,
+                "value_loss_weight": args.value_loss_weight,
+                "huber_beta": args.huber_beta,
+                "label_smoothing": args.label_smoothing,
+                "attention_dropout": args.attention_dropout,
+                "td": args.td,
+                "ema_enabled": bool(args.use_ema),
+                "ema_decay": 0.999,
+                # ---- AMP：910A 无 BF16，FP16 必须配 GradScaler ----
+                "amp_dtype": "float16",
+                "scaler_init_scale": args.scaler_init_scale,
+                "scaler_growth_interval": args.scaler_growth_interval,
+                # ---- 注意力内核（决定显存口径，见 backbone._sdpa）----
+                "attn_sdpa_force_math": True,
+                "attn_query_chunk": int(
+                    os.environ.get('GOAI_ATTN_QUERY_CHUNK', '64') or 0),
+                # ---- 数据/运行 ----
+                "data": args.data,
+                "board_size": args.board_size,
+                "prefetch_workers": args.prefetch_workers,
+                "prefetch_depth": args.prefetch_depth,
+                "npu_graph_compile": args.npu_graph_compile,
             },
         )
         logger.info("[swanlab] 实验跟踪已启用")
@@ -2613,6 +2653,21 @@ def main():
                     " | 总 steps≈%d | warmup=%d | accum=%d",
                     n_batches, micro_per_epoch, total_steps, warmup_steps,
                     max(1, args.gradient_accumulation_steps))
+        if swanlab_logger is not None:
+            # run 级事实一次性上报：这些量在 config 面板里给不出（init 时模型还没
+            # 建、数据还没切分），但对比两次 run 时它们是最先要看的。
+            try:
+                swanlab_logger.log({
+                    "run/optimizer_steps_per_epoch": n_batches,
+                    "run/micro_batches_per_epoch": micro_per_epoch,
+                    "run/total_optimizer_steps": total_steps,
+                    "run/warmup_steps": warmup_steps,
+                    "run/n_train": n_train,
+                    "run/n_eval": len(eval_idx),
+                    "run/effective_batch": bs * max(1, world_size) * max(1, _accum_steps),
+                }, step=0)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[swanlab] run 级指标上报失败（不影响训练）: %s", e)
 
     # 预取器 pf 已在**设备初始化之前**构造（见上方「数据集 + 预取 worker」段：
     # fork 晚于 set_device 会让每个 worker 继承 CANN 上下文，4 卡实测每卡凭空
@@ -2651,6 +2706,15 @@ def main():
         _t_data_max = 0.0
         _n_timed = 0
         _n_skipped = 0
+        # ---- SwanLab 上报用的「跨 micro-batch 沿用」量 ----
+        # grad_norm 每个 optimizer.step() 只有一个值（clip_grad_norm_ 的返回值，
+        # 在 unscale_ 之后取才是真值），而上报是每 micro-batch 打一次点 ⇒ 必须
+        # carry forward，否则 accum>1 时曲线出现阶梯。
+        # nan 表示「还没做过任何 optimizer step」（第 0 个打点），不是 0。
+        _grad_norm_last = float('nan')
+        # 训练健康度（train_top1 / value_rmse / 基线）在**同一个 batch** 上算才有
+        # 对照意义，故也沿用；首步若前向异常则为 nan。
+        _health_last = None
         for i in range(n_batches):
             try:
                 if i % _accum_steps == 0:
@@ -2784,7 +2848,13 @@ def main():
                     # 修复点在别处，此处只负责让它**可观测**。
                     _scale_now = scaler.get_scale()
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    # clip_grad_norm_ **返回 clip 前的总范数** —— 之前被丢弃了。它是
+                    # fp16 溢出/梯度爆炸唯一的直接信号：这轮 910A 的 inf/nan 与
+                    # 16384→8192→4096 的缩放雪崩，本可以由它提前几分钟看到。
+                    # 必须在 unscale_ 之后取（unscale 前是按 scale 放大的假值）。
+                    _gn = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_norm=1.0)
+                    _grad_norm_last = float(_gn)
                     scaler.step(optimizer)
                     scaler.update()
                     if use_scaler and scaler.get_scale() < _scale_now:
@@ -2903,25 +2973,70 @@ def main():
                 _last_stdout_step = step
 
             if _do_swanlab:
+                # ---- 训练健康度：与**基线**成对上报（2026-10-01）----
+                # 为什么必须带基线：`policy_loss` / `value_loss` 两条曲线单看没有参照，
+                # 「从 5.89 降到 5.5」和「真的学到了」在图上长得一样。基线给出
+                # 「什么都没学到」的那条线在哪儿：
+                #   · policy_ce_random = log(A)（19 路 A=362 ⇒ ≈5.89）= 均匀猜测的 CE
+                #   · value_rmse_zero  = sqrt(mean(z²))（恒预测 0 的 RMSE，按本批算）
+                # 代价：~5 个 kernel + 5 次 D2H（只在打点步付，`--swanlab-every 10`
+                # 下摊薄到每步 +0.5 次）。所以放在**上报分支**里算，而不是每个
+                # micro-batch 都算 —— 后者会白付 10 倍。
+                with torch.no_grad():
+                    _plg = policy_logits.detach().float()
+                    _vlg = value_logit.detach().float().reshape(-1)
+                    _mtg = move_t.reshape(-1)
+                    _vtg = value_t.reshape(-1).float()
+                    _lp = _plg.log_softmax(-1)
+                    _topk = _plg.topk(min(5, _plg.shape[-1]), dim=-1).indices
+                    _health_last = {
+                        'train_top1': float((_plg.argmax(-1) == _mtg).float().mean()),
+                        'train_top5': float(
+                            (_topk == _mtg[:, None]).any(-1).float().mean()),
+                        'value_rmse': float(torch.sqrt((_vlg - _vtg).pow(2).mean())),
+                        'value_rmse_zero': float(torch.sqrt(_vtg.pow(2).mean())),
+                        'policy_ce_random': float(math.log(_plg.shape[-1])),
+                        'policy_entropy': float((_lp.exp() * _lp).sum(-1).mean()),
+                    }
                 try:
                     swanlab_logger.log({
                         "loss": _lv,
                         "policy_loss": _pv,
                         "value_loss": _vv,
+                        # ---- 损失的三项分解（此前 `loss` 不可分解）----
+                        # log_loss = policy + value + c‖θ‖²（用户裁决的报告口径）；
+                        # opt_loss 才是被 backward 的量（不含 L2 —— 正则走 AdamW 的
+                        # 解耦衰减，按构造不在梯度里）。三条一起看才能判断「在降」
+                        # 是模型在学还是正则项在缩。
+                        "l2_report": float(l2_report),
+                        "opt_loss": float(opt_loss),
                         "lr": lr,
                     "memory_gb": mem,
                     "speed": speed,
                     "speed_inst": spd_inst,
+                    # 每卡吞吐与 ETA：长跑时「还剩多久」比「多快」更需要盯
+                    "speed_per_card": speed / max(1, world_size),
+                    "elapsed_min": (_now - t0) / 60.0,
+                    "eta_min": ((total_steps - step)
+                                * (_now - t0) / max(1, step - _step_at_start)
+                                / 60.0) if step > _step_at_start else float('nan'),
                     "skipped_steps": _n_skipped,
                     "skip_rate_pct": 100.0 * _n_skipped / max(1, step),
+                    # ⚠ grad_norm 之前被丢弃（clip_grad_norm_ 的返回值）。它是
+                    # fp16 溢出/梯度爆炸唯一的直接信号；accum>1 下每 optimizer
+                    # step 只有一个值，打点是每 micro-batch ⇒ 沿用上一次的。
+                    "grad_norm": _grad_norm_last,
                     "scaler_scale": _scale,
                     "t_data_ms": _dms,
                     "t_comp_ms": _cms,
                     "t_save_ms": _sms,
                     "t_eval_ms": _ems,
+                        # 取数长尾：均值能掩盖「偶尔等 3 秒」的预取抖动
+                        "t_data_max_ms": _dmax,
                         "epoch": epoch,
                         "step_pct": step / total_steps,
                         "scaler_scale": _scale if use_scaler else 1.0,
+                        **_health_last,
                     }, step=step)
                 except Exception as e:
                     logger.warning("[swanlab] log 失败: %s", e)
@@ -3002,6 +3117,18 @@ def main():
                                 "eval_batches": metrics['batches'],
                                 "eval_truncated": metrics['truncated'],
                                 "best_eval_acc": best_eval_acc,
+                                # ---- 补三项（2026-10-01）----
+                                # eval_used_ema: eval 跑的是 **EMA shadow** 还是原权重。
+                                #   不报这个就不知道在评什么 —— `--use-ema 1` 时曲线上的
+                                #   eval_top1 与训练 loss 不是同一个模型的两个量。
+                                # eval_lr: 把 eval 点与 lr 曲线对齐（lr 已退火到多少时
+                                #   评的，这在做「早停/最佳模型」判断时需要。
+                                # eval_gap_to_best: 早停判据（--early-stop-metric）直接可见。
+                                "eval_used_ema": bool(ema is not None),
+                                "eval_lr": float(optimizer.param_groups[0]['lr']),
+                                "eval_gap_to_best": (best_eval_acc - metrics['top1']
+                                                    if best_eval_metric >= 0
+                                                    else float('nan')),
                             }, step=step)
                         except Exception as e:
                             logger.warning("[swanlab] eval log 失败: %s", e)
