@@ -487,7 +487,7 @@ def test_all_optimizer_state_saves_use_plain_state_dict_under_is_main():
 
 
 # --------------------------------------------------------------------------- #
-# 7. FSDP 零残留：**代码级**全仓库；**标记级**只扫 scripts/train_sft.py
+# 7. FSDP 零残留：**代码级**全仓库所有 .py；**标记级**只扫 scripts/train_sft.py
 # --------------------------------------------------------------------------- #
 # ⚠ 范围（spec §7 I5 的对应写法，2026-10-01 评审收窄）：I5 说的是
 #   ① `scripts/train_sft.py` 内零 FSDP **代码**引用；② 该文件里剩下的 FSDP 字样
@@ -613,7 +613,7 @@ _FSDP_SCAN_SKIP_DIRS = ('.git', '.codegraph', '__pycache__', 'tmp',
 
 
 def test_no_fsdp_code_reference_anywhere_in_repo():
-    """**全仓库**代码级零 FSDP 引用（spec §7 I5 的代码级那半，跨文件版本）。
+    """**全仓库所有 `.py`** 代码级零 FSDP 引用（spec §7 I5 的代码级那半，跨文件版本）。
 
     为什么需要跨文件这一条：`test_no_fsdp_import_remains` /
     `test_no_fsdp_symbol_is_referenced` 走的是**全文件** AST，而 `SRC` 只指
@@ -654,8 +654,9 @@ def test_no_fsdp_code_reference_anywhere_in_repo():
             if what:
                 offenders.append('%s L%d %s' % (rel.as_posix(), node.lineno, what))
     assert not offenders, (
-        '全仓库代码级零 FSDP 引用（I5）被破坏：\n  %s\n'
-        '（注释级不在本条范围：train_sft.py 之外的注释性指涉按上一条的口径放行）'
+        '全仓库 `.py` 代码级零 FSDP 引用（I5）被破坏：\n  %s\n'
+        '（本条只扫 *.py，`.sh` / `.pyi` / `.ipynb` 不在范围内；'
+        '注释级也不在本条范围：train_sft.py 之外的注释性指涉按上一条的口径放行）'
         % '\n  '.join(offenders))
 
 

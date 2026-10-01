@@ -2077,8 +2077,9 @@ def main():
         _dist_preflight_check(_dist_backend, device, logger)
         if is_main:
             logger.info("[dist] 初始化分布式训练 | backend=%s world_size=%d | 策略=DDP"
-                        "（各 rank 各持完整模型，每个 micro-batch 反向做 1 次梯度 "
-                        "all-reduce；accum>1 时每个 optimizer step 就有几次）",
+                        "（各 rank 各持完整模型；每个 micro-batch 反向做 1 次梯度 "
+                        "all-reduce；本文件全无 no_sync()，故梯度累积**不摊薄**同步"
+                        "次数：accum=N 时每个 optimizer step 做 N 次）",
                         _dist_backend, world_size)
     else:
         if args.device == 'auto':
@@ -2582,7 +2583,7 @@ def main():
     #     —— 好在它是**响亮**地失败，不会安静地错。
     #   · `broadcast_buffers=True`（默认）：BN 的 `running_mean`/`running_var`
     #     跨卡一致靠它；上一代分片式包裹层默认也是 True ⇒ 行为不变。
-#   · `gradient_as_bucket_view=False`（默认）：本文件用
+    #   · `gradient_as_bucket_view=False`（默认）：本文件用
 #     `optimizer.zero_grad(set_to_none=True)`，bucket view 的别名每轮被销毁，
 #     省不掉拷贝，收益仅 ~36.27 MB/rank（= **全部梯度**的大小，torch 对该开关
 #     的定义就是"saved memory size will be equal to the total gradients
