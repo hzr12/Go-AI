@@ -232,6 +232,91 @@ def _dist_preflight_check(backend, device, logger):
                 backend, world, _dist_env_snapshot())
 
 
+# --------------------------------------------------------------------------- #
+# from-scratch 初始权重同步（2026-10-01）
+#
+# 事故形状：`_wrap_fsdp1` 的 docstring（本文件上方）要求 from-scratch 也必须
+# 同步初始权重 ——「各 rank 独立、各自不同，这里必须同步，否则第一步
+# all-gather 出来的就是拼错的权重」。但 `sync_module_states` 从未被传
+# （`_fsdp_ctor_kwargs` 与 `FSDP_CTOR_KWARGS_WHITELIST` 都没有），全文件唯一的
+# `dist.broadcast` 是 `_sync_stop_flag` 的 stop_flag —— **没有任何参数广播**。
+# `shell/train_sft_npu_4card_v21.sh` 不传 `--resume`/`--model` ⇒ from-scratch
+# ⇒ `SHARD_GRAD_OP` 的第一步 all-gather 把 4 份不同的随机权重拼成一个逻辑权重。
+#
+# 为什么用显式 broadcast 而不是 `sync_module_states=True`
+# --------------------------------------------------------
+# 1. 后者在 torch 2.1 上需要 `param_init_fn` 配套（本文件 `sync_module_states`
+#    处的注释就写了），会直接撞 `_drop_unsupported_kwargs` 那套版本兼容雷区。
+# 2. buffer 不需要额外同步：`BatchNorm2d` 的 `running_mean`/`running_var`/
+#    `num_batches_tracked` 是确定性 0/1 初始化，各 rank 本来就逐位一致。
+# 3. 显式 broadcast 是**无条件**的 —— 不依赖「resume 路径已经同步了」这类推理，
+#    运行时可验证，且能被 AST 测试直接钉住顺序。
+#
+# 代价：36.3 MB 一次性广播 + 约 100 次小 collective，**只在启动时发生一次**。
+# --------------------------------------------------------------------------- #
+
+def _dist_active() -> bool:
+    """通信域是否已建立**且** world_size > 1。
+
+    这里刻意问的是 PG 本身（`dist.is_initialized()`）而不是 `main()` 里解析的
+    `world_size` 环境变量 —— 两者可以不一致（env 写了但 PG 没起），而本组函数
+    的正确行为取决于后者。解耦也让测试能用 monkeypatch 精确控制分支。
+    """
+    try:
+        return bool(dist.is_available() and dist.is_initialized()
+                    and dist.get_world_size() > 1)
+    except Exception:  # noqa: BLE001 — 老版本/异常路径一律按「未建域」处理
+        return False
+
+
+def _sync_init_weights_from_rank0(model, logger):
+    """把 rank0 的初始权重广播给其余 rank（from-scratch 起手，见上方注释）。
+
+    `world_size == 1` / 通信域未建时**直接 return** —— 单卡路径逐字不变。
+    """
+    if not _dist_active():
+        return
+    n = 0
+    with torch.no_grad():
+        for p in model.parameters():
+            dist.broadcast(p.data, src=0)
+            n += 1
+    logger.info("[dist] 初始权重已从 rank0 同步 | tensors=%d | world_size=%d",
+                n, dist.get_world_size())
+
+
+def _assert_init_weights_identical(model, logger):
+    """各 rank 初始权重一致性自检（启动时验证，不等训练途中）。
+
+    本地 checksum = 全部参数 fp64 求和；`all_gather` 出 world_size 个标量后
+    逐位比对。失败即抛，不允许静默继续 —— 与 `_dist_preflight_check` 同一立场：
+    通信域的问题是惰性的，要主动试一发。
+    """
+    if not _dist_active():
+        return
+    acc = None
+    with torch.no_grad():
+        for p in model.parameters():
+            s = p.detach().double().sum()
+            acc = s if acc is None else acc + s
+    buf = acc.reshape(1).to(torch.float64)
+    gathered = [torch.zeros_like(buf) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, buf)
+    if not all(torch.equal(gathered[0], g) for g in gathered):
+        vals = ', '.join('rank%d=%.8g' % (i, g.item()) for i, g in enumerate(gathered))
+        raise RuntimeError(
+            '[dist] 初始权重一致性自检失败：各 rank 的参数 checksum 不一致。\n'
+            '  各 rank checksum: %s\n'
+            '  两种可能：\n'
+            '    1) from-scratch 起手时初始权重确实不同 —— 说明广播没生效或\n'
+            '       调用点晚于模型构造，检查 _sync_init_weights_from_rank0 的位置；\n'
+            '    2) 初始权重里有 NaN/Inf —— `torch.equal` 对 NaN 返回 False，\n'
+            '       会把这一种误报成前一种。（真因通常是某个 zero-init 假设被破坏）\n'
+            '  环境: %s' % (vals, _dist_env_snapshot()))
+    logger.info("[dist] 初始权重一致性自检通过 | world_size=%d | checksum=%.8g",
+                dist.get_world_size(), gathered[0].item())
+
+
 def _check_training_env(logger):
     """启动时检查三大加速能力并打印诊断：flash-attn 库 / torch.compile / 混合精度。
 
@@ -2356,6 +2441,13 @@ def main():
         attention_dropout=args.attention_dropout,           # 行为参数，仍生效
         grad_checkpoint=_v21_gc,
     ).to(device)
+    # from-scratch 起手必须把 rank0 的初始权重广播给其余 rank（2026-10-01）。
+    # ⚠ 位置是硬要求：**必须在 EMA 构造（本文件下方 `EMA(model, ...)`）之前** ——
+    # EMA 在构造时就把参数 `clone()` 进 `shadow`，放晚了 shadow 会持有广播前的
+    # 随机权重，之后每个 step 的 `ema.update()` 都往这个陈旧 shadow 上混。
+    # 也必须在 FSDP 包裹之前 —— 包裹后参数存储被替换成 flat shard，广播无意义。
+    _sync_init_weights_from_rank0(model, logger)
+    _assert_init_weights_identical(model, logger)
     n_params = sum(p.numel() for p in model.parameters())
     # 逐段开关也打出来：「grad_checkpoint=1」只说明**总开关**，看不出哪几段真的在
     # 走检查点（per-kind 默认可以不同；且训练态闸门还要求 self.training +
