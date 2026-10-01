@@ -39,12 +39,17 @@ python -m pip install swanlab -q || \
 # 这些不变量由 tests/test_dist_wrap.py 钉住（只传 device_ids；包裹点在 EMA、
 # _sync_init_weights_from_rank0、torch.compile 之后，在训练循环之前）。
 #
-# 读这个脚本时对分布式只需知道四件事，都是 DDP「完整复制 + 一步 all-reduce」的
-# 直接后果：
+# 读这个脚本时对分布式只需知道四件事，都是 DDP「完整复制 + 每次反向一次
+# 梯度 all-reduce」的直接后果：
 #   · **参数不分片**：每 rank 持有完整模型（params + grads + Adam 两矩 ≈ 145 MB，
 #     算术见「2026-10-01 的换轨」一节）。所以「卡数越多、每卡模型越省」这个
 #     直觉**从来没有成立过** —— 4 卡分的是 batch，不是模型状态。
-#   · **每步只同步梯度**：1 次 all-reduce（约 36 MB/步，fp32 梯度）。
+#   · **每次反向只同步梯度**：1 次 all-reduce（fp32 梯度 ≈ 36.3 MB）+ 1 次
+#     buffer broadcast。⚠ **不是「每个 optimizer step 1 次」**：train_sft.py 全文件
+#     没有 `no_sync()`，每个 micro-batch 都 backward()，而梯度 all-reduce 挂在
+#     **每一次** backward 的收尾上 ⇒ 本脚本 `GRAD_ACCUM=2` 下每个 optimizer step
+#     是 **2 次梯度 all-reduce + 2 次 buffer broadcast**（payload ≈ 72.5 MB/步）。
+#     仍然远小于 FSDP1 时代的「16 单元 × 2」，不是瓶颈（瓶颈在算子）。
 #   · **存档无需汇聚**：每 rank 的 `state_dict()` 本身就是完整权重，键形如
 #     `module.backbone.…`，save_model 剥掉 `module.` 之后与**包裹前同形**
 #     ⇒ **旧 checkpoint 继续可读，新 checkpoint 的键名与 FSDP1 时代一致**
@@ -113,9 +118,12 @@ python -m pip install swanlab -q || \
 #   ⇒ 换轨前 BATCH 段那套量级算术（分片也只省 0.2~0.5%）方向是对的，但它的
 #     结论应该是「分片本来就没帮上忙」，而不是「所以该开 FSDP」。
 #
-# 通信量：DDP 每 step **1 次** all-reduce（约 36 MB）；FSDP1 是 16 个 wrap 单元
+# 通信量：DDP 每个 micro-batch 反向 **1 次** all-reduce（约 36.3 MB）+ 1 次
+# buffer broadcast ⇒ 本脚本 GRAD_ACCUM=2 时**每个 optimizer step 2 次**
+# （payload ≈ 72.5 MB）；FSDP1 是 16 个 wrap 单元
 # × 4 rank，每单元前向 1 次 all-gather + 反向 1 次 all-gather + 1 次
-# reduce-scatter。
+# reduce-scatter。⚠ DDP 那侧的次数与 `no_sync` 直接相关，而 train_sft.py 全文件
+# 没有 `no_sync()` ⇒ 累积步数不会把同步次数摊薄，只是把 optimizer step 变慢。
 #
 # 附带收益（**预期，尚未验证 —— 别当结论引用**）：那 109 MB 分片换来的是分配器
 # 里额外的 all-gather 缓存。去掉后 `reserved − allocated` 的差额（实测
@@ -217,11 +225,13 @@ NPU_GRAPH_COMPILE=0
 #     ⇒ 开图编译会同时把块内检查点关掉。
 # · 不传 --flash-attn：NPU 上自动禁用，注意力走手写 math
 # · NPU 的 pin_memory 关闭 → 训练侧双缓冲 H2D 不生效（那只对 CUDA 有效）
-# · 4 卡 DDP 的那 1 次 all-reduce 仍是每步硬同步，任一卡通信抖动都会拖住全部
+# · 4 卡 DDP 的梯度 all-reduce 仍是每步硬同步，任一卡通信抖动都会拖住全部
 #   rank。此前记录过 4×910A 卡间网络不稳，若吞吐骤降或 hang，
 #   先用 shell/train_sft_npu_1card.sh 或 _2card.sh 验证通信。
-#   （FSDP1 时代这里是「16 个单元 × all-gather/reduce-scatter」，同步点更多；
-#   2026-10-01 换 DDP 后减到每步 1 次 all-reduce，但**仍然是硬同步**。）
+#   （数量口径：**每个 micro-batch 1 次**梯度 all-reduce；本脚本 GRAD_ACCUM=2
+#   ⇒ **每个 optimizer step 2 次**梯度 all-reduce + 2 次 buffer broadcast。
+#   FSDP1 时代这里是「16 个单元 × all-gather/reduce-scatter」，同步点更多；
+#   2026-10-01 换 DDP 后减到每 micro-batch 1 次，但**仍然是硬同步**。）
 # · 输入通道从 12 变 17（P4.3 补齐 ko 通道）。数据侧必须能出 17 通道，
 #   否则数据集构造会与网络 in_channels 对不上。
 # · C2NET：prepare() 与 --data 覆盖**故意**在所有 rank 上执行（每个 rank 都要
