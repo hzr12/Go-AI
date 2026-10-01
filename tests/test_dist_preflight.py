@@ -180,9 +180,11 @@ def test_downgrade_is_before_init_and_preflight_after():
 
     ⚠ 这条**与包裹层无关**：判据是「环境变量必须在通信域建立前改掉」，而不是
     「哪种包裹层在 DETAIL 下更贵」。2026-10-01 FSDP1 → DDP 换轨时降级**保留**、
-    理由被改写（spec §5.4：旧理由是上一代包裹层的 exec-order 自检会在每次前向多发
-    `all_gather_into_tensor`；DDP 下 DETAIL 只加 reducer bookkeeping，不发 collective，
-    但本仓库从未在 NPU 上验证过其开销，故仍保持 OFF）。**决定不变 ⇒ 断言不变。**
+    理由被改写过一次又再改回（spec §5.4：真理由是 DETAIL 会在建域时给每个 PG 套
+    一层一致性检查 wrapper，**每次 collective 前跑一次 `monitored_barrier`** ——
+    这个代价来自 PG wrapper，与 FSDP1/DDP 无关；旧理由里那条「FSDP1 exec-order
+    自检每次前向多发一次 all_gather」只是其中最贵的一种，换轨后已不存在）。
+    降级**行为**与**位置**都不变 ⇒ 断言不变。
     """
     main = _func('main')
     seg = ast.get_source_segment(SRC, main) or ''

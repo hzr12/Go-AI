@@ -126,6 +126,62 @@ def _contiguous_comment_block_above(lineno):
     return sorted(out)
 
 
+#: 本文件自身的 AST —— 用来**现算**行号（假模型 `_Block` / `_tiny_model` 就定义在
+#: 本文件里）。为什么需要它：第 10 条那条身份断言原来把行号写死成 `0`，失败信息
+#: 变成「L0 对应参数对象被替换了」，等于让读者去第 0 行找 —— 那是噪声，不是线索。
+#: 行为断言的判据是**对象身份**，报错的用途是「告诉人去看哪儿」，两者都得真。
+_SELF_TREE = ast.parse(pathlib.Path(__file__).read_text(encoding='utf-8'))
+
+
+def _self_assign_linenos():
+    """`{'fc': L…, 'bn': L…}`：`self.x = <构造调用>` 的行号（只收赋值给属性的）。
+
+    只认 `self.<attr> = Call(...)` 这种「造出子模块」的写法；赋值给局部变量或
+    非 Call 右值的行不进这张表（它们不是参数来源）。
+    """
+    out = {}
+    for node in ast.walk(_SELF_TREE):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            continue
+        for tgt in node.targets:
+            if (isinstance(tgt, ast.Attribute) and isinstance(tgt.value, ast.Name)
+                    and tgt.value.id == 'self'):
+                out[tgt.attr] = node.lineno
+    return out
+
+
+_SELF_ASSIGN_LINENO = _self_assign_linenos()
+
+
+def _param_def_lineno(param_name):
+    """`'0.bn.weight'` → 造出 `bn` 的那一行；查不到退到 `_tiny_model` 的构造行。
+
+    命名空间的第一段是序号（`Sequential` 给的），所以取**序号之后**那一段去查表。
+    `Sequential(_Block(8), torch.nn.Linear(8, 4))` 里最后那个 Linear 是内联构造的
+    位置参数、查不到属性名 ⇒ 退到 `_tiny_model` 里的 `return`（它就是这些参数
+    唯一的出处）。查不到时返回 0，但**不会抛**：工具函数自己炸掉会把真正的失败
+    原因盖住 —— 而「行号取不到」这件事本身不该让身份断言变成别的错。
+    """
+    parts = param_name.split('.')
+    for i, part in enumerate(parts):
+        if part.isdigit() and i + 1 < len(parts):
+            return _SELF_ASSIGN_LINENO.get(parts[i + 1]) or _tiny_model_build_lineno()
+    return _tiny_model_build_lineno()
+
+
+def _tiny_model_build_lineno():
+    """`_tiny_model()` 里 `return torch.nn.Sequential(...)` 那行（内联参数的兜底定位点）。"""
+    for node in ast.walk(_SELF_TREE):
+        if not (isinstance(node, ast.FunctionDef) and node.name == '_tiny_model'):
+            continue
+        for stmt in node.body:
+            if isinstance(stmt, ast.Return):
+                return stmt.lineno
+        if node.body:
+            return node.body[0].lineno
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # 1. 构造参数：只有 device_ids
 # --------------------------------------------------------------------------- #
@@ -137,7 +193,7 @@ def test_ddp_wrapper_passes_only_device_ids():
     风险：
       · `gradient_as_bucket_view` 与 `optimizer.zero_grad(set_to_none=True)`
         （本文件唯一的用法）混用时 bucket view 别名每轮被销毁 ⇒ 省不掉拷贝，
-        收益仅 ~27 MB/rank，却引入
+        收益仅 ~36.27 MB/rank（0.106% 的卡），却引入
         `Expected to mark a variable ready only once` 的风险；
       · `find_unused_parameters=True` 只是给「某头不参与 loss」兜底，而那种情况
         现在就会**响亮地**抛 `Expected to have finished reduction in the prior
@@ -304,6 +360,13 @@ def test_wrap_site_documents_why_sync_must_precede_ema():
 
     注释块是紧贴 `if is_dist:` 之上的那一段（不是紧贴构造调用 —— 中间隔着
     `if is_dist:` 那一行）。
+
+    ⚠ 本条的**意图只是取注释块**（上面那个 `assert stmt is not None` 是取块的
+    副产品，不是「包裹点必须在 `if is_dist` 内」这条不变量的守护）。变异测试确实
+    观察到：把 `world_size == 1` 那条路径改坏（把包裹挪出 `if is_dist:`）时，**是
+    这一句**把它抓住的 —— 纯属偶然，且失败信息指向错的地方（读者会以为要查注释）。
+    spec §7 的 I3 由 `test_ddp_wrapping_stays_inside_the_is_dist_branch` 直接钉，
+    那里的判据与失败信息都是对着 I3 写的。
     """
     call = _ddp_construct_calls()[0]
     stmt = _PARENTS.get(call)
@@ -317,6 +380,42 @@ def test_wrap_site_documents_why_sync_must_precede_ema():
         assert token in text, (
             '包裹点上方的注释必须记下 %r（EMA 与包裹顺序的因果）；当前注释块：\n%s'
             % (token, text))
+
+
+def test_ddp_wrapping_stays_inside_the_is_dist_branch():
+    """spec §7 I3：`world_size == 1` 路径不变 —— 包裹点必须仍在 `if is_dist:` 内。
+
+    `is_dist = world_size > 1`（由 `test_world_size_env_contract_is_unchanged` 钉），
+    所以「包裹在 `if is_dist` 内」就是「world_size==1 时这段代码根本不执行」的
+    **静态等价物**：判据不看运行时，只看那行 `DistributedDataParallel(...)` 的
+    `ast.Call` 祖先里有没有 `ast.If`、以及最内层判据是不是 `is_dist`。
+
+    为什么这条要**单独**钉：2026-10-01 的变异测试确实把「world_size==1 路径被改」
+    弄红过，但抓住它的是 `test_wrap_site_documents_why_sync_must_precede_ema` 里
+    顺带的一句 `assert stmt is not None`（那条要往上找 `ast.If` 才能取到注释块）——
+    **偶然**命中，且失败信息是「包裹点不在任何 if 里（结构被改了？）」，会把读者
+    引到错的地方。spec §7 的 I3 当时**没有任何测试直接对应**。
+
+    破坏它会长什么样：包裹被挪到 `if is_dist:` 之外（或判据被换成 `world_size >= 1`
+    之类）⇒ 单卡路径也会去构造 DDP，而那条路径上没有 `device_ids` 所依赖的 device
+    上下文，且 `shell/train_sft_npu_1card.sh` / `_2card.sh` 本来就不该被分布式代码
+    碰到。更隐蔽的一种是**判据被换成别的变量**（例如 `if world_size > 1:` 就地写死）
+    —— 此时 `if` 祖先还在、上面那条顺带断言照样绿，所以下面必须比对判据的**内容**。
+    """
+    call = _ddp_construct_calls()[0]
+    stmt = _PARENTS.get(call)
+    guards = []
+    while stmt is not None:
+        if isinstance(stmt, ast.If):
+            guards.append(ast.unparse(stmt.test))
+        stmt = _PARENTS.get(stmt)
+    assert guards, (
+        'DDP 包裹点（L%d）不在任何 `if` 里 ⇒ world_size==1 的路径也会构造 DDP，'
+        'spec §7 I3 被破坏' % call.lineno)
+    assert 'is_dist' in guards[0], (
+        'DDP 包裹点（L%d）的最内层判据是 %r 而不是 `is_dist` ⇒ 它不再由 '
+        'world_size>1 兜住，I3 被破坏'
+        % (call.lineno, guards[0]))
 
 
 # --------------------------------------------------------------------------- #
@@ -388,8 +487,17 @@ def test_all_optimizer_state_saves_use_plain_state_dict_under_is_main():
 
 
 # --------------------------------------------------------------------------- #
-# 7. 全文件零 FSDP 符号
+# 7. FSDP 零残留：**代码级**全仓库；**标记级**只扫 scripts/train_sft.py
 # --------------------------------------------------------------------------- #
+# ⚠ 范围（spec §7 I5 的对应写法，2026-10-01 评审收窄）：I5 说的是
+#   ① `scripts/train_sft.py` 内零 FSDP **代码**引用；② 该文件里剩下的 FSDP 字样
+#     只许出现在带「历史/已退役」标记的注释或文档串里。
+# 「零残留」只在**代码级**是全仓库事实：①的前两条对 `train_sft.py` 判 AST，最后
+# 一条 `test_no_fsdp_code_reference_anywhere_in_repo` 对整个仓库判 import/名字/
+# 属性/def 名。**注释级不是、也不追求**全仓库零：`src/networks/backbone.py` 记着
+# 「auto_wrap 按块类切 ⇒ 逐块检查点与 FSDP unit 1:1」这段 2026-09 的局部设计论证，
+# 那是**模型代码**里的取舍记录而不是包裹层配置，为它改注释属于范围蔓延。所以下面
+# 第三条只扫 `train_sft.py` —— 别把它当成「全仓库都干净了」的证据。
 
 def test_no_fsdp_import_remains():
     """`from torch.distributed.fsdp import ...` 一处都不许剩（含子模块 import）。
@@ -430,6 +538,14 @@ def test_no_fsdp_symbol_is_referenced():
 
 def test_fsdp_mentions_are_only_marked_as_retired_history():
     """残留的 FSDP 字样只允许出现在**显式标了「历史 / 已退役」的注释或文档串**里。
+
+    ⚠ **扫描范围 = `scripts/train_sft.py`**（`SRC`），**不是全仓库**。这是
+    spec §7 I5 收窄后的口径：I5 承诺的是「该文件内零 FSDP 代码引用 + 残留字样
+    带退役标记」，而不是「全仓库注释都干净」。已知在范围外的一处：
+    `src/networks/backbone.py`（2026-09 的逐块检查点论证里提到 auto_wrap 的切分
+    粒度）—— 那是模型代码里的取舍记录，让它为了「FSDP 已退役」而改注释是范围蔓延。
+    「代码级零残留」的全仓库版本由下面 `test_no_fsdp_code_reference_anywhere_in_repo`
+    单独守。**读这条测试时别把它的绿当成「全仓库没提过 FSDP」。**
 
     为什么不干脆一个字都不留：包裹点上方的换轨理由（触发事件是
     `KeyError: 'backbone.stem_bn._fsdp_wrapped_module.weight'`）必须留在代码里，
@@ -481,6 +597,68 @@ def test_fsdp_mentions_are_only_marked_as_retired_history():
         % '\n  '.join(offenders)
 
 
+#: 扫「全仓库代码级零引用」时必须排除的文件：这两个文件的**守护函数名本身**
+#: 带 fsdp（`test_no_fsdp_import_remains` / `test_retired_fsdp_history_is_...`）。
+#: 排除它们不是给它们开后门，而是「守护不许因为自己的名字而红」——它们要判的
+#: 内容（import / 标记 / 现行段）都在各自断言里。
+_FSDP_GUARD_FILES = frozenset({
+    pathlib.Path(__file__).resolve(),
+    (ROOT / 'tests' / 'test_v21_shell_script.py').resolve(),
+})
+
+#: 扫全仓库时跳过的目录（非代码 / 非本仓库产物）。写死而不是靠 gitignore：
+#: 守护不该因为「谁在跑它」而改变范围。
+_FSDP_SCAN_SKIP_DIRS = ('.git', '.codegraph', '__pycache__', 'tmp',
+                        '.superpowers', 'docs')
+
+
+def test_no_fsdp_code_reference_anywhere_in_repo():
+    """**全仓库**代码级零 FSDP 引用（spec §7 I5 的代码级那半，跨文件版本）。
+
+    为什么需要跨文件这一条：`test_no_fsdp_import_remains` /
+    `test_no_fsdp_symbol_is_referenced` 走的是**全文件** AST，而 `SRC` 只指
+    `scripts/train_sft.py`。若哪天有人在 `src/` 或别的脚本里 import 了
+    `torch.distributed.fsdp` 并用它包某个模块（历史上正是 `train_sft.py`
+    `_wrap_fsdp1` 干的），那两条守护**一声不响**。跨文件这条把它们兜住：
+    任何 `.py` 里出现 fsdp 的 import / 变量名 / 属性名 / 函数与类名即红。
+
+    判的是**代码级**（import / Name / Attribute / def 名），不判注释 ——
+    注释级的口径窄到 `train_sft.py` 一个文件（见上一条的 docstring），别混。
+    """
+    offenders = []
+    for path in sorted(ROOT.rglob('*.py')):
+        rel = path.relative_to(ROOT)
+        if any(part in _FSDP_SCAN_SKIP_DIRS for part in rel.parts):
+            continue
+        if path.resolve() in _FSDP_GUARD_FILES:
+            continue
+        text = path.read_text(encoding='utf-8')
+        if 'fsdp' not in text.lower():
+            continue
+        tree = ast.parse(text)
+        for node in ast.walk(tree):
+            what = None
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                mods = [a.name for a in node.names]
+                if getattr(node, 'module', None):
+                    mods.append(node.module)
+                hit = [m for m in mods if m and 'fsdp' in m.lower()]
+                what = ('import ' + hit[0]) if hit else None
+            elif isinstance(node, ast.Name) and 'fsdp' in node.id.lower():
+                what = 'name:' + node.id
+            elif isinstance(node, ast.Attribute) and 'fsdp' in node.attr.lower():
+                what = 'attr:' + node.attr
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                   ast.ClassDef)) and 'fsdp' in node.name.lower():
+                what = 'def:' + node.name
+            if what:
+                offenders.append('%s L%d %s' % (rel.as_posix(), node.lineno, what))
+    assert not offenders, (
+        '全仓库代码级零 FSDP 引用（I5）被破坏：\n  %s\n'
+        '（注释级不在本条范围：train_sft.py 之外的注释性指涉按上一条的口径放行）'
+        % '\n  '.join(offenders))
+
+
 # --------------------------------------------------------------------------- #
 # 8. gradient_as_bucket_view 与 set_to_none 的互斥关系
 # --------------------------------------------------------------------------- #
@@ -493,8 +671,12 @@ def test_fsdp_mentions_are_only_marked_as_retired_history():
 # 为什么这两个不能混用：`optimizer.zero_grad(set_to_none=True)` 会把每个
 # `p.grad` 置为 None，bucket view 只是**别名**那片 bucket 存储，每轮都被销毁
 # ⇒ 省不掉拷贝；更糟的是同一进程里若某些轮的 grad 是 view、某些轮不是，
-# reducer 会抛 `Expected to mark a variable ready only once`。收益仅 ~27 MB/rank
-# （0.08% 的卡），配这一类风险不值 ⇒ 保持默认 False。
+# reducer 会抛 `Expected to mark a variable ready only once`。收益仅
+# **~36.27 MB/rank（0.106% 的卡）** —— 数字来自 torch 对该开关的定义「the saved
+# memory size will be equal to the **total gradients size**」，本模型即全量梯度
+# 9,067,443 × 4 B。⚠ 别把它和「分片下的梯度 + Adam 两矩 = 3 × 9.07 MB」那个量
+# 搞混：那是另一处账（显存对比里的 +109 MB/rank），不是本开关省下的量。
+# 配上面这类风险不值 ⇒ 保持默认 False。
 
 def test_gradient_as_bucket_view_implies_set_to_none_false():
     """条件式互斥钉：开了 `gradient_as_bucket_view` 就必须同时用 `set_to_none=False`。
@@ -671,8 +853,9 @@ def test_ddp_wrap_runs_and_keeps_inner_module_identity(_gloo_pg):
     after = dict(wrapped.module.named_parameters())
     assert set(after) == set(before), '包裹后内部参数名集合变了'
     for n in after:
-        assert after[n] is before[n], \
-            'L%d 对应参数对象被替换了：%s 的身份变了' % (0, n)
+        assert after[n] is before[n], (
+            'L%d 处创建的参数 %s 的对象被替换了（DDP 只应在顶层加 wrapper，内部'
+            '模块树必须原样不动）' % (_param_def_lineno(n), n))
 
 
 def test_ddp_state_dict_is_module_prefixed_and_save_model_strips_it(_gloo_pg, tmp_path):
@@ -723,13 +906,22 @@ def test_ema_built_before_wrapping_still_updates(_gloo_pg):
 
     这里不模拟多 rank（world_size=1 跑不出跨 rank 发散），钉的是这条崩溃的
     **机理**：键空间必须一致。
+
+    ⚠ **这条断言的牙在哪里**（2026-10-01 评审记录）：原先写的是
+    `assert set(ema.shadow) == shadow_before`，而 `EMA.update()` 只**改写已有键的
+    值**、从不改键集 ⇒ 那个等式**恒真**，红不了任何东西 —— 读的人却会以为
+    「键空间一致」这件事在这里被守着，而实际上本条的全部牙都在
+    「`ema.update()` 没抛 `KeyError`」这一行。恒真的断言比没有断言更坏：它把一处
+    没被守住的地方装饰成被守住了。所以现在把那条恒真等式删掉，换成**能红的**
+    形态：shadow 的键必须与**裸模块**的键同形（尤其不得带 `module.` 前缀）——
+    若哪天有人在包裹**之后**构造 EMA，`shadow` 的键就会带上 `module.` 前缀，
+    这里立刻红；而那一刻正是事故的机理（键空间分叉）。
     """
     from torch.nn.parallel import DistributedDataParallel
     from scripts.train_sft import EMA
 
     model = _tiny_model()
     ema = EMA(model, decay=0.999)          # 与 main() 同序：先 EMA，后包裹
-    shadow_before = set(ema.shadow)
 
     wrapped = DistributedDataParallel(model)
     assert wrapped.module is ema.model, 'EMA 持有的引用必须就是被包裹的那个模块'
@@ -737,7 +929,15 @@ def test_ema_built_before_wrapping_still_updates(_gloo_pg):
     # 反向 + 一步 optimizer，让参数真的变一下，再更新 shadow
     wrapped(torch.randn(4, 8)).sum().backward()
     ema.update()          # 事故点：这里曾经抛 KeyError
-    assert set(ema.shadow) == shadow_before, 'update 之后 shadow 的键空间不该变'
+
+    # 能红的断言：键空间必须停在裸模块上（详见 docstring —— 「键集合没变」恒真，
+    # 不能用那种写法）。
+    prefixed = sorted(k for k in ema.shadow if k.startswith('module.'))
+    assert not prefixed, (
+        'shadow 的键不该带 module. 前缀（EMA 构造在包裹之前，键空间属于裸模块）：%s'
+        % prefixed)
+    assert set(ema.shadow) == {n for n, _ in model.named_parameters()}, \
+        'shadow 的键应与裸模块 named_parameters() 同键空间'
     assert all(torch.isfinite(v).all() for v in ema.shadow.values()), \
         'update 后 shadow 出现 NaN/Inf'
 

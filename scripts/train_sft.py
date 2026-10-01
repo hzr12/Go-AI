@@ -128,10 +128,16 @@ def _dist_debug_level():
 def _downgrade_npu_dist_debug(logger):
     """NPU 后端下把 `TORCH_DISTRIBUTED_DEBUG=DETAIL` 降为 `OFF`。
 
-    为什么（NPU 专属，2026-09-30 建立、2026-10-01 改写理由）：DDP 下
-    `TORCH_DISTRIBUTED_DEBUG=DETAIL` 启用的是 **reducer 的 bookkeeping 日志**
-    （`_get_ddp_logging_data`），**不额外发 collective**；但本仓库从未在 NPU 上
-    验证过它的开销（910A + HCCL 下 DETAIL 的实测数据缺失），所以保持 OFF。
+    为什么（NPU 专属，2026-09-30 建立、2026-10-01 改写理由）：`DETAIL` 会给通信域
+    套一层**一致性检查 wrapper**（torch 的 `_create_process_group_wrapper` →
+    `_ProcessGroupWrapper`，顺带另建一条 gloo 辅助 PG），而这层 wrapper 在
+    **每一次 collective 之前**都要跑一发 `monitored_barrier` —— 官方文档
+    `docs/source/distributed.md` 的 `TORCH_DISTRIBUTED_DEBUG` 一节就是这么写的
+    （"consistency and synchronization checks **on every collective call** …
+    creating a **wrapper process group** … include a `monitored_barrier`"）。
+    ⚠ 关键点：这层 wrapper 是 **`init_process_group` 建域时按 debug level 挂上去的**，
+    **与用哪种包裹层无关**（FSDP1 / DDP 都一样）。而本仓库从未在 NPU 上验证过
+    它的开销（910A + HCCL 下 DETAIL 的实测数据缺失）⇒ 在 910A 上仍降为 OFF。
 
     （历史，已退役：这条降级最初的理由是当时那套包裹层的「执行顺序自检」——
     FSDP1 的 `fsdp/_exec_order_utils.py` 里 `_checking_order = debug_level ==
@@ -139,10 +145,16 @@ def _downgrade_npu_dist_debug(logger):
     跨 rank 比对参数句柄，在 HCCL 上是纯负担。那套包裹层在 2026-10-01 被 DDP
     取代，该理由随之失效；「保持 OFF」的决定不变。）
 
+    ⚠ 换轨时（2026-10-01）曾经把上面那条历史理由换成「DDP 下 DETAIL 只加 reducer
+    bookkeeping、不额外发 collective」—— **那是错的**：额外 collective 来自上面
+    那层 PG wrapper（每次 collective 一发 `monitored_barrier`），与 DDP 无关。
+    当前这版表述才是有据的，而且比原理由更强：原理由只覆盖「FSDP1 这一种包裹层」，
+    现在覆盖**所有**包裹层。
+
     ⚠ **实测更正**：曾怀疑 DETAIL 是 4 卡 HCCL 报错的元凶（后来查到的真因是
     上一次崩掉的进程留下 HCCP 状态，`EJ0001 ... Maybe the last training process
-    is running`）。降级仍然保留，理由只剩上面那条「未验证开销、保持 OFF」，但
-    **它不是修那个错的原因**，别再拿它当根因。
+    is running`）。降级仍然保留，理由只剩「DETAIL 的 PG wrapper 代价与包裹层无关
+    且在 NPU 上未验证、保持 OFF」，但**它不是修那个错的原因**，别再拿它当根因。
 
     在 `init_process_group` **之前**调用：那时通信域还没建立。CUDA/
     CPU 后端不动（inductor/nccl 上 DETAIL 的开销可接受，且它是排查 nccl hang 的
@@ -159,8 +171,9 @@ def _downgrade_npu_dist_debug(logger):
     except Exception as e:  # noqa: BLE001 — 老版本没有这个 setter，不该因此拦住启动
         logger.warning("[dist] 降级 debug level 失败（忽略）：%s", e)
     logger.info("[dist] NPU 后端：TORCH_DISTRIBUTED_DEBUG DETAIL → OFF"
-                "（DDP 下 DETAIL 只加 reducer bookkeeping、不额外发 collective；"
-                "本仓库未在 NPU 上验证过其开销，保持 OFF）")
+                "（DETAIL 会给每个 PG 套一层一致性检查 wrapper，每次 collective "
+                "前跑一次 monitored_barrier；该代价与用哪种包裹层无关，本仓库未在 "
+                "NPU 上验证过其开销，保持 OFF）")
 
 
 def _dist_env_snapshot():
@@ -2044,8 +2057,9 @@ def main():
         _dist_backend = (args.device.split(':')[0]
                          if args.device not in ('auto', '') else
                          ('npu' if npu_is_available() else 'cuda'))
-        # ⚠ 必须在 init_process_group **之前**：DETAIL 在 NPU 上未验证过开销
-        # （DDP 下它只加 reducer bookkeeping、不额外发 collective，但仍降为 OFF）。
+        # ⚠ 必须在 init_process_group **之前**：DETAIL 是在建域那一刻给每个 PG 套
+        # 一层一致性检查 wrapper（每次 collective 前一发 monitored_barrier），NPU
+        # 上未验证过其开销 ⇒ 降为 OFF（该代价与用哪种包裹层无关，换轨后依旧存在）。
         # 见 _downgrade_npu_dist_debug 的 docstring。
         if _dist_backend == 'npu':
             _downgrade_npu_dist_debug(logger)
@@ -2063,7 +2077,8 @@ def main():
         _dist_preflight_check(_dist_backend, device, logger)
         if is_main:
             logger.info("[dist] 初始化分布式训练 | backend=%s world_size=%d | 策略=DDP"
-                        "（各 rank 各持完整模型，梯度每步 all-reduce 一次）",
+                        "（各 rank 各持完整模型，每个 micro-batch 反向做 1 次梯度 "
+                        "all-reduce；accum>1 时每个 optimizer step 就有几次）",
                         _dist_backend, world_size)
     else:
         if args.device == 'auto':
@@ -2539,8 +2554,16 @@ def main():
     #      差约 109 MB = 0.33% 的卡。参数本来就装得下，分片省下的这点余量
     #      不值得拿正确性风险换。
     #   2. 通信：FSDP1 每步是「16 个分片单元 × 2 次 collective」（前向 all-gather
-    #      参数、反向 reduce-scatter 梯度），DDP 每步只有 1 次梯度 all-reduce。
-    #      通信量小到不像瓶颈，而本仓库的实际瓶颈在算子（见 `[profile]` 日志）。
+    #      参数、反向 reduce-scatter 梯度），DDP 每次**反向**只有 1 次梯度
+    #      all-reduce +（`broadcast_buffers=True`）1 次 buffer broadcast。
+    #      ⚠⚠ **「每步 1 次」是错的说法，本文件全无 `no_sync()`**（见本文件
+    #      `_compute_l2_report` docstring 里那条同源的说明）：每个 micro-batch 都
+    #      `backward()`，梯度累积只在 `_accum_steps` 满了才 `optimizer.step()`，
+    #      而 DDP 的梯度 all-reduce 挂在**每一次 backward 的收尾**上 ⇒ v21 的
+    #      `GRAD_ACCUM=2` 下**每个 optimizer step 是 2 次梯度 all-reduce + 2 次
+    #      buffer broadcast**（payload ≈ 2 × 36.3 MB ≈ 72.5 MB）。数量仍是
+    #      「16 个分片单元 × 2」的零头，通信量小到不像瓶颈，而本仓库的实际瓶颈
+    #      在算子（见 `[profile]` 日志）。
     #
     # 为什么 Task 1 的两个同步函数必须留在包裹点**之前**（顺序的硬要求）：
     # `DistributedDataParallel.__init__` 在**它自己构造时**（`_ddp_init_helper` →
@@ -2559,11 +2582,12 @@ def main():
     #     —— 好在它是**响亮**地失败，不会安静地错。
     #   · `broadcast_buffers=True`（默认）：BN 的 `running_mean`/`running_var`
     #     跨卡一致靠它；上一代分片式包裹层默认也是 True ⇒ 行为不变。
-    #   · `gradient_as_bucket_view=False`（默认）：本文件用
-    #     `optimizer.zero_grad(set_to_none=True)`，bucket view 的别名每轮被销毁，
-    #     省不掉拷贝，收益仅 ~27 MB/rank（0.08% 的卡）；真正的风险是混用
-    #     view / 非 view 的 grad 状态触发
-    #     `Expected to mark a variable ready only once`。收益配不上这类风险。
+#   · `gradient_as_bucket_view=False`（默认）：本文件用
+#     `optimizer.zero_grad(set_to_none=True)`，bucket view 的别名每轮被销毁，
+#     省不掉拷贝，收益仅 ~36.27 MB/rank（= **全部梯度**的大小，torch 对该开关
+#     的定义就是"saved memory size will be equal to the total gradients
+#     size"；占 32 GiB 的 0.106%）；真正的风险是混用 view / 非 view 的 grad
+#     状态触发 `Expected to mark a variable ready only once`。收益配不上这类风险。
     #   · `static_graph=False`（默认）：打开会禁止「iteration 边界内参数集合
     #     变化」，收益未验证。
     if is_dist:
@@ -2809,23 +2833,22 @@ def main():
                 # 纯报告项（见 compute_l2_report docstring 的 §3.1 说明）。
                 _lv, _pv, _vv = _read_log_scalars(log_loss, policy_loss, value_loss)
                 lr = optimizer.param_groups[0]['lr']
-                    # ⚠ 2026-10-01：只打 reserved 是不够的 —— 4 卡 OOM 那轮排查
-                    # 绕了三次，就是因为这一个数分不清「活数据 / 分配器碎片 /
-                    # torch 之外的占用」。从报错能直接算出的真实账本（每卡 32 GiB）：
-                    #     20.09 活(63%) + 6.93 碎片(22%) + 4.36 CANN/HCCL(14%) + 0.62 空闲
-                    # 三个数一起打，判读规则：alloc 跟着涨 = 泄漏；只有 reserved 涨
-                    # = 碎片（`empty_cache` / expandable_segments 能治）；两者都远低于
-                    # 面板 = 差额在 torch 之外。
+                # 内存只打 reserved —— **刻意不**在这里加 allocated / peak。
+                # 那三个数（`memory_allocated` / `max_memory_allocated` /
+                # `empty_cache`）在 2026-10-01 加过一次又撤掉，理由：
+                #   · OOM 报错本身就是更好的显存报告：它在**压力最大那一刻**给出
+                #     allocated + reserved + free，配合 `total` 就能反推 torch 之外
+                #     占多少（`32.00 − 27.02 − 0.62 = 4.36 GiB`）。常打一个
+                #     「平时的 reserved」信息更少。
+                #   · `torch.npu.max_memory_allocated` 全仓库只那一处、没在
+                #     torch_npu 2.1 上验证过；它在日志路径上抛异常就是**第 50 步
+                #     崩**，正好毁掉最需要那个数的时刻。观测不该有能力杀死被观测的进程。
                 if _backend == 'cuda':
                     mem = torch.cuda.memory_reserved(device) / 1e9
-                    mem_alloc = torch.cuda.memory_allocated(device) / 1e9
-                    mem_peak = torch.cuda.max_memory_allocated(device) / 1e9
                 elif _backend == 'npu':
                     mem = npu_memory_reserved(device) / 1e9
-                    mem_alloc = float(torch.npu.memory_allocated(device)) / 1e9
-                    mem_peak = float(torch.npu.max_memory_allocated(device)) / 1e9
                 else:
-                    mem = mem_alloc = mem_peak = 0.0
+                    mem = 0.0
                 _now = time.time()
                 # ⚠ 有效 batch 必须含梯度累积：原来写的是 bs×world_size，漏乘
                 # accumulation ⇒ 用了 `--gradient-accumulation-steps 2` 时日志把
@@ -2851,12 +2874,12 @@ def main():
 
             if _do_stdout:
                 logger.info("[step %d/%d] loss=%.4f (p=%.4f v=%.4f) lr=%.2e "
-                            "scale=%.0f mem=%.2fGB (alloc %.2f/peak %.2f) "
+                            "scale=%.0f mem=%.2fGB "
                             "spd=%.0f spd_inst=%.0f s/s "
                             "elapsed=%.0fs skip=%d | "
                             "d=%.0f c=%.0f s=%.0f e=%.0f dmax=%.0f ms",
                             step, total_steps, _lv, _pv, _vv,
-                            lr, _scale, mem, mem_alloc, mem_peak,
+                            lr, _scale, mem,
                             speed, spd_inst, _now - t0, _n_skipped,
                             _dms, _cms, _sms, _ems, _dmax)
                 _last_stdout_t = time.time()
@@ -2928,19 +2951,10 @@ def main():
                 _t_eval += time.perf_counter() - _t_eval0
                 if ema is not None:
                     ema.restore()
-                # ⚠ 周期性把分配器缓存段还给驱动（2026-10-01）。为什么放这里：
-                #   实测账本里 `reserved − allocated` 高达 6.93 GiB（活数据的
-                #   34%），那是尺寸对不上的旧块 —— 步内没法回收，但**步边界可以**。
-                #   eval 本来就是同步点（前面刚跑完 no_grad 前向），在这里加一次
-                #   回收的开销可忽略（每 --eval-every 步一次，默认 500 步 ≈ 35 分钟）。
-                #   不加会怎样：reserved 单调爬升（实测 93% → 98%），面板一路涨到
-                #   顶死，然后 OOM —— 而报错里 allocated 只有 20 GiB，看不出是谁占的。
-                #   ⚠ 它**不能**救「活数据本身就超卡」：20.09+4.36 = 24.5 GiB 已经
-                #   超过可用 27.6 GiB 的一半太多，那种情况只能降每卡 batch。
-                if _backend == 'npu':
-                    torch.npu.empty_cache()
-                elif _backend == 'cuda':
-                    torch.cuda.empty_cache()
+                # 曾经在这里周期性 `empty_cache()` 回收分配器缓存段，2026-10-01 撤掉：
+                # 它在 NPU 上没验证过，且**每次 eval 都调**（默认 ~35 分钟一次）在训练
+                # 主路径上；等真机上确认了碎片确实在爬升、再按实测收益决定值不值得加。
+                # OOM 恢复路径里的那次 `empty_cache()`（在 except 分支）是既有的，保留。
                 if is_main:
                     # 不打 seed：评估固定 `augment=False`，`EVAL_SAMPLING_SEED` 与 `rng=`
                     # 都不被消费，指标与种子无关。打出它等于宣称「这批数字依赖这个常量」，

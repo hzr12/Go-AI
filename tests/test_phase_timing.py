@@ -238,19 +238,31 @@ def test_segments_logged_and_uploaded():
         assert key in SRC, f'swanlab 未上报 {key}'
 
 
-def test_memory_line_splits_live_from_cached():
-    """`[step]` 行必须同时给 alloc 与 peak，不能只有 reserved。
+def test_memory_line_reports_reserved_only():
+    """`[step]` 行只打 reserved —— **刻意不**加 allocated/peak。
 
-    为什么（2026-10-01 补）：4 卡 OOM 那轮排查绕了三次，根因是日志只有
-    `mem=`（= reserved）一个数，从它分不清「活数据 / 分配器碎片 / torch 之外」。
-    从报错能算出的真实账本是 20.09 活 + 6.93 碎片 + 4.36 CANN/HCCL + 0.62 空闲
-    ⇒ 容器可用只有 ~27.6 GiB。判读规则：alloc 跟着涨 = 泄漏；只有 reserved 涨 =
-    碎片（`empty_cache` / expandable_segments 能治）。
+    这三个调用（`memory_allocated` / `max_memory_allocated` / `empty_cache`）在
+    2026-10-01 加过一次又撤掉，理由两条：
+      · **OOM 报错本身就是更好的报告**：它在压力最大那一刻给出 allocated +
+        reserved + free，配合 `total` 就能反推 torch 之外的占用
+        （`32.00 − 27.02 − 0.62 = 4.36 GiB`）。常打一个「平时的 reserved」信息更少。
+      · `torch.npu.max_memory_allocated` 当时全仓库只有那一处、没在 torch_npu 2.1
+        上验证过，而它在日志路径上抛异常就是**第 50 步崩** —— 正好毁掉最需要那个
+        数的时刻。观测不该有能力杀死被观测的进程。
+    本测试锁住这个「刻意不加」的选择：将来有人看到只有一个数又想把三个加回来时，
+    会先撞到这里。
     """
-    assert re.search(r'mem=%\.2fGB \(alloc %\.2f/peak %\.2f\)', SRC), \
-        'mem 行必须拆出 alloc 与 peak（只有 reserved 无法区分活数据与碎片）'
-    for call in ('torch.npu.memory_allocated', 'torch.npu.max_memory_allocated'):
-        assert call in SRC, f'缺少 {call}'
+    assert re.search(r'mem=%\.2fGB', SRC), 'mem 行应打 reserved'
+    assert 'max_memory_allocated' not in CODE, \
+        'max_memory_allocated 全仓库不该出现（当时只有那一处、未在 torch_npu 2.1 验证）'
+    # 只在**日志打点附近**禁 memory_allocated：`_auto_select_device` 里选最空的卡
+    # 本来就在用 `torch.npu.memory_allocated(idx)`，那是既有且必要的。
+    i = CODE.find('mem=%.2fGB')
+    window = CODE[max(0, i - 2500):i + 2500]
+    assert 'memory_allocated' not in window, \
+        '日志打点附近不应再出现 memory_allocated（见 docstring 的两条理由）'
+    # OOM 恢复路径里的 empty_cache 是既有的、必须保留
+    assert SRC.count('npu_empty_cache()') >= 2, 'OOM 恢复路径的 empty_cache 被误删'
 
 
 def test_effective_batch_for_throughput_includes_accumulation():
