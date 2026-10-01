@@ -101,7 +101,13 @@ class ValueNetwork(nn.Module):
 
 
 class FCValueHead(nn.Module):
-    """v21 的全连接价值头（P4.1），逐项 **142,017** 参数。
+    """v21 代遗留的全连接价值头（P4.1），逐项 **142,017** 参数。
+
+    ⚠ v21 架构已随其顶层构建函数一并删除，本类**没有现役架构调用方**；
+    保留是因为它仍是「tanh 有界 value 头」规格的参照（tests/test_grad_
+    checkpointing.py、tests/test_huber_loss.py、tests/test_legacy_value_head.py
+    直接拿它当被测对象）。默认 in_channels=184 沿用 v21 中间层宽度，
+    与现役 12 通道输入（backbone 之后的特征）无关。
 
     结构（权威表 §2 的 value 行）：
         1×1 Conv 184→32 无bias + BN    5,952

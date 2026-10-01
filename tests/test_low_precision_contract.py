@@ -3,13 +3,14 @@
 背景：4 卡 910A 的 OOM 排查最后落到两处「本该是 fp16 却是 fp32」：
 
   1. **checkpoint 重算不在 autocast 里** —— `backward()` 时前向的
-     `with autocast(...)` 早已退出，于是 16 个段的重算全部退回 fp32。
+     `with autocast(...)` 早已退出，于是检查点段的重算全部退回 fp32。
      证据是那个 `Tried to allocate 1.40 GiB`：它恰好等于
      `(B,Hh,P,l,N) = (1000,4,46,32,64)` 的 **fp32** 体积。
-  2. **Mamba 的 `A_log` 是 fp32 参数** —— `dt(fp16) * A(fp32)` 按类型提升把
-     **整条扫描**（含它的块内重算）拉回 fp32。
-  3. **输入特征平面全程 fp32** —— 主机内存（预取队列）+ H2D 字节 + 设备侧
+  2. **输入特征平面全程 fp32** —— 主机内存（预取队列）+ H2D 字节 + 设备侧
      输入张量都白带一倍。
+
+（历史第 3 条「Mamba 的 `A_log` 是 fp32 参数」随 v21 硬删除一并退役：
+`MambaLTI` 不复存在，扫描 dtype 用例已删除。）
 
 本文件把「退了也不改数值」的那几条钉住，并明确列出**不能退**的那些 —— 否则下一
 个人会为了省显存把优化器状态或 loss 累加也改成 fp16。
@@ -26,7 +27,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import src.networks.backbone as bb  # noqa: E402
-from src.networks.alphanet import V21_CFG, build_v21_net  # noqa: E402
+from scripts.train_sft import KATAGO_SE_CFG, build_katago_se_net  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -74,37 +75,22 @@ def test_single_and_batched_planes_agree_bitwise():
 
 
 # --------------------------------------------------------------------------- #
-# 2. Mamba 扫描：dtype 跟随 dt，不再被 A_log 提升回 fp32
+# 2. 检查点重算：必须恢复前向的 autocast 低精度（OOM 直接机制）
 # --------------------------------------------------------------------------- #
-def test_scan_dtype_follows_dt_not_the_fp32_parameter():
-    """`log_decay = dt * A` 不得因 A 是 fp32 参数而整条退回 fp32。"""
-    blk = bb.MambaLTI(channels=184)
-    blk.train()
-    B, T = 2, 40
-    Hh, P = blk.n_heads, blk.head_dim
-    dt = (torch.rand(B, T, Hh, P) + 0.1).half()
-    # 第二个因子是 `xc.view(B,T,Hh,P)`（与 forward 里 drive_factors 同形），
-    # 不是 (B,T,d_inner) —— 传错形状会得到一条与本用例无关的 shape 报错。
-    xc = torch.rand(B, T, Hh, P).half()
-    b_vec = torch.rand(B, T, blk.d_state).half()
-    c_vec = torch.rand(B, T, blk.d_state).half()
-    log_decay = -torch.rand(B, T, Hh, P).half() * 0.1
-    y = blk._chunked_scan(log_decay, (dt, xc, b_vec), c_vec)
-    assert y.dtype == torch.float16, f'扫描输出应是 fp16，实为 {y.dtype}'
-    # 反例：`A_log` 是 fp32 参数，所以 fp32 的 dt 也必须照旧走 fp32（全精度路径）
-    blk32 = bb.MambaLTI(channels=184)
-    y32 = blk32._chunked_scan(
-        log_decay.float(), (dt.float(), xc.float(), b_vec.float()),
-        c_vec.float())
-    assert y32.dtype == torch.float32, '全精度路径被误改成低精度'
-
+# 已删除：test_scan_dtype_follows_dt_not_the_fp32_parameter —— v21 被硬删除
+# （MambaLTI/_chunked_scan 不复存在），扫描 dtype 契约随 Mamba 一起无对象。
 
 def test_checkpoint_recompute_restores_low_precision():
-    """块级检查点的**重算**必须在低精度下跑（16 个段全覆盖）。
+    """块级检查点的**重算**必须在低精度下跑（旧路径 16 段全覆盖）。
 
     这是 OOM 的直接机制：`backward()` 时前向的 autocast 已退出，不显式恢复就
     整段 fp32，体积翻倍。判据用「上下文里做一次 matmul 看输出 dtype」，而不是
     `torch.is_autocast_enabled()` —— 后者只报 CUDA 的状态，对 cpu/npu 读不到。
+
+    段数口径（v21 硬删除后按存活架构重定）：`KATAGO_SE_CFG` 的 17 块走
+    `SharedBackbone` 的 GC_LEGACY 逐块粒度 + `uncapped_last=True`
+    ⇒ 恰好 16 个检查点段（第 17 块按 checkpoint_sequential 语义豁免），
+    与 `SharedBackbone.forward` 注释里的「16 段入口」一致。
     """
     seen = []
     orig = bb._autocast_like
@@ -123,11 +109,11 @@ def test_checkpoint_recompute_restores_low_precision():
 
     bb._autocast_like = spy
     try:
-        net = build_v21_net(in_channels=V21_CFG['in_channels'],
-                            action_size=362, attn_dropout=0.1,
-                            grad_checkpoint=V21_CFG['grad_checkpoint'])
+        net, _cfg = build_katago_se_net(
+            action_size=362,
+            grad_checkpoint=KATAGO_SE_CFG['grad_checkpoint'])
         net.train()
-        x = torch.randn(2, 17, 19, 19)
+        x = torch.randn(2, KATAGO_SE_CFG['in_channels'], 19, 19)
         with torch.autocast(device_type='cpu', dtype=torch.float16):
             out = net(x)
             loss = (out[0].float().pow(2).mean() if isinstance(out, (tuple, list))
@@ -147,10 +133,10 @@ def test_checkpoint_recompute_restores_low_precision():
 def test_parameters_stay_fp32():
     """AMP 下**参数主权重必须 fp32** —— 优化器状态按它建立，GradScaler 也靠它。
 
-    本轮把 `A_log` 的**计算**降到 dt 精度，但 `A_log` 参数本身仍是 fp32；
+    本轮把激活/重算的计算降到 autocast 精度，但参数本身仍是 fp32；
     这两件事不能一起改，否则 Adam 的更新量在 fp16 下会下溢。
     """
-    net = build_v21_net(in_channels=17, action_size=362)
+    net, _cfg = build_katago_se_net(action_size=362)
     for name, p in net.named_parameters():
         assert p.dtype == torch.float32, f'{name} 应为 fp32 参数，实为 {p.dtype}'
 

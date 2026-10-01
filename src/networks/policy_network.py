@@ -37,7 +37,12 @@ class PolicyNetwork(nn.Module):
 
 
 class FCPolicyHead(nn.Module):
-    """v21 的全连接策略头（P4.1），逐项 **2,366,730** 参数。
+    """v21 代遗留的全连接策略头（P4.1），逐项 **2,366,730** 参数。
+
+    ⚠ v21 架构已随其顶层构建函数一并删除，本类**没有现役架构调用方**；
+    保留是因为它仍是「生产头」规格的参照（tests/test_grad_checkpointing.py、
+    tests/test_huber_loss.py 直接拿它当被测对象）。输入通道与 in_channels=
+    184 的 v21 中间层配套，默认值沿用当时的规格，不随现役 12 通道输入改。
 
     结构（权威表 §2 的 policy 行）：
         1×1 Conv 184→96 无bias + BN   17,856
@@ -58,7 +63,7 @@ class FCPolicyHead(nn.Module):
     2,366,730 反而是对的。详见 report §4(b)。
 
     与既有 `PolicyNetwork` 的区别（有意偏离）：不再有 `pass_bias` 手工参数，
-    也不再支持 3 层 3×3 版本 —— v21 的结构由权威表写死。
+    也不再支持 3 层 3×3 版本 —— 本类结构由 v21 代的权威表写死。
     """
 
     def __init__(self, in_channels=184, board_size=19, action_size=None):

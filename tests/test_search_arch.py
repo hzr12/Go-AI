@@ -10,48 +10,24 @@
 `untyped_storage().nbytes()` + `data_ptr()` 去重后误差降到 21%，剩余
 部分来自 checkpoint 重算临时量被按「同时存活」计入。
 
-P4.9 另覆盖三件事：`--preset` 取值修型（store_true -> choices，含 v21）、
-measure 的 17 通道支持（默认 12 零回归）、ANCHOR_V21 锚点的数值与独立性。
+P4.9 另覆盖两件事：`--preset` 取值修型（store_true -> choices）、measure 的
+多通道支持（默认 12 零回归）。
 
-P4.9c 更正 ANCHOR_V21 的 policy 头：2,366,602 → **2,366,730**
-（total_params 9,008,419 → **9,008,547**）。原值来自权威表 policy 分项行，
-而该行的「FC 128→256 带bias：32,896」是笔误（bias 被记成 in_features）。
-本文件随之把该条矛盾的 recorded 换成 32,896→33,024、补上一条**单一**仲裁规则
-（按其两个分支逐条核），并给 print 格式补上此前完全缺失的测试。
-
-P4.9d 跟随用户「Mamba-1 换 Mamba-2」（块9-12）：`MambaLTI` 改名 `Mamba2`，
-参数 454,112 → **516,960**（每块 113,528 → **129,240**），backbone_total
-6,499,800 → **6,562,648**，total_params 9,008,547 → **9,071,395**。形状字段
-（N 64 / r 4 / d_conv 4 / dt_rank 4 / expand 2 / A 结构化低秩 992）入锚点，
-好让 P4.2 只读锚点就能拿到块布局。
-
-⚠ **total_params 是 9,071,395 而不是任务书写的 9,071,389**：后者与本表其余
-字面量无法自洽（6,562,648+2,366,730+142,017 = 9,071,395，差 6），从旧值顺推
-（9,008,547+62,848）也等于 9,071,395。按 arbitration_rule 前半句（形状被钉死
-→ 取精确算术值），9,071,389 属表内笔误。
-
-P4.9c review 的 Important 5 是「主干做了分项级核对、头没做」。本轮把同样的
-分项核对**常驻**到 Mamba-2 块上（8 个分项之和 == 129,240，逐项对上精确算术），
-并新增 policy 首层仍是 128 的守卫——防有人把已撤回的 120 变更「修」回来。
-
-P4.9e 跟随用户「Mamba-2 的 A 用 **per-head scalar decay**」：head 数 P=4 把
-C=184 切成 4×46，A 只剩每 head 一个标量 ⇒ A 的记账 992 → **4**（A_log 形状
-(4,)），`mamba2_rank` 键与「结构化低秩 C*r + r*N」口径**整体作废**。参数
-516,960 → **513,008**（每块 129,240 → **128,252**），backbone_total
-6,562,648 → **6,558,696**，total_params 9,071,395 → **9,067,443**。分项核对
-随之变成 368+67,712+920+24,288+920+**4**+184+33,856 = 128,252。
-
-P4.9e 另一支：stem 的 3×3 vs 7×7 **形状冲突已由用户 2026-09-27 显式裁决**
-（取 3×3）。`arbitration_rule` 因此从两支变三支：②「形状矛盾、算术不裁决」
-是个**有终态**的中间态，③「经用户显式裁决」才是它的归宿（resolution =
-`resolved_by_user_ruling`，被否的 7×7 口径以 `voided_by_user_ruling` 整份
-留痕，含它会把合计顶到多少）。stem 参数仍是 28,520，所有合计不变。
+katago-se-v1：v21 架构（Mamba/Transformer/CrossAttn）从 src/networks/ 删除时，
+其静态锚点 ANCHOR_V21、`--preset v21`、run_anchor_v21 一并从
+scripts/search_arch.py 退役 —— 锚点记录的结构已不存在，静态表失去被测对象。
+现行候选 = KataGo SE-bottleneck：search_arch.SE_CFG 镜像
+scripts/train_sft.py 的 KATAGO_SE_CFG **结构键**，measure 从 cfg 自带的
+`arch` 建网，`--preset se` 走与 v18 完全相同的实测投影路径 —— 参数量/FLOPs
+是本机实测，显存与 s/step 仍**自 v18 锚点外推（误差未知）**，两者的口径差
+写在 project() 的 docstring 里，测试不把外推值钉成金标（只有 params/flops
+这类实测整数进 GOLDEN）。
 """
 
-import ast
 import inspect
 import os
 import sys
+import pytest
 
 import torch
 import torch.nn as nn
@@ -231,42 +207,47 @@ def test_max_batch_respects_budget():
 
 
 # ---------------------------------------------------------------------------
-# P4.9：--preset 修型（store_true -> 取值）/ measure 17ch / ANCHOR_V21
+# P4.9：--preset 修型（store_true -> 取值）/ measure 多通道 / 预设金标
 # ---------------------------------------------------------------------------
 
 # 既有 4 个预设在**改前**的实测金标（params/flops 均为整数，机器无关；
 # 改前用 scripts/search_arch.py 逐一 project 采集）。任何使既有预设行为
 # 漂移的改动都会撞上它。
+# 第 5 行 SE 是 katago-se-v1 新增：params 与 train_sft 的 KATAGO_SE_CFG
+# ['params_total']=9,112,005 对账（test_se_measure_matches_katago_budget），
+# flops 是本工具 batch=1 forward hook 实测整数。
 GOLDEN_PRESETS = [
     ('v18 原样（锚点）', 12_858_978, 8_489_705_920),
     ('V12 原样', 12_652_834, 8_987_335_872),
     ('B: ConvNeXt4→Res4', 14_315_874, 9_540_475_840),
     ('F: V12块序+v18头', 14_056_866, 9_354_165_184),
+    ('SE: KataGo 240ch（候选）', 9_112_005, 6_212_830_720),
 ]
 
 
-def test_preset_accepts_v21(capsys):
-    """`--preset v21` 必须能被解析并路由到 v21 分支。
+def test_preset_accepts_se(capsys):
+    """`--preset se` 必须能被解析并走**实测**投影路径（SE 是现行训练结构）。
 
-    改前红：`--preset` 是 store_true，`--preset v21` 会把 `v21` 当成
-    unrecognized argument 直接 SystemExit(2)。
+    与退役的 v21 分支正相反：SE 结构 AlphaGoNet 造得出来 ⇒ 有校准、有
+    forward、有显存投影行。note 里必须带「外推」标注 —— 显存/s/step 不是在
+    SE 自己身上实测的，是从 v18 锚点外推的（口径见 project 的 docstring）。
     """
-    args = S.build_parser().parse_args(['--preset', 'v21'])
-    assert args.preset == 'v21'
-    S.main(['--preset', 'v21'])
+    args = S.build_parser().parse_args(['--preset', 'se'])
+    assert args.preset == 'se'
+    S.main(['--preset', 'se', '--batch', '1000'])
     out = capsys.readouterr().out
-    assert 'ANCHOR_V21' in out, 'v21 分支没有陈列 ANCHOR_V21'
-    assert '6,558,696' in out and '9,067,443' in out, \
-        'v21 分支没有输出合计，自洽核算缺失'
-    # v21 走静态锚点，不得触发 v18 校准/实测路径（P4.2 前造不出该结构）
-    assert '校准核对' not in out
+    assert '校准核对' in out, 'SE 预设应走 v18 校准（实测投影路径）'
+    name, _, _, note = S.preset_entries('se')[0]
+    assert name in out, 'SE 预设行没有出现在输出里'
+    assert note in out, 'SE 行没有带「自 v18 锚点外推（误差未知）」标注'
+    assert '9.11M' in out, 'SE 参数量应显示 9.11M（实测 9,112,005）'
 
 
 def test_preset_choices_contain_legacy_values(capsys):
     """既有预设仍在 choices 里、旧命令行仍可用，且行为与改前逐项一致。"""
     p = S.build_parser()
     act = next(a for a in p._actions if a.dest == 'preset')
-    assert set(S.PRESET_CHOICES) == {'all', 'v18', 'v12', 'b', 'f', 'v21'}
+    assert set(S.PRESET_CHOICES) == {'all', 'v18', 'v12', 'b', 'f', 'se'}
     for k in S.PRESET_CHOICES:
         assert k in act.choices, '{} 不在 --preset choices 里'.format(k)
         assert p.parse_args(['--preset', k]).preset == k
@@ -297,37 +278,53 @@ def test_preset_choices_contain_legacy_values(capsys):
                              'value_res_blocks': 8, 'policy_channels': 128,
                              'policy_layers': 3}, 2800, ''),
     ]
-    assert S.preset_cfgs() == golden_cfgs, '既有预设定义被改动（与改前不一致）'
+    # 既有 4 条逐字节不变（前缀钉死）；SE 是新增的第 5 条
+    assert S.preset_cfgs()[:4] == golden_cfgs, '既有预设定义被改动（与改前不一致）'
+    se_cfg = dict(backbone_channels=240, backbone_res_blocks=17,
+                  attention_mode='mix', num_attention_layers=4, num_heads=4,
+                  attn_mode='global', attn_window=7,
+                  res_blocks=0, convnext_blocks=0, attn_blocks=0,
+                  value_channels=96, value_res_blocks=2,
+                  policy_channels=128, policy_layers=3,
+                  arch='se_bottleneck')
+    se_name = 'SE: KataGo 240ch（候选）'
+    se_note = 'KATAGO_SE_CFG 结构；显存/s/step 自 v18 锚点外推（误差未知）'
+    assert len(S.preset_cfgs()) == 5
+    assert S.preset_cfgs()[4] == (se_name, se_cfg, 3200, se_note), \
+        'SE 预设定义被改动（结构键 / 默认 batch / 外推标注）'
 
-    # 选择映射：整表 == 既有清单；单项 == 对应下标；v21 不进实测表
+    # 选择映射：整表 == 全清单；单项 == 对应下标；既有 4 项与金标逐项一致
     assert S.preset_entries('all') == S.preset_cfgs()
+    for i, k in enumerate(('v18', 'v12', 'b', 'f', 'se')):
+        assert S.preset_entries(k) == [S.preset_cfgs()[i]], \
+            '{} 选错了预设'.format(k)
     for i, k in enumerate(('v18', 'v12', 'b', 'f')):
         assert S.preset_entries(k) == [golden_cfgs[i]], \
-            '{} 选错了预设'.format(k)
-    assert S.preset_entries('v21') == []
+            '{} 选错了既有预设'.format(k)
 
-    # 各跑一次，结果与改前实测金标一致（params/flops 为整数）
+    # 各跑一次，结果与实测金标一致（params/flops 为整数）
     for (gname, gparams, gflops), k in zip(
-            GOLDEN_PRESETS, ('v18', 'v12', 'b', 'f')):
+            GOLDEN_PRESETS, ('v18', 'v12', 'b', 'f', 'se')):
         (name, r), = S.run_preset(key=k)
         assert name == gname
         assert r['params'] == gparams, \
-            '{} params {} != 改前 {}'.format(k, r['params'], gparams)
+            '{} params {} != 金标 {}'.format(k, r['params'], gparams)
         assert r['flops'] == gflops, \
-            '{} flops {} != 改前 {}'.format(k, r['flops'], gflops)
+            '{} flops {} != 金标 {}'.format(k, r['flops'], gflops)
 
-    # 通道数来源 = 预设推导：既有预设恒 12（= 改前），v21 取自 ANCHOR_V21
-    for k in ('all', 'v18', 'v12', 'b', 'f'):
+    # 通道数来源 = 预设推导：全部预设（含 SE = KATAGO_SE_CFG['in_channels']）恒 12
+    for k in ('all', 'v18', 'v12', 'b', 'f', 'se'):
         assert S.preset_in_channels(k) == 12
-    assert S.preset_in_channels('v21') == S.ANCHOR_V21['in_channels'] == 17
 
-    # --list：既有 4 行逐字节不变，v21 仅为新增行
+    # --list：既有 4 行逐字节不变，SE 为新增行，v21 行绝迹
     S.main(['--list'])
     out = capsys.readouterr().out
     for gname, _, gbs, gnote in golden_cfgs:
         line = '  {:<30} batch={:<5} {}'.format(gname, gbs, gnote)
         assert line in out, '--list 既有行丢失/改动: {!r}'.format(line)
-    assert 'ANCHOR_V21' in out
+    se_line = '  {:<30} batch={:<5} {}'.format(se_name, 3200, se_note)
+    assert se_line in out, '--list 缺 SE 行: {!r}'.format(se_line)
+    assert 'v21' not in out, '--list 仍有 v21 残留'
 
 
 def test_measure_supports_17_channels():
@@ -360,603 +357,148 @@ def test_measure_default_unchanged():
     assert r1 == r2
 
 
-def _anchor_source_with_comments():
-    """返回 ANCHOR_V21 赋值 + 其上方紧邻注释块的源码文本。
+# ---------------------------------------------------------------------------
+# katago-se-v1：KataGo SE-bottleneck 候选（KATAGO_SE_CFG）的测量与投影
+# ---------------------------------------------------------------------------
 
-    数值能被结构化字段钉住，「为什么这么取」的依赖说明只能活在注释里，
-    故单独取出来做断言——否则日后有人把注记删了，数字仍绿，理由却没了。
+
+def test_se_preset_mirrors_katago_se_cfg():
+    """SE_CFG 必须逐键等于**活的** KATAGO_SE_CFG 结构键（单一事实源对账）。
+
+    train_sft.py 改 KATAGO_SE_CFG（宽度/块数/头）而忘了同步 search_arch 时，
+    本测试当场变红 —— 否则 search_arch 投影的是一张不存在的结构表，预算结论
+    会静默错位。
     """
-    path = os.path.join(ROOT, 'scripts', 'search_arch.py')
-    with open(path, encoding='utf-8') as f:
-        src = f.read()
-    tree = ast.parse(src)
-    node = next(stmt.value for stmt in tree.body
-                if isinstance(stmt, ast.Assign)
-                and any(isinstance(t, ast.Name) and t.id == 'ANCHOR_V21'
-                        for t in stmt.targets))
-    lines = src.splitlines()
-    i = node.lineno - 2                      # 赋值行的 0-based 前一行
-    while i >= 0 and lines[i].lstrip().startswith('#'):
-        i -= 1
-    return '\n'.join(lines[i + 1:node.end_lineno])
+    from scripts.train_sft import KATAGO_SE_CFG as K
+    cfg = S.SE_CFG
+    # 结构键逐一对应（键名映射：channels->backbone_channels、blocks->...）
+    assert cfg['backbone_channels'] == K['channels'] == 240
+    assert cfg['backbone_res_blocks'] == K['blocks'] == 17
+    assert cfg['attention_mode'] == K['attention_mode'] == 'mix'
+    assert cfg['num_attention_layers'] == K['num_attention_layers'] == 4
+    assert cfg['num_heads'] == K['num_heads'] == 4
+    assert cfg['value_channels'] == K['value_channels'] == 96
+    assert cfg['value_res_blocks'] == K['value_res_blocks'] == 2
+    assert cfg['policy_channels'] == K['policy_channels'] == 128
+    assert cfg['policy_layers'] == K['policy_layers'] == 3
+    assert cfg['arch'] == K['arch'] == 'se_bottleneck'
+    assert S.preset_in_channels('se') == K['in_channels'] == 12
+    # attn_mode/attn_window：KATAGO_SE_CFG 不传 ⇒ 必须等于 AlphaGoNet 默认
+    # （build_katago_se_net 正是这么拿到 global/7 的）
+    dflt = inspect.signature(S.AlphaGoNet).parameters
+    assert cfg['attn_mode'] == dflt['attn_mode'].default == 'global'
+    assert cfg['attn_window'] == dflt['attn_window'].default == 7
+    # 行为键与对账硬数不进结构表（理由见 SE_CFG 上方注释）
+    for banned in ('in_channels', 'grad_checkpoint', 'params_backbone',
+                   'params_total'):
+        assert banned not in cfg, \
+            '{} 不该进 search_arch 的结构表'.format(banned)
 
 
-def test_anchor_v21_constants():
-    """ANCHOR_V21 逐项等于 P4.1 详细结构表（权威），且合计自洽。
+def test_se_measure_matches_katago_budget():
+    """SE 候选的实测参数量必须 == KATAGO_SE_CFG['params_total']（对账硬数）。
 
-    ⚠ P4.9e：块9-12 的 A 改 **per-head scalar decay**（P=4 heads × 46 通道），
-    mamba 项 516,960 → **513,008**（每块 129,240 → **128,252**），
-    backbone_total 6,562,648 → **6,558,696**，total_params 9,071,395 →
-    **9,067,443**。三个数只由 A 那 4×(992-4) = 3,952 驱动，其余分项一字未动。
-    ⚠ P4.9d：块9-12 换成 Mamba-2（454,112 → 516,960，旧值 113,528/块）。
-    键名同时由 `mamba_lti*` 改为 `mamba2*`（用户「从 1 换 2」）。
-
-    ⚠ P4.9c：policy 头由 2,366,602 更正为 **2,366,730**（表头自己的数字）。
-    原值 2,366,602 来自权威表的 policy 分项行，而那一行里「FC 128→256
-    带bias：32,896」是笔误——bias 被记成 in_features。下面的 policy_lines
-    断言是本测试的关键：把表自己的 5 行分项（fc2 换成精确值 33,024）加总，
-    必须正好等于 heads.policy_params。分项与合计对不上时，错的几乎总是分项。
+    这是「工具测出来的」与「train_sft 表里写的」唯一一次碰面：两个数都可能
+    过期，只有互相钉住才有人负责。FLOPs 是 forward hook 实测整数，进金标。
     """
-    A = S.ANCHOR_V21
-    assert A['name'] == 'v21'
-    assert A['in_channels'] == 17
-    assert A['backbone_channels'] == 184
-    lay = A['layout']
-    assert lay['stem'] == 'Conv3x3(17->184)+BN'
-    assert lay['res_blocks'] == 8
-    assert lay['mamba2_blocks'] == 4
-    assert lay['transformer_blocks'] == 2
-    assert lay['transformer_heads'] == 4
-    assert lay['ffn_hidden'] == 240, 'FFN 中间维必须是 240（旧表 276 作废）'
-    assert abs(lay['ffn_ratio'] - 240 / 184) < 1e-3, \
-        'ffn_ratio 与 240/184 不符: {}'.format(lay['ffn_ratio'])
-    assert lay['cross_attn_res_blocks'] == 2
-    assert lay['cross_attn_concat_blocks'] == (1, 5, 9)
-    assert lay['out'] == '1x1 Conv+BN'
-    # 权威表逐项（P4.1 brief §2；块9-12 已是 Mamba-2 + per-head scalar A）
-    parts = dict(stem=28_520, res_blocks=4_881_152, mamba2=513_008,
-                 transformer=448_960, cross_attn_res=652_832, out=34_224)
-    assert A['params'] == parts, '各部分参数量与权威表不符'
-    # 每块单价也对得上（448,960 = 2×224,480；652,832 = 2×326,416）
-    assert parts['transformer'] == 2 * 224_480
-    assert parts['cross_attn_res'] == 2 * 326_416
-    assert parts['res_blocks'] == 8 * 610_144
-    assert parts['mamba2'] == 4 * 128_252, 'Mamba-2 每块必须是 128,252'
-    # 合计自洽：六项之和 == backbone_total == 6,558,696（权威表）
-    assert sum(parts.values()) == A['backbone_total'] == 6_558_696, \
-        '主干合计与各部分之和不自洽'
-    h = A['heads']
-    assert h['in'] == 184
-    assert h['policy_params'] == 2_366_730, \
-        'policy 头 = 表头合计 2,366,730（分项 fc2 的 32,896 是笔误，见 §3(b)）'
-    assert h['policy_out'] == 362
-    assert h['value_params'] == 142_017
-    assert h['value_out'] == 1
-    assert A['total_params'] == 9_067_443
-    assert A['backbone_total'] + h['policy_params'] + h['value_params'] \
-        == A['total_params'], '总合计与 主干+两头 不自洽'
-    # 增量的另一种算法：从 P4.9c 的旧值顺推，必须得到同一个数
-    assert 9_008_547 + (513_008 - 454_112) == 9_067_443, \
-        'total_params 与「旧值 + Mamba 增量」对不上'
-    # 增量还必须是 A 的记账差 × 4（防止有人顺手改了别的分项却仍凑对合计）
-    assert 4 * (992 - 4) == 3_952 == 516_960 - 513_008
-    assert 6_562_648 - 3_952 == 6_558_696 and 9_071_395 - 3_952 == 9_067_443
-    # policy 头的分项复核（权威表 §2 policy 行的 5 个数，fc2 取精确值）：
-    # 17,856(1×1Conv+BN) / 4,704 / 2,218,112 / 33,024 / 93,034
-    assert 17_856 == 184 * 96 + 2 * 96, '1×1 Conv 184→96 无 bias + BN(96)'
-    assert 4_704 == 96 * 48 + 2 * 48, '1×1 Conv 96→48 无 bias + BN(48)'
-    assert 2_218_112 == 48 * 19 * 19 * 128 + 128, 'FC 17328→128 带 bias'
-    assert 33_024 == 128 * 256 + 256, 'FC 128→256 带 bias：bias 恒为 out_features'
-    assert 93_034 == 256 * 362 + 362, 'FC 256→362 带 bias'
-    policy_lines = [17_856, 4_704, 2_218_112, 33_024, 93_034]
-    assert sum(policy_lines) == h['policy_params'] == 2_366_730, \
-        'policy 头与权威表分项之和不自洽: {} vs {}'.format(
-            sum(policy_lines), h['policy_params'])
-    # 被否掉的那行确实是「bias 记成 in_features」，且任何 bias 设置都给不出它
-    assert 32_896 == 128 * 256 + 128
-    assert 128 * 256 + 256 == 33_024 and 128 * 256 == 32_768
-    assert 6_558_696 + 2_366_730 + 142_017 == 9_067_443
+    from scripts.train_sft import KATAGO_SE_CFG as K
+    n, f, ret = S.measure(dict(S.SE_CFG), probe_bs=2)
+    assert n == K['params_total'] == 9_112_005, \
+        '实测参数 {} != KATAGO_SE_CFG[params_total] {}'.format(
+            n, K['params_total'])
+    assert n == GOLDEN_PRESETS[4][1], 'SE 金标参数与实测不符'
+    assert f == GOLDEN_PRESETS[4][2] > 0, 'SE 金标 FLOPs 与实测不符'
+    assert ret > 0, '保留激活字节应为正'
 
 
-# 块9-12 Mamba-2 的 8 个分项（权威表逐项，顺序 = 子模块定义序）。
-# 每项的算式钉在 test_anchor_v21_mamba2_blockwise_sums 里：任一项被「顺手改
-# 整齐」都会当场变红，而不是等到与 128,252 对不上才被人发现。
-MAMBA2_BLOCK_PARTS = [
-    ('norm', 368),            # LayerNorm2d(184)：weight+bias = 2×184
-    ('in_proj', 67_712),      # Linear(184→368) 无 bias：d_inner=C，扇出 expand×C
-    ('dw_conv', 920),         # Conv1d(184,184,k=4,groups=184,bias)：184×4+184
-    ('x_proj', 24_288),       # Linear(184→132) 无 bias：132 = dt_rank + 2N
-    ('dt_proj', 920),         # Linear(4→184) 带 bias：4×184+184
-    ('A', 4),                 # per-head 标量：P 个（旧结构化低秩 992 作废）
-    ('D', 184),               # 逐通道直通参数
-    ('out_proj', 33_856),     # Linear(184→184) 无 bias
-]
+def test_se_cfg_actually_builds_se_and_attn_blocks():
+    """SE 预设必须真的建成 13×SEBottleneck + 4×AttentionResBlock 的主干。
 
-
-def test_anchor_v21_mamba2_blockwise_sums():
-    """块9-12 的 8 个分项之和必须精确等于 128,252，且**逐项**对上精确算术。
-
-    P4.9c 的 review Important 5 指出：分项级核对当时只做在主干、没做在头。
-    本轮把同样的核对常驻到 Mamba-2 块上——不是只对总和：只对总和的话，把 A
-    写成某个凑数用的数、同时把某一项写成相反差，也能凑出同一个和；逐项钉死
-    后任何一项漂移都无处藏身。
-
-    ⚠ `expand=2` 是 **in_proj 的扇出**（184→368），**不是**分支内宽度扩张：
-    d_inner 仍是 C=184。按 Mamba 惯例误读成 d_inner=2C 会让 in_proj 变成
-    184→736（135,424），整块凭空多出 67,712——权威表明确只认扇出这一种。
-
-    ⚠ P4.9e：A 由「结构化低秩 C*r + r*N」改为 **per-head 标量**（P=4），
-    6 个分项一字未动，只有 A 那项 992 → 4。两种旧记账各自会让块变成
-    129,240（低秩 992）/ 140,024（稠密 C×N），都不是 128,252。
+    防「cfg 写着 se_bottleneck、实际建出 resnet」的静默回退：参数量对账抓得住
+    宽度错，却抓不住「参数量恰好相同的另一种块」—— 直接数块类型才钉得住。
+    块配比 = blocks - num_attention_layers（KATAGO_SE_CFG 的 17/4）。
     """
-    A, lay = S.ANCHOR_V21, S.ANCHOR_V21['layout']
-    C, N = 184, 64
-    P = lay['mamba2_n_heads']
-    d_conv, dt_rank, expand = lay['mamba2_d_conv'], lay['mamba2_dt_rank'], 2
-    d_inner = C                                  # 见 docstring：扇出而非内宽
-    x_proj_out = dt_rank + 2 * N                 # 4 + 2×64 = 132
-
-    exact = [
-        2 * C,                                   # norm: weight+bias
-        d_inner * (expand * C),                  # in_proj 无 bias
-        d_inner * d_conv + d_inner,              # dw_conv 深度卷积带 bias
-        d_inner * x_proj_out,                    # x_proj 无 bias
-        dt_rank * d_inner + d_inner,             # dt_proj 带 bias
-        P,                                       # A：每 head 一个标量（**不是** C×N）
-        C,                                       # D
-        d_inner * C,                             # out_proj 无 bias
-    ]
-    names = [n for n, _ in MAMBA2_BLOCK_PARTS]
-    stated = [v for _, v in MAMBA2_BLOCK_PARTS]
-    assert names == ['norm', 'in_proj', 'dw_conv', 'x_proj', 'dt_proj',
-                     'A', 'D', 'out_proj'], '分项清单本身被改动: {}'.format(names)
-    for (name, got), want in zip(MAMBA2_BLOCK_PARTS, exact):
-        assert got == want, \
-            'Mamba-2 分项 {} 被改动：{:,} != 精确算术 {:,}'.format(name, got, want)
-    assert len(stated) == 8, '必须是 8 个分项'
-    assert sum(stated) == 128_252, \
-        'Mamba-2 单块 8 分项之和 {:,} != 128,252'.format(sum(stated))
-    # 逐块单价 × 4 必须回到锚点里那一项（不是各自独立写死的两个数）
-    assert A['params']['mamba2'] == 4 * sum(stated) == 513_008
-    # dw_conv 与 dt_proj 同为 920 是巧合（184×4+184 与 4×184+184），非笔误
-    assert MAMBA2_BLOCK_PARTS[2][1] == MAMBA2_BLOCK_PARTS[4][1] == 920
-    assert lay['mamba2_A_params'] == P == 4, '锚点里的 A 记账必须与分项一致'
-    # A 若仍按旧的结构化低秩 / 稠密 C×N 记账，块会变成 129,240 / 140,024
-    head = sum(stated) - 4
-    assert head + 992 == 129_240, '结构化低秩口径作废，单块不该再是 129,240'
-    assert 184 * 64 == 11_776 > 4, '稠密 C×N 远大于 per-head 标量'
-    assert head + 11_776 == 140_024
-    # per-head 记账与 head 切分必须自洽：P 个标量 × 4 = 4 个 head × 46 通道 = 184
-    assert P * lay['mamba2_head_dim'] == C == 184
+    from src.networks.se_bottleneck import SEBottleneck
+    from src.networks.backbone import AttentionResBlock
+    from scripts.train_sft import KATAGO_SE_CFG as K
+    m = AlphaGoNet(in_channels=12, action_size=362,
+                   attention_dropout=0.0, use_checkpoint=False, **dict(S.SE_CFG))
+    blocks = list(m.backbone.blocks)
+    n_se = sum(isinstance(b, SEBottleneck) for b in blocks)
+    n_attn = sum(isinstance(b, AttentionResBlock) for b in blocks)
+    assert len(blocks) == K['blocks'] == 17
+    assert n_se == K['blocks'] - K['num_attention_layers'] == 13
+    assert n_attn == K['num_attention_layers'] == 4
+    assert sum(p.numel() for p in m.parameters()) == K['params_total']
+    del m
 
 
-def test_anchor_v21_records_mamba2_shape():
-    """Mamba-2 的形状字段必须入锚点，且旧称/旧参数ization 绝迹。
+def test_se_project_reports_budget_fields():
+    """project(SE, batch) 的字段与口径：params/flops 实测，其余自 v18 锚点外推。
 
-    P4.2 只读 ANCHOR_V21 常量就要能搭出块9-12，形状（N / P / head_dim /
-    d_conv / dt_rank / expand / A 的记账）不能只活在实现代码或本文件里。
-
-    P4.9e：A 由结构化低秩改为 **per-head scalar decay**——A 的标量个数 = head
-    数 P=4，A_log 形状 (4,)。旧的 `mamba2_rank` 键与 C*r + r*N 口径必须
-    **彻底绝迹**（键名、描述文字、数字三样都查）：留着它们等于给后续 agent
-    留一张按旧参数ization 改回来的票据。
+    **不**钉显存绝对值当金标（单点标定的外推值不配当金标）；钉住的是口径
+    关系与两个训练目标的判定：
+      * fits 与 SAFE_GB 一致、total = act + 常驻开销；
+      * act ∝ batch（显存模型的线性外推性质）；
+      * batch=1000 装得下（shell 的 BATCH=1000 有依据）、batch=3200 装不下
+        —— 若哪天翻转，是结构或预算变了，要人来复核，不是测试静默通过。
     """
-    A, lay = S.ANCHOR_V21, S.ANCHOR_V21['layout']
-    assert lay['mamba2_blocks'] == 4
-    assert lay['mamba2_d_state'] == 64, 'N：Mamba-1 的 16 作废（Mamba-2 为 64）'
-    assert lay['mamba2_d_conv'] == 4
-    assert lay['mamba2_dt_rank'] == 4
-    assert lay['mamba2_expand'] == 2
-    # per-head 标量：A 的参数 = head 数 P，A_log 形状 (4,)，与 head 切分自洽
-    C, P, P2 = A['backbone_channels'], lay['mamba2_n_heads'], lay['mamba2_head_dim']
-    assert (P, P2) == (4, 46), 'head 数/head 维必须是 4×46（用户裁决 P=4）'
-    assert P * P2 == C == 184, 'head 切分必须把 C=184 铺满，不许有缝'
-    assert lay['mamba2_A_params'] == P == 4, 'A 只剩 P=4 个标量'
-    assert 'per-head' in lay['mamba2_A_form'] and '(4,)' in lay['mamba2_A_form'], \
-        'A 的记账口径必须写在锚点里: {!r}'.format(lay['mamba2_A_form'])
-    # x_proj 出向 = dt_rank + 2N，形状字段自洽（否则 24,288 无从复核）
-    assert lay['mamba2_dt_rank'] + 2 * lay['mamba2_d_state'] == 132
-    # 旧称 MambaLTI 只允许出现在源码注释的历史记录里，锚点数据与打印表都不许有
-    blob = repr(lay) + repr(A['params']) + repr(A['heads'])
-    assert 'mambalti' not in blob.lower() and 'mamba_lti' not in blob, \
-        '锚点数据里还残留旧键名 mamba_lti'
-
-    # ---- 低秩参数ization 的残留：一个都不许有（键名 / 口径 / 数字） ----
-    def all_keys(obj):
-        """递归取出对象里所有键名。"""
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                yield k
-                yield from all_keys(v)
-        elif isinstance(obj, (tuple, list)):
-            for v in obj:
-                yield from all_keys(v)
-
-    assert 'mamba2_rank' not in set(all_keys(lay)), \
-        'mamba2_rank 键还在：per-head 标量没有 r 这个量'
-    for k in all_keys(A):
-        assert 'rank' not in k or k == 'mamba2_dt_rank', \
-            'A 的低秩键不该存在（dt_rank 是另一回事）: {!r}'.format(k)
-    data = repr(A)
-    for bad, why in (('C*r', '低秩口径'), ('r*N', '低秩口径'),
-                     ('low-rank', '低秩口径'), ('992', '旧 A 记账'),
-                     ('1920', '凑数用的假 A 记账'), ('11776', '稠密 C×N 记账')):
-        assert bad not in data, '锚点数据里还残留{}（{}）'.format(bad, why)
-    # 但**理由**必须留在源码注释里：992 是怎么被否掉的，日后要能查
-    src = _anchor_source_with_comments()
-    assert 'per-head' in src and '992' in src and '作废' in src, \
-        '锚点注释必须记下 A 的低秩口径为何作废（否则只剩数字、丢掉理由）'
+    cfg = dict(S.SE_CFG)
+    r1 = S.project(cfg, 1000)
+    r32 = S.project(cfg, 3200)
+    for r in (r1, r32):
+        assert set(r) == {'params', 'flops', 'act_gb', 'total_gb',
+                          'step_s', 'samples_per_s', 'fits'}
+        assert r['params'] == 9_112_005
+        assert r['flops'] == 6_212_830_720
+        assert r['fits'] == (r['total_gb'] <= S.SAFE_GB)
+    assert r1['fits'], \
+        'batch 1000 预测应装得下（否则 shell 的 BATCH=1000 无依据）'
+    assert not r32['fits'], \
+        'batch 3200 预测 {:.1f}GB 超预算 —— 结构/预算变了，需人工复核'.format(
+            r32['total_gb'])
+    assert abs(r32['act_gb'] / r1['act_gb'] - 3.2) < 0.01, \
+        'act 必须随 batch 线性外推（3200/1000 = 3.2）'
+    assert abs(r32['total_gb']
+               - (r32['act_gb'] + S.overhead_gb(r32['params']))) < 1e-9
 
 
-def test_anchor_v21_policy_head_still_128(capsys):
-    """policy 头首层仍是 128、合计仍是 2,366,730——防有人"修"回已撤回的 120。
+def test_emit_flags_se_branch_says_struct_flags_are_archived(capsys, monkeypatch):
+    """--emit-flags 对 SE 预设不发旧结构 flag，明说结构归 KATAGO_SE_CFG。
 
-    曾有一版把 Flatten 之后的首个 FC 从 128 改成 120 的草稿，被用户**撤回**：
-    该变更并不存在。因此锚点里既没有它、也不该出现任何指向它的条目（登记
-    一条 user_directed_change 等于给后续 agent 留张"待办"票据）。本测试把
-    "没变"这件事本身钉住：合计、首层宽度、以及分项里 128×256+256 的形状。
+    旧 flag（--backbone-channels 等）在 train_sft 已归档：接受但不参与建网。
+    发它们等于发一套会被静默忽略的假旋钮。既有预设的发旗行为保持不变。
     """
-    A = S.ANCHOR_V21
-    h = A['heads']
-    assert h['policy_params'] == 2_366_730, \
-        'policy 头必须保持 2,366,730（用户明确「policy 不变」）'
-    # 分项里带出首层 128 的那两行：17328→128 与 128→256
-    assert 2_218_112 == 48 * 19 * 19 * 128 + 128, '首层 FC 17328→128'
-    assert 33_024 == 128 * 256 + 256, '次层 FC 128→256：bias 恒为 out_features'
-    assert sum([17_856, 4_704, 2_218_112, 33_024, 93_034]) == 2_366_730
-    # 首层宽度同时出现在乘式里：48*19*19*128 换成 120 就凑不出 2,218,112
-    assert 48 * 19 * 19 * 120 + 120 == 2_079_480 != 2_218_112, \
-        '首层若被改成 120，分项就与 2,366,730 对不上了（差 {:,}）'.format(
-            2_218_112 - 2_079_480)
-    # 锚点里不得存在任何把 120 当作权威值的条目
-    for d in A['known_discrepancies']:
-        assert d['recorded'] not in (2_079_480, 120), \
-            '锚点里混进了已撤回的 120 变更条目: {}'.format(d)
-    S.main(['--preset', 'v21'])
+    fake = dict(params=9_112_005, flops=6_212_830_720, act_gb=1.0,
+                total_gb=1.0, step_s=1.0, samples_per_s=100.0, fits=True)
+    monkeypatch.setattr(S, 'project', lambda *a, **k: dict(fake))
+    monkeypatch.setattr(S, 'calibrate', lambda verbose=True: 0.0)
+    S.main(['--preset', 'v18', '--emit-flags'])
     out = capsys.readouterr().out
-    assert '2,366,730' in out, '打印表没有陈列 policy 合计'
-    assert '2,366,602' not in out, '被作废的旧裁定仍在打印表里'
+    se_name, _, _, _ = S.preset_entries('se')[0]
+    assert se_name in out, 'emit 输出里没有 SE 预设'
+    se_block = out.split(se_name)[1]
+    assert '无 flag 可发' in se_block and 'KATAGO_SE_CFG' in se_block, \
+        'SE 分支没有说明结构 flag 已归档: {!r}'.format(se_block[:200])
+    assert '--backbone-channels 240' not in out, \
+        'SE 不该收到会被 train_sft 静默忽略的旧结构 flag'
+    assert '--backbone-channels 192' in out, \
+        '既有预设的 --emit-flags 行为被改动（仍应发旧 flag）'
 
 
-def test_anchor_v21_layout_names_match_p41_class_names(capsys):
-    """布局/参数键名与 P4.1 的类名逐项对齐：旧称必须绝迹。
+def test_v21_machinery_is_retired():
+    """v21 架构删除后，ANCHOR_V21 / run_anchor_v21 / --preset v21 必须退场。
 
-    P4.1 brief §1 定的类名是 Mamba2 / TransformerBlock / CrossAttnRes
-    （块13-14 旧称 LightAttn 作废；块9-12 旧称 MambaLTI，用户本轮明确
-    「从 1 换成 2」，一并作废）。键名一旦与类名脱节，锚点表就会与被实现的
-    结构各说各话——而锚点正是 P4.2 预算仲裁的依据。
+    锚点曾是 P4.2 预算仲裁的静态表；结构从 src/networks/ 拔掉后，表留着只会
+    让人以为还能量、还能投影。谁想复活 v21，先过本测试（改测试要写理由）。
     """
-    A = S.ANCHOR_V21
-    lay = A['layout']
-
-    def strings(obj):
-        """递归取出对象里所有字符串（键与值都算）。"""
-        if isinstance(obj, str):
-            yield obj
-        elif isinstance(obj, dict):
-            for k, v in obj.items():
-                yield from strings(k)
-                yield from strings(v)
-        elif isinstance(obj, (tuple, list)):
-            for v in obj:
-                yield from strings(v)
-
-    # 布局键 = P4.1 类名的 snake_case，三个注意力/序列块都在
-    assert {'mamba2_blocks', 'transformer_blocks',
-            'cross_attn_res_blocks'} <= set(lay), \
-        '布局缺 P4.1 的三个块类键: {}'.format(sorted(lay))
-    # 旧称 LightAttn / light_attn_* / MambaLTI / mamba_lti_* 全部消失
-    # （大小写不敏感；旧键名会让 P4.2 读不到新布局，看起来像「没改」）
-    for s in list(strings(lay)) + list(lay) + list(A['params']):
-        low = s.lower()
-        assert 'lightattn' not in low and 'light_attn' not in low, \
-            '布局/参数里还残留旧称 LightAttn: {!r}'.format(s)
-        assert 'mambalti' not in low and 'mamba_lti' not in low, \
-            '布局/参数里还残留旧称 MambaLTI（Mamba-1）: {!r}'.format(s)
-    assert 'mamba2' in A['params'] and 'mamba_lti' not in A['params']
-    # 打印表用 P4.1 的类名（run_anchor_v21 的 label 跟着键名走）
-    S.main(['--preset', 'v21'])
-    out = capsys.readouterr().out
-    assert 'TransformerBlock ×2' in out, '打印表没有用 TransformerBlock'
-    assert 'LightAttn' not in out, '打印表仍出现旧称 LightAttn'
-    assert 'MambaLTI' not in out, '打印表仍出现旧称 MambaLTI'
-    assert 'Mamba2 ×4' in out and 'CrossAttnRes ×2' in out
-    assert 'ffn=240' in out, '打印表没有陈列 FFN 中间维 240'
-
-
-def test_anchor_v21_arbitration_rule_is_single_and_applied_to_both_entries():
-    """**一条**仲裁规则，两处冲突都按它判——不许对同型证据换标准。
-
-    规则（ANCHOR_V21['arbitration_rule']，注释里有长版）三支：
-      ①形状被唯一钉死 → 取精确算术值（冲突的表记数字 = 笔误）
-        ⇒ resolved_by_exact_arithmetic
-      ②形状本身矛盾 → 精确算术**不裁决**，两口径都留着待用户拍板
-        ⇒ unresolved_shape_conflict（一个**有终态**的中间态）
-      ③经用户显式裁决 → 按裁决取值，被否口径 voided_by_user_ruling 留痕
-        ⇒ resolved_by_user_ruling
-
-    规则落到两条 entry 的 `resolution` 上，必须**互不相同**且各归其位：
-      (a) stem：表头文字 7×7 与它自己给的参数量 3×3 指向不同形状 ⇒ 算术裁决
-          不了，先走②；用户 2026-09-27 显式裁决 3×3 ⇒ 转入③
-          （resolved_by_user_ruling）。**不允许**退回②/悬着。
-      (b) policy：fc2 的形状与 bias 都被表写死 ⇒ 精确算术有唯一解 ⇒ 走①
-          （resolved_by_exact_arithmetic，规则必须给出结论）。
-    「两条 resolution 必须同时存在且分属不同支」正是 P4.9b 缺的东西：它对 (a)
-    弃表取实算、对 (b) 取实算弃表头，同型证据两套相反标准。P4.9e 只是把②补
-    上了归宿（③），没有放松任何一支。
-    """
-    A = S.ANCHOR_V21
-    rule = A['arbitration_rule']
-    assert isinstance(rule, str) and rule, '锚点必须带一条可读的仲裁规则'
-    for branch in ('精确算术', '形状本身矛盾', '显式裁决'):
-        assert branch in rule, '仲裁规则缺分支：{}'.format(branch)
-    # 三个 resolution 标记必须都写在规则里（②不能是「无归宿」的分支）
-    for res in ('resolved_by_exact_arithmetic', 'unresolved_shape_conflict',
-                'resolved_by_user_ruling', 'voided_by_user_ruling'):
-        assert res in rule, '仲裁规则缺 resolution 标记：{}'.format(res)
-    d = {x['id']: x for x in A['known_discrepancies']}
-    stem = d['stem_kernel_3x3_vs_7x7']
-    assert stem['resolution'] == 'resolved_by_user_ruling', \
-        '(a) 的形状冲突已由用户显式裁决（3×3），不许退回「悬着」'
-    assert d['policy_fc2_128_off']['resolution'] == 'resolved_by_exact_arithmetic', \
-        '(b) 的形状被钉死，规则必须裁决它（而不是含糊其辞）'
-    # 两条 entry 仍必须分属不同支（不是「反正都裁决了就都写同一个词」）
-    assert stem['resolution'] != d['policy_fc2_128_off']['resolution']
-    # 规则与结论方向一致：被算术裁决的 (b) 必须站「精确算术」这一侧
-    pol = d['policy_fc2_128_off']
-    assert pol['recorded'] == 128 * 256 + 256 > pol['stated'] == 128 * 256 + 128, \
-        '被裁决的条目必须采纳精确算术值、否掉表记值'
-    # 被用户裁决的 (a)：两侧都精确（谁也不比谁权威）⇒ 结论只能来自裁决本身，
-    # 所以条目里必须写明裁决者，且 status 不许再写「未裁决」
-    assert stem['recorded'] == 3 * 3 * 17 * 184, '3×3 精确'
-    assert stem['stated_exact'] == 7 * 7 * 17 * 184, '7×7 精确'
-    assert stem['ruled_by'].startswith('user_ruling'), \
-        '走③的条目必须写明裁决来自用户（不是算术）'
-    assert '未裁决' not in stem['status'] and stem['status'].startswith('已裁决')
-    # 悬而未决的那一支现在是空的：两条都已定案，不许有第三条偷偷挂着
-    assert not [x['id'] for x in A['known_discrepancies']
-                if x['resolution'] == 'unresolved_shape_conflict'], \
-        '已无待裁决条目，不该再挂在 unresolved_shape_conflict 上'
-
-
-def test_anchor_v21_stem_is_3x3_and_7x7_is_voided():
-    """stem = 3×3 已由用户显式裁决；7×7 口径**作废但整份留痕**。
-
-    2026-09-27 之前，这条冲突在锚点里挂了四轮 `unresolved_shape_conflict`
-    （3×3 的 28,152 vs 7×7 的 153,272，各自形状下都精确 ⇒ 算术裁决不了）。
-    现在它已定案：stem 取 3×3，合计 28,520 不变，**所有合计一字未动**。
-
-    为什么作废的那一支还要留着：7×7 的提案只存在于 git 历史里，日后有人
-    `git log` 翻出来会以为它「还没被评估过」。故 voided_alternative 必须
-    连同它**会把合计顶到多少**一起记下（153,272 / stem 153,640 / backbone
-    6,683,816 / total 9,192,563），让复活它的成本一眼可见。
-    """
-    A = S.ANCHOR_V21
-    stem = next(x for x in A['known_discrepancies']
-                if x['id'] == 'stem_kernel_3x3_vs_7x7')
-    # 采用的一侧：3×3，且与 params.stem 逐项对上（9×17×184 + BN 368）
-    assert A['params']['stem'] == stem['recorded'] + 368 == 28_520
-    assert stem['recorded'] == 3 * 3 * 17 * 184 == 28_152
-    assert '3x3' in A['layout']['stem'].lower(), '布局必须标明 stem 按 3×3 记'
-    # 作废的一侧：形状与两个口径的数字都在，且明确标成 voided 而非「待定」
-    void = dict(stem['voided_alternative'])
-    assert stem['voided'] == 'voided_by_user_ruling', \
-        '7×7 口径必须标成被用户裁决作废，不是「还没定」'
-    assert void['kernel'] == '7x7'
-    assert void['conv_params'] == 7 * 7 * 17 * 184 == 153_272
-    assert void['stem_with_bn'] == void['conv_params'] + 368 == 153_640
-    # 作废口径的代价：把它换回去，两个合计会变成多少（= 本表合计 + stem 增量）
-    assert void['backbone_total'] == A['backbone_total'] \
-        - A['params']['stem'] + void['stem_with_bn'] == 6_683_816
-    assert void['total_params'] == void['backbone_total'] \
-        + A['heads']['policy_params'] + A['heads']['value_params'] == 9_192_563
-    # 裁决书里同时流传的 6,687,768 / 9,196,515 是按 P4.9d 基数算的（多 3,952），
-    # 已被本锚点按精确算术取代——但**不许从记录里抹掉**，否则日后无从解释
-    assert '6,687,768' in void['note'] and '9,196,515' in void['note']
-    assert 6_687_768 - void['backbone_total'] == 3_952 == 4 * (992 - 4)
-    # 表记口径的 24 个笔误仍在（153,296 vs 精确 153,272）
-    assert stem['stated'] == 153_296 and stem['stated_exact'] == 153_272
-    # status 必须写明作废那一支的代价（否则复活它的人看不见代价）
-    assert '作废' in stem['status'] and '6,683,816' in stem['status']
-    # 打印表里也要能看出这条已定案（resolution 逐条打出行内，见打印格式测试）
-    assert stem['resolution'] in ('resolved_by_user_ruling',
-                                  'resolved_by_exact_arithmetic'), \
-        'stem 已定案（用户裁决 3×3），不许退回 unresolved_shape_conflict'
-    assert stem['resolution'] in S.ANCHOR_V21['arbitration_rule'], \
-        'resolution 必须是仲裁规则里写明的那一支（否则是凭空发明的状态）'
-
-
-def test_anchor_v21_documents_known_discrepancies():
-    """权威表的两处笔误必须被记录在锚点里，不许静默抹掉。
-
-    (a) stem 表头写 7×7，参数却是 3×3 的值（28,152 vs 153,296）。锚点按 3×3
-        取值（**用户 2026-09-27 显式裁决**，规则第③支）—— 7×7 那支已作废，
-        但仍连同它会把合计顶到多少一起留痕，见 test_anchor_v21_stem_is_3x3_
-        and_7x7_is_voided。若日后确认改 7×7，stem 变 153,640，**整表作废**。
-    (b) policy 分项「FC 128→256 带bias」写 32,896，精确值 33,024（bias 恒为
-        out_features=256，不是 in_features=128）。⚠ P4.9c 已把方向翻过来：
-        笔误在**分项**，表头合计 2,366,730 才是对的；P4.9b 写的「以分项实算
-        2,366,602 为权威」是误判，已作废。
-
-    这两条一旦被「顺手改整齐」，P4.2 的预算窗口就会在无人察觉下偏移
-    125,144 / 128 个参数。故既断言结构化字段，也断言锚点源码的注释里写了
-    依赖关系（防止只留数字、不留理由）。
-    """
-    A = S.ANCHOR_V21
-    d = {x['id']: x for x in A['known_discrepancies']}
-    assert set(d) == {'stem_kernel_3x3_vs_7x7', 'policy_fc2_128_off'}, \
-        'known_discrepancies 缺条目或多出条目: {}'.format(sorted(d))
-
-    # (a) stem：记录值必须就是 params 里采用的那个，且两个口径的算式对得上
-    stem = d['stem_kernel_3x3_vs_7x7']
-    assert stem['recorded'] == 3 * 3 * 17 * 184 == 28_152
-    # 7×7：表记 153,296，但 49×17×184 精确值是 153,272（表内笔误，多 24）。
-    # 两个口径都必须留着——日后真改 7×7 的人只有靠这条才知道该用哪个。
-    assert stem['stated'] == 153_296, '表记的 7×7 口径被改动'
-    assert stem['stated_exact'] == 7 * 7 * 17 * 184 == 153_272
-    assert stem['stated'] - stem['stated_exact'] == 24, '表内 24 的笔误未记录'
-    assert stem['delta'] == stem['stated'] - stem['recorded'] == 125_144
-    # delta 记的是**表记口径**（含那 24 的笔误），而上方注释里的 +125,120 是
-    # 精确口径的增量。两者必须差恰好 24——否则注释与字段各说各话。
-    assert stem['delta'] - 24 == 153_272 - 28_152 == 125_120, \
-        'stem 的 delta 与「精确口径增量 125,120」对不上（表记多 24）'
-    assert 28_152 + 368 == 28_520, '注释里的 3×3 stem+BN 合计'
-    assert 153_272 + 368 == 153_640, '注释里的 7×7 stem+BN 合计（精确口径）'
-    assert A['params']['stem'] == stem['recorded'] + 368, \
-        'params.stem 应 = 3×3 卷积 + BN，锚点却没采用 recorded 口径'
-    assert '3x3' in A['layout']['stem'].lower(), \
-        '布局未标明 stem 按 3×3 记'
-    assert '作废' in stem['status'] and '153,640' in stem['status'], \
-        'stem 记录的 status 必须写明「改 7×7 则整表作废」这个依赖'
-    # (a) 已定案：走规则第③支，结论来自用户裁决而不是算术
-    assert stem['resolution'] == 'resolved_by_user_ruling' \
-        and stem['voided'] == 'voided_by_user_ruling' \
-        and stem['ruled_by'].startswith('user_ruling')
-
-    # (b) policy：错的是分项行。stated/recorded 记录的是**同一形状**下的两个值
-    pol = d['policy_fc2_128_off']
-    assert pol['stated'] == 32_896 == 128 * 256 + 128, \
-        '表记的分项行（bias 被误记成 in_features）'
-    assert pol['recorded'] == 33_024 == 128 * 256 + 256, \
-        '同一形状 Linear(128,256) 的唯一精确值'
-    assert pol['delta'] == pol['recorded'] - pol['stated'] == 128
-    # 表头合计不再是被否的一方，而是与修正后的分项和**互相印证**的那个
-    assert pol['total_stated'] == 2_366_730 == A['heads']['policy_params']
-    assert sum([17_856, 4_704, 2_218_112, pol['recorded'], 93_034]) \
-        == pol['total_stated'], '修正后的分项和必须回到表头合计'
-    assert A['total_params'] == A['backbone_total'] + pol['total_stated'] \
-        + A['heads']['value_params'], 'total_params 必须按表头合计而非笔误分项'
-    # 旧裁定（以 2,366,602 为权威）必须已被彻底换掉：那两个数一个都不许出现
-    assert 2_366_602 not in (A['heads']['policy_params'], A['total_params'],
-                             pol['stated'], pol['recorded'], pol['delta'])
-    assert '已裁定' in pol['status'], \
-        '(b) 已被形状的精确算术裁决，status 不该再写「未裁决」'
-
-    # 理由也必须留在锚点的注释里（防止只剩数字、丢掉依赖说明）
-    src = _anchor_source_with_comments()
-    for marker in ('3×3', '7×7', '28,152', '153,296', '153,640', '153,272',
-                   '2,366,730', '33,024', '32,896', 'in_features',
-                   'arbitration_rule', 'known_discrepancies',
-                   '显式裁决', 'per-head'):
-        assert marker in src, '锚点注释里没有记下 {}'.format(marker)
-    # 作废的旧裁定也必须留痕（否则日后有人从 git 里翻出来会以为它有效）
-    assert '2,366,602' in src, '锚点注释未记录被作废的 2,366,602 旧裁定'
-
-
-def test_anchor_v21_is_independent_of_network_code():
-    """ANCHOR_V21 必须是独立字面量常量，不得由 src/networks/** 推导。
-
-    若锚点由被测代码算出，test_v21_budget（P4.2）与本锚点就只是互相
-    印证——两边同时错也照样绿。故对 ANCHOR_V21 的赋值表达式做 AST 断言：
-    只允许字面量节点（Dict/Tuple/List/Constant），连 Name/Call/Attribute/
-    Subscript 都不许有。这比 brief 里「模块没有 src.networks import」的
-    字面读法**更强**且可行——本模块必须合法地 import AlphaGoNet 供
-    measure 用，但锚点一个名字都不许引用，更不许调用模型构造。
-    """
-    path = os.path.join(ROOT, 'scripts', 'search_arch.py')
-    with open(path, encoding='utf-8') as f:
-        tree = ast.parse(f.read())
-    # ① 全模块**恰好一条** Assign 指向该名字（AnnAssign / 第二次赋值都不行）
-    assigns = [st for st in tree.body
-               if isinstance(st, ast.Assign)
-               and any(isinstance(t, ast.Name) and t.id == 'ANCHOR_V21'
-                       for t in st.targets)]
-    assert len(assigns) == 1, \
-        'ANCHOR_V21 必须只有一条模块级赋值，实得 {} 条'.format(len(assigns))
-    node = assigns[0].value
-    assert isinstance(node, ast.Dict), 'ANCHOR_V21 应是字面量 dict'
-    allowed = (ast.Dict, ast.Tuple, ast.List, ast.Constant, ast.UnaryOp,
-               ast.Load)
-    offenders = sorted({type(n).__name__ for n in ast.walk(node)
-                        if not isinstance(n, allowed)})
-    assert not offenders, \
-        'ANCHOR_V21 不是纯字面量，疑似由被测代码推导: {}'.format(offenders)
-    # 兜底：显式点名三类最危险的节点（也含在上面的 offenders 检查里）
-    used = sorted({n.id for n in ast.walk(node) if isinstance(n, ast.Name)})
-    calls = [n for n in ast.walk(node) if isinstance(n, ast.Call)]
-    assert not used and not calls, \
-        'ANCHOR_V21 引用了名字 {} 或调用了 {} 个函数'.format(used, len(calls))
-    # ② 没有任何 Store/Del 的下标或属性写入落在 ANCHOR_V21 上——上面的字面量
-    #    检查只管那一条语句，管不到 `ANCHOR_V21['heads']['policy_params'] = …`
-    #    或 `ANCHOR_V21.update(…)`：这类改写会静默地把锚点调偏（改前无人抓）。
-    #    代码今天是干净的（一条赋值、零改写），本断言是**钉住这条性质**。
-    writes = [type(n).__name__ for n in ast.walk(tree)
-              if isinstance(n, (ast.Subscript, ast.Attribute))
-              and isinstance(n.ctx, (ast.Store, ast.Del))
-              and any(isinstance(v, ast.Name) and v.id == 'ANCHOR_V21'
-                      for v in ast.walk(n.value))]
-    assert not writes, \
-        'ANCHOR_V21 在模块级被改写过（字面量检查管不到这类写入）: {}'.format(writes)
-
-
-def test_anchor_v21_prints_known_discrepancies_in_a_pinned_format(capsys):
-    """`⚠ 已知矛盾` 这条 print 改前**零测试覆盖**，是三处记录点里唯一裸奔的。
-
-    它是把「已知矛盾原样可见」交给 P4.2 审计的唯一凭据：格式一变（字段
-    改名、少打一个数字、status 被截断），矛盾就等于被静默抹掉了。
-    故按行断言：每条 entry 各占一行，行内必须同时出现 id、resolution、带
-    千分位的 stated/recorded/delta、以及 status 全文。⚠ P4.9e 起 resolution
-    也进打印：一条「已定案」和一条「还悬着」在输出里必须长得不一样。
-    """
-    S.main(['--preset', 'v21'])
-    out = capsys.readouterr().out
-    lines = [ln for ln in out.splitlines() if ln.startswith('⚠ 已知矛盾[')]
-    entries = S.ANCHOR_V21['known_discrepancies']
-    assert len(lines) == len(entries) == 2, \
-        '已知矛盾行数不符: {} vs {}'.format(len(lines), len(entries))
-    for x in entries:
-        hit = [ln for ln in lines if ln.startswith('⚠ 已知矛盾[{}]'.format(x['id']))]
-        assert len(hit) == 1, '条目 {} 的行没打出来或重复: {}'.format(x['id'], lines)
-        ln = hit[0]
-        for field in ('stated', 'recorded', 'delta'):
-            assert '{:,}'.format(x[field]) in ln, \
-                '{} 的 {}={:,} 没打出来: {!r}'.format(x['id'], field, x[field], ln)
-        assert x['about'] in ln and x['status'] in ln, \
-            '条目 {} 丢了 about/status: {!r}'.format(x['id'], ln)
-        assert 'resolution={}'.format(x['resolution']) in ln, \
-            '条目 {} 的 resolution 没打出来（已定案/悬着必须一眼可分）: {!r}'.format(
-                x['id'], ln)
-    # 两行落在**不同**分支上，且 stem 那行带的是用户裁决
-    stem_line = next(ln for ln in lines if 'stem_kernel_3x3_vs_7x7' in ln)
-    pol_line = next(ln for ln in lines if 'policy_fc2_128_off' in ln)
-    assert 'resolution=resolved_by_user_ruling' in stem_line
-    assert 'resolution=resolved_by_exact_arithmetic' in pol_line
-    # 已无待裁决条目：**矛盾行**里不该还出现 unresolved（仲裁规则本身要提到
-    # ②那一支的名字，那是规则文本，不是「还有条目悬着」）
-    assert not [ln for ln in lines if 'unresolved' in ln], \
-        '已无待裁决条目，矛盾行里不该再出现 unresolved'
-    # policy 那条的 128 必须双向可见：表记 32,896 / 采 33,024
-    pol = next(x for x in entries if x['id'] == 'policy_fc2_128_off')
-    assert '32,896' in pol_line and '33,024' in pol_line, \
-        'policy 的笔误值与修正值必须都在输出里: {!r}'.format(pol_line)
-    assert pol['delta'] == 128
-    # 作废的 7×7 那一支的代价也得打在行内（复活它的人第一眼就要看见）
-    assert '作废' in stem_line and '6,683,816' in stem_line
-    # 仲裁规则也被打出来（v21 分支是给人看的表，规则不该只活在源码里）
-    assert '仲裁规则' in out and S.ANCHOR_V21['arbitration_rule'] in out, \
-        '打印表没有陈列仲裁规则'
-
-
-def test_anchor_v21_print_tolerates_a_new_params_key(capsys, monkeypatch):
-    """params 每加一个键都必须能打出来——这张表就是要长的。
-
-    改前是 `label[k]` 硬索引：下一个结构块加进来（params 多一项）就直接
-    KeyError 崩掉整张表。现在缺键退回键名本身。合计仍当场自洽核算，故把
-    backbone_total 一起加平，MISMATCH 不得出现。
-    """
-    grown = dict(S.ANCHOR_V21,
-                 params={**S.ANCHOR_V21['params'], 'future_block': 1_234})
-    grown['backbone_total'] = S.ANCHOR_V21['backbone_total'] + 1_234
-    grown['total_params'] = grown['backbone_total'] + \
-        S.ANCHOR_V21['heads']['policy_params'] + S.ANCHOR_V21['heads']['value_params']
-    monkeypatch.setattr(S, 'ANCHOR_V21', grown)
-    S.main(['--preset', 'v21'])
-    out = capsys.readouterr().out
-    assert 'future_block' in out and '1,234' in out, \
-        'params 的新键没有被打出来（label 缺键时应退回键名）'
-    assert 'MISMATCH' not in out, '加键后合计核算没跟上'
-    # 既有六行仍逐行在场（没有因新键被挤掉）
-    for k in S.ANCHOR_V21['params']:
-        assert '{:,}'.format(S.ANCHOR_V21['params'][k]) in out, \
-            '加键后原有分项 {} 丢失'.format(k)
+    assert not hasattr(S, 'ANCHOR_V21'), 'ANCHOR_V21 不该复活（v21 结构已删除）'
+    assert not hasattr(S, 'run_anchor_v21'), 'run_anchor_v21 不该复活'
+    assert 'v21' not in S.PRESET_CHOICES, 'v21 不该回到 --preset choices'
+    with pytest.raises(SystemExit):
+        # argparse 对非法 choice 走 parser.error -> SystemExit(2)
+        S.build_parser().parse_args(['--preset', 'v21'])
+    # SE 是它的接任者：现行训练结构在 choices 里
+    assert hasattr(S, 'SE_CFG')
+    assert 'se' in S.PRESET_CHOICES
 

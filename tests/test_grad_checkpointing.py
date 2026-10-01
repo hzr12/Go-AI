@@ -1,11 +1,12 @@
-"""P4.6b —— 梯度检查点（ResBlocks 必开 / Mamba·Transformer 建议开 / CrossAttnRes 关）。
+"""P4.6b —— 梯度检查点（ResBlocks 必开 / Transformer 建议开 / legacy 默认关）。
 
-本文件同时是**测量台**：v21 的主干容器归 P4.2 建（`V21_CFG` / `AlphaGoNet`），
-所以这里按 `task-p4-1-report.md` §7.1 的接线契约复刻了一份等价物
-`V21BackboneHarness`，既是测试夹具也是 §5 实测的被测对象。
-报告见 `.superpowers/sdd/2026-09-25-v21-roadmap/task-p4-6b-report.md`。
-
-只跑本文件 + `tests/test_arch_v21_blocks.py` + `tests/test_npu_graph_compile.py`。
+v21 被硬删除后（`MambaLTI` / `CrossAttnRes` / `V21_CFG` / `build_v21_net` 连同
+`GC_MAMBA` / `GC_CROSS_ATTN_RES` 两个 kind 一并退役），本文件的夹具已改接到
+**存活架构**上：`SegBackboneHarness` = stem + [ResBlock ×8] + [TransformerBlock
+×2] + out，两段 kind 为 `res` / `transformer`；旧路径（`SharedBackbone` +
+`GC_LEGACY`）与 KataGo SE-bottleneck 的预算锚（`KATAGO_SE_CFG`）契约在本文件
+内一并钉住。原测量报告见
+`.superpowers/sdd/2026-09-25-v21-roadmap/task-p4-6b-report.md`（历史）。
 """
 import contextlib
 import os
@@ -22,18 +23,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+from scripts.train_sft import KATAGO_SE_CFG, build_katago_se_net  # noqa: E402
 from src.networks.backbone import (  # noqa: E402
-    GC_CROSS_ATTN_RES,
     GC_LEGACY,
-    GC_MAMBA,
     GC_PER_BLOCK_DEFAULT,
     GC_RES,
     GC_TRANSFORMER,
-    V21_GRAD_CHECKPOINT_DEFAULTS,
+    GRAD_CHECKPOINT_DEFAULTS,
     ConvNeXtBlock,
-    CrossAttnRes,
     GradCheckpointMixin,
-    MambaLTI,
     ResBlock,
     SharedBackbone,
     TransformerBlock,
@@ -42,55 +40,46 @@ from src.networks.backbone import (  # noqa: E402
     compiled_module_paths,
     run_grad_segment,
 )
-from src.networks.policy_network import FCPolicyHead  # noqa: E402
-from src.networks.value_network import FCValueHead  # noqa: E402
 
 CH = 184
 BOARD = 19
-IN_CH = 17
+IN_CH = 12
 DROPOUT = 0.1
-EXPECT_TOTAL = 9_067_443
-EXPECT_BACKBONE = 6_558_696
-N_RES, N_MAMBA, N_TRANS, N_CROSS = 8, 4, 2, 2
+N_RES, N_TRANS = 8, 2
 
 # 抽头下标（0-based，`tap_positions` 取的是**该块的输出**，不是下一个块的输入）：
 #   s1 = ResBlock #1 的输出  -> 段内下标 0
 #   s5 = ResBlock #5 的输出  -> 段内下标 4
-#   s9 = MambaLTI #1 的输出  -> 段内下标 0（P4.1 §7.3 读法 A/B：stem 不计数）
-S1_POS, S5_POS, S9_POS = 0, 4, 0
+S1_POS, S5_POS = 0, 4
 RES_SLICE = slice(0, N_RES)
-MAMBA_SLICE = slice(N_RES, N_RES + N_MAMBA)
-TRANS_SLICE = slice(N_RES + N_MAMBA, N_RES + N_MAMBA + N_TRANS)
-CROSS_SLICE = slice(N_RES + N_MAMBA + N_TRANS, None)
+TRANS_SLICE = slice(N_RES, None)
 
 
 def _n(mod):
     return sum(p.numel() for p in mod.parameters())
 
 
-class V21BackboneHarness(GradCheckpointMixin, nn.Module):
-    """P4.2 将要建的 v21 主干的等价物：stem + 8/4/2/2 段 + out。
+class SegBackboneHarness(GradCheckpointMixin, nn.Module):
+    """存活块类的主干夹具：stem + [ResBlock ×8] + [TransformerBlock ×2] + out。
 
-    段划分（= 报告 §2 的 (b) 粒度：同类型连续块合并成一段）：
-        stem → [ResBlock ×8] → [MambaLTI ×4] → [TransformerBlock ×2]
-             → [CrossAttnRes ×2] → out
-    三路抽头 `s1/s5/s9` 用 `run_segment(..., tap_positions=...)` 从段内取，
-    **不**切开段边界。
+    段划分（同类型连续块合并成一段，粒度按 kind 查 `GC_PER_BLOCK_DEFAULT`）：
+        stem → [ResBlock × N_RES] → [TransformerBlock × N_TRANS] → out
+    两段 kind 分别是 `res` / `transformer`；v21 的 `mamba` / `cross_attn_res`
+    随 `MambaLTI` / `CrossAttnRes` 一起硬删除，其 kind 已从 mixin 退役。
+    抽头 `s1/s5` 用 `run_segment(..., tap_positions=...)` 从 res 段内取，
+    **不**切开段边界（抽头在 forward 里不被消费 —— 守的是「额外出参」路径）。
     """
 
     def __init__(self, in_channels=IN_CH, channels=CH, dropout=DROPOUT,
-                 n_res=N_RES, n_mamba=N_MAMBA, n_trans=N_TRANS, n_cross=N_CROSS):
+                 n_res=N_RES, n_trans=N_TRANS):
         super().__init__()
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels))
         blocks = ([ResBlock(channels) for _ in range(n_res)]
-                  + [MambaLTI(channels) for _ in range(n_mamba)]
-                  + [TransformerBlock(channels, ffn_hidden=240, attn_dropout=dropout)
-                     for _ in range(n_trans)]
-                  + [CrossAttnRes(channels, tap_channels=(channels,) * 3,
-                                  ffn_hidden=240, attn_dropout=dropout)
-                     for _ in range(n_cross)])
+                  + [TransformerBlock(channels, ffn_hidden=240,
+                                      attn_dropout=dropout)
+                     for _ in range(n_trans)])
         self.blocks = nn.ModuleList(blocks)
         self.out = nn.Sequential(
             nn.Conv2d(channels, channels, 1, bias=False),
@@ -99,46 +88,10 @@ class V21BackboneHarness(GradCheckpointMixin, nn.Module):
 
     def forward(self, x):
         x = F.relu(self.stem(x))
-        x, taps = self.run_segment(self.blocks[RES_SLICE], (x,), GC_RES,
-                                   tap_positions=(S1_POS, S5_POS))
-        s1, s5 = taps
-        x, taps = self.run_segment(self.blocks[MAMBA_SLICE], (x,), GC_MAMBA,
-                                   tap_positions=(S9_POS,))
-        s9 = taps[0]
+        x, _s1_s5 = self.run_segment(self.blocks[RES_SLICE], (x,), GC_RES,
+                                     tap_positions=(S1_POS, S5_POS))
         x, _ = self.run_segment(self.blocks[TRANS_SLICE], (x,), GC_TRANSFORMER)
-        x, _ = self.run_segment(self.blocks[CROSS_SLICE], (x, (s1, s5, s9)),
-                                GC_CROSS_ATTN_RES)
         return F.relu(self.out(x))
-
-
-class V21Net(GradCheckpointMixin, nn.Module):
-    """主干 + 两个 v21 头，全网 9,067,443。"""
-
-    def __init__(self, **kw):
-        super().__init__()
-        self.backbone = V21BackboneHarness(**kw)
-        self.policy = FCPolicyHead(CH, board_size=BOARD)
-        self.value = FCValueHead(CH)
-        self._init_grad_checkpointing()
-
-    def forward(self, x):
-        h = self.backbone(x)
-        return self.policy(h), self.value(h)
-
-    def run_segment(self, blocks, args, kind, tap_positions=(), per_block=None,
-                    uncapped_last=False):
-        return run_grad_segment(blocks, args, use_checkpoint=False,
-                                tap_positions=tap_positions, per_block=per_block,
-                                uncapped_last=uncapped_last,
-                                kind=kind, guard_root=None)
-
-    def grad_checkpointing_for(self, kind):
-        return self.backbone.grad_checkpointing_for(kind)
-
-    def set_grad_checkpointing(self, enabled=None, **kinds):
-        self.backbone.set_grad_checkpointing(enabled, **kinds)
-        super(V21Net, self).set_grad_checkpointing(enabled, **kinds)
-        return self
 
 
 def _x(batch=1, board=BOARD, seed=20260927, ch=IN_CH):
@@ -147,10 +100,10 @@ def _x(batch=1, board=BOARD, seed=20260927, ch=IN_CH):
 
 
 def _small(**kw):
-    """小尺寸 v21（board=5、通道 24）—— 语义测试用，跑得快。"""
+    """小尺寸夹具（board=5、通道 24）—— 语义测试用，跑得快。"""
     kw.setdefault('in_channels', 8)
     kw.setdefault('channels', 24)
-    return V21BackboneHarness(**kw)
+    return SegBackboneHarness(**kw)
 
 
 def _reset_bn(mod):
@@ -446,67 +399,23 @@ def test_bn_guard_is_actually_entered_only_on_recompute():
         o.sum().backward()
     finally:
         _BatchNormStatGuard.__enter__ = orig
-    # 被检查点的**块**数（不是段数！）：2026-09-30 起 v21 四个 kind 都是**逐块**
-    # 粒度（= V18 旧机制，见 GC_PER_BLOCK_DEFAULT 的「粒度改判」），所以守卫
-    # 在重算期进入的次数 = 被检查点的块数。cross_attn_res 不含 BN，守卫对它空转，
-    # 但「每个被检查点的段进一次」这个口径不变。
-    slices = {GC_RES: RES_SLICE, GC_MAMBA: MAMBA_SLICE,
-              GC_TRANSFORMER: TRANS_SLICE, GC_CROSS_ATTN_RES: CROSS_SLICE}
+    # 被检查点的**块**数（不是段数！）：`GC_PER_BLOCK_DEFAULT` 里 res 与
+    # transformer 都是**逐块**粒度（= V18 旧机制），所以守卫在重算期进入的
+    # 次数 = 被检查点的块数。TransformerBlock 不含 BN，守卫对它空转，
+    # 但「每个被检查点的块进一次」这个口径不变。
+    slices = {GC_RES: RES_SLICE, GC_TRANSFORMER: TRANS_SLICE}
     n_ckpt = sum(len(m.blocks[sl]) for k, sl in slices.items()
                  if m.grad_checkpointing_for(k))
     assert len(seen) == n_ckpt, \
-        '重算期间守卫进入次数应为「被检查点的段数」%d，实得 %d' % (n_ckpt, len(seen))
+        '重算期间守卫进入次数应为「被检查点的块数」%d，实得 %d' % (n_ckpt, len(seen))
 
 
 # ============================================================================ #
-# 2. Mamba-2 的 A_log 梯度（§4.1）
+# 2. （原 Mamba-2 A_log 梯度 / oracle 用例已删除）
 # ============================================================================ #
-def test_A_log_grad_nonzero_and_equal_under_checkpointing():
-    m = _small()
-    _reset_bn(m)
-    x = _x(batch=2, board=5, seed=13, ch=8)
-    a_names = [n for n, _ in m.named_parameters() if n.endswith('A_log')]
-
-    def a_grad(on):
-        m.set_grad_checkpointing(on)
-        for p in m.parameters():
-            p.grad = None
-        torch.manual_seed(17)
-        o = m(x)
-        o.sum().backward()
-        return {n: p.grad.detach().clone() for n, p in m.named_parameters()
-                if n.endswith('A_log')}
-
-    off = a_grad(False)
-    on = a_grad(True)
-    assert len(off) == N_MAMBA and len(on) == N_MAMBA, \
-        '预期 %d 个 A_log，实得 %d' % (N_MAMBA, len(on))
-    for n in a_names:
-        assert off[n] is not None and on[n] is not None, '%s 梯度为 None' % n
-        assert float(on[n].abs().max()) > 0.0, \
-            '%s 梯度恒零 —— A_log 是 Mamba-2 唯一学到衰减的入口，不能丢' % n
-        assert torch.equal(off[n], on[n]), \
-            '%s: 开/关检查点的梯度不一致 max|Δ|=%.3e' % (n, (off[n] - on[n]).abs().max())
-
-
-def test_mamba_checkpointed_path_never_calls_the_sequential_oracle():
-    """§4.4：检查点路径不得引用测试专用 oracle。"""
-    m = _small()
-    m.train()
-    m.set_grad_checkpointing(True)
-    calls = []
-    for blk in m.blocks:
-        if isinstance(blk, MambaLTI):
-            orig = blk._sequential_scan_oracle
-
-            def spy(*a, __o=orig, __b=blk):
-                calls.append(__b)
-                return __o(*a)
-            blk._sequential_scan_oracle = spy
-    o = m(_x(batch=1, board=5, seed=2, ch=8))
-    o.sum().backward()
-    assert calls == [], '检查点路径调用了 _sequential_scan_oracle %d 次' % len(calls)
-
+# 已删除：test_A_log_grad_nonzero_and_equal_under_checkpointing 与
+# test_mamba_checkpointed_path_never_calls_the_sequential_oracle —— v21 被硬
+# 删除（MambaLTI / A_log / _sequential_scan_oracle 均不复存在），两条用例无对象。
 
 # ============================================================================ #
 # 3. dropout 掩码在重算下可复现（§4.3）
@@ -520,10 +429,11 @@ def test_dropout_mask_reproduced_under_checkpointing():
     28 个测试全绿 —— 所以这里比的是 fwd+bwd，并且先断言「重算确实发生过」
     （否则「相等」可能是没重算换来的）。
     """
-    m = V21BackboneHarness(in_channels=8, channels=24, dropout=0.3)
+    m = SegBackboneHarness(in_channels=8, channels=24, dropout=0.3)
     _reset_bn(m)
     x = _x(batch=2, board=5, seed=23, ch=8)
-    assert any(isinstance(b, (TransformerBlock, CrossAttnRes)) for b in m.blocks)
+    assert any(isinstance(b, TransformerBlock) for b in m.blocks), \
+        '夹具里没有带 dropout 的 TransformerBlock —— 本测试会空转'
 
     def fwd_bwd(on):
         m.set_grad_checkpointing(on)
@@ -562,7 +472,7 @@ def test_dropout_mask_reproduced_under_checkpointing():
 
 
 def test_eval_mode_zero_dropout_regardless_of_switch():
-    m = V21BackboneHarness(in_channels=8, channels=24, dropout=0.3)
+    m = SegBackboneHarness(in_channels=8, channels=24, dropout=0.3)
     _reset_bn(m)
     x = _x(batch=2, board=5, seed=29, ch=8)
     m.train()
@@ -588,7 +498,7 @@ def test_eval_mode_is_unaffected():
     x = _x(batch=2, board=5, seed=31, ch=8)
     bn_before = _snap_bn(m)
     m.eval()
-    for kind in (GC_RES, GC_MAMBA, GC_TRANSFORMER, GC_CROSS_ATTN_RES):
+    for kind in (GC_RES, GC_TRANSFORMER, GC_LEGACY):
         assert not m.grad_checkpointing_for(kind), \
             'eval 下 %s 段仍会走检查点' % kind
     m.set_grad_checkpointing(False)
@@ -624,20 +534,16 @@ def test_inference_zero_overhead():
 # 5. 开关形态
 # ============================================================================ #
 def test_defaults_match_the_ruling():
-    assert V21_GRAD_CHECKPOINT_DEFAULTS == {
-        GC_RES: True, GC_MAMBA: True, GC_TRANSFORMER: True,
-        GC_CROSS_ATTN_RES: True, GC_LEGACY: False,
-    }, ('默认值与用户裁决不符（2026-09-27 三段必开/建议开 + 2026-09-30「全用GC」'
-        '把 cross_attn_res 也打开；legacy 因 D5 仍默认关）：%s'
-        % V21_GRAD_CHECKPOINT_DEFAULTS)
+    assert GRAD_CHECKPOINT_DEFAULTS == {
+        GC_RES: True, GC_TRANSFORMER: True, GC_LEGACY: False,
+    }, ('默认值与裁决不符（res/transformer 必开；legacy 因 D5 仍默认关；'
+        'v21 的 mamba / cross_attn_res 随硬删除从 kind 表退役）：%s'
+        % GRAD_CHECKPOINT_DEFAULTS)
     m = _small()
     assert m.grad_checkpointing is True
-    assert m.grad_checkpointing_kinds() == V21_GRAD_CHECKPOINT_DEFAULTS
+    assert m.grad_checkpointing_kinds() == GRAD_CHECKPOINT_DEFAULTS
     assert m.grad_checkpointing_for(GC_RES) is True
-    assert m.grad_checkpointing_for(GC_MAMBA) is True
     assert m.grad_checkpointing_for(GC_TRANSFORMER) is True
-    # 2026-09-30 起 cross_attn_res 也默认开（原来这里是 False）
-    assert m.grad_checkpointing_for(GC_CROSS_ATTN_RES) is True
     assert m.grad_checkpointing_for(GC_LEGACY) is False, \
         'legacy 必须仍默认关（D5：不得改变旧路径行为）'
     with pytest.raises(ValueError):
@@ -657,12 +563,12 @@ def test_switch_without_rebuilding_the_model():
     m.set_grad_checkpointing(True)
     torch.manual_seed(3)
     b = m(x)
-    m.set_grad_checkpointing(mamba=False)
+    m.set_grad_checkpointing(transformer=False)
     torch.manual_seed(3)
     c = m(x)
     assert torch.equal(a, b) and torch.equal(a, c)
     assert m.grad_checkpointing is True, '只给逐类型覆盖时总开关不该被动'
-    assert m.grad_checkpointing_for(GC_MAMBA) is False
+    assert m.grad_checkpointing_for(GC_TRANSFORMER) is False
     assert m.grad_checkpointing_for(GC_RES) is True
     m.set_grad_checkpointing(False)
     assert m.grad_checkpointing is False
@@ -670,11 +576,11 @@ def test_switch_without_rebuilding_the_model():
 
 
 class _Wrapper(GradCheckpointMixin, nn.Module):
-    """父级持有 mixin、`forward` 只调子模块 —— 正是 P4.2 的 `AlphaGoNet` 形状。"""
+    """父级持有 mixin、`forward` 只调子模块 —— 正是 `AlphaGoNet` 的形状。"""
 
     def __init__(self):
         super().__init__()
-        self.backbone = V21BackboneHarness(in_channels=8, channels=24)
+        self.backbone = SegBackboneHarness(in_channels=8, channels=24)
 
     def forward(self, x):
         return self.backbone(x)
@@ -734,7 +640,7 @@ def test_state_dict_unaffected_by_switch():
     keys_before = set(before)
     m.set_grad_checkpointing(False)
     mid = {k: v.clone() for k, v in m.state_dict().items()}
-    m.set_grad_checkpointing(True, res=False, mamba=True, transformer=False)
+    m.set_grad_checkpointing(True, res=False, transformer=True)
     after = m.state_dict()
     assert set(after) == keys_before, '开关改了 state_dict 的键集合'
     for k in keys_before:
@@ -746,18 +652,29 @@ def test_state_dict_unaffected_by_switch():
 
 
 def test_param_count_unchanged():
-    net = V21Net()
-    assert _n(net.backbone) == EXPECT_BACKBONE, \
-        '主干 %d != %d' % (_n(net.backbone), EXPECT_BACKBONE)
-    assert _n(net.policy) == 2_366_730
-    assert _n(net.value) == 142_017
-    assert _n(net) == EXPECT_TOTAL, '全网 %d != %d' % (_n(net), EXPECT_TOTAL)
-    m2 = V21Net()
-    m2.set_grad_checkpointing(False)
-    assert _n(m2) == EXPECT_TOTAL
+    """开关不动参数；全网预算锚 = `KATAGO_SE_CFG` 的硬数（存活生产配置）。
+
+    v21 硬删除后原 9,067,443 锚点随之退役 —— 同一条契约（逐子模块参数量
+    对账 + 开关切换前后逐位不变 + state_dict 往返）改钉当前训练配置的
+    `params_backbone` / `params_total`。
+    """
+    net, cfg = build_katago_se_net(
+        action_size=362, grad_checkpoint=KATAGO_SE_CFG['grad_checkpoint'])
+    assert cfg['params_backbone'] == KATAGO_SE_CFG['params_backbone']
+    assert cfg['params_total'] == KATAGO_SE_CFG['params_total']
+    assert _n(net.backbone) == cfg['params_backbone'], \
+        '主干 %d != %d' % (_n(net.backbone), cfg['params_backbone'])
+    assert _n(net) == cfg['params_total'], \
+        '全网 %d != %d' % (_n(net), cfg['params_total'])
+    net.backbone.set_grad_checkpointing(False)
+    assert _n(net) == cfg['params_total']
     sd = net.state_dict()
+    m2, _ = build_katago_se_net(action_size=362, grad_checkpoint=0)
     m2.load_state_dict(sd)
-    assert _n(m2) == EXPECT_TOTAL
+    assert _n(m2) == cfg['params_total']
+    # 开关属性既不是 parameter 也不是 buffer
+    assert not any('grad_checkpoint' in n for n, _ in m2.named_parameters())
+    assert not any('grad_checkpoint' in n for n, _ in m2.named_buffers())
 
 
 # ============================================================================ #
@@ -811,10 +728,8 @@ def test_each_block_type_is_covered():
     _reset_bn(m)
     x = _x(batch=1, board=5, seed=51, ch=8)
     m.train()
-    segs = {GC_RES: RES_SLICE, GC_MAMBA: MAMBA_SLICE,
-            GC_TRANSFORMER: TRANS_SLICE, GC_CROSS_ATTN_RES: CROSS_SLICE}
-    # cross_attn_res 自 2026-09-30「全用GC」起也在覆盖集合内
-    enabled = (GC_RES, GC_MAMBA, GC_TRANSFORMER, GC_CROSS_ATTN_RES)
+    segs = {GC_RES: RES_SLICE, GC_TRANSFORMER: TRANS_SLICE}
+    enabled = (GC_RES, GC_TRANSFORMER)
 
     def run(kinds):
         m.set_grad_checkpointing(True, **kinds)
@@ -824,11 +739,9 @@ def test_each_block_type_is_covered():
             m(x).sum().backward()
         return counts
 
-    # 「未开检查点」这行必须把四个 kind **全部**显式关掉：cross_attn_res 的
-    # 默认自 2026-09-30「全用GC」起是 True，只关前三个会让它接着走检查点，
-    # 于是这行基线不再是真正的基线（实测 CrossAttnRes.14 跑了 2 次）。
-    off = run(dict(res=False, mamba=False, transformer=False,
-                   cross_attn_res=False))
+    # 「未开检查点」这行必须把两个 kind **全部**显式关掉：默认值都是 True，
+    # 只关一个会让另一段接着走检查点，于是这行基线不再是真正的基线。
+    off = run(dict(res=False, transformer=False))
     assert set(off.values()) == {1}, '未开检查点时每块应只跑 1 次：%s' % off
 
     on = run({})
@@ -848,36 +761,18 @@ def test_each_block_type_is_covered():
                 '%s 段并非每块都被重算：%s' % (kind, {n: on[n] for n in names})
 
 
-def test_cross_attn_res_can_be_turned_on_and_is_then_covered():
-    """cross_attn_res 段：默认已开（2026-09-30「全用GC」），仍可显式开关。
-
-    逐块粒度下两块 CrossAttnRes 都是独立 checkpoint 段 ⇒ 两块都必须重算
-    （段级 + early_stop 时只有前一块会重算，那正是本条要区分的两种语义）。
-    """
-    m = _small()
-    _reset_bn(m)
-    x = _x(batch=1, board=5, seed=53, ch=8)
-    m.train()
-    for on in (True, False):
-        m.set_grad_checkpointing(True, cross_attn_res=on)
-        with _count_block_forwards(m.blocks) as counts:
-            torch.manual_seed(4)
-            m(x).sum().backward()
-        want = 2 if on else 1
-        for i in range(CROSS_SLICE.start, len(m.blocks)):
-            name = 'CrossAttnRes.%d' % i
-            assert counts[name] == want, \
-                'cross_attn_res=%s 时 %s 前向 %d 次（期望 %d）' % (
-                    on, name, counts[name], want)
+# 已删除：test_cross_attn_res_can_be_turned_on_and_is_then_covered ——
+# v21 被硬删除（CrossAttnRes / GC_CROSS_ATTN_RES 不复存在），用例无对象。
 
 
 def test_granularity_is_per_block_and_segment_keeps_its_advantage():
-    """粒度：**逐块**（2026-09-30 改判 = V18 旧机制），但两种粒度的差别要说准。
+    """粒度：**逐块**（= V18 旧机制），但两种粒度的差别要说准。
 
     逐块：每块一个 checkpoint 段 ⇒ 留 n−1 个边界激活（存储多），**重算峰值按块**
     计（省得多）。
     段级：整段一个 checkpoint ⇒ 只留 1 个边界激活（存储少），但**重算时整段内部
-    同时活着**，峰值按段计 —— v21 的 Mamba 段 4 块，这正是 4 卡 OOM 的成因。
+    同时活着**，峰值按段计 —— 段越长越危险（v21 时代的 4 块 Mamba 段正是 4 卡
+    OOM 成因，该 kind 已随硬删除退役）。
 
     这里钉住「段级仍然更省**存储**」这一条（它是段级唯一剩下的优势，别在改判时
     把它也一起否掉），重算峰值那一面由 `tmp/measure_granularity.py` 的实测负责
@@ -904,9 +799,9 @@ def test_granularity_is_per_block_and_segment_keeps_its_advantage():
     assert (b_blk - b_mrg) >= (N_RES - 1) * elem * 0.5, \
         ('合并段比逐块段只省了 %d 字节，理论下限约 %d（少留 %d 个边界激活）'
          % (b_blk - b_mrg, (N_RES - 1) * elem, N_RES - 1))
-    # 改判的落点：v21 的默认粒度必须是**逐块**，否则 4 卡会 OOM
+    # 改判的落点：存活 kind 的默认粒度必须是**逐块**（否则 4 卡会 OOM）
     from src.networks.backbone import GC_PER_BLOCK_DEFAULT
-    for kind in (GC_RES, GC_MAMBA, GC_TRANSFORMER, GC_CROSS_ATTN_RES):
+    for kind in (GC_RES, GC_TRANSFORMER):
         assert GC_PER_BLOCK_DEFAULT.get(kind) is True, \
             '%s 段的默认粒度必须是逐块（V18 旧机制），实得 %r' % (
                 kind, GC_PER_BLOCK_DEFAULT.get(kind))
@@ -1085,11 +980,26 @@ def test_convnext_legacy_path_default_off():
 # 9. 段内 BN 与 shape 校验
 # ============================================================================ #
 def test_run_grad_segment_multi_input_signature():
-    """`CrossAttnRes` 那种 `(x, taps)` 双输入段。"""
+    """`(x, taps)` 双输入段 —— `run_grad_segment` 公开签名仍承诺的能力。
+
+    原消费者 `CrossAttnRes` 随 v21 硬删除，但 `_segment_runner` 的「段内不必
+    同签名：单输入收 `(x,)`、多输入收 `(x, taps)`」仍是公开契约（docstring +
+    返回张量只替换第一个实参的规则），所以用本地夹具块守住它。
+    """
+    class _MultiIn(nn.Module):
+        def __init__(self, ch):
+            super().__init__()
+            self.c1 = nn.Conv2d(ch, ch, 3, padding=1)
+            self.c2 = nn.Conv2d(ch, ch, 1)
+
+        def forward(self, x, taps):
+            # 三路 taps 都参与计算：若实现只传 (x,)，这里就会 TypeError
+            return self.c1(x) + self.c2(taps[0]) + taps[2]
+
     m = _small()
     _reset_bn(m)
     stem_out = F.relu(m.stem(_x(batch=1, board=5, seed=67, ch=8)))
-    seg = m.blocks[CROSS_SLICE]
+    seg = [_MultiIn(stem_out.shape[1]) for _ in range(2)]
     m.train()
     m.set_grad_checkpointing(False)
     torch.manual_seed(9)
@@ -1210,7 +1120,7 @@ def test_legacy_granularity_is_pinned_to_checkpoint_sequential():
     # 常量面再钉一层（调用次数是对行为，常量是对默认表）
     assert GC_PER_BLOCK_DEFAULT[GC_LEGACY] is True, \
         'legacy 粒度默认表被改（并段会让保留量差 17×，k 失效）'
-    assert V21_GRAD_CHECKPOINT_DEFAULTS[GC_LEGACY] is False, \
+    assert GRAD_CHECKPOINT_DEFAULTS[GC_LEGACY] is False, \
         'legacy 默认必须关（D5：不传 use_checkpoint 就是旧行为）'
 
 
@@ -1273,13 +1183,13 @@ def test_use_checkpoint_property_equals_effective_legacy_state():
 
 def test_mixin_precedes_nn_module_in_mro():
     """B5：mixin 必须排在 `nn.Module` **之前**（`run_segment` 等通用名防劫持）。"""
-    for cls in (SharedBackbone, V21BackboneHarness, V21Net):
+    for cls in (SharedBackbone, SegBackboneHarness):
         mro = cls.__mro__
         assert mro.index(GradCheckpointMixin) < mro.index(nn.Module), \
             '%s 的 MRO 里 mixin 落到 nn.Module 之后（B5 回归）' % cls.__name__
-    # 解析到 mixin 的实现（`V21Net` 例外：它**有意**覆写 run_segment 强制
-    # use_checkpoint=False，是 switch-owner 测试的夹具，不算 B5）
-    for cls in (SharedBackbone, V21BackboneHarness):
+    # 解析到 mixin 的实现（原 `V21Net` 夹具的 run_segment 覆写随硬删除一并退役，
+    # 现存两个挂载点都不覆写）
+    for cls in (SharedBackbone, SegBackboneHarness):
         assert cls.run_segment is GradCheckpointMixin.run_segment, \
             '%s.run_segment 没解析到 mixin 的实现' % cls.__name__
     assert 'run_segment' not in vars(nn.Module), \
@@ -1311,32 +1221,19 @@ def measure(batch=1, board=BOARD, channels=CH, in_channels=IN_CH,
     * `cfg_names`：只跑其中若干个配置（B=8 全跑要 ~7 min，用它切成两半，
       每条命令都能压在 8 分钟以内）。
     """
-    m = V21BackboneHarness(in_channels=in_channels, channels=channels)
+    m = SegBackboneHarness(in_channels=in_channels, channels=channels)
     _reset_bn(m)
     x = _x(batch=batch, board=board, seed=20260927, ch=in_channels)
     m.train()
     params = [p for p in m.parameters() if p.requires_grad]
     configs = [
-        ('off/all', {'res': False, 'mamba': False, 'transformer': False,
-                     'cross_attn_res': False}),
-        # ⚠ 每行都**显式**写全四个 kind：cross_attn_res 的默认在 2026-09-30
-        # 从 False 改成了 True，留空会继承默认值 ⇒ 行的标签就不再等于实际组合。
-        ('on/res', {'res': True, 'mamba': False, 'transformer': False,
-                    'cross_attn_res': False}),
-        ('on/mamba', {'res': False, 'mamba': True, 'transformer': False,
-                      'cross_attn_res': False}),
-        ('on/trans', {'res': False, 'mamba': False, 'transformer': True,
-                      'cross_attn_res': False}),
-        ('on/res+mamba', {'res': True, 'mamba': True, 'transformer': False,
-                          'cross_attn_res': False}),
-        ('on/res+trans', {'res': True, 'mamba': False, 'transformer': True,
-                          'cross_attn_res': False}),
-        ('on/mamba+trans', {'res': False, 'mamba': True, 'transformer': True,
-                            'cross_attn_res': False}),
-        ('on/3seg', {'res': True, 'mamba': True, 'transformer': True,
-                     'cross_attn_res': False}),
-        ('on/all4', {'res': True, 'mamba': True, 'transformer': True,
-                     'cross_attn_res': True}),
+        ('off/all', {'res': False, 'transformer': False}),
+        # ⚠ 每行都**显式**写全 kind：res / transformer 的默认都是 True，留空会
+        # 继承默认值 ⇒ 行的标签就不再等于实际组合（v21 时代 cross_attn_res
+        # 默认值翻转踩过同一个坑）。
+        ('on/res', {'res': True, 'transformer': False}),
+        ('on/trans', {'res': False, 'transformer': True}),
+        ('on/all', {'res': True, 'transformer': True}),
     ]
     rows = []
     for name, kinds in configs:
@@ -1380,44 +1277,41 @@ def measure(batch=1, board=BOARD, channels=CH, in_channels=IN_CH,
         for p in params:
             p.grad = None
         rows.append(row)
-    m.set_grad_checkpointing(False, res=False, mamba=False, transformer=False,
-                             cross_attn_res=False)
+    m.set_grad_checkpointing(False, res=False, transformer=False)
     return rows
 
 
 def test_measurement_ordering_is_stable():
-    """非空转：真实尺寸（B=1 / 19 路 / 184 通道）下各段的激活量同一量级。
+    """非空转：真实尺寸（B=1 / 19 路 / 184 通道）下两段的激活量同一量级。
 
-    ⚠ 2026-09-30 改判：这条断言**原来**是「Mamba 段省下的激活 > 5× ResBlock
-    段」，用来反驳「ResBlocks 占 74% 参数 ⇒ 必须开」。块内检查点（`_scan_chunk`
-    走 `checkpoint`，4 卡 OOM 的第二个原因）落地后，那个前提**不再成立**：
-    Mamba 的 `u`/`M`/`h` 不再随段级开关被留住，Mamba 与 ResBlock 的保留量掉到
-    同一量级（实测 B=1：res 28.79 / mamba 19.04 / trans 19.54 MB）。
-
-    换成钉住两条**当前真实**的不变量：
-      1. 三段的节省都为正（段级检查点仍然有效、仍然值得开）；
-      2. 全开 < 3 段全开 < 全关（单调），且 cross_attn_res 纳入后继续下降。
-    「Mamba 段特别吃激活」这条经验现在只对**未做块内检查点**的实现成立，
-    由 `tests/test_mamba_drive_memory.py` 单独钉住。
+    v21 硬删除（MambaLTI / CrossAttnRes 及其 kind 退役）后钉住三条当前真实的
+    不变量：
+      1. res / transformer 段的节省都为正（检查点仍然有效、仍然值得开）；
+      2. 两段的节省量同一量级（≤3×，不许某一段悄悄退化成零贡献）；
+      3. 全开 < 任一单开 < 全关（单调）。
+    （原「Mamba 段省下 >5× ResBlock 段」及 2026-09-30 的改判说明随 MambaLTI
+    一起退役；「块内检查点下 Mamba 不再是异类」的历史实测见
+    `.superpowers/sdd/2026-09-25-v21-roadmap/task-p4-6b-report.md`。）
     """
     rows = measure(batch=1, board=BOARD, channels=CH, in_channels=IN_CH,
                    do_timing=False, do_mem=False)
     by = {r['cfg']: r for r in rows}
     base = by['off/all']['saved_mb']
     saved = {k: round(base - by['on/' + k]['saved_mb'], 2)
-             for k in ('res', 'mamba', 'trans')}
+             for k in ('res', 'trans')}
     assert min(saved.values()) > 0, \
         '有段开了检查点却没有省下激活：%s' % saved
     assert max(saved.values()) < 3 * min(saved.values()), \
-        '各段保留量应当同一量级（块内检查点后 Mamba 不再是异类）：%s' % saved
-    assert by['on/3seg']['saved_mb'] < by['off/all']['saved_mb'], \
-        '三段全开必须比全关省激活'
-    # 2026-09-30「全用GC」后 cross_attn_res 也在内。`saved_mb` 是前向驻留的
-    # **峰值**（越小越好）：@B=1/19路/184ch 实测 291.8 → 26.2 → 2.5 MB，
-    # 即这两块正是 v21 激活的大头（全局 N×N 注意力），量化了改判依据。
-    assert by['on/all4']['saved_mb'] < by['on/3seg']['saved_mb'], \
-        'cross_attn_res 纳入检查点后峰值驻留没有继续下降：%s' % (
-            {k: by[k]['saved_mb'] for k in ('off/all', 'on/3seg', 'on/all4')},)
+        '两段保留量应当同一量级：%s' % saved
+    assert by['on/res']['saved_mb'] < base, \
+        'res 单开没有比全关省激活：%s' % by['on/res']['saved_mb']
+    assert by['on/trans']['saved_mb'] < base, \
+        'transformer 单开没有比全关省激活：%s' % by['on/trans']['saved_mb']
+    assert by['on/all']['saved_mb'] < min(by['on/res']['saved_mb'],
+                                          by['on/trans']['saved_mb']), \
+        '全开必须比任何单开更省激活：%s' % (
+            {k: by[k]['saved_mb'] for k in ('off/all', 'on/res',
+                                            'on/trans', 'on/all')},)
 
 
 if __name__ == '__main__':

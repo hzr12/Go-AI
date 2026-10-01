@@ -103,7 +103,7 @@ _STRUCT3[1] = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
 # 单图 `GoBoard.feature_planes` 与批量 `GoBoard.feature_planes_batched` 共用下面
 # 三个函数：**眼位**（`_neighbor_all`）与**块气**（`_distinct_liberty_counts`）的判定
 # 口径必须只有一份实现，否则两条路径的通道 10/11/12/13/14/15 会随实现漂移
-# （而它们的输出要喂同一份 v21 stem）。放模块级而不是做成方法，是因为
+# （而这些通道的输出最终进的是同一份模型输入平面）。放模块级而不是做成方法，是因为
 # `feature_planes_batched` 是 `@staticmethod`（只拿到裸 int8 board，没有 GoBoard 实例）。
 
 def _neighbor_all(mask):
@@ -269,15 +269,21 @@ _ko_range_warned = False
 def _check_n_channels(n_channels):
     """`n_channels` 只允许落在 12..17（通道表是一个**前缀**连续的契约，见段注释）。
 
-    为什么不放开：`>= 12` 保证 0-11 永远齐（那 12 格是旧权重见过的全部输入），
+    为什么不放开：`>= 12` 保证 0-11 永远齐（那 12 格是现役与一切旧权重的全部输入），
     `<= 17` 保证不越界（越界要么静默写进 planes 之外、要么被裁掉，两种都是错答案）。
     13/14/15 这些中间值允许，是为了让「只加眼位」「只加 atari 梯度」这类实验
     不用改生产代码。
+
+    ⚠ 白名单按**通道表**（17 行）定，不按当前消费方收窄：现役一切模型都取 12
+    （`KATAGO_SE_CFG['in_channels']` / `AlphaGoNet` 默认 / 数据集默认），但 13..17
+    档的尾部通道仍在本模块实现且被 `tests/test_go_feature_planes_v21.py`、
+    `tests/test_katago_se.py` 钉住 —— 收窄成 `== 12` 会把它们一起砸掉。
     """
     if not 12 <= n_channels <= 17:
         raise ValueError(
             f"n_channels={n_channels} 越界：特征平面的通道表恒为 17 格，"
-            f"只允许取前缀 12..17（12 = P4.3 之前的布局，17 = v21 stem 需要的布局）。")
+            f"只允许取前缀 12..17（12 = 现役布局，17 = 通道表全表；"
+            f"满布局是已退役 v21 代用过的，白名单仍放行）。")
 
 
 # 对称变换：8 种（4 旋转 × 2 翻转）。用于数据增强时的坐标重映射。
@@ -319,6 +325,9 @@ def transform_coord(r: int, c: int, transform_id: int, board_size: int) -> int:
 #   （重复判定专用）。见 GoBoard.position_hash 的 docstring：用含行棋方的键判重复
 #   就是 SSK（situational superko），与 Tromp-Taylor / OpenSpiel 的 PSK 分歧。
 _ZOBRIST_SEED = b"Go-AI/v21/GoBoard/Zobrist/v1"
+# ⚠ 种子串里的 `v21` 是**冻结**的历史字符串（v21 代定的种子），不是待清理的
+#   残留：改它 = 全部 Zobrist 键值换一批，任何记录过哈希值的外部数据与历史
+#   版本就此不可比。通道数清理不碰这里，**勿改**。
 _ZOBRIST_MASK = (1 << 64) - 1
 # 按 (行, 列) 索引而非 r*board_size+c：这样同一坐标在任何盘口下都是同一把钥匙，
 # 且与盘口大小无关。棋盘边长需 <= 32（覆盖 9/13/19 等全部在用盘口）。
@@ -1185,8 +1194,9 @@ class GoBoard:
     #     （flood fill）：**参考实现**，留给测试当 oracle，别再挂进热路径。
     # 踩过的坑：「惰性重建表」那版正是把热路径换成查表，却让每个候选
     # `clone()+play()` 都付一次 O(n²) 全盘重建（19 路 87 µs → 2080 µs），
-    # 掩码也跟着从 0.66 ms 涨到 2.19 ms。教训全文见
-    # `.superpowers/sdd/2026-09-25-v21-roadmap/task-p2-7a-negative-result.md`。
+    # 掩码也跟着从 0.66 ms 涨到 2.19 ms。教训（同一次失败尝试的完整记录）见
+    # `.superpowers/sdd/2026-09-25-v21-roadmap/task-p2-7a-record.md`（原先引用的
+    # `task-p2-7a-negative-result.md` 已不在库中）。
 
     # ---- 增量棋块/气表（P2.7a） -------------------------------------------
     #
@@ -2371,13 +2381,17 @@ class GoBoard:
     #
     # my_hist / op_hist: 长度均为 3 的扁平坐标序列（不足补 -1），最近一手在 index 0。
     #
-    # ⚠ **0-11 的语义与下标一个字都没动** —— P4.3 只在尾部追加 5 格。v21 的 stem 是
-    # `Conv3×3(17→184)`（用户给定规格），所以**默认通道数是 17**；旧数据 / 旧权重
+    # ⚠ **0-11 的语义与下标一个字都没动** —— P4.3 只在尾部追加 5 格。尾部 5 格是
+    # 为已退役的 v21 代 stem（`Conv3×3(17→184)`，用户给定规格）加的；v21 删除后
+    # **默认值仍是 17**（`tests/test_go_feature_planes_v21.py` 逐字钉住默认与白名单
+    # 12..17），而现役全部模型路径都显式传通道数：数据集默认 12、
+    # `KATAGO_SE_CFG['in_channels']=12`。旧数据 / 旧权重
     # 路径用 `n_channels=12` 裁回前 12 格，输出与 P4.3 之前**逐字节相同**
     # （C7「12↔17，默认 12 保零回归」在 feature 侧的落法）。
     # ⚠ **通道定义是跨进程契约**：数据侧（`src/data/dataset.py`）、训练侧
-    # （`V21_CFG['in_channels']`）、推理侧（GoAI 双代）必须同时改，只改一处会得到
-    # 「模型与数据的通道数不一致」的静默错答案。
+    # （`scripts/train_sft.py` 的 `KATAGO_SE_CFG['in_channels']`）、推理侧
+    # （`src/inference.py` 的 in_channels 构建器注册表，现役只注册了 12）
+    # 必须同时改，只改一处会得到「模型与数据的通道数不一致」的静默错答案。
     #
     # ---- 为什么是 12-16 这 5 个（用户 2026-09-27 直接给定，不容改写）----
     #   - 12/13 **眼位**是死活 / 做眼的核心信号，而 12 通道版本里**完全没有**；
@@ -2408,8 +2422,8 @@ class GoBoard:
 
         `n_channels` 取 12..17 的前缀（越界抛 ValueError，见 `_check_n_channels`）：
         12 = P4.3 之前的布局（旧权重的输入分布，**逐字节零回归**），
-        17 = v21 stem 需要的布局。取值只影响**尾部 5 格算不算**，
-        0-11 的取值在任何取值下都相同。
+        17 = 通道表全表（v21 代退役后无现役模型消费，白名单与默认值仍按全表保留）。
+        取值只影响**尾部 5 格算不算**，0-11 的取值在任何取值下都相同。
         """
         n = self.board_size
         if to_play is None:

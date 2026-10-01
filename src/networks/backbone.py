@@ -5,6 +5,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint  # noqa: F401  （`torch.utils.checkpoint` 的显式 import）
 
+# ⚠ 绝对导入而非 `from .se_bottleneck import …`：
+# `tests/test_backbone_block_classes.py` 用 `spec_from_file_location` 把本文件
+# **当独立脚本**加载（没有包上下文），相对导入会 `ImportError: attempted relative
+# import with no known parent package`。绝对导入与本仓其余跨包引用的写法一致
+# （见 `src/inference.py` / `src/search/*.py`），两条路径都能过。
+from src.networks.se_bottleneck import SEBottleneck
+
 
 class RMSNorm(nn.Module):
     """RMSNorm（兼容 PyTorch 2.1，不依赖 nn.RMSNorm）。"""
@@ -87,30 +94,28 @@ class ResBlock(nn.Module):
 # ============================================================================
 # 梯度检查点（P4.6b）
 #
-# 本节是**机制**，不含 v21 主干容器 —— 容器归 P4.2（`V21_CFG` / `AlphaGoNet`）。
-# 两者通过 `GradCheckpointMixin` + `run_grad_segment()` 这一对接口对接。
+# 本节是**通用机制**，不含任何具体主干容器 —— 容器归 `SharedBackbone` /
+# `AlphaGoNet`（src/networks/alphanet.py）。两者通过 `GradCheckpointMixin` +
+# `run_grad_segment()` 这一对接口对接。
 # ============================================================================
 
-#: 块类型标识。取值必须与 P4.2 的分段名一致（`V21_CFG` 的段名就是它们）。
+#: 块类型标识。现役只有 `legacy`：`SharedBackbone.blocks` 那个混合列表（resnet /
+#: convnext / se_bottleneck / attention 混排）走这一段。
+#:
+#: `res` / `transformer` 两个 kind **注册但当前无人调用** —— `ResBlock` 与
+#: `TransformerBlock` 都还在（前者是 v12/v18 的基本块，后者是可复用的 pre-norm
+#: 块），但没有任何现役主干按 kind 分段调用它们。保留这两个常量是为了
+#: `run_segment(..., kind=...)` 的调用面与既有测试不必因为「删了一个类」而重写；
+#: 随 v21 一起退役的 `mamba` / `cross_attn_res` 两个 kind 已删除（对应块类
+#: `MambaLTI` / `CrossAttnRes` 不复存在，留着就是两个永远点不到的死常量）。
 GC_RES = 'res'
-GC_MAMBA = 'mamba'
 GC_TRANSFORMER = 'transformer'
-GC_CROSS_ATTN_RES = 'cross_attn_res'
-#: 旧 resnet / convnext 路径（`SharedBackbone.blocks` 那个混合列表）用这个 key。
 GC_LEGACY = 'legacy'
 
-V21_GRAD_CHECKPOINT_DEFAULTS = {
+#: 逐 kind 的默认开关。语义不变：`legacy` 默认**关**（不改变既有路径的行为）。
+GRAD_CHECKPOINT_DEFAULTS = {
     GC_RES: True,
-    GC_MAMBA: True,
     GC_TRANSFORMER: True,
-    # 2026-09-30 用户改判：**全开**。原裁决（2026-09-27）是 False，理由见本节
-    # 末尾；4×910A 上 16 块里唯独这 2 块不受检查点保护，而它们的恒等腿是**全局**
-    # MHSA（math 路径物化 N×N），实测 2.1 MB @B=1/块 ⇒ @B=2800 两块 ≈ 11.8 GB，
-    # 是 v21 比 12ch/192ch 的 v18 更吃显存的主因。batch 上墙时那个权衡就反过来了：
-    # 「每字节省的激活对应最多重算」成立，但重算成本是一次全局注意力前向，
-    # 而收益是省掉整段激活 —— 换 batch 时这笔交易划算。
-    # 要临时关掉：`model.set_grad_checkpointing(cross_attn_res=False)`。
-    GC_CROSS_ATTN_RES: True,
     GC_LEGACY: False,
 }
 
@@ -126,35 +131,34 @@ V21_GRAD_CHECKPOINT_DEFAULTS = {
 #: 并段本身是更好的显存策略，但它是一次**需要重标 k** 的行为变化，不能混在
 #: 「机制重构」里做。见 `tests/test_grad_checkpointing.py::
 #: test_legacy_granularity_is_pinned_to_checkpoint_sequential`。
-#: 见上面那段裁决：**v21 四个 kind 逐块**（2026-09-30 实测后改判）、legacy 逐块。
-#: 段级（并段）对 v21 是错的，理由见本表下方「粒度改判」。
+#: 见上面那段裁决：逐块。
 GC_PER_BLOCK_DEFAULT = {
-    GC_RES: True, GC_MAMBA: True, GC_TRANSFORMER: True, GC_CROSS_ATTN_RES: True,
+    GC_RES: True, GC_TRANSFORMER: True,
     GC_LEGACY: True,
 }
 
 
-# 粒度改判（2026-09-30，用户 4×910A OOM 之后实测）
+# 粒度裁决（2026-09-30，用户 4×910A OOM 之后实测；历史，裁决对象已退役）
 # --------------------------------------------------------
-# 原裁决：v21 用**段级**（同类型连续块合并成一个 checkpoint 段，brief §2 的 (b)），
-# 理由是「(a) 会在每块边界留激活、(b) 只留 1 个；重算的调度开销两者相同，(b) 的
-# autograd 钩子还少 4/5」。
+# 原裁决：某些 kind 用**段级**（同类型连续块合并成一个 checkpoint 段，brief §2 的
+# (b)），理由是「(a) 会在每块边界留激活、(b) 只留 1 个；重算的调度开销两者相同，(b)
+# 的 autograd 钩子还少 4/5」。
 #
 # 那个比较**只看了留给反向的存储，没看重算期的峰值** —— 而 OOM 是被后者打爆的：
 # 段级把整段包进**一个** `checkpoint`（`run_grad_segment` 的 `if not per_block:`
 # 分支），于是反向重算时**整段内部所有块的中间激活同时活着**，峰值按「段」计。
-# v21 最重的是 Mamba 段（4 块、d_inner=736），它的重算峰值就是 4 块之和。
 #
 # 实测（tests 同款 harness，B=32 / 19 路 / 184ch / fp32 CPU，区间峰值增量）：
 #     段级   fwd 292.9 MB   fwd+bwd 1306.6 MB   fwd+bwd 26.36 s
 #     逐块   fwd 189.9 MB   fwd+bwd  149.0 MB   fwd+bwd 26.08 s
 # 逐块在**两个峰值上都更低**（B=8 时前向驻留反而高 91.7 vs 72.5，那是 16 个段的开销
 # 还压得住的小 batch 情形），而**耗时不增**（重算总量本来就一样，只是峰值从「一段」
-# 降到「一块」）。线性外推到 fp16 NPU：段级 ≈ 20 MB/样本 ⇒ B=1000 约 20 GB
-# （32GB 卡上必 OOM，与实测一致）；逐块 ≈ 2.3 MB/样本 ⇒ B=1000 约 2.3 GB。
+# 降到「一块」）。
 #
-# 与 FSDP1 的关系：auto_wrap 本来就按块类切（每个块是一个 FSDP unit），逐块检查点
+# 与分片并行的关系：分片包装本来就是按块类切（每个块是一个 wrap unit），逐块检查点
 # 与它 1:1 对齐，重算时只重新 all-gather 一个 unit —— 段级则会让重算横跨多个 unit。
+# ⚠ 留下这段是为了**别再犯同一个错**：本表里现役只有 `legacy`，而 `legacy` 是
+# **逐块**；任何新增的分段主干请直接沿用逐块，除非愿意像上面那样实测重算峰值。
 
 
 class _BatchNormStatGuard:
@@ -278,8 +282,9 @@ def _segment_runner(blocks, taps_want):
         captured = {}
         for i, blk in enumerate(blocks):
             out = blk(*cur)
-            # 段内的块不必是同一个签名：`ResBlock`/`MambaLTI`/`TransformerBlock`
-            # 收 `(x,)`，`CrossAttnRes` 收 `(x, taps)` 并只返回新的 x。规则：
+            # 段内的块不必是同一个签名：单输入块（如 `ResBlock` /
+            # `TransformerBlock` / `SEBottleneck`）收 `(x,)`，多输入块收
+            # `(x, taps)` 并只返回新的 x。规则：
             # 返回张量 -> 只替换**第一个**实参、保留其余（`taps` 沿途不变）；
             # 返回 tuple -> 实参个数跟着返回值走。不假设整段同签名。
             # 抽头取该块的**输出**（不是下一个块的输入）—— 两者在 i>0 时是同一个
@@ -303,8 +308,8 @@ def run_grad_segment(blocks, args, use_checkpoint=False, tap_positions=(),
 
     Args:
         blocks: 段的模块序列（同一块类型的一段，见 §2 的粒度裁决）。
-        args: 段入口的位置参数元组。`ResBlock`/`MambaLTI`/`TransformerBlock` 是
-            `(x,)`；`CrossAttnRes` 是 `(x, taps)`。**逐位置传入**，所以不假设签名。
+        args: 段入口的位置参数元组。`ResBlock`/`TransformerBlock`/`SEBottleneck`
+            是 `(x,)`；多输入块是 `(x, taps)`。**逐位置传入**，所以不假设签名。
         use_checkpoint: 段是否走检查点。调用方（`GradCheckpointMixin.run_segment`）
             已把 `self.training` 与总开关合并进来。
         tap_positions: 需要额外返回的**块下标**（0-based，升序）—— 取的是这些块的
@@ -320,8 +325,8 @@ def run_grad_segment(blocks, args, use_checkpoint=False, tap_positions=(),
             activations" / 源码注释 "the last chunk has to be non-volatile"），
             旧路径必须照搬，否则 `use_checkpoint=True` 就是一次**未声明的既有
             行为变化**（见 `SharedBackbone.forward` 的注释与
-            `task-p4-6b-fix-report.md` B1）。v21 的段**不要**开这个选项 ——
-            合并段下豁免末块等于白放弃整段的收益。
+            `task-p4-6b-fix-report.md` B1）。逐块粒度下**不要**开这个选项 ——
+            豁免末块等于白放弃最后一块的收益。
         kind: 仅用于取默认粒度与报错信息。
         guard_root: 传模块则每次前向做一次 compile 互斥检查（便宜：一个模型 ~100
             个子模块，微秒级；换来「编译发生在构造之后」也能被抓住）。
@@ -462,40 +467,36 @@ def _checkpointed(runner, args, bns):
 class GradCheckpointMixin:
     """按块类型分组的梯度检查点开关（P4.6b）。
 
-    为什么是 mixin 而不是 v21 主干的一个方法
+    为什么是 mixin 而不是某个主干容器的一个方法
     ----------------------------------------
-    v21 的主干容器归 P4.2 建；旧 resnet/convnext 的 `SharedBackbone` 归既有代码。
-    两边都要用同一套机制，而 `SharedBackbone.__init__` 的签名被
-    `tests/test_arch_v21_blocks.py::test_legacy_class_signatures_untouched`
+    现役挂载点是 `SharedBackbone`；新架构（KataGo SE-bottleneck）走的也是它。
+    而 `SharedBackbone.__init__` 的签名被
+    `tests/test_katago_se.py::test_legacy_class_signatures_untouched`
     逐字锁死（不能加 kwarg）—— 所以开关只能是**构造后**可调的方法。
 
     开关形态
     --------
-    * 不带任何 CLI 参数（D1：v21 不新增训练参数），由模型属性控制。
-    * 默认值见 `V21_GRAD_CHECKPOINT_DEFAULTS`：`res`/`mamba`/`transformer` = True
-      （用户 2026-09-27 裁决：ResBlocks 必开，Mamba/Transformer 建议开），
-      `cross_attn_res` = **True**（2026-09-30 用户改判「全用GC」；原为 False，
-      理由与改判依据见本节末尾），`legacy` = False（D5：旧路径默认关，
-      不得改变现有行为）。
+    * 不带任何 CLI 参数，由模型属性控制（`SharedBackbone.use_checkpoint` 的
+      setter 就是它的入口）。
+    * 默认值见 `GRAD_CHECKPOINT_DEFAULTS`：`res`/`transformer` = True，
+      `legacy` = False（不改变既有路径的行为）。
     * `set_grad_checkpointing()` 可以在**不重建模型**的情况下切换 —— 属性不进
       `state_dict`（既不是 parameter 也不是 buffer），所以切换前后存档逐位相同。
 
-    ⚠ **开关属于「调用 `run_segment` 的那个模块」**（P4.2 接线必读）
+    ⚠ **开关属于「调用 `run_segment` 的那个模块」**（接线必读）
     ----------------------------------------------------------
-    开关是**普通实例属性**，不自动向子模块传播。若 `AlphaGoNet` 持有 mixin 而
+    开关是**普通实例属性**，不自动向子模块传播。若某个全网类持有 mixin 而
     `forward` 只调 `self.backbone(x)`，那么 `net.set_grad_checkpointing(True)`
     只会改到 net 自己，主干容器里的 `run_segment` 看不到 —— **静默不生效**。
     正确形态二选一：
-      (a) mixin 只挂在 **v21 主干容器**上，调用方走
-          `net.backbone.set_grad_checkpointing(...)`；
-      (b) mixin 挂在 net 上，但 `AlphaGoNet.set_grad_checkpointing` **显式转发**
-          给 `self.backbone`（本文件测试夹具 `V21Net` 就是 (b) 的样子）。
+      (a) mixin 只挂在**主干容器**上，调用方走
+          `net.backbone.set_grad_checkpointing(...)`（`SharedBackbone` 就是这一条）；
+      (b) mixin 挂在 net 上，但 net 必须**显式转发**给 `self.backbone`。
     两条路都要求「开关的持有者 == `run_segment` 的调用者」。测试
     `test_switch_owner_must_be_the_module_that_calls_run_segment` 把这个坑钉住。
     """
 
-    GRAD_CHECKPOINT_KINDS = (GC_RES, GC_MAMBA, GC_TRANSFORMER,
-                             GC_CROSS_ATTN_RES, GC_LEGACY)
+    GRAD_CHECKPOINT_KINDS = (GC_RES, GC_TRANSFORMER, GC_LEGACY)
 
     def _init_grad_checkpointing(self, enabled=True, **kinds):
         unknown = sorted(set(kinds) - set(self.GRAD_CHECKPOINT_KINDS))
@@ -504,7 +505,7 @@ class GradCheckpointMixin:
                 '未知的块类型 %s；可用的是 %s'
                 % (unknown, list(self.GRAD_CHECKPOINT_KINDS)))
         self._gc_enabled = bool(enabled)
-        self._gc_kinds = dict(V21_GRAD_CHECKPOINT_DEFAULTS)
+        self._gc_kinds = dict(GRAD_CHECKPOINT_DEFAULTS)
         for k, v in kinds.items():
             if v is not None:
                 self._gc_kinds[k] = bool(v)
@@ -516,7 +517,7 @@ class GradCheckpointMixin:
 
     def grad_checkpointing_kinds(self):
         """返回逐类型的开关副本（`dict`，改它不影响模型）。"""
-        return dict(getattr(self, '_gc_kinds', V21_GRAD_CHECKPOINT_DEFAULTS))
+        return dict(getattr(self, '_gc_kinds', GRAD_CHECKPOINT_DEFAULTS))
 
     def set_grad_checkpointing(self, enabled=None, **kinds):
         """在**不重建模型**的前提下改开关。返回 `self`（便于链式）。
@@ -553,10 +554,10 @@ class GradCheckpointMixin:
     def run_segment(self, blocks, args, kind, tap_positions=(), per_block=None,
                     uncapped_last=False):
         """跑一段。`kind` 决定是否检查点；返回 `(out, taps)`，语义同
-        `run_grad_segment`。这是 P4.2 的主干 forward 唯一要调的入口。
+        `run_grad_segment`。主干 forward 唯一要调的入口。
 
         `uncapped_last=True` 只给**旧路径**用（照搬 `checkpoint_sequential`
-        的「最后一块不检查点」）；v21 的段不要传。"""
+        的「最后一块不检查点」）；逐块粒度的段不要传。"""
         on = self.grad_checkpointing_for(kind)
         return run_grad_segment(
             blocks, args,
@@ -567,40 +568,6 @@ class GradCheckpointMixin:
             kind=kind,
             guard_root=self if on else None,
         )
-
-
-# `CrossAttnRes` 的检查点裁决：**2026-09-27 默认 False → 2026-09-30 改判全开**
-# ---------------------------------------------------------
-# 技术前提（两条都仍成立，不因改判而变）：
-# 1. brief 给的原理由（「段边界会切断抽头路径」）**技术上不成立**：
-#    `checkpoint` 的段函数**可以返回多个出参**，把 `s1`/`s5`/`s9` 当额外出参返回
-#    即可，反向路径完好。实测（`test_taps_survive_a_checkpointed_segment`）保留它们
-#    的代价只有 3 × (B,184,19,19) fp32 ≈ 0.75 MB @B=1。
-# 2. `CrossAttnRes` 明确**不含 BatchNorm**（见类 docstring），所以检查点最脏的
-#    `running stats` 双更新问题对它不存在（BN 守卫会正确地空转）。
-#
-# 改判理由（2026-09-30，用户裁决「全用GC」）
-# ------------------------------------------------
-# 原裁决是按「性价比不合算」关掉它的：它的激活大头是 MHSA 的 N×N 矩阵
-# （19×19、math 路径物化，2.1 MB @B=1/块），而重算它要重跑 2 次**全局**注意力 ——
-# 在全部段里「每字节省的激活对应最多重算」。这个账在**参数/激活总量**层面是对的，
-# 但 4×910A 的实际约束是 **batch 显存**：
-#   · 16 块里只有这 2 块不受检查点保护，却各自带着全局 N×N 注意力；
-#   · 2.1 MB @B=1 ⇒ @B=2800 两块 ≈ **11.8 GB**，@B=1500 也有 ≈ 6.3 GB；
-#   · 12ch/192ch 的 v18 没有这种块，所以「V18 能到 2800」不能直接搬到 v21。
-# 把 2 块纳入检查点 = 每步多 2 次全局注意力重算，换回这十几个 GB，用来顶 batch
-# 是划算的（重算成本是固定的，收益随 batch 线性）。
-#
-# 怎么关掉：`model.set_grad_checkpointing(cross_attn_res=False)`（不重建模型，
-# 属性不进 state_dict，切换前后存档逐位相同）。想看实际收益对照：
-# `tests/test_grad_checkpointing.py::test_measurement_ordering_is_stable` 里的
-# `on/3seg` vs `on/all4` 两行就是按真实尺寸（B=1 / 19 路 / 184ch）量的。
-#
-# ⚠ 段粒度裁决：同类型连续块**合并成一个段**（brief §2 的 (b)），不是逐块 (a)。
-# 理由：(a) 会让每块边界激活都留下（8 个 ResBlock = 8 × (B,184,19,19)），
-# 而 (b) 只留 1 个；重算的 Python 层调度开销两者相同（都要逐块跑 forward），
-# (b) 的 autograd 钩子边界还少 4/5；`s1`/`s5` 落在 ResBlock 段内这件事在 (b) 下
-# 用「额外出参」零成本解决（(a) 下要额外处理跨段捕获）。
 
 
 # flash-attn 内核的 batch 维参与 CUDA grid 坐标，受 grid y/z 维上限 65535 约束。
@@ -1180,6 +1147,7 @@ class SharedBackbone(GradCheckpointMixin, nn.Module):
             attn_window:       window 模式的窗口边长
             use_checkpoint:    是否启用梯度检查点（显存优化）
             arch:              网络架构风格 "resnet" (默认，向后兼容) | "convnext"
+                                 | "se_bottleneck"（KataGo 风格 bottleneck+SE）
             res_blocks:        ResBlock 数量（浅层，局部细节），0 表示使用默认模式
             convnext_blocks:   ConvNeXtBlock 数量（中层，大感受野），0 表示使用默认模式
             attn_blocks:       AttentionResBlock 数量（深层，全局关系），0 表示使用默认模式
@@ -1187,7 +1155,7 @@ class SharedBackbone(GradCheckpointMixin, nn.Module):
         super(SharedBackbone, self).__init__()
         self.channels = channels
         self.attention_mode = attention_mode
-        # P4.6b：走 v21 同一套机制，但默认关（D5：旧路径行为一字不变）。
+        # P4.6b：走与全仓库同一套检查点机制，但默认关（不改变既有路径的行为）。
         # `use_checkpoint=True` 与 `set_grad_checkpointing(True)` 等价 ——
         # 赋这个属性就是走 `use_checkpoint` 的 property setter（见类末尾），
         # 它把总开关与 `GC_LEGACY` 段开关**一起**设成同一个值，不会分叉。
@@ -1207,7 +1175,8 @@ class SharedBackbone(GradCheckpointMixin, nn.Module):
             total_blocks = num_res_blocks
             blocks = self._build_segmented_blocks(
                 total_blocks, res_blocks, convnext_blocks, attn_blocks,
-                channels, num_heads, attention_dropout, attn_mode, attn_window)
+                channels, num_heads, attention_dropout, attn_mode, attn_window,
+                arch)
         else:
             blocks = self._build_blocks(
                 num_res_blocks, attention_mode, num_attention_layers,
@@ -1228,6 +1197,8 @@ class SharedBackbone(GradCheckpointMixin, nn.Module):
         if mode == "none" or num_attn <= 0:
             if arch == "convnext":
                 return [ConvNeXtBlock(channels) for _ in range(num_res_blocks)]
+            if arch == "se_bottleneck":
+                return [SEBottleneck(channels) for _ in range(num_res_blocks)]
             return [ResBlock(channels) for _ in range(num_res_blocks)]
         if mode == "all":
             return [AttentionResBlock(channels, num_heads, dropout, attn_mode, attn_window)
@@ -1246,19 +1217,24 @@ class SharedBackbone(GradCheckpointMixin, nn.Module):
             else:
                 if arch == "convnext":
                     blocks.append(ConvNeXtBlock(channels))
+                elif arch == "se_bottleneck":
+                    blocks.append(SEBottleneck(channels))
                 else:
                     blocks.append(ResBlock(channels))
         return blocks
 
     @staticmethod
     def _build_segmented_blocks(total_blocks, res_count, convnext_count, attn_count,
-                                 channels, num_heads, dropout, attn_mode, attn_window):
+                                 channels, num_heads, dropout, attn_mode, attn_window,
+                                 arch="resnet"):
         """三段式架构：浅层 ResNet + 中层 ConvNeXt + 深层 Attention"""
         blocks = []
 
-        # 浅层：ResBlock (局部细节)
+        # 浅层：ResBlock (局部细节)。`arch="se_bottleneck"` 也落在这个槽位：
+        # 段内中/深层分别由 convnext_blocks / attn_blocks 显式指定，不看 arch。
+        shallow_cls = SEBottleneck if arch == "se_bottleneck" else ResBlock
         for _ in range(res_count):
-            blocks.append(ResBlock(channels))
+            blocks.append(shallow_cls(channels))
 
         # 中层：ConvNeXtBlock (大感受野)
         for _ in range(convnext_count):
@@ -1305,8 +1281,8 @@ class SharedBackbone(GradCheckpointMixin, nn.Module):
         `kinds.setdefault(GC_LEGACY, True)` 只在没显式传 `legacy=` 时补
         `legacy=True`：`SharedBackbone` 只用得到 legacy 段，`set_grad_checkpointing(True)`
         若不补，就会变成「总开关 True 而什么都不检查点」（P4.6b fix B4 的
-        反面），而 `V21_GRAD_CHECKPOINT_DEFAULTS[GC_LEGACY] is False` 是
-        **默认**（D5：不传就关）不是本方法的语义。
+        反面），而 `GRAD_CHECKPOINT_DEFAULTS[GC_LEGACY] is False` 是
+        **默认**（不传就关）不是本方法的语义。
         """
         kinds.setdefault(GC_LEGACY, True)
         super(SharedBackbone, self).set_grad_checkpointing(enabled, **kinds)
@@ -1338,79 +1314,28 @@ class SharedBackbone(GradCheckpointMixin, nn.Module):
 
 
 # ============================================================================
-# v21 新块类（P4.1；MambaLTI 块由 P4.1r 从 Mamba-1 换成 Mamba-2）
+# 可复用的 pre-norm Transformer 块（P4.1 引入）
 #
-# 这三个类 + 两个头（P4.1 落 policy_network.py / value_network.py）只**新增**，
-# 既有 resnet / convnext 路径与既有类签名一字未改（D5）：v21 走自己的构建类
-# （P4.2 的 V21_CFG），不经过 SharedBackbone / AttentionResBlock。
-#
-# 权威结构 = 用户给定的逐层参数表（P4.1 brief §2；MambaLTI 依次被 P4.1r（N 16→64、
-# A 改结构化低秩，129,240）与 **P4.1s**（A 改**逐 head 标量** `A_log` (4,)，**128,252**）
-# 取代）。本节所有类的参数量都被 tests/test_arch_v21_blocks.py 逐类**精确相等**锁住
-# （128,252 / 224,480 / 326,416），不是窗口 —— 全网预算窗口留给 P4.2 的
-# test_v21_budget。
+# 本节的 `MHSA` / `TransformerBlock` **当前没有现役调用方** —— 随 v21 一起退役的
+# `MambaLTI` / `CrossAttnRes` 是同节里另两个块类，而 `AttentionResBlock` 走的是
+# 父类 `MultiHeadSelfAttention`、不是 `MHSA`。这两个类与具体主干无关，是通用件，
+# 保留给后续架构复用。
+# 它们**不进** `SharedBackbone` 的块栈 ⇒ 不参与任何现役建网，也不影响任何
+# 现存 checkpoint。
 # ============================================================================
-
-# ⚠ `MambaLTI` 的扫描实现**没有选择**了（P4.1s-vec，用户 2026-09-27 裁决）
-# ---------------------------------------------------------------------------
-# P4.1s 一度保留 `MAMBA_SCAN_DEFAULT = 'auto'` 这个**活的运行时分派**（训练走分块、
-# eval 走顺序），理由是自对弈 MCTS 是大 batch 前向、而顺序递推的前向是
-# dispatch-bound。用户**覆盖**了那个判断：**向量化（= 分块 SSD）就是实现本身**，
-# 顺序路径在运行时不再可选。
-#
-# 「向量化」在这里只能指分块形式：线性递推**无法**沿 T 直接并行，向量化只能是
-# 「块内 (L,L) 衰减积矩阵做批量矩阵乘 + 仅 ⌈T/L⌉ 步块间状态传递」。
-#
-# 因此本文件**不再有** `MAMBA_SCAN_DEFAULT`、不再有 `MambaLTI(scan=...)`、不再有
-# `_scan_impl()`：`MambaLTI.forward` 无条件走 `self._chunked_scan`。
-# 原 `MAMBA_CHUNK_SIZE` 保留 —— 它是**分块扫描自己的**块长，不是分派开关，且
-# 绝不暴露成 CLI 参数（D1：v21 不新增任何训练参数）。
-#
-# 顺带**消掉**的问题：`'auto'` 曾让 train 与 eval 的输出差 ≈ 0.82 个 fp32 eps
-# （实测 max|ΔY| = 4.768e-07 / 相对 9.79e-08，**与 L 无关**；float64 下
-# 2.2e-16 ~ 4.4e-16）—— 同一类差异本仓库在 SDPA（flash vs math）上接受了。
-# 单一路径后该差异**归零**（同一输入下 train/eval 逐位相同，因为块内没有
-# dropout / BatchNorm 这类依赖 `self.training` 的层）。
-# 代价（整网实测，见 task-p4-1s-vec-report.md §2）：大 batch 前向变慢。
-#
-# 顺序递推的递推式**没有删** —— 它是分块路径唯一的独立对照系，作为
-# `MambaLTI._sequential_scan_oracle` **仅供测试**保留，生产路径不可达。
-
-# 分块扫描的块长 L。**训练与推理用同一个值**（单一路径 ⇒ 不必再为两个方向分别
-# 折中）。P4.1s-vec 重扫的整网实测（19×19 / fp32 / v21 主干 / min-of-N，
-# 全表见 task-p4-1s-vec-report.md §3）：
-#
-# | L | B=1 fwd | B=8 fwd | B=1 fwd+bwd | B=8 fwd+bwd | B=8 fwd+bwd 峰值 |
-# |---|---|---|---|---|---|
-# | 4 | 184 ms | 599 ms | 1,926 ms | 17,096 ms | 2,014 MB |
-# | 8 | 132 | 601 | 1,147 | 9,501 | 1,930 |
-# | 16 | 106 | 769 | 802 | 6,446 | 2,005 |
-# | **32（本值）** | **104** | 1,049 | 583 | 5,073 | 2,162 |
-# | 64 | 135 | 1,248 | **488** | **4,352** | 2,397 |
-#
-# ⇒ **L=32**。理由：L=64 只在反向快 1.16×，却要多付 235 MB 训练峰值、并在
-# B=1 前向上倒退 30%（135 vs 104 ms）；L=16 在 B=1 前向与 L=32 打平（106 vs 104），
-# 却让 B=8 前向慢 36%、反向慢 38%。**L=32 是唯一在「B=1 前向 / B=8 前向 / 反向 /
-# 训练峰值」四张表上都不垫底的取值**；L=8 的 B=8 训练峰值最省（1,930 MB，比 L=32
-# 少 232 MB），但 B=8 前向慢 1.75×、反向慢 1.87×，不值。单一路径之前，推理想用
-# L=8、训练想用 L=32；现在只有 L=32。
-# ⚠ P4.1r 时代的 L=64（1,878 ms fwd、184 MB/块、B=8 时 5.2 GB）在逐 head 标量
-# 衰减下已不再是怪物（2.9 MB/块 @B=1、23 MB/块 @B=8，快照降**恰好 N=64 倍**）。
-MAMBA_CHUNK_SIZE = 32
 
 
 class MHSA(MultiHeadSelfAttention):
-    """v21 的多头自注意力核心（Wq/Wk/Wv/Wo **四个独立无 bias** Linear）。
+    """拆成四个独立无 bias Linear（Wq/Wk/Wv/Wo）的多头自注意力核心。
 
-    `TransformerBlock` 与 `CrossAttnRes` 共用本类，两处预算都是
-    3×184×184（Wq/Wk/Wv）+ 184×184（Wo）= 135,424。
+    `TransformerBlock` 用它做注意力的那半条恒等捷径。四路参数与父类的融合
+    `qkv`（`nn.Linear(C, 3C, bias=False)`）**数值上相等**，但 state_dict 布局
+    不同（无法逐权从融合 qkv 的旧模型迁移）。
 
     为什么**继承** MultiHeadSelfAttention 而不是新写一个注意力类
     ------------------------------------------------------------
-    1) 预算：父类是**融合** qkv（`nn.Linear(C, 3C, bias=False)`），参数量数值上
-       恰好等于 3 个独立 Linear，但 state_dict 布局不同（无法逐权从旧模型迁移），
-       而且父类还自带 `ln1/ln2/ffn/ffn_drop`（368+368+44,160×2+128 = 89,184 个
-       多余参数），整体会超出 v21 的分项预算。故不能直接复用父类的 forward。
+    1) 参数预算：父类除融合 qkv 外还自带 `ln1/ln2/ffn/ffn_drop`，直接复用会
+       多出一整套本块用不到的 FFN。故不能直接复用父类的 forward。
     2) **注意力 dropout 的 eval 闸门（P2.2b）**：`_sdpa(..., dropout_p=...)` 是
        文件级静态锁 `tests/test_attn_dropout_eval.py::test_all_five_attn_dropout_sites_are_gated`
        的对象，它对本文件做**文件级** AST 扫描并断言取 `self.attn_drop_p` 的
@@ -1421,8 +1346,8 @@ class MHSA(MultiHeadSelfAttention):
 
     因此 `__init__` 刻意**不**调用 `MultiHeadSelfAttention.__init__`（那会建出融合
     qkv 与 FFN），只手工填 `_global_attn` / `_to_heads` / `attn_drop_p` 真正读到的
-    最小属性集。本类**只支持 global 模式**（v21 的块布局里 MHSA 就是全局注意力；
-    window/sparse 等模式的参数与形状不属本预算）。
+    最小属性集。本类**只支持 global 模式**（window/sparse 等模式的参数与形状
+    不在本类的承担范围内）。
     """
 
     def __init__(self, channels, num_heads=4, dropout=0.0):
@@ -1432,9 +1357,9 @@ class MHSA(MultiHeadSelfAttention):
         self.head_dim = channels // num_heads
         self.scale = self.head_dim ** -0.5
         self.attn_drop = dropout
-        # 父类 forward 的 window/sparse 分支会读 mode/window_size；v21 只用 global。
+        # 父类 forward 的 window/sparse 分支会读 mode/window_size；本类只用 global。
         # ⚠ 这两个属性是**惰性占位**，不是安全网：父类 forward 还会读
-        # `self.ln1/ln2/ffn/ffn_drop`，本类**刻意不建**这些（+89,184 参数），
+        # `self.ln1/ln2/ffn/ffn_drop`，本类**刻意不建**这些，
         # 所以误用父类 forward 照样 AttributeError。填它们只是为了让
         # `getattr(m, 'mode', None)` 这类查询拿到合法值，不至于在别处炸出
         # 「缺属性」而不是「用错类」这种更难排查的错。
@@ -1462,495 +1387,13 @@ class MHSA(MultiHeadSelfAttention):
         return out
 
 
-def _scan_chunk(sigma, dt_k, xc_k, bv_k, u_k, cv_k, h_in, use_ckpt,
-                _scan_batch_split=250):
-    """分块 SSD 的**块内一步**：返回 `(y, h_last)`。
-
-    参数二选一：
-      - 因子形式：给 `dt_k`/`xc_k`/`bv_k`，本函数内相乘出 `u`（省掉整条物化）；
-      - 物化形式：给 `u_k`，直接用（测试与对照路径）。
-    两者数学相同。
-
-    `use_ckpt` 为真**且**在训练/有 grad 时用 `checkpoint(use_reentrant=False)`
-    包住：块内的 `M`/`u`/`h` 于是**不留到反向**（它们是 bmm/mul 的输入，按
-    autograd 规则本来会被留住）。这是 4 卡 910A 放不下 batch 的直接原因 ——
-    不包的话一个 MambaLTI 块的反向重算要 ~39 GiB（fp16@B=2000），详见
-    `MambaLTI._chunked_scan` 的 docstring。
-    """
-    B = sigma.shape[0]      # ⚠ 只有切分分支用；块内一律现取（见 _body 里的说明）
-
-    def _body(sigma, dt_k, xc_k, bv_k, u_k, cv_k, h_in):
-        # ⚠ `B`/`Hh`/`P`/`l` 全部从**本次调用的** `sigma` 现取，不能用外层闭包里的：
-        #   下面按 batch 切分后每个子块的 B 是 `min(BS, B-i0)`，用整批的 `nb`
-        #   reshape 会直接炸（实测 `shape '[16, 9, 9]' is invalid for input of
-        #   size 648` —— 正是子批）。
-        _B, _Hh, _P, l = sigma.shape
-        # dt_k is None ⇒ 物化形态（N 取自 u_k）；否则因子形态（N 取自 bv_k）
-        N = (u_k if dt_k is None else bv_k).shape[-1]
-        if dt_k is None:
-            u = u_k
-        else:
-            u = (dt_k.unsqueeze(-1) * xc_k.unsqueeze(-1)
-                 * bv_k[:, :, None, None, :])
-        u = u.permute(0, 2, 3, 1, 4)                     # (B,H,P,l,N)
-        # 块内衰减乘积矩阵 M[i,j] = exp(σ_i − σ_j)·1[j≤i]。
-        # ⚠ 上三角必须在 **exp 之前** 屏蔽：i<j 时 σ_i − σ_j ≥ 0，exp 会溢出。
-        lower = torch.ones(l, l, dtype=torch.bool, device=sigma.device).tril()
-        dd = sigma.unsqueeze(-1) - sigma.unsqueeze(-2)  # (B,H,P,l,l) = σ_i − σ_j
-        M = dd.masked_fill(~lower, float('-inf')).exp()  # exp(−inf) = 0
-        nb = _B * _Hh * _P                                # 批量矩阵乘的批数 = B·C
-        h = torch.bmm(M.reshape(nb, l, l),
-                      u.reshape(nb, l, N)).reshape(_B, _Hh, _P, l, N)
-        h = h + torch.exp(sigma).unsqueeze(-1) * h_in   # 块间状态传递
-        y = (h.permute(0, 3, 1, 2, 4)
-             * cv_k.unsqueeze(-2).unsqueeze(-2)).sum(-1)          # 读出
-        return y, h[..., -1:, :]                        # 块末状态 = 下一块的 h_in
-
-    # ⚠⚠ **沿 batch 维再切一刀**（2026-10-01 云端 OOM 的修法）。
-    #
-    # 事故：`Tried to allocate 1.40 GiB ... 28.00 GiB already allocated;
-    #        741.02 MiB free`，栈指向本函数的 `h = h + exp(sigma)*h_in`。
-    #
-    # 为什么 `chunk_size=32`（T=361 ⇒ 12 块）救不了：峰值**不是**「逐块物化
-    # 多少」，而是「**单块内同时活着的字节**」。块内三个 5 维张量都是
-    #     (B, Hh, P, l, N) = (1000, 4, 46, 32, 64)      ← N = d_state = 64
-    # 每个 3.77 亿元素 ⇒ **单个 fp16 副本 719 MiB**；那一行同时活着
-    # `bmm` 输出 + `exp(sigma)*h_in` + 求和结果 ⇒ **瞬时 ~2.1 GiB**。
-    # checkpoint 只保证这些**不留到反向**，对**单块前向瞬时峰值**无效。
-    #
-    # ⚠ 顺手记一个曾经的误判，免得再犯：我一度把 N 读成 368（其实是
-    #   `d_inner`）并据此写「比 docstring 的 N=64 放大 5.75 倍，单副本 4.03 GiB」
-    #   —— 那是**从 `bv_k` 的广播形状倒推错了**，`N` 取的是 `bv_k` 的**最后一维**
-    #   = `d_state` = 64（`MambaLTI.__init__` 默认 `d_state=64`，backbone.py:1654）。
-    #   本 docstring 原有的 N=64 推导口径是**对的**，没有「文档过时」这回事。
-    #   顺带一提，那次误判还导致我两次给出相反的结论（先说「降 norm 精度对 OOM
-    #   无效」，纠正后又说「省 7.6 GiB」）—— 容量数字必须从真模型取，不能倒推。
-    #
-    # 为什么不改 `N` 去降峰值：`N` 是状态维（`_body` 末尾 `sum(-1)` 读出那一维），
-    # 改它要动 MambaLTI 的参数化与已训练权重的兼容性。所以**不改 N，改峰值**：
-    # 沿 batch 切。
-    #
-    # 为什么切 batch 是**精确**的而不是近似：`torch.bmm` 的批维彼此独立
-    # （`nb = B·Hh·P`，M 与 u 批内一一对应），块入口状态 `h_in` 也是按 batch
-    # 独立携带的，`sum(-1)` 只沿 `N`。逐 batch 子块算完按 dim 0 拼回，与整批
-    # 一次算**逐位相同** —— 没有任何跨 batch 的归约顺序变化。
-    # （`tests/test_scan_batch_split.py` 用 `torch.equal` 钉住，不是 allclose。）
-    #
-    # 峰值口径：切完后单次分配的 `u`/`h` 降到 1/ceil(B/BS) ⇒
-    #     BS=250 → 719/4 ≈ 180 MiB/副本，那一行瞬时 ~0.53 GiB。
-    # 选 250：它是 1000 的整除数（`cat` 后形状与整批完全一致），且 4 个子块
-    # 仍能把 AI Core 的矩阵流水喂满。
-    BS = max(1, int(_scan_batch_split))
-    if BS >= B:
-        if use_ckpt and torch.is_grad_enabled():
-            return torch.utils.checkpoint.checkpoint(
-                _body, sigma, dt_k, xc_k, bv_k, u_k, cv_k, h_in,
-                use_reentrant=False)
-        return _body(sigma, dt_k, xc_k, bv_k, u_k, cv_k, h_in)
-
-    # 因子形式：`u` 由 `_body` 内部现算，切 batch 要把**因子**一起切；
-    # 物化形式：`u_k` 已物化，同样按 batch 切。两条路径数学相同。
-    outs, houts = [], []
-    for i0 in range(0, B, BS):
-        i1 = min(i0 + BS, B)
-        sl_b = slice(i0, i1)
-        y_i, h_i = _body(
-            sigma[sl_b],
-            None if dt_k is None else dt_k[sl_b],
-            None if xc_k is None else xc_k[sl_b],
-            None if bv_k is None else bv_k[sl_b],
-            None if u_k is None else u_k[sl_b],
-            cv_k[sl_b], h_in[sl_b])
-        outs.append(y_i)
-        houts.append(h_i)
-    return torch.cat(outs, dim=0), torch.cat(houts, dim=0)
-
-
-class MambaLTI(nn.Module):
-    """Mamba-2 风格的**线性时序（LTI）**块：dt 步长的因果累积递推（C=184, expand=2,
-    d_conv=4, d_state N=64, ddt_rank=4, **逐 head 标量衰减** H=4 × head_dim=46），
-    逐块 **128,252** 参数。
-
-    语义（x: (B, C, H, W) -> 同形；内部按 (B, T=H*W, ·) 的**行主序**序列看）：
-
-        h  = LayerNorm(x)                                    # pre-LN（唯一一层）
-        [xs, z] = split(in_proj(h), 2)                       # in_proj 184→368，各 184
-        xc     = SiLU(causal_dwconv1d_k4(xs))                # 仅 x 路，深度卷积
-        [dt_raw, bc] = split(x_proj(xc), rank, 2N)           # 4 + 128 = 132
-        dt     = softplus(dt_proj(dt_raw))                   # (B,T,184)，逐通道 > 0
-        [Bm, Cm] = split(bc, N, N)                           # 各 64
-        A      = −exp(A_log)                                # (4,) 逐 head 标量 < 0
-        # 通道 c 属于 head c//46：decay_t = exp(dt_t · A_{head(c)})，**与状态维 n 无关**
-        h_t     = decay_t ⊙ h_{t−1} + dt_t · (xc_t ⊗ Bm_t)   # 状态 (B, 4, 46, 64)
-        y_t     = ⟨h_t , Cm_t⟩_N                            # 读出
-        y       = y + D ⊙ xc                                 # D：逐通道直通
-        out     = out_proj(y) * SiLU(z)                      # z 走 SiLU 门
-        返回    x + out                                      # pre-norm 残差
-
-    ⚠ `expand=2` 是 **in_proj 的扇出**（C→2C 拆 x/z），不是分支内宽度扩张 ——
-    见 `__init__` 里的注释（关系到 128,252 这个数）。
-
-    为什么衰减是**逐 head 标量**（P4.1s 用户裁决，权威）
-    ----------------------------------------------------
-    P4.1r 把 A 做成逐 (c,n) 的结构化低秩（992 参数），后果是块内衰减积
-    `exp(σ_i − σ_j)` 的 σ **含 n** ⇒ (L,L) 矩阵跨不了状态维共享 ⇒ 分块要物化
-    `B·C·N` 个 (L,L)，B=8/L=64 时每块 1,472 MB，分块前向比顺序慢 3.5×(L=4)
-    ~ 46.6×(L=64)。逐 head 标量衰减把 σ 里的 n 整个去掉（A 只是 head 的
-    标量）⇒ `M` 只依赖 (b,h,p,i,j) ⇒ 整块只需 `B·H·P = B·C` 个 (L,L)、`M @ u`
-    是真正的 `(L,L)@(L,N)` GEMM，物化量降**恰好 N=64 倍**（B=8/L=64：1,472 MB
-    → 23 MB/块），分块前向在 B≤2 时**快于**顺序递推、反向**无条件快 13×**。
-    代价：衰减参数从 992（结构化低秩）降到 **4**（`A_log` 形状 (4,)，即稠密
-    184×64 的 1/2944），且同一 head 的 46 个通道 × 64 个状态维共享一个衰减率
-    —— 多尺度多样性从「逐状态维」退化为「逐 head」。A/B 实测（扫描段单独，
-    对顺序扫描的比值）：
-
-    | A 参数化 | 分块实现 | L=4 | L=8 | L=16 | L=32 | L=64 |
-    |---|---|---|---|---|---|---|
-    | 顺序（基线） | — | 1.00× | 1.00× | 1.00× | 1.00× | 1.00× |
-    | 逐 (C,N) 184×64（P4.1r） | `bmm` over `B·C·N` | 2.27× | 2.68× | 5.34× | 29.26× | 35.38× |
-    | 逐 head 标量 (4,) | `bmm` over `B·C·N`（**实现不动**） | 2.77× | 4.09× | 8.58× | 35.11× | 43.77× |
-    | 逐 head 标量 (4,) | **共享 (L,L) + 真 GEMM** | 0.83× | 0.56× | 0.54× | **0.43×** | 0.63× |
-
-    ⇒ **只改参数化不管实现是无效的**（第 3 行仍慢 35~44×），两处必须同时改。
-    全表（含 B=8、fwd+bwd、峰值内存）在 task-p4-1s-report.md §3。
-
-
-    Mamba-2 递推（状态更新 + 读出）与分块 SSD 扫描的闭式、等价性论证见
-    `task-p4-1s-report.md` §2。测试侧的 oracle 是 `tests/test_arch_v21_blocks.py`
-    里独立写的三重 for 循环朴素解与 cumsum 闭式（两条都在）。
-
-    因果性：递推只用 s ≤ t 的量，深度卷积**左**填充 k-1=3，三处都没有未来信息。
-    `test_ssm_is_causal_in_time` 直接钉这条（改 t 之后的输入不得影响 t 的输出），
-    `test_ssm_scan_matches_naive_triple_loop` / `test_ssm_scan_equals_dt_strided_cumulative_form`
-    从两个独立参考实现侧钉同一条性质。
-
-    相对 P4.1（rev1，Mamba-1）/ P4.1r（结构化低秩）的变化
-    ----------------------------------------------------
-    | 子模块 | rev1 | P4.1r | 本类（P4.1s） |
-    |---|---|---|---|
-    | 状态维 N | 16 | 64 | **64** |
-    | `x_proj` 输出 | 36 = 4+2·16 | 132 = 4+2·64 | **132** |
-    | A | 稠密 `A_log` 184×16 = 2,944 | 结构化低秩 992 | **逐 head 标量 `A_log` (4,) = 4** |
-    | 单块 | 113,528 | 129,240 | **128,252** |
-
-    实现选择（无参数开销、但影响梯度流）：
-      * **只有一条扫描路径**（P4.1s-vec，用户裁决）：`_chunked_scan`（分块 SSD）。
-        P4.1s 一度有 `scan='auto'` 的运行时分派（训练分块 / 推理顺序），已删除 ——
-        线性递推无法沿 T 直接并行，向量化只能取块内 (L,L) 矩阵乘 + ⌈T/L⌉ 步块间
-        传递这条形式。代价（大 batch 前向变慢）与收益（train/eval 逐位一致）见
-        文件头 `MAMBA_CHUNK_SIZE` 上方的注释与 task-p4-1s-vec-report.md §2。
-      * 顺序递推**没有删**，改名为 `_sequential_scan_oracle` 并**标注为测试专用**
-        —— 它是本实现唯一的独立对照系（推导 `_chunked_scan` 的闭式用的就是它），
-        删掉就等于没有 oracle。
-      * `A = −exp(A_log)`：符号约束**折进参数化**（对数域，同 rev1），
-        对**任意** `A_log` 都有 `A < 0` ⇒ `decay = exp(dt·A) ∈ (0,1]`，
-        构造上保证，不依赖初值符号。
-      * `A_log` 初值 = `log(1..n_heads)`，即 canonical Mamba-2 的 `A = −(1..H)`
-        （**不是** P4.1r/rev1 的 `−(1..N)` 斜坡按 head 取段平均）。理由与代价见
-        `_init_a_log` 的 docstring —— 那条斜坡平均在本规格下会让 4 个 head 的
-        记忆常数全部 < 0.2 步，并在 fp32 + 分块下产生**恒零梯度**（实测
-        37/288 组配置），canonical 初值下是 **0/288**。
-      * `z` 的 SiLU 门作用在 **z** 上（Mamba 参考实现：`out_proj(y) * silu(z)`），
-        而不是作用在 y 上；P4.1r brief §2.1 的 `out_proj(SiLU(y) * z)` 与同段
-        「z 走 SiLU 门」自相矛盾，沿用 rev1 的读法（未被本次任务列入变更项），
-        并由 `test_ssm_gate_is_on_the_z_branch` 钉住。
-    """
-
-    def __init__(self, channels=184, expand=2, d_conv=4, d_state=64,
-                 ddt_rank=4, n_heads=4, chunk_size=MAMBA_CHUNK_SIZE):
-        super().__init__()
-        # ⚠ `expand` 的含义以**权威表**为准，不是 Mamba 惯例。表里给的是
-        #   `in_proj 184→368`（=67,712）、`dw conv1d Conv1d(184,184,...)`、
-        #   `out_proj 184→184` ⇒ 每个分支的宽度就是 C=184，in_proj 的**扇出**
-        #   才是 2×C（拆两半各 184：x 路 / z 路），即 d_inner = C。
-        #   若按惯例理解成「分支内扩张 d_inner = 2C = 368」，in_proj 会变成
-        #   184→736（135,424），本块会比权威多 67,712×2 个参数。
-        assert expand == 2, (
-            '权威表只定义 expand=2（in_proj 扇出 2C，拆 x/z 各 C）；'
-            '其它 expand 值未在参数表里定义，不臆造。收到 {}'.format(expand))
-        if int(chunk_size) < 1:
-            raise ValueError('chunk_size 必须 ≥ 1，收到 {}'.format(chunk_size))
-        if channels % n_heads:
-            raise ValueError(
-                'channels={} 必须能被 n_heads={} 整除（P4.1s：4 head × 46 通道）'
-                .format(channels, n_heads))
-        self.channels = channels
-        self.expand = expand
-        self.d_inner = channels                  # 184（= d_model，见上）
-        self.d_state = d_state                    # 64
-        self.d_conv = d_conv                    # 4
-        self.ddt_rank = ddt_rank                # 4
-        self.n_heads = n_heads                  # 4（P4.1s：head 数 = A 的标量个数）
-        self.head_dim = channels // n_heads     # 46（184/4）
-        # ⚠ 这里**曾经**有 `self.scan`（P4.1s 的 `scan='auto'` 运行时分派）。P4.1s-vec
-        #   把它删了：分块 SSD 是唯一实现，运行时没有第二条路可切。`chunk_size` 是
-        #   分块自己的块长，不是分派开关。
-        self.chunk_size = int(chunk_size)       # 32（单一路径实测，见 MAMBA_CHUNK_SIZE）
-        # 扫描「块内一步」是否用检查点（2026-09-30，4 卡 OOM 的第二个原因）。
-        # 见 `_scan_chunk` 的 docstring：关掉它，一个 Mamba 块的反向重算要
-        # ~39 GiB（fp16@B=2000），任何 batch 都放不下。默认跟随 `self.training`
-        # 与 grad 是否开启（推理路径恒为 False ⇒ 零开销、逐位不变）。
-        self.scan_checkpoint = True
-        self.dt_project_rank = ddt_rank + 2 * d_state   # 132 = x_proj 输出维
-
-        self.norm = LayerNorm2d(channels)                                   # 368
-        self.in_proj = nn.Linear(channels, expand * channels, bias=False)  # 67,712
-        # 深度因果卷积，**仅**作用于 x 路
-        self.dw_conv = nn.Conv1d(self.d_inner, self.d_inner, d_conv,
-                                 groups=self.d_inner, bias=True)            # 920
-        self.x_proj = nn.Linear(self.d_inner, self.dt_project_rank, bias=False)  # 24,288
-        self.dt_proj = nn.Linear(ddt_rank, self.d_inner, bias=True)         # 920
-        # A = −exp(A_log)：**逐 head 标量**衰减，形状 (n_heads,) —— P4.1s 把
-        # P4.1r 的结构化低秩 U(184×4)·V(4×64)（992 参数）换成 4 个标量。
-        self.A_log = nn.Parameter(self._init_a_log(n_heads))               # 4
-        self.D = nn.Parameter(torch.ones(channels))                         # 184
-        self.out_proj = nn.Linear(self.d_inner, channels, bias=False)       # 33,856
-
-    @staticmethod
-    def _init_a_log(n_heads):
-        """`A_log` (n_heads,) 初值 = `log(1..n_heads)`，即 canonical Mamba-2 的
-        `A = −(1..H)`（**不是** P4.1r/rev1 的 `−(1..N)` 斜坡）。
-
-        shipped（n_heads=4）：`log([1, 2, 3, 4])` ⇒ `A = −([1, 2, 3, 4])`。
-        四个 head 初值互不相同 —— 若四个 head 同值，梯度也相同，对称性永远破不掉，
-        per-head 的自由度等于白给。
-
-        为什么**不**沿用 `−(1..N)` 斜坡的段平均（P4.1r 的一版候选，实测否决）
-        ----------------------------------------------------------------------
-        `−(1..N)` 斜坡的作用是让**状态维 n** 有不同的时间常数。P4.1s 把 A 压成
-        4 个逐 head 标量之后，n 维的多样性已经没有了；若把斜坡按 4 段取算术平均
-        就得到 `A = −([8.5, 24.5, 40.5, 56.5])`，在 `dt ~ O(0.7)`（`softplus` 在
-        初始化附近）下每步衰减是 `2.6e-3 / 2.5e-8 / 7.0e-13 / 7.3e-18`，
-        **四个 head 的记忆常数 `1/(dt·|A|)` 全部 < 0.2 步**（0.168/0.057/0.036/
-        0.025）—— 也就是这块 SSM 在 T=361 的棋盘序列上几乎没有时间记忆。
-        canonical 初值给出 `exp(dt·A) = 0.50/0.24/0.13/0.061`、记忆常数
-        `1.43/0.70/0.48/0.36` 步，同样是逐 head 多尺度，但**每一档都可用**。
-
-        **代价（诚实记账）**：per-head 衰减的跨度从 6.6×（8.5→56.5）收窄到 4×
-        （1→4）。换来的是 fp32 下不再有恒零梯度（见类 docstring 的实现选择段
-        与 task-p4-1s-report.md §4：斜坡平均 37/288 组配置出现恒零梯度、
-        canonical 0/288），以及 4 个 head 的衰减梯度动态范围从 1.6e9~3.3e9
-        降到 19~152。
-        """
-        return torch.log(torch.arange(1, n_heads + 1, dtype=torch.float32))
-
-    def _sequential_scan_oracle(self, log_decay, drive, cvec):
-        """⚠ **测试专用 oracle，生产路径不可达** —— 请不要在 `forward` 里调用它。
-
-        为什么保留（P4.1s-vec：顺序递推已从运行时退役，见文件头的说明）
-        --------------------------------------------------------------
-        向量化（分块 SSD）实现**没有任何独立参照**：它自己的推导就是
-        `task-p4-1s-report.md` §2.3 的闭式，而那条闭式又是从本方法这条递推
-        推出来的。删掉本方法就没有第二个实现了，也就没人能说清块内矩阵、块间
-        状态传递、上三角 mask 到底算对了没有。本方法就是那个「第二个实现」：
-        逐时间步 `for t in range(T)`，`T = 361` 时慢 1.2~3.8×（大 batch 前向），
-        且反向要在 361 个 4.25M 元素的状态张量上跑（fwd+bwd 慢 12.6~13.6×）。
-        **正因为它慢，生产路径不用它**；正因为它是唯一独立的oracle，测试必须能
-        调它 —— 所以保留，只是**改名**成一眼可辨的 `_…_oracle`，让任何残留的
-        运行时引用立刻 `AttributeError` 而不是静默走进慢路。
-
-        覆盖它的测试（一条都没删、没弱）：
-          * `test_ssm_chunked_scan_matches_sequential_oracle` — 15 组 `(T, L)`
-            上分块 ≡ 本方法（小 T 还要再压一层朴素三重循环）；
-          * `test_mamba2_state_shape_is_b_h_p_n` — one-hot 探针对两条路径都跑；
-          * `test_ssm_no_dead_state_components` / `test_mamba2_fp32_active_state_dims`
-            — fp32 下「本方法干净、分块死」是 fp32 **下溢**地板（而非结构死亡）
-            的一半判据。
-
-        递推本身
-        --------
-        log_decay: (B, T, H, P) = dt_t · A_{head(p)}（ℓ ≤ 0 ⇒ exp(·) ∈ (0, 1]）
-        drive:     (B, T, H, P, N) = dt_t · xc_t ⊗ B_t
-        cvec:      (B, T, N)       = C_t
-
-        状态 `(B, H, P, N)`；返回 `(B, T, H, P)`。T 步的 Python 循环换来
-        O(B·H·P·N) 的显存；换成闭式 (T,T) 衰减矩阵会物化 T²·H·P·N 个元素，
-        19×19 下不可接受。
-
-        与 `_chunked_scan` 的关系：数学上**逐项相同**（浮点结合律不同 ⇒ 非逐 bit
-        相同：float64 下 max|Δ| = 2.2e-16 ~ 4.4e-16，float32 下 2.384e-7 绝对 /
-        ≤6.0e-8 相对 ≈ 0.5 fp32 eps，**与 L 无关**）。测试按
-        `allclose(rtol=1e-10, atol=1e-12)` 断言而不是 `equal`。
-        """
-        B, T, Hh, P = log_decay.shape
-        if isinstance(drive, tuple):
-            # 因子形式（与 `_chunked_scan` 同一契约）：本方法是**测试对照 oracle**，
-            # 不参与训练路径的显存预算，直接整条物化即可。
-            _dt, _xc, _bv = drive
-            drive = _dt.unsqueeze(-1) * _xc.unsqueeze(-1) * _bv[:, :, None, None, :]
-        N = drive.shape[-1]
-        state = drive.new_zeros(B, Hh, P, N)
-        out = []
-        for t in range(T):
-            state = state * log_decay[:, t].exp().unsqueeze(-1) + drive[:, t]
-            out.append((state * cvec[:, t].view(B, 1, 1, N)).sum(-1))
-        return torch.stack(out, dim=1)
-
-    def _chunked_scan(self, log_decay, drive, cvec, chunk_size=None):
-        """分块 SSD 扫描 —— Mamba-2 的**定义性**实现特征，也是本块**唯一**的扫描。
-
-        ⚠ 这里的「唯一」是 P4.1s-vec 之后的状态（用户 2026-09-27 裁决）：先前存在
-        的运行时分派（`scan='auto'`，训练走本方法、eval 走 `_sequential_scan_oracle`）
-        已删除。线性递推无法沿 T 直接并行 ⇒ 「向量化」**只能**是本方法这种形式：
-        块内 (L,L) 衰减积矩阵的批量矩阵乘 + 仅 ⌈T/L⌉ 步的块间状态传递。
-        对照系保留在 `_sequential_scan_oracle`（**仅测试**）。
-
-        闭式（task-p4-1s-report.md §2）。记 `ℓ_t = dt_t·A_{head} ≤ 0`、
-        `u_t = drive_t`、`S_t = Σ_{r≤t} ℓ_r`（单调不增 ⇒ 任何 `S_t − S_s ≤ 0`
-        恒成立，指数不溢出）。顺序递推 `h_t = Σ_{s≤t} exp(S_t − S_s)·u_s`
-        按 L 切块，块内用 σ（块内局部累积）与
-        `M[i,j] = exp(σ_i − σ_j)·1[j≤i]` 这个 (L,L) 衰减乘积矩阵做一次批量
-        矩阵乘，块间只递推 `T/L` 步状态：
-
-            h_{kL+i} = exp(σ_i)·H_k + Σ_{j≤i} M[i,j]·u_{kL+j}
-            H_{k+1}  = h_{kL+l−1}                    （块末状态 = 下一块的 H_k）
-
-        `exp(σ_i)·H_k` 是**块间状态传递**那一项（L 次乘法/块，不是 T 次）。
-        `H_0 = 0`、`S_{−1} = 0`，最后一块可以短于 L（`l = min(L, T−kL)`）。
-
-        ★ 逐 head 标量衰减让这里**真的塌成共享 (L,L)**（P4.1s 的核心收益）
-        ----------------------------------------------------------------------
-        `A` 只是 head 的标量 ⇒ `ℓ_t`、`σ_i` 都**不含状态维 n** ⇒
-        `M[b,h,p,i,j]` 与 n 无关 ⇒ 整块只需 `B·H·P = B·C` 个 (L,L) 矩阵，
-        `M @ u` 是真正的 `(L,L)@(L,N)` GEMM（批数 B·C=184）。对比 P4.1r 的
-        逐通道 `A_eff`（σ 逐 (c,n) 不同 ⇒ `B·C·N` 个瘦矩阵向量乘）：每块的
-        `M` 物化量降**恰好 N=64 倍**（B=8/L=64：1,472 MB/块 → 23 MB/块；
-        B=1/L=64：184 MB/块 → 2.9 MB/块）。**只改参数化、不改这里的实现是无效
-        的**（实测仍慢 35~44×，见类 docstring 的 A/B 表）。
-
-        本方法与 `_selective_scan` 数学上逐项相同（浮点结合律不同 ⇒ 非逐
-        bit 相同：float64 下 max|Δ| = 2.2e-16 ~ 4.4e-16，float32 下 2.384e-7
-        绝对 / ≤6.0e-8 相对 ≈ 0.5 fp32 eps，**与 L 无关**），由
-        `test_ssm_chunked_scan_matches_sequential` 在 15 组 (T, L) 上钉住。
-
-        ★ 块内一步走检查点（2026-09-30，4 卡 910A OOM 的第二个原因）
-        ------------------------------------------------------------
-        「逐块物化」只降**前向瞬时峰值**，不降**反向要重取/仍活着的量**：每个块
-        的 `u`(B,H,P,l,N)、`M`(B,H,P,l,l)、`h`(B,H,P,l,N) 都是 bmm/mul 的
-        输入，被 autograd 留住直到反向。fp16@B=2000 实测（ckpt=OFF 口径）：
-
-            (736,32,64)  ×44   1.44 GiB/块  ← u
-            (4,32,4,46,64)×44  1.44 GiB/块  ← h
-            (4,4,46,32,32)×44  0.72 GiB/块  ← M
-            ⇒ 一个 MambaLTI 块 = 11 块 × 3.6 GiB ≈ **39 GiB**
-
-        加上前向留下的 8.78 GiB 就超了 32 GiB 卡 ⇒ 云端实测
-        `20.13 GiB already allocated` + `Tried to allocate 2.81 GiB`
-        （2.81 GiB ≈ 又一个块的 u）。所以这里把**块内一步**整体交给
-        `_scan_chunk` 并用 `checkpoint(..., use_reentrant=False)` 包住：每块只留
-        y（(B,l,H,P)，~50 MB）与块末状态，`u`/`M`/`h` 在反向逐块重算 ⇒
-        每块保留量降到 ~1/40。
-
-        代价：反向多一遍块内计算（Mamba 反向的 flops 约 ×1.4）。这是明确接受的
-        交换 —— 吞吐换 batch，而 batch 才是这里真正的瓶颈。推理路径
-        （`not self.training` 或无 grad）**完全不走检查点**，逐位不变、零开销。
-两条路径（因子 / 物化）共用 `_scan_chunk`，数学完全相同。
-
-    ⚠⚠ **单块前向瞬时峰值**（`_scan_batch_split`，2026-10-01 云端 OOM）
-    ------------------------------------------------------------------
-    `chunk_size` 只管「逐块物化多少」，**不管单块内同时活着的字节**。
-    块内三个 5 维张量都是 `(B, Hh, P, l, N)`，v21 @B=1000 是
-    `(1000, 4, 46, 32, 64)`（`N = d_state = 64`）—— **每个 fp16 副本 719 MiB**，
-    `h + exp(σ)·h_in` 一行同时活着三份 ⇒ **瞬时 ~2.1 GiB**，checkpoint 对此
-    无效（它只管「留不留到反向」）。实测撞墙：
-    `Tried to allocate 1.40 GiB / 28.00 GiB already allocated / 741.02 MiB free`。
-    故沿 **batch** 维切（`_scan_batch_split=250`，降到 180 MiB/副本）：
-    `bmm` 的批维独立、块入口状态按 batch 携带、`sum(-1)` 只沿 `N` ⇒
-    **逐位相同**，不是近似。详见 `_scan_chunk` 里的完整推导。
-    """
-        L = int(self.chunk_size if chunk_size is None else chunk_size)
-        if L < 1:
-            raise ValueError('chunk_size 必须 ≥ 1，收到 {}'.format(L))
-        B, T, Hh, P = log_decay.shape
-        # N（状态维）：物化形式取 drive 的最后一维；因子形式 `(dt, xc, b_vec)`
-        # 取 b_vec 的最后一维（两者恒等 —— drive = dt ⊗ xc ⊗ b_vec）。
-        N = (drive[2] if isinstance(drive, tuple) else drive).shape[-1]
-        # S：全序列的对数衰减累积。ℓ ≤ 0 ⇒ S 单调不增且 ≤ 0 ⇒ 后续所有
-        # exp(·) 的指数都 ≤ 0，不会溢出（下溢到 0 是**正确**行为）。
-        S = torch.cumsum(log_decay, dim=1)                     # (B,T,H,P)
-        nb = B * Hh * P                                        # 批量矩阵乘的批数 = B·C
-        S_prev = log_decay.new_zeros(B, 1, Hh, P)             # S_{−1} ≡ 0
-        h_in = log_decay.new_zeros(B, Hh, P, 1, N)            # H_k：块入口状态
-        ys = []
-        for k0 in range(0, T, L):
-            sl = slice(k0, min(k0 + L, T))
-            sigma = (S[:, sl] - S_prev).permute(0, 2, 3, 1)   # (B,H,P,l) 局部累积
-            # 块内这一步（`M` 的 exp、`u` 的相乘、bmm、块间传递、读出）整体
-            # 交给 `_scan_chunk` 并**用检查点包住**（2026-09-30，4 卡 OOM 的
-            # 第二个原因）：不这样做的话，逐块物化只降「前向瞬时峰值」，每个块的
-            # `u`(B,H,P,l,N) / `M`(B,H,P,l,l) / `h` 仍要**活到反向** —— fp16
-            # @B=2000 下一个 Mamba 块就是 11×(1.44+1.44+0.72) GiB ≈ 39 GiB，
-            # 任何 batch 都放不下（实测 `20.13 GiB already allocated` +
-            # `Tried to allocate 2.81 GiB`）。包上之后每块只留 y 与块末状态
-            # （各 ~50 MB），`u`/`M`/`h` 在反向时逐块重算。
-            _dt_k = _xc_k = _bv_k = None
-            _u_k = None
-            if isinstance(drive, tuple):
-                _dt, _xc, _bv = drive
-                _dt_k, _xc_k, _bv_k = _dt[:, sl], _xc[:, sl], _bv[:, sl]
-            else:
-                _u_k = drive[:, sl]
-            y, h_last = _scan_chunk(
-                sigma, _dt_k, _xc_k, _bv_k, _u_k, cvec[:, sl], h_in,
-                bool(self.scan_checkpoint) and self.training)
-            h_in = h_last                                         # (B,H,P,1,N) 块末状态
-            S_prev = S[:, sl][:, -1:]                            # (B,1,H,P)
-            ys.append(y)
-        return ys[0] if len(ys) == 1 else torch.cat(ys, dim=1)
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        T = H * W
-        Hh, P = self.n_heads, self.head_dim
-
-        h = self.norm(x).flatten(2).transpose(1, 2)            # (B, T, C)
-        hs, z = self.in_proj(h).split(self.d_inner, dim=-1)  # 各 (B, T, 184)
-
-        # 深度因果卷积：左填充 k-1，保证 out[t] 只看 xs[t-3..t]
-        xs = F.pad(hs.transpose(1, 2), (self.d_conv - 1, 0))
-        xc = F.silu(self.dw_conv(xs).transpose(1, 2))        # (B, T, d_inner)
-
-        # x_proj 132 维拆成 ddt_rank(=4) + 2N(=128)：注意必须按「前 4 / 后 128」
-        # 切，不能用 split(4)（那会切成 32 块 4 维的碎片，且**不会报错**）。
-        proj_db = self.x_proj(xc)
-        dt_raw, bc = proj_db[..., :self.ddt_rank], proj_db[..., self.ddt_rank:]
-        dt = F.softplus(self.dt_proj(dt_raw))                # (B, T, d_inner) > 0
-        b_vec, c_vec = bc.split(self.d_state, dim=-1)        # 各 (B, T, 64)
-
-        # `A_log` 是 nn.Parameter（AMP 下参数主权重必须 fp32），而 dt 是 autocast
-        # 出来的 fp16/bf16。直接相乘会按类型提升把**整条扫描**拉回 fp32 ——
-        # 2026-10-01 的 4 卡 OOM 就死在这：块内重算时 `h = h + exp(sigma)*h_in`
-        # 要 `(B,Hh,P,l,N) = (1000,4,46,32,64)` 的 **fp32** 体积 = 1.40 GiB。
-        # 按 dt 的精度转一次：A 是 4 个 head 的标量衰减（值域 −1..−4），fp16/bf16
-        # 对它是精确的，而指数/衰减的误差量级本来就远大于 fp16 eps。
-        A = -torch.exp(self.A_log).to(dt.dtype)          # (H,) < 0，逐 head 标量
-        # 每步的对数衰减 ℓ[b,t,h,p] = dt[b,t,h,p]·A[h] —— **与状态维 n 无关**
-        # （P4.1s 的逐 head 标量衰减），这正是块内 (L,L) 矩阵能跨 n 共享的原因。
-        log_decay = dt.view(B, T, Hh, P) * A[None, None, :, None]        # (B,T,H,P)
-        # ⚠ **不要**在这里整条物化 drive：(B,T,H,P,N) 每样本 17.0 MB
-        # （B=2000 → 31.67 GiB，4 卡 910A 实测 OOM 的**直接原因**，且梯度检查点
-        # 管不到它 —— 它是块内部临时量，重算还要再物化一次）。改为把三个因子
-        # 交给 `_chunked_scan`，由它在**块内**相乘：峰值降到 B·L·H·P·N
-        # （L = chunk_size，默认 32）≈ B × 1.5 MB。逐块与整条乘法逐位相同。
-        drive_factors = (dt.view(B, T, Hh, P), xc.view(B, T, Hh, P), b_vec)
-        # 唯一的扫描实现（P4.1s-vec：运行时分派已退役，线性递推无法沿 T 并行，
-        # 块内 (L,L) 矩阵乘 + ⌈T/L⌉ 步块间传递就是「向量化」本身）。
-        y = self._chunked_scan(log_decay, drive_factors, c_vec)  # (B, T, H, P)
-        y = y.view(B, T, C)
-        y = y + self.D * xc                                 # D 逐通道直通
-
-        out = self.out_proj(y) * F.silu(z)                   # z 走 SiLU 门
-        return (x + out.transpose(1, 2).reshape(B, C, H, W))  # pre-norm 残差
-
-
 class TransformerBlock(nn.Module):
-    """pre-norm Transformer 块：MHSA + FFN(184→240→184)，逐块 **224,480** 参数。
-
-    两条恒等捷径（残差）：
+    """pre-norm Transformer 块：MHSA + FFN，两条恒等捷径（残差）：
         x = x + MHSA(LN1(x))
         x = x + FFN(LN2(x))
 
-    FFN 中间维 **240**（ratio 240/184 ≈ 1.304；旧表的 276 / 1.5 已作废）。
+    默认形状沿用引入时的取值（184 通道 / FFN 中间维 240，即 ratio ≈ 1.304）；
+    宽度与中间维都是构造参数，换主干时显式传。
     注意力用**四个独立无 bias Linear**（Wq/Wk/Wv/Wo），不是融合 qkv。
     注意力 dropout 走 MHSA 内部的既有闸门 `attn_drop_p`（P2.2b）。
     """
@@ -1972,99 +1415,4 @@ class TransformerBlock(nn.Module):
         h = self.norm2(x).flatten(2).transpose(1, 2)          # (B, N, C)
         h = self.fc2(F.gelu(self.fc1(h)))                    # (B, N, C)
         x = x + h.transpose(1, 2).reshape(B, C, H, W)        # 恒等捷径 2
-        return x
-
-
-class CrossAttnRes(nn.Module):
-    """跨层注意力残差块：拼接主干三个浅/中/深位置的输出后投影回来，逐块
-    **326,416** 参数。
-
-        taps = (s1, s5, s9)   # 三个抽头的输出，见下面的「编号有歧义」
-        x = x + proj(concat(LN1(s1), LN1(s5), LN1(s9)))      # 跨层投影支路
-        x = x + MHSA(LN2(x))                                  # 恒等捷径
-        x = x + FFN(LN3(x))                                   # 恒等捷径
-
-    「第 1、5、9 号块」的编号**有歧义**（report §7.3 列了三种读法）
-    --------------------------------------------------------
-    本类**只消费抽头**，不自己去找主干，所以编号的裁定不影响参数量与计算图，
-    但它决定 P4.2 从哪里取特征 —— 因此把歧义与本任务的选择写在这里（P4.2 读的是
-    本类 docstring，不是 report）：
-
-    | 读法 | s1 | s5 | s9 |
-    |---|---|---|---|
-    | **A/B：块号 = ResBlock/Mamba/… 的序号，stem 不计数**（**本任务采用**） | **ResBlock #1** | **ResBlock #5** | **MambaLTI #1** |
-    | C：把 stem 算作第 1 个 | stem 输出 | ResBlock #4 | ResBlock #8 |
-
-    ⚠ 采用 A/B 时 **s9 是第一个 `MambaLTI` 块，不是 ResBlock #8** —— 两者是完全
-    不同的特征（SSM 块 vs 第 8 个残差块）。**P4.2 接线前请按上表核对一遍**；若要改成
-    读法 C，只需改接线，本类一行都不用动。
-
-    快捷腿是**当前流 `x`**，不是 `s1`
-    --------------------------------
-    实际计算图是 `x = x + proj(concat(...))`：`proj` 那条支路的残差腿是**进入本块的
-    当前流 `x`**。`s1`/`s5`/`s9` 三路地位**完全对等**，都只是被逐路 LN 后 concat 进去
-    的特征通道，没有哪一路享有 identity 语义 —— 把 concat 次序换成 `(s5,s9,s1)`
-    只是一个**纯置换**，不改变「谁提供恒等通路」这件事。`tests/test_arch_v21_blocks.py`
-    的 `test_cross_attn_res_matches_hand_written_pre_norm_formula` 把「快捷腿 = x」
-    钉住了（把腿换成 `s1` 会红）。
-
-    为什么 LN1 是 **184 维**、且三路共用一个
-    --------------------------------------
-    权威表给「pre-LN ×3：1,104」= 3 × 368，即**三个** 184 通道的 LayerNorm。
-    若 LN1 直接作用在 concat 后的 552 通道上，它自己就是 1,104（552×2），
-    加上 LN2/LN3 的 736 → 1,840，本块会变成 327,152（比权威的 326,416 多 736）。
-    既要满足 326,416、又要保住 `proj(LN(concat(...)))` 的「先 norm 再 proj」次序，
-    唯一解是：**一个 184 维 LN 逐路作用后 concat**（三路共用同一套仿射参数）。
-    这是本任务里唯一需要我自己钉死的实现细节（brief §4「需要你自己钉死」），
-    已在 report §4(c) 单列，供用户确认是否改用 `LN1(proj(concat))`（同参数、
-    换归一化位置与统计口径）。
-
-    明确**没有** BatchNorm 也没有 ReLU：权威表的 326,416 不含 BN 的 368。
-    """
-
-    def __init__(self, channels=184, tap_channels=(184, 184, 184),
-                 num_heads=4, ffn_hidden=240, attn_dropout=0.0):
-        super().__init__()
-        self.channels = channels
-        self.tap_channels = tuple(int(c) for c in tap_channels)
-        if len(self.tap_channels) != 3:
-            raise ValueError(
-                'CrossAttnRes 需要恰好 3 路抽头（主干第 1/5/9 号块；编号读法见类 '
-                'docstring，s9 = MambaLTI #1），收到 {} 路'.format(len(self.tap_channels)))
-        self.ffn_hidden = ffn_hidden
-        self.norm_tap = LayerNorm2d(channels)                 # 368（逐路复用）
-        self.proj = nn.Conv2d(sum(self.tap_channels), channels, 1, bias=False)  # 101,568
-        self.norm_attn = LayerNorm2d(channels)               # 368
-        self.attn = MHSA(channels, num_heads=num_heads, dropout=attn_dropout)  # 135,424
-        self.norm_ffn = LayerNorm2d(channels)                # 368
-        self.fc1 = nn.Linear(channels, ffn_hidden, bias=False)   # 44,160
-        self.fc2 = nn.Linear(ffn_hidden, channels, bias=False)   # 44,160
-
-    def _check_taps(self, taps):
-        if len(taps) != 3:
-            raise ValueError(
-                'CrossAttnRes.forward 需要 3 路抽头（主干第 1/5/9 号块的输出；'
-                '编号读法见类 docstring，s9 = MambaLTI #1），收到 {} 路'.format(len(taps)))
-        for i, (t, want) in enumerate(zip(taps, self.tap_channels)):
-            if t.dim() != 4:
-                raise ValueError(
-                    '第 {} 路抽头应为 (B, C, H, W)，收到形状 {}'.format(i + 1, tuple(t.shape)))
-            if t.shape[1] != want:
-                raise ValueError(
-                    '第 {} 路抽头通道数应为 {}（构造时给的 tap_channels[{}]），'
-                    '收到 {} —— 抽头宽度必须与构造参数一致，'
-                    '否则 proj 的 in_channels={} 与实际 concat 宽度对不上'
-                    .format(i + 1, want, i, t.shape[1], sum(self.tap_channels)))
-
-    def forward(self, x, taps):
-        B, C, H, W = x.shape
-        self._check_taps(taps)
-        s1, s5, s9 = (self.norm_tap(t) for t in taps)
-        merged = self.proj(torch.cat([s1, s5, s9], dim=1))  # 无 BN、无 ReLU
-
-        x = x + merged                                       # 跨层投影支路
-        x = x + self.attn(self.norm_attn(x))                 # 恒等捷径
-        h = self.norm_ffn(x).flatten(2).transpose(1, 2)
-        h = self.fc2(F.gelu(self.fc1(h)))
-        x = x + h.transpose(1, 2).reshape(B, C, H, W)       # 恒等捷径
         return x

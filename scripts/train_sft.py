@@ -258,7 +258,7 @@ def _dist_preflight_check(backend, device, logger):
 # 拿到的就是拼错的权重」。但它的 `sync_module_states=True` **从未被传**
 # （当时的构造参数白名单里也没有），**修复前**全文件唯一的 `dist.broadcast`
 # 是 `_sync_stop_flag` 的 stop_flag —— **没有任何参数广播**。
-# `shell/train_sft_npu_4card_v21.sh` 不传 `--resume`/`--model` ⇒ from-scratch
+# `shell/train_sft_npu_4card_katago_se.sh` 不传 `--resume`/`--model` ⇒ from-scratch
 # ⇒ 第一步之后各 rank 的权重就永久分叉：梯度虽然被 all-reduce 拉齐，但被拉齐的
 # 是「起点不同」的同一份梯度，从 step 0 起两份权重就不是同一个模型了。
 #
@@ -279,8 +279,8 @@ def _dist_preflight_check(backend, device, logger):
 #   EMA 已经构造完、把各 rank 自己的随机权重 clone 进了 shadow。所以必须由本组
 #   函数把广播放在 EMA 之前，包裹层自带的那次只能当第二道保险。
 #
-# 代价：36.3 MB 一次性广播 + 167 次小 collective（= `build_v21_net` 的参数张量数，
-# 实测 167 个 / 9,067,443 参数），**只在启动时发生一次**。
+# 代价：36.4 MB 一次性广播 + 226 次小 collective（= `build_katago_se_net` 的参数
+# 张量数，实测 226 个 / 9,112,005 参数），**只在启动时发生一次**。
 # --------------------------------------------------------------------------- #
 
 def _dist_active() -> bool:
@@ -406,9 +406,91 @@ def _check_training_env(logger):
 
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.networks.alphanet import V21_CFG, build_v21_net
+from src.networks.alphanet import AlphaGoNet
 from src.data.dataset import SupervisedDataset
 from scripts.build_dataset import build
+
+
+# =========================================================================== #
+# 训练结构的**唯一真相源**（结构参数仍然归档在 CLI 之外）
+#
+# 这里替代（已随 v21 一并删除的）`alphanet.V21_CFG`：形状不再由某个专有主干类
+# 决定，而是一张喂给 `AlphaGoNet.__init__` 的 flag 表（arch="se_bottleneck" = KataGo
+# v4+ 的 bottleneck + SE 路线）。旧 CLI flag（--arch / --backbone-channels /
+# --res-blocks / --policy-layers …）**仍然不参与建网**，下面这张表才是真的。
+#
+# 参数量是**实测值**（`sum(p.numel() for p in model.parameters())`，19×19 /
+# action_size=362 / 12 通道 / 随机初始化下数出来的，不是估算）：
+#     主干 8,392,995 + 头 719,010 = 全网 9,112,005
+#   主干 = stem 26,400 + 13 × SEBottleneck(240) 195,375
+#          + 4 × AttentionResBlock(240) 1,442,160 + out 58,080
+#   头   = ValueNetwork(96 宽 / 2 残差块) 540,193 + PolicyNetwork(128 宽 / 3 层)
+#          178,817
+#   （块数：17 段里 mix 插了 4 个 AttentionResBlock、13 个 SEBottleneck。）
+# 宽度为什么是 240 而不是 160：`SEBottleneck` 只 195,375 参数（C=240；C=160 时
+# 87,050 —— 同宽度的 `ResBlock` 是 461,440，省下 5.3 倍），所以 160 宽 × 17 块
+# 只有约 4M，离 9M 的预算差一半多。这里**保留目标形状的块布局**（17 块 / mix /
+# 4 个注意力 / value_res_blocks=2），只把宽度从 160 提到 240 把参数填满 ——
+# 实测 9,112,005，落在 8.5~9.5M 窗口正中。同布局的宽度实测对照：
+#     C=192 → 6,050,622   C=208 → 6,996,907   C=224 → 8,017,368
+#     C=232 → 8,552,392   C=240 → 9,112,005   C=248 → 9,683,909
+# 改这张表之后**必须**重数这两个数（`scripts/train_sft.py` 启动时也会把实测值
+# 打出来，可与下面这两个数字对账）。
+#
+# ⚠ 显存口径**尚未实测**：上面 9.11M 的宽度是按参数量定的，而 240 通道 ×
+# 19×19 的激活比 160 通道大 2.25 倍，`shell/train_sft_npu_4card_katago_se.sh`
+# 里的 BATCH=1000 是按 184 通道那档定的。上云首跑请按报错往下调 BATCH。
+# =========================================================================== #
+KATAGO_SE_CFG = {
+    # ---- 形状（结构，全部对应 AlphaGoNet.__init__ 的参数名）----
+    'in_channels': 12,            # 与 AlphaGoNet 默认 / 数据集默认 / GoAI 注册的
+                                  # 12 通道构建器一致
+    'arch': 'se_bottleneck',      # KataGo v4+ bottleneck + SE
+    'channels': 240,              # backbone_channels
+    'blocks': 17,                 # backbone_res_blocks（段内块数）
+    'attention_mode': 'mix',      # 卷积 + 注意力混排
+    'num_attention_layers': 4,    # 其中 4 个是 AttentionResBlock
+    'num_heads': 4,
+    'value_channels': 96,
+    'value_res_blocks': 2,
+    'policy_channels': 128,
+    'policy_layers': 3,
+    # ---- 行为（非结构，可被调用方覆盖）----
+    'grad_checkpoint': 1,         # 必开；compile=1 时由调用方关掉并记日志
+    # ---- 预算锚（实测，硬数）----
+    'params_backbone': 8_392_995,
+    'params_total': 9_112_005,
+}
+
+
+def build_katago_se_net(*, action_size, attention_dropout=0.1,
+                        grad_checkpoint=1, **overrides):
+    """按 `KATAGO_SE_CFG` 建网；返回 `(model, cfg)`，`cfg` 是**实际生效**的取值。
+
+    `overrides` 只用于行为参数（见调用点），结构键不接受覆盖 —— 与 D1 的
+    「结构只由这一张表决定」一致。实测参数量与 `cfg` 一并返回，好让日志 /
+    SwanLab config 面板里出现的数字与这张表对账（而不是各写一份）。
+    """
+    c = dict(KATAGO_SE_CFG)
+    c['attention_dropout'] = float(attention_dropout)
+    c['grad_checkpoint'] = int(grad_checkpoint)
+    model = AlphaGoNet(
+        in_channels=c['in_channels'],
+        backbone_channels=c['channels'],
+        backbone_res_blocks=c['blocks'],
+        attention_mode=c['attention_mode'],
+        num_attention_layers=c['num_attention_layers'],
+        num_heads=c['num_heads'],
+        attention_dropout=c['attention_dropout'],
+        value_channels=c['value_channels'],
+        value_res_blocks=c['value_res_blocks'],
+        policy_channels=c['policy_channels'],
+        policy_layers=c['policy_layers'],
+        action_size=int(action_size),
+        arch=c['arch'],
+        use_checkpoint=bool(c['grad_checkpoint']),
+    )
+    return model, c
 
 
 def save_model(model, path):
@@ -631,11 +713,11 @@ def _positive_beta(text):
 def load_dataset(path):
     """加载单个 .npz 训练集。"""
     d = np.load(path, allow_pickle=False)
-    # 通道数必须与**模型侧同改**（D1：train_sft 的模型恒 v21 = 17 路）。
-    # SupervisedDataset 的默认 12 是给旧权重回归留的（dataset.py C7），这里
-    # 不显式传就会拿 12 路平面去喂 17 路 stem —— 第一个 batch 就形状错。
+    # 通道数必须与**模型侧同改**（训练结构恒 = KATAGO_SE_CFG）。
+    # SupervisedDataset 的默认 12 是它自己的默认（dataset.py C7），这里不显式传
+    # 就等于赌「模型侧也是 12」—— 两者一旦分叉，第一个 batch 就形状错。
     return SupervisedDataset({k: d[k] for k in d.files},
-                             n_channels=V21_CFG['in_channels'])
+                             n_channels=KATAGO_SE_CFG['in_channels'])
 
 
 # ---- eval 的确定性：固定采样源 + 与训练 RNG 流隔离 + 关闭数据增强 ----
@@ -934,8 +1016,8 @@ def load_from_path(path, board_size, max_games_per_tgz=0):
                 f"目录 {path} 下未解析到任何有效棋谱，请检查 --board-size 是否与棋谱尺寸匹配")
         merged = _concat_dicts(dicts)
         print(f"[data] 合并后样本数 {merged['boards'].shape[0]}")
-        # 同 load_dataset：平面通道数随 V21_CFG 走（与模型侧同改）
-        return SupervisedDataset(merged, n_channels=V21_CFG['in_channels'])
+        # 同 load_dataset：平面通道数随 KATAGO_SE_CFG 走（与模型侧同改）
+        return SupervisedDataset(merged, n_channels=KATAGO_SE_CFG['in_channels'])
     return load_dataset(path)
 
 
@@ -1099,28 +1181,35 @@ def _init_swanlab(args, logger):
         if api_key:
             swanlab.login(api_key=api_key, save=True)
             logger.info("[swanlab] API key 已设置，自动登录")
-        # ⚠ config 面板此前记的是 9 个 **D1 已归档**的结构 flag
-        # （backbone_channels / res_blocks / convnext_blocks / attn_blocks /
-        #  value_channels / value_res_blocks / policy_channels / policy_layers …），
-        # 它们**完全不参与建网** —— v21 恒为 V21_CFG 那个形状。而 config 面板正是
-        # 对比两次 run 时第一个看的东西，记虚构值比不记更糟。2026-10-01 换成真值。
+        # ⚠ config 面板记的必须是**真值**：结构一律取 `KATAGO_SE_CFG`（唯一真相源），
+        # **不记**任何已归档的 CLI 结构 flag（backbone_channels / res_blocks /
+        # convnext_blocks / attn_blocks / value_channels / value_res_blocks /
+        # policy_channels / policy_layers …）—— 它们完全不参与建网，记进去就是
+        # 虚构值，而 config 面板恰恰是对比两次 run 时第一个看的东西。
+        # `blocks` 那个描述串同理：从真形状数出来（se×13 + attn×4），不是抄配置。
         _ws = max(1, int(os.environ.get('WORLD_SIZE', '1') or '1'))
         _accum = max(1, int(args.gradient_accumulation_steps))
         swanlab.init(
             project="go-ai",
             name=f"sft_{args.board_size}x{args.board_size}_{args.ver}",
             config={
-                # ---- 结构：v21 真值（唯一真相源是 V21_CFG，不是这些 flag）----
-                "v21/in_channels": V21_CFG['in_channels'],
-                "v21/channels": V21_CFG['channels'],
-                "v21/blocks": "res%d_mamba%d_trans%d_cross%d" % (
-                    V21_CFG['n_res'], V21_CFG['n_mamba'],
-                    V21_CFG['n_trans'], V21_CFG['n_cross']),
-                "v21/ffn_hidden": V21_CFG['ffn_hidden'],
-                "v21/num_heads": V21_CFG['num_heads'],
-                "v21/params_total": V21_CFG['params_total'],
-                "v21/params_backbone": V21_CFG['params_backbone'],
-                "grad_checkpoint": V21_CFG['grad_checkpoint'],
+                # ---- 结构：新架构真值（唯一真相源是 KATAGO_SE_CFG）----
+                "arch/in_channels": KATAGO_SE_CFG['in_channels'],
+                "arch/name": KATAGO_SE_CFG['arch'],
+                "arch/channels": KATAGO_SE_CFG['channels'],
+                # 段内块描述串：mix 模式在 17 段里插了 4 个注意力块，其余是 SE 块
+                "arch/blocks": "se13_attn4_of_%d" % KATAGO_SE_CFG['blocks'],
+                "arch/attention_mode": KATAGO_SE_CFG['attention_mode'],
+                "arch/num_attention_layers": KATAGO_SE_CFG['num_attention_layers'],
+                "arch/num_heads": KATAGO_SE_CFG['num_heads'],
+                # 注意力块里 FFN 的中间维 = 2×通道（MultiHeadSelfAttention 的 ffn）——
+                # 新架构没有单一 `ffn_hidden` 键，这里记的是它真正的对应物
+                "arch/attn_ffn_hidden": KATAGO_SE_CFG['channels'] * 2,
+                # SE 瓶颈块的中段宽 = 通道/2（SEBottleneck 默认 mid_channels）
+                "arch/se_mid_channels": KATAGO_SE_CFG['channels'] // 2,
+                "arch/params_total": KATAGO_SE_CFG['params_total'],
+                "arch/params_backbone": KATAGO_SE_CFG['params_backbone'],
+                "grad_checkpoint": KATAGO_SE_CFG['grad_checkpoint'],
                 # ---- batch/lr：有效 batch 含累积（漏乘会把学习率口径搞错）----
                 "batch_size_per_card": args.batch_size,
                 "grad_accum": _accum,
@@ -1474,8 +1563,8 @@ def _build_param_groups(model, args) -> list[dict]:
     与 bias），与 SFT 常规做法相反。`nn.Parameter` 按身份可哈希（`Tensor.__hash__`
     是 id 语义），直接用对象做集合元素即可，不必绕 `id()`。
 
-    value 归属按**前缀** `'value.'` 判定而非子串 `'value' in n`：子串判定会把未来
-    v21 新增的 `backbone.value_proj` 之类（非 value 头、名字里带 value）误归到 value 组。
+    value 归属按**前缀** `'value.'` 判定而非子串 `'value' in n`：子串判定会把将来
+    主干里新增的 `backbone.value_proj` 之类（非 value 头、名字里带 value）误归到 value 组。
 
     调用前提：`model` 必须是**裸模块**。DDP 包裹后 `named_parameters()` 的名字会带
     `module.` 前缀，`startswith('value.')` 就不再成立。main() 里本函数在
@@ -1915,7 +2004,7 @@ def main():
                          '其梯度天然比 value 弱 ~A 倍，修掉归约 bug 后实测仍差 '
                          '约 250~360:1，此参数不足以单独补平。')
     # ---- D4（SFT 侧）：损失口径三参数 ------------------------------------
-    # 只加这三个（D1：v21 不新增其他 CLI 参数）。RL 侧的对应拆分在 P3-C/P3-D，
+    # 只加这三个（结构参数不新增任何 CLI）。RL 侧的对应拆分在 P3-C/P3-D，
     # scripts/selfplay_train.py 不在本任务范围。
     ap.add_argument('--policy-loss', default='ce',
                     choices=['huber', 'ce'],
@@ -2332,36 +2421,37 @@ def main():
     else:
         train_sampler = None
 
-    # ---------------------------------------------------------------- D1 v2 ----
-    # 训练结构**唯一** = v21（结构硬编码在 src.networks.alphanet.V21_CFG）。
+# ------------------------------------------------------ 结构（唯一）----
+    # 训练结构**唯一** = `KATAGO_SE_CFG`（本文件顶部那张表，KataGo
+    # SE-bottleneck 路线，形状喂给 `AlphaGoNet`）。
     # 旧结构 flag（--arch / --backbone-channels / --res-blocks / --policy-layers …
     # 与下面这一整串）**全部归档：不参与建网**，仍被 argparse 接受只为旧 shell
-    # 不必改命令行（忽略而非报错，是 D1 的硬约束 C11；运行日志里那句
+    # 不必改命令行（忽略而非报错，是这条约束的硬要求；运行日志里那句
     # 「结构参数已归档」就是这里）。
-    # `--use-checkpoint` 同样归档：v21 的检查点开关 = V21_CFG['grad_checkpoint']
-    # （用户裁决：ResBlocks 必开）∧「未开图编译」，见下。
-    # 没有 `arch=='v21'` 分支、没有新增任何 CLI（D1）。
-    _v21_gc = V21_CFG['grad_checkpoint']
+    # `--use-checkpoint` 同样归档：检查点开关 = `KATAGO_SE_CFG['grad_checkpoint']`
+    # ∧「未开图编译」，见下。
+    # 没有任何 arch 分支、也没有新增任何 CLI。
+    _gc = KATAGO_SE_CFG['grad_checkpoint']
     if args.compile == 1 or args.npu_graph_compile == 1:
         # grad checkpointing 与 torch.compile / TorchAir 图编译互斥
         # （P4.6b §8.2④：训练态 GC 会在第一次前向撞断言）。两者都要是
         # **显式**决策：这里让图编译赢、检查点让位并打 warning，绝不静默
         # 丢掉任何一边（显存会回升，日志必须能看出原因）。
-        _v21_gc = 0
+        _gc = 0
         logger.warning(
             "[model] compile/npu-graph-compile=1 ⇒ 本次运行关闭 gradient "
-            "checkpointing（V21_CFG 的 %d 与图编译互斥，显存占用回升）",
-            V21_CFG['grad_checkpoint'])
+            "checkpointing（配置的 %d 与图编译互斥，显存占用回升）",
+            KATAGO_SE_CFG['grad_checkpoint'])
     elif args.use_checkpoint == 0:
-        logger.info("[model] --use-checkpoint 已归档（D1）：v21 的检查点开关由 "
-                    "V21_CFG[%r]=%d 决定，本次启用（如需关闭请用 --compile 1）",
-                    'grad_checkpoint', _v21_gc)
-    model = build_v21_net(
-        in_channels=V21_CFG['in_channels'],
+        logger.info("[model] --use-checkpoint 已归档：检查点开关由 "
+                    "KATAGO_SE_CFG[%r]=%d 决定，本次启用（如需关闭请用 --compile 1）",
+                    'grad_checkpoint', _gc)
+    model, _eff_cfg = build_katago_se_net(
         action_size=args.board_size * args.board_size + 1,  # +1 为 pass 类别
         attention_dropout=args.attention_dropout,           # 行为参数，仍生效
-        grad_checkpoint=_v21_gc,
-    ).to(device)
+        grad_checkpoint=_gc,
+    )
+    model = model.to(device)
     # from-scratch 起手必须把 rank0 的初始权重广播给其余 rank（2026-10-01）。
     # ⚠ 位置是硬要求：**必须在 EMA 构造（本文件下方 `EMA(model, ...)`）之前** ——
     # EMA 在构造时就把参数 `clone()` 进 `shadow`，放晚了 shadow 会持有广播前的
@@ -2371,6 +2461,17 @@ def main():
     _sync_init_weights_from_rank0(model, logger)
     _assert_init_weights_identical(model, logger)
     n_params = sum(p.numel() for p in model.parameters())
+    _n_backbone = sum(p.numel() for p in model.backbone.parameters())
+    # ⚠ 实测 vs 锚：改了 `KATAGO_SE_CFG` 之后这两个数必须重数（构建器返回的
+    # `_eff_cfg` 里也有一份）。对不上说明表被改过而锚没更新 —— 直接在这里响，
+    # 别等到几天后拿一个「莫名涨了 2M 参数」的 run 去比 loss。
+    if (n_params, _n_backbone) != (_eff_cfg['params_total'],
+                                   _eff_cfg['params_backbone']):
+        logger.warning(
+            "[model] ⚠ 参数量与 KATAGO_SE_CFG 的预算锚不符：实测 %d / %d"
+            "（全网 / 主干），锚 %d / %d。改了结构表就要重数这两个数。",
+            n_params, _n_backbone,
+            _eff_cfg['params_total'], _eff_cfg['params_backbone'])
     # 逐段开关也打出来：「grad_checkpoint=1」只说明**总开关**，看不出哪几段真的在
     # 走检查点（per-kind 默认可以不同；且训练态闸门还要求 self.training +
     # grad enabled）。这段日志的用处是让「GC 到底生效没有」不必翻代码，也不必
@@ -2378,8 +2479,11 @@ def main():
     _gc_kinds = getattr(getattr(model, 'backbone', None),
                         'grad_checkpointing_kinds', None)
     _gc_kinds = _gc_kinds() if callable(_gc_kinds) else {}
-    logger.info("[model] v21 (V21_CFG) 参数量=%.2fM | grad_checkpoint=%d | 设备=%s",
-                n_params / 1e6, _v21_gc, device)
+    logger.info("[model] %s (%dch / %d 段 / mix+%d 注意力) 参数量=%.2fM"
+                "（主干 %.2fM）| grad_checkpoint=%d | 设备=%s",
+                _eff_cfg['arch'], _eff_cfg['channels'], _eff_cfg['blocks'],
+                _eff_cfg['num_attention_layers'],
+                n_params / 1e6, _n_backbone / 1e6, _gc, device)
     logger.info("[model] GC 逐段开关=%s | 生效还需 training 态+grad enabled"
                 "（eval/推理恒不检查点，零开销）", _gc_kinds or 'n/a')
 
@@ -2570,10 +2674,10 @@ def main():
             # flash-attn 只接受 fp16/bf16，导致图编译被误判为不可用而回退 eager，
             # 且这个误判极难排查。torch.compile 是惰性的，编译错误在这里才浮出来。
             with torch.no_grad(), maybe_autocast(device, amp_dtype):
-                # 通道数走 V21_CFG 常量（C9 / P4.4）：D1 之后这里建的永远是 v21，
-                # 硬编码 12 会让图编译预热在 stem 上直接形状错 → 整条编译路径
-                # 静默回退 eager。
-                _dummy = torch.zeros(1, V21_CFG['in_channels'], args.board_size,
+                # 通道数走 KATAGO_SE_CFG 常量：预热张量必须与模型 stem
+                # 同宽，硬编码一个字面量只会在 stem 上形状错 → 整条编译路径静默
+                # 回退 eager。
+                _dummy = torch.zeros(1, KATAGO_SE_CFG['in_channels'], args.board_size,
                                       args.board_size, device=device)
                 model(_dummy)
             logger.info("[train] NPU TorchAir Linear-only 图编译已启用（已编译 %d 个 "
@@ -2607,8 +2711,8 @@ def main():
                 # FP32 输入直灌会报 "FlashAttention only support fp16 and bf16 data
                 # type"，导致 compile 被误判为不可用而回退 eager。
                 with torch.no_grad(), maybe_autocast(device, amp_dtype):
-                    # 同上：预热输入通道 = V21_CFG['in_channels']（C9 / P4.4）
-                    dummy = torch.zeros(1, V21_CFG['in_channels'], args.board_size,
+                    # 同上：预热输入通道 = KATAGO_SE_CFG['in_channels']
+                    dummy = torch.zeros(1, KATAGO_SE_CFG['in_channels'], args.board_size,
                                         args.board_size, device=device)
                     model(dummy)
                 logger.info("[train] 已启用 torch.compile 算子融合")
@@ -2643,9 +2747,9 @@ def main():
     #      ⚠⚠ **「每步 1 次」是错的说法，本文件全无 `no_sync()`**（见本文件
     #      `_compute_l2_report` docstring 里那条同源的说明）：每个 micro-batch 都
     #      `backward()`，梯度累积只在 `_accum_steps` 满了才 `optimizer.step()`，
-    #      而 DDP 的梯度 all-reduce 挂在**每一次 backward 的收尾**上 ⇒ v21 的
+    #      而 DDP 的梯度 all-reduce 挂在**每一次 backward 的收尾**上 ⇒ 默认的
     #      `GRAD_ACCUM=2` 下**每个 optimizer step 是 2 次梯度 all-reduce + 2 次
-    #      buffer broadcast**（payload ≈ 2 × 36.3 MB ≈ 72.5 MB）。数量仍是
+    #      buffer broadcast**（payload ≈ 2 × 36.4 MB ≈ 72.9 MB）。数量仍是
     #      「16 个分片单元 × 2」的零头，通信量小到不像瓶颈，而本仓库的实际瓶颈
     #      在算子（见 `[profile]` 日志）。
     #

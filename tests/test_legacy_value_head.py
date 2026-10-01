@@ -31,7 +31,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from src.inference import GoAI, remap_legacy_value_keys  # noqa: E402
-from src.networks.alphanet import AlphaGoNet, build_v21_net  # noqa: E402
+from src.networks.alphanet import AlphaGoNet  # noqa: E402
 
 N = 19
 
@@ -167,21 +167,30 @@ def test_value_res_blocks_ctor_arg_is_honored_without_checkpoint():
 
 
 # --------------------------------------------------------------------------- #
-# 5. 不得牵连 v21 / 不得回归别的告警
+# 5. 不得牵连「无 res 块的 value 头」/ 不得回归别的告警
 # --------------------------------------------------------------------------- #
-def test_v21_path_unaffected_by_legacy_remap(tmp_path, capsys):
-    """v21（17ch）不受影响：FCValueHead 无 res 块，remap 必须是 0 命中。"""
+def test_resless_value_head_unaffected_by_legacy_remap(tmp_path, capsys):
+    """无 res 块的 value 头（`value_res_blocks=0`）：remap 必须是 0 命中。
+
+    原 v21 用例（`build_v21_net` + FCValueHead + 17ch）随 v21 硬删除退役；
+    守的契约不变 —— 「value 头没有 `value.res*` 键的网络」必须既不被
+    `remap_legacy_value_keys` 碰到、也能经 GoAI 全量加载、还不触发
+    「未完全对齐」告警。存活架构里对应的形状是 `value_res_blocks=0`
+    （`ValueNetwork` 的空 `res_blocks`），加载侧显式传同名构造参数。
+    """
     torch.manual_seed(15)
-    m = build_v21_net(in_channels=17, action_size=N * N + 1)
+    m = AlphaGoNet(in_channels=12, backbone_channels=16, backbone_res_blocks=2,
+                   action_size=N * N + 1, value_res_blocks=0)
     state = m.state_dict()
-    assert not any(k.startswith('value.res') for k in state)
+    assert not any(k.startswith('value.res') for k in state), \
+        '无 res 块的头不应有 value.res* 键'
     _, moved = remap_legacy_value_keys(state)
     assert moved == 0
 
-    ck = _save(state, tmp_path / 'v21.pth')
-    ai = GoAI(model_path=ck, board_size=N, device='cpu')
+    ck = _save(state, tmp_path / 'resless_value.pth')
+    ai = GoAI(model_path=ck, board_size=N, device='cpu', value_res_blocks=0)
     out = capsys.readouterr().out
-    assert ai.in_channels == 17
+    assert ai.in_channels == 12
     assert '未完全对齐' not in out, out
     for k, v in state.items():
         assert torch.equal(ai.model.state_dict()[k], v), f'{k} 没加载进来'

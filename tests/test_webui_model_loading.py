@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from scripts.webui import build_parser
 from src.game.go_rules import GoBoard
 from src.inference import GoAI
-from tests.test_goai_dual_generation import _make_ckpt, _register_17_placeholder
+from tests.test_katago_se import _make_ckpt, _register_17_placeholder
 
 N = 9
 REPO = pathlib.Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

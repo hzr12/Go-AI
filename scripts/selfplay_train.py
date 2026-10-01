@@ -165,7 +165,8 @@ def self_play_game(ai, board_size, max_moves, temperature,
 
     data 行（**8 元组**，P3-C 契约 + B2 的 logq）：
       (planes, action, logp_old, to_play, mc, v_collect, mask, logq)
-      · planes:   (C,n,n) float32，C = `ai.in_channels`（12 旧权重 / 17 v21）。
+      · planes:   (C,n,n) float32，C = `ai.in_channels`（由 checkpoint 的 stem
+                  形状推断；现役一切架构都是 12）。
                   **与推演共用同一次特征计算**（走子器把 planes 原样返回），
                   不再像改造前那样「MCTS 算一遍、记样本再算一遍」。
       · action:   本手**实际落子**的动作（采样值，play 拒绝时回退 pass=n²）——
@@ -839,8 +840,9 @@ def _ppo_value_loss(value, z, v_old, clip_eps):
     `--ppo-clip`（不新增参数，D1）、`v_old` = 行内 root_value（= buffer 第 4 列）。
 
     参数：
-      value     (B,) 或 (B,1)  网络当前的价值 v_new（v21 的 value head 末层是
-                                  tanh，值域 [-1,1]；旧 ValueNetwork 是裸线性输出）
+      value     (B,) 或 (B,1)  网络当前的价值 v_new（`FCValueHead`——v21 代遗留、
+                                  现役已无架构调用方——末层是 tanh，值域 [-1,1]；
+                                  现役 `ValueNetwork` 是裸线性输出）
       z         (B,) 或 (B,1)  n-step TD 目标 ∈ [-1,1]（compute_td_target 产出）
       v_old     (B,) 或 (B,1)  **采集时**的 root_value = 行为策略的价值（buffer
                                   常量、停止梯度）。它是信任域的**锚点**
@@ -853,7 +855,8 @@ def _ppo_value_loss(value, z, v_old, clip_eps):
        越界」被另一个样本的正常损失平均掉，信任域就成了**软**约束；逐样本 max
        才是 PPO 原文的悲观目标（per-sample pessimistic）。
     2. **clip 对称**：`clip(v_new, v_old-ε, v_old+ε)`。z 与 v 都落在 [-1,1]，
-       价值头在 v21 是 tanh 有界的，ε=0.2 ≈ 值域的 20% —— 这个宽度偏大，
+       价值头若是 `FCValueHead`（v21 代遗留）则 tanh 有界，ε=0.2 ≈ 值域的 20%
+       —— 这个宽度偏大，
        报告里标为规格歧义（路线图没给 value 侧单独的 ε），暂按文档契约复用。
     3. **v_new 绝不回流进优势**：A = standardize(z - v_old) 只依赖采集期的
        （z, v_old）这一对，裁剪后不重算 —— v_new 是「当前网络」的值，进 A 会让

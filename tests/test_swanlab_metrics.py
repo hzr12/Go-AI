@@ -3,8 +3,8 @@
 这次改了两类东西，都容易「加了变量却没上报」或「上报了但没意义」：
 
 1. **config 面板此前记的是 9 个 D1 已归档的结构 flag** —— 它们完全不参与建网
-   （v21 恒为 `V21_CFG` 那个形状），而 config 面板是对比两次 run 时第一个看的
-   东西。记虚构值比不记更糟。
+   （结构恒由 `KATAGO_SE_CFG` 这张表决定，v21 硬删除后旧 `V21_CFG` 已不存在），
+   而 config 面板是对比两次 run 时第一个看的东西。记虚构值比不记更糟。
 2. **一批「算了但没上报」或「上报了但没有参照」的量**：
    - `grad_norm`：`clip_grad_norm_` 的返回值此前被**丢弃** —— fp16 溢出/梯度爆炸
      唯一的直接信号；
@@ -144,7 +144,7 @@ def test_config_panel_has_no_archived_flags():
 
 
 @pytest.mark.parametrize('key', [
-    'v21/in_channels', 'v21/channels', 'v21/blocks', 'v21/params_total',
+    'arch/in_channels', 'arch/channels', 'arch/blocks', 'arch/params_total',
     'grad_checkpoint', 'batch_size_per_card', 'grad_accum', 'world_size',
     'effective_batch', 'lr', 'weight_decay', 'clip_grad_max_norm',
     'label_smoothing', 'attention_dropout', 'ema_enabled', 'ema_decay',
@@ -155,12 +155,18 @@ def test_config_panel_records_the_key(key):
     assert _has(INIT, key), f'config 面板缺 {key}'
 
 
-def test_config_v21_facts_come_from_v21_cfg():
-    """结构字段必须来自 `V21_CFG` 而不是 args（args 里那些是归档 flag）。"""
+def test_config_arch_facts_come_from_katago_se_cfg():
+    """结构字段必须来自 `KATAGO_SE_CFG` 而不是 args（args 里那些是归档 flag）。
+
+    v21 硬删除后 `V21_CFG` 不复存在，结构唯一真相源是 `scripts/train_sft.py` 里的
+    `KATAGO_SE_CFG` —— 断言的对象随之换轨，判据的形状不变：config 面板里的每一个
+    结构数字都必须直接引那张表，不得引 args。
+    """
     cfg = INIT[INIT.index('config={'):]
-    assert "V21_CFG['in_channels']" in cfg
-    assert "V21_CFG['channels']" in cfg
-    assert "V21_CFG['n_res']" in cfg and "V21_CFG['n_mamba']" in cfg
+    assert "KATAGO_SE_CFG['in_channels']" in cfg
+    assert "KATAGO_SE_CFG['channels']" in cfg
+    assert "KATAGO_SE_CFG['blocks']" in cfg
+    assert "KATAGO_SE_CFG['params_total']" in cfg
 
 
 def test_effective_batch_includes_accumulation():
@@ -339,7 +345,7 @@ def test_config_expression_actually_evaluates():
     """把 config 表达式用**真实 dest 集合**的 Namespace 真 eval 一遍。
 
     静态检查挡得住「属性不存在」，挡不住别的：表达式里除 args 还引用了
-    `V21_CFG` / `os` / `_ws` / `_accum` 等局部名，任何一个拼错或漏定义都会在
+    `KATAGO_SE_CFG` / `os` / `_ws` / `_accum` 等局部名，任何一个拼错或漏定义都会在
     `swanlab.init(...)` 那一步抛异常 —— 而那一步被 `except Exception` 吞掉，
     结果是**跟踪静默全丢、训练照跑**（2026-10-01 真发生过一次：`args.td`）。
 
@@ -359,12 +365,13 @@ def test_config_expression_actually_evaluates():
 
     body = SRC[SRC.index('config={'):]
     expr = body[body.index('{') + 1:body.index('},\n')]
-    env = {'args': ns, 'V21_CFG': tsf.V21_CFG, 'os': os, '_ws': 2, '_accum': 2}
+    env = {'args': ns, 'KATAGO_SE_CFG': tsf.KATAGO_SE_CFG, 'os': os,
+           '_ws': 2, '_accum': 2}
     cfg = eval('{' + expr + '}', env)   # noqa: S307 — 测试内显式求值
 
     assert isinstance(cfg, dict) and len(cfg) >= 25, \
         f'config 键数异常：{len(cfg) if isinstance(cfg, dict) else type(cfg)}'
-    for k in ('v21/in_channels', 'v21/blocks', 'effective_batch',
+    for k in ('arch/in_channels', 'arch/blocks', 'effective_batch',
               'grad_accum', 'world_size', 'lr', 'amp_dtype',
               'attn_query_chunk', 'ema_decay'):
         assert k in cfg, f'config 实跑后缺 {k}'

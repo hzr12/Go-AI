@@ -51,10 +51,10 @@ SEED = 1234
 # 夹具
 # --------------------------------------------------------------------------- #
 def _register_17_placeholder():
-    """P4.2 接线前的占位：真 v21 结构归 P4.2，这里只证明接缝 + 通道驱动。
+    """17ch 没有真构建器（v21 代连同 V21_CFG 已删除），占位只证明接缝 + 通道驱动。
 
-    与 `tests/test_goai_dual_generation.py` 同一手法：17ch 的构建器不存在时，
-    用一个「尊重 in_channels 参数」的构建器顶上去，端到端仍走真 GoAI。
+    手法与已退役的 `tests/test_goai_dual_generation.py` 相同：17ch 的构建器
+    不存在时，用一个「尊重 in_channels 参数」的构建器顶上去，端到端仍走真 GoAI。
     """
     from src import inference as inf
 
@@ -507,10 +507,11 @@ def test_worker_prefetch_swallow_does_not_hide_channel_mismatch_end_to_end():
 
 
 def test_seventeen_channel_search_runs_end_to_end(tmp_path):
-    """17 通道 v21 模型走**整条**搜索链路（含 worker 推测性预取）必须跑通。
+    """17 通道模型（占位 builder 造）走**整条**搜索链路（含 worker 推测性预取）
+    必须跑通。
 
     前面那些用例是把三处建特征拆开点名的；这条把它们串起来：真 `GoAI`
-    （17ch，由 P4.2 注册表里的占位 builder 造）+ 真 MCTS + `num_threads=4`
+    （17ch，由本文件的占位 builder 造）+ 真 MCTS + `num_threads=4`
     打开 `spec_prefetch`（worker 预取路径真的会被走到）+ 一次 `search`。
     改前这条路必然炸在 F5（「期望 17…实际 12」）。
     """

@@ -6,7 +6,7 @@
     - value : 当前执子方视角的局面胜率，tanh 后落在 [-1, 1]
 
 特征由 src.game.go_rules.GoBoard.feature_planes 统一生成，通道数与模型 stem 的
-in_channels 一致（旧代 12 / v21 17，由 `_infer_in_channels` 从权重形状推断），
+in_channels 一致（现役 12，由 `_infer_in_channels` 从权重形状推断），
 与 src.data.dataset 使用同一套特征工程，避免训练/推理不一致。
 """
 
@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 from src.game.go_rules import GoBoard
-from src.networks.alphanet import AlphaGoNet, build_v21_net
+from src.networks.alphanet import AlphaGoNet
 
 
 def _ensure_torch_npu():
@@ -34,11 +34,11 @@ def _ensure_torch_npu():
 
 
 # --------------------------------------------------------------------------- #
-# 通道数 → 网络构建器注册表（双代接缝，P4.8/P4.13）
+# 通道数 → 网络构建器注册表（P4.8/P4.13）
 #
-# P4.2 接线方式：
+# 接线方式：
 #     from src.inference import register_in_channels_builder
-#     register_in_channels_builder(17, builder)
+#     register_in_channels_builder(N, builder)
 # builder 契约：builder(*, in_channels: int, **arch_kwargs) -> nn.Module
 #     - in_channels 由 GoAI 从权重 stem 形状推断后传入，必须用于 stem；
 #     - arch_kwargs 是 GoAI.__init__ 的架构参数字典，不认识的键直接忽略；
@@ -160,8 +160,8 @@ def _build_for_in_channels(in_channels, **arch_kwargs):
 
     `built is None`（构建器返回的模型里四个候选 stem 键一个都没有）同样是
     **硬错误**而不是「跳过校验」：那条路上通道数对不对根本无从判断，等于
-    放行一个 stem 可能是随机权重的模型。注册进来的构建器（如 v21 的）必须
-    把 stem 命名在 `_STEM_WEIGHT_KEYS` 之内，否则 GoAI 侧所有通道数保证失效。
+    放行一个 stem 可能是随机权重的模型。注册进来的构建器必须把 stem 命名在
+    `_STEM_WEIGHT_KEYS` 之内，否则 GoAI 侧所有通道数保证失效。
     """
     in_channels = int(in_channels)
     builder = _IN_CHANNEL_BUILDERS.get(in_channels)
@@ -169,10 +169,11 @@ def _build_for_in_channels(in_channels, **arch_kwargs):
         registered = ", ".join(str(k) for k in sorted(_IN_CHANNEL_BUILDERS))
         raise RuntimeError(
             f"in_channels={in_channels} 没有可用的网络构建器（已注册: {registered}）。"
-            f"{in_channels} 通道结构由任务 P4.2 接线：调用 "
+            f"{in_channels} 通道结构未接线：调用 "
             f"src.inference.register_in_channels_builder({in_channels}, builder)，"
             f"builder 签名 builder(*, in_channels: int, **arch_kwargs) -> nn.Module"
-            f"（{in_channels}ch 的结构类 / V21_CFG 由 P4.2 提供）。")
+            f"（{in_channels}ch 的结构类由该 builder 提供，且必须把 in_channels "
+            f"传给 stem）。")
     model = builder(in_channels=in_channels, **arch_kwargs)
     built = _stem_in_channels(model.state_dict())
     if built is None:
@@ -190,15 +191,16 @@ def _build_for_in_channels(in_channels, **arch_kwargs):
 
 
 def _legacy_alpha_go_net(in_channels, **arch_kwargs):
-    """12 通道旧代（现行 resnet/convnext 结构）的构建器。"""
+    """12 通道现行结构（resnet / convnext / se_bottleneck）的构建器。
+
+    现在**只有这一个通道数接线**。17 路那一代（v21）随它的构建器一起退役，
+    未注册的通道数会走 `_build_for_in_channels` 的报错分支，那条分支已经把
+    「谁来接、怎么接」的契约写在消息里了。
+    """
     return AlphaGoNet(in_channels=in_channels, **arch_kwargs)
 
 
 register_in_channels_builder(12, _legacy_alpha_go_net)
-# P4.2 接线：17ch = v21（D1 的唯一训练结构，结构只由 V21_CFG 决定）。
-# builder 收到的 arch_kwargs 里旧结构参数（backbone_channels/attention_mode…）
-# 按 D1 归档一律忽略，只保留 action_size / attention_dropout / grad_checkpoint。
-register_in_channels_builder(17, build_v21_net)
 
 
 class GoAI:
@@ -305,11 +307,10 @@ class GoAI:
         self.model = _build_for_in_channels(self.in_channels, **net_kwargs).to(
             self.device)
         # ⚠ 这里就进 eval，别等下面那行 —— torch.compile 的 warmup 前向在
-        # `self.model.eval()`（下面）**之前**就跑，而 v21 主干带 grad
-        # checkpointing（V21_CFG['grad_checkpoint']=1）：GC 只在 training 态
-        # 生效，warmup 时模型默认 training=True 会让 compile 撞上 GC 互斥守卫
-        # 并静默回退 eager（P4.6b §8.2④ 那组组合）。eval 下检查点恒关闭，
-        # compile 正常走。
+        # `self.model.eval()`（下面）**之前**就跑，而训练出来的模型可能带 grad
+        # checkpointing（train_sft 默认开）：GC 只在 training 态生效，warmup 时
+        # 模型默认 training=True 会让 compile 撞上 GC 互斥守卫并静默回退 eager
+        # （P4.6b §8.2④ 那组组合）。eval 下检查点恒关闭，compile 正常走。
         self.model.eval()
         # torch.compile 融合算子（GPU 上约 20-40% 提速），不支持时回退 eager。
         # 注意：torch.compile 是惰性的，错误在首次前向才抛出，因此编译后用
@@ -342,14 +343,7 @@ class GoAI:
         if state is not None:
             # 从权重形状自动推断架构参数，防止 mismatch
             inferred_bs = self._infer_board_size(state)
-            if _IN_CHANNEL_BUILDERS.get(self.in_channels) is build_v21_net:
-                # v21：结构由 V21_CFG 唯一决定（D1），没有「可调的架构参数」。
-                # 若照常走 legacy 推断，会把 v21 的 16 个块误读成
-                # backbone_res_blocks=16（默认 12）→ 触发一次与初建完全相同的
-                # 重建 + 一条误导日志（v21 根本不认这个参数）。
-                inferred_arch = {}
-            else:
-                inferred_arch = self._infer_architecture(state)
+            inferred_arch = self._infer_architecture(state)
             needs_rebuild = False
             if inferred_bs is not None and inferred_bs != self.board_size:
                 print(f"[GoAI] 权重按 {inferred_bs} 路训练（当前 board_size={self.board_size}），"
@@ -495,11 +489,11 @@ class GoAI:
 
     @staticmethod
     def _infer_in_channels(state):
-        """从权重 stem 卷积的形状推断输入通道数（旧代 12 / v21 17）。
+        """从权重 stem 卷积的形状推断输入通道数（现役 12）。
 
         判定依据：stem 是唯一消费输入特征平面的层，读它的 in 维（张量 shape[1]）；
         policy/value 头的第一层吃的是 backbone 输出通道，与输入通道数无关，
-        不能用来判 12/17。键按 `_STEM_WEIGHT_KEYS` 优先级回退。
+        不能用来判通道数。键按 `_STEM_WEIGHT_KEYS` 优先级回退。
         失败模式：
         - 找不到任何可识别的 stem 键 → 返回 None，**调用方必须报错**（P4.8 fix
           轮改的：原为「回退旧默认 12 + 告警」，那条路会拿随机 12ch 模型去装
@@ -522,7 +516,7 @@ class GoAI:
         拦一条：**模型自己的 stem 键不在权重里**（incompatible.missing_keys 命中
         `_STEM_WEIGHT_KEYS`）。那意味着输入投影层停在随机初始化 —— 正是本任务
         要消灭的「随机初始化、形状却完全正常」那条静默路：checkpoint 的 stem 若
-        叫别的名字（例如 v21 的 `backbone.patch_embed.weight`），推断层仍可能读到
+        叫别的名字（例如 `backbone.patch_embed.weight`），推断层仍可能读到
         另一个候选键而给出正确 in_channels，缺口正好落在 stem 上。
 
         不拦的部分（只告警）：非 stem 的缺键，例如 checkpoint 里缺了某个
@@ -563,7 +557,7 @@ class GoAI:
         做成 property 而不是普通属性，是为了掐死 `ai.in_channels = 17` 这个
         最顺手的「绕过 mcts.py 里还钉着 12 的预取路径」的写法：它会造出
         12ch 模型吃 17ch 特征（或反之）的错配，而这种错配在本设计里**不报错**
-        —— 恰恰是本任务要消灭的那一类。要改通道数只能换 checkpoint。
+        —— 恰恰是本设计要消灭的那一类。要改通道数只能换 checkpoint。
         """
         return self._in_channels
 
