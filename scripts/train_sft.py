@@ -238,8 +238,8 @@ def _dist_preflight_check(backend, device, logger):
 # 事故形状：`_wrap_fsdp1` 的 docstring（本文件上方）要求 from-scratch 也必须
 # 同步初始权重 ——「各 rank 独立、各自不同，这里必须同步，否则第一步
 # all-gather 出来的就是拼错的权重」。但 `sync_module_states` 从未被传
-# （`_fsdp_ctor_kwargs` 与 `FSDP_CTOR_KWARGS_WHITELIST` 都没有），全文件唯一的
-# `dist.broadcast` 是 `_sync_stop_flag` 的 stop_flag —— **没有任何参数广播**。
+# （`_fsdp_ctor_kwargs` 与 `FSDP_CTOR_KWARGS_WHITELIST` 都没有），**修复前**全文件
+# 唯一的 `dist.broadcast` 是 `_sync_stop_flag` 的 stop_flag —— **没有任何参数广播**。
 # `shell/train_sft_npu_4card_v21.sh` 不传 `--resume`/`--model` ⇒ from-scratch
 # ⇒ `SHARD_GRAD_OP` 的第一步 all-gather 把 4 份不同的随机权重拼成一个逻辑权重。
 #
@@ -252,7 +252,8 @@ def _dist_preflight_check(backend, device, logger):
 # 3. 显式 broadcast 是**无条件**的 —— 不依赖「resume 路径已经同步了」这类推理，
 #    运行时可验证，且能被 AST 测试直接钉住顺序。
 #
-# 代价：36.3 MB 一次性广播 + 约 100 次小 collective，**只在启动时发生一次**。
+# 代价：36.3 MB 一次性广播 + 167 次小 collective（= `build_v21_net` 的参数张量数，
+# 实测 167 个 / 9,067,443 参数），**只在启动时发生一次**。
 # --------------------------------------------------------------------------- #
 
 def _dist_active() -> bool:
@@ -297,7 +298,15 @@ def _assert_init_weights_identical(model, logger):
     acc = None
     with torch.no_grad():
         for p in model.parameters():
-            s = p.detach().double().sum()
+            # `sum(dtype=torch.float64)` 而不是 `p.detach().double().sum()`：两者
+            # 结果**逐位相同**（本地实测），但后者把**每个参数整份物化成 fp64** ——
+            # v21 有 167 个张量 / 9.07M 参数，峰值临时显存 = 最大单参数 ×8，且每个
+            # 张量多一发 cast kernel。本文件唯一的既有先例是 `term = sq.double()`，
+            # 那是 **0 维标量** 的 cast，**不能**当作「整张量 fp64 cast 在 910A 上可用」
+            # 的证据（开发机纯 CPU，全量测试通过不构成 NPU 证据）。这段在启动期
+            # **无条件**执行，一旦 910A 不支持就是 4 卡 run 立刻死 —— 所以宁可走
+            # 「只 reduce、不 cast」那条路，把风险面从 cast+reduce 缩到只 reduce。
+            s = p.detach().sum(dtype=torch.float64)
             acc = s if acc is None else acc + s
     buf = acc.reshape(1).to(torch.float64)
     gathered = [torch.zeros_like(buf) for _ in range(dist.get_world_size())]

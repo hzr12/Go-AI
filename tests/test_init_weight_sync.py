@@ -2,33 +2,54 @@
 
 事故形状
 --------
-`scripts/train_sft.py:335-339` 的 `_wrap_fsdp1` docstring 要求 from-scratch 也要
-同步初始权重：「各 rank 独立、各自不同，这里必须同步，否则第一步 all-gather
-出来的就是拼错的权重」。但 `sync_module_states` 从未被传（`_fsdp_ctor_kwargs`
-在 :399-423，白名单在 :393-396），全文件唯一的 `dist.broadcast` 是
-`_sync_stop_flag` 的 stop_flag（:1495）——**没有任何参数广播**。
+`scripts/train_sft.py` 的 `_wrap_fsdp1` docstring 要求 from-scratch 也要同步初始
+权重：「各 rank 独立、各自不同，这里必须同步，否则第一步 all-gather 出来的就是
+拼错的权重」。但 `sync_module_states` 从未被传（`_fsdp_ctor_kwargs` 与
+`FSDP_CTOR_KWARGS_WHITELIST` 都没有），**修复前**全文件唯一的 `dist.broadcast`
+是 `_sync_stop_flag` 的 stop_flag —— **没有任何参数广播**。
 
 `shell/train_sft_npu_4card_v21.sh` 不传 `--resume`/`--model` ⇒ from-scratch
 ⇒ `SHARD_GRAD_OP` 的第一步 all-gather 把 4 份不同的随机权重拼成一个逻辑权重。
 
 测试分两组：**顺序**靠源码位置（唯一能证明时机的手段，真机上观察不到
-「谁先谁后」），**护栏**用 monkeypatch 的假通信域验证「权重不同 ⇒ 真的抛」。
+「谁先谁后」），**护栏**用 monkeypatch 的假通信域验证真行为（含「checksum 的
+**计算**本身」—— 它是启动期硬失败闸门的判据，见
+`test_checksum_depends_on_every_parameter`）。
 
-⚠ 相对实现计划的两处修正（两处都是**原测试自己不可满足**，不是削弱断言）
-----------------------------------------------------------------------
-1. `test_sync_call_precedes_fsdp_wrap` 原本取 `_call_lines('FullyShardedData
-   Parallel')`。本文件里那个符号只有一个裸名字调用点 —— L383，在
-   `_wrap_fsdp1` **函数体内**（`handle = FullyShardedDataParallel(model,
-   **_ctor_kwargs)`），它在文本上早于 `main()`（L2300+）里任何东西。而广播点
-   按契约必须落在 `main()` 的 `.to(device)` 之后 ⇒ 断言 `sync < 383` 恒假，
-   与「同步点位置」无关。真正代表「FSDP 包裹发生在这里」的是**运行期**的调用
-   点 `_wrap_fsdp1(...)`（L2615，在 `main()` 里、在广播点之后）。改用它之后
-   断言钉的仍是原意（同步点早于 FSDP 包裹），且不再是恒假。
-2. `test_broadcast_covers_every_parameter_once` 原本用
-   `torch.nn.Linear(4, 3, bias=True)` 并注释「3 个参数张量」、断言
-   `len(seen) == 3`。**`Linear` 只有 2 个**（weight / bias）—— 断言恒假。
-   换成显式的 3 参数小模块，让「3 个参数张量」这句话成真，并顺带把每次广播的
-   **形状**一起钉住（原来记录的 `tuple(t.shape)` 从没被断言过，等于白记）。
+坐标约定
+--------
+本文件**刻意不写绝对行号**：`scripts/train_sft.py` 每轮都在长，写死的行号下一次
+改动就全错（上一版就栽在这上面）。指路一律用「函数名 + 内容锚点」；测试真需要
+行号时走 AST 现算的 `_call_lines` / `_main_body_calls`，那两个是**自维护**的。
+
+只有下面这张表必须锚在具体 commit 上 —— 因为「事故现场」指的是一个**历史
+commit**，不是当前文件。下次改 `train_sft.py` 后右列会变，**左列不会**：
+
+| 现场                                        | 修复前 3dc9672 | 590f267 |
+|---------------------------------------------|---------------:|--------:|
+| `_wrap_fsdp1` docstring（「必须同步」那段）   |          :335-339 | :409-425 |
+| `FSDP_CTOR_KWARGS_WHITELIST`                 |         :393-396 | :478-481 |
+| `_fsdp_ctor_kwargs`                          |         :399-423 |      :484 |
+| `_sync_stop_flag` 的 stop_flag 广播            |           :1495 |     :1580 |
+| `FullyShardedDataParallel` 唯一裸名字调用      |           :383 |      :468 |
+
+关于「FSDP 包裹点」为什么不能用 `FullyShardedDataParallel`
+--------------------------------------------------------
+`FullyShardedDataParallel` 在 `train_sft.py` 里只有一个裸名字调用点，且它在
+`_wrap_fsdp1` **函数体内**（`handle = FullyShardedDataParallel(model, **_ctor_kwargs)`），
+文本上早于 `def main()`（590f267 里 :1934，3dc9672 里 :1849 —— 两者都不是原先
+docstring 写的 `L2300+`）。而广播点按契约必须落在 `main()` 里 ⇒ 断言
+`sync < 那个行号` **恒假**，与同步点放哪无关。真正代表「FSDP 包裹发生在这里」的
+是**运行期**的调用点 `_wrap_fsdp1(...)`（在 `main()` 里、且在广播点之后）。
+见 `test_sync_call_precedes_fsdp_wrap`。
+
+⚠ 相对实现计划的一处修正（是**原测试自己不可满足**，不是削弱断言）
+------------------------------------------------------------------
+`test_broadcast_covers_every_parameter_once` 原本用
+`torch.nn.Linear(4, 3, bias=True)` 并注释「3 个参数张量」、断言
+`len(seen) == 3`。**`Linear` 只有 2 个**（weight / bias）—— 断言恒假。
+换成显式的 3 参数小模块，让「3 个参数张量」这句话成真，并顺带把每次广播的
+**形状**一起钉住（原来记录的 `tuple(t.shape)` 从没被断言过，等于白记）。
 """
 import ast
 import importlib.util
@@ -54,12 +75,32 @@ def _load_module():
     return mod
 
 
-def _call_lines(fname):
-    """返回 `fname(` 作为**裸名字调用**的行号列表。"""
-    return [n.lineno for n in ast.walk(TREE)
+def _calls_in(node, fname):
+    """`fname(` 作为**裸名字调用**的行号列表（限 `node` 子树内）。"""
+    return [n.lineno for n in ast.walk(node)
             if isinstance(n, ast.Call)
             and isinstance(n.func, ast.Name)
             and n.func.id == fname]
+
+
+def _call_lines(fname):
+    """全文件级的裸名字调用行号。"""
+    return _calls_in(TREE, fname)
+
+
+def _main_fn():
+    return next(n for n in TREE.body
+                if isinstance(n, ast.FunctionDef) and n.name == 'main')
+
+
+def _main_body_calls(fname):
+    """`fname(` 在 **`main()` 函数体内**的裸名字调用行号。
+
+    比 `_call_lines` 窄一档，是刻意的：全文件级的检查会把「同步点被挪进某个辅助
+    函数」这种退化放过（helper 里发广播，训练路径根本走不到）。凡是消息里写着
+    「main() 里没有调用」的检查，就必须真的是 main() 级。
+    """
+    return _calls_in(_main_fn(), fname)
 
 
 class _RecLogger:
@@ -76,10 +117,10 @@ class _RecLogger:
 
 def test_sync_call_precedes_ema_construction():
     """同步点必须早于 `EMA(`：EMA 构造时就把参数 clone 进 shadow。"""
-    sync = _call_lines('_sync_init_weights_from_rank0')
+    sync = _main_body_calls('_sync_init_weights_from_rank0')
     assert len(sync) == 1, '同步点应唯一（唯一才能证明时机）：%s' % sync
-    ema = _call_lines('EMA')
-    assert ema, '没找到 EMA( 调用点'
+    ema = _main_body_calls('EMA')
+    assert ema, 'main() 里没找到 EMA( 调用点'
     assert sync[0] < min(ema), (
         '_sync_init_weights_from_rank0 在 L%d，但它在 L%d 的 EMA() 之后 —— '
         'EMA 构造时已把**广播前**的随机权重 clone 进 shadow，之后每个 step 的 '
@@ -93,12 +134,12 @@ def test_sync_call_precedes_fsdp_wrap():
     取 `_wrap_fsdp1(` 而不是 `FullyShardedDataParallel(`：后者在本文件里只出现
     在 `_wrap_fsdp1` **函数体内**（构造那一行，文本上早于 `main()`），拿它当
     「包裹发生在这里」的代理是恒假的判据；`_wrap_fsdp1(` 才是 `main()` 里真正
-    发生包裹的位置。见本文件 docstring 的 ⚠ 第 1 条。
+    发生包裹的位置。见本文件 docstring 的「关于『FSDP 包裹点』」一节。
     """
-    sync = _call_lines('_sync_init_weights_from_rank0')
+    sync = _main_body_calls('_sync_init_weights_from_rank0')
     assert len(sync) == 1, '同步点应唯一：%s' % sync
-    wrap = _call_lines('_wrap_fsdp1')
-    assert wrap, '没找到 _wrap_fsdp1( 调用点'
+    wrap = _main_body_calls('_wrap_fsdp1')
+    assert wrap, 'main() 里没找到 _wrap_fsdp1( 调用点'
     assert sync[0] < min(wrap), (
         '同步点（L%d）必须早于 FSDP 包裹（L%d）：包裹后参数存储被替换成 flat '
         'shard，broadcast 无意义' % (sync[0], min(wrap)))
@@ -106,13 +147,76 @@ def test_sync_call_precedes_fsdp_wrap():
 
 def test_sync_and_assert_are_both_called():
     """广播与自检成对出现——只有广播没有自检等于把注释里的承诺又还回去。"""
-    assert _call_lines('_sync_init_weights_from_rank0'), \
+    assert _main_body_calls('_sync_init_weights_from_rank0'), \
         'main() 里没有调用 _sync_init_weights_from_rank0'
-    assert _call_lines('_assert_init_weights_identical'), \
+    assert _main_body_calls('_assert_init_weights_identical'), \
         'main() 里没有调用 _assert_init_weights_identical：广播完不验证等于没做'
 
 
 # ---- 护栏（真行为）------------------------------------------------------- #
+
+def test_dist_active_real_body_decision_table():
+    """**真正**的 `_dist_active()`（不 stub 它自己）在各种 PG 状态下的判定。
+
+    其余护栏测试都把 `_dist_active` 整个 stub 成 `lambda: False/True`，于是
+    「通信域没建 / 没 torch_npu ⇒ 安全退化」这条全局契约**一次都没被真调过**。
+    这里只换掉它依赖的 `mod.dist`，让 `_dist_active` 的函数体真跑一遍判定表。
+    """
+    mod = _load_module()
+
+    class _PG:
+        def __init__(self, available, initialized, world):
+            self._a, self._i, self._w = available, initialized, world
+
+        def is_available(self):
+            return self._a
+
+        def is_initialized(self):
+            return self._i
+
+        def get_world_size(self):
+            return self._w
+
+    class _Boom:
+        @staticmethod
+        def is_available():
+            raise RuntimeError('老版本 / 驱动缺失路径')
+
+    cases = [
+        ((True, False, 4), False, 'PG 未建（from-scratch 起手前的那一瞬）'),
+        ((True, True, 1), False, 'world_size==1（单卡路径必须 no-op）'),
+        ((True, True, 4), True, 'PG 已建且多卡（该广播了）'),
+        ((False, False, 4), False, 'torch.distributed 不可用（无 torch_npu 环境）'),
+    ]
+    real_dist = mod.dist
+    try:
+        for (a, i, w), want, why in cases:
+            mod.dist = _PG(a, i, w)
+            got = mod._dist_active()
+            assert got is want, (
+                '%s：(available=%s, initialized=%s, world=%s) ⇒ %s，期望 %s'
+                % (why, a, i, w, got, want))
+        mod.dist = _Boom
+        assert mod._dist_active() is False, \
+            'is_available() 抛异常时必须按「未建域」退化，不能把异常放出去'
+    finally:
+        mod.dist = real_dist
+
+
+def test_dist_active_is_false_on_this_test_machine():
+    """本机（pytest 单进程、无 4 卡 PG）真调一次必须 False。
+
+    防的是「上面的判定表把某个分支钉死了，但真实 `dist` 上的整体接线是错的」。
+    注意本仓库另有测试（`test_dist_preflight.py` / `test_fsdp1_conversion.py`）
+    会用 gloo `init_process_group(world_size=1)`，所以这里**只断言结果**、
+    不预设「PG 未建」——world_size==1 分支同样必须 False。
+    """
+    mod = _load_module()
+    assert mod._dist_active() is False, (
+        '本测试机是单进程、world_size 最多 1，_dist_active() 必须 False；'
+        '若为 True，单卡路径会发 collective（= test_noop_when_dist_not_active '
+        '要防的事故）')
+
 
 def test_noop_when_dist_not_active():
     """world_size==1 / 通信域未建时是 no-op，单卡路径逐字不变。"""
@@ -178,9 +282,90 @@ def test_broadcast_covers_every_parameter_once():
         mod.dist, mod._dist_active = real_dist, real_active
     assert len(seen) == 3, '每个参数应恰好广播一次，实得 %d 次：%s' % (len(seen), seen)
     assert all(src == 0 for _, src in seen), 'src 必须恒为 0：%s' % seen
-    assert sorted(shapes for shapes, _ in seen) == sorted([(4,), (3, 5), ()]), (
+    assert sorted(shape for shape, _ in seen) == sorted([(4,), (3, 5), ()]), (
         '广播的必须正是本模块的三个参数（按形状核对，漏掉/多掉一个都会露出来）：%s'
         % (seen,))
+
+
+# ---- checksum 的**计算**本身（不是它的比对逻辑）--------------------------- #
+
+class _CapturingDist:
+    """记下 `all_gather` 收到的 `buf`（dtype + 值的拷贝），然后让各 rank 一致。
+
+    这一族测试针对的是 checksum 怎么**算出来**的。原先的
+    `test_checksum_detects_divergence` / `test_checksum_passes_when_all_ranks_agree`
+    两个假 `all_gather` 一个无视 `buf`、一个原样回显，于是 `buf` 的内容从头到尾
+    没有任何断言碰过 —— 实测把实现改成「只算最后一个参数」/「`acc + s * 0.0`」
+    /「只算第一个参数」/「丢掉 fp64」，7 条测试全绿。自检是启动期**硬失败闸门**，
+    判据本身不能没有覆盖。
+    """
+
+    def __init__(self):
+        self.seen = []
+
+    def as_dist(self):
+        return self
+
+    def get_world_size(self):
+        return 2
+
+    def all_gather(self, out, buf):
+        self.seen.append((buf.dtype, buf.detach().clone()))
+        for t in out:
+            t.copy_(buf)
+
+
+def _captured_checksum(mod, model):
+    """跑一次 `_assert_init_weights_identical`，返回它送进 all_gather 的 buf。
+
+    顺带 stub 掉 `_dist_env_snapshot`：它在 `train_sft.py` 里**自己**
+    `import torch.distributed as dist`，所以 patch `mod.dist` 触不到它，无真实 PG
+    时会在 `get_rank()` 上抛 ValueError。成功路径本来走不到它，这里是防御性兜底。
+    """
+    cap = _CapturingDist()
+    real = (mod.dist, mod._dist_active, mod._dist_env_snapshot)
+    mod.dist, mod._dist_active = cap.as_dist(), (lambda: True)
+    mod._dist_env_snapshot = (lambda: 'SNAPSHOT=<stub>')
+    try:
+        mod._assert_init_weights_identical(model, _RecLogger())
+    finally:
+        mod.dist, mod._dist_active, mod._dist_env_snapshot = real
+    assert len(cap.seen) == 1, '每次自检只该发一次 all_gather：%s' % len(cap.seen)
+    return cap.seen[0]
+
+
+def test_checksum_depends_on_every_parameter():
+    """checksum 必须真的由**全部**参数决定，否则自检是空转的。"""
+    mod = _load_module()
+    dtype, base = _captured_checksum(mod, _ThreeParam())
+    assert dtype == torch.float64, (
+        'checksum 标量必须是 fp64（docstring 承诺），实得 %s' % dtype)
+    assert base.numel() == 1, 'all_gather 的载荷应是 1 个标量：%s' % base.shape
+    for name in ('a', 'b', 'c'):
+        m2 = _ThreeParam()
+        getattr(m2, name).data.add_(1.0)          # 只动一个参数
+        _, got = _captured_checksum(mod, m2)
+        assert not torch.equal(base, got), (
+            '只改 %s 时 checksum 不变 ⇒ 这个参数根本没进 checksum（自检漏掉它 ⇒ '
+            '4 卡拼错权重也检测不出来）' % name)
+
+
+def test_checksum_accumulates_in_fp64_not_fp32():
+    """累加必须真在 fp64 上做 —— fp32 会在大数上把小量整个吃掉。"""
+    mod = _load_module()
+
+    class _Big(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            # 1e8 本身在 fp32 里是精确的（390625×2^8，19 位尾数放得下），但 1e8+1
+            # 需要 27 位 ⇒ fp32 的 ulp=8 会把后面的 1 全部舍掉：fp32 累加得
+            # 100000000.0，fp64 累加得精确的 100000003.0。两个值差 3，一测就分得开。
+            self.v = torch.nn.Parameter(torch.tensor([1e8, 1.0, 1.0, 1.0]))
+
+    _, got = _captured_checksum(mod, _Big())
+    assert got.item() == 100000003.0, (
+        'checksum 是 %.8g，说明累加没在 fp64 上做（或输入没按 fp64 提升）：'
+        'fp32 会在 1e8 级别把尾数吃掉' % got.item())
 
 
 def test_checksum_detects_divergence():
@@ -201,10 +386,10 @@ def test_checksum_detects_divergence():
     real_dist, real_active = mod.dist, mod._dist_active
     real_snap = mod._dist_env_snapshot
     mod.dist, mod._dist_active = _Divergent, (lambda: True)
-    # `_dist_env_snapshot` 内部**自己** `import torch.distributed as dist`（本文件
-    # L164-165），所以 monkeypatch `mod.dist` 触不到它；无真实 PG 时它会在
-    # `get_rank()` 上抛 ValueError，把「自检失败」这个真信号盖掉。这里换掉它 ——
-    # 断言只关心消息里的「初始权重」/「NaN」两处诊断，环境快照是上下文。
+    # `_dist_env_snapshot` 内部**自己** `import torch.distributed as dist`（在
+    # `_dist_env_snapshot` 里），所以 monkeypatch `mod.dist` 触不到它；无真实 PG 时
+    # 它会在 `get_rank()` 上抛 ValueError，把「自检失败」这个真信号盖掉。这里换掉
+    # 它 —— 断言只关心消息里的「初始权重」/「NaN」两处诊断，环境快照是上下文。
     mod._dist_env_snapshot = (lambda: 'SNAPSHOT=<stub>')
     try:
         with pytest.raises(RuntimeError) as ei:
