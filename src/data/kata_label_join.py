@@ -68,24 +68,88 @@ def load_kata_labels(path, required=True):
     return d
 
 
-def scan_dataset_hashes(npz_path, keys=DATASET_KEYS, chunk=_HASH_CHUNK,
-                        limit=None, progress=None):
-    """流式算主数据集每行的 `pos_hash`。
+def materialize_dataset(dataset_npz, out_dir, keys=DATASET_KEYS, progress=None):
+    """把 npz 里的 join 用列**一次性**落成 `.npy`，供 `mmap_mode='r'` 分块读。
+
+    为什么必须做这一步
+    ------------------
+    `np.load('x.npz')['boards']` 会把**整个成员**解压进内存再切片 ——
+    不是按需解压。`boards` 是 ``34.2M × 361 B = 12.3 GB``，而本机 13.9 GB，
+    任何一次 `z['boards'][s:e]` 都会先吃掉 12.3 GB，余量只剩 1.6 GB，
+    任何瞬时开销（numpy 临时量、另一条数据流）就会把它推过 OOM。
+
+    落成 `.npy` 后 `np.load(mmap_mode='r')` 是真正的按需分页：分块读 200K 行
+    只驻留 200K × 361 B = 72 MB。实测吞吐 478K 行/s，全量 34.2M 约 72s。
+
+    磁盘代价：``boards.npy`` 12.3 GB + 两个小列（F 盘余 695 GB，可接受）。
+    一次落盘、之后反复扫描都省内存。
+
+    ⚠ 用 `open_memmap` 建**完整形状**的可写文件再分块填，而不是先写头再 append
+    —— 后者会在 `write_array` 时重复写文件头，得到一个前段全 0 的坏 `.npy`
+    （实测踩过：形状对、值全 0、散列全错，且不报错）。
 
     Returns:
-        ``(hashes uint64 (N,), n_rows)``。``limit`` 给定时只算前 N 行（调试用）。
+        ``{key: path}``。
     """
-    z = np.load(npz_path, allow_pickle=False)
+    os.makedirs(out_dir, exist_ok=True)
+    z = np.load(dataset_npz, allow_pickle=False)
+    out = {}
     for k in keys:
         if k not in z.files:
-            raise KeyError(f'{npz_path} 缺列 {k}；现有 {sorted(z.files)}')
-    total = z['boards'].shape[0]
+            raise KeyError(f'{dataset_npz} 缺列 {k}；现有 {sorted(z.files)}')
+        arr = z[k]
+        p = os.path.join(out_dir, f'{k}.npy')
+        mm = np.lib.format.open_memmap(p, mode='w+', dtype=arr.dtype,
+                                       shape=arr.shape)
+        step = 1_000_000
+        for s in range(0, arr.shape[0], step):
+            e = min(s + step, arr.shape[0])
+            mm[s:e] = arr[s:e]
+            if progress:
+                progress(k, e, arr.shape[0])
+        mm.flush()
+        del mm
+        out[k] = p
+    z.close()
+    return out
+
+
+def _open_columns(dataset_npz, out_dir=None, keys=DATASET_KEYS):
+    """优先用 `.npy` memmap；没有就退回 npz（会整份解压，调用方要知情）。"""
+    if out_dir:
+        paths = {k: os.path.join(out_dir, f'{k}.npy') for k in keys}
+        if all(os.path.isfile(p) for p in paths.values()):
+            return {k: np.load(p, mmap_mode='r') for k, p in paths.items()}, True
+    z = np.load(dataset_npz, allow_pickle=False)
+    return {k: z[k] for k in keys}, False
+
+
+def scan_dataset_hashes(npz_path, keys=DATASET_KEYS, chunk=_HASH_CHUNK,
+                        limit=None, progress=None, materialized_dir=None):
+    """算主数据集每行的 `pos_hash`。
+
+    Args:
+        materialized_dir: `materialize_dataset` 的输出目录。**给了它才不会
+            把 12.3 GB 的 `boards` 整个解压进内存**（见该函数 docstring）。
+        limit: 只算前 N 行（调试用）。
+
+    Returns:
+        ``(hashes uint64 (N,), n_rows)``。
+    """
+    cols, is_mmap = _open_columns(npz_path, materialized_dir, keys)
+    if not is_mmap:
+        # 明确告知：这一条路径会把整个成员读进内存
+        print('[join] ⚠ 未提供 materialized_dir：npz 成员会被整份解压，'
+              'boards 约 12.3 GB。本机 13.9 GB，余量极小。'
+              '先跑 materialize_dataset()。', flush=True)
+    boards = cols['boards']
+    total = boards.shape[0]
     hi = total if limit is None else min(total, int(limit))
     out = np.empty(hi, dtype=np.uint64)
     for s in range(0, hi, chunk):
         e = min(s + chunk, hi)
-        out[s:e] = pos_hash_block(z['boards'][s:e], z['to_play'][s:e],
-                                  z['ko'][s:e])
+        out[s:e] = pos_hash_block(boards[s:e], cols['to_play'][s:e],
+                                  cols['ko'][s:e])
         if progress is not None:
             progress(e, hi)
     return out, hi
@@ -158,8 +222,12 @@ def duplicate_factor(dataset_hashes, label_hashes):
 
 
 def build_sidecar(dataset_npz, labels_npz, out_path, max_repeats=1,
-                  limit=None, progress_every=0):
+                  limit=None, progress_every=0, materialized_dir=None):
     """算 join 并写 sidecar npz。
+
+    Args:
+        materialized_dir: `materialize_dataset` 的输出目录。**强烈建议给**：
+            不给的话 `boards` 会整份解压（12.3 GB），本机只剩 1.6 GB 余量。
 
     Returns:
         诊断 dict（行数 / 命中率 / 重复倍数 / 实际写出的行数）。
@@ -175,7 +243,8 @@ def build_sidecar(dataset_npz, labels_npz, out_path, max_repeats=1,
 
     ds_hash, n_rows = scan_dataset_hashes(dataset_npz, limit=limit,
                                           progress=_prog if progress_every
-                                          else None)
+                                          else None,
+                                          materialized_dir=materialized_dir)
     row_index, label_index = join_by_hash(ds_hash, lab['pos_hash'],
                                           max_repeats=max_repeats)
     hit = int(row_index.size)
