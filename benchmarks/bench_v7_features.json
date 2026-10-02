@@ -1,0 +1,999 @@
+{
+  "meta": {
+    "what": "C0 · 22 通道 V7 特征吞吐基准",
+    "generated_at": "2026-10-02T19:27:30",
+    "seed": 20261002,
+    "budget_ms_per_row": 3.04,
+    "board_rows_per_sample": 5,
+    "cli": {
+      "npz": "F:\\AI\\Go-AI\\data\\sgf_19x19_full.npz",
+      "mat_dir": "F:\\AI\\Go-AI\\tmp\\materialized",
+      "out": "benchmarks/bench_v7_features.json",
+      "phase": [
+        "materialize",
+        "components",
+        "batch_curve",
+        "gather",
+        "workers",
+        "memory"
+      ],
+      "rows": 512,
+      "first": 1024,
+      "random": 2048,
+      "complex": 1024,
+      "pool": 24000,
+      "batch": "32,128,512",
+      "batch_curve": "32,64,128,256,512,1024",
+      "workers": "1,2,4,8",
+      "io": "cold,warm",
+      "warm_batches": 1,
+      "bench_batches": 4,
+      "reps": 3,
+      "quick": false,
+      "no_prime": false
+    }
+  },
+  "env": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.12.4",
+    "numpy": "1.26.4",
+    "cpu_count_logical": 16,
+    "physical_mem_mb": 14198.7,
+    "start_method": "spawn",
+    "scipy": "1.17.1",
+    "cpu_model": "AMD Ryzen 7 5800H with Radeon Graphics",
+    "repo_drive": "F:",
+    "disk": "{\"Name\":\"JMicron Generic\",\"Bus\":\"USB\"}"
+  },
+  "dataset": {
+    "npz": "F:\\AI\\Go-AI\\data\\sgf_19x19_full.npz",
+    "npz_bytes": 469041241,
+    "rows": 34202713,
+    "mat_dir": "F:\\AI\\Go-AI\\tmp\\materialized"
+  },
+  "materialize": {
+    "npz": "F:\\AI\\Go-AI\\data\\sgf_19x19_full.npz",
+    "npz_bytes": 469041241,
+    "out_dir": "F:\\AI\\Go-AI\\tmp\\materialized",
+    "columns": {
+      "boards": 12347179521,
+      "game_ids": 136810980,
+      "ko": 68405554,
+      "my_hist": 205216406,
+      "op_hist": 205216406,
+      "to_play": 34202841
+    },
+    "previous_runs": [],
+    "total_materialized_bytes": 12997031708,
+    "boards_npz_member": {
+      "uncompressed_bytes": 12347179521,
+      "compressed_bytes": 183435346,
+      "rows": 34202713,
+      "dtype": "int8",
+      "stream_decompress_s": 17.3,
+      "stream_decompress_rows_per_s": 1976967,
+      "stream_decompress_MB_per_s": 713.7,
+      "resident_if_materialize_dataset_used_bytes": 12347179521,
+      "note": "materialize_dataset() 第 276 行 arr = z[k] 会一次解压整个成员（12.35 GB）⇒ 本机（14.9 GB）没有余量，故只测流式解压半程；落盘半程见 boards_write_MB_per_s"
+    }
+  },
+  "sampling": {
+    "first": {
+      "n": 1024,
+      "note": "数据集最前 N 行（含开局）"
+    },
+    "random": {
+      "n": 2048,
+      "note": "均匀随机 M 行"
+    },
+    "complex": {
+      "n": 1024,
+      "note": "候选池 24000 行里复杂度分最高的 1024 行",
+      "pool_stones_p50": 102.0,
+      "pool_stones_p100": 303.0,
+      "pool_two_lib_p50": 10.0,
+      "pool_two_lib_p100": 120.0,
+      "sel_stones_p50": 235.5,
+      "sel_two_lib_p50": 42.0
+    },
+    "method": "分层采样：① 前 N 行 ② 均匀随机 M 行 ③ 复杂度分 top-K 行（分数 = 子数 + 3×2 气子数 + 20×有劫）。⚠ 只测前 N 行会系统性低估（开局空盘是最快路径），所以三层都报。"
+  },
+  "components": {
+    "first": {
+      "B=32": {
+        "rows": 1024,
+        "prime_cache_s": 0.0,
+        "seconds": {
+          "read_current": 3.3e-05,
+          "read_hist": 2.5e-05,
+          "gather_ladder": 0.000357,
+          "gather_future": 0.000235,
+          "gather_default_1_8_32": 0.000314,
+          "spatial": 3.38514,
+          "spatial_1search": 1.300221,
+          "ladder_3": 3.379265,
+          "ladder_1": 1.142862,
+          "liberties_123": 0.03191,
+          "history_five": 0.000355,
+          "calculate_area": 0.013676,
+          "global": 0.000399,
+          "_pipeline": 3.386187
+        },
+        "rows_per_s": 302.4,
+        "ms_per_row": 3.3068
+      },
+      "B=128": {
+        "rows": 1024,
+        "prime_cache_s": 0.0,
+        "seconds": {
+          "read_current": 3.6e-05,
+          "read_hist": 2.7e-05,
+          "gather_ladder": 0.000235,
+          "gather_future": 0.000225,
+          "gather_default_1_8_32": 0.000346,
+          "spatial": 3.428234,
+          "spatial_1search": 1.242139,
+          "ladder_3": 3.412606,
+          "ladder_1": 1.141692,
+          "liberties_123": 0.033228,
+          "history_five": 0.000368,
+          "calculate_area": 0.014104,
+          "global": 0.000325,
+          "_pipeline": 3.429082
+        },
+        "rows_per_s": 298.6,
+        "ms_per_row": 3.3487
+      },
+      "B=512": {
+        "rows": 1024,
+        "prime_cache_s": 0.0,
+        "seconds": {
+          "read_current": 3.5e-05,
+          "read_hist": 2.7e-05,
+          "gather_ladder": 0.000342,
+          "gather_future": 0.000353,
+          "gather_default_1_8_32": 0.000512,
+          "spatial": 3.536836,
+          "spatial_1search": 1.243683,
+          "ladder_3": 3.257118,
+          "ladder_1": 1.074048,
+          "liberties_123": 0.032421,
+          "history_five": 0.000377,
+          "calculate_area": 0.01331,
+          "global": 0.000317,
+          "_pipeline": 3.53791
+        },
+        "rows_per_s": 289.4,
+        "ms_per_row": 3.455
+      }
+    },
+    "random": {
+      "B=32": {
+        "rows": 2048,
+        "prime_cache_s": 13.227,
+        "seconds": {
+          "read_current": 0.000311,
+          "read_hist": 0.000103,
+          "gather_ladder": 0.000509,
+          "gather_future": 0.00076,
+          "gather_default_1_8_32": 0.000912,
+          "spatial": 6.098904,
+          "spatial_1search": 2.234875,
+          "ladder_3": 6.137229,
+          "ladder_1": 2.03764,
+          "liberties_123": 0.067745,
+          "history_five": 0.000608,
+          "calculate_area": 0.03717,
+          "global": 0.00039,
+          "_pipeline": 6.100978
+        },
+        "rows_per_s": 335.7,
+        "ms_per_row": 2.979
+      },
+      "B=128": {
+        "rows": 2048,
+        "prime_cache_s": 0.002,
+        "seconds": {
+          "read_current": 0.000115,
+          "read_hist": 0.000102,
+          "gather_ladder": 0.000601,
+          "gather_future": 0.001166,
+          "gather_default_1_8_32": 0.001082,
+          "spatial": 6.21333,
+          "spatial_1search": 2.398945,
+          "ladder_3": 6.584846,
+          "ladder_1": 2.235776,
+          "liberties_123": 0.073231,
+          "history_five": 0.000699,
+          "calculate_area": 0.039152,
+          "global": 0.000393,
+          "_pipeline": 6.215706
+        },
+        "rows_per_s": 329.5,
+        "ms_per_row": 3.035
+      },
+      "B=512": {
+        "rows": 2048,
+        "prime_cache_s": 0.003,
+        "seconds": {
+          "read_current": 0.000116,
+          "read_hist": 0.000148,
+          "gather_ladder": 0.001156,
+          "gather_future": 0.000876,
+          "gather_default_1_8_32": 0.000943,
+          "spatial": 6.790975,
+          "spatial_1search": 2.442513,
+          "ladder_3": 6.906631,
+          "ladder_1": 2.313389,
+          "liberties_123": 0.077453,
+          "history_five": 0.000659,
+          "calculate_area": 0.040763,
+          "global": 0.000475,
+          "_pipeline": 6.793746
+        },
+        "rows_per_s": 301.5,
+        "ms_per_row": 3.3173
+      }
+    },
+    "complex": {
+      "B=32": {
+        "rows": 1024,
+        "prime_cache_s": 6.829,
+        "seconds": {
+          "read_current": 9.4e-05,
+          "read_hist": 5.3e-05,
+          "gather_ladder": 0.000218,
+          "gather_future": 0.000391,
+          "gather_default_1_8_32": 0.000615,
+          "spatial": 5.642052,
+          "spatial_1search": 1.947655,
+          "ladder_3": 5.635905,
+          "ladder_1": 1.867051,
+          "liberties_123": 0.038906,
+          "history_five": 0.000358,
+          "calculate_area": 0.023297,
+          "global": 0.000354,
+          "_pipeline": 5.643161
+        },
+        "rows_per_s": 181.5,
+        "ms_per_row": 5.5109
+      },
+      "B=128": {
+        "rows": 1024,
+        "prime_cache_s": 0.001,
+        "seconds": {
+          "read_current": 7.9e-05,
+          "read_hist": 5.3e-05,
+          "gather_ladder": 0.000264,
+          "gather_future": 0.00062,
+          "gather_default_1_8_32": 0.000972,
+          "spatial": 5.729493,
+          "spatial_1search": 2.006324,
+          "ladder_3": 5.662505,
+          "ladder_1": 1.848213,
+          "liberties_123": 0.042175,
+          "history_five": 0.000394,
+          "calculate_area": 0.024863,
+          "global": 0.000359,
+          "_pipeline": 5.730868
+        },
+        "rows_per_s": 178.7,
+        "ms_per_row": 5.5966
+      },
+      "B=512": {
+        "rows": 1024,
+        "prime_cache_s": 0.001,
+        "seconds": {
+          "read_current": 8e-05,
+          "read_hist": 6e-05,
+          "gather_ladder": 0.000265,
+          "gather_future": 0.000392,
+          "gather_default_1_8_32": 0.000558,
+          "spatial": 5.438762,
+          "spatial_1search": 1.817226,
+          "ladder_3": 5.134532,
+          "ladder_1": 1.785657,
+          "liberties_123": 0.034749,
+          "history_five": 0.000387,
+          "calculate_area": 0.020648,
+          "global": 0.000303,
+          "_pipeline": 5.439862
+        },
+        "rows_per_s": 188.2,
+        "ms_per_row": 5.3124
+      }
+    }
+  },
+  "batch_curve": [
+    {
+      "batch": 32,
+      "rows": 2048,
+      "prime_cache_s": 0.002,
+      "pipeline_s": 6.5763,
+      "rows_per_s": 311.4,
+      "ms_per_row": 3.2111,
+      "seconds": {
+        "read_current": 0.000122,
+        "read_hist": 9.7e-05,
+        "gather_ladder": 0.000588,
+        "gather_future": 0.000595,
+        "gather_default_1_8_32": 0.0007,
+        "spatial": 6.574473,
+        "spatial_1search": 2.308092,
+        "ladder_3": 6.485516,
+        "ladder_1": 2.196856,
+        "liberties_123": 0.075688,
+        "history_five": 0.000606,
+        "calculate_area": 0.03792,
+        "global": 0.000434,
+        "_pipeline": 6.576309
+      }
+    },
+    {
+      "batch": 64,
+      "rows": 2048,
+      "prime_cache_s": 0.002,
+      "pipeline_s": 6.6843,
+      "rows_per_s": 306.4,
+      "ms_per_row": 3.2638,
+      "seconds": {
+        "read_current": 0.000153,
+        "read_hist": 9.8e-05,
+        "gather_ladder": 0.00058,
+        "gather_future": 0.001341,
+        "gather_default_1_8_32": 0.001106,
+        "spatial": 6.681708,
+        "spatial_1search": 2.342015,
+        "ladder_3": 6.490509,
+        "ladder_1": 2.280141,
+        "liberties_123": 0.090157,
+        "history_five": 0.000853,
+        "calculate_area": 0.040705,
+        "global": 0.000415,
+        "_pipeline": 6.684295
+      }
+    },
+    {
+      "batch": 128,
+      "rows": 2048,
+      "prime_cache_s": 0.002,
+      "pipeline_s": 6.6132,
+      "rows_per_s": 309.7,
+      "ms_per_row": 3.2291,
+      "seconds": {
+        "read_current": 0.000145,
+        "read_hist": 0.000105,
+        "gather_ladder": 0.00145,
+        "gather_future": 0.000862,
+        "gather_default_1_8_32": 0.001052,
+        "spatial": 6.610205,
+        "spatial_1search": 2.368166,
+        "ladder_3": 6.440512,
+        "ladder_1": 2.164899,
+        "liberties_123": 0.087545,
+        "history_five": 0.000862,
+        "calculate_area": 0.038235,
+        "global": 0.000386,
+        "_pipeline": 6.613154
+      }
+    },
+    {
+      "batch": 256,
+      "rows": 2048,
+      "prime_cache_s": 0.002,
+      "pipeline_s": 6.691,
+      "rows_per_s": 306.1,
+      "ms_per_row": 3.2671,
+      "seconds": {
+        "read_current": 0.000133,
+        "read_hist": 9.9e-05,
+        "gather_ladder": 0.00069,
+        "gather_future": 0.001006,
+        "gather_default_1_8_32": 0.001024,
+        "spatial": 6.688707,
+        "spatial_1search": 2.393621,
+        "ladder_3": 6.528775,
+        "ladder_1": 2.146219,
+        "liberties_123": 0.088644,
+        "history_five": 0.000783,
+        "calculate_area": 0.037313,
+        "global": 0.000413,
+        "_pipeline": 6.691047
+      }
+    },
+    {
+      "batch": 512,
+      "rows": 2048,
+      "prime_cache_s": 0.002,
+      "pipeline_s": 6.6796,
+      "rows_per_s": 306.6,
+      "ms_per_row": 3.2615,
+      "seconds": {
+        "read_current": 0.000153,
+        "read_hist": 0.000103,
+        "gather_ladder": 0.000804,
+        "gather_future": 0.001082,
+        "gather_default_1_8_32": 0.00117,
+        "spatial": 6.676967,
+        "spatial_1search": 2.33949,
+        "ladder_3": 6.411488,
+        "ladder_1": 2.235884,
+        "liberties_123": 0.087378,
+        "history_five": 0.000842,
+        "calculate_area": 0.040978,
+        "global": 0.000457,
+        "_pipeline": 6.679566
+      }
+    },
+    {
+      "batch": 1024,
+      "rows": 2048,
+      "prime_cache_s": 0.002,
+      "pipeline_s": 6.6688,
+      "rows_per_s": 307.1,
+      "ms_per_row": 3.2563,
+      "seconds": {
+        "read_current": 0.000225,
+        "read_hist": 0.000105,
+        "gather_ladder": 0.000569,
+        "gather_future": 0.000595,
+        "gather_default_1_8_32": 0.001125,
+        "spatial": 6.666948,
+        "spatial_1search": 2.397894,
+        "ladder_3": 6.603709,
+        "ladder_1": 2.242459,
+        "liberties_123": 0.070545,
+        "history_five": 0.00067,
+        "calculate_area": 0.040582,
+        "global": 0.000395,
+        "_pipeline": 6.668837
+      }
+    }
+  ],
+  "gather": {
+    "taskbook_offsets_1_8_32": {
+      "offsets": [
+        1,
+        8,
+        32
+      ],
+      "batch": 32,
+      "board_rows_touched_per_sample": 5,
+      "cold_ms_per_row": {
+        "min": 10.4167,
+        "median": 11.0839,
+        "max": 24.7284,
+        "samples": [
+          24.7284,
+          11.9351,
+          11.0656,
+          10.9589,
+          11.1022,
+          10.4167
+        ]
+      },
+      "warm_ms_per_row": {
+        "min": 0.005,
+        "median": 0.0067,
+        "max": 0.0079,
+        "samples": [
+          0.0069,
+          0.0079,
+          0.0065,
+          0.0079,
+          0.005,
+          0.0056
+        ]
+      },
+      "concurrency_probe": {
+        "threads_1": {
+          "rows": 32,
+          "elapsed_s": 0.3489,
+          "rows_per_s": 91.7,
+          "ms_per_row": 10.9032
+        },
+        "threads_4": {
+          "rows": 128,
+          "elapsed_s": 1.2697,
+          "rows_per_s": 100.8,
+          "ms_per_row": 9.9196
+        },
+        "threads_8": {
+          "rows": 256,
+          "elapsed_s": 2.3376,
+          "rows_per_s": 109.5,
+          "ms_per_row": 9.1311
+        }
+      },
+      "probe_verdict": "存储瓶颈（线程从 1 到 8 聚合吞吐几乎不涨 ⇒ 随机读被磁盘串行化）"
+    },
+    "ladder_offsets_-1_-2": {
+      "offsets": [
+        -1,
+        -2
+      ],
+      "batch": 32,
+      "board_rows_touched_per_sample": 5,
+      "cold_ms_per_row": {
+        "min": 8.466,
+        "median": 11.1519,
+        "max": 14.7628,
+        "samples": [
+          14.7628,
+          11.3194,
+          10.9845,
+          12.2383,
+          8.466,
+          10.4331
+        ]
+      },
+      "warm_ms_per_row": {
+        "min": 0.004,
+        "median": 0.005,
+        "max": 0.0078,
+        "samples": [
+          0.0078,
+          0.0047,
+          0.004,
+          0.0051,
+          0.0067,
+          0.0048
+        ]
+      },
+      "concurrency_probe": {
+        "threads_1": {
+          "rows": 32,
+          "elapsed_s": 0.3476,
+          "rows_per_s": 92.1,
+          "ms_per_row": 10.8624
+        },
+        "threads_4": {
+          "rows": 128,
+          "elapsed_s": 1.0571,
+          "rows_per_s": 121.1,
+          "ms_per_row": 8.2586
+        },
+        "threads_8": {
+          "rows": 256,
+          "elapsed_s": 2.0567,
+          "rows_per_s": 124.5,
+          "ms_per_row": 8.0342
+        }
+      },
+      "probe_verdict": "存储瓶颈（线程从 1 到 8 聚合吞吐几乎不涨 ⇒ 随机读被磁盘串行化）"
+    }
+  },
+  "workers": [
+    {
+      "workers": 1,
+      "batch": 512,
+      "io": "cold",
+      "start_method": "spawn",
+      "spawn_s": 3.3469,
+      "prime_cache_s": null,
+      "warm_batches": 1,
+      "bench_batches": 4,
+      "rows": 2048,
+      "elapsed_s": 11.6526,
+      "rows_per_s": 175.8,
+      "ms_per_row_wall": 5.6897,
+      "warmup_rows": 512,
+      "warmup_s": 1.965,
+      "errors": [],
+      "index_span": [
+        3420271,
+        6840542
+      ]
+    },
+    {
+      "workers": 2,
+      "batch": 512,
+      "io": "cold",
+      "start_method": "spawn",
+      "spawn_s": 3.8364,
+      "prime_cache_s": null,
+      "warm_batches": 1,
+      "bench_batches": 4,
+      "rows": 2048,
+      "elapsed_s": 13.1981,
+      "rows_per_s": 155.2,
+      "ms_per_row_wall": 6.4444,
+      "warmup_rows": 512,
+      "warmup_s": 4.0911,
+      "errors": [],
+      "index_span": [
+        6840542,
+        10260813
+      ]
+    },
+    {
+      "workers": 4,
+      "batch": 512,
+      "io": "cold",
+      "start_method": "spawn",
+      "spawn_s": 4.3575,
+      "prime_cache_s": null,
+      "warm_batches": 1,
+      "bench_batches": 4,
+      "rows": 2048,
+      "elapsed_s": 9.4018,
+      "rows_per_s": 217.8,
+      "ms_per_row_wall": 4.5907,
+      "warmup_rows": 512,
+      "warmup_s": 3.3176,
+      "errors": [],
+      "index_span": [
+        10260813,
+        13681084
+      ]
+    },
+    {
+      "workers": 8,
+      "batch": 512,
+      "io": "cold",
+      "start_method": "spawn",
+      "spawn_s": 5.641,
+      "prime_cache_s": null,
+      "warm_batches": 1,
+      "bench_batches": 4,
+      "rows": 2048,
+      "elapsed_s": 7.4982,
+      "rows_per_s": 273.1,
+      "ms_per_row_wall": 3.6612,
+      "warmup_rows": 512,
+      "warmup_s": 2.6802,
+      "errors": [],
+      "index_span": [
+        13681084,
+        17101355
+      ]
+    },
+    {
+      "workers": 1,
+      "batch": 512,
+      "io": "warm",
+      "start_method": "spawn",
+      "spawn_s": 3.3686,
+      "prime_cache_s": 8.9104,
+      "warm_batches": 1,
+      "bench_batches": 4,
+      "rows": 2048,
+      "elapsed_s": 6.0027,
+      "rows_per_s": 341.2,
+      "ms_per_row_wall": 2.931,
+      "warmup_rows": 512,
+      "warmup_s": 2.2706,
+      "errors": [],
+      "index_span": [
+        17101355,
+        20521626
+      ]
+    },
+    {
+      "workers": 2,
+      "batch": 512,
+      "io": "warm",
+      "start_method": "spawn",
+      "spawn_s": 3.7908,
+      "prime_cache_s": 8.7087,
+      "warm_batches": 1,
+      "bench_batches": 4,
+      "rows": 2048,
+      "elapsed_s": 3.4438,
+      "rows_per_s": 594.7,
+      "ms_per_row_wall": 1.6815,
+      "warmup_rows": 512,
+      "warmup_s": 1.5563,
+      "errors": [],
+      "index_span": [
+        20521626,
+        23941897
+      ]
+    },
+    {
+      "workers": 4,
+      "batch": 512,
+      "io": "warm",
+      "start_method": "spawn",
+      "spawn_s": 4.1889,
+      "prime_cache_s": 8.6286,
+      "warm_batches": 1,
+      "bench_batches": 4,
+      "rows": 2048,
+      "elapsed_s": 2.4741,
+      "rows_per_s": 827.8,
+      "ms_per_row_wall": 1.208,
+      "warmup_rows": 512,
+      "warmup_s": 1.0046,
+      "errors": [],
+      "index_span": [
+        23941897,
+        27362168
+      ]
+    },
+    {
+      "workers": 8,
+      "batch": 512,
+      "io": "warm",
+      "start_method": "spawn",
+      "spawn_s": 5.3045,
+      "prime_cache_s": 8.5539,
+      "warm_batches": 1,
+      "bench_batches": 4,
+      "rows": 2048,
+      "elapsed_s": 1.7634,
+      "rows_per_s": 1161.4,
+      "ms_per_row_wall": 0.861,
+      "warmup_rows": 512,
+      "warmup_s": 0.8616,
+      "errors": [],
+      "index_span": [
+        27362168,
+        30782439
+      ]
+    }
+  ],
+  "memory": [
+    {
+      "workers": 8,
+      "batch": 32,
+      "io": "warm",
+      "rows": 2048,
+      "spawn_s": 3.3603,
+      "peak_wset_mb": 306.5,
+      "physical_mem_mb": 14198.7,
+      "x_workers_peak_mb": 2451.9
+    },
+    {
+      "workers": 8,
+      "batch": 128,
+      "io": "warm",
+      "rows": 2048,
+      "spawn_s": 3.3961,
+      "peak_wset_mb": 307.2,
+      "physical_mem_mb": 14198.7,
+      "x_workers_peak_mb": 2457.4
+    },
+    {
+      "workers": 8,
+      "batch": 512,
+      "io": "warm",
+      "rows": 2048,
+      "spawn_s": 3.328,
+      "peak_wset_mb": 306.4,
+      "physical_mem_mb": 14198.7,
+      "x_workers_peak_mb": 2450.8
+    }
+  ],
+  "verdict": {
+    "single_process": {
+      "B=32": {
+        "first": {
+          "rows_per_s": 302.4,
+          "ms_per_row": 3.3068
+        },
+        "random": {
+          "rows_per_s": 335.7,
+          "ms_per_row": 2.979
+        },
+        "complex": {
+          "rows_per_s": 181.5,
+          "ms_per_row": 5.5109
+        }
+      },
+      "B=128": {
+        "first": {
+          "rows_per_s": 298.6,
+          "ms_per_row": 3.3487
+        },
+        "random": {
+          "rows_per_s": 329.5,
+          "ms_per_row": 3.035
+        },
+        "complex": {
+          "rows_per_s": 178.7,
+          "ms_per_row": 5.5966
+        }
+      },
+      "B=512": {
+        "first": {
+          "rows_per_s": 289.4,
+          "ms_per_row": 3.455
+        },
+        "random": {
+          "rows_per_s": 301.5,
+          "ms_per_row": 3.3173
+        },
+        "complex": {
+          "rows_per_s": 188.2,
+          "ms_per_row": 5.3124
+        }
+      }
+    },
+    "single_process_reference_batch": "B=512",
+    "single_process_slowest_stratum": {
+      "rows_per_s": 301.5,
+      "stratum": "random"
+    },
+    "single_process_fastest_stratum": {
+      "rows_per_s": 188.2,
+      "stratum": "complex"
+    },
+    "worker_curves": {
+      "warm": [
+        {
+          "workers": 1,
+          "rows_per_s": 341.2,
+          "ms_per_row_wall": 2.931,
+          "spawn_s": 3.3686
+        },
+        {
+          "workers": 2,
+          "rows_per_s": 594.7,
+          "ms_per_row_wall": 1.6815,
+          "spawn_s": 3.7908
+        },
+        {
+          "workers": 4,
+          "rows_per_s": 827.8,
+          "ms_per_row_wall": 1.208,
+          "spawn_s": 4.1889
+        },
+        {
+          "workers": 8,
+          "rows_per_s": 1161.4,
+          "ms_per_row_wall": 0.861,
+          "spawn_s": 5.3045
+        }
+      ],
+      "cold": [
+        {
+          "workers": 1,
+          "rows_per_s": 175.8,
+          "ms_per_row_wall": 5.6897,
+          "spawn_s": 3.3469
+        },
+        {
+          "workers": 2,
+          "rows_per_s": 155.2,
+          "ms_per_row_wall": 6.4444,
+          "spawn_s": 3.8364
+        },
+        {
+          "workers": 4,
+          "rows_per_s": 217.8,
+          "ms_per_row_wall": 4.5907,
+          "spawn_s": 4.3575
+        },
+        {
+          "workers": 8,
+          "rows_per_s": 273.1,
+          "ms_per_row_wall": 3.6612,
+          "spawn_s": 5.641
+        }
+      ]
+    },
+    "best_warm": {
+      "workers": 8,
+      "rows_per_s": 1161.4,
+      "ms_per_row_wall": 0.861,
+      "spawn_s": 5.3045
+    },
+    "best_cold": {
+      "workers": 8,
+      "rows_per_s": 273.1,
+      "ms_per_row_wall": 3.6612,
+      "spawn_s": 5.641
+    },
+    "verdict": {
+      "budget_ms_per_row": 3.04,
+      "measured_ms_per_row": 3.6612,
+      "over_budget_by": 1.2,
+      "holds": false
+    },
+    "memory": {
+      "worst": {
+        "workers": 8,
+        "batch": 128,
+        "io": "warm",
+        "rows": 2048,
+        "spawn_s": 3.3961,
+        "peak_wset_mb": 307.2,
+        "physical_mem_mb": 14198.7,
+        "x_workers_peak_mb": 2457.4
+      },
+      "total_peak_mb": 2457.6,
+      "total_peak_gb": 2.4,
+      "physical_mem_gb": 13.87,
+      "fits": true,
+      "verdict": "OK · 8 workers 的峰值远小于物理内存"
+    }
+  },
+  "recommendation": {
+    "workers_warm": {
+      "points": [
+        {
+          "workers": 1,
+          "rows_per_s": 341.2
+        },
+        {
+          "workers": 2,
+          "rows_per_s": 594.7
+        },
+        {
+          "workers": 4,
+          "rows_per_s": 827.8
+        },
+        {
+          "workers": 8,
+          "rows_per_s": 1161.4
+        }
+      ],
+      "best_workers": 8,
+      "best_rows_per_s": 1161.4,
+      "marginal_efficiency_at_best": 0.701,
+      "note": "热曲线 = CPU 上限（数据已在页缓存）"
+    },
+    "workers_cold": {
+      "points": [
+        {
+          "workers": 1,
+          "rows_per_s": 175.8
+        },
+        {
+          "workers": 2,
+          "rows_per_s": 155.2
+        },
+        {
+          "workers": 4,
+          "rows_per_s": 217.8
+        },
+        {
+          "workers": 8,
+          "rows_per_s": 273.1
+        }
+      ],
+      "best_workers": 8,
+      "best_rows_per_s": 273.1,
+      "marginal_efficiency_at_best": 0.627,
+      "note": "冷/热两条曲线谁才是部署态，看 gather_*_ms_per_row：数据卷是 USB 时冷曲线才是真实的"
+    },
+    "batch": {
+      "points": [
+        {
+          "batch": 32,
+          "rows_per_s": 311.4,
+          "ms_per_row": 3.2111
+        },
+        {
+          "batch": 64,
+          "rows_per_s": 306.4,
+          "ms_per_row": 3.2638
+        },
+        {
+          "batch": 128,
+          "rows_per_s": 309.7,
+          "ms_per_row": 3.2291
+        },
+        {
+          "batch": 256,
+          "rows_per_s": 306.1,
+          "ms_per_row": 3.2671
+        },
+        {
+          "batch": 512,
+          "rows_per_s": 306.6,
+          "ms_per_row": 3.2615
+        },
+        {
+          "batch": 1024,
+          "rows_per_s": 307.1,
+          "ms_per_row": 3.2563
+        }
+      ],
+      "max_rows_per_s_batch": 32,
+      "spread_max_over_min": 1.017,
+      "note": "特征侧的 Python 开销**长在每行的梯子 DFS 里面**，不在批级；所以「大 batch 摊薄开销」在本管道上基本不成立 ⇒ batch 应该按训练侧（显存 / 收敛）选，而不是按特征吞吐选"
+    }
+  }
+}
