@@ -209,17 +209,20 @@ def test_eval_max_batches_absent_from_run_txt_rl_table():
     该测试的参数集是从 selfplay_train.py 抽的，所以只要 `--eval-max-batches`
     不是 selfplay_train 的选项，它就既不需要文档行、也不会引起双向齐全失败。
     """
-    txt = open(RUN_TXT, encoding='utf-8').read()
-    start = txt.find("③' RL 完整参数表")
-    end = txt.find('④ WebUI')
-    assert start != -1 and end != -1 and start < end, 'run.txt 缺少 ③\' RL 参数表'
-    assert '--eval-max-batches' not in txt[start:end], \
-        'run.txt ③\' 表只准收 selfplay_train.py 的 RL 选项，train_sft 的新旗标不该进去'
-
     sp = open(SELFPLAY_SRC, encoding='utf-8').read()
     opts = set(re.findall(r'ap\.add_argument\(\s*[\'"](--[a-z0-9-]+)[\'"]', sp))
     assert '--eval-max-batches' not in opts, \
-        'selfplay_train.py 竟然也有 --eval-max-batches —— run.txt ③\' 表会因此要求它有文档行'
+        'selfplay_train.py 竟然也有 --eval-max-batches —— 那 run.txt 若照抄它就要求它有文档行'
+
+    # 原实现是「在 run.txt 的 ③' RL 完整参数表（照抄 selfplay_train.py 的那段）
+    # 里不许出现」，把上面这个源码级检查做了双保险。但 run.txt 已改为一屏简洁版
+    # （7d1d5fd），不再承载逐项参数表，那一节不存在了 ⇒ 断言静默退化成对一个
+    # 不存在的节做 find，检查力归零却不报红 —— 这类「锚点消失」比断言红更危险。
+    # 改为**整篇**不许出现：既不再依赖已退役的小节结构，守卫也比原来更强 ——
+    # train_sft 没有这个选项，那 run.txt 里任何位置都不该教人用它。
+    txt = open(RUN_TXT, encoding='utf-8').read()
+    assert '--eval-max-batches' not in txt, \
+        'run.txt 不得出现 --eval-max-batches（train_sft.py 没有这个 argparse 选项）'
 
 
 # --------------------------------------------------------------------------- #
