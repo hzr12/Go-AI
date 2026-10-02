@@ -710,6 +710,124 @@ def _positive_beta(text):
     return value
 
 
+def _at_least_one(text):
+    """`--soft-every` 的 argparse type：要求 >= 1 的整数。
+
+    为什么必须校验：`--soft-every 0` 会让 `step % 0` 变成 ZeroDivisionError ——
+    报错点落在训练循环里，栈里全是训练代码，看不出是哪个旗写错了。`step % N`
+    的语义里 N=0 本来就无意义（没有「第 0 步」以外的可判定边界）。
+    """
+    try:
+        value = int(text)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f'--soft-every 必须是 >= 1 的整数（收到 {text!r}）')
+    if value < 1:
+        raise argparse.ArgumentTypeError(
+            f'--soft-every 必须 >= 1（0 会让 step % N 抛 ZeroDivisionError，'
+            f'负数没有「每 N 步一个软批」的意义），收到 {value}')
+    return value
+
+
+#: `build_soft_index.py` 的产物里必须有的键。缺一个就报错而不是当默认值 ——
+#: 缺 `idx` 意味着「这批行没有软标签」，缺 `policy` 意味着「软标签是全 0」，
+#: 两者都会静默把软 CE 训成 no-op。
+SOFT_INDEX_KEYS = ('idx', 'policy')
+
+
+def attach_soft_index(dataset, path):
+    """把软标签索引挂到数据集上（`--soft-index` 的实现）。
+
+    产物格式（与 `scripts/build_soft_index.py` / `src/data/kata_label_join.py`
+    的 `build_soft_index` 一字对齐）::
+
+        idx     int64  (M,)      数据集行号
+        policy  float16(M, 362)  对应的 KataGo 访问分布（行和 ≈ 1）
+
+    ⚠ 必须在**预取器 fork 之前**调用：软标签挂在 dataset 对象上，fork 之后
+    再挂就只有父进程看得见，worker 会继续造 `soft_mask` 全 0 的批 —— 而训练
+    不报任何错，只是「软标签训了个寂寞」。
+    """
+    z = np.load(path, allow_pickle=False)
+    missing = [k for k in SOFT_INDEX_KEYS if k not in z.files]
+    if missing:
+        raise KeyError(
+            f'--soft-index {path} 缺字段 {missing}；现有 {sorted(z.files)}。'
+            f'请用 scripts/build_soft_index.py 重新生成（它是唯一的产物写者）。')
+    idx = np.asarray(z['idx']).ravel()
+    pol = np.asarray(z['policy'])
+    diag = dataset.attach_soft(idx, pol)
+    diag.update({'path': os.path.abspath(path),
+                 'index_rows': int(idx.size),
+                 'policy_shape': tuple(int(x) for x in pol.shape),
+                 'hit_rate': (int(idx.size) / max(len(dataset), 1))})
+    return diag
+
+
+def resolve_policy_loss_kind(policy_loss, soft_index):
+    """软标签接入后，**生效**的 policy 损失 kind。
+
+    `soft_ce` 不是又一个旗：它是 `--soft-index` 的**派生**结果。给了 `--soft-index`
+    就用软 CE（段 2 的全部意义），没给就原样返回 `--policy-loss`（段 1 的旧路径，
+    数值逐位不变）。
+
+    ⚠ 显式 `soft_ce` 却没有 `--soft-index` 必须**报错**：`compute_policy_loss`
+      拿不到 `soft`/`soft_mask` 会抛 ValueError，但那是训练跑到第一个 batch
+      时的栈 —— 这里提前拒掉，错误信息直指 CLI。
+    ⚠ `--policy-loss huber` + `--soft-index` 也报错：huber 分支**完全不看**
+      软标签，组合起来等于「以为在蒸馏，其实在回归 one-hot 的概率」。
+    """
+    if not soft_index:
+        if policy_loss == 'soft_ce':
+            raise SystemExit(
+                '--policy-loss soft_ce 需要 --soft-index（否则 soft_mask 全 0，'
+                '软项恒 0 —— 训练照跑但什么也没学到）')
+        return policy_loss
+    if policy_loss == 'huber':
+        raise SystemExit(
+            '--policy-loss huber 与 --soft-index 互斥：huber 分支不消费软标签，'
+            '组合起来会「以为在蒸馏、其实在回归 one-hot 概率」。段 2 请让 '
+            '--soft-index 接管（它把 kind 派生为 soft_ce）。')
+    return 'soft_ce'
+
+
+def _soft_kind_for_step(hard_kind, step, soft_every):
+    """第 `step` 个 micro-batch 走哪个 policy kind（`--soft-every` 的节奏）。
+
+    `soft_every == 1`（默认）⇒ 每步都走软 CE。`> 1` ⇒ 只有 `step % N == 0` 的
+    那些步走软 CE，其余步回退到 `--policy-loss` 的硬目标口径。
+
+    ⚠ 非软步里的软行会按 **one-hot** 训（软项被完全跳过）。这正是 spec §5
+    退路表点名的「混合训练 ⇒ index 0 向两种语义折中」，所以默认值是 1，
+    且 `>1` 时 main() 会打 warning。
+    """
+    every = max(1, int(soft_every))
+    if every == 1:
+        return 'soft_ce'
+    return 'soft_ce' if step % every == 0 else hard_kind
+
+
+def narrow_to_soft_rows(train_idx, dataset):
+    """`--soft-only-sampling`：把训练行索引空间收窄到「有软标签的行」。
+
+    段 2 的决定（spec §1.2）：**只训软行**，而不是全量混训 / 靠权重混 ——
+    同一个 head 同时收到搜索分布与人类 one-hot 会去折中而不是学搜索；
+    `--soft-weight 0` 关不掉（那是「开了软标签但 99% 样本仍在教 one-hot」的
+    静默半吊子）。与 Phase 4 item 3 的滑动窗口**正交**，两者可叠加。
+
+    ⚠ 收窄到 0 行必须**报错**而不是退回全量：静默退回正是本函数要防的那个
+    失败模式（用户以为在跑段 2，实际在跑段 1）。
+    """
+    keep = dataset.soft_row_mask()
+    out = np.asarray(train_idx)[keep[np.asarray(train_idx)]]
+    if out.size == 0:
+        raise SystemExit(
+            '--soft-only-sampling 之后训练行为 0：软标签与训练集没有交集'
+            '（索引陈旧？散列口径漂移？）。**不要**把它当成「这批局面真的没标签」'
+            '—— 先跑 scripts/build_soft_index.py 看它的缓存告警。')
+    return out
+
+
 def load_dataset(path):
     """加载单个 .npz 训练集。"""
     d = np.load(path, allow_pickle=False)
@@ -1030,8 +1148,85 @@ def _prefetch_worker_init(dataset):
     _worker_dataset = dataset
 
 
-def _prefetch_worker(wi, task_q, res_q, seed, dataset):
-    """multiprocessing worker：从 task_q 取任务，计算后放 res_q。"""
+# ---- A3 · labels_dict 的主进程侧工具 --------------------------------------
+# ⚠ **必须放在 `_prefetch_worker` 之前**：`tests/test_prefetch_fork_order.py::
+# test_prefetch_workers_do_not_touch_cuda_or_npu` 对源码做的是**切片**扫描 ——
+# 它取 worker 函数定义处到 `_BatchPrefetcher` 类定义处之间的那一段，禁止其中
+# 出现设备相关字面量。下面这几个函数里 `.to(device)` 是**必需**的（张量转换
+# 只允许发生在主进程，见 A3），放进切片会让那条测试变红 —— 而那条测试要守的
+# 判据是「worker 纯 numpy」，这里不是 worker。
+# ⚠ 这段注释本身也不能出现 worker 定义的那一行源码：切片用的是 `str.find`，
+#   第一个匹配就会被注释里的字面量抢走。
+# --------------------------------------------------------------------------
+
+
+def _concat_label_dicts(dicts):
+    """把各子块的 `labels_dict` 沿 **batch 轴**拼成整批（顶层入口）。
+
+    ⚠ `w` 是**嵌套 dict** ⇒ 拼接必须递归（见 `_concat_tree`）。键集合必须
+    一致：同一份 dataset 造出来的 dict 形状恒定（`SupervisedDataset.
+    _build_labels`），所以这里做**严格**校验而不是取交集 —— 少一个键就是
+    「某个子块用了旧契约」，宁可炸。
+    """
+    if not dicts:
+        raise ValueError('_concat_label_dicts: 没有可拼的子块')
+    return _concat_tree(dicts)
+
+
+def _concat_tree(vals):
+    """递归拼接：叶子是 numpy（沿 batch 轴），中间层是 dict。
+
+    `vals` 是「同一层、同一父键」在各子块里的取值列表。**键集合在每一层都做
+    对称校验**（不只查「后者缺前者有的」，也查「后者多出前者没有的」）：少一个
+    `w` 里的权重项同样会被静默丢掉，而症状是「某个权重恒 0」，没人会想到是
+    拼接时丢的。
+    """
+    out = {}
+    keys0 = set(vals[0])
+    for v in vals[1:]:
+        if set(v) != keys0:
+            raise KeyError(
+                f'labels_dict 键集合在子块之间不一致：缺 {sorted(keys0 - set(v))}、'
+                f'多 {sorted(set(v) - keys0)}（契约分叉）')
+    for k, v0 in vals[0].items():
+        if isinstance(v0, dict):
+            out[k] = _concat_tree([v[k] for v in vals])
+        else:
+            out[k] = np.concatenate([v[k] for v in vals], axis=0)
+    return out
+
+
+def _labels_dict_to_tensors(d, device=None):
+    """numpy 的 `labels_dict` → 同 device 的张量 dict（**递归**）。
+
+    与 `SupervisedDataset.sample_batch(labels=True)` 用同一套口径（含嵌套的
+    `w`）：**只有一种 payload 形状**是 A3 的全部意义。
+    """
+    def conv(x):
+        if isinstance(x, dict):
+            return {k: conv(v) for k, v in x.items()}
+        t = torch.from_numpy(x)
+        return t.to(device, non_blocking=True) if device is not None else t
+    return {k: conv(v) for k, v in d.items()}
+
+
+def _prefetch_worker(wi, task_q, res_q, seed, dataset, labels=False):
+    """multiprocessing worker：从 task_q 取任务，计算后放 res_q。
+
+    ⚠ **本函数里不许出现任何设备相关调用**（两个后端的运行时入口、跨设备搬运、
+    低精度上下文管理器）—— 见 `tests/test_prefetch_fork_order.py::
+    test_prefetch_workers_do_not_touch_cuda_or_npu`，它对本段源码做**字面**
+    扫描（注释也算，所以这句描述刻意避开被禁的字面量）。理由是 worker 只做纯
+    numpy：碰一下设备上下文就会让每个 worker 建一份映射（4 卡实测每卡凭空多占
+    ~24 GiB ⇒ OOM）。
+    同理不许在这里重新打开主 npz —— 父进程已经把列读进内存了（fork 复制
+    地址空间），每个 worker 再解一次 `boards` 就是 12.3 GB × k。数据只能走
+    dataset 引用（`dataset` 形参）。
+
+    `labels=True` 时 payload 是 **4 元组 + dict**（spec §5.5），第 4 项是
+    numpy 的 `labels_dict`（`w` 是**嵌套 dict**）；张量转换留到主进程的
+    `next()` —— 在 worker 里转会把设备上下文也带出去，正是上面那条禁令。
+    """
     rng = np.random.default_rng(seed + wi)
     while True:
         item = task_q.get()
@@ -1039,10 +1234,15 @@ def _prefetch_worker(wi, task_q, res_q, seed, dataset):
             return
         step, pos, sub_idx = item
         try:
-            s, m, v = dataset.sample_batch_numpy(sub_idx, rng=rng)
-            res_q.put((step, pos, s, m, v, None))
+            out = dataset.sample_batch_numpy(sub_idx, rng=rng, labels=labels)
+            if labels:
+                s, m, v, lbl = out
+            else:
+                s, m, v = out
+                lbl = None
+            res_q.put((step, pos, s, m, v, lbl, None))
         except Exception as e:  # noqa: BLE001
-            res_q.put((step, pos, None, None, None, e))
+            res_q.put((step, pos, None, None, None, None, e))
 
 
 class _BatchPrefetcher:
@@ -1053,10 +1253,16 @@ class _BatchPrefetcher:
     主进程按序拼回整批。
 
     两步流水：submit() 投递一个 batch 的下标，next() 取回构造好的 numpy 数组。
-    两个有界队列提供背压，避免无限预取吃内存。各进程用独立 np.random.Generator。
+    两个**有界**队列提供背压，避免无限预取吃内存。各进程用独立 np.random.Generator。
+
+    `labels=True`（软标签接入 A3）：`next(device=...)` 额外返回第 4 项
+    `labels_dict`（张量 dict，含嵌套 `w`）；`labels=False`（默认）时
+    `next()` 的返回值与改造前**逐位一致**（仍是 numpy 三元组）—— 段 1 的
+    热路径不因软标签接线多搬任何字节。
     """
 
-    def __init__(self, dataset, num_workers=4, prefetch=2, seed=1234):
+    def __init__(self, dataset, num_workers=4, prefetch=2, seed=1234,
+                 labels=False):
         # ⚠ 护栏：**绝不能在设备运行时初始化之后**构造本类（4 卡 910A 的 OOM
         # 直接原因，2026-09-30）。`mp.Process` 默认 fork，子进程会整份继承父
         # 进程的 CANN/CUDA 上下文与已分配显存映射 ⇒ 每卡被旁挂 4 份 ≈ 24 GiB，
@@ -1078,17 +1284,21 @@ class _BatchPrefetcher:
         self.dataset = dataset
         self.k = max(1, int(num_workers))
         self.prefetch = max(1, int(prefetch))
+        # ⚠ 背压语义不可动：两个队列都必须**有界**（maxsize = k·depth）。
+        #   改成无界队列 = 无限预取 = 预取深度失控时把内存吃光（fp16 输入
+        #   12 路 × B=512 × 19² × 19² 在 flight 里就能到 GB 级）。
         cap = self.k * self.prefetch
         self._task_q: mp.Queue = mp.Queue(maxsize=cap)
         self._res_q: mp.Queue = mp.Queue(maxsize=cap)
+        self.labels = bool(labels)
         self._step = 0     # 下一个待投递 batch 的编号
         self._expect = 0   # 下一个待取回 batch 的编号
-        self._pending: dict = {}  # step -> [(pos, s, m, v, err)] 已收到但还没收集完的
+        self._pending: dict = {}  # step -> [(pos, s, m, v, lbl, err)]
         self._processes = []
         for wi in range(self.k):
             p = mp.Process(
                 target=_prefetch_worker,
-                args=(wi, self._task_q, self._res_q, seed, dataset),
+                args=(wi, self._task_q, self._res_q, seed, dataset, self.labels),
                 daemon=True,
             )
             p.start()
@@ -1104,37 +1314,52 @@ class _BatchPrefetcher:
             end = (wi + 1) * n // self.k
             sub = idxs[start:end]
             if len(sub) == 0:
-                self._res_q.put((step, wi, None, None, None, None))
+                # 空子块直接回一个空 payload（不投 task_q）：否则每个空块都要
+                # 占一个 worker 的往返，而 worker 的往返是要抢 GIL 的。
+                self._res_q.put((step, wi, None, None, None, None, None))
             else:
                 self._task_q.put((step, wi, sub))
 
-    def next(self):
-        """取回下一个 batch，返回 (states_np, moves_np, values_np)。"""
+    def next(self, device=None):
+        """取回下一个 batch。
+
+        `labels=False`（默认）→ ``(states_np, moves_np, values_np)``，与改造前
+        逐位一致（**纯 numpy**，不碰 device）。
+
+        `labels=True` → 上面三项 + `labels_dict`（同 device 的张量 dict，
+        含嵌套 `w`）。`device=None` 时 dict 里的张量留在 CPU。
+        """
         step = self._expect
         self._expect += 1
         # 从 _pending 中取出之前缓存的该 step 结果
         parts = self._pending.pop(step, [])
         # 如果不够 k 个，从队列中继续收
         while len(parts) < self.k:
-            r_step, pos, s, m, v, err = self._res_q.get()
+            r_step, pos, s, m, v, lbl, err = self._res_q.get()
             if r_step == step:
-                parts.append((pos, s, m, v, err))
+                parts.append((pos, s, m, v, lbl, err))
             else:
                 # 缓存未来 step 的结果
-                self._pending.setdefault(r_step, []).append((pos, s, m, v, err))
+                self._pending.setdefault(r_step, []).append(
+                    (pos, s, m, v, lbl, err))
         # 检查错误
-        for pos, s, m, v, err in parts:
+        for pos, s, m, v, lbl, err in parts:
             if err is not None:
                 raise err
         # 按 pos 排序并拼接
-        parts = [(pos, s, m, v) for pos, s, m, v, _ in parts if s is not None]
+        parts = [(pos, s, m, v, lbl) for pos, s, m, v, lbl, _ in parts
+                 if s is not None]
         parts.sort(key=lambda x: x[0])
         if not parts:
             raise RuntimeError(f"step {step}: 所有子块为空")
         states = np.concatenate([p[1] for p in parts], axis=0)
         moves = np.concatenate([p[2] for p in parts], axis=0)
         values = np.concatenate([p[3] for p in parts], axis=0)
-        return states, moves, values
+        if not self.labels:
+            return states, moves, values
+        labels_dict = _concat_label_dicts([p[4] for p in parts])
+        return (states, moves, values,
+                _labels_dict_to_tensors(labels_dict, device=device))
 
 
 def resolve_c2net_data(dataset_path):
@@ -1225,6 +1450,14 @@ def _init_swanlab(args, logger):
                 "value_loss_weight": args.value_loss_weight,
                 "huber_beta": args.huber_beta,
                 "label_smoothing": args.label_smoothing,
+                # ---- 软标签（A4）----
+                # ⚠ policy_loss 在这里已是**派生后**的取值（main() 在加载数据集
+                #   之前就调了 resolve_policy_loss_kind），所以 soft_ce 的 run
+                #   不会在 config 面板里显示成 'ce'。
+                "soft_index": args.soft_index or "",
+                "soft_weight": args.soft_weight,
+                "soft_only_sampling": bool(args.soft_only_sampling),
+                "soft_every": args.soft_every,
                 "attention_dropout": args.attention_dropout,
                 "ema_enabled": bool(args.use_ema),
                 "ema_decay": 0.999,
@@ -2080,11 +2313,16 @@ def main():
     # 只加这三个（结构参数不新增任何 CLI）。RL 侧的对应拆分在 P3-C/P3-D，
     # scripts/selfplay_train.py 不在本任务范围。
     ap.add_argument('--policy-loss', default='ce',
-                    choices=['huber', 'ce'],
+                    choices=['huber', 'ce', 'soft_ce'],
                     help='policy 损失：ce=原交叉熵口径（数值行为与 D4 之前逐位一致）'
                          '，**默认**；huber=对 label-smoothed one-hot 目标做 Huber'
                          '(smooth L1, beta=--huber-beta，归约=类内 sum over A + '
-                         'batch mean)，保留仅供复现实验。'
+                         'batch mean)，保留仅供复现实验；soft_ce=**软标签**交叉熵'
+                         '（KataGo 访问分布蒸馏，spec §5.7），掩码逐行二选一 —— '
+                         'soft_mask=1 的行走软 CE、0 的行贡献恰好 0（不是插值）。'
+                         '⚠ soft_ce 只在给了 --soft-index 时才会被自动选中；'
+                         '显式写 --policy-loss soft_ce 而没有 --soft-index 会在'
+                         '启动时报错（否则软项恒 0，是静默半吊子）。'
                          '⚠ 默认**不是** huber（P4.5b 用户裁决）：定义在概率上的损失，'
                          '梯度尺度必然依赖动作空间 A —— softmax 雅可比贡献 p≈1/A，'
                          'mean over A 给 1/A²、sum over A 给 A，没有任何归约能消掉它；'
@@ -2121,6 +2359,37 @@ def main():
                     help='value head 学习率倍数（相对主干 LR，补偿参数量小的梯度不足）')
     ap.add_argument('--label-smoothing', type=float, default=0.1,
                     help='policy loss label smoothing（0=不平滑，0.1=标准值）')
+    # ---- A4 · 软标签（KataGo 访问分布）四参数 --------------------------------
+    # spec §3 A 组 / §5.7。这四个旗**只在给了 --soft-index 时有任何作用**；
+    # 没给时下面每一条路径都逐位不变（段 1 的通路基线不受影响）。
+    ap.add_argument('--soft-index', default=None,
+                    help='软标签索引 npz（scripts/build_soft_index.py 的产物，'
+                         '含 idx (M,) 与 policy (M,362)）。给了就把它挂到数据集'
+                         '行上并把 policy 损失切到 soft_ce；**不给 = 完全走段 1 '
+                         '旧路径**（labels=False、policy_loss=ce，数值逐位不变）。'
+                         '⚠ 该索引必须来自当前主 npz：build_soft_index 的缓存 key '
+                         '含主 npz 指纹与散列口径版本，索引陈旧时它会告警并重建 —— '
+                         '静默挂错标签的症状只是「命中率 0」，别把它当成「这批局面'
+                         '真的没标签」')
+    ap.add_argument('--soft-weight', type=float, default=1.0,
+                    help='软项的全局缩放（soft_ce 的乘子，默认 1.0 = 不缩放）。'
+                         '⚠ soft_ce 的分母恒为 batch 大小 B 而不是 Σmask ⇒ 软项'
+                         '量级随「批里软行占比」线性变化；--soft-only-sampling 让'
+                         '占比≈1 时本参数才有可解释的量级，否则调它是在调软行占比')
+    ap.add_argument('--soft-only-sampling', type=int, default=0, choices=[0, 1],
+                    help='训练行索引空间收窄到「有软标签的行」（soft_row >= 0）'
+                         '(0=关闭=全量混训，1=开启)。段 2 用它：**只训软行**是'
+                         'spec §1.2 的决定 —— 同一个 head 同时收到搜索分布与人类 '
+                         'one-hot 会去折中而不是学搜索；--soft-weight 0 关不掉'
+                         '这个问题（那是「开了软标签但 99%% 样本仍在教 one-hot」的'
+                         '静默半吊子）。与 Phase 4 item 3 的滑动窗口**正交**，'
+                         '两者可叠加。⚠ 必须同时给 --soft-index，否则启动时报错')
+    ap.add_argument('--soft-every', type=_at_least_one, default=1,
+                    help='每 N 个 micro-batch 里有 1 个走软 CE（默认 1 = 每步都走）。'
+                         'N>1 时其余步骤回退到 --policy-loss 的硬目标口径，'
+                         '那几步里的软行会按 one-hot 训 —— 这正是 spec §5 退路表'
+                         '点名的「混合训练 ⇒ index 0 向两种语义折中」，只在'
+                         '明确知道后果时才用。必须 >= 1')
     ap.add_argument('--use-checkpoint', type=int, default=0, choices=[0, 1],
                     help='用 gradient checkpointing 减少显存占用（约省 50%%，训练慢 ~30%%）(0=关闭, 1=开启)')
     ap.add_argument('--use-ema', type=int, default=0, choices=[0, 1],
@@ -2195,6 +2464,21 @@ def main():
     is_main = (rank == 0)
     log_file = args.log_file if args.log_file else None
     logger = setup_logging(log_file, rank=rank)
+
+    # ---- A4 · 软标签：kind 解析（**在加载数据集之前**）--------------------
+    # `soft_ce` 是 `--soft-index` 的**派生**结果，不是又一个旗；坏组合
+    # （soft_ce 却没有 --soft-index / huber 撞上 --soft-index）在这里就拒掉 ——
+    # 等到第一个 batch 才炸，代价是先花几分钟把 12.3 GB 灌进内存。
+    # ⚠ 位置在 `setup_logging` 之后（要用 logger 报口径变化）、在
+    #   `load_from_path` 之前（坏组合不该先吃满内存）。两处顺序都有测试钉。
+    _soft_on = bool(args.soft_index)
+    _hard_policy_loss = args.policy_loss
+    _eff_kind = resolve_policy_loss_kind(args.policy_loss, args.soft_index)
+    if _eff_kind != _hard_policy_loss:
+        logger.info("[soft] policy 损失口径 %s → %s（--soft-index 已给定）",
+                    _hard_policy_loss, _eff_kind)
+    args.policy_loss = _eff_kind
+    _soft_every = max(1, int(args.soft_every))
 
     # ---- C2NET 支持（OpenI 启智平台）----
     # 关于 rank 守卫：prepare() 与 --data 覆盖**必须**在所有 rank 上执行——
@@ -2273,12 +2557,37 @@ def main():
     # numpy（与 rank 无关），提前无语义影响；反向顺序（dist 初始化后再 fork）
     # 才是 HCCL 的危险方向，提前 fork 是安全的那一侧。
     dataset = load_from_path(args.data, args.board_size, args.max_games_per_tgz)
+    # ---- A4 · 软标签挂载：**必须在 fork 之前** -----------------------------
+    # 顺序是硬要求：软标签挂在 dataset 对象上，预取器 fork 之后再挂就只有父
+    # 进程看得见，worker 会继续造 `soft_mask` 全 0 的批 —— 训练不报任何错，
+    # 只是「软标签训了个寂寞」。
+    if _soft_on:
+        _sd = attach_soft_index(dataset, args.soft_index)
+        logger.info("[soft] 已挂载软标签 | 索引=%s | 覆盖行=%d/%d (%.3f%%) | "
+                    "重复标注行=%d | 软 CE 步间隔=%d",
+                    args.soft_index, _sd['n_soft'], _sd['n_rows'],
+                    100.0 * _sd['hit_rate'], _sd['n_soft_dup'], _soft_every)
+        if _sd['n_soft'] == 0:
+            logger.error("[soft] ⚠ 软标签命中 0 行。先确认索引与当前主 npz 匹配"
+                         "（build_soft_index 会对陈旧缓存告警并重建），"
+                         "**不要**把「索引陈旧」当成「这批局面真的没标签」—— "
+                         "后者根本不会命中缓存。")
+        if _soft_every > 1:
+            logger.warning("[soft] ⚠ --soft-every=%d：只有 1/%d 的 micro-batch 走软 "
+                           "CE，其余步骤的软行按 one-hot 训 —— spec §5 退路表点名"
+                           "这是「index 0 向两种语义折中」的场景，请确认这是有意的。",
+                           _soft_every, _soft_every)
+    elif _soft_every > 1:
+        logger.warning("[soft] ⚠ --soft-every=%d 但没有 --soft-index：该参数无作用",
+                       _soft_every)
+
     pf = None
     if args.prefetch_workers > 1:
         pf = _BatchPrefetcher(dataset, num_workers=args.prefetch_workers,
-                              prefetch=args.prefetch_depth)
-        logger.info("[data] 预取器已启用（在设备初始化之前 fork）| workers=%d depth=%d",
-                    args.prefetch_workers, args.prefetch_depth)
+                              prefetch=args.prefetch_depth, labels=_soft_on)
+        logger.info("[data] 预取器已启用（在设备初始化之前 fork）| workers=%d depth=%d"
+                    " | labels=%s", args.prefetch_workers, args.prefetch_depth,
+                    _soft_on)
     else:
         logger.info("[data] 预取器已关闭（--prefetch-workers=%d ≤ 1）",
                     args.prefetch_workers)
@@ -2484,6 +2793,27 @@ def main():
         rng.shuffle(idx_all)
         train_idx = idx_all[:n_train]
         eval_idx = idx_all[n_train:]
+    # ---- A4 · --soft-only-sampling：训练行空间收窄到 soft_row >= 0 ---------
+    # 段 2 的决定（spec §1.2）：**只训软行**，而不是全量混训 / 靠权重混。理由
+    # 是同一个 head 同时收到搜索分布与人类 one-hot 会去折中而不是学搜索；
+    # `--soft-weight 0` 关不掉（那是「开了软标签但 99% 样本仍在教 one-hot」的
+    # 静默半吊子）。与 Phase 4 item 3 的滑动窗口**正交**，两者可叠加。
+    #
+    # 只收窄**训练**行：`eval_idx` 不动 —— 验证集要能同时看软行与硬行。
+    # 收窄后 `n_train` 必须跟着改（下面的每卡步数 / 调度步数 / 日志行数都由它
+    # 推出），而 eval 侧的 `n_eval` 用的是 `len(eval_idx)`，不受影响。
+    if args.soft_only_sampling:
+        if not _soft_on:
+            raise SystemExit(
+                '--soft-only-sampling 需要 --soft-index：没有软标签时收窄到 '
+                'soft_row>=0 会得到 0 行，而静默退回全量混训正是 spec §1.2 '
+                '否决掉的方案。')
+        _before = len(train_idx)
+        train_idx = narrow_to_soft_rows(train_idx, dataset)
+        n_train = len(train_idx)
+        logger.info("[soft] --soft-only-sampling：训练行 %d → %d "
+                    "(%.3f%%，只保留有软标签的行)", _before, n_train,
+                    100.0 * n_train / max(_before, 1))
     logger.info("[data] 总样本数=%d | 训练=%d | 验证=%d", n, len(train_idx), len(eval_idx))
 
     # 分布式：每张卡用 DistributedSampler 取到不相交的训练分片（会自动 pad 到
@@ -2952,7 +3282,14 @@ def main():
                     nxt = i + args.prefetch_depth
                     if nxt < n_batches:
                         pf.submit(perm[nxt * bs:(nxt + 1) * bs])
-                    states_np, moves_np, values_np = pf.next()
+                    # labels=False（默认）时 next() 仍返回 numpy 三元组，与软标签
+                    # 接入前**逐位一致**；labels=True 时多一个同 device 的
+                    # `labels_dict`（含嵌套 w 的张量）。
+                    if _soft_on:
+                        states_np, moves_np, values_np, lbl = pf.next(device=device)
+                    else:
+                        states_np, moves_np, values_np = pf.next()
+                        lbl = None
                     if _backend == 'cuda':
                         # pin_memory 需要 contiguous 且为 CPU 内存
                         moves_np = np.ascontiguousarray(moves_np)
@@ -2990,10 +3327,29 @@ def main():
                     value_t = value_t.to(device, non_blocking=True)
                 else:
                     sel = perm[i * bs:(i + 1) * bs]
-                    state, move_t, value_t = dataset.sample_batch(sel, device)
+                    if _soft_on:
+                        state, move_t, value_t, lbl = dataset.sample_batch(
+                            sel, device, labels=True)
+                    else:
+                        state, move_t, value_t = dataset.sample_batch(sel, device)
+                        lbl = None
                     # A100 上转 NHWC 以匹配模型 channels_last 布局，卷积更快
                     if use_channels_last:
                         state = state.to(memory_format=torch.channels_last)
+                # ---- A4：软批节奏 + 软项 kwarg -----------------------------
+                # kind 走 `args.policy_loss` 这个**既有**通道：`compute_policy_loss`
+                # 的第 3 个位置实参被 tests/test_huber_loss.py::
+                # test_flags_reach_loss_calls 钉成 `args.policy_loss`，所以
+                # `--soft-every` 的切换改的是 args 上的取值，不是调用点的写法。
+                # `_hard_policy_loss` 是用户给的硬目标口径（软标签没接管时的值）。
+                if _soft_on:
+                    args.policy_loss = _soft_kind_for_step(
+                        _hard_policy_loss, step, _soft_every)
+                # 未开软标签时是**空 dict** ⇒ 损失调用的实参集合与 A3 之前逐字
+                # 相同（段 1 的热路径不多搬一个字节、也不多算一个张量）。
+                soft_kwargs = ({'soft': lbl['soft'], 'soft_mask': lbl['soft_mask'],
+                                'soft_weight': args.soft_weight}
+                               if lbl is not None else {})
                 _dt = time.perf_counter() - _t_data0
                 _t_data += _dt
                 if _dt > _t_data_max:
@@ -3015,7 +3371,7 @@ def main():
                     policy_loss = compute_policy_loss(
                         policy_logits, move_t, args.policy_loss,
                         label_smoothing=args.label_smoothing,
-                        huber_beta=args.huber_beta)
+                        huber_beta=args.huber_beta, **soft_kwargs)
                     value_loss = compute_value_loss(
                         value_logit, value_t, args.value_loss,
                         huber_beta=args.huber_beta)

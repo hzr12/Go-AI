@@ -197,6 +197,30 @@ class SupervisedDataset:
         self.n_soft = int((row >= 0).sum())
         self.n_soft_dup = n_dup
 
+    def attach_soft(self, soft_idx, soft_policy):
+        """公开入口：数据集**建好之后**再挂软标签（`--soft-index` 走这里）。
+
+        为什么需要它：`_attach_soft` 是构造期路径，而 CLI 是在 `load_from_path`
+        返回之后才读 `--soft-index` 的。让脚本去调私有方法会把 `_` 前缀的
+        约定撕开，于是「构造器传参」与「CLI 传参」两条路各自漂移。
+
+        与构造器传参**完全等价**（同一个 `_attach_soft`），可重复调用（后一次
+        覆盖前一次）。
+        """
+        self._attach_soft(soft_idx, soft_policy)
+        return {'n_soft': self.n_soft, 'n_soft_dup': self.n_soft_dup,
+                'n_rows': self.N}
+
+    def soft_row_mask(self):
+        """``(N,) bool``：该行是否有软标签（`--soft-only-sampling` 收窄行空间用）。
+
+        ⚠ 没挂软标签时返回**全 False**（而不是全 True）—— 收窄到 0 行必须
+        让调用方立刻发现，而不是悄悄退回「全量采样」。
+        """
+        if self.soft_row is None:
+            return np.zeros(self.N, dtype=bool)
+        return self.soft_row >= 0
+
     def __len__(self):
         return self.N
 

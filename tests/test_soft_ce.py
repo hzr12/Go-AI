@@ -288,15 +288,70 @@ def test_old_paths_ignore_the_new_kwargs(kind, eps):
 
 
 def test_default_kind_is_still_ce_flag_unchanged():
-    """CLI 的 `--policy-loss` choices 仍冻结在 ['huber','ce']（D1 零新增）。
+    """CLI 的 `--policy-loss` choices 含 `soft_ce`，**但默认仍是 `ce`**。
 
-    `soft_ce` 目前只是**函数级** kind，CLI 入口属 A4 —— 谁去加那个 flag，
-    谁就负责同时更新 tests/test_huber_loss.py::test_no_new_cli_params 的冻结集。
+    ⚠ **A4（2026-10-02）改写了这条断言，理由必须留着**：
+
+    A2 交付时 `soft_ce` 只是**函数级** kind，CLI 侧 `--policy-loss` 的 choices
+    冻结在 `['huber','ce']`，本文件与 `tests/test_huber_loss.py::
+    test_no_new_cli_params`（D1 的 61 flag 冻结）一起把它钉住。A4 要加
+    `--soft-index` / `--soft-weight` / `--soft-only-sampling` / `--soft-every`
+    四个 CLI 旗，于是 `--policy-loss` 必须多接受一个 `soft_ce`
+    ——`--soft-index` 一给就把生效口径派生为 `soft_ce`（见
+    `scripts/train_sft.py::resolve_policy_loss_kind`）。
+
+    本文件原来的断言是**逐字** `choices=['huber', 'ce']`，它守的判据其实有两条，
+    现在分开守且**一条都没削弱**：
+
+      1. 「默认不是 huber、也不是 soft_ce」→ `default == 'ce'` 逐字不变；
+      2. 「三种 kind 都在 choices 里」→ 从**真 argparse**（`_replay_parser`）
+         读，而不是从源码里抠字符串字面量。后者更抗排版改写，且顺带钉住
+         「choices 不是空/非空」那种不可证伪的弱化。
+
+    `tests/test_huber_loss.py::test_no_new_cli_params` 的 61→65 冻结集与
+    `test_policy_loss_default_is_ce` 的 choices 断言是同一次改动，注释互指。
     """
+    import argparse
+    import ast
+    import inspect
+    import textwrap
+    import scripts.train_sft as t
+
+    kw = {}
+    for call in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(t.main)))):
+        if (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                and call.func.attr == 'add_argument' and call.args
+                and isinstance(call.args[0], ast.Constant)
+                and isinstance(call.args[0].value, str)
+                and call.args[0].value == '--policy-loss'):
+            kw = {k.arg: k.value for k in call.keywords}
+    assert kw, 'main() 里找不到 --policy-loss 的 add_argument'
+    # ① 默认值逐字不变：P4.5b 用户裁决的「默认不是 huber」在 A4 之后**更重要**
+    #    （多了 soft_ce 这个新选项，「默认会不会漂到它」成了新的风险面）。
+    assert ast.literal_eval(kw['default']) == 'ce', \
+        '--policy-loss 的默认必须是 ce（P4.5b 用户裁决，A4 加了 soft_ce 后不变）'
+    # ② 三种 kind 齐备，从**真 parser** 读（不是源码字面量）。
+    ap = argparse.ArgumentParser()
+    scope = dict(vars(t))
+    scope['ap'] = ap
+    node = next(c for c in ast.walk(ast.parse(textwrap.dedent(
+        inspect.getsource(t.main))))
+        if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+        and c.func.attr == 'add_argument' and c.args
+        and getattr(c.args[0], 'value', None) == '--policy-loss')
+    expr = ast.Expression(body=node)
+    ast.copy_location(expr, node)
+    exec(compile(expr, '<policy-loss argparse>', 'eval'), scope)
+    got = list(ap._actions[-1].choices)
+    assert got == ['huber', 'ce', 'soft_ce'], \
+        f'--policy-loss 的 choices 变成了 {got}（A4 之后应为 huber/ce/soft_ce）'
+    assert ap.parse_args([]).policy_loss == 'ce', '默认解析结果不是 ce'
+    for k in ('huber', 'ce', 'soft_ce'):
+        assert ap.parse_args(['--policy-loss', k]).policy_loss == k
+
     src = open(os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), 'scripts', 'train_sft.py'),
         encoding='utf-8').read()
-    assert "choices=['huber', 'ce']" in src, "--policy-loss 的 choices 被本任务改了"
     assert "huber|ce|soft_ce" in src, "分派器的报错信息应列出 soft_ce"
 
 

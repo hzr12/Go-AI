@@ -62,6 +62,15 @@ P4.6 追加（对应 task-p4-6-optimizer-brief.md §4/§5）：
   「全模块 + 构造点必须落在 build_adamw 内 + 吃它的入参」；意图（AdamW 仍是
   AdamW、每处构造都吃 `_build_param_groups` 的产物）一字不变。
 
+A4 追加（软标签接入，2026-10-02）—— 本文件被改了三处，理由就地写在各处：
+* `test_no_new_cli_params` 的冻结集 61 → **65**（新增 `--soft-index` /
+  `--soft-weight` / `--soft-only-sampling` / `--soft-every`）。
+  **冻结集被保留而不是删测试**：门禁的价值是「新增必须留痕」，不是那个数字。
+* `test_policy_loss_default_is_ce` 的 choices 断言：`== ['huber','ce']` 改成
+  「含 soft_ce **且** 默认仍是 ce」（不是弱化成「choices 非空」）。
+* `test_log_loss_identity` 的 `ns` 多了 `soft_kwargs`（main() 的局部命名空间
+  多了一个名字；§3.1 的恒等式与「backward 的是 opt_loss」一字未动）。
+
 原则：
 * Huber 的正确性 oracle = torch 官方 `F.smooth_l1_loss(..., beta=...)`
   逐位对拍 + 一份手写公式的独立复核；**不 import 任何「旧实现」**。
@@ -424,7 +433,27 @@ def test_policy_loss_default_is_ce():
 
     assert ast.literal_eval(kw['--policy-loss']['default']) == 'ce', \
         '--policy-loss 默认必须是 ce（P4.5b 用户裁决）'
-    assert ast.literal_eval(kw['--policy-loss']['choices']) == ['huber', 'ce']
+    # ⚠ **A4（2026-10-02）改了这一条断言，理由必须留着**：
+    #   原来是 `== ['huber','ce']` 的**逐字**比较。A4 加了 `--soft-index` 等
+    #   四个软标签旗后，`--policy-loss` 必须多接受 `soft_ce`
+    #   （`--soft-index` 一给就把生效口径**派生**为 soft_ce，见
+    #   `scripts/train_sft.py::resolve_policy_loss_kind`），否则用户没法选它。
+    #
+    #   为什么不是「弱化成 choices 非空」：那条弱化等于**丢掉了这条断言的
+    #   全部内容**（choices 可以被清空/改成任意东西）。这里改成
+    #   「**含** soft_ce **且** 默认仍是 ce」两条分别断言 —— 「默认是 ce」这个
+    #   性质在加了新选项之后**反而更重要**（多了 soft_ce 这个新默认值漂移面）。
+    #   覆盖面净增不减：仍然钉住 (a) 默认值 = ce、(b) huber 仍在 choices 里、
+    #   (c) 新 kind 已登记。`tests/test_soft_ce.py::
+    #   test_default_kind_is_still_ce_flag_unchanged` 从**真 argparse** 侧
+    #   复核同一件事（那边不抠源码字面量），两处互为交叉验证。
+    assert 'soft_ce' in ast.literal_eval(kw['--policy-loss']['choices']), \
+        f'--policy-loss 的 choices 未登记 soft_ce: ' \
+        f'{ast.literal_eval(kw["--policy-loss"]["choices"])}'
+    assert set(ast.literal_eval(kw['--policy-loss']['choices'])) == \
+        {'huber', 'ce', 'soft_ce'}, \
+        (f'--policy-loss 的 choices 多/少了别的 kind: '
+         f'{ast.literal_eval(kw["--policy-loss"]["choices"])}')
     assert ast.literal_eval(kw['--value-loss']['default']) == 'huber', \
         'value 侧默认仍是 huber（用户未裁决改它）'
     assert ast.literal_eval(kw['--value-loss']['choices']) == ['huber', 'mse']
@@ -454,7 +483,10 @@ def test_policy_loss_default_is_ce():
 
     # help 文案必须记录「为什么默认不是 huber」，否则下一个人会再把它设成默认
     ap = _replay_parser()
-    entry = _help_entry(ap, '--policy-loss {huber,ce}')
+    # ⚠ A4 之后 metavar 是 `--policy-loss {huber,ce,soft_ce}`：choices 多了一项，
+    #   argparse 就按 choices 渲染 metavar。**不要**把这里改回逐字查
+    #   `{huber,ce}` —— 那等于把「soft_ce 已登记」这条又钉回字面量。
+    entry = _help_entry(ap, '--policy-loss {huber,ce,soft_ce}')
     assert '默认**不是** huber' in entry, \
         f'--policy-loss 的 help 没写明「默认不是 huber」: {entry}'
     # ⚠ **P4.5b-fix3：文案断言只留「机制」那一个 token，删掉三个纯数字。**
@@ -1304,6 +1336,17 @@ def test_log_loss_identity():
         'model': lambda s: (net.fc(s), net.value(s)),
         'state': state, 'move_t': move_t, 'value_t': value_t,
         'args': args, 'optimizer': opt, 'scaler': scaler, '_accum_steps': 1,
+        # ---- A4（2026-10-02）：main() 的损失调用点多了一个 `**soft_kwargs` ----
+        # 为什么必须在这里登记：`_main_wiring_tail()` 执行的是 main() 里**真实**
+        #   那些语句，而软标签接线给那个调用加了一个新的局部变量来源。A4 让
+        #   `--soft-index` 生效时它装 {soft, soft_mask, soft_weight}，否则是
+        #   **空 dict**（段 1 的热路径必须与 A4 之前逐字相同：多传三个 None 会
+        #   让 `compute_policy_loss` 的 ce/huber 分支行为不变，但断言「ce 与裸
+        #   F.cross_entropy 逐位相等」的口径会变脆 —— 所以这里给 `{}`）。
+        # ⚠ 这不是放宽断言：`ns` 模拟的是 main() 在该点的**局部命名空间**，
+        #   A3/A4 让那里多了一个名字。§3.1 的恒等式与 (d)「backward 的是
+        #   opt_loss」等断言一个字都没动。
+        'soft_kwargs': {},
     }
     mod = ast.Module(body=[with_stmt] + tail, type_ignores=[])
     ast.fix_missing_locations(mod)
@@ -1434,16 +1477,24 @@ def test_no_new_cli_params():
         '--onnx-quantize', '--swanlab', '--swanlab-api-key', '--swanlab-every',
         '--early-stop', '--early-stop-patience', '--early-stop-metric',
         '--max-gpu-memory', '--c2net',
+        # ---- A4（2026-10-02）新增的 4 个：软标签（KataGo 访问分布）----
+        # ⚠ **为什么要显式登记而不是删掉本测试**：D1 的门禁价值不在「61 这个
+        #   数字」，而在「新增必须是一次**留痕**的改动」。删掉整个测试等于把
+        #   门禁拆了；把 4 个名字写进冻结集，则下一个想加 `--soft-mask-eps`
+        #   的人仍然会在这里红一次，并被迫把理由写在这里。
+        #   4 个旗的语义见 spec §3 A 组 / §5.7；默认值由
+        #   `tests/test_soft_cli.py` 钉（None / 1.0 / 0 / 1）。
+        '--soft-index', '--soft-weight', '--soft-only-sampling', '--soft-every',
     }
     got = set(kw)
     assert got == expected, (
-        f'CLI 选项集合被改动（D1：零新增/零删除/零改名）。'
+        f'CLI 选项集合被改动（D1：零新增/零删除/零改名；A4 已显式登记 4 个软标签旗）。'
         f'新增={sorted(got - expected) or "（无）"}  '
         f'缺失={sorted(expected - got) or "（无）"}  '
         f'个数 {len(got)} vs {len(expected)}'
         + (f'  仅顺序不同（不算违规）: '
            f'{[k for k in kw if k in expected]}' if got == expected else ''))
-    assert len(expected) == 61, f'冻结的基线本身变了：{len(expected)} != 61'
+    assert len(expected) == 65, f'冻结的基线本身变了：{len(expected)} != 65（61 + A4 的 4 个）'
     # 特别地：L2 系数不许有独立参数，label smoothing 也不许有第二个旋钮
     for banned in ('--l2-coef', '--l2-weight', '--weight-decay-l2',
                    '--l2-report', '--label-smoothing-ce'):
@@ -1459,8 +1510,10 @@ def test_no_new_cli_params():
     #   (b) `ap.add_argument(f'--{name}')` 等 f-string / 拼接      —— 计算名
     #   (c) `for f in FLAGS: ap.add_argument(f)` 之类循环批量注册 —— 名字在列表里
     #   (d) 注册点落在 main() 之外的函数（helper / 工厂）—— 上面的 kw 收不到
-    # 三条断言把它们逐类堵死：调用总数必须等于 61、每个第一个实参必须是字符串
-    # 字面量、每个名字必须在 main() 的登记集合里。
+    # 三条断言把它们逐类堵死：调用总数必须等于冻结集个数、每个第一个实参必须是
+    # 字符串字面量、每个名字必须在 main() 的登记集合里。
+    # ⚠ A4 之后「61」这个硬编码数也归到这里（65）：断言里的计数一旦写死，
+    #   加旗时就只会红在「个数」这一行，报不出「新增了谁」。
     all_calls = [n for n in ast.walk(_module_tree())
                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                  and n.func.attr == 'add_argument']
@@ -1476,7 +1529,8 @@ def test_no_new_cli_params():
         f'D1 失守）: {non_literal}')
     unregistered = [f'{n.lineno}:{n.args[0].value}' for n in all_calls
                     if n.args[0].value not in expected]
-    assert not unregistered, f'这些旗不在冻结的 61 个选项名里: {unregistered}'
+    assert not unregistered, (
+        f'这些旗不在冻结的 {len(expected)} 个选项名里: {unregistered}')
 
 
 def test_optimizer_param_groups_unchanged():
