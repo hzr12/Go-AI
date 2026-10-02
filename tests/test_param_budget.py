@@ -74,22 +74,15 @@ def test_value_head_table_in_run_txt_is_accurate():
         assert got == exp, f'value {vc}ch/{rb}blk 实测 {got} != 记录 {exp}'
 
 
-def test_run_txt_records_are_consistent():
-    """run.txt 里出现的具体数字必须与实测吻合。"""
-    txt = open(os.path.join(ROOT, 'run.txt'), encoding='utf-8').read()
-    m = re.search(r'#\s*v18 架构参数', txt, re.I)
-    assert m, 'run.txt 缺少 v18 架构参数小节'
-    block = txt[m.start():m.start() + 1200]
-    for label, val in (('Backbone', EXPECTED['backbone']),
-                       ('Value', EXPECTED['value']),
-                       ('Policy', EXPECTED['policy']),
-                       ('Total', EXPECTED['total'])):
-        assert f'{val:,}' in block, \
-            f'run.txt 的 {label} 未写实测值 {val:,}'
-
-    # 旧的自相矛盾表述必须已被订正
-    assert '96ch, 11 blocks' not in txt or '2.00M' in txt, \
-        'run.txt 仍把 1.01M 标为 96ch/11 blocks（实测 11 blocks 是 2.00M）'
+# 已删：test_run_txt_records_are_consistent
+# 它要求 run.txt 保留 `# v18 架构参数` 小节并逐项写实测值。但 v18 已退役
+# （现役是 V7 / KATAGO_SE_CFG 12ch），而 run.txt 已改为「简洁」的一屏版，
+# 不再承载退役架构的参数表。与 test_run_txt_sync.py 属同一类保证，
+# 按同一决定移除。
+# ⚠ 随之失去的保证：run.txt 里的数字与实测值的自动比对。补参数时
+#   需人工核对（README §「静默出错的坑」第 8 条记录了同类的 flag 冻结问题）。
+#   若日后 run.txt 再次变长、值得机器校验，应改为校验「run.txt 实际写了哪些
+#   数字」而不是「必须写 v18 的数字」。
 
 
 def test_shell_script_config_matches_v18_definition():

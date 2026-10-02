@@ -1,729 +1,395 @@
-# Go-AI：监督学习围棋 AI（策略-价值网络 + MCTS + LightPLS）
+# Go-AI —— 对标 KataGo 的 19 路围棋 AI
 
-> 一个从 SGF 棋谱做监督学习（SFT）的围棋 AI。主线为 **AlphaGoZero 风格的 12 通道策略-价值网络**，
-> 推理阶段用 **MCTS（PUCT + 批量叶子评估 + 虚拟损失多线程）** 选点，并可叠加 **LightPLS 轻量 rollout**
-> 提升无强 RL 时的棋力。规则引擎为自建 `GoBoard`（Tromp-Taylor 数子、中国规则基础）。
-> 支持 **ONNX Runtime** 推理后端（含 int8 动态量化），NPU/CPU 场景下显著加速。
+从 16 万局职业 SGF 语料出发，重建成**官方 KataGo V7 语义**的 19×19 围棋 AI：
+输入 = 22 空间通道 + 19 全局特征，主干 = `nbt`(nested bottleneck) + transformer，
+四个头（policy / value / ownership / scorebelief），12 项可构造监督目标。
 
-> **状态说明**：当前为**纯监督学习**路线（从人类棋谱学着法），不是 AlphaGo/MuZero 的自我对弈 RL。
-> 已删除与 12 通道 SFT 冲突的旧 19 通道死代码（`resnet.py` / `minimax.py` / `evaluator.py` / `alpha_evaluator.py` / `config.py`）。
+> **当前是「重建管线」阶段，不是「训出强棋」阶段。** 模型、特征、标签三条流都已
+> 落地或有实测结论，但**训练侧还没接到 22 通道**：`scripts/train_sft.py` 至今建的是
+> `KATAGO_SE_CFG`（12 通道、9,112,005 参数）。进度见 [§4](#4-当前进度)。
 
 ---
 
 ## 目录
 
-- [1. 环境要求](#1-环境要求)
-- [2. 安装](#2-安装)
-- [3. 项目结构](#3-项目结构)
-- [4. 核心概念](#4-核心概念)
-  - [4.1 棋盘与规则引擎 GoBoard](#41-棋盘与规则引擎-goboard)
-  - [4.2 特征平面与通道表](#42-特征平面与通道表)
-  - [4.3 网络架构 AlphaGoNet](#43-网络架构-alphagonet)
-  - [4.4 MCTS 搜索](#44-mcts-搜索)
-  - [4.5 LightPLS 轻量 rollout](#45-lightpls-轻量-rollout)
-- [5. 数据准备](#5-数据准备)
-- [6. 训练](#6-训练)
-- [7. 推理与对弈](#7-推理与对弈)
-- [8. 评估](#8-评估)
-- [9. 加速手段总览](#9-加速手段总览)
-- [10. 自对弈训练（AlphaZero）](#10-自对弈训练alphazero)
-- [11. 完整工作流示例（4 卡 NPU 910A）](#11-完整工作流示例4-卡-npu-910a)
-- [12. API 速查](#12-api-速查)
-- [13. 常见问题与排错](#13-常见问题与排错)
+- [1. 快速开始](#1-快速开始)
+- [2. 架构：数据 → 特征 → 模型 → 训练 → 推理](#2-架构数据--特征--模型--训练--推理)
+- [3. 三条流与三个训练段](#3-三条流与三个训练段)
+- [4. 当前进度](#4-当前进度)
+- [5. 会静默出错的 10 个坑](#5-会静默出错的-10-个坑)
+- [6. 关键决策与理由](#6-关键决策与理由)
+- [7. 已知限制](#7-已知限制)
 
 ---
 
-## 1. 环境要求
+## 1. 快速开始
 
-| 组件 | 最低 | 推荐（训练/推理） |
-|------|------|-------------------|
-| Python | 3.8 | 3.10+ |
-| PyTorch | ≥ 1.9 | ≥ 2.0（用上 `torch.compile`）|
-| 算力 | 任意 CPU | NVIDIA GPU（V100S / Ampere），CUDA 11.8+；Ascend NPU（910B）|
-| 磁盘 | 几百 MB | 棋谱数据 + npz（19 路全量可能数十 GB）|
-| 内存 | 4 GB | 16 GB+（npz 全量加载到内存）|
+**所有可跑命令在 [`run.txt`](run.txt)**（一屏：环境 → 数据 → 打标签 → 训练 → 推理）。
+本文件不复述命令，只讲**为什么这样设计**、**踩过什么坑**、**哪里会静默出错**。
 
-依赖仅 `torch` / `numpy` / `pytest`（见 `requirements.txt`）。**无** `tensorflow`、无额外围棋库。
-可选：`onnxruntime`（ONNX 推理后端，CPU 推理场景推荐）、`torchao`（GPU INT4 量化）。
+设计文档（**注意：`docs/` 已被 `.gitignore` 排除，不在版本控制内**）：
 
-```text
-torch>=1.9.0
-numpy>=1.19.0
-pytest>=6.0.0
-onnxruntime>=1.17.0    # 可选，ONNX 推理
-torchao>=0.1.0         # 可选，GPU weight-only INT4 量化
-```
+| 文件 | 内容 |
+|---|---|
+| `docs/superpowers/specs/2026-10-01-katago-nbt-tf-design.md` | 模型 / 22 通道 / 12 项 loss 设计 + §9 实测附录 |
+| `docs/superpowers/specs/2026-10-02-goai-training-pipeline-design.md` | 三段训练 + A/B/C/D 工作组 |
+| `docs/superpowers/specs/2026-10-01-ddp-instead-of-fsdp-design.md` | 为什么 4 卡用 DDP 而不是 FSDP |
 
 ---
 
-## 2. 安装
+## 2. 架构：数据 → 特征 → 模型 → 训练 → 推理
 
-```bash
-# 1) 克隆（假设已在仓库根目录）
-cd f:/AI/Go-AI
+### 2.1 数据层
 
-# 2) 创建虚拟环境（可选但推荐）
-python -m venv .venv
-.venv\Scripts\activate        # Windows
-# source .venv/bin/activate   # Linux/macOS
-
-# 3) 安装依赖
-pip install -r requirements.txt
-
-# 4) 装 GPU 版 PyTorch（云端 V100S，CUDA 12.1 示例）
-pip install torch --index-url https://download.pytorch.org/whl/cu121
-#   本地仅 CPU 调试：
-#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+```
+data/games/games/{agz,foxpro,leela_zero,yenw_pro}/   133,604 个 SGF
+data/*.tgz            (5 个)                         36,274 个 SGF
+                                    └── 零重叠，合计 169,878，完整覆盖 162,298 局
+data/sgf_19x19_full.npz   34,202,713 行 / 162,298 局 / 10 列（压缩 447 MB，解压 12.3 GB）
+data/labels/games.npz      局级 sidecar，4 键，约 1.2 MB（待生成）
+data/labels/kata_labels.npz  KataGo 访问分布软标签（待生成）
+data/labels/soft_index.npz   软标签 → 主数据集行号的 join（待生成）
+katago/stdata/*.tgz         官方分布式训练数据，4.67M 行（19×19 可用 ≈3.10M）
 ```
 
-> Windows 上若要用 `torch.compile`，需有 MSVC 工具链（`vcvars64.bat` / `cl.exe`）。
-> 本项目此前已在 `D:\MSVC` 验证：`torch 2.12.0+cpu` + `torch.compile` 在 CPU 上可用。
+主数据集的 10 列：`boards / my_hist / op_hist / ko / to_play / moves / winrates /
+game_ids / game_weights` 等。V7 需要的 13 项里**11 项**能从这 10 列推出或实时算，
+只有 6 个局级标量（`KM` / `RE` / `RU` / 是否认输）需要 sidecar。
+
+🔴 **三条硬约束**：
+
+1. **`data/sgf_19x19_full.npz` 绝对不可 rebuild。** 重建要重放 169,878 个 SGF，
+   而 `build_dataset.py:314-316` 有 **id 复用 bug**（`board.play()` 失败时
+   `return 0,1` 但已追加的行留在 `cur`、`game_id_counter` 未自增）——
+   `game_ids` 本身对不上局，所有 join 链一起废。
+2. **它是 12.3 GB，不要整列读。** `np.load('x.npz')['boards']` 会把整个成员
+   解压进内存（本机 13.9 GB ⇒ 任何分块读都先吃掉 12.3 GB，余量 1.6 GB）。
+   必须经 `kata_label_join.materialize_dataset()` 落成 `.npy` 后
+   `mmap_mode='r'`（落盘 152 s，实测 478K 行/s）。
+3. **`game_ids` 是置换不是升序**，同一个 id 可能出现在不相邻的行区间。
+
+### 2.2 特征层 —— 22 空间 + 19 全局
+
+**训练时由预取器在 CPU 上实时算，不落盘。** 端口函数在 `src/data/feature_v7.py`
+与 `src/data/feature_v7_ladders.py`（**刻意不放 `go_rules.py`**，避免污染
+`feature_planes` / `feature_planes_batched` 所在的旧 17 通道实现）。
+
+空间 22 通道：`on-board / pla / opp / 1-2-3 气 / ko-ban / 历史 5 手 / 梯子
+(ch14–17) / 当前区域(ch18,19)`。全局 19 通道：历史 pass 标志、`currentSelfKomi/20`、
+ko 规则、计分制度、tax、encore、`passWouldEndPhase`、komi 奇偶三角波。
+
+**8 路恒 0 通道（保留不裁剪）**：空间 `7, 8, 20, 21` + 全局 `12, 13, 15, 16`。
+保留理由是严格复刻官方张量布局，未来接官方 checkpoint 零改形状；裁剪只省 0.3% 参数。
+
+**性能闸门**：NPU 侧需 ~2635 行/s，`--prefetch-workers 8` 下每行预算 **3.04 ms**，
+现有 12 通道单盘基线 1.78 ms ⇒ **1.7× 余量**。贵的是 `iterLadders`（3 块盘面）与
+`calculateArea`（1 块）。
+
+### 2.3 模型层
+
+| | 现行 SFT（`KATAGO_SE_CFG`） | 目标 V7（`NbtTfNet`） |
+|---|---|---|
+| 输入通道 | 12 | 22 空间 + 19 全局 |
+| 主干 | 240 宽 · 13×SEBottleneck + 4×Attention | `C=256 M=128 H=4 F=384 B=11` nbt2 块 |
+| 归一化 | — | `fson` 固定方差标量 + `rsnh` 末端 RMSNorm，**全网无 BN** |
+| 头 | policy + value | policy(K=2) + value(3 分类 + scoremean/stdev/lead) + ownership + scorebelief(842 桶) |
+| 参数量 | 9,112,005 | **5,561,832**（硬预算 5,850,000，余量 4.9%） |
+| 代码 | `scripts/train_sft.py:444` `KATAGO_SE_CFG` | `src/networks/katago_v7.py` |
+
+`NbtTfNet` 已实现并通过预算测试（`tests/test_katago_v7_budget.py` 断言精确值
+5,561,832），`src/inference.py:177` 已 `register_in_channels_builder(22, ...)`。
+**但 `train_sft.py` 尚未切过来** —— 见 [§4](#4-当前进度)。
+
+### 2.4 训练层
+
+- **段 1 SFT**：`scripts/train_sft.py`（4 卡 910A 入口 `shell/train_sft_npu_4card_katago_se.sh`，
+  DDP + HCCL + fp16/GradScaler）。
+- **V7 tracer bullet**：`scripts/smoke_train_v7.py` —— 302 行 / batch 8 / 40 步，
+  直接吃 stdata，用来回答「12 项 loss 每项到底降不降」。
+- **RL**：`scripts/selfplay_train.py`（PPO + lookahead，**MCTS 已在 2026-09-30 归档**，
+  采集换成 N 步 minimax 推演）。
+
+### 2.5 推理层
+
+`GoAI`（`src/inference.py`）按权重 stem 的形状读 `in_channels`，
+再查构建器注册表：`22 → NbtTfNet`、`12 → AlphaGoNet`。
+**读不到可识别的 stem 键直接 `RuntimeError`，不静默回退 12**
+（否则会拿随机 12ch 模型装一份陌生架构的权重）。
+搜索侧 MCTS（PUCT + 批量叶子评估 + 虚拟损失）保留给 `webui` / `cli_play` /
+`evaluate` / `eval_elo`；`feature_planes` 取通道数时向所挂模型要，缺失即报错。
 
 ---
 
-## 3. 项目结构
+## 3. 三条流与三个训练段
 
-```text
-Go-AI/
-├── README.md                     # 本文件
-├── requirements.txt              # 依赖
-├── run.txt                       # 训练/推理/评估命令（4 卡 NPU 910A 优化版）
-├── data/
-│   └── games/games/              # SGF 棋谱（36648 个 .sgf，多层目录）
-│       └── Aizu/01/1.sgf ...
-├── models/                       # 训练产出权重（*.pt / *.pth），默认不存在需自训练
-├── src/
-│   ├── __main__.py
-│   ├── inference.py              # GoAI 推理入口 + CLI（selfplay / human / analyze / ONNX 导出）
-│   ├── game/
-│   │   └── go_rules.py           # GoBoard 规则引擎 + feature_planes（默认 17 通道，n_channels 可裁到 12）
-│   ├── networks/
-│   │   ├── alphanet.py           # AlphaGoNet（策略+价值双头）
-│   │   ├── backbone.py           # SharedBackbone（ResBlock + 注意力）
-│   │   ├── policy_network.py     # PolicyNetwork 头
-│   │   └── value_network.py      # ValueNetwork 头（3 层残差）
-│   ├── search/
-│   │   ├── mcts.py               # MCTS（批量叶子评估 + 跨叶子批量 leaf_ab + 虚拟损失 + 特征缓存）
-│   │   └── light_rollout.py      # FastPolicy + light_rollout（Tromp-Taylor 数子）
-│   ├── data/
-│   │   ├── dataset.py            # SupervisedDataset（紧凑存储 + 随机对称增广）
-│   │   └── sgf_parser.py         # SGFParser（解析棋谱）
-│   └── utils/
-│       └── helpers.py            # print_board 等
-├── scripts/
-│   ├── train_sft.py              # 监督学习训练（policy=CE / value=Huber，支持 DDP / NPU）
-│   ├── build_dataset.py          # SGF 目录/tgz -> npz 训练集
-│   ├── evaluate.py               # 评估（vs 随机 / 自对弈 / 速度基准）
-│   ├── eval_elo.py               # ELO 评分
-│   ├── selfplay_train.py         # AlphaZero 自对弈训练（并行生成 + 流式训练 + DDP）
-│   ├── webui.py                  # Web UI（Flask，浏览器对弈 + 实时 MCTS 可视化）
-│   ├── cli_play.py               # 终端人机对弈
-│   ├── fetch_games.py            # 从在线平台抓取棋谱
-│   └── bench_train.py            # 训练速度基准
-└── tests/
-    ├── test_mcts.py              # MCTS + LightPLS 单测
-    └── ...                       # 其他单测
-```
+### 3.1 三条实现流
 
-> 入口统一用 `src.inference.GoAI`，所有脚本通过 `sys.path.insert(0, 仓库根)` 以 `src.xxx` 方式导入。
+| 流 | 内容 |
+|---|---|
+| **软标签流** | `permute_soft` / `soft_cross_entropy`（掩码二选一）/ `labels=True` 的 4 元组 + dict 契约 / `games.npz` sidecar 生成器（ply-20 哈希锚点，小规模实测 50/50 匹配） |
+| **特征流** | `src/data/feature_v7.py`（气桶 / 历史 5 手 / `calculateArea`）已完成；`src/data/feature_v7_ladders.py`（ch14–17）**仍在收尾** |
+| **模型流** | `katago_v7.py` + `katago_v7_loss.py` + 22ch builder 已接线；`train_sft.py` 切 22 通道未做 |
+
+### 3.2 三个训练段
+
+| 段 | 数据 | 量 | policy 目标 | 目的 |
+|---|---|---:|---|---|
+| **1** | 自有 34.2M 语料（SGF 派生标签） | 34,202,713 | 人类着法 one-hot | 通路基线；学会读 22 通道 |
+| **2** | 自有语料的 1%，用 KataGo 标注 | ~342,000 | 访问分布 | 域匹配桥梁（人类局面 + 搜索答案） |
+| **3** | `katago/stdata`（19×19 部分） | ≈3,100,000 | 访问分布 | 棋力主体 |
+
+段 2 与段 3 的 policy 目标同为访问分布 ⇒ **可以合并成一轮跑 ~3.44M**。
+段 2 的价值是**桥梁**：stdata 是自对弈局，自有语料是职业对局。
+
+### 3.3 段 1 只训 policy 系
+
+段 1 启用：`#1 policy`、`#2 π_opp`、`#3 value` 3 类、`#11 futurepos`。
+
+**不启用**：score 系（`#5/#6` scorebelief、`#8` scoremean、`#9` lead、`#10` scoring）
+与 `#4 ownership`、`#12 seki`。理由见 [§6.2](#62-段-1-为何不训-score)。
 
 ---
 
-## 4. 核心概念
+## 4. 当前进度
 
-### 4.1 棋盘与规则引擎 GoBoard
-
-文件：`src/game/go_rules.py`
-
-- 棋盘状态：`board` 为 `int8 (n, n)`，取值 `-1`=白、`0`=空、`1`=黑。
-- 当前执子方：`current_player`（`1`=黑 / `-1`=白），**注意不是** `to_play`（MCTS 内部用 1/2 表示，二者不等价）。
-- 核心方法：
-  - `play(mv)` → `bool`：落子 `mv`（扁平下标 `r*n + c`）；**虚着(pass) 传 `-1`**；
-    非法着法（含自杀、重复染色）返回 `False`（不抛异常）。
-    ⚠ **动作空间的 `PASS`（`GoBoard.PASS == n*n`）不是 `play()` 接受的写法**：`play(GoBoard.PASS)` 返回 `False`，
-    要下 pass 请用 `play(-1)`（等价写法：`play(-1 if a == board.PASS else a)`）。
-  - `get_legal_moves()` → `bool (n*n,)` 一维掩码（`True`=合法）。TT 口径：空点 + 禁自杀 + 位置超级劫。
-  - `legal_actions()` → `list[int]`：升序的合法**动作**（含 `PASS`）。
-  - `is_legal(a)` → `bool`：**单点**判定，不物化全掩码；`a == PASS` 恒为 `True`；越界返回 `False`。
-    与 `get_legal_moves()` 逐点等价（`is_legal(a) == bool(mask[a])`，`0 <= a < n*n`）。
-  - `num_actions()` → `n*n + 1`；`PASS = n*n`（类级常量，带写入守卫）。
-  - `action_to_coord(a)` / `coord_to_action(r, c)`：动作 ↔ 坐标，越界抛 `ValueError`。
-  - `action_to_string(a)` / `string_to_action(s)`：动作 ↔ 文本记法（**列字母在前**的 SGF 风格，如 `"ee"`=天元、`"pass"`=虚着），
-    非法输入抛 `ValueError`；记法与 `parse_move_str` 是**同一套**（`string_to_action` 直接委托它）。
-  - `feature_planes(my_hist, op_hist, to_play, n_channels=17)` → `(n_channels, n, n)` 特征（见 §4.2）。第 8 通道 = 合法点掩码。
-  - `score()` → `float`：**黑 − 白** 面积分（`B_area − W_area − komi`，`>0` 黑胜）；`result()` 是其符号。
-  - `is_terminal(max_moves=None)` → `bool`：连续两次 pass 或达到 `2*n*n` 手上限。
-    ⚠ **重复局面不是终局条件**（TT 下它是非法手），本方法不查重复历史。
-  - `hash()` / `position_hash()` / `is_repetition()`：局面指纹与重复局面查询（`position_hash` 只含棋盘染色，
-    重复判定用它；`hash` 含行棋方，仅作通用指纹——**两者不可混用**）。
-  - `parse_move_str(s, color)` → `(ok, mv)`：坐标串转扁平索引。
-  - `to_string()`：文本化棋盘（供 CLI 展示）。
-- 规则：气(liberties)计算、提子、**禁自杀**、**位置超级劫（PSK，重复染色即非法）**、双 pass 终局。
-  `ko_point` 仍会计算，但只是「上一手是否形成单劫」的**只读描述位，不参与合法性**（PSK 已覆盖简单劫，
-  且 Tromp-Taylor 规则里本就没有独立的禁劫条款——多子提子后回提按 TT 是合法手）。
-  贴目 `komi` 默认 6.5（中国规则常用）。禁自杀是**相对 TT 的有意偏离**（TT 规则本身允许自提），
-  以免后人拿 TT 原文「纠正」它。
-- 规则/计分对拍语料在 `tests/data/go_parity.json`（10 条手工推导局面），回放测试
-  `tests/test_go_rules_parity.py`（含 200 局随机对局的合法性/计分/生命周期不变量，
-  其中的面积分解是**独立实现**，用来交叉校验 `score()`）。
-- 克隆：无 `clone()` 方法，MCTS 用 `copy.deepcopy(board)` 复制局面。
-
-### 4.2 特征平面与通道表
-
-由 `GoBoard.feature_planes(my_hist, op_hist, to_play, n_channels=17)` 产生，形状 `(n_channels, n, n)`，单一真相来源（训练/推理/评估共用）。
-**权威通道表在 `src/game/go_rules.py:2353-2404`**（`feature_planes` 上方的段注释），下表与其逐格一致：
-
-| 通道 | 含义 |
-|------|------|
-| 0 | 当前执子方(to_play)的棋子 |
-| 1 | 己方最近第 1 手（扁平坐标置 1，其余 0）|
-| 2 | 己方最近第 2 手 |
-| 3 | 己方最近第 3 手 |
-| 4 | 对手棋子 |
-| 5 | 对手最近第 1 手 |
-| 6 | 对手最近第 2 手 |
-| 7 | 对手最近第 3 手 |
-| 8 | 合法着法掩码（1=合法，口径见下）|
-| 9 | 常量平面，值 = `to_play`（全 1 若黑 / 全 -1 若白）|
-| 10 | 己方「气=1」块掩码（送吃预警）|
-| 11 | 对手「气=1」块掩码 |
-| 12 | 己方眼位（空点 ∧ 严格内点 ∧ 4 邻全为己方）← 17 通道新增 |
-| 13 | 对方眼位（空点 ∧ 严格内点 ∧ 4 邻全为对方）← 17 通道新增 |
-| 14 | 己方「气=2」块掩码 ← 17 通道新增 |
-| 15 | 对方「气=2」块掩码 ← 17 通道新增 |
-| 16 | 劫禁点掩码（`ko_point` 单点，无劫则全零）← 17 通道新增 |
-
-**通道数口径（`n_channels` 是 12..17 的前缀契约，`_check_n_channels`，`go_rules.py:269-280`）**
-
-- `feature_planes(..., n_channels=17)` **默认 17**（`go_rules.py:2406`）；批量版 `feature_planes_batched` 同样**默认 17**（`go_rules.py:2534-2535`）。
-- `SupervisedDataset(..., n_channels=12)` **默认 12**（`src/data/dataset.py:30`），`train_sft.py:1950-1951` 也仍按 `in_channels=12` 建网 —— 即**训练侧至今产出/消费的都是 12 通道输入**；17 通道是路线图里 v21 的布局（P4.2/P4.3）。
-- 实测现有 checkpoint：`models/sft_19x19_v12.pth` 的 `backbone.conv1.weight` 形状 `(192, 12, 3, 3)` ⇒ stem `in_channels=12`。
-- 取 12 只是「不算尾部 5 格」，**0-11 的下标与含义在任何取值下都不变**（`go_rules.py:2409-2412`）。
-
-**读旧/新 checkpoint 时必须知道的三处「同形不同值」（12 通道的取值也已经变过）**
-
-1. **通道 8 = 合法点掩码**：`get_legal_moves()` 的口径 = 空点 ∧ 非自杀 ∧ 非 PSK 重复，**不含 PASS**（`go_rules.py:2360-2362`）。P2.6 规则语义切换后**取值变严**（序号与含义不变）——旧权重训练时看到的通道 8 与今天不是同一个分布（路线图 D14 登记项）。
-2. **气数口径（P4.3-fix）**：通道 10/11/14/15 的「气」= 与该块相邻的**去重空点个数**（`go_rules.py:2396-2401`）。批量路径曾用「入射计数」，U 形块被多算导致 10/11 漏标，已修（`go_rules.py:164-177`）——**连 12 通道的批量输出都因此变了**。
-3. **批量版通道 8 与单图版有已文档化的分歧**（批量侧无 `GoBoard` ⇒ 判不了 PSK、有意不禁自杀、遗留的 ko 排除，`go_rules.py:2572-2596`）。
-
-> 历史手用「最近 3 手」环形填充（不足 3 手用 `-1` 表示无）。`my_hist`/`op_hist` 为长度 3 的扁平坐标列表。
-
-### 4.3 网络架构 AlphaGoNet
-
-文件：`src/networks/alphanet.py`
-
-```
-输入 (B, 12, H, W)
-      │
-SharedBackbone(in_ch=12, ch=192, res_blocks=17, 注意力模式)
-      │  -> (B, 192, H, W) 共享表征
-      ├─ PolicyNetwork(ch=192 -> 64, action_size) -> (B, A) logits
-      └─ ValueNetwork(ch=192 -> 32, 3 res_blocks, 1)  -> (B, 1) Tanh[-1,1]（黑方视角胜率）
-```
-
-- `forward(x)` → `(policy_logits, value)`；`policy_logits` 在推理时经 `softmax` 得概率。
-- 输入通道数 = 构造参数 `in_channels`（`alphanet.py:22`，**默认 12**，`train_sft.py:1950-1951` 也显式传 12）；17 通道由路线图 P4.2 接线，届时上图的 12 换成 17（§4.2）。
-- `action_size = n*n + 1`，**多出的 1 类是 pass**。
-- 注意力（可选，默认 `mix`）：`global`（全配对）/ `window`（滑动窗口，`--attn-window`）/
-  `window_global`（窗口 + 全局 token）/ `axial`（轴向）；
-  `attention_mode`：`none`（纯卷积）/ `mix`（卷积+注意力混合）/ `all`（全注意力）。
-  V100 上推荐 `--attn-mode window --attn-window 7`（注意力约 7× 提速）；
-  `window_global` 比 `sparse` 快约 35%，比 `global` 快约 14%，综合最优。
-- Value Head：3 层残差块（`res1`, `res2`, `res3`），预训练权重 `res3` 为随机初始化（norm=4.6 vs 其他层=77.4），自对弈训练会自动校准。
-- RMSNorm 替代 LayerNorm（手写实现，兼容 PyTorch 2.1）；Policy head 改为 1x1 conv + pass_bias。
-
-### 4.4 MCTS 搜索
-
-文件：`src/search/mcts.py`，类 `MCTS`
-
-- 算法：PUCT（AlphaGoZero 风格），`score = Q + U`，`U = c_puct * prior * sqrt(parent_visits) / (1 + child_visits)`。
-- 节点：`MCTSNode(board, my_hist, op_hist, to_play, move_int, prior, visit, value_sum, virtual_loss)`。
-- 展开：对叶子的每个合法着法（含 pass），`deepcopy(board)` 走一步，批量拼成 `states` 一次 `GoAI.predict_batch` 得到
-  `(policies, values)`，写入子节点先验与价值。
-- **加速（生产者-消费者并行）**：`num_threads` 个 worker 线程只负责「选路径」（纯 CPU 估算 PUCT，极廉价，加虚拟损失占位），
-  主线程从队列**批量取出叶子**，统一 `deepcopy`+`feature_planes`+`predict_batch`（昂贵部分一次大 batch 前向），
-  每个叶子只构造一次特征、只前向一次。`--num-threads 4` 即可。
-- **加速（跨叶子批量 leaf_ab）**：`_batch_leaf_ab` 将 N 个叶子的浅层 negamax 合并为 depth+1 次 predict（而非 N×(depth+1) 次），
-  CPU/ONNX 场景下 predict 调用降低约 3×。
-- **加速（特征平面 LRU 缓存）**：`_planes1` 缓存 16384 个局面的特征（key = board bytes + to_play + history + ko），
-  **通道数 = 所挂模型的 `in_channels`**（`mcts.py:197-236`，旧代 12 / v21 17，缺失即报错、不回退 12），
-  带 30 秒 TTL，MCTS 同一叶子深度路径中相同局面可复用，避免重复 flood-fill 计算。
-- **spec_prefetch 加速**：仅 `num_threads >= 4` 时启用，worker 线程异步预评估疑似叶子。
-- **leaf_ab 智能降级**：`sims < 64` 时自动 `leaf_ab_depth = 1`，避免低模拟数下过度展开。
-- 虚拟损失（virtual loss）：并行模拟时对路径占位，避免多线程反复选同一条路径。
-- 输出：`best_move(...)` → `(move_int, is_pass, root_value)`；或 `search(...)` → `(visits, probs, root_value)`。
-- 选点：温度 `temperature>0` 按访问次数分布采样；`temperature=0` 贪心取访问最高。
-
-### 4.5 LightPLS 轻量 rollout
-
-文件：`src/search/light_rollout.py`
-
-- `FastPolicy`：纯 numpy 启发式轻量走子策略（邻边奖励 + 避免送吃）；采样走子到终局。
-- `light_rollout(board, policy, max_steps, rng)`：从当前局面用 `FastPolicy` 随机走子到双 pass 终局，
-  用 `board.score()`（Tromp-Taylor）得**发起方视角**胜率 `+1/-1/0`。
-- **价值融合**：叶子最终价值 `v = (1-λ)·v_net + λ·v_rollout`（`--rollout-lambda`，默认 0.25）。
-- 意义：在不强 RL 的前提下，用一次低价随机推演补充「全局胜负」信号，显著提升搜索深度与棋力；
-  单次 rollout 成本 << 一次网络前向（尤其 9 路）。可用 `--use-rollout` 开启。
+| 组件 | 状态 | 备注 |
+|---|---|---|
+| 主数据集 `sgf_19x19_full.npz` | ✅ 已建 | 34,202,713 行 / 162,298 局；**不可 rebuild** |
+| 语料完整性 | ✅ 已核实 | 169,878 SGF 零重叠，完整覆盖；100% 的局 ≥20 手 |
+| KataGo 权重 + stdata | ✅ 就位 | `katago/`（含 204 MB 权重）；**已被 `.gitignore` 排除** |
+| `pos_hash.py`（唯一散列口径） | ✅ | 478,603 行/s；全量 34.2M ≈72 s |
+| `katago_npz.py`（stdata 读取） | ✅ | 27 项测试，含两条真实 stdata 对拍 |
+| `kata_label_join.py` | ✅ | `materialize_dataset` + join + `REQUIRED_KEYS` |
+| `permute_soft` | ✅ | 8 项测试；方向极易搞反，见 [§5.1](#51-散列口径只有一份) |
+| 软 CE（`soft_cross_entropy`） | ✅ | 掩码**逐行二选一** |
+| `labels=True` 4 元组 + dict 契约 | ✅ | 5 个假 dataset 已补 `labels=False` 形参 |
+| `games.npz` sidecar **生成器** | ✅ | 小规模实测 50/50 匹配 |
+| `games.npz` **产物** | ⬜ 未生成 | `data/labels/` 目前是空的 |
+| `kata_labels.npz`（段 2 标签） | ⬜ 未生成 | 需跑 `label_sgf.py` |
+| `soft_index.npz` | ⬜ 未生成 | 需跑 `build_soft_index.py` |
+| `feature_v7.py`（气桶 / 历史 5 手 / `calculateArea`） | ✅ | |
+| `feature_v7_ladders.py`（ch14–17） | 🔄 **收尾中** | |
+| `katago_v7.py`（5,561,832 参数） | ✅ | `tests/test_katago_v7_budget.py` 精确断言 |
+| 22ch builder 注册 | ✅ | `src/inference.py:177` |
+| 12 项 loss 装配 | ✅ | `tests/test_katago_v7_loss.py` 24 项 |
+| V7 端到端冒烟 | ✅ 跑过 | 40 步，11/12 项下降；`score_stdev` **−0.0%** |
+| **`train_sft.py` 切 22 通道** | ⬜ **未做** | 现状仍建 `KATAGO_SE_CFG`（12ch / 9.11M） |
+| 软标签 CLI 接线 | ⬜ 未做 | 无 `--soft-labels/--soft-weight/--soft-index/--soft-only-sampling` |
+| 邻行 gather（5 偏移）接线 | ⬜ 未做 | B6，纯 `boards` 索引，几乎免费 |
+| stdata 训练（段 3）整轮 | ⬜ 未做 | 只有 smoke |
+| 段 1 正式训练（新模型） | ⬜ 未做 | 被上一行阻塞 |
+| RL（段外） | ✅ 可跑 | 但 MCTS 已归档，采集走 lookahead |
+| 910A 融合注意力探针 | ⬜ 未做 | R1，见 [§7](#7-已知限制) |
 
 ---
 
-## 5. 数据准备
+## 5. 会静默出错的 10 个坑
 
-### 5.1 SGF 解析规则
+这一节是本文件最有价值的部分。以下每一条**错了都不报错**，只会静默地算错。
 
-文件：`src/data/sgf_parser.py`，类 `SGFParser`
+### 5.1 散列口径只有一份
 
-- 支持属性：`SZ`(棋盘大小)、`RE`(结果)、`PB`/`PW`(对局者)、`DT`(日期)、`KM`(贴目，默认 6.5)。
-- 着法提取：正则 `(?:;|\A)(AB|AW|[BW])((\[[^\]]*\])+)`，**必须以 `;` 或开头锚定**，避免把 `BR`/`WR`/`PB`/`PW`/`KM`
-  里的 `B`/`W` 误当落子。
-- **pass** 用空坐标 `B[]` / `W[]` 表示（此前被丢弃导致黑白错位，已修复）。
-- **让子** `AB[..]`（黑）/ `AW[..]`（白）作为开局先行子，按其出现顺序并入着法序列。
-- 坐标：`a..s` → 0..18；`tt` 或超范围按 pass 处理。
+`pos_hash_block` = **棋盘(361B) + to_play(1B) + ko(2B)**，三样都进哈希。
+**唯一事实来源 = `src/data/pos_hash.py`**；`probe0_join.py` / `label_sgf.py` /
+`build_soft_index.py` 全部 import 它。
 
-> **棋盘尺寸兼容（居中 pad）**：`build_dataset.build` 只跳过**大于** `--board-size` 的棋谱；
-> 小于目标尺寸的棋谱（如 9x9 喂到 19x19）会**居中填充**到目标棋盘——偏移量
-> `off = (board_size - game.board_size)//2`，落子坐标 `(r,c)` 映射为 `(r+off, c+off)`。
-> 例如 9x9 棋谱在 19x19 上落在 `(5..13, 5..13)` 居中区域，棋形对称不偏，可直接混合训练扩充数据。
-> 大于目标尺寸的棋谱无法放入小棋盘，照常跳过。
-- `parse_result_to_value(RE)`：`B+`→`+1`（黑胜）、`W+`→`-1`（白胜）、`0`→`0`、其余→`None`（丢弃该样本）。
+🔴 `to_play` 或 `ko` 错一个 ⇒ 探针实测 **0/5 匹配**，join **静默变成空**，
+症状看起来像「这批局面真的没标签」。这不是数据问题，是你重写了散列。
+改了种子会让 `kata_labels.npz` 里已落盘的 `pos_hash` 列全部失效，而症状同样是
+「join 变空」⇒ **永远不要重写这个文件**。
 
-### 5.2 构建训练集 `build_dataset.py`
+（`game_id` 与 `(sgf 路径, ply)` 都不能当 join 键：前者被 id 复用 bug + 45% 过滤率
+毁掉；后者要求两侧独立枚举 SGF 且顺序完全一致，枚举规则动一行就静默错位，
+而「join 不上」和「本来就不该 join」长得一模一样。）
 
-```bash
-python scripts/build_dataset.py --src <目录或 .tgz> --out data/sgf_19x19.npz \
-    --board-size 19 [--max-games N]
+### 5.2 `KM` 有 ×100 家族
+
+`foxpro` 语料里 `KM[650]` 表示 **6.5**（2,163 局 / 1.62%）。
+照字面存 650 会让全局特征 `currentSelfKomi/20` 变成 **32.5**。
+
+处理：`scripts/build_games_sidecar.py::parse_komi` 在 `fix_outlier=True` 时把
+`|v| > KOMI_OUTLIER_ABS (=100)` 的值除以 100。命令行开关是 `--no-komi-outlier-fix`
+（**默认是修的**，别顺手加上）。
+
+### 5.3 历史门控是回退复制，不是置 0
+
+官方 `fillRowV7`：
+
+```cpp
+prevBoard     = (numTurnsOfHistoryIncluded < 1) ? board     : hist.getRecentBoard(1);
+prevPrevBoard = (numTurnsOfHistoryIncluded < 2) ? prevBoard : hist.getRecentBoard(2);
 ```
 
-参数：
+**history=0 ⇒ ch15=ch14、ch16=ch15**；history=1 ⇒ ch16=ch15。
+写成置 0 不崩，只让开局几个位置的输入偏掉。
 
-| 参数 | 默认 | 说明 |
-|------|------|------|
-| `--src` | 必填 | SGF **目录**（递归 `**/*.sgf`）或 `.tgz`/`.tar.gz`（内含 .sgf）；也支持单个 .sgf 文件 |
-| `--out` | `data/sft_dataset.npz` | 输出 npz 路径（父目录自动 `makedirs`）|
-| `--board-size` | `19` | 只保留该尺寸的棋谱（其余跳过）|
-| `--max-games` | `None`（全部）| 最多处理的棋局数（先小批量跑通用）|
-| `--chunk-size` | `50000` | **流式分片落盘阈值**：每攒够这么多样本就 flush 成一个临时 npz 分片，最后合并成单个 npz。峰值内存仅约一个 chunk（几十 MB），避免全量常驻内存 OOM。设为 `0` 退回旧的全量内存模式 |
-
-### 5.3 训练集内存布局
-
-`SupervisedDataset`（`src/data/dataset.py`）以紧凑 numpy 保存，**运行时**才展开特征平面 + 随机对称增广（等效 8× 静态增强，内存仅 1/8）。通道数由构造参数 `n_channels` 决定，**默认 12**（`dataset.py:30`；12 = P4.3 之前的布局，`n_channels=17` 才是尾部补 5 格的 v21 布局，见 §4.2）：
-
-| 字段 | dtype | shape | 含义 |
-|------|-------|-------|------|
-| `boards` | int8 | (N, n, n) | 局面，-1/0/1 |
-| `my_hist` | int16 | (N, 3) | 己方前 3 手扁平坐标（-1 填充）|
-| `op_hist` | int16 | (N, 3) | 对手前 3 手 |
-| `ko` | int16 | (N,) | 劫禁着点（-1 无）|
-| `moves` | int16 | (N,) | 监督目标着法（0..n*n-1，pass=n*n）|
-| `values` | int8 | (N,) | 胜负标签（+1 黑 / -1 白）|
-| `to_play` | int8 | (N,) | 该样本轮到谁（1 黑 / -1 白）|
-
-- `sample_batch(idxs, device)` → `(state(B,n_channels,H,W) fp32, move(B,) int64, value(B,1) fp32)`。
-  CUDA/NPU 自动 `pin_memory` + `non_blocking=True`，加速传输。
-- 对称增广：每样本随机选 8 种变换之一（旋转 0/90/180/270 × 翻转），同时作用于特征平面与着法坐标（`SYMMETRIES`）。
-
----
-
-## 6. 训练
-
-### 6.1 监督训练 `train_sft.py`
-
-```bash
-python scripts/train_sft.py --data data/sgf_19x19.npz --out models/sft_19x19.pth \
-    --device cuda --use-amp 1 --compile 1 \
-    --board-size 19 --batch-size 512 --epochs 5 \
-    --backbone-channels 192 --backbone-res-blocks 17 \
-    --attention-mode mix --attn-mode window --attn-window 7 \
-    --value-loss-weight 1.0 --value-lr-mult 2.0
-```
-
-**NPU 4 卡训练**（推荐）：
-
-```bash
-torchrun --nproc_per_node=4 scripts/train_sft.py \
-  --data data/sgf_19x19_full.npz \
-  --device npu --board-size 19 \
-  --backbone-channels 192 --backbone-res-blocks 17 \
-  --res-blocks 8 --convnext-blocks 4 --attn-blocks 5 \
-  --value-channels 96 --value-res-blocks 11 \
-  --policy-channels 128 --policy-layers 3 \
-  --batch-size 3200 --epochs 1 \
-  --lr 0.002 --weight-decay 0.0001 \
-  --attention-mode mix --num-attention-layers 4 --num-heads 4 \
-  --attn-mode window_global --attn-window 5 \
-  --attention-dropout 0.1 --label-smoothing 0.1 \
-  --gradient-accumulation-steps 1 \
-  --use-amp 1 --use-ema 1 \
-  --prefetch-workers 16 --prefetch-depth 16 \
-  --log-every 50 --eval-every 500 --save-every 500 \
-  --early-stop 1 --early-stop-patience 3 \
-  --out models/sft_19x19_v17.pth \
-  --swanlab 1 --project go-ai --name sft_v17_npu4
-```
-
-> **纯 Python 调用**（无需命令行环境）：
-> ```bash
-> python run.py                    # 默认 SFT 训练
-> python run.py sft                # 同上
-> python run.py sft -- --epochs 2 --batch-size 64  # 覆盖参数
-> python run.py selfplay           # 自对弈训练
-> ```
-> 详见 `run.py`。
-
-关键参数（**所有布尔开关使用 0/1**）：
-
-| 参数 | 默认 | 说明 |
-|------|------|------|
-| `--data` | 必填 | 单个 `.npz` 或包含多个 `.npz` 的目录 |
-| `--out` | `models/sft.pt` | 权重输出路径（父目录自动建）|
-| `--device` | `auto` | `cuda` / `npu` / `cpu`；`auto`=有 GPU 用 cuda |
-| `--use-amp` | `0` | 启用混合精度训练（0=关闭, 1=开启）|
-| `--batch-size` | `512` | 每步批量 |
-| `--epochs` | `4` | 训练轮数 |
-| `--lr` | `2e-3` | 学习率（AdamW）|
-| `--weight-decay` | `1e-4` | 权重衰减（AdamW **解耦** weight decay，**唯一实际正则**）|
-| `--policy-loss` | `ce` | policy 损失：`ce`（交叉熵）/ `huber`（label-smoothed 目标上的 Huber，仅供复现）|
-| `--value-loss` | `huber` | value 损失：`huber`（smooth L1）/ `mse`；BCE 分支已删 |
-| `--value-loss-weight` | `1.0` | value loss 权重（BCE 时代为平衡梯度的 `5.0` 补偿已删）|
-| `--huber-beta` | `0.5` | Huber 拐点 beta（须 > 0），policy/value 两侧的 `huber` 共用 |
-| `--backbone-channels` | `128` | 主干通道数（推荐 192，12.4M 参数）|
-| `--backbone-res-blocks` | `12` | 主干残差块数（推荐 17）|
-| `--res-blocks` | `0` | ResBlock 数量（0=使用默认 mix 模式）|
-| `--convnext-blocks` | `0` | ConvNeXtBlock 数量 |
-| `--attn-blocks` | `0` | AttentionResBlock 数量 |
-| `--value-channels` | `64` | Value head 通道数（推荐 96）|
-| `--value-res-blocks` | `3` | Value head 残差块数（推荐 11）|
-| `--policy-channels` | `32` | Policy head 通道数（推荐 128）|
-| `--policy-layers` | `2` | Policy head 层数（推荐 3）|
-| `--use-ema` | `0` | 指数移动平均权重（0=关闭, 1=开启）|
-| `--compile` | `0` | `torch.compile` 算子融合（GPU +20~40%）|
-| `--flash-attn` | `0` | 启用 flash-attn（A100 最快，需 pip install）|
-| `--export-onnx` | `0` | 训练结束后导出 ONNX |
-| `--swanlab` | `0` | 启用 SwanLab 实验跟踪 |
-| `--early-stop` | `0` | 启用早停机制 |
-| `--early-stop-patience` | `3` | 早停耐心值 |
-| `--gradient-accumulation-steps` | `1` | 梯度累积步数（等效 batch = batch_size × steps）|
-| `--prefetch-depth` | `8` | 预取流水深度（提前造好数据，控制内存/吞吐）|
-| `--ver` | `v17` | 模型版本号（用于 swanlab name 和 --out 默认值）|
-| `--c2net` | `0` | 启用 C2NET（OpenI 启智平台）支持 |
-
-训练细节：
-
-- **损失分项**（`scripts/train_sft.py`，默认旗标，`tests/test_huber_loss.py` 钉住）：
-  - `policy_loss` = `F.cross_entropy(policy_logits, move_t, label_smoothing=0.1)`（`--policy-loss` 默认 **`ce`**，`train_sft.py:1575`；`huber` 分支保留仅供复现实验）；
-  - `value_loss` = Huber/smooth L1（`beta = --huber-beta`，默认 **0.5**，`:1601`）直接回归 `value_t ∈ [-1,1]`（`--value-loss` 默认 **`huber`**，`:1589`）；**BCE 分支已删除**（`test_sft_has_no_bce_branch`）；
-  - 权重 `--value-loss-weight` 默认 **1.0**（`:1565`），BCE 时代为平衡梯度加的 `5.0` 补偿已按裁决删除。
-- **日志三个键的语义（P4.5b；键名被 `test_log_keys_unchanged` 钉死，含义变过）**：
-
-  | 键 / 变量 | 内容 | 代码 |
-  |---|---|---|
-  | `policy_loss`、`value_loss` | 两个分项本身，**不含任何 L2** | `:2314`、`:2318` |
-  | `loss`（= `log_loss`） | `policy_loss + w·value_loss + c‖θ‖²` —— **含报告用的 L2 项** | `:2346-2347`、`:2430`、`:2472` |
-  | `opt_loss` | `policy_loss + w·value_loss`，**唯一被 backward 的量、不含 L2** | `:1208`、`:2348` |
-
-  - `c‖θ‖²` 由 `compute_l2_report`（`:1213-1283`）从 `optimizer.param_groups` 读回 `--weight-decay`（默认 `1e-4`）算出，只覆盖 `weight_decay != 0` 的组，返回**纯 Python float** ⇒ 不进计算图（`test_log_loss_identity` 断言对 `log_loss` 反向与对 `opt_loss` 反向梯度逐位相同）。
-  - ⇒ **日志里的 `loss` 不是被优化的目标**；`--weight-decay` 是唯一实际正则（AdamW 解耦），**没有 `--l2-coef` 这个参数**（`test_no_new_cli_params` 点名封杀）。
-  - ⚠ 键名没变、含义变过（多了一项 `c‖θ‖²`，且 policy 默认从 `huber` 改回 `ce`）：**跨新旧 run 的 `loss` / `policy_loss` 曲线不可直接比**。
-- 优化器：AdamW + `CosineAnnealingLR`；warmup 10%；价值网络头用 `value_lr_mult × base_lr`。
-- EMA（`--use-ema 1`）：指数移动平均权重，评估/保存时自动使用 EMA 参数。
-- NPU：`torch_npu` + HCCL 后端，fp16 autocast。
-
-### 6.2 自对弈训练 `selfplay_train.py`（AlphaZero 风格）
-
-详见 [§10 自对弈训练](#10-自对弈训练alphazero)。
-
----
-
-## 7. 推理与对弈
-
-`GoAI` 类（`src/inference.py`）封装模型加载、单/批量前向、MCTS 选点、自对弈、人机对弈，并提供 CLI。
-
-常用模式：
-
-```bash
-# 自对弈（MCTS）
-python src/inference.py --model models/sft_19x19.pth --board-size 19 \
-    --device cuda --use-amp 1 --compile 1 --tf32 1 \
-    --attn-mode window --attn-window 7 \
-    --mode selfplay --games 10 --use-mcts 1 --simulations 400 --num-threads 4
-
-# 人机对弈（终端输入坐标，如 ce；pass/resign）
-python src/inference.py --model models/sft_19x19.pth --board-size 19 \
-    --device cuda --use-amp 1 --compile 1 --tf32 1 \
-    --mode human --human-color 1 --use-mcts 1 --simulations 400
-
-# 开启 LightPLS 轻量 rollout
-python src/inference.py --model models/sft_19x19.pth --board-size 19 \
-    --device cuda --use-amp 1 --compile 1 --tf32 1 \
-    --attn-mode window --attn-window 7 \
-    --mode selfplay --use-mcts 1 --simulations 800 --num-threads 4 \
-    --use-rollout 1 --rollout-lambda 0.25
-
-# ONNX 导出
-python src/inference.py --model models/sft_19x19.pth --board-size 19 \
-    --mode analyze --onnx models/sft_19x19.onnx
-```
-
-**两代 checkpoint 的加载分派（12 通道旧代 / 17 通道 v21，P4.8 + P4.13，`src/inference.py`）**
-
-- `GoAI` 从权重 **stem 卷积的形状**读输入通道数：`_stem_in_channels` 读 `_STEM_WEIGHT_KEYS` 的 `shape[1]`（`inference.py:60-69`），`_infer_in_channels` 校验范围（`:391-411`）。
-  - 读不到可识别的 stem 键 → **直接 `RuntimeError`**（`:194-202`），**不静默回退 12**（否则会拿随机 12ch 模型装一份陌生架构权重）；
-  - stem 通道不在 12..17 → `ValueError`（`:407-410`）。
-- 按通道数查构建器注册表 `_build_for_in_channels`（`:85-119`）：
-  - **12 通道 → `AlphaGoNet`**（模块导入时 `register_in_channels_builder(12, _legacy_alpha_go_net)`，`:127`）——现有 checkpoint（实测 `models/sft_19x19_v12.pth` stem = `(192, 12, 3, 3)`）走这条；
-  - **17 通道 → 由路线图 P4.2 注册**；未注册前 `_build_for_in_channels` 会 `RuntimeError` 并打印接线方式（`:98-105`）。
-- 无 checkpoint 时才用默认 12（`:187`）；`ai.in_channels` 是**只读 property**（`:448-457`），想换通道数只能换 checkpoint。
-- 特征与搜索侧同源：`feature_planes(..., n_channels=self.in_channels)`（`:473`）；`MCTS._in_channels()` 向所挂模型要通道数、缺失即 raise（`mcts.py:197-216`），外部只读视图 `MCTS.n_channels`（`mcts.py:218-236`）。
-
----
-
-## 8. 评估
-
-```bash
-python scripts/evaluate.py --model models/sft_19x19.pth --board-size 19 \
-    --mode random --num-games 100 --use-mcts 1 --simulations 400
-```
-
-`--mode`：
-
-| 模式 | 说明 |
-|------|------|
-| `random` | 模型（黑）对随机策略（白），输出胜率 |
-| `benchmark` | 推理速度基准：单样本 vs 批量 32 前向吞吐 |
-| `selfplay` | 模型自对弈，输出黑方胜率 |
-
----
-
-## 9. 加速手段总览
-
-| 加速项 | 状态 | 说明 / 开启方式 |
-|--------|------|----------------|
-| 批量叶子评估 | ✅ | `GoAI.predict_batch` 同层拼 batch 一次前向（GPU 吞吐 ×10+）|
-| 跨线程合并 batch（生产者-消费者）| ✅ | worker 只选路径，主线程统一 `deepcopy`+`feature_planes`+`predict_batch` |
-| 增量特征 | ✅ | `predict_batch` 接受预计算 planes，省重复计算 |
-| **跨叶子批量 leaf_ab** | ✅ | N 个叶子浅层 negamax 合并为 depth+1 次 predict |
-| **特征平面 LRU 缓存** | ✅ | 16384 局面缓存（19 路），30 秒 TTL |
-| **spec_prefetch** | ✅ | `num_threads >= 4` 时自动启用，worker 异步预评估 |
-| **leaf_ab 智能降级** | ✅ | `sims < 64` 时自动 `depth=1`，避免低模拟数过度展开 |
-| ONNX Runtime | ✅ | `--onnx models/xxx.onnx`，含 int8 动态量化 |
-| TF32 matmul | ✅ | `--tf32`，V100/Amp 上 fp32 约 2~4× |
-| `channels_last` | ✅ | CUDA 上 conv 走 NHWC（默认开）|
-| 虚拟损失 + 多线程 | ✅ | `--num-threads 4`，并行选路径 |
-| `torch.compile` | ✅ | `--compile 1`，GPU 上约 20~40% |
-| `--use-amp` fp16 | ✅ | cuda/npu 上 `--use-amp 1` |
-| `window_global` 注意力 | ✅ | `--attn-mode window_global --attn-window 7` |
-| LightPLS rollout | ✅ | `--use-rollout 1 --rollout-lambda` |
-| pin_memory + non_blocking | ✅ | CUDA/NPU 数据传输自动重叠 |
-| GPU weight-only INT4 | ✅ | `ai.quantize_int4_torchao()` |
-| **并行自对弈** | ✅ | `--parallel-games N`，多进程并行生成 |
-| **流式训练** | ✅ | `--streaming`，不写临时文件，内存队列传递 |
-| **多 GPU DDP** | ✅ | `--ddp` + `torchrun --nproc_per_node=N` |
-
----
-
-## 10. 自对弈训练（AlphaZero）
-
-`scripts/selfplay_train.py`：纯自我对弈生成数据 → 训练 → 循环（无外部棋谱）。
-
-### 流程
-
-```
-自对弈 N 局 → 8 对称增强 → replay buffer → 训练 → 保存最佳权重 → 下一轮
-```
-
-- **数据标签**：MCTS visit 分布 → policy 标签；终局胜负 → value 标签
-- **探索**：根先验混 Dirichlet 噪声 + 温度采样
-- **价值软化**：按手数位置 tanh 软化（开局弱信号、终局强信号），z = tanh(z_raw × α)，α∈[0.3, 1.0]
-- **TD 学习（C+E 混合，`--td 1` 默认开启）**：v_td = sign·root_values[t+td_steps]（sign 按执子方奇偶，越界回退终局值），z = clip(α_td·v_td + (1-α_td)·r_soft, -1, 1)，α_td 从 `--td-alpha-init`（0.2）线性升到 `--td-alpha-end`（0.9）；`--td 0` 时逐位退回旧 tanh 软化（回归保证）
-
-### 50GB 磁盘约束优化
-
-- **流式处理**：自对弈数据不写临时 npz，用共享内存队列传递
-- **只保存最佳权重**：只保留 `latest` + `best` 两个文件
-- **紧凑 buffer**：内存中最多保留 500 局数据（~80MB）
-
-### 快速开始
-
-```bash
-# CPU 9 路验证
-python scripts/selfplay_train.py --board-size 9 --iters 5 --games 4 --sims 64
-
-# NPU 19 路正式训练（4 进程并行 + 流式 + rollout）
-python scripts/selfplay_train.py \
-  --board-size 19 --iters 20 --games 16 --sims 400 \
-  --parallel-games 4 --streaming 1 \
-  --model models/sft_19x19_v17.pth \
-  --out models/az_best.pth \
-  --use-rollout 1 --leaf-ab-depth 2 --num-threads 8 \
-  --c-puct 2.0 --virtual-loss 8.0
-
-# NPU 4 卡 DDP 训练
-torchrun --nproc_per_node=4 scripts/selfplay_train.py \
-  --board-size 19 --iters 20 --games 16 --sims 400 \
-  --parallel-games 4 --ddp 1 --streaming 1 \
-  --model models/sft_19x19_v17.pth --out models/az_best.pth
-```
-
-关键参数（**所有布尔开关使用 0/1**）：
-
-| 参数 | 默认 | 说明 |
-|------|------|------|
-| `--sims` | `400` | 每步 MCTS 模拟数（越高越强，越慢）|
-| `--parallel-games` | `1` | 并行自对弈局数（多进程，推荐 4-8）|
-| `--c-puct` | `2.0` | PUCT 探索系数 |
-| `--num-threads` | `8` | MCTS 多线程数 |
-| `--use-rollout` | `0` | LightPLS rollout 价值融合（0=关闭, 1=开启）|
-| `--leaf-ab-depth` | `2` | 叶内 α-β 搜索深度 |
-| `--buffer-size` | `500` | replay buffer 容量（局数）|
-| `--streaming` | `0` | 流式训练（不写临时文件，0=关闭, 1=开启）|
-| `--ddp` | `0` | 多 GPU 数据并行（torchrun 启动，0=关闭, 1=开启）|
-| `--temperature` | `1.0` | 自对弈采样温度 |
-| `--use-ema` | `0` | EMA 权重（0=关闭, 1=开启）|
-| `--async-pipeline` | `0` | 异步流水线（生成与训练并行，0=关闭, 1=开启）|
-| `--swanlab` | `0` | 启用 SwanLab 实验跟踪 |
-| `--c2net` | `0` | 启用 C2NET（OpenI 启智平台）支持 |
-| `--ver` | `rl` | 模型版本号（SwanLab name 后缀）|
-| `--td` | `1` | TD (C+E) 价值标签（0=旧 tanh 软化, 1=开启）|
-| `--td-steps` | `3` | TD n-step 前看步数（数据下标空间）|
-| `--td-alpha-init` | `0.2` | TD α 调度初值（开局偏 r_soft）|
-| `--td-alpha-end` | `0.9` | TD α 调度终值（残局偏 v_td）|
-| `--batch-size` | `256` | 训练 batch（NPU 甜点）|
-| `--spec-prefetch` | `1` | worker 推测预评估（0=关闭, 1=开启）|
-| `--grad-accum-steps` | `1` | 梯度累积 micro-batch 数（1=每批即更新，保持现状；>1 时等效 batch×N、step÷N，建议同时把 `--lr` 调高 1.4~2 倍）|
-| `--mcts-vector-backup` | `1` | MCTS 回传 visit/value_sum 走 numpy 批量更新（1=默认，与逐层循环数值等价；0=回退原实现）|
-
-### 11.1 新一轮训练加速（三项，不触碰数据集）
-
-以下三项只改训练循环与 MCTS 回传，**不改** `src/data/dataset.py` /
-`src/game/go_rules.py` 特征与增强路径，因此自对弈数据生成速度不受影响。
-
-1. **梯度累积 `--grad-accum-steps`**（默认 `1` = 现状）
-   摊薄 NPU/CUDA 的优化器步与 kernel 启动开销。`>1` 时每 N 个 micro-batch 才
-   `opt.step()`，等效 batch 变大、优化步数变少，loss 曲线右移但更平滑；
-   建议同步把 `--lr` 调高 1.4~2 倍以补偿。尾部不足一个累积周期的梯度被丢弃。
-2. **双缓冲 H2D 预取**（CUDA 自动启用，NPU/CPU 走原路径）
-   训练循环预分配两个 pinned 槽交替填充，上一批异步搬运与本批 CPU 侧构造重叠。
-   纯搬运时机优化，数值不变；`pin_memory` 仍仅 CUDA 开启（NPU 直传）。
-3. **MCTS 回传向量化 `--mcts-vector-backup`**（默认 `1`）
-   `_backup` 的 `visit += 1` / `value_sum += ±v` 由逐层 Python 循环改为 numpy
-   批量（符号按深度交替，数值与原实现完全等价）。MCTS-Solver 的 `proved ±1`
-   传播与 `virtual_loss` 回收仍在 Python（正确性敏感），`_select` 未改动。
-   `--mcts-vector-backup 0` 可随时回退原逐层实现。
-
----
-
-## 11. 完整工作流示例（4 卡 NPU 910A）
-
-详见 `run.txt`。
-
-```bash
-# ① 构建数据集
-python scripts/build_dataset.py \
-  --src data/games/games/ --out data/sgf_19x19_full.npz \
-  --board-size 19 --chunk-size 50000 --tmp-dir data/tmp
-
-# ② 监督训练（4 卡 NPU）
-torchrun --nproc_per_node=4 scripts/train_sft.py \
-  --data data/sgf_19x19_full.npz --device npu --board-size 19 \
-  --backbone-channels 192 --backbone-res-blocks 17 \
-  --res-blocks 8 --convnext-blocks 4 --attn-blocks 5 \
-  --value-channels 96 --value-res-blocks 11 \
-  --policy-channels 128 --policy-layers 3 \
-  --batch-size 3200 --epochs 1 --use-amp 1 --use-ema 1 \
-  --early-stop 1 --out models/sft_19x19_v17.pth
-
-# ③ 自对弈训练（AlphaZero）
-python scripts/selfplay_train.py \
-  --board-size 19 --iters 20 --sims 48 \
-  --parallel-games 8 --streaming 1 \
-  --model models/sft_19x19_v17.pth --out models/az_best.pth
-
-# ④ 评估
-python scripts/evaluate.py --model models/sft_19x19_v17.pth \
-  --board-size 19 --mode random --num-games 100 --use-mcts 1
-
-# ⑤ WebUI
-python scripts/webui.py --port 7860 --device cpu --priors-leaf \
-    --mode hybrid --hybrid-sims 32 --hybrid-blend 0.5 \
-    --expand-topk 16 --num-threads 8
-```
-
----
-
-## 12. API 速查
+### 5.4 `labels=True` 必须是 4 元组
 
 ```python
-from src.inference import GoAI
-from src.search.mcts import MCTS
-from src.game.go_rules import GoBoard
-from src.search.light_rollout import FastPolicy, light_rollout
-
-# 推理
-ai = GoAI(model_path="models/sft_19x19_v17.pth", board_size=19, device="npu")
-board = GoBoard(19)
-h = [-1, -1, -1]
-oh = [-1, -1, -1]
-to_play = 1
-policy, value = ai.predict(board, h, oh, to_play)            # 单样本
-states = [(board, list(h), list(oh), to_play)] * 32
-pol_batch, val_batch = ai.predict_batch(states)              # 批量
-
-# MCTS
-mcts = MCTS(ai, board_size=19, num_threads=4, temperature=0.0,
-            use_rollout=True, rollout_lambda=0.25)
-move_int, is_pass, root_value = mcts.best_move(
-    board, h, oh, to_play, simulations=400, return_value=True)
-
-# ONNX 导出
-ai.export_onnx("model.onnx", board_size=19, quantize_int8=False)
-
-# LightPLS
-fp = FastPolicy(19)
-v = light_rollout(board, fp, max_steps=60, rng=np.random.default_rng(0))
+sample_batch_numpy(idxs, rng=None, augment=True, labels=False)
 ```
 
----
+- `labels=False`（**默认**）→ **3 元组** `(states, moves_out, values)`
+- `labels=True` → **4 元组** `(states, moves_out, values, labels_dict)`
 
-## 13. 纯 Python 调用（`run.py`）
+🔴 **不是 5 元组**。5 元组 `(…, soft, mask)` 没有 dict 的位置，而 V7 的 loss 需要那个
+dict ⇒ 最后只会变成 6 元组或 fork 两条路。4 元组让预取器只需搬运**一种** payload 形状。
+（实现过程里确实一度做成 5 元组，已订正回 4 元组。）
 
-无需命令行环境，直接通过 Python 调用训练脚本：
+### 5.5 软 CE 掩码逐行二选一，不是混合
+
+`soft_mask` 是**逐行二选一**：1 = 软 CE，0 = one-hot CE，**不做混合**。
 
 ```python
-# 方式一：命令行风格
-import subprocess
-subprocess.run(["python", "run.py", "sft", "--", "--epochs", "2"])
-
-# 方式二：直接 import（适合测试/Jupyter）
-import sys
-sys.argv = ["train_sft.py", "--data", "data/test.npz", "--epochs", "1", "--device", "cpu"]
-from scripts.train_sft import main
-main()
+soft_cross_entropy(...) = (per_row * mask).mean()   # mask=0 的行贡献 0
 ```
 
-```bash
-python run.py                    # 默认 SFT 训练
-python run.py sft                # 同上
-python run.py sft -- --epochs 2  # 覆盖参数
-python run.py selfplay           # 自对弈训练
-```
+理由：同一个 head 同时收到「搜索分布」与「人类 one-hot」会去**折中**而不是学搜索。
+`mask=0` 的行贡献 0，不是「退化成 one-hot CE」。段 2 用独立采样器**只取软行**。
+
+### 5.6 `RE` 认输类不能当成分差
+
+`B+R` / `W+Resign` / `B+T` / `W+Forfeit` ⇒ **认输填 `NaN`，不是 0**。
+`g_score` 为 `NaN` 时 `w_score = 0`。
+
+🔴 **真实语料里 81.09% 的 SGF 是认输**（spec 早期抽样写的是 75.2%，
+`build_games_sidecar.py` 在 162,298 局上实测是 **81.09%**），只有约 **18.5%** 有数值分差。
+照字面把认输当 0 分会让 scoremean / lead 被系统性地教成「双方刚好一样」。
+
+### 5.7 ch18/19 无法与官方 stdata 对齐
+
+官方 `calculateArea` **先提死子**，本仓 `GoBoard.score()` 没有死子判定
+（其 docstring 自陈「没有死子判定，对局双方应在 pass 认输前实际提掉对方的死子」）。
+
+🔴 实测 1254 行**零行完全相同**（总点多 21,896 点）。
+⇒ **stdata 只能当 ch3/4/5 与 ch9–13 的 oracle**，不能拿它判 ch18/19 的对错。
+
+ladder 通道的可验证性因此被拆成两半（`katago/` 下无 `cpp/` 源码，stdata 是唯一 oracle）：
+
+| 通道 | 依赖盘面 | 能否对 stdata 直接验证 |
+|---|---|---|
+| ch14 | 当前盘 | ✅ |
+| ch17 | 当前盘（working move） | ✅ |
+| ch15 | 前一手盘 | ❌ stdata 是逐行独立样本 |
+| ch16 | 前二手盘 | ❌ 同上 |
+
+⇒「**算法**」由 ch14 对 stdata 逐位担保，「**盘面**」由 SGF 重放担保。
+
+### 5.8 `test_no_new_cli_params` 把 61 个 CLI flag 整个冻结
+
+`tests/test_huber_loss.py::test_no_new_cli_params` 断言「D1 零新增 / 零删除 /
+零改名」。**加任何新 flag 都要同步改它**，否则 CI 红。
+同理，日志三个键的键名也被 `test_log_keys_unchanged` 钉死。
+
+`loss` / `policy_loss` / `opt_loss` 的**键名没变但含义变过**：
+`loss = policy_loss + w·value_loss + c‖θ‖²`（含报告用 L2），
+`opt_loss = policy_loss + w·value_loss`（唯一被 backward 的量）。
+⇒ **跨新旧 run 的 loss 曲线不可直接比**；`top1` 仍可比。
+
+### 5.9 真实语料里一定有一部分坏 SGF
+
+曾整批 13 万局卡死于 `Illegal move 72: F2`（某局没有 `AB/AW/HA`，文件名以数字开头）。
+
+`label_sgf.py` 已改为收集 `(resps, errors)` 由调用方隔离，**不再因单局抛异常**。
+判定用 `_BAD_MOVE_RE = /Illegal move\s+(\d+)/i`，并且只有 `out` + `errors` 一起
+凑满目标数量才停（否则坏局会被静默跳过、循环提前结束）。
+
+### 5.10 `requirements.txt` 漏列 `scipy`（记账缺口）
+
+`src/data/feature_v7.py` 直接 `from scipy.ndimage import label, binary_dilation`，
+`src/game/go_rules.py` 另有 8 处 import，但 **`requirements.txt` 里没有 `scipy`**
+（同样漏了 `onnxruntime`）。新环境按 `pip install -r requirements.txt` 装完会
+在 import 时炸。
+
+> 已知缺口，**故意不在此处修**（`requirements.txt` 不在本文件的改动范围内）。
+> `run.txt` 里显式补了 `pip install scipy`。
 
 ---
 
-## 14. 常见问题与排错
+## 6. 关键决策与理由
 
-| 现象 | 原因 / 解决 |
-|------|------------|
-| `ImportError: src.xxx` | 必须在**仓库根目录**运行（`sys.path` 以根为基准）|
-| 权重加载形状不匹配 | `attention_mode`/`attn_mode`/`board_size` 必须与训练时一致 |
-| `play()` 返回 `False` | 着法非法（落子撞禁着/自杀/劫）|
-| MCTS 选到非法着法 | 极端情况下回退到 `choose_move`（纯策略 argmax）|
-| V100 上 bf16 报错 | V100 无 bf16，已默认走 fp16 |
-| ONNX 导出 ShapeInferenceError | `export_onnx` 已自动回退 legacy exporter |
-| 自对弈 res3 未加载 | 预训练 v12 无 `value.res3`，`strict=False` 自动跳过，随机初始化 |
-| NPU 训练报错 | 确认 `torch_npu` 已安装，`torch.npu.is_available()` 返回 `True` |
+### 6.1 22 通道为何现场算，不落盘
+
+| 理由 | 说明 |
+|---|---|
+| **主数据集不可 rebuild** | §2.1 第 1 条。加列 = 重建 = 毁掉 join 链 |
+| **11/13 项不需要新数据** | 现有 10 列能推出或实时算；只有 6 个局级标量要 sidecar |
+| **空间开销不划算** | bit-packed 22 通道 × 34.2M 行 ≈ 940 MB；实时算是「零新增空间存储」 |
+| **性能有余量** | 3.04 ms/行预算 vs 1.78 ms 基线 = 1.7×；贵的是 `iterLadders`（3 块盘面） |
+| **降级成本为零** | 若 `iterLadders` 超预算 ⇒ 降到 **18 通道**（ch14–17 恒 0），主干 / 四头 / 12 项 loss / 参数量 5,561,832 **一行不改** |
+
+未来pos 几乎免费：每局行数 p50=208 / mean=210.7，`+8` 有效 96.2%、`+32` 有效 84.8%
+⇒ **gather 全部行是免费的**（`boards` 常驻内存，就是索引），只有靠近终局的那
+**4%** 行需要真跑一次 area 的 flood fill。
+
+### 6.2 段 1 为何不训 score
+
+三条理由，按重要性：
+
+1. **覆盖率**：81.09% 的局是认输 ⇒ 没有分差 ⇒ `g_score = NaN` ⇒
+   `w_score = 0`。score 系 5 项（`#5/#6` scorebelief、`#8` scoremean、`#9` lead、
+   `#10` scoring）在 **81% 的局上权重为 0**，有监督的只约
+   `18.5% × 162,298 × 210 ≈ 6.3M 行`（34.2M 的 **19%**）。跑一个 19% 覆盖的
+   score 头，不如等段 2/3。
+2. **信号质量**：认输局即使重放到终局，`GoBoard.score()` 没有死子判定 ⇒
+   从认输棋谱反推的终局归属**不可靠**。`ownership` / `scoring` / `seki` 正是这类。
+3. **有更好的来源**：stdata 的 `valueTargetsNCHW` 直接带 ownership / seki /
+   futurepos / scoring（值域 `{−1,0,+1}` 与 `±120`），来自**搜索器自己的评分器**，
+   不需要移植任何东西。
+
+⇒ **训练责任从 34.2M 挪到 3.4M**，而那 3.4M 上这些信号质量高得多。
+⇒ ownership / scoring / seki **不在段 1**，交给段 2/3。
+
+### 6.3 sidecar 为何只存 4 键
+
+| 决策 | 理由 |
+|---|---|
+| **局级而非逐行** | 逐行存是 3.6 B/行 ⇒ 34.2M 行 = **123 GB**；局级是 **1.2 MB** |
+| **只留 `g_komi` / `g_score` / `g_rules` / `g_resign`** | 砍掉 `g_ownership` / `g_scoring` / `g_seki`（原 176 MB → **1.2 MB**）；墙钟从 8–28 min 降到几分钟。理由见 §6.2 |
+| **哈希锚点对齐，不能靠顺序** | `build_dataset.build()` 一串过滤实测丢掉 **45%** 的 tgz 成员，`tarfile` 顺序 ≠ glob 顺序；且有 id 复用 bug。锚点法（ply-20）对枚举顺序与该 bug **完全免疫** |
+| **必须打印覆盖报告** | 匹配率 <100% 时未匹配的局权重置 0，**不静默填垃圾** |
+
+`g_komi` **不能假设常数**：实测 7.5 占 37.7%、6.5 占 18.0%、5.5 占 15.1%、
+3.8 占 10.5%、**0 占 5.9%**、2.8/4.5/缺 各若干 ⇒ 必须逐局存。
+
+### 6.4 policy 保持 K=2
+
+段 2/3 的目标同型（访问分布）可合并成一轮；人类 one-hot 已在段 1 学进去，
+段 2/3 覆盖它**正是蒸馏的目的**。K=3 只在「同一部位两个 policy 目标同时训」时才需要，
+而那会带来权重调参负担且收益未经验证。K=2 恰好对上 stdata 的两路输出
+（`policyTargetsNCMove[0]` 本方 / `[1]` 对手）。
 
 ---
 
-## 许可 / 参考
+## 7. 已知限制
 
-监督学习路线参考 AlphaGoZero 的 12 通道特征与策略-价值网络设计；规则引擎为自建中国规则基础实现。
+1. **无 KataGo C++ 源码。** `katago/` 下**只有 Windows 二进制**（`katago.exe` +
+   dll），**没有 `cpp/`** ⇒ `nninputs.cpp::fillRowV7`、`iterLadders`、`calculateArea`
+   的官方实现**不可读**。stdata 是唯一可执行 oracle。
+2. **ch18/19 无法与官方 stdata 对齐**（详见 [§5.7](#57-ch1819-无法与官方-stdata-对齐)）。
+3. **`docs/` 被 `.gitignore` 排除**（`:46 /docs`）⇒ 两份 spec 与 sidecar 生成脚本
+   都不在版本控制内，无设计历史。
+4. **`katago/` 也在 `.gitignore` 里**（含 204 MB 权重）⇒ 换机器要重新准备权重与 stdata。
+5. **`requirements.txt` 漏 `scipy`**（见 [§5.10](#510-requirementstxt-漏列-scipy记账缺口)）。
+6. **`scorestdev` 的 `beta` 待裁决。** spec 的 `SoftPlus(x₁, 0.05)` 让预测初值落在
+   277，而 loss #7 的目标是 5~20 量级、δ=10 ⇒ 硬算需 ~9 万步才挪到位
+   ⇒ 40 步冒烟实测该项 **−0.0%**，**等效于没有学习信号**。
+   取 `beta=1.0`（初值 13.86）是**一行**，已提成具名常量 `SCORE_STDEV_SOFTPLUS_BETA`，
+   但那是改已批准的 spec ⇒ **裁决前不得当作可训练项排期**。
+7. **`scoring` 开局就占 83/104**（随机预测 vs ±120 目标）⇒ 梯度范数在 step 20
+   冲到 365、被 clip 到 5。真实跑要相应加 warmup，或先确认 `±120` 缩放是否该归一。
+8. **stdata 布局随网络版本变。** `globalTargetsNC` 是 **64**（b40c768nbt / b28c512）
+   vs **80**（tf3-b11c768）列；`qValueTargetsNCMove` 只有前两批有
+   ⇒ **绝不能硬编码列号**，必须按网络名查 `GLOBAL_TARGET_LAYOUT`，未登记的网络报错不猜。
+   `zzb28c512` 那批是 **seki 富集**（131,706 行里 104,905 行含 seki 格子）⇒ 当作
+   seki 专项单独用，不混进主训练。
+9. **`col3` / `col22` 的精确语义未定**（stdata）⇒ 目前**不作为任何 loss 的目标**，只记录。
+10. **910A 融合注意力未探针。** 现有 `head_dim=46 ∉ 支持集 {16,32,64}`
+    （推测是 `force_math` 的根因）。V7 的 `head_dim=32` 落在支持集内，
+    若融合可用 ⇒ 注意力显存 6.2–9.3 GiB → **~0.7 GiB**，总峰值 21–25 → 15–19 GiB。
+    最坏情形就是维持现在的 `force_math`，所以这只是「可能更好」，不是阻塞项。
+11. **`run.py` 的 `default_argv` 是旧代残留** —— 仍带 `--compile-mode reduce-overhead`
+    （走 CUDA Graphs，维持不归还的私有内存池，临界 batch 下直接 OOM）。
+    **别照抄 `python run.py sft` 的默认值。**
+12. **显存结论都标着「旧代」。** run.txt 里那张 4 卡 910A 账本是 v21 时代
+    （184 通道）量的；V7 是 256 通道，换硬件前必须重新标定并先跑 50 步 smoke。
