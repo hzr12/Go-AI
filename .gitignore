@@ -41,6 +41,10 @@ wandb/
 .idea/
 *.swp
 
+# 工具缓存（CodeGraph 的 SQLite 索引，本机 19.6 MB，随代码自动重建）
+# ⚠ 必须锚定：裸 `.codegraph` 会匹配任意层级
+/.codegraph/
+
 # 系统
 .DS_Store
 Thumbs.db

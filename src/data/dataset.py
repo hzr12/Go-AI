@@ -26,8 +26,67 @@ import torch
 from src.game.go_rules import GoBoard, SYMMETRIES, _check_n_channels
 
 
+def permute_soft(soft, tforms, board_size):
+    """按每个样本的对称变换重排软策略（362 维）向量。
+
+    ⚠ **这是软标签接入里唯一会「静默出错」的地方**。
+    `sample_batch_numpy` 会对 `states` 施加 8 种对称增强、对 `moves_out` 施加
+    `SYMMETRIES[t]` 重映射；若软 policy 不同步重排，训练**不会报任何错**，
+    只是标签指向错误的点 —— 表现为「loss 正常下降、指标好看，但棋力不涨」。
+
+    约定：
+      · 前 `board_size**2` 项是落点，扁平下标 `r * board_size + c`；
+      · 最后 1 项是 **pass**（下标 `board_size**2`），**任何变换都不动它**。
+        这与 `sample_batch_numpy` 里 `moves_out` 对 pass 的处理一致
+        （L147：默认填 `bs*bs`，只对 `0 <= mv < bs*bs` 做重映射）。
+
+    参数
+    ----
+    soft   : (B, A) float；A = board_size**2 + 1
+    tforms : (B,) int，取值 0..7（0 = 恒等）
+    返回   : (B, A) float（float64 计算后转回原 dtype）
+    """
+    bs = board_size
+    A = bs * bs + 1
+    soft = np.asarray(soft)
+    if soft.ndim != 2 or soft.shape[1] != A:
+        raise ValueError(f"permute_soft: soft 应为 (B,{A})，实得 {soft.shape}")
+    tforms = np.asarray(tforms)
+    if tforms.shape[0] != soft.shape[0]:
+        raise ValueError(f"permute_soft: tforms 长度 {tforms.shape[0]} "
+                         f"与 soft 批 {soft.shape[0]} 不符")
+
+    # 8 种变换的**逆置换**表：inv[t][j] = 「目标位 j 该从哪个源位取值」。
+    #
+    # ⚠ 方向极易搞反，这里是踩过的坑：若直接写
+    #       out[:, perms[t]] = soft[:, :]
+    #   或 `out = soft[:, perms[t]]`（gather），得到的都是**逆变换**——
+    #   因为 `out[j] = soft[perms[j]]` 意味着「源 perms[j] 移到 j」，
+    #   等价于把每个源点送到了 perms 的**像**的反方向。
+    #   正解是显式求逆：perms[t] 是「源→目标」，那么目标 j 的来源是
+    #   perms[t] 的逆映射，即 inv[perms[t][k]] = k。
+    rr_all, cc_all = np.divmod(np.arange(bs * bs), bs)   # 源点 (r,c)
+    invs = []
+    for t in range(8):
+        tr, tc = SYMMETRIES[t](rr_all, cc_all, bs)
+        fwd = tr * bs + tc                             # 源 k -> 目标 fwd[k]
+        inv = np.empty(bs * bs, dtype=np.int64)
+        inv[fwd] = np.arange(bs * bs)                  # 目标 j <- 源 inv[j]
+        invs.append(inv)
+
+    out = np.zeros_like(soft, dtype=np.float64)
+    out[:, A - 1] = soft[:, A - 1]          # pass 恒等
+    for t in range(8):
+        m = tforms == t
+        if not m.any():
+            continue
+        out[m, :A - 1] = soft[m][:, invs[t]]   # 目标位取来源位
+    return out.astype(soft.dtype)
+
+
 class SupervisedDataset:
-    def __init__(self, data: dict, n_channels: int = 12):
+    def __init__(self, data: dict, n_channels: int = 12,
+                 soft_idx=None, soft_policy=None):
         """
         data 必须含：boards(int8), my_hist(int16), op_hist(int16),
                        ko(int16), moves(int16), values(int8), to_play(int8)
@@ -65,10 +124,48 @@ class SupervisedDataset:
         self.board_size = self.boards.shape[1]
         self._board = GoBoard(self.board_size)  # 复用实例，避免重复分配
 
+        # ---- 软标签（KataGo 搜索分布）——可选，**默认 None = 零回归** ----
+        # `soft_idx` 是行下标数组 (M,)，`soft_policy` 是对应的 (M, A) 分布。
+        # 两者由调用方（train_sft）用 pos_hash join 算好后传入；本类不自己算 hash
+        # （3420 万行算一遍要 ~2 分钟，属于启动期一次性开销，交给脚本层更合适）。
+        self.soft_idx = None
+        self.soft_policy = None
+        self.soft_row = None      # int32 (N,) 行->soft 槽位，-1 = 该行无标签
+        self.n_soft = 0
+        if soft_idx is not None and soft_policy is not None:
+            self._attach_soft(soft_idx, soft_policy)
+
+    def _attach_soft(self, soft_idx, soft_policy):
+        """挂载软标签并建行→槽位映射。"""
+        A = self.board_size * self.board_size + 1
+        soft_idx = np.asarray(soft_idx, dtype=np.int64).ravel()
+        sp = np.asarray(soft_policy)
+        if sp.ndim != 2 or sp.shape[1] != A:
+            raise ValueError(f"soft_policy 应为 (M,{A})，实得 {sp.shape}")
+        if sp.shape[0] != soft_idx.size:
+            raise ValueError("soft_idx 与 soft_policy 行数不一致")
+        if soft_idx.size and (soft_idx.min() < 0 or soft_idx.max() >= self.N):
+            raise ValueError("soft_idx 越界（数据集行号）")
+        # 同一行可能被多份标签命中（实测 800 标签覆盖 995 行，因为同局内
+        # 相同局面在 npz 里有多行）。此时**保留第一条**并计数，不报错——
+        # 同一局面的 KataGo 分布本应一致，重复只是同一事实的多次记录。
+        row = np.full(self.N, -1, dtype=np.int32)
+        n_dup = 0
+        for k, r in enumerate(soft_idx):
+            if row[r] >= 0:
+                n_dup += 1
+                continue
+            row[r] = k
+        self.soft_idx = soft_idx
+        self.soft_policy = sp
+        self.soft_row = row
+        self.n_soft = int((row >= 0).sum())
+        self.n_soft_dup = n_dup
+
     def __len__(self):
         return self.N
 
-    def sample_batch_numpy(self, idxs, rng=None, augment=True):
+    def sample_batch_numpy(self, idxs, rng=None, augment=True, labels=False):
         """
         给定样本下标，返回 numpy 版 (states, moves_out, values)：
             states    : (B, n_channels, H, W) float32
@@ -167,21 +264,40 @@ class SupervisedDataset:
         # 优先使用 winrates（连续胜率），缺失则回退到 values
         if self.winrates is not None:
             values = self.winrates[idxs].astype(np.float32).reshape(-1, 1)
-        return states, moves_out, values
 
-    def sample_batch(self, idxs, device='cpu'):
+        # ---- 软标签分支：契约保持 ----
+        # `labels=False`（默认）→ 仍返回**三元组**，既有调用点逐位不变。
+        # `labels=True` 且挂了软标签 → 返回五元组，追加 (soft, mask)。
+        if not labels or self.soft_row is None:
+            return states, moves_out, values
+
+        B = len(idxs)
+        A = self.board_size * self.board_size + 1
+        soft = np.zeros((B, A), dtype=np.float32)
+        mask = np.zeros((B,), dtype=np.float32)
+        slots = self.soft_row[idxs]
+        hit = slots >= 0
+        if hit.any():
+            mask[hit] = 1.0
+            soft[hit] = self.soft_policy[slots[hit]].astype(np.float32)
+            # ⚠ **软标签必须与 states 用同一个变换重排**。漏了这步不报错，
+            #   只会让标签指向错误的点（loss 照降、棋力不涨）。
+            #   上面 states 走的是 `tforms`（augment=False 时恒等），故：
+            if augment:
+                soft = permute_soft(soft, tforms, self.board_size)
+        return states, moves_out, values, soft, mask
+
+    def sample_batch(self, idxs, device='cpu', labels=False):
         """numpy 取批 + 转 torch 张量（等价于 sample_batch_numpy 后再 to(device)）。"""
-        states, moves_out, values = self.sample_batch_numpy(idxs)
+        out = self.sample_batch_numpy(idxs, labels=labels)
         dev_prefix = device.split(':')[0] if isinstance(device, str) else str(device)
-        if dev_prefix in ('cuda', 'npu'):
-            # pin_memory 加速 CPU→GPU/NPU 传输，non_blocking 重叠传输与计算
-            return (
-                torch.from_numpy(states).pin_memory().to(device, non_blocking=True),
-                torch.from_numpy(moves_out).pin_memory().to(device, non_blocking=True),
-                torch.from_numpy(values).pin_memory().to(device, non_blocking=True),
-            )
-        return (
-            torch.from_numpy(states).to(device),
-            torch.from_numpy(moves_out).to(device),
-            torch.from_numpy(values).to(device),
-        )
+        pinned = (dev_prefix in ('cuda', 'npu'))
+        conv = ([lambda a: torch.from_numpy(a).pin_memory().to(device, non_blocking=True)]
+                if pinned else
+                [lambda a: torch.from_numpy(a).to(device)])
+        if labels and self.soft_row is not None:
+            states, moves_out, values, soft, mask = out
+            return (conv[0](states), conv[0](moves_out), conv[0](values),
+                    conv[0](soft), conv[0](mask))
+        states, moves_out, values = out
+        return conv[0](states), conv[0](moves_out), conv[0](values)
