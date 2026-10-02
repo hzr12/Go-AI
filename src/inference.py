@@ -152,6 +152,31 @@ def infer_value_head(state):
     return out
 
 
+def _katago_v7_net(*, in_channels: int, **arch_kwargs):
+    """22 通道 = KataGo NBT+Transformer（spec §3/§4，配置 `b11c256h4nbttflrs-...`）。
+
+    22 是官方 `fillRowV7` 的空间通道数（19 全局特征走独立的 `global_fc`，
+    不经 stem）。`in_channels` 必须等于 22 —— `NbtTfNet` 的 stem 是
+    `Conv2d(22→256, 3×3)`，给它别的数就是建出了与 spec 不符的结构。
+
+    `arch_kwargs` 里本模型**只认** `use_checkpoint` 与 `attn_dropout` 两个行为
+    参数；结构键**不接受覆盖**（与 `KATAGO_SE_CFG` 同一立场：结构只由
+    `NBT_TF_CFG` 决定）。传别的键会被静默忽略 —— 刻意不报错，因为
+    `GoAI.__init__` 会把一整套 12 通道时代的结构参数一起透传下来。
+    """
+    from src.networks.katago_v7 import NBT_TF_CFG, build_katago_v7_net
+    if int(in_channels) != NBT_TF_CFG['in_channels']:
+        raise ValueError(
+            f'V7 构建器只接 {NBT_TF_CFG["in_channels"]} 通道，收到 {in_channels}。'
+            f'22 是官方 fillRowV7 的空间通道数，改它等于改 spec。')
+    return build_katago_v7_net(
+        use_checkpoint=arch_kwargs.get('use_checkpoint'),
+        attn_dropout=arch_kwargs.get('attn_dropout'))
+
+
+register_in_channels_builder(22, _katago_v7_net)
+
+
 def _build_for_in_channels(in_channels, **arch_kwargs):
     """按通道数建网；建完立刻校验 stem 通道数与请求一致后返回。
 
