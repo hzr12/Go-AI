@@ -145,16 +145,21 @@ def policy_dense_from_sparse(idx, val, action_size=362, renormalize=True):
     截断版本会引入一个 spec 里没有的额外近似。
 
     截断丢掉的尾部质量默认**按比例摊回**（`renormalize=True`），让每行仍是
-    和为 1 的合法分布。丢了多少由 `labels['policy_resid']` 单独记账，作为
-    「K=16 够不够大」的哨兵（见 `test_katago_v7_loss.py`）。
+    和为 1 的合法分布。丢了多少由标签侧单独记账（``to_v7_labels`` 的
+    ``policy_resid``），作为「K=16 够不够大」的哨兵。
+
+    ⚠ 接受 numpy 输入：整条数据链路（`dataset.py` / `katago_npz.py`）产出的
+    都是 numpy，在这里 `torch.as_tensor` 比要求上游先转一遍更不容易漏。
 
     Args:
         idx: ``(B, K)`` int，着法索引（0..action_size−1，含 pass）。
         val: ``(B, K)`` 数值，原始 visit 计数或概率。
     """
+    idx = torch.as_tensor(idx)
+    val = torch.as_tensor(val, dtype=torch.float32, device=idx.device)
     b, k = idx.shape
     out = torch.zeros(b, action_size, dtype=torch.float32, device=idx.device)
-    out.scatter_(1, idx.to(torch.long), val.to(torch.float32))
+    out.scatter_(1, idx.to(torch.long), val)
     if renormalize:
         s = out.sum(dim=1, keepdim=True)
         out = out / s.clamp_min(1e-12)
@@ -267,9 +272,25 @@ class KataGoV7Loss(nn.Module):
         w = labels.get('w') or {}
         ones = torch.ones(b, device=dev)
 
+        def T(x, dtype=torch.float32):
+            """numpy → torch（整条数据链路都是 numpy；要求上游先转一遍
+            只会让某个新字段静默留在 numpy 上，而 numpy 与 tensor 的混算
+            报错位置离出错点很远）。"""
+            return torch.as_tensor(x, dtype=dtype, device=dev)
+
         def w_of(name):
             v = w.get(name)
-            return ones if v is None else v.to(dev).reshape(-1)
+            return ones if v is None else T(v).reshape(-1)
+
+        # ⚠ seki 的行权重**不能**默认取 w_ownership（spec §4.5 #12 写的是
+        # w_ownership，但那是「从 SGF 自造标签」时的口径）。在 stdata 上
+        # seki 通道实测**极稀有**（~1e-4 的格子，前两批几乎全 0），而
+        # w_ownership 在 91% 的行上是 1 ⇒ 复用它等于让 seki 头在 99.99%
+        # 的行上被推向「全中性」，再乘上 #12 那个上限 8 的自适应系数放大。
+        # ⇒ 标签**没给** w_seki 时一律按 0 处理（宁可不训，不要训错方向）。
+        if 'seki' not in w:
+            w = dict(w)
+            w['seki'] = torch.zeros(b, device=dev)
 
         terms = {}
         logp = F.log_softmax(out['policy_logits'].float(), dim=-1)
@@ -287,11 +308,12 @@ class KataGoV7Loss(nn.Module):
 
         # ---- 3 value 三分类 CE（系数 1.20，行权重恒 1）----
         terms['value'] = _weighted_mean(F.cross_entropy(
-            out['outcome_logits'].float(), labels['outcome'].reshape(-1).long(),
+            out['outcome_logits'].float(),
+            T(labels['outcome'], torch.long).reshape(-1),
             reduction='none'), None)
 
         # ---- 4 ownership（系数 1.5，w_ownership）----
-        own_t = labels['ownership'].reshape(b, -1).float()
+        own_t = T(labels['ownership']).reshape(b, -1)
         own_logit = 2.0 * out['ownership_pretanh'].reshape(b, -1).float()
         own_bce = F.binary_cross_entropy_with_logits(
             own_logit, (own_t + 1.0) * 0.5, reduction='none')
@@ -302,9 +324,10 @@ class KataGoV7Loss(nn.Module):
         sb_logits = out['scorebelief_logits'].float()
         sb_tgt = labels.get('score_distr')
         if sb_tgt is None:
-            sb_tgt = build_score_distr_target(labels['sb_center'],
-                                              labels['sb_upper'], self.num_bins)
-        sb_tgt = sb_tgt.to(dev).float()
+            sb_tgt = build_score_distr_target(
+                torch.as_tensor(labels['sb_center']).to(dev),
+                torch.as_tensor(labels['sb_upper']).to(dev), self.num_bins)
+        sb_tgt = T(sb_tgt)
         terms['scorebelief_pdf'] = _weighted_mean(
             -(sb_tgt * F.log_softmax(sb_logits, dim=-1)).sum(-1),
             w_of('score'))
@@ -317,26 +340,26 @@ class KataGoV7Loss(nn.Module):
         sb_std = F.softmax(sb_logits, dim=-1).std(-1)
         terms['score_stdev'] = _weighted_mean(
             huber(out['score_stdev'].float(), sb_std, 10.0),
-            labels.get('game_weight'))
+            None if labels.get('game_weight') is None
+            else T(labels['game_weight']).reshape(-1))
 
         # ---- 8 scoremean（系数 0.0015，w_score，δ=12）----
+        score_t = T(labels['score']).reshape(-1)
         terms['score_mean'] = _weighted_mean(
-            huber(out['score_mean'].float(), labels['score'].reshape(-1).float(),
-                  12.0), w_of('score'))
+            huber(out['score_mean'].float(), score_t, 12.0), w_of('score'))
 
         # ---- 9 lead（系数 0.0060，w_lead，δ=8）----
         terms['lead'] = _weighted_mean(
-            huber(out['lead'].float(), labels['score'].reshape(-1).float(), 8.0),
-            w_of('lead'))
+            huber(out['lead'].float(), score_t, 8.0), w_of('lead'))
 
-        # ---- 10 scoring（**0.25 在装配处**，w_scoring）----
-        sc_t = labels['scoring'].reshape(b, -1).float()
+        # ---- 10 scoring（**0.25 在系数表里**，w_scoring）----
+        sc_t = T(labels['scoring']).reshape(b, -1)
         sc_mse = (out['scoring'].reshape(b, -1).float() - sc_t).pow(2).mean(-1)
         terms['scoring'] = _weighted_mean(
             4.0 * (torch.sqrt(0.5 * sc_mse + 1.0) - 1.0), w_of('scoring'))
 
         # ---- 11 futurepos（**0.25 已内嵌在公式里**，w_futurepos）----
-        fut_t = labels['futurepos'].reshape(b, 2, n_sq).float()
+        fut_t = T(labels['futurepos']).reshape(b, 2, n_sq)
         fut_sq = (torch.tanh(out['futurepos'].reshape(b, 2, n_sq).float())
                   - fut_t).pow(2)
         chan_w = torch.tensor([1.0, 0.25], device=dev).reshape(1, 2, 1)
@@ -344,12 +367,13 @@ class KataGoV7Loss(nn.Module):
             0.25 * (fut_sq * chan_w).reshape(b, -1).sum(-1) / math.sqrt(n_sq),
             w_of('futurepos'))
 
-        # ---- 12 seki（自适应，w_ownership）----
+        # ---- 12 seki（自适应，w_seki）----
         if 'seki_sign' in labels and 'seki_neutral' in labels:
-            sign_t = labels['seki_sign'].reshape(b, n_sq).long()
-            neu_t = labels['seki_neutral'].reshape(b, n_sq).float()
+            sign_t = T(labels['seki_sign'], torch.long).reshape(b, n_sq)
+            neu_t = T(labels['seki_neutral']).reshape(b, n_sq)
         else:
-            sign_t, neu_t = seki_targets_from_plane(labels['seki'])
+            sign_t, neu_t = seki_targets_from_plane(
+                torch.as_tensor(labels['seki']).reshape(b, 1, n_sq))
         seki_logits = out['seki_logits'].float()
         # 逐 (样本, 格) 对 3 个符号类做 CE：把类维放中间 ⇒
         # cross_entropy(input=(B,3,N), target=(B,N)) → (B,N)。
@@ -365,7 +389,7 @@ class KataGoV7Loss(nn.Module):
             reduction='none')
         seki_raw = (ce_sign.sum(-1) + 0.5 * ce_neu.sum(-1)) / n_sq
         adaptive = self._seki_adaptive_scale(seki_raw.detach().mean())
-        terms['seki'] = _weighted_mean(seki_raw * adaptive, w_of('ownership'))
+        terms['seki'] = _weighted_mean(seki_raw * adaptive, w_of('seki'))
 
         # ---- 装配：逐项乘**有效**系数（只乘一次）----
         weighted = {k: self.coeff[k] * v for k, v in terms.items()}
