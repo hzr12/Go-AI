@@ -573,6 +573,11 @@ class CorpusScan:
         self.rules = np.empty(0, np.int8)
         self.resign = np.empty(0, np.bool_)
         self.re = np.empty(0, np.int8)     # 0 未识别/无结果 1 数值 2 和棋 3 认输
+        #: 每局**是谁认输**：0 = 黑 / 1 = 白 / -1 = 非认输。
+        #: ⚠ 用 -1 而不是 None/0 占位，因为 0 在这里有实义（黑认输）——
+        #: 拿 0 当「无信息」的默认值会让「白认输」与「什么都不知道」混成一类。
+        #: `resign` 只是 bool，**恢复不出方向**，所以这一列必须自己落盘。
+        self.resign_side = np.empty(0, np.int8)
         self.has_komi = np.empty(0, np.bool_)
         #: 每局的**内容签名** = 它最后一个被记录前缀（偏移 `min(20, 手数)`）的散列。
         #:
@@ -588,6 +593,44 @@ class CorpusScan:
 RE_CLASS_UNKNOWN, RE_CLASS_SCORE, RE_CLASS_DRAW, RE_CLASS_RESIGN = 0, 1, 2, 3
 #: `CorpusScan.stats` 里 `ru_*` 的取值
 RU_CLASS_DEFAULT, RU_CLASS_AREA, RU_CLASS_TERRITORY, RU_CLASS_UNRECOGNIZED = 0, 1, 2, 3
+
+#: `derive_outcome` 的取值（下游 A 阶段的硬 outcome 标签）。
+OUTCOME_BLACK, OUTCOME_WHITE, OUTCOME_DRAW = 0, 1, 2
+
+
+def derive_outcome(g_re, g_score, g_resign_side) -> np.ndarray:
+    """把 sidecar 的三列局级标签压成 A 阶段的硬 outcome。返回 `int64`、形状同输入。
+
+    ============  ==================================  ================
+    `g_re`       判据                                 结果
+    ============  ==================================  ================
+    `RE_CLASS_SCORE`  `g_score` 的符号（黑−白）        黑胜 0 / 白胜 1
+    `RE_CLASS_RESIGN` 谁认输谁输（`g_resign_side`）    黑认输→1 / 白认输→0
+    `RE_CLASS_DRAW` / `RE_CLASS_UNKNOWN`  ——          2
+    ============  ==================================  ================
+
+    ⚠ **SCORE 分支不减贴目。** `g_score` 是 SGF 的最终分差，符号已经是**黑−白**
+      且**含贴目**（`ResultInfo.score` 的约定），再减一次 `g_komi` 会把
+      `B+2.5 / KM[7.5]` 这类局翻成白胜 —— 这是这个契约里最容易写错的一步。
+    ⚠ **按 `g_re` 分派，不看另一列。** 复用旧 `.scan.npz` 缓存时两列可能来自不同
+      扫描批次，一个「RESIGN 却残留了分差」的样本仍按认输判。
+    ⚠ 两个「理论上不可达」的退化情形，按上面那张表**字面**取值、不额外兜底，
+      因为它们一旦发生就说明上游坏了，静默修正只会把坏数据藏起来：
+      `SCORE` 但 `g_score` 是 `NaN`（`NaN > 0` 为假 ⇒ 判白胜）、
+      `RESIGN` 但 `g_resign_side == -1`（≠ 0 ⇒ 判黑胜）。
+    """
+    re_arr = np.asarray(g_re)
+    score_arr = np.asarray(g_score, np.float32)
+    side_arr = np.asarray(g_resign_side)
+    out = np.full(re_arr.shape, OUTCOME_DRAW, np.int64)
+
+    is_score = re_arr == RE_CLASS_SCORE
+    is_resign = re_arr == RE_CLASS_RESIGN
+    # SCORE：符号已是黑−白，> 0 即黑胜
+    out[is_score] = np.where(score_arr[is_score] > 0, OUTCOME_BLACK, OUTCOME_WHITE)
+    # RESIGN：side==0 是**黑**认输 ⇒ 白胜；side==1 是白认输 ⇒ 黑胜
+    out[is_resign] = np.where(side_arr[is_resign] == 0, OUTCOME_WHITE, OUTCOME_BLACK)
+    return out
 
 
 def classify_rules(ru: Optional[str]) -> int:
@@ -628,6 +671,7 @@ def scan_corpus(sgf_dirs: Sequence[str] = (), parser: Optional[SGFParser] = None
     score_l: List[Optional[float]] = []
     rules_l: List[int] = []
     resign_l: List[bool] = []
+    resign_side_l: List[int] = []
     recls_l: List[int] = []
     has_komi_l: List[bool] = []
     ru_cls = [0, 0, 0, 0]
@@ -727,6 +771,9 @@ def scan_corpus(sgf_dirs: Sequence[str] = (), parser: Optional[SGFParser] = None
         score_l.append(ri.score)
         rules_l.append(int(parse_rules(ru)))
         resign_l.append(bool(ri.is_resign))
+        # ⚠ 方向只在这一行能拿到（`ResultInfo.resign_side` 是 None/0/1），
+        # 而落盘侧用 -1 表示「非认输」—— 因为 0 在那边有实义（黑认输）。
+        resign_side_l.append(-1 if ri.resign_side is None else int(ri.resign_side))
         recls_l.append(cls)
         has_komi_l.append('KM' in props)
 
@@ -749,6 +796,7 @@ def scan_corpus(sgf_dirs: Sequence[str] = (), parser: Optional[SGFParser] = None
     scan.score = np.asarray([np.nan if s is None else s for s in score_l], np.float16)
     scan.rules = np.asarray(rules_l, np.int8)
     scan.resign = np.asarray(resign_l, np.bool_)
+    scan.resign_side = np.asarray(resign_side_l, np.int8)
     scan.re = np.asarray(recls_l, np.int8)
     scan.has_komi = np.asarray(has_komi_l, np.bool_)
     # 提前收工时尾部几局没进过 flush ⇒ 没有签名。补零占位（它们也没有任何锚点
@@ -862,6 +910,10 @@ def build_sidecar(dataset: str, sgf_dirs: Sequence[str], out: str,
     g_score = np.full(G, np.nan, np.float16)
     g_rules = np.full(G, RULES_DEFAULT, np.int8)
     g_resign = np.zeros(G, np.bool_)
+    g_re = np.full(G, RE_CLASS_UNKNOWN, np.int8)
+    # ⚠ 未匹配的局回落到 `-1`（「非认输」），**不是** 0 —— 0 有实义（黑认输）。
+    # 回落成 0 会让 `derive_outcome` 把它们判成黑认输，凭空造出一批标签。
+    g_resign_side = np.full(G, -1, np.int8)
     # ⚠ 左索引是 **slot**（`sidecar[game_ids]` 的下标），右索引才是**语料局号**。
     # 两者不是一回事：语料 17 万局、sidecar 16 万局，且 slot 只按升序排。
     # 写反了就是 `IndexError`，或更糟 —— 在大小恰好相同时静默串味。
@@ -873,12 +925,15 @@ def build_sidecar(dataset: str, sgf_dirs: Sequence[str], out: str,
     g_score[slots[finite]] = scan.score[src[finite]]
     g_rules[slots] = scan.rules[src]
     g_resign[slots] = scan.resign[src]
+    g_re[slots] = scan.re[src]
+    g_resign_side[slots] = scan.resign_side[src]
 
     n_matched = int(sel.sum())
     n_unmatched = G - n_matched
 
     os.makedirs(os.path.dirname(os.path.abspath(out)) or '.', exist_ok=True)
-    np.savez(out, g_komi=g_komi, g_score=g_score, g_rules=g_rules, g_resign=g_resign)
+    np.savez(out, g_komi=g_komi, g_score=g_score, g_rules=g_rules, g_resign=g_resign,
+             g_re=g_re, g_resign_side=g_resign_side)
 
     report: Dict[str, object] = dict(
         out=out, n_games=G, n_rows=n_rows_total, n_runs=n_runs,
@@ -920,7 +975,8 @@ def print_report(rep: Dict[str, object], log: Callable[[str], None] = _log) -> N
         f' / {rep["n_sgf_positions"]} 个锚点前缀')
     log(f'  匹配            {m} / {G}  ({100.0 * m / max(G, 1):.2f}%)')
     log(f'  未匹配          {u} / {G}  ({100.0 * u / max(G, 1):.2f}%)'
-        f'   → g_komi=0, g_score=NaN, g_rules={RULES_DEFAULT:#04x}, g_resign=False')
+        f'   → g_komi=0, g_score=NaN, g_rules={RULES_DEFAULT:#04x}, g_resign=False, '
+        f'g_re={RE_CLASS_UNKNOWN}（无结果）, g_resign_side=-1（非认输）')
     log(f'  锚点段命中      {rep["n_runs_hit"]} 段')
     log(f'                  布局歧义：主锚点 {rep["n_anchor_ambiguous"]} 段 / '
         f'交叉锚点 {rep["n_anchor_ambiguous_cross"]} 段（歧义时取最早那份）')
@@ -955,7 +1011,8 @@ def _save_scan_cache(path: str, scan: CorpusScan, index: AnchorIndex) -> None:
     keys = sorted(scan.stats)
     np.savez(path,
              komi=scan.komi, score=scan.score, rules=scan.rules, resign=scan.resign,
-             re=scan.re, has_komi=scan.has_komi, sig=scan.sig,
+             re=scan.re, resign_side=scan.resign_side,
+             has_komi=scan.has_komi, sig=scan.sig,
              pos_hash=index._sh, sgf_of_pos=index._ss, offset_of_pos=index._so,
              stat_keys=np.array(keys), stat_vals=np.array([scan.stats[k] for k in keys],
                                                           np.int64))
@@ -970,6 +1027,10 @@ def _load_scan_cache(path: str) -> Tuple[Optional[CorpusScan], Optional[AnchorIn
         scan.rules = z['rules']
         scan.resign = z['resign']
         scan.re = z['re']
+        # ⚠ 这一列**不能**从旧的 `resign`（bool）推出来 —— bool 没有方向。
+        # 缺键就抛 KeyError，被下面的 except 吞成 `(None, None)` ⇒ 调用方**重扫**。
+        # 宁可重扫一遍 133,604 局，也不能静默填一个方向错乱的默认值。
+        scan.resign_side = z['resign_side']
         scan.has_komi = z['has_komi']
         scan.sig = z['sig']
         scan.stats = {str(k): int(v) for k, v in zip(z['stat_keys'], z['stat_vals'])}

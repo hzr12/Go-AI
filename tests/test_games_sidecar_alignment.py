@@ -312,7 +312,13 @@ def test_sidecar_dtypes_match_spec(tiny):
     assert z['g_score'].dtype == np.float16
     assert z['g_rules'].dtype == np.int8
     assert z['g_resign'].dtype == np.bool_
-    assert set(z.files) == {'g_komi', 'g_score', 'g_rules', 'g_resign'}
+    assert z['g_re'].dtype == np.int8
+    assert z['g_resign_side'].dtype == np.int8
+    # ⚠ A 阶段的硬 outcome 标签要靠 `g_re`（RE 四分类）+ `g_resign_side`（谁认输），
+    # 光有 `g_resign`（bool）定不出方向 ⇒ 这两列是**必须**的，不是可选的冗余。
+    # 契约见 `tests/test_sidecar_re_labels.py` 与 `derive_outcome`。
+    assert set(z.files) == {'g_komi', 'g_score', 'g_rules', 'g_resign',
+                             'g_re', 'g_resign_side'}
 
 
 def test_anchor_is_immune_to_game_id_reuse(tmp_path):

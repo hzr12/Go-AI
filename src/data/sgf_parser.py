@@ -46,22 +46,32 @@ class ResultInfo:
 
     返回约定（三态必须可区分，所以不给「万能的 -1/None」）
     --------------------------------------------------------
-    | 情形 | `score` | `is_draw` | `is_resign` |
-    |---|---|---|---|
-    | 数值分差 `B+2.5` / `W+3.5` | `+2.5` / `-3.5` | False | False |
-    | 和棋 `0` / `draw` | `0.0` | **True** | False |
-    | 认输 `B+R` / `W+T` / `B+F` | `None` | False | **True** |
-    | 无结果 / 空 / `?` / `Void` / `B+` | `None` | False | False |
+    | 情形 | `score` | `is_draw` | `is_resign` | `resign_side` |
+    |---|---|---|---|---|
+    | 数值分差 `B+2.5` / `W+3.5` | `+2.5` / `-3.5` | False | False | None |
+    | 和棋 `0` / `draw` | `0.0` | **True** | False | None |
+    | 认输 `B+R` / `W+T` / `B+F` | `None` | False | **True** | **0** |
+    | 认输 `W+R` / `W+T` / `W+F` | `None` | False | **True** | **1** |
+    | 无结果 / 空 / `?` / `Void` / `B+` | `None` | False | False | None |
 
     ⚠ **`score is None` 单独出现时无法区分「认输」与「无结果」** —— 训练侧若要
     这个区别必须读 `is_resign`（`games.npz` 的 `g_resign` 就是它的落盘形式）。
     `score` 的符号约定是**黑−白**：`B+2.5 → +2.5`，`W+3.5 → -3.5`。
 
     ⚠ `score` 是 SGF 的最终分差，**含贴目**，不是「净胜目数」。
+
+    ⚠ **`resign_side` 是「谁认输」，不是「谁赢」**：`B+R` ⇒ 0（黑认输 ⇒ 白赢）。
+    它**只**在 `is_resign` 为 True 时有值，其余一律 None —— `B+` / `W+`（空分差，
+    实测 95 局）胜负已定但分差不可知，那**不是认输**。语料里 63.8% 是认输，
+    只有这一列能告诉训练侧方向；`games.npz` 的 `g_resign_side` 是它的落盘形式。
     """
     score: Optional[float]
     is_draw: bool
     is_resign: bool
+    #: 0 = 黑认输 / 1 = 白认输 / None = 非认输。
+    #: ⚠ **必须放在末尾并带默认值**：全仓（`parse_result` 的 8 处 +
+    #: `GameRecord.result_info` 的 default_factory）都用位置三元组构造。
+    resign_side: Optional[int] = None
 
 
 # `g_rules` 的 bit 布局（spec §5.3.2）。**每一位都是「1 = 非 TT 默认值」的标志位**，
@@ -123,7 +133,9 @@ def parse_result(re_str: Optional[str]) -> ResultInfo:
 
     low_rest = rest.lower()
     if low_rest in _RE_RESIGN_WORDS:
-        return ResultInfo(None, False, True)
+        # `who` 是前缀字母，**方向只能从这里取** —— 余部（`R`/`T`/`F`）不带信息。
+        # 0 = 黑认输、1 = 白认输；`B+R` 意味着白赢，名字容易读反，见 `ResultInfo`。
+        return ResultInfo(None, False, True, 0 if who == 'B' else 1)
 
     mm = _RE_MARGIN_RE.match(rest)
     if mm is None:
