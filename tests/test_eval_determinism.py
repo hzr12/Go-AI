@@ -108,12 +108,14 @@ class _FakeDataset:
         self.rngs = []            # 每次调用收到的 rng 对象（None = 走了全局）
         self.first_draw = None    # 首次调用抽到的变换向量
 
-    def sample_batch_numpy(self, idxs, rng=None, augment=True):
+    def sample_batch_numpy(self, idxs, rng=None, augment=True, labels=False):
         # `augment` 只为签名兼容而存在（真实实现新增了它，评估路径传 False）。
         # 本假 dataset **刻意忽略**它、继续照常抽变换：本文件锁的是「采样源被固定 +
         # 消耗不逃逸」，它的断言（尤其用例 1 的空转守卫 forced_tform 0 → top1=1.0）
         # 就建立在「eval 真的消费了抽到的变换」这个前提上。关增强那一半由
         # tests/test_eval_no_augment.py 单独覆盖。
+        # `labels` 同样只为签名兼容而存在（真实实现的 `labels=True` 会多返第四个
+        # 元素 labels_dict，见 dataset.py 的 4 元组契约）；评估路径永远传 False。
         sel = np.asarray(list(idxs), dtype=np.int64)
         B = len(sel)
         self.batch_sizes.append(B)

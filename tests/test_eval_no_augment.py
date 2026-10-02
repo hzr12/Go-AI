@@ -216,7 +216,10 @@ class _AugDataset:
         self.batch_sizes = []
         self.augment_flags = []
 
-    def sample_batch_numpy(self, idxs, rng=None, augment=True):
+    def sample_batch_numpy(self, idxs, rng=None, augment=True, labels=False):
+        # `labels` 只为签名兼容而存在（真实实现的 `labels=True` 会多返第四个元素
+        # labels_dict，见 dataset.py 的 4 元组契约）；本文件锁的是 augment 的语义，
+        # 评估路径永远传 labels=False。
         sel = np.asarray(list(idxs), dtype=np.int64)
         B = len(sel)
         self.batch_sizes.append(B)

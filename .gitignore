@@ -49,6 +49,6 @@ wandb/
 .DS_Store
 Thumbs.db
 /tmp
-
+*.zip
 /docs
 /katago

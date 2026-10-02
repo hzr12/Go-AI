@@ -33,29 +33,18 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# 散列唯一真相（与打标签端共用，见 pos_hash_block 的 docstring）
+from src.data.pos_hash import pos_hash_block as _pos_hash_block  # noqa: E402
+
 
 def pos_hash_block(boards, to_play, ko):
-    """位置 hash（与 scripts/probe0_join.py 同口径：board+to_play+ko）。
+    """位置 hash —— **直接复用 `src.data.pos_hash` 的唯一实现**。
 
-    ⚠ 权重必须是**固定种子**的常量：改种子会让此前存下的所有索引缓存失效。
-    向量化线性散列，3420 万行约 60~130 秒（实测 127s）。
+    ⚠ 不要在这里重抄一份散列实现：口径一旦与打标签端（`label_sgf.py` →
+      `probe0_join` → `pos_hash`）漂移，join 会**静默变成空**，而症状看起来
+      像「这批局面真的没标签」。单点真相在 `src/data/pos_hash.py`。
     """
-    B = boards.shape[0]
-    idx = (boards.reshape(B, -1).astype(np.int8) + np.int8(1)).astype(np.uint64)
-    h1 = idx.dot(_W1)
-    h2 = idx.dot(_W2)
-    out = h1 * np.uint64(0x9E3779B97F4A7C15) + h2 + _SEED
-    tp = to_play.astype(np.int8).astype(np.uint64)
-    ko16 = ko.astype(np.int16).astype(np.uint64)
-    out = out + tp * np.uint64(0xC2B2AE3D27D4EB4F) + \
-        (ko16 + np.uint64(1)) * np.uint64(0x165667B19E3779F9)
-    return out
-
-
-_HASH_SEED = 0x5EED19191919
-_W1 = np.random.default_rng(_HASH_SEED).integers(1, 2**63, 361, dtype=np.uint64)
-_W2 = np.random.default_rng(_HASH_SEED + 1).integers(1, 2**63, 361, dtype=np.uint64)
-_SEED = np.uint64(0x243F6A8885A308D3)
+    return _pos_hash_block(boards, to_play, ko)
 
 
 def main():

@@ -1307,6 +1307,11 @@ def _read_log_scalars(loss, policy_loss, value_loss):
 # 上，d(CE)/d(logit)=p−y 每坐标有界且与 A 无关）。实测 ce+huber、w=1 的
 # value:policy 梯度比 = 1.113:1（与 P4.5 报告记录的 ce 备选口径逐位一致），
 # 与老的 ce+5·bce（2.225:1）同一量级，**不需要补偿旋钮**。
+#
+# ⚠ **软标签接入（A2）新增了第三种 kind `soft_ce`（软 CE），但 CLI 侧
+# `--policy-loss` 的 choices 仍冻结在 ['huber','ce']** —— tests/test_huber_loss.py
+# ::test_no_new_cli_params 以 D1「零新增/零删除/零改名」把 61 个 flag 整个钉死。
+# `soft_ce` 与 `--soft-weight` 的 CLI 入口属 A4（那一票才允许改冻结集）。
 
 
 
@@ -1360,17 +1365,69 @@ def huber_loss(pred, target, beta=0.5, reduction='mean'):
     return F.smooth_l1_loss(pred, target, beta=beta, reduction=reduction)
 
 
+def soft_cross_entropy(policy_logits, soft, soft_mask, soft_weight=1.0):
+    """**软标签**交叉熵：`mean_b( mask_b · (−Σ_a soft_b[a]·log_softmax(logits_b)[a]) )`。
+
+    参数
+    ----
+    policy_logits : (B, A) —— 模型输出，**logits**（不是概率；归一化在本函数里做）
+    soft          : (B, A) —— KataGo 访问分布，**概率**（行和 ≈ 1；最后一项是 pass）
+    soft_mask     : (B,)  —— 1 = 该行走软 CE，0 = 该行**不参与**软项
+    soft_weight   : float —— 软项的全局缩放（`--soft-weight` 的函数侧形参；默认 1.0）
+
+    ⚠ **掩码是逐行二选一，不是混合。** `mask=0` 的行贡献**恰好 0**，**不退化
+    成 one-hot CE**、也不与软项按比例插值。理由（spec §5.7）：同一个 head 同时
+    收到「搜索分布」与「人类 one-hot」会去折中而不是学搜索。段 2/3 用独立采样器
+    **只取软行**（`--soft-only-sampling`）来喂蒸馏，不靠混合权重。
+
+    ⚠ **分母恒为 B（不是 mask 的和）。** 这是上面那条「二选一」的直接推论：
+    掩掉的行既不进分子也不进分母 ⇒ 软项的量级随「本批软行占比」线性变化。
+    段 2 的采样器把占比拉到 1，所以正常训练里 B == Σmask；要在这里改成
+    `sum / mask.sum()`（占比无关的平均）会让软项的量级与 1.0 权重的含义
+    随 batch 组成漂移。`soft_weight` 就是给这个全局量级用的旋钮。
+
+    ⚠ 精度：**升到 float32，但绝不上 float64**。autocast 下 logits 可能是
+    fp16/bf16，而软 target 在低精度下会被舍入掉可观的相对误差（bf16 只有 8 位
+    尾数，0.001 量级的概率直接被抹平），所以要 `.to(torch.float32)`。
+    但 910A **没有 fp64 硬件**，任何设备侧 fp64 都走「cast 成 fp32」的兜底，
+    而实测那条兜底路径会挂 AICPU（`EXCEPTION TASK: task type=aicpu kernel`），
+    且故障是**异步**的——报错栈会指向后面第一次同步的无关算子，极难定位。
+    由 `tests/test_no_aicpu_ops_in_startup_check.py::test_no_fp64_anywhere_on_the_device_path`
+    钉死。返回标量张量（fp32）。
+    """
+    if soft is None or soft_mask is None:
+        raise ValueError(
+            "compute_policy_loss(kind='soft_ce') 需要 soft (B,A) 与 soft_mask (B,)；"
+            " 现状二者都是 None —— 软标签的接线在 A3/A4（预取器透传 dict + CLI）")
+    if tuple(soft.shape) != tuple(policy_logits.shape):
+        raise ValueError(f"soft {tuple(soft.shape)} 与 logits "
+                         f"{tuple(policy_logits.shape)} 形状不符")
+    # 一律 fp32：见 docstring 的 910A/fp64 段。`soft` 是 fp16（.npz 里就是
+    # float16），直接乘会把 0.001 量级的概率舍掉，必须先升到 fp32。
+    calc_dtype = torch.float32
+    logp = F.log_softmax(policy_logits.to(calc_dtype), dim=-1)
+    tgt = soft.reshape(logp.shape).to(calc_dtype)
+    per_row = -(tgt * logp).sum(dim=-1)                     # (B,) 每行的软 CE
+    mask = soft_mask.reshape(-1).to(calc_dtype)             # (B,) 逐行二选一
+    if mask.numel() != per_row.numel():
+        raise ValueError(f"soft_mask 长度 {mask.numel()} 与 batch {per_row.numel()} 不符")
+    return float(soft_weight) * (per_row * mask).mean()
+
+
 def compute_policy_loss(policy_logits, move_t, kind,
-                        label_smoothing=0.1, huber_beta=0.5):
+                        label_smoothing=0.1, huber_beta=0.5,
+                        soft=None, soft_mask=None, soft_weight=1.0):
     """按 `--policy-loss` 分派 policy 损失；返回标量张量。
 
     **默认 kind='ce'**（P4.5b 用户裁决）。`huber` 分支保留，仅供复现 D4/P4.5
     的实验；它不是默认的理由写在 docstring 末尾的「P4.5b」一节（梯度尺度对
     动作空间 A 的结构性依赖），别只看 `default=` 那一行就改回去。
 
+    三种 kind 的语义（软标签接入后新增第 3 条，前两条**逐位不变**）
+    --------------------------------------------------------------
     kind='ce'   —— **原口径原样保留**：`F.cross_entropy(logits, move_t,
         label_smoothing=...)`，与 D4 之前的调用逐字相同（默认 label_smoothing
-        0.1 也照旧生效），数值行为不得改变。
+        0.1 也照旧生效），数值行为不得改变。目标 = **人类/自对弈的 one-hot**。
     kind='huber' —— 对 policy **目标**（label-smoothed one-hot 分布）做 Huber：
         · 目标 y = (1−eps)·onehot(move_t) + eps/A（eps = label_smoothing，
           A = 动作数）—— 与 `F.cross_entropy(label_smoothing=eps)` 用的是
@@ -1378,6 +1435,19 @@ def compute_policy_loss(policy_logits, move_t, kind,
         · 预测侧 = `softmax(policy_logits)`（模型输出是 logits，目标是概率
           分布，必须先归一化到同一值域 [0,1] 才能逐元素回归）；
         · 归约 = **类内 sum over A，再对 batch 取 mean**（P4.5-fix 修，见下）。
+    kind='soft_ce' —— **软标签**交叉熵（蒸馏，spec §5.7）。目标不是 one-hot 而是
+        KataGo 的**访问分布** `soft` (B,A)（361 落点 + pass），由
+        `SupervisedDataset(..., soft_idx=, soft_policy=)` 挂载、经
+        `labels=True` 返回的 `labels_dict['soft']` 送来，且**已随 `states` 同步
+        重排过对称变换**（`permute_soft`）。掩码 `soft_mask` **逐行二选一**：
+        1 = 该行只算软 CE，0 = 该行对软项贡献恰好 0（**不退化成 one-hot CE**、
+        不做插值）—— 理由与分母约定见 `soft_cross_entropy` 的 docstring。
+
+    ⚠ `kind='soft_ce'` 走的是**新参数** `soft` / `soft_mask` / `soft_weight`；
+    `huber` / `ce` 两条既有路径**完全不看这三个形参**，数值逐位不变（有测试钉着）。
+    CLI 侧的 `--policy-loss` choices 仍冻结在 `['huber','ce']`
+    （tests/test_huber_loss.py::test_no_new_cli_params，D1 零新增），
+    `--soft-weight` 的 CLI 入口属 A4；本函数已带好同名形参（默认 1.0）。
 
     ⚠ **P4.5-fix：归约口径是修过的实现 bug，不是设计选择。**
     D4 首版用 `huber_loss(..., reduction='mean')`，对 **B×A 个元素**求均值；
@@ -1457,7 +1527,10 @@ def compute_policy_loss(policy_logits, move_t, kind,
         # 保住逐元素 Huber 与逐样本归约的写法）
         return huber_loss(pred, target, beta=huber_beta,
                           reduction='none').sum(dim=-1).mean()
-    raise ValueError(f"--policy-loss 只接受 huber|ce，收到 {kind!r}")
+    if kind == 'soft_ce':
+        return soft_cross_entropy(policy_logits, soft, soft_mask,
+                                  soft_weight=soft_weight)
+    raise ValueError(f"--policy-loss 只接受 huber|ce|soft_ce，收到 {kind!r}")
 
 
 def compute_value_loss(value_pred, value_target, kind, huber_beta=0.5):

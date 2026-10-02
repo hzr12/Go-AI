@@ -295,20 +295,31 @@ def build_queries(paths, move_lo, move_hi, max_games, seed, game_frac=0.0):
 def find_katago_exe():
     """自动找 katago 可执行文件（跨 Windows/Linux）。
 
-    约定：`katago/<平台目录>/katago[.exe]`，或 PATH 里的 `katago`。
-    找不到就返回 None，由调用方报明确错误而不是 FileNotFoundError。
+    ⚠ **同名不同平台要挑对的**：soft_tag 包里同时有 `katago/katago`（Linux ELF）
+      和（若在 Windows 上测试时）`katago/katago.exe`。按 glob 顺序取第一个会在
+      Windows 上选中 ELF，报 `WinError 193 %1 不是有效的 Win32 应用程序`。
+      故按平台显式偏好带后缀的那个。
     """
     import glob
     import shutil
+    import sys as _sys
     base = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "katago")
+    win = _sys.platform.startswith("win")
+    # 覆盖两种摆放：`katago/katago[.exe]`（本包）与 `katago/<子目录>/katago[.exe]`
+    # （仓库里解压的版本）。Windows 优先 .exe —— 同目录可能并存 Linux ELF 与
+    # Windows .exe（冒烟测试时就会），取错会报 WinError 193。
+    if win:
+        pats = ("katago.exe", "katago*/katago.exe", "*/katago.exe",
+                "katago", "katago*/katago", "*/katago")
+    else:
+        pats = ("katago", "katago*/katago", "*/katago",
+                "katago.exe", "katago*/katago.exe", "*/katago.exe")
     if os.path.isdir(base):
-        for pat in ("katago*/katago.exe", "katago*/katago",
-                    "*/katago.exe", "*/katago", "katago", "katago.exe"):
-            hits = sorted(glob.glob(os.path.join(base, pat)))
-            # 必须可执行（Linux 上 +x）
-            for h in hits:
-                if os.access(h, os.X_OK) or h.endswith(".exe"):
+        for pat in pats:
+            for h in sorted(glob.glob(os.path.join(base, pat))):
+                if os.path.isfile(h) and (h.endswith(".exe")
+                                         or os.access(h, os.X_OK)):
                     return h
     return shutil.which("katago")
 
@@ -335,7 +346,9 @@ def find_model():
 
 def main():
     ap = argparse.ArgumentParser(description="KataGo 批量打搜索标签")
-    ap.add_argument("--sgf-dir", default=os.path.join("data", "games", "games"))
+    ap.add_argument("--sgf-dir", default=None,
+                    help="SGF 目录；不给则优先用 <repo>/data/sgf，"
+                         "否则 <repo>/data/games/games")
     ap.add_argument("--exe", default=None,
                     help="katago 可执行文件；不给则自动在 katago/ 下找")
     ap.add_argument("--model", default=None,
@@ -363,6 +376,18 @@ def main():
     ap.add_argument("--out", default=os.path.join("data", "labels", "kata_labels.npz"))
     args = ap.parse_args()
 
+    # SGF 目录：soft_tag 包里是 data/sgf（扁平 + 源名前缀），
+    # 仓库里是 data/games/games（分源子目录）。两者都支持（glob 带 **）。
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if args.sgf_dir is None:
+        for cand in (os.path.join(repo, "data", "sgf"),
+                     os.path.join(repo, "data", "games", "games")):
+            if os.path.isdir(cand):
+                args.sgf_dir = cand
+                break
+        else:
+            raise SystemExit("找不到 SGF 目录（试了 data/sgf 与 data/games/games），"
+                             "请用 --sgf-dir 指定")
     paths = sorted(glob.glob(os.path.join(args.sgf_dir, "**", "*.sgf"), recursive=True))
     if not paths:
         raise SystemExit(f"没找到 SGF: {args.sgf_dir}")
@@ -384,7 +409,13 @@ def main():
                                      args.max_games, args.seed, args.game_frac)
     print(f"选中 {n_sel} 局 -> {args.move_lo}~{args.move_hi} 手共 "
           f"{len(positions):,} 个候选局面")
-    positions = positions[: args.limit]
+    # limit<=0 表示「全打」——不能写成 positions[:0]，那会静默产出空批次
+    # （用户以为在跑 1.5%，实际一个标签都没有）。
+    n_all = len(positions)
+    if args.limit and args.limit > 0:
+        positions = positions[: args.limit]
+    else:
+        print(f"limit<=0 -> 全打 {n_all:,} 个候选局面")
     print(f"本次打标签 {len(positions):,} 个局面，"
           f"maxVisits={args.max_visits}（引擎实际达成 {args.max_visits+1}），"
           f"并发={args.concurrency}")
@@ -394,8 +425,8 @@ def main():
     # 长跑（几小时~几天）中途若崩/被kill，已打的标签还在，可续跑；
     # 攒内存的写法一崩就全丢，这也是第一版跑完 8 分钟输出为空的原因之一。
     part = os.path.splitext(args.out)[0]
-    # 引擎**必须在项目根启动**（KataGo 的 KataGoData/ 按 cwd 解析）
-    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # repo 已在上面（SGF 目录探测处）算好：引擎**必须在项目根启动**
+    #（KataGo 的 KataGoData/ 按 cwd 解析）
     done_marker = part + ".done.n"
     done = int(open(done_marker).read().strip()) \
         if os.path.exists(done_marker) else 0

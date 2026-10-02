@@ -72,7 +72,7 @@ class _FakeDataset:
         """被请求的批数（= 评估函数实际跑的批数）。"""
         return len(self.batch_sizes)
 
-    def sample_batch_numpy(self, sel, rng=None, augment=True):
+    def sample_batch_numpy(self, sel, rng=None, augment=True, labels=False):
         """`rng` 是评估侧固定采样源传进来的随机源（P2.2 新增），本假 dataset **刻意不用它**。
 
         本模块锁的是「批数预算 / 截断可见化」，数值必须由 `sel` 单独决定，才谈得上
@@ -81,6 +81,10 @@ class _FakeDataset:
 
         `augment` 同理只为签名兼容而存在（真实实现新增了它，评估路径传 False），本假
         dataset 刻意不用 —— 它要能对同一份 `sel` 重复给出同一批数值。
+
+        `labels` 同理只为签名兼容而存在（真实实现的 `labels=True` 会多返一个
+        labels_dict，见 dataset.py 的 4 元组契约）。评估路径永远传 False，
+        形参存在只是为了让 `train_sft.py` 任何一处传 `labels=True` 都不 TypeError。
         """
         sel = np.asarray(list(sel), dtype=np.int64)
         B = len(sel)
