@@ -19,12 +19,16 @@ models/
 *.onnx
 
 # 数据集（原始 SGF / 生成的 npz 较大）
-data/*.npz
-data/*.tgz
-data/*.tar.gz
-data/raw/
-data/games/
-data/*.sgf
+# ⚠ 必须是 `/data`：**裸 `data` 会匹配任意层级的 data 目录**，包括
+# `src/data/` —— 那里面是要提交源码的（`katago_npz.py` / `pos_hash.py`）。
+# 曾因此需要 `git add -f` 才能提交 `src/data/katago_npz.py`。
+/data
+/data/*.npz
+/data/*.tgz
+/data/*.tar.gz
+/data/raw/
+/data/games/
+/data/*.sgf
 
 # 日志与中间产物
 runs/
@@ -41,3 +45,6 @@ wandb/
 .DS_Store
 Thumbs.db
 /tmp
+
+/docs
+/katago
