@@ -52,3 +52,6 @@ Thumbs.db
 *.zip
 /docs
 /katago
+# Windows 保留设备名 'nul' 的残留产物（来源未查明，全量门禁后偶发）
+nul.npz
+tmp_smoke*.py
