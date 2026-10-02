@@ -20,10 +20,24 @@
 翻转/旋转污染，详见该方法的 docstring。
 """
 
+import os
+
 import numpy as np
 import torch
 
+from src.data.feature_v7_gather import FUTUREPOS_OFFSETS, gather_neighbors
 from src.game.go_rules import GoBoard, SYMMETRIES, _check_n_channels
+
+
+#: ``future``（futurepos 标签）里**不可用行**的哨兵值。
+#:
+#: 🔴 为什么不能是 0：0/1 恰好是「对手一颗子都不占」这个**完全合法的标签**，
+#: 所以「盘面丢了」与「对手没占点」在纯 {0,1} 下不可区分，且不可逆
+#: （这与 `src/data/pos_hash.py` 警告的「假信号」是同一类病）。
+#: `-1.0` 落在标签域 {0,1} 之外 ⇒ ① 不是「无占用」；② 也不是「对方占满」
+#: （那是全 1，同样看起来无害）；③ 任何 0.5 阈值的消费方都不会把它判成有效占用。
+#: 第四道保险是 `w['futurepos_h*']` = 0：哨兵管「看到了什么」，权重管「算不算」。
+FUTUREPOS_SENTINEL = np.float32(-1.0)
 
 
 def permute_soft(soft, tforms, board_size):
@@ -82,6 +96,38 @@ def permute_soft(soft, tforms, board_size):
             continue
         out[m, :A - 1] = soft[m][:, invs[t]]   # 目标位取来源位
     return out.astype(soft.dtype)
+
+
+def _permute_future(future, tforms, board_size):
+    """按每个样本的对称变换重排 ``future`` 的最后一维（(B,2,bs²) 扁平占用图）。
+
+    🔴 **为什么复用 `permute_soft` 而不是另写一份置换**：置换方向极易搞反
+    （见 `permute_soft` 上面那段踩坑注释），而 `future` 是**标签**——方向错了
+    不报错，只是 loss 照降、棋力不涨。本文件里唯一已被
+    `tests/test_dataset_soft_labels.py::test_soft_argmax_agrees_with_moves_out_after_augment`
+    钉住方向的置换实现就是 `permute_soft`，所以这里**不加第二份**。
+
+    `permute_soft` 的契约是 (B, A=n²+1) 且**最后一格是 pass、任何变换都不动**。
+    `future` 没有 pass 格，于是补一个恒 0 的哑格调用它、再把哑格丢掉 —— 哑格恒 0
+    所以「不动它」这条规则对它无影响。顺带白拿 `permute_soft` 的 float64 中间量
+    语义（先 float64 算再转回原 dtype）。
+
+    两个 horizon 走**同一个** `tforms`（前提见 `attach_futurepos` 的「对称增广」段）。
+    """
+    f = np.asarray(future)
+    if f.ndim != 3 or f.shape[1] != 2 or f.shape[2] != board_size * board_size:
+        raise ValueError(f'_permute_future: 应为 (B,2,{board_size ** 2})，'
+                         f'实得 {f.shape}')
+    tforms = np.asarray(tforms)
+    if tforms.shape[0] != f.shape[0]:
+        raise ValueError(f'_permute_future: tforms 长度 {tforms.shape[0]} 与批 '
+                         f'{f.shape[0]} 不符')
+    bs2 = board_size * board_size
+    # (B,2,bs²) -> (B*2, bs²+1)：哑格恒 0
+    padded = np.zeros((f.shape[0] * 2, bs2 + 1), dtype=f.dtype)
+    padded[:, :bs2] = f.reshape(f.shape[0] * 2, bs2)
+    out = permute_soft(padded, np.repeat(tforms, 2), board_size)
+    return out[:, :bs2].reshape(f.shape)
 
 
 def permute_move_vector(moves, tforms, board_size):
@@ -170,6 +216,16 @@ class SupervisedDataset:
         if soft_idx is not None and soft_policy is not None:
             self._attach_soft(soft_idx, soft_policy)
 
+        # ---- futurepos（未来 2 手位置）——**可选，默认关闭 = 逐字节零回归** ----
+        # 关闭的理由**不是**设计偏好，而是两个既有测试钉死的：
+        # `tests/test_dataset_soft_labels.py::test_placeholder_labels_are_zeros_
+        # with_zero_weights` 在**默认构造**的 dataset 上断言 `w['futurepos'].sum()
+        # == 0`，`tests/test_prefetch_labels.py::test_future_placeholder_stays_
+        # zeros_through_the_prefetcher` 断言 `future` 全零。⚠ **不要**为了「让
+        # futurepos 默认生效」去改那两条测试——它们钉的是 A6 之前的历史契约。
+        # `self._fp` 见 `attach_futurepos`；None = 未启用。
+        self._fp = None
+
     def _attach_soft(self, soft_idx, soft_policy):
         """挂载软标签并建行→槽位映射。"""
         A = self.board_size * self.board_size + 1
@@ -220,6 +276,269 @@ class SupervisedDataset:
         if self.soft_row is None:
             return np.zeros(self.N, dtype=bool)
         return self.soft_row >= 0
+
+    # ---- futurepos（未来 2 手位置）----------------------------------------
+    #
+    # 语义
+    # ----
+    # ``future[b, h, r*bs+c] ∈ {0,1}`` = 「点 (r,c) 上有**行 i 时该走子那一方的
+    # 对手**的子」，其中 h=0 取第 ``i+8`` 行盘面、h=1 取第 ``i+32`` 行盘面
+    # （``FUTUREPOS_OFFSETS = (8, 32)``，主数据集每局约 316 行，8/32 是实测选出
+    # 的「足够远」间隔）。
+    #
+    # 「对手」按**行 i 的 to_play** 定，不是按未来行的 to_play：i+1、i+2 轮到的
+    # 正是 ``-to_play[i]``。⇒ 两个 horizon 天然共用同一套「谁是对手」口径。
+    #
+    # 权重契约
+    # --------
+    # =============================  ==========================================
+    # 键                            形状 / 含义
+    # =============================  ==========================================
+    # ``future``                    (B,2,bs²) f32；h 有效 ⇒ {0,1}，否则全 -1
+    # ``w['futurepos']``            (B,)；**两路都有效**才 1.0
+    # ``w['futurepos_h0']``         (B,)；``i+8`` 那一路有效才 1.0
+    # ``w['futurepos_h1']``         (B,)；``i+32`` 那一路有效才 1.0
+    # =============================  ==========================================
+    #
+    # 🔴 **为什么 `w['futurepos']` 是「与」而不是「或」**：
+    # `src/networks/katago_v7_loss.py:362-368` 把 `future` reshape 成 (b,2,bs²)
+    # 之后压成**一个逐样本标量**，再乘**一个**权重；`_weighted_mean` 又是
+    # `(per_sample * weight).mean()`（**刻意不除 Σw**）。⇒ 权重的最小作用单位是
+    # 「整块 2×bs²」，不是单路。只活一路时若给 w=1，那一路的 -1 哨兵会被当成
+    # 真值去拟合 tanh ⇒ 头学出一个恒 -0.76 的假平面。所以单路有效性只能由
+    # `w['futurepos_h*']` 表达，整块权重必须为 0。
+    #
+    # 不可用行的哨兵
+    # --------------
+    # ``future[b, h, :] = FUTUREPOS_SENTINEL``（-1.0），**不是** 0。见
+    # :data:`FUTUREPOS_SENTINEL` 的论证。
+    #
+    # 对称增广
+    # --------
+    # 两路 h 是两个**不同时间点、同一局面**的未来盘面，因此走**同一个**
+    # `tforms`（镜像的是行 i 的盘面，两个未来时刻必须跟着一起镜像）。
+    # ⚠ 若将来两个 horizon 用了**不同**的 tforms，batch 内同一行就不存在
+    # 「一个统一的镜像」了——`states` 旋转 90° 而 h1 没转，等于把 h1 当成
+    # 「另一个镜像下的未来」在学，标签与输入不同源，且不报任何错。**所以两条
+    # 路必须共用同一个 `tforms`，这条是契约不是实现细节。**
+    def attach_futurepos(self, source=None, *, mode='live',
+                         dataset_npz=None, materialized_dir=None,
+                         offsets=FUTUREPOS_OFFSETS,
+                         table=None, table_valid=None):
+        """启用 futurepos 标签（**opt-in**，不调它就完全保持 A6 之前的占位行为）。
+
+        与 ``attach_soft`` 是同一个「构造之后再挂」的约定：构造器签名不加参数，
+        CLI 才能在拿到 dataset 之后再决定要不要开这个开关。
+
+        Parameters
+        ----------
+        mode:
+            - ``'live'``（默认，**段 1 训练用**）：每个 batch 走一次
+              ``gather_neighbors``，实时取 ``i+8`` / ``i+32`` 的盘面。
+            - ``'index'``（评估 / 自战 / 调用方已做过全量扫描）：读调用方预好的
+              整表 ``table``，**完全不做邻行 gather**。
+
+        source:
+            ``'live'`` 模式下 ``boards`` 的来源，可为
+            ``None``（用 ``self.boards``）/ ``.npy`` 路径 / memmap / ndarray。
+            ⚠ 传 ``.npz`` 路径**会报错**：``gather_neighbors`` 的 ``_reject_npz``
+            会拦下（mmap 对 zip 压缩成员无效，会静默退化成整份 12.3 GB 解压）。
+        dataset_npz / materialized_dir:
+            ``'live'`` 模式下「先落 .npy 再 mmap」的原料，见
+            :meth:`_futurepos_boards`。
+        table / table_valid:
+            ``mode='index'`` 的两张表：``table`` (N,2,bs²) bool、
+            ``table_valid`` (N,2) bool（缺省 = 全 True）。
+
+        Returns
+        -------
+        ``dict``：本次启用是否改变了 payload（供启动期打日志）。
+        """
+        bs = self.board_size
+        n_sq = bs * bs
+        if mode not in ('live', 'index'):
+            raise ValueError(f"futurepos mode 应为 'live'/'index'，实得 {mode!r}")
+        offsets = tuple(int(o) for o in offsets)
+        if len(offsets) != 2:
+            raise ValueError(f'futurepos 恒为 2 路（future 的第 1 轴长 2），'
+                             f'实得 {len(offsets)} 个偏移：{offsets}')
+        if 0 in offsets:
+            raise ValueError('futurepos 偏移不能是 0（那就是当前盘面，不是未来）')
+
+        if mode == 'index':
+            if table is None:
+                raise ValueError("mode='index' 必须给 table（N,2,bs²）")
+            tbl = np.asarray(table)
+            if tbl.shape != (self.N, 2, n_sq):
+                raise ValueError(f'table 应为 {(self.N, 2, n_sq)}，实得 {tbl.shape}')
+            if table_valid is None:
+                tv = np.ones((self.N, 2), dtype=bool)
+            else:
+                tv = np.asarray(table_valid, dtype=bool)
+                if tv.shape != (self.N, 2):
+                    raise ValueError(f'table_valid 应为 {(self.N, 2)}，实得 {tv.shape}')
+            self._fp = {'mode': 'index', 'offsets': offsets,
+                        'table': tbl, 'valid': tv, 'boards': None}
+            return self.futurepos_status()
+
+        self._fp = {'mode': 'live', 'offsets': offsets,
+                    'source': source, 'dataset_npz': dataset_npz,
+                    'materialized_dir': materialized_dir,
+                    'boards': None}          # 惰性解析的缓存位
+        return self.futurepos_status()
+
+    def _futurepos_boards(self):
+        """解析 ``boards`` 的 mmap 来源，**只做一次**，之后复用。
+
+        解析优先级（命中即止）
+        --------------------
+        1. ``attach_futurepos(source=...)`` 给了路径/数组 ⇒ 直接用，**零磁盘写**；
+        2. ``self.boards`` 本身是 memmap 或已在内存的 ndarray ⇒ 直接用，
+           **零磁盘写**。fancy-index 只触碰被点到的 B 行，不会整列读；
+        3. 给了 ``dataset_npz`` + ``materialized_dir`` ⇒ 调
+           ``kata_label_join.materialize_dataset`` 落 ``.npy`` 再 mmap。
+
+        第 3 步会往磁盘写什么、多大
+        ----------------------------
+        ``materialize_dataset(npz, dir, keys=('boards','to_play','ko','game_ids'))``：
+        ``boards.npy`` = ``N × bs × bs`` B（int8，主数据集 34.2M × 19 × 19 =
+        **12.3 GB**）、``to_play.npy`` 34 MB、``ko.npy`` 68 MB、``game_ids.npy``
+        137 MB。落盘耗时实测全量约 72s（478K 行/s），**一次落盘、之后反复扫描
+        都只按需分页**。
+
+        🔴 **为什么这条路径绝不能靠惰性触发**
+        ``sample_batch_numpy`` 是在 ``_prefetch_worker``（``mp.Process`` fork 出来
+        的子进程）里调的。惰性解析若发生在 fork 之后，**每个 worker 各解析一次**
+        ⇒ 12.3 GB × worker 数（还可能同时写同一个路径互相踩坏）。所以：
+        :meth:`warm_futurepos` 由调用方在**父进程 fork 之前**显式调，本方法里的
+        惰性解析只是「构造期就开了 futurepos 但忘了 warm」的兜底。
+        """
+        fp = self._fp
+        if fp is None:
+            raise RuntimeError('futurepos 未启用：请先调 attach_futurepos()')
+        if fp['mode'] == 'index':
+            raise RuntimeError("mode='index' 不做邻行 gather，不该走到 _futurepos_boards")
+        if fp['boards'] is not None:
+            return fp['boards']
+
+        boards = None
+        src = fp.get('source')
+        if src is not None:
+            if isinstance(src, (str, bytes, os.PathLike)):
+                p = os.fspath(src)
+                if p.endswith('.npz'):
+                    raise TypeError(
+                        f'futurepos source 不能是 .npz（{p}）：mmap 对 zip 压缩成员'
+                        f'无效，`np.load(..., mmap_mode="r")` 不报错但会整份解压。'
+                        f'先跑 `materialize_dataset(npz, dir)`，或直接传 boards.npy。')
+                boards = np.load(p, mmap_mode='r')
+            else:
+                boards = src
+        elif fp.get('dataset_npz') and fp.get('materialized_dir'):
+            # 第 3 步：唯一会写磁盘的分支，且**只在调用方显式给了两个路径时**。
+            from src.data.kata_label_join import materialize_dataset
+            d = fp['materialized_dir']
+            paths = materialize_dataset(fp['dataset_npz'], d,
+                                        keys=('boards', 'to_play', 'ko', 'game_ids'))
+            fp['materialized_paths'] = paths
+            boards = np.load(paths['boards'], mmap_mode='r')
+            # 三个小列一并换成 mmap 口径：它们只有几百 MB，但保持「同一份
+            # 物化产物」比保持「同一次解压」更重要（口径漂移 = 静默错标签）。
+            fp['cols'] = {k: np.load(paths[k], mmap_mode='r')
+                          for k in ('to_play', 'ko', 'game_ids')}
+        else:
+            boards = self.boards       # 第 2 步：零磁盘写
+
+        boards = np.asarray(boards)
+        if boards.shape != self.boards.shape:
+            raise ValueError(
+                f'futurepos 的 boards 来源形状 {boards.shape} 与数据集 '
+                f'{self.boards.shape} 不符（行数或盘面尺寸不同 ⇒ 偏移的语义变了）')
+        fp['boards'] = boards
+        return boards
+
+    def warm_futurepos(self):
+        """在**父进程**里强制解析 boards 来源（fork 预取 worker 之前调）。
+
+        返回 source 描述 dict。幂等：已解析就直接返回缓存。
+        """
+        if self._fp is not None and self._fp['mode'] == 'live':
+            self._futurepos_boards()
+        return self.futurepos_status()
+
+    def futurepos_status(self):
+        """当前 futurepos 配置快照（启动期打日志用；不触发任何 IO）。"""
+        if self._fp is None:
+            return {'enabled': False}
+        out = {'enabled': True, 'mode': self._fp['mode'],
+               'offsets': self._fp['offsets'],
+               'resolved': self._fp.get('boards') is not None}
+        if self._fp['mode'] == 'live':
+            out['source'] = ('self.boards' if not self._fp.get('source')
+                             and not self._fp.get('dataset_npz')
+                             else self._fp.get('source') or self._fp['dataset_npz'])
+        return out
+
+    def _futurepos_target(self, idxs, tforms=None):
+        """算 ``(future, w_h0, w_h1)``；**每个偏移恰好一次** fancy-index。
+
+        三个「不可用」情形都在这里收口，且它们都表现为 ``g.valid[offset]``
+        的 False（``gather_neighbors`` 已把「越界」与「跨局」都算进同一个
+        ``valid``）：越界（接近局尾）/ ``game_ids[j] != game_ids[i]``（跨局）。
+
+        ⚠ **不能单独消费 ``g.boards[offset]``**：它的不可用行被填 0，而 0 是
+        「合法空盘」—— 会被读成「该点将来没人下」，也就是**把盘面丢了说成
+        「对手一颗子都没占」**。所以先过 ``valid``，无效行写哨兵。
+        """
+        idxs = np.asarray(idxs, dtype=np.int64)
+        fp = self._fp
+        if fp is None:
+            raise RuntimeError('futurepos 未启用：请先调 attach_futurepos()')
+        B = idxs.size
+        bs = self.board_size
+        n_sq = bs * bs
+
+        if fp['mode'] == 'index':
+            occ = np.asarray(fp['table'][idxs], dtype=bool).reshape(B, 2, n_sq)
+            hvalid = np.asarray(fp['valid'])[idxs].astype(bool).reshape(B, 2)
+        else:
+            cols = fp.get('cols')
+            gid = cols['game_ids'] if cols is not None else self.game_ids
+            if gid is None:
+                # ⚠ 无 game_ids ⇒ **无法验证同局**，一律不给标签（与 `next_move`
+                # 同一口径，见 `_build_labels` 里那段说明）。`gather_neighbors` 在
+                # 缺 game_ids 时只做越界检查（valid = in_range），会把别局的盘面
+                # 当成这一手的未来 —— 那正是要防的串局，宁可一行都不给。
+                # 连 boards 来源都不解析（连 gather 一起省掉）。
+                hvalid = np.zeros((B, 2), dtype=bool)
+                occ = np.zeros((B, 2, n_sq), dtype=bool)
+            else:
+                # 「对手」按**行 i** 的 to_play 定（i+1/i+2 轮到的正是 -to_play[i]），
+                # 所以乘的是本行的 to_play，不是未来行的。
+                to_play_i = np.asarray(self.to_play[idxs],
+                                       dtype=np.int8).reshape(B, 1, 1)
+                g = gather_neighbors(
+                    self._futurepos_boards(), idxs, offsets=fp['offsets'],
+                    # ⚠ game_ids **必须给**：主数据集是 162,298 局首尾相接的一根
+                    # 大数组、没有局边界标记，i 与 i+8/i+32 可以分属两局，跨局
+                    # 取到的盘面**看起来完全合法**（它就是某个真实盘面）只是不属于
+                    # 这一手 ⇒ 静默错标签。
+                    game_ids=gid,
+                    to_play=(cols['to_play'] if cols is not None else self.to_play),
+                    ko=(cols['ko'] if cols is not None else self.ko))
+                hvalid = np.stack([g.valid[off] for off in fp['offsets']]).T.astype(bool)
+                occ = np.stack(
+                    [(np.asarray(g.boards[off], dtype=np.int8) * to_play_i) < 0
+                     for off in fp['offsets']],
+                    axis=1).reshape(B, 2, n_sq)   # 对手的子 ⇒ 乘 to_play 后 < 0
+
+        future = occ.astype(np.float32)
+        # 哨兵**在置换之后**盖：增广按 tforms 把有效格的占用挪位置，随后一次性
+        # 把无效行整块写成 -1，就不必去追「无效行的值被搬到哪去了」。
+        if tforms is not None:
+            future = _permute_future(future, tforms, bs)
+        future[~hvalid] = FUTUREPOS_SENTINEL
+        return future, hvalid[:, 0], hvalid[:, 1]
 
     def __len__(self):
         return self.N
@@ -349,10 +668,14 @@ class SupervisedDataset:
            `soft` / `soft_mask` / `w['policy']` / `w['policy_opp']`。
         2. **本轮占位**（恒 0，且对应 `w` 恒 0，消费方必须先看权重）：
            `score` / `sb_center` / `sb_upper` / `global` / `ownership` /
-           `scoring` / `seki` / `future` —— **待 D0 sidecar（B 组）接线**。
+           `scoring` / `seki` —— **待 D0 sidecar（B 组）接线**。
            占位用 `np.zeros`（而非 `None`）是为了让预取器只搬运**一种** payload
            形状（A3）；它们恒 0 的语义与 KataGo「权重 0 = 本行无此标签」一致。
-        3. 软标签未挂载时 `soft`/`soft_mask` 全 0（=「本批没有任何软标签」），
+        3. **`future` 是 opt-in 的**：`attach_futurepos()` 调过 ⇒ 填真值
+           （`w['futurepos']` / `w['futurepos_h0']` / `w['futurepos_h1']` 才出现）；
+           没调过 ⇒ 仍是 `np.zeros` + `w['futurepos']` 恒 0，与 A6 之前**逐字节
+           相同**。契约见 `attach_futurepos`。
+        4. 软标签未挂载时 `soft`/`soft_mask` 全 0（=「本批没有任何软标签」），
            **不退回 3 元组**——形状随数据变化会让预取器的 payload 分叉。
 
         形状（bs = board_size，B = len(idxs)）
@@ -361,6 +684,8 @@ class SupervisedDataset:
         ``game_weight`` (B,) f32 · ``soft`` (B, bs²+1) f32 ·
         ``soft_mask`` (B,) f32 · ``w`` dict[str → (B,) f32] ·
         ``future`` (B, 2, bs²) f32（19 路时即 (B,2,361)，与 V7 对齐）·
+          ⚠ 取值域：有效格 ∈ {0,1}，**无效格恒为 -1.0**（`FUTUREPOS_SENTINEL`）；
+          未启用 futurepos 时整块为 0。详见 `attach_futurepos` ·
         ``score``/``sb_center``/``sb_upper`` (B,) f32 · ``global`` (B,19) f32 ·
         ``ownership``/``scoring``/``seki`` (B,1,bs,bs) f32
 
@@ -449,12 +774,29 @@ class SupervisedDataset:
             'score': np.zeros(B, dtype=np.float32),
             'scoring': np.zeros(B, dtype=np.float32),
             'seki': np.zeros(B, dtype=np.float32),
+            # 未启用 futurepos 时恒 0。⚠「未启用」不是「碰巧没数据」：opt-in 是
+            # `test_dataset_soft_labels.py:510` / `test_prefetch_labels.py:464`
+            # 两条既有测试逼出来的（见 `__init__` 里的说明）。
             'futurepos': np.zeros(B, dtype=np.float32),
         }
 
         def z(*shape):
             """占位标签的统一构造（全 0 float32）。"""
             return np.zeros(shape, dtype=np.float32)
+
+        # ---- futurepos（未来 2 手位置）：opt-in，未启用 ⇒ 保持 A6 之前的占位 ----
+        # 未启用时**不 gather、不加 `w` 的新键** ⇒ payload 与今天逐字节相同。
+        future = z(B, 2, bs * bs)
+        if self._fp is not None:
+            future, w_h0, w_h1 = self._futurepos_target(
+                idxs, tforms if permuted else None)
+            # 🔴 整块权重是**与**：loss 的作用单位是整个 (2, bs²) 块（见
+            # `attach_futurepos` 的「权重契约」段），只活一路时给 1 会让另一路
+            # 的 -1 哨兵被当真值拟合。
+            w['futurepos'] = (w_h0 & w_h1).astype(np.float32)
+            # 单路有效性**必须**单独暴露：否则「只活一路」与「两路都死」不可分。
+            w['futurepos_h0'] = w_h0.astype(np.float32)
+            w['futurepos_h1'] = w_h1.astype(np.float32)
 
         return {
             'next_move': next_move,
@@ -472,8 +814,9 @@ class SupervisedDataset:
             'ownership': z(B, 1, bs, bs),
             'scoring': z(B, 1, bs, bs),
             'seki': z(B, 1, bs, bs),
-            # futurepos = 落子后 +8 / +32 手的盘面（2 通道）；待 B6 邻行 gather 接线
-            'future': z(B, 2, bs * bs),
+            # futurepos = 落子后 +8 / +32 手的**对手**占位图（2 通道）；
+            # 启用后由 `attach_futurepos` 填真值，无效行填 FUTUREPOS_SENTINEL。
+            'future': future,
         }
 
     def sample_batch(self, idxs, device='cpu', labels=False):
