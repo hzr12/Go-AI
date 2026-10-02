@@ -1485,6 +1485,16 @@ def test_no_new_cli_params():
         #   4 个旗的语义见 spec §3 A 组 / §5.7；默认值由
         #   `tests/test_soft_cli.py` 钉（None / 1.0 / 0 / 1）。
         '--soft-index', '--soft-weight', '--soft-only-sampling', '--soft-every',
+        # ---- B8（2026-10-02）新增的 1 个：V7 路径开关 ----
+        # ⚠ **为什么要显式登记而不是删掉本测试**：D1 的门禁价值不在「65 这个
+        #   数字」，而在「新增必须是一次**留痕**的改动」。删掉整个测试等于把
+        #   门禁拆了；把 `--v7` 写进冻结集，则下一个想加 `--v7-lr-mult` 的人
+        #   仍然会在这里红一次，并被迫把理由写在这里。
+        #   B8 **只加了这一个旗**：V7 的段位权重是代码里的常量表
+        #   （`V7_STAGE1_SCORE_TERMS`）而不是 CLI —— 让「段 1 不训 score」变成
+        #   一个能被人顺手关掉的旋钮是错的，它的依据是数据集事实（81.09% 的
+        #   SGF 是认输），不是调参口味。
+        '--v7',
     }
     got = set(kw)
     assert got == expected, (
@@ -1494,7 +1504,7 @@ def test_no_new_cli_params():
         f'个数 {len(got)} vs {len(expected)}'
         + (f'  仅顺序不同（不算违规）: '
            f'{[k for k in kw if k in expected]}' if got == expected else ''))
-    assert len(expected) == 65, f'冻结的基线本身变了：{len(expected)} != 65（61 + A4 的 4 个）'
+    assert len(expected) == 66, f'冻结的基线本身变了：{len(expected)} != 66（61 + A4 的 4 个 + B8 的 1 个）'
     # 特别地：L2 系数不许有独立参数，label smoothing 也不许有第二个旋钮
     for banned in ('--l2-coef', '--l2-weight', '--weight-decay-l2',
                    '--l2-report', '--label-smoothing-ce'):
