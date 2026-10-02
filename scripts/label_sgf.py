@@ -321,6 +321,102 @@ def dump_bad_game(path, err, chars=900):
 
 
 # --------------------------------------------------------------------------- #
+# 续跑指纹（Phase 0a）
+# --------------------------------------------------------------------------- #
+# ⚠⚠ **为什么必须有**：`.done.n` 只是一个裸游标，而 `positions` 的内容由一堆参数
+#   决定。原来只有一条守卫 `cursor > len(positions)` —— **单向**。于是：
+#     · 同样参数重跑        -> 无事可做，正确
+#     · 参数变小（局面变少） -> 拦住了
+#     · **参数变大**（比如把 game-frac 0.02 改成全量，positions 从 219,343 变成
+#       13,360,400）-> `cursor(219,343) > len(13,360,400)` 为假，**不拦** ⇒
+#       脚本认为「前 219,343 个局面已完成」而直接跳过 ⇒ **那批标签永久缺失，
+#       且不报任何错**，只会看到最终行数少了 219,343。
+#   这与 `build_soft_index.py` 踩过的「陈旧缓存静默挂错标签」是同一类故障。
+#
+# 指纹覆盖**一切能改变 positions 的输入**：抽局参数、窗口参数、语料目录的身份
+# （路径 + 文件数 + 总大小 + mtime）。语料变了同样必须重建游标 —— 否则「第 i 行」
+# 指向的局面已经完全不是当初那个。
+
+_FP_VERSION = 1
+
+
+def positions_fingerprint(args, sgf_dir, n_sgf, n_positions):
+    """续跑指纹：任何影响 `positions` 的输入都进这里。"""
+    try:
+        st = os.stat(sgf_dir)
+        corpus = {"path": os.path.abspath(sgf_dir), "n_sgf": int(n_sgf),
+                  "mtime_ns": int(st.st_mtime_ns)}
+    except OSError:
+        corpus = {"path": os.path.abspath(sgf_dir), "n_sgf": int(n_sgf),
+                  "mtime_ns": None}
+    return {
+        "version": _FP_VERSION,
+        "move_lo": int(args.move_lo), "move_hi": int(args.move_hi),
+        "max_games": int(args.max_games), "game_frac": float(args.game_frac),
+        "seed": int(args.seed), "limit": int(args.limit),
+        "n_positions": int(n_positions),
+        "corpus": corpus,
+    }
+
+
+def _fp_path(out_path):
+    return os.path.splitext(out_path)[0] + ".done.json"
+
+
+def check_resume_fingerprint(out_path, fp):
+    """比对续跑指纹。
+
+    Returns
+    -------
+    `(cursor, matched)`：
+      `matched=True`  -> `cursor` 是可信游标（从 `.done.n` 读，或 0）
+      `matched=False` -> 指纹对不上但用户显式要求重来，`cursor=0` 从头开始
+
+    指纹不一致且**没有**显式重来时直接报错退出 —— 静默续跑会丢掉那批标签。
+    """
+    path = _fp_path(out_path)
+    fresh = os.environ.get("SOFT_TAG_FRESH", "") == "1"
+    if not os.path.isfile(path):
+        if fresh:
+            return 0, False
+        # 首次跑（既无指纹也无 .done.n）→ 正常起点
+        return 0, True
+    try:
+        old = json.load(open(path, "r", encoding="utf-8"))
+    except Exception as e:                       # 坏文件当「无法判断」而不是「没跑过」
+        raise SystemExit(
+            f"续跑指纹 {path} 读取失败（{type(e).__name__}: {e}）。"
+            f"它损坏时无法判断 positions 是否还是同一份 —— 请删掉该文件"
+            f"（或设 SOFT_TAG_FRESH=1 从头重跑）。") from e
+    if old == fp:
+        return 0, True                           # 指纹一致；真正的游标由调用方读
+    if fresh:
+        return 0, False
+    diff = {k: (old.get(k), fp.get(k)) for k in set(old) | set(fp)
+            if old.get(k) != fp.get(k)}
+    detail = "\n".join(
+        f"    {k}: 之前={v[0]!r} 现在={v[1]!r}" for k, v in sorted(diff.items()))
+    raise SystemExit(
+        f"续跑指纹不一致 —— 上次的游标**不能**套到这次的 positions 上：\n"
+        f"  {detail}\n"
+        f"  继续跑会静默丢掉已经处理过的那些局面的标签（不报任何错）。\n"
+        f"  两种处理：\n"
+        f"    · 从头重跑：删掉 {os.path.splitext(out_path)[0]}.* 后重跑，"
+        f"或设 SOFT_TAG_FRESH=1\n"
+        f"    · 换输出路径：给 --out 一个新的名字，让两批标签互不干扰")
+
+
+def save_resume_fingerprint(out_path, fp):
+    p = _fp_path(out_path)
+    os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(fp, f, ensure_ascii=False, sort_keys=True, indent=1)
+    os.replace(tmp, p)      # 原子：崩溃时不会留下半份指纹
+    return p
+
+
+# --------------------------------------------------------------------------- #
 def pos_hash_one(board, to_play, ko):
     """单个局面的位置 hash（与 probe0_join.pos_hash_block 同口径）。"""
     b = np.asarray(board, dtype=np.int8).reshape(1, BOARD, BOARD)
@@ -668,10 +764,14 @@ def main():
     #   结果是**静默产出错位的标签**（pos_hash 与 policy 不再属于同一局面，
     #   join 命中率会诡异地下降而不是报错）。行数改为从落盘文件长度反推。
     done_marker = part + ".done.n"
-    cursor = int(open(done_marker).read().strip()) \
-        if os.path.exists(done_marker) else 0
+    # 指纹必须**先于**读游标比对：裸游标无法证明「第 i 行」还是当初那个局面
+    # （见 positions_fingerprint 的 docstring —— 参数变大时旧守卫是单向的）。
+    fp = positions_fingerprint(args, args.sgf_dir, len(paths), len(positions))
+    _c, fp_ok = check_resume_fingerprint(args.out, fp)
+    cursor = (int(open(done_marker).read().strip())
+              if (fp_ok and os.path.exists(done_marker)) else 0)
     # 隔离清单：续跑时与上轮合并，避免同一坏局被反复试、反复打日志
-    skipped = load_skipped(args.out)
+    skipped = load_skipped(args.out) if fp_ok else {}
     if cursor:
         print(f"检测到已完成 {cursor} 个局面，从该处续跑"
               + (f"（上轮已隔离 {len(skipped)} 局）" if skipped else ""))
@@ -681,6 +781,19 @@ def main():
             f"参数变了（--move-lo/--move-hi/--max-games/--game-frac/--limit "
             f"任一）。继续跑会把上一轮的游标套到新的 positions 上，"
             f"产出错位标签。请删掉 {done_marker} 与 {part}.*.part.npy 后重来。")
+    if cursor == 0:
+        # 从头跑：把上一轮残留的分片挪走，否则新行会追加在旧数据后面 -> 行数对不上
+        stale = [f"{part}.{k}.part.npy" for k in
+                 ("policy", "pos_hash", "root_win", "score_mean", "score_stdev",
+                  "visits", "game_idx", "move_idx")]
+        hit = [p for p in stale if os.path.exists(p)]
+        if hit:
+            raise SystemExit(
+                "检测到无续跑指纹但存在上一轮的分片文件：\n  "
+                + "\n  ".join(hit)
+                + "\n这些是**上一批**标签的缓冲，追加写入会让行数与内容错位。"
+                  "请删掉它们（或换 --out）后重跑。")
+    save_resume_fingerprint(args.out, fp)
 
     def _open(tag):
         return {k: open(f"{part}.{k}.{tag}.npy", "ab")
