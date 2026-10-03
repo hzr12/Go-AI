@@ -1420,10 +1420,18 @@ def build_argparser():
                          'N 倍之和）。'
                          '⚠ 必须 N >= 1（1 = 不分片）；N <= 0 直接报错，'
                          '**不**静默当成不分片。N >= 2 时**必须**同时给 '
-                         '--shard-id')
+                         '--shard-id，除非用 --convert-all（它自己跑完全部 N 块）')
+    ap.add_argument('--convert-all', action='store_true',
+                    help='**一条命令跑完全部 N 块**（推荐；对齐 build_dataset 的 '
+                         '--merge 断点续做范式）：逐块**串行**转换，已完成的块'
+                         '自动跳过，中断后重跑同一条命令即可续做。产出 <out> 的 '
+                         'N 个兄弟文件（foo_s0.npz … foo_s{N-1}.npz）加一份 '
+                         '<out>.shards.json 清单（记录各块行数/文件/指纹）。'
+                         '⚠ 与 --shard-id 互斥（那是手动单块模式）；'
+                         '⚠ --count-only 时本参数让计数也逐块跑并打进清单')
     ap.add_argument('--shard-id', type=int, default=None, metavar='I',
-                    help='本块编号，2 <= N 且 0 <= I < N。逐块跑：'
-                         '--num-shards 8 --shard-id 0/1/…/7'
+                    help='本块编号，2 <= N 且 0 <= I < N。**手动单块模式**，'
+                         '逐块跑：--num-shards 8 --shard-id 0/1/…/7'
                          '（规则是全局行号取模，N 块严格构成全集的划分）。'
                          '🔴 **不给 = 不分片**（default 是 None 而不是 0：'
                          '「不分片」与「第 0 块」在 0 这个值上无法区分，'
@@ -1465,7 +1473,104 @@ def resolve_archives(args):
     return srcs
 
 
-def resolve_shard_args(num_shards, shard_id):
+def shard_paths(out_path, num_shards, shard_id):
+    """``out`` + ``(N, I)`` → 这一块的路径：``foo_s{I}.npz``（``num_shards<=1`` 时就是 ``out``）。
+
+    ⚠ 命名**不**加 ``_s`` 前缀的另一种方案是按块建子目录（``foo/s0.npz``）。
+      选兄弟文件是因为 ``build_dataset.merge_shards`` 用的是 ``glob('*.npz')``
+      扫同目录 —— 子目录会让它扫不到，兄弟文件能与既有习惯对齐。
+    """
+    if int(num_shards) <= 1:
+        return out_path
+    base, ext = os.path.splitext(out_path)
+    return '%s_s%d%s' % (base, int(shard_id), ext or '.npz')
+
+
+def convert_all_shards(archives, out_path, *, num_shards, log=print, **kw):
+    """**逐块串行**把全量转成 ``num_shards`` 个 npz，支持断点续做。
+
+    为什么需要它（而不是让用户自己写 for 循环）
+    ------------------------------------------
+    ① **断点续做**：8 块全量约 80 分钟，中途 Ctrl-C 很常见。已完成的块靠
+       ``<块>.done`` 标记跳过，重跑同一条命令即可 —— 这正是
+       ``build_dataset.py --merge`` 的范式，本仓已有这个习惯。
+    ② **串行**：并行的峰值是 N 倍之和（本机 8 块并行 = 44.8 GB，直接 OOM）。
+    ③ **清单**：写一份 ``<out>.shards.json``，记录每块的行数 / 文件 / 状态。
+       只建了 1 块就开训是最容易发生的事故，清单让它显形。
+
+    ⚠ **跳过靠 ``.done`` 标记而不是「文件存在」**：npz 即使中途被杀也会留下
+      一个**行数对不上**的合法 zip，而训练端不会报错、只会在中途崩
+      （见 :class:`NpzChunkedWriter` 的约定 5）。标记由 ``convert`` 成功后写出。
+
+    Args:
+        num_shards: 块数。``<= 1`` 直接退化成不分片（只跑一次）。
+        **kw: 透传给 :func:`convert`。
+
+    Returns:
+        清单 dict（也写到 ``<out>.shards.json``）。
+
+    Raises:
+        ConversionError: 任何一块失败。🔴 已完成的块**保留**（含 ``.done``），
+            所以修掉问题后重跑同一条命令会从失败处继续。
+    """
+    out_path = os.path.abspath(out_path)
+    num_shards = int(num_shards)
+    if num_shards < 1:
+        raise ConversionError('--convert-all 需要 --num-shards >= 1')
+    parent = os.path.dirname(out_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    manifest_path = out_path + '.shards.json'
+    manifest = {
+        'tool': 'scripts/stdata_to_npz.py',
+        'created': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'out_base': out_path,
+        'num_shards': num_shards,
+        'partition_rule': 'global_row_index % num_shards == shard_id',
+        'archives': [{'path': a, 'network': n} for a, n in archives],
+        'shards': [],
+    }
+    if num_shards <= 1:
+        log('[all] --num-shards 1 ⇒ 不分片，只跑一次')
+    t0 = time.perf_counter()
+    for sid in range(num_shards):
+        p = shard_paths(out_path, num_shards, sid)
+        done = p + '.done'
+        entry = {'shard_id': sid, 'path': p, 'done_marker': done}
+        if os.path.isfile(done) and os.path.isfile(p):
+            rows = int(open(done).read().strip())
+            entry.update(status='done', rows=rows)
+            manifest['shards'].append(entry)
+            log('[all] 块 %d/%d 已完成（%d 行），跳过 %s'
+                % (sid + 1, num_shards, rows, os.path.basename(p)))
+            continue
+        log('[all] ── 块 %d/%d → %s'
+            % (sid + 1, num_shards, os.path.basename(p)))
+        t1 = time.perf_counter()
+        meta = convert(archives, p, num_shards=num_shards, shard_id=sid, **kw)
+        with open(done, 'w', encoding='utf-8') as fh:
+            fh.write(str(int(meta['rows'])))
+        entry.update(status='done', rows=int(meta['rows']),
+                     file_bytes=int(meta.get('file_bytes', 0)),
+                     seconds=round(time.perf_counter() - t1, 1))
+        manifest['shards'].append(entry)
+        _dump(manifest_path, manifest)      # 每块后落盘 ⇒ 中断也留得下进度
+    done_n = [s for s in manifest['shards'] if s['status'] == 'done']
+    total_rows = sum(s.get('rows', 0) for s in done_n)
+    manifest['shards_done'] = len(done_n)
+    manifest['rows_total'] = total_rows
+    manifest['elapsed_seconds'] = round(time.perf_counter() - t0, 1)
+    _dump(manifest_path, manifest)
+    log('[all] 完成 %d/%d 块，共 %d 行，清单：%s（%.1fs）'
+        % (len(done_n), num_shards, total_rows,
+           os.path.basename(manifest_path), manifest['elapsed_seconds']))
+    if len(done_n) < num_shards:
+        log('[all] ⚠ 还有 %d 块没跑完 —— **不要**用现有这几块开训，'
+            '重跑同一条命令即可续做。' % (num_shards - len(done_n)))
+    return manifest
+
+
+def resolve_shard_args(num_shards, shard_id, convert_all=False):
     """CLI 的 ``--num-shards/--shard-id`` → 归一化后的 ``(num_shards, shard_id)``。
 
     🔴 **整个文件里唯一一处分片参数校验** —— `--count-only` 与 `convert` 两条
@@ -1510,13 +1615,16 @@ def resolve_shard_args(num_shards, shard_id):
             f'分片流程的前提是「各块行数之和 == 全集行数」，'
             f'而这个输出**看起来是正常的数字**。')
     if shard_id is None:
-        if num_shards != 1:
+        if num_shards != 1 and not convert_all:
             raise ConversionError(
                 f'--num-shards {num_shards} 少了 --shard-id：分 {num_shards} 块'
                 f'时必须指明本块是第几号（0 <= I < {num_shards}）。'
                 f'\n  · 想要第 0 块 ⇒ --shard-id 0'
-                f'\n  · 想要全量（不分片）⇒ 别给 --num-shards')
-        return 1, 0                      # 不分片
+                f'\n  · 想要全量（不分片）⇒ 别给 --num-shards'
+                f'\n  · 想一条命令跑完 N 块 ⇒ 加 --convert-all')
+        # `convert_all=True` ⇒ 返回 (N, None)：调用方自己遍历 0..N-1，
+        # 这里给 0 会被 `shard_paths` 当「第 0 块」而只建一块。
+        return (num_shards, None) if convert_all else (1, 0)
     shard_id = int(shard_id)
     if num_shards < 2:
         raise ConversionError(
@@ -1541,9 +1649,59 @@ def main(argv=None):
         archives = resolve_archives(args)
         # 🔴 分片校验在分叉之前、只做一次 ⇒ `--count-only` 与 `convert` 对同一
         #   组参数的合法性判定必然一致（归一化后的值直接喂给两条路径）。
-        num_shards, shard_id = resolve_shard_args(args.num_shards,
-                                                  args.shard_id)
+        if args.convert_all and args.shard_id is not None:
+            raise ConversionError(
+                '--convert-all 与 --shard-id 互斥：前者自己跑完 N 块，'
+                '后者是手动单块模式。\n'
+                '  · 想一条命令跑完 ⇒ 只给 --convert-all --num-shards 8\n'
+                '  · 想只跑第 3 块 ⇒ 只给 --shard-id 3')
+        if args.convert_all:
+            # 🔴 `--convert-all` 自己会遍历 0..N-1 ⇒ **不能**先过那条
+            #   「N>=2 必须配 --shard-id」的三态表。`convert_all=True` 让它
+            #   只校验 `num_shards` 本身（`--num-shards 0` 照样报错）。
+            num_shards, shard_id = resolve_shard_args(
+                args.num_shards, None, convert_all=True)
+        else:
+            num_shards, shard_id = resolve_shard_args(
+                args.num_shards, args.shard_id)
         if args.count_only:
+            # 🔴 `--convert-all --count-only` 必须**逐块**数，不能只数第 0 块 ——
+            #   那会报出「第 0/8 块 = 12.5%」而用户以为看到了全量的分配。
+            #   逐块也顺带验证了「各块行数之和 == 全集」这个分片前提。
+            if args.convert_all:
+                sharded_counts = []
+                for sid in range(num_shards):
+                    per, b = [], 0
+                    for p, n in archives:
+                        info = count_kept_rows(p, n, limit=args.limit, log=None,
+                                               num_shards=num_shards,
+                                               shard_id=sid, global_offset=b)
+                        per.append(info)
+                        b += info['rows_kept']
+                    mine = sum(i['rows_kept_shard'] for i in per)
+                    allrows = sum(i['rows_kept'] for i in per)
+                    sharded_counts.append({'shard_id': sid,
+                                           'rows': mine, 'rows_all': allrows})
+                    log('  第 %d/%d 块 → %s 行（%.2f%%，理论 %.2f%%）'
+                        % (sid, num_shards, mine,
+                           100.0 * mine / max(allrows, 1),
+                           100.0 / num_shards))
+                tot = sum(s['rows'] for s in sharded_counts)
+                want = sharded_counts[0]['rows_all'] if sharded_counts else 0
+                log('[count] 各块合计 %d 行 / 全集 %d 行 %s'
+                    % (tot, want, '✓ 一致' if tot == want else '❌ 不一致！'))
+                if tot != want:
+                    raise ConversionError(
+                        f'各块行数之和 {tot} != 全集 {want} ⇒ 分片的偏移算术'
+                        f'在第 0 遍与第 1 遍之间分叉了。**不要写文件**，'
+                        f'先查 global_offset 是否两遍一致。')
+                if args.json_path:
+                    _dump(args.json_path, {'count_only': True,
+                                           'num_shards': num_shards,
+                                           'rows_total': tot,
+                                           'rows_all': want,
+                                           'shards': sharded_counts})
+                return 0
             infos = []
             base = 0                       # ⚠ 按过滤前的行数推进，与 convert 一致
             for p, n in archives:
@@ -1570,17 +1728,22 @@ def main(argv=None):
                                        'num_shards': num_shards})
             return 0
         out = args.out or os.path.join('tmp', 'stdata_v7.npz')
-        meta = convert(archives, out, policy_topk=args.policy_topk,
-                       limit=args.limit, ram_budget_gb=args.ram_budget_gb,
-                       keep_qvalue=args.keep_qvalue, compress=args.compress,
-                       level=args.compress_level, log_every=args.log_every,
-                       log=log, num_shards=num_shards,
-                       shard_id=shard_id)
+        kwargs = dict(policy_topk=args.policy_topk, limit=args.limit,
+                      ram_budget_gb=args.ram_budget_gb,
+                      keep_qvalue=args.keep_qvalue, compress=args.compress,
+                      level=args.compress_level, log_every=args.log_every,
+                      log=log)
+        if args.convert_all:
+            convert_all_shards(archives, out, num_shards=num_shards,
+                               **kwargs)
+            return 0
+        meta = convert(archives, out, num_shards=num_shards,
+                       shard_id=shard_id, **kwargs)
     except ConversionError as e:
         sys.stderr.write('stdata_to_npz: 失败\n%s\n' % e)
         return 2
     except KeyboardInterrupt:
-        sys.stderr.write('stdata_to_npz: 中断（半截文件已删）\n')
+        sys.stderr.write('stdata_to_npz: 中断（已完成的块保留，重跑同一条命令续做）\n')
         return 130
 
     print(render_report(meta), flush=True)

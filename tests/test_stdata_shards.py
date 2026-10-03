@@ -38,8 +38,9 @@ if ROOT not in sys.path:
 from scripts import stdata_to_npz as s2n   # noqa: E402
 from scripts.stdata_to_npz import (   # noqa: E402
     ConversionError,
-    count_kept_rows,
     convert,
+    convert_all_shards,
+    count_kept_rows,
     render_report,
     shard_mask,
     subset_labels,
@@ -725,3 +726,176 @@ def test_real_archive_count_offset_accumulates_across_archives(first_n_members):
         base += i1['rows_kept']
         assert base > prev_last
         prev_last = base
+
+
+# --------------------------------------------------------------------------- #
+# 9 · --convert-all（一条命令跑完 N 块 + 断点续做）
+# --------------------------------------------------------------------------- #
+# 它对齐 build_dataset.py --merge 的范式：已完成的部分跳过、中断后重跑同一条
+# 命令继续。全量 8 块约 80 分钟，中途 Ctrl-C 是常事而非例外。
+
+
+def _arch(tmp_path, n_members=4, per_member=40):
+    import io as _io
+    import tarfile as _tf
+    from tests.test_stdata_to_npz import _fake_npz
+    ms = [('m%02d/b11c768/b.npz' % i, _fake_npz(n=per_member + i * 7, seed=i))
+          for i in range(n_members)]
+    path = str(tmp_path / 'a.tar')
+    with _tf.open(path, 'w') as tf:
+        for name, d in ms:
+            buf = _io.BytesIO()
+            np.savez(buf, **d)
+            info = _tf.TarInfo(name)
+            info.size = buf.tell()
+            tf.addfile(info, _io.BytesIO(buf.getvalue()))
+    return path
+
+
+def test_convert_all_produces_every_shard_plus_a_manifest(tmp_path):
+    arch = _arch(tmp_path)
+    out = str(tmp_path / 'v7.npz')
+    man = convert_all_shards([(arch, NET_80)], out, num_shards=4,
+                             log=lambda *a, **k: None)
+    assert man['num_shards'] == 4 and man['shards_done'] == 4
+    assert [s['shard_id'] for s in man['shards']] == [0, 1, 2, 3]
+    for s in man['shards']:
+        assert os.path.isfile(s['path']), s
+        assert os.path.isfile(s['done_marker'])
+        assert s['rows'] > 0 and s['status'] == 'done'
+    assert os.path.isfile(out + '.shards.json')
+    # 行数之和 == 不分片的行数
+    whole = convert([(arch, NET_80)], str(tmp_path / 'whole.npz'))
+    assert man['rows_total'] == whole['rows']
+
+
+def test_convert_all_skips_finished_shards_on_rerun(tmp_path, monkeypatch):
+    """断点续做：重跑同一条命令**不重做已完成的块**。"""
+    arch = _arch(tmp_path)
+    out = str(tmp_path / 'v7.npz')
+    convert_all_shards([(arch, NET_80)], out, num_shards=4,
+                       log=lambda *a, **k: None)
+    called = []
+    real = s2n.convert
+
+    def spy(*a, **k):
+        called.append(k.get('shard_id'))
+        return real(*a, **k)
+
+    monkeypatch.setattr(s2n, 'convert', spy)
+    convert_all_shards([(arch, NET_80)], out, num_shards=4,
+                       log=lambda *a, **k: None)
+    assert called == [], '已完成的块不应该重跑'
+
+
+def test_convert_all_resumes_from_the_failed_shard(tmp_path, monkeypatch):
+    """第 3 块失败时：前两块**保留**（含 .done），重跑只补少的那块。
+
+    → 修掉问题后重跑**同一条命令**（build_dataset --merge 的范式）。
+    """
+    arch = _arch(tmp_path)
+    out = str(tmp_path / 'v7.npz')
+    real = s2n.convert
+    n = [0]
+
+    def boom(*a, **k):
+        n[0] += 1
+        if n[0] == 3:
+            raise ConversionError('模拟第 3 块失败')
+        return real(*a, **k)
+
+    monkeypatch.setattr(s2n, 'convert', boom)
+    with pytest.raises(ConversionError):
+        convert_all_shards([(arch, NET_80)], out, num_shards=4,
+                           log=lambda *a, **k: None)
+    for sid in (0, 1):
+        p = s2n.shard_paths(out, 4, sid)
+        assert os.path.isfile(p) and os.path.isfile(p + '.done')
+    assert not os.path.isfile(s2n.shard_paths(out, 4, 2) + '.done')
+
+    called = []
+    monkeypatch.setattr(s2n, 'convert',
+                        lambda *a, **k: (called.append(k.get('shard_id')),
+                                         real(*a, **k))[1])
+    man = convert_all_shards([(arch, NET_80)], out, num_shards=4,
+                             log=lambda *a, **k: None)
+    assert called == [2, 3], '应只补跑第 3、4 块'
+    assert man['shards_done'] == 4
+
+
+def test_manifest_survives_interruption(tmp_path, monkeypatch):
+    """清单每块后落盘 → 中断也留得下进度。"""
+    arch = _arch(tmp_path)
+    out = str(tmp_path / 'v7.npz')
+    real = s2n.convert
+    n = [0]
+
+    def boom(*a, **k):
+        n[0] += 1
+        if n[0] == 2:
+            raise ConversionError('模拟第 2 块失败')
+        return real(*a, **k)
+
+    monkeypatch.setattr(s2n, 'convert', boom)
+    with pytest.raises(ConversionError):
+        convert_all_shards([(arch, NET_80)], out, num_shards=4,
+                           log=lambda *a, **k: None)
+    import json
+    man = json.load(open(out + '.shards.json', encoding='utf-8'))
+    assert [s['shard_id'] for s in man['shards']] == [0]
+    assert man['shards'][0]['status'] == 'done'
+
+
+def test_shard_paths_are_sibling_files_and_unsharded_is_the_base(tmp_path):
+    """命名用兄弟文件（而非子目录），才与 build_dataset.merge_shards
+    的 `glob('*.npz')** 扫同目录** 的习惯对齐。"""
+    base = str(tmp_path / 'foo.npz')
+    assert s2n.shard_paths(base, 1, 0) == base
+    for sid in range(4):
+        p = s2n.shard_paths(base, 4, sid)
+        assert os.path.dirname(p) == str(tmp_path)
+        assert os.path.basename(p) == 'foo_s%d.npz' % sid
+
+
+def test_convert_all_degenerates_to_a_single_unsharded_run(tmp_path):
+    """`--convert-all --num-shards 1` → 不分片，只跑一次且输出就是 `out`。"""
+    arch = _arch(tmp_path)
+    out = str(tmp_path / 'v7.npz')
+    man = convert_all_shards([(arch, NET_80)], out, num_shards=1,
+                             log=lambda *a, **k: None)
+    assert man['num_shards'] == 1 and man['shards_done'] == 1
+    assert os.path.isfile(out)
+    assert not os.path.isfile(str(tmp_path / 'v7_s0.npz'))
+
+
+def test_cli_rejects_convert_all_with_shard_id(capsys):
+    from scripts.stdata_to_npz import main
+    rc = main(['--convert-all', '--num-shards', '4', '--shard-id', '1',
+               '--archive', 'x.tar'])
+    assert rc == 2
+    assert '互斥' in capsys.readouterr().err
+
+
+def test_cli_convert_all_still_validates_num_shards(capsys):
+    """`--num-shards 0` 在 --convert-all 下**照样报错** —— 静默变成分片成 1 块
+    会写出一个「分片流程下的全集」，而它看起来是个正常数字。"""
+    from scripts.stdata_to_npz import main
+    assert main(['--convert-all', '--num-shards', '0', '--archive', 'x.tar']) == 2
+    assert 'num-shards' in capsys.readouterr().err
+
+
+def test_cli_convert_all_does_not_require_shard_id(tmp_path, capsys,
+                                                   monkeypatch):
+    """一条命令跑完 ⇒ 不得报「少了 --shard-id」。
+
+    ⚠ ``--convert-all`` 自己遍历 0..N-1，所以**不该**过 ``resolve_shard_args``
+      那条「N>=2 必须配 --shard-id」的三态表。但 ``num_shards`` 本身的合法性
+      仍要查（``--num-shards 0`` 必须报错，不能静默变成不分片）。
+    """
+    from scripts.stdata_to_npz import main
+    arch = _arch(tmp_path)
+    rc = main(['--convert-all', '--num-shards', '3', '--archive', arch,
+               '--network', NET_80, '--out', str(tmp_path / 'v7.npz')])
+    assert rc == 0, capsys.readouterr().err
+    for sid in range(3):
+        assert os.path.isfile(str(tmp_path / ('v7_s%d.npz' % sid)))

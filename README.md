@@ -46,9 +46,9 @@ data/games/games/{agz,foxpro,leela_zero,yenw_pro}/   133,604 个 SGF
 data/*.tgz            (5 个)                         36,274 个 SGF
                                     └── 零重叠，合计 169,878，完整覆盖 162,298 局
 data/sgf_19x19_full.npz   34,202,713 行 / 162,298 局 / 10 列（压缩 447 MB，解压 12.3 GB）
-data/labels/games.npz      局级 sidecar，4 键，约 1.2 MB（待生成）
-data/labels/kata_labels.npz  KataGo 访问分布软标签（待生成）
-data/labels/soft_index.npz   软标签 → 主数据集行号的 join（待生成）
+data/labels/games.npz      局级 sidecar（4 键，约 1.2 MB，⚠️ 待生成）
+data/labels/kata_labels.npz  KataGo 访问分布软标签（157.5 MB，✅ 已生成）
+data/labels/soft_index.npz   软标签 → 主数据集行号的 join（160.5 MB，✅ 已生成）
 katago/stdata/*.tgz         官方分布式训练数据，4.67M 行（19×19 可用 ≈3.10M）
 ```
 
@@ -98,7 +98,7 @@ ko 规则、计分制度、tax、encore、`passWouldEndPhase`、komi 奇偶三�
 
 `NbtTfNet` 已实现并通过预算测试（`tests/test_katago_v7_budget.py` 断言精确值
 5,561,832），`src/inference.py:177` 已 `register_in_channels_builder(22, ...)`。
-**但 `train_sft.py` 尚未切过来** —— 见 [§4](#4-当前进度)。
+**已接入 `train_sft.py`**（`--v7 1`，实测 5,561,832 参数）—— 见 [§4](#4-当前进度)。⚠️ 段 1 会**跳过** eval / early-stop / ONNX 导出：`evaluate_metrics` 与 `GoAI` 仍是 12 通道推理链 |
 
 ### 2.4 训练层
 
@@ -126,8 +126,8 @@ ko 规则、计分制度、tax、encore、`passWouldEndPhase`、komi 奇偶三�
 
 | 流 | 内容 |
 |---|---|
-| **软标签流** | `permute_soft` / `soft_cross_entropy`（掩码二选一）/ `labels=True` 的 4 元组 + dict 契约 / `games.npz` sidecar 生成器（ply-20 哈希锚点，小规模实测 50/50 匹配） |
-| **特征流** | `src/data/feature_v7.py`（气桶 / 历史 5 手 / `calculateArea`）已完成；`src/data/feature_v7_ladders.py`（ch14–17）**仍在收尾** |
+| **软标签流** | `permute_soft` / `soft_cross_entropy`（掩码 `0` 的行贡献恰好 0）/ `labels=True` 的 4 元组 + dict 契约 / `games.npz` sidecar 生成器（ply-20 锚点）|
+| **特征流** | `src/data/feature_v7.py`（气桶 / 历史 5 手 / `calculateArea`）+ `feature_v7_ladders.py`（ch14–17）+ `feature_v7_gather.py`（邻行 gather）**全部完成**，ch0–6/ch8/ch14/ch17 对官方 stdata 逐位 1.000000 |
 | **模型流** | `katago_v7.py` + `katago_v7_loss.py` + 22ch builder 已接线；`train_sft.py` 切 22 通道未做 |
 
 ### 3.2 三个训练段
@@ -159,16 +159,16 @@ ko 规则、计分制度、tax、encore、`passWouldEndPhase`、komi 奇偶三�
 | KataGo 权重 + stdata | ✅ 就位 | `katago/`（含 204 MB 权重）；**已被 `.gitignore` 排除** |
 | `pos_hash.py`（唯一散列口径） | ✅ | 478,603 行/s；全量 34.2M ≈72 s |
 | `katago_npz.py`（stdata 读取） | ✅ | 27 项测试，含两条真实 stdata 对拍 |
-| `kata_label_join.py` | ✅ | `materialize_dataset` + join + `REQUIRED_KEYS` |
+| `kata_label_join.py` | ✅ | `materialize_dataset` + join + `REQUIRED_KEYS` + **防陈旧缓存**（含 `hash_spec_fingerprint()`）|
 | `permute_soft` | ✅ | 8 项测试；方向极易搞反，见 [§5.1](#51-散列口径只有一份) |
-| 软 CE（`soft_cross_entropy`） | ✅ | 掩码**逐行二选一** |
+| 软 CE（`soft_cross_entropy`） | ✅ | 掩码 `mask=0` 的行贡献**恰好 0**（**不是**退化成 one-hot CE）；分母恒为 B ⇒ 不开 `--soft-only-sampling` 就只有 ~1% 的行贡献，policy 项缩小约 100× |
 | `labels=True` 4 元组 + dict 契约 | ✅ | 5 个假 dataset 已补 `labels=False` 形参 |
-| `games.npz` sidecar **生成器** | ✅ | 小规模实测 50/50 匹配 |
-| `games.npz` **产物** | ⬜ 未生成 | `data/labels/` 目前是空的 |
-| `kata_labels.npz`（段 2 标签） | ⬜ 未生成 | 需跑 `label_sgf.py` |
-| `soft_index.npz` | ⬜ 未生成 | 需跑 `build_soft_index.py` |
-| `feature_v7.py`（气桶 / 历史 5 手 / `calculateArea`） | ✅ | |
-| `feature_v7_ladders.py`（ch14–17） | 🔄 **收尾中** | |
+| `games.npz` sidecar **生成器** | ✅ | 小规模实测 50/50 匹配；`g_rules`/`g_resign`/`g_resign_side` 4 键 |
+| `games.npz` **产物** | ⚠️ **未生成** | 段 1 的 komi/score/rules 来源；需跑 `build_games_sidecar.py`（几十分钟） |
+| `kata_labels.npz`（段 2 蒸馏） | ✅ **已生成** | 157.5 MB，跑 `label_sgf.py` |
+| `soft_index.npz` | ✅ **已生成** | 160.5 MB，跑 `build_soft_index.py`；`--soft-index` 已接入训练侧 |
+| `feature_v7.py`（气桶 / 历史 5 手 / `calculateArea`） | ✅ | ch0–6/ch8 对 stdata 逐位 1.000000；**ch18/19 已知对不齐**（官方先提死子，本仓 `score()` 没有） |
+| `feature_v7_ladders.py`（ch14–17） | ✅ | 对官方 stdata **逐位 1.000000**（4,368 行）；梯子占特征耗时 99.8% |
 | `katago_v7.py`（5,561,832 参数） | ✅ | `tests/test_katago_v7_budget.py` 精确断言 |
 | 22ch builder 注册 | ✅ | `src/inference.py:177` |
 | 12 项 loss 装配 | ✅ | `tests/test_katago_v7_loss.py` 24 项 |

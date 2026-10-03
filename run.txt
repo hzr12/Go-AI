@@ -34,8 +34,26 @@ python scripts/build_soft_index.py --data data/sgf_19x19_full.npz --labels data/
 #     那些 --backbone-channels / --attn-* 结构 flag **已归档，不参与建网**。显存未实测，先跑单卡。
 python run.py --sh shell/train_sft_npu_1card.sh          # 单卡冒烟，建议先跑这个
 python run.py --sh shell/train_sft_npu_4card_katago_se.sh # 4 卡正式；每卡 batch 别上调
-# 4b V7（22 通道，--v7）：端到端冒烟吃 stdata 真实目标，40 步 / batch 8，CPU ~1 分钟。
+# 4b V7（22 通道）端到端冒烟：吃 stdata 真实目标，40 步 / batch 8，CPU ~1 分钟。
 python scripts/smoke_train_v7.py --files 40 --rows 256 --batch 8 --steps 40 --device cpu
+
+# ---------- 4c. 多卡推荐参数（4×910A / DDP）----------
+# ⚠ 不要为 V7 加 --backbone-channels / --attn-* 等结构 flag：它们已归档，建网只看一个源
+#     （12ch = KATAGO_SE_CFG，V7 = katago_v7.py）。多会被 run.py 忽略。
+# 已实测（4 卡 32 GiB）：batch 2000 在 27.6 GiB 时 OOM（20.1起分配 + 6.93 式片 + 4.36 HCCL）
+#     ↳ DDP 每 rank 复制参数，只能加 batch，不能加卡数（卡多只复制再去拓）
+# ⚠ 预取 worker 是**每 rank**的：4 卡×6 = 24 个。8 卡就改 3。
+#     特征速度对 batch 几乎无感（32→1024 仅差 1.7%）↳ batch 按显存选、不要为特征保留。
+python run.py --sh shell/train_sft_npu_4card_katago_se.sh \
+  --batch-size 1000 --gradient-accumulation-steps 2 --lr 0.00637 \
+  --prefetch-workers 6 --prefetch-depth 16 --scaler-init-scale 1024
+# ↳ 有效 batch = 1000×4×2 = 8000；lr 0.00637 是从 2500 的 0.00356 平方根定标推的。
+#     2026-10-01 曾测 4 卡×每卡 2000 时 OOM，下调到 1000。
+#
+# 段 1（V7 22 通道）：同一脚本加 --v7 1，并**删掉** --eval-every / --early-stop 1 / --export-onnx 1
+#     原因：段 1 跳过这三项（evaluate_metrics 与 GoAI 仍是 12 通道推理链）。
+# 段 2（蒸馏）：加 --soft-index data/labels/soft_index.npz --soft-only-sampling 1
+#     ↳ 省不可省 --soft-only-sampling：mask=0 的行贡献恰好 0 ↳ policy 项缩小约 100×。
 
 # ---------- 5. 门禁（~3.5min）----------
 # ⚠ 必须先钉线程，否则 -n auto 的 worker 抢核比串行还慢（test_max_batch 10.8s → 115s）。
