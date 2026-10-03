@@ -165,6 +165,18 @@ SCHEMA_VERSION = 1
 #: policy 稀疏目标的 K（rank 列与权重列各 K 个）。
 POLICY_TOPK = 16
 
+#: 转换期峰值内存 ÷ 未压缩总量的**实测**余量。
+#:
+#: 实测（Windows / 16 逻辑核 / 13.9 GB，``2026-08-25npzs.tgz``）：
+#: ``--limit 100000`` 峰值 1.50 GB、``--limit 400000`` 峰值 5.72 GB ⇒ 每行
+#: 14.0–14.6 KB，而 spec 算出的未压缩是 11.9 KB/行 ⇒ **余量约 19%**。
+#: 那一部分来自 zip/deflate 的工作缓冲、`np.empty` 的对齐与页碎片。
+#:
+#: ⚠ **别把它删掉当"保守估计"**：``--ram-budget-gb`` 是唯一能在开跑前拦住
+#: "装不下"的闸门，按未压缩量估会在临界配置上**放行一个必然 OOM 的任务** ——
+#: 而 OOM 发生在写了几个 GB 之后，现场既没有堆栈也没有块边界可查。
+RAM_OVERHEAD_FACTOR = 1.19
+
 BOARD = BOARD_STRIDE
 CELLS = BOARD * BOARD
 
@@ -584,6 +596,79 @@ def trim_chunk(chunk, take):
 
 
 # --------------------------------------------------------------------------- #
+# 分片（把全量拆成 N 块分别转换，峰值内存 ÷ N）
+# --------------------------------------------------------------------------- #
+def shard_mask(n_rows, global_offset, num_shards, shard_id):
+    """本成员内属于本 shard 的行的**局部**下标（升序 int64）。
+
+    分片规则是**全局行号取模**：``(global_offset + j) % num_shards == shard_id``。
+
+    为什么取模而不是切连续区间
+    ------------------------
+    ① **可证明**：N 块的并集恒等于全集、两两不相交，且每块大小至多差 1。
+       切连续区间则要事先知道每个归档各有多少行（得多跑一遍计数）。
+    ② 与成员边界无关 —— 成员大小不均（实测每个 npz 约 63 行）也不会让某块偏大。
+
+    ⚠⚠ **``global_offset`` 必须按「分片过滤**之前**」的行数推进。**
+    若误用过滤后的行数当偏移，每块算出的全局行号会随自己的过滤结果漂移
+    ⇒ 从第 2 块起，同一行会同时落进两块（重复），另一些行谁都不落（丢失）。
+    这是取模分片最经典的一个错，而且**全程不报任何错** ——
+    实测症状是各块 `game_ids` 区间重叠，而 `game_ids` 正是这里唯一的溯源列。
+    """
+    n_rows = int(n_rows)
+    if num_shards is None or int(num_shards) <= 1:
+        return np.arange(n_rows, dtype=np.int64)
+    num_shards = int(num_shards)
+    j = np.arange(n_rows, dtype=np.int64)
+    return j[((int(global_offset) + j) % num_shards) == int(shard_id)]
+
+
+def subset_labels(labels, j):
+    """按**局部行下标** ``j`` 取 :func:`katago_npz.to_v7_labels` 结果的子集。
+
+    🔴 **不能写成 ``{k: v[j] for k, v in labels.items()}``** ——
+    `to_v7_labels` 的返回值混着四类东西，只有两类带行轴：
+
+    ==========  ==========================================  ==============
+    类别        例子                                        处理
+    ==========  ==========================================  ==============
+    行轴 ndarray ``outcome`` / ``score_distr`` / ``spatial``   ``v[j]``
+    嵌套 dict   ``w``（6 个权重列）                            逐键 ``v[j]``
+    tuple       ``policy_player_sparse`` = ``(idx, val)``    每半都 ``x[j]``
+    标量/字符串  ``_kept`` / ``_network`` / ``_dropped``       原样带走
+    ==========  ==========================================  ==============
+
+    统一判据用「第 0 轴长度 == ``_kept``」，所以以后 `to_v7_labels`
+    新增带行轴的键时**不会漏切**（漏切会让块内行数与 ``game_ids`` 不符，
+    而那正是写手 ``close()`` 里会当场报错的地方）。
+
+    ⚠ ``spatial`` 是**解包后 float32、每行 31.8 KB** —— 分片时切它纯属白切
+    （``labels_to_chunk`` 用的是 packed），但不能因为「用不上」就跳过：
+    跳过会让这个键的行数与 ``_kept`` 不一致，将来谁改成用解包版就会静默错位。
+    """
+    n = int(labels['_kept'])
+    j = np.asarray(j, dtype=np.int64)
+    out = {}
+    for key, val in labels.items():
+        if isinstance(val, np.ndarray) and val.ndim >= 1 and val.shape[0] == n:
+            out[key] = val[j]
+        elif isinstance(val, dict):
+            out[key] = {
+                k2: (v2[j] if isinstance(v2, np.ndarray) and v2.ndim >= 1
+                     and v2.shape[0] == n else v2)
+                for k2, v2 in val.items()}
+        elif isinstance(val, tuple):
+            out[key] = tuple(
+                x[j] if isinstance(x, np.ndarray) and x.ndim >= 1
+                and x.shape[0] == n else x for x in val)
+        else:
+            out[key] = val
+    out['_kept'] = int(j.size)
+    # `_dropped` 记的是「本批丢了多少非 19×19 行」，与分片无关 ⇒ 刻意不动。
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # 流式 npz 写手
 # --------------------------------------------------------------------------- #
 class NpzChunkedWriter:
@@ -605,7 +690,12 @@ class NpzChunkedWriter:
     功能上等价，但 ``np.savez`` 有三件这里更好的事：
     ① **压缩**（``--compress-level``，实测 14×，2.6 GB vs 36.7 GB）；
     ② 逐键**校验** dtype / 形状 / 行数（本实现每个键都查，查错在写之前）；
-    ③ 写完删掉该键的块缓冲（``self._chunks[key] = None``）⇒ 峰值不叠加。
+    ③ 写完删掉该键的块缓冲（``self._chunks[key] = None``）—— 但这只在
+       ``close()`` **逐键落盘**的那一刻才发生，此前**所有键的累积列都同时
+       在内存里**。⚠ 所以别把这句话读成"峰值 = 最大单键"：实测峰值是
+       **未压缩总量**（3.13M 行 ≈ 37.4 GB）再加 :data:`RAM_OVERHEAD_FACTOR`
+       的余量 ≈ 44.8 GB，**不是**最大单键 `score_distr` 的 10.55 GB。
+       要降峰值只能分片（``--num-shards``），见模块说明。
 
     ⚠ ``force_zip64=True`` 是必需的：``futurepos`` 单成员就 9.2 GB，
       超过 ZIP 的 4 GB 单成员上限（未压缩）/ 2 GB（压缩）。
@@ -844,7 +934,8 @@ def iter_npz_members(archive):
         tf.close()
 
 
-def count_kept_rows(archive, network=None, limit=None, log=None):
+def count_kept_rows(archive, network=None, limit=None, log=None,
+                    num_shards=1, shard_id=0, global_offset=0):
     """数出这个归档过滤后有多少行 19×19（= 第 1 遍要写的行数）。
 
     ⚠ **只解 ``binaryInputNCHWPacked`` 与 ``globalTargetsNC`` 两个成员**
@@ -854,10 +945,24 @@ def count_kept_rows(archive, network=None, limit=None, log=None):
 
     ⚠ **布局解不出来的成员不计数** —— 两遍必须对同一批成员达成一致，
       否则第 1 遍写的行数会比预算少，`convert` 会当场报错。
+
+    分片
+    ----
+    ``num_shards``/``shard_id``/``global_offset`` 让这一遍只数**属于本块**的行。
+    🔴 **两遍必须用同一套全局偏移算术** —— `global_offset` 是「本归档之前
+    全部归档累计的 19×19 行数」（**过滤前**），`member_base` 每个成员按它
+    自己保留的行数推进。任何一处改成「过滤后」，第 0 遍与第 1 遍就会对同一批
+    行给出不同的归属，而 `convert` 的 ``a_rows != budget`` 检查**抓不到**
+    （两边会一起错）。
+
+    ⚠ ``--limit`` 的语义随之变成「**本块**最多留多少行」，不再是整个归档的。
+      所以 ``--limit`` + 分块只是抽样工具，**不能**用来重建某个已知名单 ——
+      全量构建请不要带 ``--limit``（不带时 N 块严格构成全集的划分）。
     """
     if network:
         resolve_network_key(network)             # 早失败：网络名错就别读 1.5 GB
-    raw = kept = members = no_input = skipped_layout = 0
+    raw = kept = kept_shard = members = no_input = skipped_layout = 0
+    member_base = int(global_offset)
     skipped_examples = []
     t0 = time.perf_counter()
     for mname, npz in iter_npz_members(archive):
@@ -877,10 +982,15 @@ def count_kept_rows(archive, network=None, limit=None, log=None):
                 skipped_examples.append(str(e).splitlines()[0])
             npz.close()
             continue
-        kept += int((board_size_from_packed(packed) == BOARD).sum())
+        n_keep = int((board_size_from_packed(packed) == BOARD).sum())
+        kept += n_keep
+        kept_shard += int(shard_mask(n_keep, member_base, num_shards,
+                                     shard_id).size)
+        member_base += n_keep                     # ⚠ 按过滤前的行数推进
         npz.close()
-        if limit is not None and kept >= limit:
+        if limit is not None and kept_shard >= limit:
             break
+    capped = kept_shard if limit is None else min(kept_shard, limit)
     info = {
         'archive': os.path.abspath(archive),
         'archive_bytes': int(os.path.getsize(archive)),
@@ -888,6 +998,7 @@ def count_kept_rows(archive, network=None, limit=None, log=None):
         'rows_raw': raw,
         'rows_kept': kept if limit is None else min(kept, limit),
         'rows_kept_seen': kept,
+        'rows_kept_shard': capped,
         'members_scanned': members,
         'members_without_binary_input': no_input,
         'members_layout_unresolved': skipped_layout,
@@ -895,9 +1006,10 @@ def count_kept_rows(archive, network=None, limit=None, log=None):
         'count_seconds': round(time.perf_counter() - t0, 2),
     }
     if log:
-        log('[count] %s → 原始 %d 行 / 保留 %d 行'
+        log('[count] %s → 原始 %d 行 / 保留 %d 行%s'
             '（扫 %d 个成员，布局解不出 %d 个，%.1fs）'
             % (os.path.basename(archive), raw, info['rows_kept'],
+               (' / 本块 %d 行' % capped) if num_shards > 1 else '',
                members, skipped_layout, info['count_seconds']))
     return info
 
@@ -907,15 +1019,18 @@ def count_kept_rows(archive, network=None, limit=None, log=None):
 # --------------------------------------------------------------------------- #
 def convert(archives, out_path, *, policy_topk=POLICY_TOPK, limit=None,
             keep_qvalue=False, compress=True, level=1, ram_budget_gb=0.0,
-            log_every=2_000, log=None):
+            log_every=2_000, log=None, num_shards=1, shard_id=0):
     """把若干 stdata 归档写进**一个** `.npz`。
 
     Args:
         archives: ``[(路径, 网络名), ...]``。每个归档**各自的**网络名 ——
             列数不同的归档（80 / 64）就是这么在同一个文件里对上的。
-        limit: 每个归档最多保留多少行 19×19（`None` = 全量）。
-        ram_budget_gb: 峰值内存上限（GB）。``0`` = 不检查。⚠ 估算的是**未压缩
-            总量**（见 :class:`NpzChunkedWriter`：zip 容器无法交错写成员）。
+        limit: 每个归档**本块**最多保留多少行 19×19（`None` = 全量）。
+        num_shards / shard_id: 分片（见 :func:`shard_mask`）。``num_shards<=1``
+            时行为与不分片**逐位相同**。峰值内存 ≈ 未压缩总量 / ``num_shards``。
+        ram_budget_gb: 峰值内存上限（GB）。``0`` = 不检查。⚠ 估的是**未压缩
+            总量 × :data:`RAM_OVERHEAD_FACTOR`**（见 :class:`NpzChunkedWriter`：
+            zip 容器无法交错写成员 ⇒ 转换期必须把未压缩数据整个放内存）。
         log: ``str -> None`` 的回调（进度）。
 
     Returns:
@@ -927,38 +1042,58 @@ def convert(archives, out_path, *, policy_topk=POLICY_TOPK, limit=None,
             比没有更糟（下游不会报错，只会在训练中途崩）。
     """
     log = log or (lambda *a, **k: None)
+    num_shards = max(1, int(num_shards))
+    shard_id = int(shard_id)
+    if not 0 <= shard_id < num_shards:
+        raise ConversionError(
+            f'--shard-id {shard_id} 越界：应有 0 <= shard-id < '
+            f'--num-shards({num_shards})')
     t_start = time.perf_counter()
 
     # ---- 第 0 遍：数行数（`.npy` 头里就是形状，没有增量布局）-----------------
     counts = []
     total_rows = 0
+    archive_base = 0
     for archive, network in archives:
-        info = count_kept_rows(archive, network, limit=limit, log=log)
+        info = count_kept_rows(archive, network, limit=limit, log=log,
+                               num_shards=num_shards, shard_id=shard_id,
+                               global_offset=archive_base)
         counts.append(info)
-        total_rows += info['rows_kept']
+        total_rows += info['rows_kept_shard']
+        # ⚠ 下一归档的偏移按「过滤前」的行数推进（见 shard_mask 的警告）
+        archive_base += info['rows_kept']
         if info['rows_kept'] == 0:
             raise ConversionError(
                 f'{archive} 过滤后**一行 19×19 都没有**（原始 {info["rows_raw"]} 行、'
                 f'扫了 {info["members_scanned"]} 个成员）⇒ 网络名或归档搞错了？')
+    if total_rows == 0:
+        raise ConversionError(
+            f'第 {shard_id}/{num_shards} 块一行都没分到 —— '
+            f'本块行数取模后的归属依赖于第 0/1 遍完全一致的偏移算术，'
+            f'出现 0 行说明两者已经分叉（别猜是哪一遍错，先查 global_offset）。')
     spec = output_spec(policy_topk, keep_qvalue)
-    need = uncompressed_bytes_estimate(spec, total_rows)
-    log('[plan] %d 个归档 → %s：%d 行，未压缩共 %s（= 转换期峰值内存的主项）'
-        % (len(archives), out_path, total_rows, human_bytes(need)))
+    need = int(uncompressed_bytes_estimate(spec, total_rows) * RAM_OVERHEAD_FACTOR)
+    log('[plan] %d 个归档 → %s：第 %d/%d 块，%d 行，未压缩共 %s'
+        '（= 转换期峰值内存的主项）'
+        % (len(archives), out_path, shard_id, num_shards, total_rows,
+           human_bytes(need)))
     if ram_budget_gb and need > ram_budget_gb * 1e9:
         raise ConversionError(
             f'未压缩 {need / 1e9:.1f} GB > --ram-budget-gb 给的 '
             f'{ram_budget_gb:.1f} GB。\n'
             f'  ⚠ 这不是"压缩后放不放得下"的问题：zip 容器无法交错写成员 ⇒ '
             f'转换期必须把未压缩数据整个放内存（见 `NpzChunkedWriter`）。\n'
-            f'  · 降 `--limit` 先出小样本，或换内存更大的机器。\n'
+            f'  · **加 --num-shards N 把峰值除以 N**（推荐，见 --num-shards）\n'
+            f'  · 降 `--limit` 先出小样本。\n'
             f'  · `--keep-qvalue` 是最大的一个可省项（+4.3 KB/行）。')
 
     writer = NpzChunkedWriter(out_path, spec, total_rows)
     written = members = source_counter = 0
+    global_seen = 0                 # ⚠ 按过滤前的行数推进，见 shard_mask
     per_archive = []
     try:
         for (archive, network), cinfo in zip(archives, counts):
-            budget = int(cinfo['rows_kept'])
+            budget = int(cinfo['rows_kept_shard'])
             first_source_id = source_counter
             a_rows = a_members = 0
             plaus_all = {}
@@ -1015,6 +1150,22 @@ def convert(archives, out_path, *, policy_topk=POLICY_TOPK, limit=None,
                         f'{mname}：本脚本按 ch0 反推取到 {idx.size} 行 19×19，'
                         f'`to_v7_labels` 说 {labels["_kept"]} 行 ⇒ 两处过滤已分叉，'
                         f'**停下来**，别猜哪个对。')
+                # ---- 分片：按**全局行号取模**挑出属于本块的行 ------------------
+                # 刻意放在 `to_v7_labels` **之后**：早过滤（先切 d 再算标签）能省
+                # 7/8 的标签计算，但要在 `d` 上做一次全键切片，而 `d` 里混着
+                # 行轴数组与标量诊断，切错一个键就是静默错位。实测全量标签计算
+                # 约 6.4k 行/s，8 块各跑一遍共约 80 分钟 —— 一次性构建可接受，
+                # 换来的好处是**分片逻辑完全不影响标签计算路径**。
+                n_local = int(idx.size)
+                j = shard_mask(n_local, global_seen, num_shards, shard_id)
+                global_seen += n_local           # ⚠ 先按过滤前的行数推进
+                if j.size == 0:
+                    labels = d = None
+                    npz.close()
+                    continue
+                if j.size != n_local:
+                    idx = idx[j]                 # 仍是**原始成员行号**
+                    labels = subset_labels(labels, j)
                 take = min(int(idx.size), budget - a_rows)
                 chunk = labels_to_chunk(
                     labels, d['binaryInputNCHWPacked'], policy_all, idx,
@@ -1077,7 +1228,9 @@ def convert(archives, out_path, *, policy_topk=POLICY_TOPK, limit=None,
             out_path=out_path, per_archive=per_archive, counts=counts,
             n_rows=written, members=members, policy_topk=policy_topk,
             keep_qvalue=keep_qvalue, compress=compress, level=level, spec=spec,
-            elapsed=time.perf_counter() - t_start)
+            elapsed=time.perf_counter() - t_start,
+            num_shards=num_shards, shard_id=shard_id,
+            total_rows_all_shards=archive_base)
         writer.add_scalars({
             'meta_json': np.array(json.dumps(meta, ensure_ascii=False)),
             'schema_version': np.array(SCHEMA_VERSION, dtype=np.int32),
@@ -1098,13 +1251,29 @@ def convert(archives, out_path, *, policy_topk=POLICY_TOPK, limit=None,
 
 
 def build_meta(*, out_path, per_archive, counts, n_rows, members,
-               policy_topk, keep_qvalue, compress, level, spec, elapsed):
+               policy_topk, keep_qvalue, compress, level, spec, elapsed,
+               num_shards=1, shard_id=0, total_rows_all_shards=None):
     """`meta_json` 的内容。**通道资格表直接引用 `crosscheck_stdata`。**"""
     return {
         'tool': 'scripts/stdata_to_npz.py',
         'schema_version': SCHEMA_VERSION,
         'target_model': TARGET_MODEL,
         'created': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        # ---- 分片：下游据此判断「我拿到的是全集还是一块」----
+        # `rows_all_shards` 是**未分片时的总行数**（按过滤前的 19×19 行数累计）。
+        # 下游可以用 n_rows / num_shards ≈ rows_all_shards / num_shards 做自检；
+        # 若有人只跑了 3 块里的 1 块就开训，这一列会让缺口显形而不是静默少数据。
+        'shard': {
+            'num_shards': int(num_shards),
+            'shard_id': int(shard_id),
+            'rows_in_shard': int(n_rows),
+            'rows_all_shards': (None if total_rows_all_shards is None
+                                else int(total_rows_all_shards)),
+            'partition_rule': 'global_row_index % num_shards == shard_id',
+            'game_ids_note': ('game_ids 是**本块内**的局部行号（0 起）；'
+                              '分块后各块的游戏编号不再全局唯一，'
+                              '但 game_ids 逐行唯一这个跨局守卫语义不变'),
+        },
         'out_path': os.path.abspath(out_path),
         'rows': int(n_rows),
         'rows_raw': int(sum(c['rows_raw'] for c in counts)),
@@ -1229,15 +1398,25 @@ def build_argparser():
                          'meta.archives[*].members_with_unregistered_cols')
     ap.add_argument('--out', default=None, help='输出 .npz 路径')
     ap.add_argument('--limit', type=int, default=None,
-                    help='每个归档最多保留多少行 19×19（默认全量）。'
+                    help='每个归档**本块**最多保留多少行 19×19（默认全量）。'
                          '⚠ 是**过滤后**的行数')
+    ap.add_argument('--num-shards', type=int, default=1, metavar='N',
+                    help='把全量拆成 N 块分别转换，峰值内存 ≈ ÷N。'
+                         '⚠ 实测峰值是**未压缩总量 ×1.19**（不是最大单键）：'
+                         '全量 3.13M 行 ≈ 44.8 GB，13.9 GB 的机器必须分块。'
+                         'N=8 时 ≈5.6 GB。分块后**各块串行跑**（并行的峰值是 '
+                         'N 倍之和）')
+    ap.add_argument('--shard-id', type=int, default=0, metavar='I',
+                    help='本块编号，0 <= I < N。逐块跑：'
+                         '--num-shards 8 --shard-id 0/1/…/7'
+                         '（规则是全局行号取模，N 块严格构成全集的划分）')
     ap.add_argument('--policy-topk', type=int, default=POLICY_TOPK,
                     help='policy 稀疏目标的 K')
     ap.add_argument('--ram-budget-gb', type=float, default=0.0,
                     help='峰值内存上限（GB），超了就在开跑前报错（0 = 不检查）。'
-                         '⚠ 估的是**未压缩**总量：zip 容器无法交错写成员，'
-                         '转换期必须把未压缩数据整个放内存'
-                         '（见 `NpzChunkedWriter` 的 docstring）')
+                         '⚠ 估的是**未压缩总量 ×1.19**（RAM_OVERHEAD_FACTOR，'
+                         '实测）：zip 容器无法交错写成员，转换期必须把未压缩'
+                         '数据整个放内存（见 `NpzChunkedWriter` 的 docstring）')
     ap.add_argument('--keep-qvalue', action='store_true',
                     help='保留 qValueTargetsNCMove（float32 (3,362) ≈ 4.3 KB/行）。'
                          '⚠ V7 的 12 项 loss **不消费**它，默认丢弃只为省内存/磁盘')
@@ -1275,23 +1454,43 @@ def main(argv=None):
 
     try:
         archives = resolve_archives(args)
+        if args.shard_id and not args.num_shards > args.shard_id >= 0:
+            raise ConversionError(
+                f'--shard-id {args.shard_id} 越界：应有 '
+                f'0 <= --shard-id < --num-shards({args.num_shards})')
         if args.count_only:
-            infos = [count_kept_rows(p, n, limit=args.limit, log=log)
-                     for p, n in archives]
+            infos = []
+            base = 0                       # ⚠ 按过滤前的行数推进，与 convert 一致
+            for p, n in archives:
+                info = count_kept_rows(p, n, limit=args.limit, log=log,
+                                       num_shards=args.num_shards,
+                                       shard_id=args.shard_id,
+                                       global_offset=base)
+                infos.append(info)
+                base += info['rows_kept']
             raw = sum(i['rows_raw'] for i in infos)
             kept = sum(i['rows_kept'] for i in infos)
             log('\n合计：原始 %d 行 → 19×19 保留 %d 行（%.1f%%）'
                 % (raw, kept, 100.0 * kept / max(raw, 1)))
+            if args.num_shards > 1:
+                mine = sum(i['rows_kept_shard'] for i in infos)
+                log('  第 %d/%d 块 → %d 行（%.2f%% of 保留，理论值 %.2f%%）'
+                    % (args.shard_id, args.num_shards, mine,
+                       100.0 * mine / max(kept, 1),
+                       100.0 / args.num_shards))
             if args.json_path:
                 _dump(args.json_path, {'count_only': True, 'archives': infos,
-                                       'rows_raw': raw, 'rows_kept': kept})
+                                       'rows_raw': raw, 'rows_kept': kept,
+                                       'shard_id': args.shard_id,
+                                       'num_shards': args.num_shards})
             return 0
         out = args.out or os.path.join('tmp', 'stdata_v7.npz')
         meta = convert(archives, out, policy_topk=args.policy_topk,
                        limit=args.limit, ram_budget_gb=args.ram_budget_gb,
                        keep_qvalue=args.keep_qvalue, compress=args.compress,
                        level=args.compress_level, log_every=args.log_every,
-                       log=log)
+                       log=log, num_shards=args.num_shards,
+                       shard_id=args.shard_id)
     except ConversionError as e:
         sys.stderr.write('stdata_to_npz: 失败\n%s\n' % e)
         return 2
@@ -1319,9 +1518,14 @@ def render_report(meta):
          % (meta['target_model'], meta['schema_version'], meta['compression']),
          '  行数 %d（原始 %d，保留 %.1f%%）/ %d 个归档成员'
          % (meta['rows'], meta['rows_raw'],
-            100.0 * meta['rows'] / max(meta['rows_raw'], 1), meta['members']),
-         '-' * 78,
-         '  归档明细:']
+            100.0 * meta['rows'] / max(meta['rows_raw'], 1), meta['members'])]
+    sh = meta.get('shard') or {}
+    if int(sh.get('num_shards', 1)) > 1:
+        L.append('  ⚠ 分片：第 %d/%d 块（本块 %d 行，全量 %s 行）'
+                 '⇒ 单个 npz **不是**全量，训练要同时读入全部 N 块'
+                 % (sh['shard_id'], sh['num_shards'], sh['rows_in_shard'],
+                    sh['rows_all_shards']))
+    L += ['-' * 78, '  归档明细:']
     for a in meta['archives']:
         L.append('    %-46s %8d 行 %6d 成员'
                  % (os.path.basename(a['archive'])[:46], a['rows'],
