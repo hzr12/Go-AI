@@ -37,23 +37,84 @@ python run.py --sh shell/train_sft_npu_4card_katago_se.sh # 4 卡正式；每卡
 # 4b V7（22 通道）端到端冒烟：吃 stdata 真实目标，40 步 / batch 8，CPU ~1 分钟。
 python scripts/smoke_train_v7.py --files 40 --rows 256 --batch 8 --steps 40 --device cpu
 
-# ---------- 4c. 多卡推荐参数（4×910A / DDP）----------
-# ⚠ 不要为 V7 加 --backbone-channels / --attn-* 等结构 flag：它们已归档，建网只看一个源
-#     （12ch = KATAGO_SE_CFG，V7 = katago_v7.py）。多会被 run.py 忽略。
-# 已实测（4 卡 32 GiB）：batch 2000 在 27.6 GiB 时 OOM（20.1起分配 + 6.93 式片 + 4.36 HCCL）
-#     ↳ DDP 每 rank 复制参数，只能加 batch，不能加卡数（卡多只复制再去拓）
-# ⚠ 预取 worker 是**每 rank**的：4 卡×6 = 24 个。8 卡就改 3。
-#     特征速度对 batch 几乎无感（32→1024 仅差 1.7%）↳ batch 按显存选、不要为特征保留。
-python run.py --sh shell/train_sft_npu_4card_katago_se.sh \
+# ---------- 4c. 全流程训练参数（2×910A / 4×910A，SFT + RL）----------
+# 【通则】
+# ⚠ 建网只看一个源：12ch = KATAGO_SE_CFG，V7 22ch = katago_v7.py。
+#   --backbone-channels / --res-blocks / --attn-* 等结构 flag 已归档，加了会被 run.py 忽略。
+# ⚠ 910A 无 BF16 → 自动走 fp16+GradScaler，故 --scaler-init-scale 必须显式给（默认 65536 会炸）。
+# ⚠ DDP 每 rank 复制参数 → **只能加 batch，不能加卡数**（卡多只是复制再去拓）。
+# ⚠ 预取 worker 是**每 rank**的：2 卡 ×12 = 24，4 卡 ×6 = 24（24 核云端 CPU）。
+#   ⚠ 且不钉线程会互相抢核，比串行还慢（实测 test_max_batch 10.8s → 115s）：
+#      export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+# ⚠ LR 定标律（两个既有脚本都成立）：LR = 0.00356 × √(有效batch / 2500)
+# ⚠ batch 对特征速度几乎无影响（32→1024 仅差 1.7%）⇒ batch 按显存选，别为特征保留。
+#   V7 尤其如此：22 通道特征耗时 99.8% 在 iterLadders，但 CPU 侧与 batch 无关。
+# ⚠ 段 1（V7）会**跳过** eval / early-stop / ONNX 导出 ⇒ 这三个 flag 传了也无效。
+
+# ============ 段 1：SFT 从零训（22 通道 V7，policy/π_opp/value/futurepos）============
+# 参数量 5,561,832（主干 5.48M）。score 系 8 项权重为 0（81% 的 SGF 是认输）。
+# 显存实测（4 卡 32 GiB）：batch 2000/卡 在 27.6 GiB 时 OOM
+#   （20.1 起始分配 + 6.93 碎片 + 4.36 CANN/HCCL）⇒ 4 卡下调到 1000。
+
+# --- 2 × 910A：每卡 batch 2800，accum 1 ⇒ 有效 5600，LR 0.00533 ---
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+python run.py --sh shell/train_sft_npu_2card.sh --v7 1 \
+  --batch-size 2800 --gradient-accumulation-steps 1 --lr 0.00533 \
+  --prefetch-workers 12 --prefetch-depth 16 --scaler-init-scale 1024 \
+  --out models/v7_stage1_npu2.pth
+# ⚠ shell/train_sft_npu_2card.sh 里带 --eval-every 2000 --early-stop 1 --export-onnx 1
+#   —— 段 1 下这三项被跳过；要跑纯 SFT 请手写 torchrun 去掉它们。
+
+# --- 4 × 910A：每卡 batch 1000，accum 2 ⇒ 有效 8000，LR 0.00637 ---
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+python run.py --sh shell/train_sft_npu_4card_katago_se.sh --v7 1 \
   --batch-size 1000 --gradient-accumulation-steps 2 --lr 0.00637 \
-  --prefetch-workers 6 --prefetch-depth 16 --scaler-init-scale 1024
-# ↳ 有效 batch = 1000×4×2 = 8000；lr 0.00637 是从 2500 的 0.00356 平方根定标推的。
-#     2026-10-01 曾测 4 卡×每卡 2000 时 OOM，下调到 1000。
-#
-# 段 1（V7 22 通道）：同一脚本加 --v7 1，并**删掉** --eval-every / --early-stop 1 / --export-onnx 1
-#     原因：段 1 跳过这三项（evaluate_metrics 与 GoAI 仍是 12 通道推理链）。
-# 段 2（蒸馏）：加 --soft-index data/labels/soft_index.npz --soft-only-sampling 1
-#     ↳ 省不可省 --soft-only-sampling：mask=0 的行贡献恰好 0 ↳ policy 项缩小约 100×。
+  --prefetch-workers 6 --prefetch-depth 16 --scaler-init-scale 1024 \
+  --out models/v7_stage1_npu4.pth
+
+# ============ 段 2：软标签蒸馏（吃段 1 权重，只训 policy）============
+# ⚠ **必须配 --soft-only-sampling 1**：软 CE 的 mask=0 的行贡献**恰好 0**
+#   （不是退化成 one-hot CE）⇒ 不开的话只有约 1% 的行贡献，policy 项被缩小约 100×。
+# ⚠ --soft-index 接的是 data/labels/soft_index.npz（160.5 MB，已生成）。
+# ⚠ 权重必须与段 1 同形（都从段 1 的 checkpoint 续），否则 load_state_dict 会形状不匹配。
+python run.py --sh shell/train_sft_npu_4card_katago_se.sh --v7 1 \
+  --model models/v7_stage1_npu4.pth \
+  --soft-index data/labels/soft_index.npz --soft-only-sampling 1 \
+  --soft-weight 1.0 --soft-every 1 \
+  --batch-size 1000 --gradient-accumulation-steps 2 --lr 0.00637 \
+  --prefetch-workers 6 --prefetch-depth 16 --scaler-init-scale 1024 \
+  --out models/v7_stage2_npu4.pth
+
+# ============ 段 3：RL 自对弈 ============
+# 🔴 **没有 2 卡 / 4 卡的 RL 脚本**（shell/ 下只有 train_rl_npu_1card.sh）。
+#    selfplay_train.py 有 `--ddp 1`（默认 0）+ torchrun 入口，但**从未在多卡跑过**。
+# 🔴 RL 是 **CPU 瓶颈**：CPU 预算 = parallel_games × mcts_threads，且要除以 rank 数。
+#    --sims 48 是**刻意下调**（默认 400），19 路太慢。
+# ⚠ --model 必须指向**真实存在**的 checkpoint —— train_rl_npu_1card.sh 里写的
+#   models/sft_19x19_v18.pth **不存在**（models/ 只有 sft_19x19_v12.pth）。
+# ⚠ MCTS 是通道无关的（mcts.py 从 checkpoint 的 stem 读 in_channels），
+#   且 inference.py 已注册 22 通道 builder ⇒ 理论能吃 V7 权重，但**未验证**。
+
+# --- 2 × 910A：24 核 / 2 rank = 12 核/rank ⇒ parallel-games 4 × mcts-threads 3 ---
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 torchrun --nproc_per_node=2 scripts/selfplay_train.py \
+  --ddp 1 --device npu --board-size 19 \
+  --model models/v7_stage2_npu4.pth --out models/az_v7_npu2 \
+  --iters 200 --sims 48 --parallel-games 4 --mcts-threads 3 \
+  --batch-cap 64 --expand-topk 16 --buffer-size 500 \
+  --td 1 --td-steps 3 --use-rollout 1 --leaf-ab-depth 2 --rollout-lambda 0.25 \
+  --grad-accum-steps 1 --mcts-vector-backup 1 --lr 1e-3 --swanlab 1
+
+# --- 4 × 910A：24 核 / 4 rank = 6 核/rank ⇒ parallel-games 2 × mcts-threads 3 ---
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 torchrun --nproc_per_node=4 scripts/selfplay_train.py \
+  --ddp 1 --device npu --board-size 19 \
+  --model models/v7_stage2_npu4.pth --out models/az_v7_npu4 \
+  --iters 200 --sims 48 --parallel-games 2 --mcts-threads 3 \
+  --batch-cap 64 --expand-topk 16 --buffer-size 500 \
+  --td 1 --td-steps 3 --use-rollout 1 --leaf-ab-depth 2 --rollout-lambda 0.25 \
+  --grad-accum-steps 1 --mcts-vector-backup 1 --lr 1e-3 --swanlab 1
+# ⚠ RL 的 batch/lr 没有定标律可依（不像 SFT 有 √ 律）⇒ 这两个数是**起点，不是实测值**。
+# ⚠ --iters 从 1 卡脚本的 20 上调到 200 是按「要跑长」的意图填的，**无依据**，
+#   请按实际收敛曲线调；--parallel-games 减小时 self-play 吞吐也降，二者要一起权衡。
 
 # ---------- 5. 门禁（~3.5min）----------
 # ⚠ 必须先钉线程，否则 -n auto 的 worker 抢核比串行还慢（test_max_batch 10.8s → 115s）。
