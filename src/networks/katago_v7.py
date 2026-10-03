@@ -317,12 +317,17 @@ class MHSA(nn.Module):
     def forward(self, t, pos):
         """``t``: ``(B, N, C)`` token 序列；``pos``: ``(B, N, 2)`` 行列坐标。"""
         b, n, c = t.shape
-        q = self._heads(self.q(t)) * self.scale
+        # 🔴 q **不**预乘 scale。scale 作为参数交给 `_sdpa`，由它按所选后端决定
+        #    怎么施加（math 手动乘、SDPA 透传 scale=、flash 手动抵消它的写死值）。
+        #    旧写法「预乘 q + scale=None」只在 math 路径（V100/910A）正确；
+        #    走 SDPA 路径时 SDPA 会再乘一次 1/sqrt(d) ⇒ 注意力 logits 小 32 倍，
+        #    softmax 被压平、注意力趋近均值，实测相对误差 82%。
+        q = self._heads(self.q(t))
         k = self._heads(self.k(t))
         v = self._heads(self.v(t))
         q = self.rope(q, pos)
         k = self.rope(k, pos)
-        ctx = _sdpa(q, k, v, dropout_p=self.attn_dropout, scale=None)
+        ctx = _sdpa(q, k, v, dropout_p=self.attn_dropout, scale=self.scale)
         return self.out(ctx.permute(0, 2, 1, 3).reshape(b, n, c))
 
 

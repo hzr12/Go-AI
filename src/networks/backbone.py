@@ -1,4 +1,5 @@
 import contextlib
+import math
 
 import torch
 import torch.nn as nn
@@ -614,6 +615,11 @@ def _sdpa(q, k, v, dropout_p=0.0, use_math=False, scale=None):
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
             v = v.to(torch.bfloat16)
+        # 🔴 flash-attn 的 `scale` 在 kernel 里写死为 1/sqrt(head_dim)，Python 侧没有
+        # 参数可传。调用方若传了别的 `scale`，必须在这里手动预乘 q 把它抵消掉，
+        # 否则 SDPA 路径（已透传 scale）和 flash 路径会给出不同结果。
+        if scale is not None:
+            q = q * scale * math.sqrt(q.shape[-1])
         # flash-attn 独立库：要求 (B, S, Hh, d) 布局（头维 -2、head_dim -1）。
         # 我们的 (B, Hh, N, d) 中 head_dim 为最内层（stride=1），transpose 后满足
         # flash-attn 的 last-dim contiguous 要求，无需显式 .contiguous() 拷贝。
@@ -652,8 +658,14 @@ def _sdpa(q, k, v, dropout_p=0.0, use_math=False, scale=None):
         if dropout_p > 0.0:
             attn = torch.nn.functional.dropout(attn, p=dropout_p)
         return attn @ v
-    # SDPA 路径：内部自带 1/sqrt(d) 缩放，q 不能预乘 scale，否则双重缩放
-    return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+    # SDPA 路径：SDPA 自带默认缩放 1/sqrt(d)，但 PyTorch>=2.1 支持显式 `scale=`。
+    # 🔴 必须把调用方传入的 `scale` 透传进去，否则本函数会**无条件**套用 1/sqrt(d)：
+    #   - 调用方传 `scale=None`（V7 的 MHSA，旧写法预乘过 q）⇒ 恰好 1/sqrt(d)，巧合正确
+    #   - 调用方传 `scale=self.scale`（本文件里 815/882/1040 三处）⇒ 被**忽略**，
+    #     只剩 1/sqrt(d)。当 self.scale != 1/sqrt(head_dim) 时结果就是错的。
+    # scale=None 时保持 SDPA 的原生默认（等价 1/sqrt(d)），向后兼容。
+    return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p,
+                                          scale=scale)
 
 
 # flash-attn 独立库的内核句柄（None=未启用）。由 train_sft.py 启动时按
