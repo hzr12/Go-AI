@@ -93,12 +93,12 @@ ko 规则、计分制度、tax、encore、`passWouldEndPhase`、komi 奇偶三�
 | 主干 | 240 宽 · 13×SEBottleneck + 4×Attention | `C=256 M=128 H=4 F=384 B=11` nbt2 块 |
 | 归一化 | — | `fson` 固定方差标量 + `rsnh` 末端 RMSNorm，**全网无 BN** |
 | 头 | policy + value | policy(K=2) + value(3 分类 + scoremean/stdev/lead) + ownership + scorebelief(842 桶) |
-| 参数量 | 9,112,005 | **5,561,832**（硬预算 5,850,000，余量 4.9%） |
+| 参数量 | 9,112,005 | **5,562,121**（硬预算 5,850,000，余量 4.9%） |
 | 代码 | `scripts/train_sft.py:444` `KATAGO_SE_CFG` | `src/networks/katago_v7.py` |
 
 `NbtTfNet` 已实现并通过预算测试（`tests/test_katago_v7_budget.py` 断言精确值
-5,561,832），`src/inference.py:177` 已 `register_in_channels_builder(22, ...)`。
-**已接入 `train_sft.py`**（`--v7 1`，实测 5,561,832 参数）—— 见 [§4](#4-当前进度)。⚠️ 段 1 会**跳过** eval / early-stop / ONNX 导出：`evaluate_metrics` 与 `GoAI` 仍是 12 通道推理链 |
+5,562,121），`src/inference.py:177` 已 `register_in_channels_builder(22, ...)`。
+**已接入 `train_sft.py`**（`--v7 1`，实测 5,562,121 参数）—— 见 [§4](#4-当前进度)。⚠️ 段 1 会**跳过** eval / early-stop / ONNX 导出：`evaluate_metrics` 与 `GoAI` 仍是 12 通道推理链 |
 
 ### 2.4 训练层
 
@@ -169,7 +169,7 @@ ko 规则、计分制度、tax、encore、`passWouldEndPhase`、komi 奇偶三�
 | `soft_index.npz` | ✅ **已生成** | 160.5 MB，跑 `build_soft_index.py`；`--soft-index` 已接入训练侧 |
 | `feature_v7.py`（气桶 / 历史 5 手 / `calculateArea`） | ✅ | ch0–6/ch8 对 stdata 逐位 1.000000；**ch18/19 已知对不齐**（官方先提死子，本仓 `score()` 没有） |
 | `feature_v7_ladders.py`（ch14–17） | ✅ | 对官方 stdata **逐位 1.000000**（4,368 行）；梯子占特征耗时 99.8% |
-| `katago_v7.py`（5,561,832 参数） | ✅ | `tests/test_katago_v7_budget.py` 精确断言 |
+| `katago_v7.py`（5,562,121 参数） | ✅ | `tests/test_katago_v7_budget.py` 精确断言 |
 | 22ch builder 注册 | ✅ | `src/inference.py:177` |
 | 12 项 loss 装配 | ✅ | `tests/test_katago_v7_loss.py` 24 项 |
 | V7 端到端冒烟 | ✅ 跑过 | 40 步，11/12 项下降；`score_stdev` **−0.0%** |
@@ -316,7 +316,7 @@ ladder 通道的可验证性因此被拆成两半（`katago/` 下无 `cpp/` 源�
 | **11/13 项不需要新数据** | 现有 10 列能推出或实时算；只有 6 个局级标量要 sidecar |
 | **空间开销不划算** | bit-packed 22 通道 × 34.2M 行 ≈ 940 MB；实时算是「零新增空间存储」 |
 | **性能有余量** | 3.04 ms/行预算 vs 1.78 ms 基线 = 1.7×；贵的是 `iterLadders`（3 块盘面） |
-| **降级成本为零** | 若 `iterLadders` 超预算 ⇒ 降到 **18 通道**（ch14–17 恒 0），主干 / 四头 / 12 项 loss / 参数量 5,561,832 **一行不改** |
+| **降级成本为零** | 若 `iterLadders` 超预算 ⇒ 降到 **18 通道**（ch14–17 恒 0），主干 / 四头 / 12 项 loss / 参数量 5,562,121 **一行不改** |
 
 未来pos 几乎免费：每局行数 p50=208 / mean=210.7，`+8` 有效 96.2%、`+32` 有效 84.8%
 ⇒ **gather 全部行是免费的**（`boards` 常驻内存，就是索引），只有靠近终局的那
@@ -375,7 +375,7 @@ ladder 通道的可验证性因此被拆成两半（`katago/` 下无 `cpp/` 源�
    预测初值高达 277，而 loss #7 的目标量级只有 5~20（Huber δ=10）⇒ 初期梯度被
    常数偏差完全支配（40 步冒烟实测该项 **−0.0%**，即**根本没在学**）。
    实测改 `beta=1.0` 后 `score_stdev.mean()` **13.8599**、loss #7 **8.83**，
-   **落在 δ=10 附近**；参数量不变（5,561,832），段 1 四目标**逐位不变**
+   **落在 δ=10 附近**；参数量不变（5,562,121），段 1 四目标**逐位不变**
    （段 1 权重为 0，此改动是为段 2/3 生效的）。
    常量在 `katago_v7.py::SCORE_STDEV_SOFTPLUS_BETA`，**只改这一行即可**。
 7. **`policy_entropy` 曾报负熵** ✅ 已改成真熵 `H`。原值是 `Σ p·log p = −H`，
