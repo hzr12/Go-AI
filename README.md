@@ -106,6 +106,35 @@ ko 规则、计分制度、tax、encore、`passWouldEndPhase`、komi 奇偶三�
   DDP + HCCL + fp16/GradScaler）。
 - **V7 tracer bullet**：`scripts/smoke_train_v7.py` —— 302 行 / batch 8 / 40 步，
   直接吃 stdata，用来回答「12 项 loss 每项到底降不降」。
+
+### 2.5 导出到 KataGo 引擎
+
+`.bin.gz` 里存的不只是权重，还带一份**结构描述**，引擎完全按它去读每个数组。
+翻译逻辑在 `src/data/katago_export.py`，CLI 做包装 + **强制读回自检**：
+
+```bash
+python scripts/export_katago_bin.py export --checkpoint models/ours.pth \
+    --out tmp/coding/ours.bin.gz
+# 用引擎验证
+katago/katago-v1.18.1-opencl-windows-x64/katago.exe analysis \
+    -model tmp/coding/ours.bin.gz -config analysis.cfg
+```
+
+导出 **5,545,737** 参数（V7 的 5,562,121 减去四个无对应物的自研头）。已实测：
+引擎报 `Model name: goai_v7 (nbt transformer, 5545737 params)`，`rootInfo` 里
+sv3 六通道全部正确读出并后处理，GTP `genmove` 正常走子。
+
+三处被吸收的结构差异（详见 `katago_export.py` 模块 docstring）：
+
+1. **trunk 宽度不同** —— 我们 C=256/11 块，官方 b10c384 是 C=384/10 块，描述按我们自己的 cfg 生成。
+2. **attn/ffn 堆叠粒度不同** —— 官方 `BlockStack` 是 attn/ffn **交替**堆叠，
+   我们把两者**融合**在一个 `TransformerBlock` 里 ⇒ 一个融合单元展开成官方两个 block。
+3. **四个自研头**（`scoring` / `futurepos` / `seki` / `scorebelief`）在官方 `.bin`
+   里没有对应字段，剥离而非硬塞。
+
+⚠ `sv3Mul` 六通道里后两路（`shorttermWinlossError` / `shorttermScoreError`）
+**没有训练标签**（已核对 `trainingwrite.cpp` 全部 `rowGlobal[n]=` 赋值，官方 stdata
+的 64/80 列布局里不存在这两列），导出后恒为常量；第 4 路 `varTimeLeft` 是真训练的。
 - **RL**：`scripts/selfplay_train.py`（PPO + lookahead，**MCTS 已在 2026-09-30 归档**，
   采集换成 N 步 minimax 推演）。
 
