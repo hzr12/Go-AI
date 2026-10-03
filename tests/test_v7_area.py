@@ -1,19 +1,28 @@
 # -*- coding: utf-8 -*-
-"""V7 空间通道 B3：ch18/ch19（`calculateArea`）+ 区域计分归属图。
+"""V7 空间通道 B3：ch18/ch19 —— 官方 `Board::calculateArea*` 口径的归属图。
 
 被测对象 `src/data/feature_v7.py`：
-  · `area_ownership_map` —— 逐点归属图（`GoBoard.score()` 的批量版，逐格同构）
+  · `area_ownership_map` —— 逐点归属图（**官方绝对色口径**，逐字照抄
+    `board.cpp:1853-2327`）
   · `calculate_area`      —— 规则条件化 + 视角翻转（spec §2.5）
 
-**核心断言是「与 `GoBoard.score()` 的口径一致性」**（brief 点名的验收项）：
-随机盘面上 `ownership_map(board).sum() == GoBoard.score() + komi`。
-加上一个**独立写的** Python 逐点参考实现做三方对拍（向量化 ↔ 参考实现 ↔ `score()`），
-因为「sum 相等」单独看太弱：正负抵消可以让两张完全不同的归属图给出同一个和。
+    ---- 🔴 本文件曾经断言一个**错误的不变式**，已退役 ----
+旧版这里的核心断言是 `ownership_map(board).sum() == GoBoard.score() + komi`，
+配套一个 Tromp-Taylor 逐点参考实现。**那条不变式是错的**：官方 area 根本不是
+Tromp-Taylor 区域计分 —— 它多了两层算法（Benson 无条件存活 + 双活整块过滤），
+在真实对局里两者都会大面积生效。旧 docstring 把差异归因为「官方算 area 前先提
+死子」，**那个根因也是错的**（官方既不提子也不做死子判定，见
+`area_ownership_map` 的 docstring）。两处都已按官方源码改正。
 
-⚠ **ch18/19 不能与官方 stdata 对拍**。实测 1254 行真实数据，我们比官方多
-21,896 点（其中 19,913 个是**子**），原因见
-`src/data/feature_v7.py::area_ownership_map` 的 docstring（官方算 area 前先提死子，
-`GoBoard.score()` 不做）。本文件因此**不**假装 stdata 是这里的 oracle。
+现在这个文件守的是三件事：
+  1. **逐格**等价于一份**独立写的**官方算法参考实现（`_ref_area`，纯 Python
+     抄写 `board.cpp`，与被测的向量化实现零共享代码）；
+  2. 两条从官方源码推出来的、**能区分新旧口径**的结构性质（见
+     `test_seki_tax_never_adds_area`、`test_tax_seki_and_tax_all_share_the_area_planes`）；
+  3. 规则条件化（TERRITORY 恒 0、TAX_SEKI/ALL 抛错）与输出取值域。
+
+与官方 stdata 的**逐位**对拍在 `tests/test_v7_area_official.py`（那里才有真实
+归档；本文件不依赖归档，`pytest tests/test_v7_area.py` 随时可跑）。
 
 运行：
     python -m pytest tests/test_v7_area.py -q
@@ -33,7 +42,6 @@ from src.data.feature_v7 import (
     area_ownership_map,
     calculate_area,
 )
-from src.game.go_rules import GoBoard
 
 N = 19
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -58,42 +66,194 @@ def board(rows):
 
 
 # --------------------------------------------------------------------------- #
-# 参考实现：独立写的逐点 flood fill（**不复用**被测代码的任何一行）
+# 参考实现：**独立写的**官方算法逐字抄写（`board.cpp:1853-2327`）
+#
+# ⚠ 这里**不能**再放 Tromp-Taylor 参考实现了：旧版那个 `_ref_ownership`
+#   编码的是「空区域 + 边界颜色集合」判定，与官方 area 不同族。它作为 oracle
+#   会把实现往回拽到旧口径 —— 而旧口径与官方 stdata 逐行 0 行相同。
 # --------------------------------------------------------------------------- #
-def _ref_ownership(b):
-    """`GoBoard.score()` 的逐点版：Python 双层循环 + 栈式 flood fill。
+def _nb4(n, cell):
+    r, c = cell
+    if r > 0:
+        yield (r - 1, c)
+    if r + 1 < n:
+        yield (r + 1, c)
+    if c > 0:
+        yield (r, c - 1)
+    if c + 1 < n:
+        yield (r, c + 1)
 
-    ⚠ **为什么必须独立写一遍**：向量化版（`area_ownership_map`）与
-      `GoBoard.score()` 共用同一套「空区域 + 边界颜色集合」的判定思路，
-      而「sum == score() + komi」这一条允许两张不同的图互相抵消。所以
-      「三方对拍」（参考实现 ↔ 向量化 ↔ `score()` 的标量）才是可信的证据。
-    """
-    empty = b == 0
-    seen = np.zeros((N, N), dtype=bool)
-    own = np.where(b > 0, 1, np.where(b < 0, -1, 0)).astype(np.int8)
-    for r in range(N):
-        for c in range(N):
-            if not empty[r, c] or seen[r, c]:
+
+def _chains(b, n, pla):
+    """同色 4-邻接链：`{cell: chain_id}`（`board.cpp` 的 `chain_head`）。"""
+    out = {}
+    for r in range(n):
+        for c in range(n):
+            if b[r, c] != pla or (r, c) in out:
                 continue
+            cid = len(set(out.values())) + 1
             stack = [(r, c)]
-            seen[r, c] = True
-            region = []
-            border = set()
+            out[(r, c)] = cid
             while stack:
-                cr, cc = stack.pop()
-                region.append((cr, cc))
-                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                    nr, nc = cr + dr, cc + dc
-                    if not (0 <= nr < N and 0 <= nc < N):
-                        continue
-                    if empty[nr, nc] and not seen[nr, nc]:
-                        seen[nr, nc] = True
-                        stack.append((nr, nc))
-                    elif b[nr, nc] != 0:
-                        border.add(int(b[nr, nc]))
-            if len(border) == 1:
-                for cr, cc in region:
-                    own[cr, cc] = 1 if border == {1} else -1
+                cur = stack.pop()
+                for nb in _nb4(n, cur):
+                    if b[nb] == pla and nb not in out:
+                        out[nb] = cid
+                        stack.append(nb)
+    return out
+
+
+def _regions(b, n, pla, chain):
+    """「空点 ∪ opp 子」的 4-邻接极大连通块 + 官方记的属性（`:2006-2130`）。
+
+    `vital` 是**逐点过滤后**的结果（`:2033-2049`）；`num_internal` 封顶 2
+    （`:2052-2054`）；`contains_opp`（`:2056-2057`）。
+    """
+    opp = -pla
+    seen = set()
+    out = []
+    for r in range(n):
+        for c in range(n):
+            # 🔴 区域**只能从空点起头**（`board.cpp:2083-2086`：`colors[loc] !=
+            #   C_EMPTY` 那一支只更新 `atLeastOnePla` 然后 continue）。被本方子
+            #   四面围住的一颗对方子因此**不属于任何区域** —— 若让它当区域头，
+            #   它会拿到一个「从未经过滤的 vital 初始表」（头部相邻的链全算
+            #   vital，`:2100-2120`），那是官方根本不会产生的结果。
+            if b[r, c] != 0 or (r, c) in seen:
+                continue
+            cells, stack = [], [(r, c)]
+            seen.add((r, c))
+            while stack:
+                cur = stack.pop()
+                cells.append(cur)
+                for nb in _nb4(n, cur):
+                    if b[nb] in (0, opp) and nb not in seen:
+                        seen.add(nb)
+                        stack.append(nb)
+            vital = {chain[nb] for nb in _nb4(n, (r, c)) if b[nb] == pla}
+            num_internal = 0
+            contains_opp = False
+            for cell in cells:
+                if num_internal < 2 and not any(b[nb] == pla
+                                                for nb in _nb4(n, cell)):
+                    num_internal += 1
+                if b[cell] == opp:
+                    contains_opp = True
+                vital = {cid for cid in vital
+                         if any(b[nb] == pla and chain[nb] == cid
+                                for nb in _nb4(n, cell))}
+            out.append({'cells': cells, 'vital': vital,
+                        'num_internal': num_internal,
+                        'contains_opp': contains_opp, 'borders': False})
+    return out
+
+
+def _ref_area_for_pla(b, n, pla, suicide_legal, result):
+    """`Board::calculateAreaForPla(pla, safe=true, unsafe=true, suicide)`。
+
+    ⚠ `result` 由调用方填好 C_EMPTY **一次**（`board.cpp:1860-1862`：先
+      `std::fill`，再黑先白后共用同一块缓冲）—— 本函数里绝不能再填，否则白的
+      那一遍会把黑的结果整个抹掉，`:2237` 的 C_EMPTY 守卫随之失效。
+      这正是被测实现里那条「黑先白后顺序不能换」的由来。
+    """
+    chain = _chains(b, n, pla)
+    cells_of = {}
+    for cell, cid in chain.items():
+        cells_of.setdefault(cid, []).append(cell)
+    regions = _regions(b, n, pla, chain)
+    at_least_one_pla = any(b[r, c] == pla for r in range(n) for c in range(n))
+
+    vital_count = {cid: 0 for cid in cells_of}
+    for reg in regions:
+        for cid in reg['vital']:
+            vital_count[cid] += 1
+
+    killed = set()
+    while True:                                   # Benson 定点迭代 :2159-2195
+        progressed = False
+        for cid in list(cells_of):
+            if cid in killed:
+                continue
+            if vital_count[cid] < 2:               # :2168
+                killed.add(cid)
+                progressed = True
+                for cell in cells_of[cid]:
+                    for nb in _nb4(n, cell):
+                        for reg in regions:
+                            if nb in reg['cells'] and not reg['borders']:
+                                reg['borders'] = True
+                                for h in reg['vital']:
+                                    vital_count[h] -= 1
+        if not progressed:
+            break
+
+    for cid, cells in cells_of.items():
+        if cid not in killed:                       # :2202-2211
+            for cell in cells:
+                result[cell] = pla
+    for reg in regions:
+        should = (reg['num_internal'] <= 1 and not reg['borders']
+                  and at_least_one_pla)             # :2221
+        should = should or (not reg['contains_opp'] and not reg['borders']
+                            and at_least_one_pla)    # :2222
+        if should:
+            for cell in reg['cells']:
+                result[cell] = pla
+        elif not reg['contains_opp'] and at_least_one_pla:     # :2233
+            for cell in reg['cells']:
+                if result[cell] == 0:
+                    result[cell] = pla              # :2237 C_EMPTY 守卫
+    return result
+
+
+def _ref_area(b, suicide_legal=False, tax_rule=TAX_NONE):
+    """整条 `area_ownership_map` 的参考实现。"""
+    n = len(b)
+    basic = {(r, c): 0 for r in range(n) for c in range(n)}
+    _ref_area_for_pla(b, n, 1, suicide_legal, basic)       # 黑先
+    _ref_area_for_pla(b, n, -1, suicide_legal, basic)      # 白后（同一块缓冲）
+    for r in range(n):                                    # :1865-1873 / :1892-1898
+        for c in range(n):
+            if basic[(r, c)] == 0:
+                basic[(r, c)] = b[r, c]
+    if tax_rule == TAX_NONE:
+        return basic                                       # 官方 calculateArea
+    return _ref_independent_life(b, n, basic)
+
+
+def _ref_independent_life(b, n, basic):
+    """双活过滤（`:2264-2296`）+ keepStones（`:1927-1935`）。"""
+    atari = set()
+    for pla in (1, -1):
+        chain = _chains(b, n, pla)
+        cells_of = {}
+        for cell, cid in chain.items():
+            cells_of.setdefault(cid, []).append(cell)
+        for cells in cells_of.values():
+            libs = {nb for cell in cells for nb in _nb4(n, cell) if b[nb] == 0}
+            if len(libs) == 1:                            # :2270 触发①
+                atari.update(cells)
+    seki = set()
+    for cell in sorted(basic):
+        if basic[cell] == 0 or cell in seki:
+            continue
+        trigger = (b[cell] == basic[cell] and cell in atari) or any(
+            b[nb] == 0 and basic.get(nb, 0) == 0 for nb in _nb4(n, cell))  # :2272
+        if not trigger:
+            continue
+        pla = basic[cell]
+        seki.add(cell)                                   # :2280-2292 整块 flood
+        stack = [cell]
+        while stack:
+            cur = stack.pop()
+            for nb in _nb4(n, cur):
+                if basic.get(nb) == pla and nb not in seki:
+                    seki.add(nb)
+                    stack.append(nb)
+    own = {cell: (0 if cell in seki else basic[cell]) for cell in basic}
+    for cell in basic:                                   # keepStones
+        if b[cell] != 0 and basic[cell] == b[cell]:       # :1931
+            own[cell] = basic[cell]
     return own
 
 
@@ -139,6 +299,16 @@ def test_area_single_point_enclosures():
 
     逐格而不是只看聚合值：三态里错一态时聚合值常常仍然对（一个 +1 和一个 −1
     抵消），而这正是归属图最容易错的地方。
+
+    ⚠ **旧 docstring 的理由是错的，结论恰好是对的**。旧版写「按 Tromp-Taylor
+      归黑/归白」—— 现在这两个断言走的是完全不同的路径，且官方输出**确实**
+      是 −1/+1，但理由是：
+        · `(5,5)` 被 8 颗白子围住。对**黑**那一遍，它是 1 点区域、
+          `numInternal=1` ⇒ `:2221` 命中 ⇒ 写 +1；随后**白**那一遍
+          （`board.cpp:1862`，黑先白后）`numInternal=0` ⇒ `:2221` 再次命中，
+          而 `:2221` 是**无条件覆盖** ⇒ 最终 −1。
+        · `(9,9)` 对称地最终 +1。
+      所以这条现在钉的是「**白能覆盖黑**」这个覆盖语义，而不是区域计分。
     """
     out = calculate_area(_ENCLOSURES, np.array([1], np.int8), 0)
     pla, opp = out[0, 0], out[0, 1]
@@ -167,11 +337,17 @@ def test_area_whole_region_is_filled_not_just_one_point():
 
 
 def test_area_stones_belong_to_their_own_colour():
-    """有子的点归该子自己的颜色（区域计分里子本身算属地）。
+    """有子的点归该子自己的颜色。
 
-    这条是「区域计分 vs 领土计分」的分界：territory 口径下棋子**不算**属地。
-    写错成「只算围空」会让 ch18/ch19 丢掉所有己方棋子 —— 一个巨大的、
-    不抛异常的静默错。
+    ⚠ **旧 docstring 说这是「区域计分 vs 领土计分」的分界** —— 那是 Tromp-Taylor
+      的分界，官方 area 不分这个：子归自己颜色来自 `nonPassAliveStones` 兜底
+      （`board.cpp:1865-1873`：`result` 仍为 C_EMPTY 的**子**取自己的颜色），
+      或者来自 Benson 的「无条件存活子」（`:2202-2211`）。
+      ⚠ **这条断言仍不是无条件的**：一颗被对方围空分支（`:2221`/`:2222`，两者
+        都**无条件覆盖**）改写过的己方子，在官方输出里是**对方颜色**；若它落在
+        双活块里且 `basicArea != colors`，`keepStones`（`:1931`，判据是
+        `basicArea == colors`）也不会补回 ⇒ 该点为中立。这两种情形由
+        `tests/test_v7_area_official.py` 钉。
     """
     own = area_ownership_map(_ENCLOSURES)[0]
     assert own[7, 7] == 1, '黑子应归黑'
@@ -180,62 +356,102 @@ def test_area_stones_belong_to_their_own_colour():
 
 
 # --------------------------------------------------------------------------- #
-# 与 GoBoard.score() 的口径一致性
+# 结构性质：两条从官方源码推出来的、能**区分新旧口径**的不变量
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize('komi', [0.0, 7.5, -6.5])
-def test_ownership_sum_agrees_with_go_board_score(komi):
-    """**核心不变式**：`ownership_map(board).sum() == GoBoard.score() + komi`。
+def test_seki_tax_never_adds_area():
+    """**双活过滤只会抹掉 area，不会新增**（`TAX_SEKI`/`TAX_ALL` ⊆ `TAX_NONE`）。
 
-    为什么要自己加回 komi：`GoBoard.score()` 返回的是「黑分 − 白分 − komi」的
-    **净胜值**，而归属图的和是「黑属地 + 黑子 − 白属地 − 白子」，两者恰好差一个
-    komi 常数。这个常数是计分规则的定义、不是实现的偏差，所以测试里显式写清
-    「加回来」，而不是把 komi 设成 0 去绕开它（设 0 会让这条断言失去
-    「黑方先手必须贴目」这个真实场景的覆盖）。
-
-    ⚠ **为什么这条还不够**：正负抵消可以让两张不同的归属图给出同一个和。
-      逐格等价由下面的 `test_ownership_matches_independent_reference` 负责，
-      两条合起来才是 brief 要求的「口径一致性」。
+    为什么这条能区分新旧口径：Tromp-Taylor 没有 tax 这个维度，所以旧实现根本
+    写不出这条断言。而它挡住的是一整类很隐蔽的错 —— 双活过滤一旦被写成
+    「只清 atari 的子、不清接触 dame 的块」（漏掉 `board.cpp:2272-2275` 那个
+    触发），会**凭空多出**大量中立点，row_exact 掉下来但 cell_agree 还很高。
     """
-    rng = np.random.default_rng(20261002)
-    for trial in range(40):
-        x = rng.random((N, N))
-        b = np.where(x < 0.30, 1, np.where(x < 0.60, -1, 0)).astype(np.int8)
-        g = GoBoard(N, komi=komi)
-        g.board = b.copy()
-        got = int(area_ownership_map(b[None])[0].sum())
-        want = g.score() + komi
-        assert got == want, (
-            f'第 {trial} 个随机盘面（komi={komi}）：归属图求和 {got} '
-            f'!= score() {g.score()} + komi {komi} = {want}')
+    rng = np.random.default_rng(20261003)
+    for _ in range(40):
+        x = rng.random((9, 9))
+        b = np.where(x < 0.22, 1, np.where(x < 0.44, -1, 0)).astype(np.int8)
+        for sl in (False, True):
+            none = area_ownership_map(b[None], is_multi_stone_suicide_legal=sl,
+                                      tax_rule=TAX_NONE)[0]
+            for tax in (TAX_SEKI, TAX_ALL):
+                got = area_ownership_map(b[None],
+                                         is_multi_stone_suicide_legal=sl,
+                                         tax_rule=tax)[0]
+                assert not ((got != 0) & (none == 0)).any(), (
+                    f'tax={tax} 归出了 TAX_NONE 下不存在的点 ⇒ '
+                    f'双活过滤的方向反了')
+
+
+def test_tax_seki_and_tax_all_share_the_area_planes():
+    """**`TAX_SEKI` 与 `TAX_ALL` 的 ch18/ch19 必须逐位相同**。
+
+    依据官方源码：`calculateIndependentLifeArea`（`board.cpp:1876-1937`）**根本
+    不读 `taxRule`** —— 它只有 `keepTerritories` / `keepStones` /
+    `excludeTerritoryAdjacentToAtari` / `isMultiStoneSuicideLegal` 四个参数。
+    `taxRule` 在 `nninputs.cpp` 里只多算一个**全局**标量
+    `groupTaxAdjustmentForPla`（`:2436-2437`），**不进任何空间通道**。
+    ⇒ 谁要是把 tax 接进空间路径（一个很自然、看起来很合理的"改进"），这条立刻红。
+    """
+    rng = np.random.default_rng(20261004)
+    for _ in range(40):
+        x = rng.random((9, 9))
+        b = np.where(x < 0.22, 1, np.where(x < 0.44, -1, 0)).astype(np.int8)
+        for sl in (False, True):
+            seki = area_ownership_map(b[None], is_multi_stone_suicide_legal=sl,
+                                      tax_rule=TAX_SEKI)[0]
+            alls = area_ownership_map(b[None], is_multi_stone_suicide_legal=sl,
+                                      tax_rule=TAX_ALL)[0]
+            assert np.array_equal(seki, alls), (
+                f'TAX_SEKI 与 TAX_ALL 的 ch18/19 必须相同（taxRule 不进空间通道，'
+                f'nninputs.cpp:2436-2437 只算一个全局标量）；'
+                f'{int((seki != alls).sum())} 格不同')
+
+
+def _ref_arr(b, suicide_legal=False, tax_rule=TAX_NONE):
+    """`_ref_area` 的 `(n,n)` int8 包装（便于与被测实现直接 `array_equal`）。"""
+    n = len(b)
+    out = np.zeros((n, n), dtype=np.int8)
+    for (r, c), v in _ref_area(b, suicide_legal, tax_rule).items():
+        out[r, c] = v
+    return out
 
 
 def test_ownership_matches_independent_reference():
-    """**逐格**等价于一个独立写的 Python 参考实现（随机盘面 40 个）。
+    """**逐格**等价于一份独立写的官方算法参考实现（随机盘面 30 个 × 3 种 tax）。
 
-    与上一条互补：上一条管「总量」，这条管「每一格」。两者都要 ——
-    只有总量会被抵消骗过，只有逐格抓不到 komi 约定。
+    ⚠ **旧版这条用的是 Tromp-Taylor 参考实现**（`_ref_ownership`）⇒ 它断言的是
+      旧口径，与官方**相反**。旧实现在真实 stdata 上与官方逐行 0 行相同。
+      现在的 `_ref_area` 是 `board.cpp:1853-2327` 的纯 Python 抄写，与被测的
+      向量化实现零共享代码 —— 这才是「两份独立实现」的对拍。
     """
     rng = np.random.default_rng(11)
-    for trial in range(40):
-        x = rng.random((N, N))
-        b = np.where(x < 0.28, 1, np.where(x < 0.56, -1, 0)).astype(np.int8)
-        got = area_ownership_map(b[None])[0]
-        want = _ref_ownership(b)
-        if not np.array_equal(got, want):
-            rr, cc = np.argwhere(got != want)[0]
-            raise AssertionError(
-                f'第 {trial} 个随机盘面：({rr},{cc}) 我们={got[rr, cc]} '
-                f'参考={want[rr, cc]}（共 {int((got != want).sum())} 格不同）')
+    for trial in range(30):
+        x = rng.random((9, 9))
+        b = np.where(x < 0.24, 1, np.where(x < 0.48, -1, 0)).astype(np.int8)
+        sl = bool(rng.integers(0, 2))
+        for tax in (TAX_NONE, TAX_SEKI, TAX_ALL):
+            want = _ref_arr(b.astype(int), sl, tax)
+            got = area_ownership_map(b[None], is_multi_stone_suicide_legal=sl,
+                                     tax_rule=tax)[0]
+            if not np.array_equal(got, want):
+                rr, cc = np.argwhere(got != want)[0]
+                raise AssertionError(
+                    f'第 {trial} 个随机盘面（tax={tax}, suicide={sl}）：'
+                    f'({rr},{cc}) 我们={got[rr, cc]} 参考={want[rr, cc]}'
+                    f'（共 {int((got != want).sum())} 格不同）')
 
 
 def test_ownership_full_board_and_one_stone_per_colour():
-    """两个退化形状：满盘（无空点 ⇒ `label()` 返回 `num == 0` 的短路分支），
+    """两个退化形状：满盘（无空点 ⇒ 区域/链标注全空 ⇒ 走短路分支），
     以及「黑白各一颗子」（整块盘面是一大片空区、边界只有两种颜色 ⇒ 全中立）。
 
     两者都不是随机盘面容易覆盖到的分支。
-    ⚠ 注意**单独一颗黑子**不是退化形状：其余 360 个空点构成一个只邻黑子的区域，
-      按 Tromp-Taylor **全部归黑**（`sum == 361`）。这条容易被误当成 bug，
-      所以这里改用「黑白各一颗」—— 边界有两种颜色，那片空区才真的中立。
+    ⚠ **旧 docstring 里「按 Tromp-Taylor 全部归黑（sum == 361）」那句已作废** ——
+      那是旧口径的理由。官方语义下单颗黑子那一大片空区仍然归黑，但走的是
+      `:2222`（`safeBigTerritories && !containsOpp && !borders && atLeastOnePla`），
+      前提是那条链**没被 Benson 判死**；一颗孤子只有 1 个 vital 区域 ⇒ 判死
+      ⇒ `bordersNonPassAlive` ⇒ `:2222` 不命中，只剩 `:2233` 的 C_EMPTY 兜底。
+      结论与旧 docstring 一致纯属巧合，别拿它当依据。
     """
     full = np.zeros((1, N, N), np.int8)
     full[0, ::2, ::2] = 1

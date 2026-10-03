@@ -96,8 +96,13 @@ WHITE_STONES = [(8, 9), (10, 9), (9, 10),
                 (16, 17), (18, 17), (17, 16), (17, 18)]
 
 #: 区域归属的三个标记点（ch18 / ch19）：
-#:   (1,17) 只邻黑子 ⇒ 归黑； (17,17) 只邻白子 ⇒ 归白；
+#:   (1,17) 四邻全是黑子 ⇒ 归黑； (17,17) 四邻全是白子 ⇒ 归白；
 #:   (0,0) 在「哪边都不邻」的大空区里 ⇒ 中立。
+#: ⚠ **旧注释的理由（"只邻黑子 ⇒ 归黑"，Tromp-Taylor 的区域/边界色判定）已作废**。
+#:   官方 area 是 Benson + 围空：白先被黑用 `:2221` 写成 +1，再被白用 `:2221`
+#:   无条件覆盖回 −1（`board.cpp:2221`/`:1862`，黑先白后）；(1,17) 反过来 —— 白那
+#:   一遍没能覆盖（该区域 `bordersNonPassAlive`），于是留下 +1。**取值没变，路径
+#:   整个换了**，所以别再拿「只邻一种颜色」当依据。
 AREA_BLACK = (1, 17)
 AREA_WHITE = (17, 17)
 AREA_NEUTRAL = (0, 0)
@@ -275,6 +280,12 @@ def test_ch18_ch19_are_the_two_boolean_area_planes():
     ⚠ `calculate_area` 返回**带符号**的两视角（+1/−1/0）；装配层必须二值化 ——
       否则 −1 会让「有归属的点」与「on-board 的点」在张量上混同，而且无法与
       `unpack_binary_input` 的解包结果对拍。
+    ⚠ **下面三个取值与旧版一模一样，但旧版的理由是错的**（见 `AREA_BLACK` 上方
+      的注释：旧版按 Tromp-Taylor 的「只邻一种颜色」解释）。按官方算法重算，
+      `(1,17)→ch18`、`(17,17)→ch19`、`(0,0)→中立` 仍然成立，走的却是另一条路
+      （Benson + `:2221`/`:2222` 围空 + 黑先白后的覆盖）。所以这条现在钉的是
+      **装配层的二值化与通道顺序**，归属语义由 `tests/test_v7_area.py` 与
+      `tests/test_v7_area_official.py` 担保。
     """
     out = assemble()
     assert set(np.unique(out[:, 18:20])).issubset({0.0, 1.0}), \
@@ -520,8 +531,11 @@ _NOT_COMPARABLE = {
     13: '同上',
     15: 'stdata 无「前一手盘」⇒ 走官方回退复制（spec §9.4）',
     16: 'stdata 无「前二手盘」⇒ 同上',
-    18: '官方算 area 前先提死子，本仓 score() 不做（已知口径差）',
-    19: '同上',
+    18: '本 harness 用**单一**默认 rules_flags（AREA+TAX_NONE）跑全样本，'
+        '而官方 ch18/19 是**逐行按规则分岔**的 ⇒ 全样本 row_exact 不是对齐率；'
+        '按官方 globalInputNC 逐行分派后可比子集上 1.0，见 '
+        'tests/test_v7_area_official.py',
+    19: '同 ch18',
 }
 
 #: 必须**逐行 100% 精确相等**的通道。🔴 这些掉下来就是**组装顺序**出了问题 ——
@@ -568,11 +582,42 @@ def test_stdata_per_channel_match_table(stdata, capsys):
     # 恒 0 的通道：两边都必须全 0
     for ch in _PINNED_ZERO_BOTH:
         assert rows[ch][3] == 0 and rows[ch][4] == 0
-    # ch18/19 已知对不齐 —— 但**必须如实记录**，不许调阈值迁就
+    # ch18/19：**正向**断言 —— 在本 harness 的默认 flags 恰好与官方一致的
+    # 那个子集上必须逐位全对。
+    #
+    # 🔴 **旧断言（已作废）**：这里原来写的是 `assert rows[ch][1] < 1.0`，
+    #   失败信息写「那说明本仓也提了死子，去查死子」。**那个根因已被推翻** ——
+    #   官方 `Board::calculateArea*`（`board.cpp:1853-1937`）既不提子也不做死子
+    #   判定，它的输入只有 `colors`。照着那条信息去查死子会把人带进死胡同。
+    #   现在改成正向断言：对齐了就是 1.0，对不上就报真实数字。
+    #
+    # ⚠ 为什么不能直接断言全样本 == 1.0：`_assemble_stdata` 用**单一**默认
+    #   `rules_flags`（AREA+TAX_NONE+`multiStoneSuicideLegal=false`）跑全部行，
+    #   而官方 ch18/19 是**逐行按规则分岔**的（`nninputs.cpp:2391-2439`）。所以
+    #   只有「官方自己是 AREA ∧ TAX_NONE ∧ ch8==0」的行才该全对 ——
+#   TERRITORY 行官方只在 `encorePhase>=2` 才发 area，TAX_SEKI/ALL 行要走
+    #   双活过滤，本 harness 都喂不了。逐规则的完整分解（含
+    #   `multiStoneSuicideLegal` 两种取值、4368 行）在
+    #   `tests/test_v7_area_official.py`，那里是 1.000000 / 2282 行。
+    #   ⚠ 本前缀样本的 `AREA ∧ TAX_NONE` 行 `globalInputNC[:,8]` 全是 1，也就是
+    #   说默认 flags 的 `multiStoneSuicideLegal=False` 在这批行上**没被考到** ——
+    #   所以这里只断言到 `TAX_NONE` 这一层，别在这里假装覆盖了 suicide 口径。
+    G = stdata[1]
+    subset = (G[:, 9] < 0.5) & (G[:, 10] < 0.5) & (G[:, 11] < 0.5)
+    n_ch8 = int((subset & (G[:, 8] > 0.5)).sum())
+    assert subset.sum() > 0, (
+        f'这个样本里一条「官方=AREA+TAX_NONE」的行都没有（{S.shape[0]} 行）'
+        f'⇒ ch18/19 的正向断言会空跑。换 stdata 批次或调大取样。')
     for ch in (18, 19):
-        assert rows[ch][1] < 1.0, (
-            'ch18/19 突然逐行全对了：那说明本仓也提了死子，'
-            '`area_ownership_map` 的口径记录与实现就不一致了，要重新对账。')
+        sub = (mine[subset, ch] == S[subset, ch]).all(axis=(1, 2))
+        assert sub.all(), (
+            f'ch{ch} 在 {int(subset.sum())} 条「官方=AREA+TAX_NONE」的'
+            f'行上只有 {int(sub.sum())} 行逐位全对'
+            f'（其中 {n_ch8} 行的 multiStoneSuicideLegal=1）。'
+            f'\n⚠ 这批行是本 harness 的默认 flags **恰好**覆盖官方分支的子集，'
+            f'掉下来就是 ch18/19 的实现回归 —— 查 '
+            f'`area_ownership_map` / `_area_for_pla`，不要动装配层，也不要'
+            f'去查死子（官方不做死子判定）。')
 
 
 @needs_stdata

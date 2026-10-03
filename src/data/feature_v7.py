@@ -324,95 +324,349 @@ def history_gated(prev_board, prev_prev_board, boards, offset=LADDER_CH_BASE):
 
 
 # --------------------------------------------------------------------------- #
-# B3 · ch18 / ch19：calculateArea
+# B3 · ch18 / ch19：calculateIndependentLifeArea
 # --------------------------------------------------------------------------- #
-def area_ownership_map(boards):
-    """返回 `(B, n, n)` int8 的**逐点归属图**（Tromp-Taylor 区域计分），取值 −1/0/+1。
+#: 4 邻域的四个偏移（`(dr, dc)`），顺序与官方 `board.cpp` 的 `adj_offsets`
+#: （`board.cpp:39-42`：`{-(x_size+1), -1, +1, x_size+1}`）一致。
+#: ⚠ 只在**本模块的私有 helper** 里用；不要拿去改 `go_rules._NB4` 之类。
+_NB4_DIRS = ((-1, 0), (1, 0), (0, -1), (0, 1))
 
-    规则（与 `GoBoard.score()` **逐格同口径**）：
-      · 有子的点归该子自己的颜色；
-      · 空点按 4 邻域连通成**区域**，区域若**只**与一种颜色相邻则整片归该色，
-        与两色相邻（或与谁都不相邻）则为中立 0。
 
-    ---- 与 `GoBoard.score()`（`go_rules.py:2261`）的口径等价性 ----
-    `score()` 逐点 flood fill 空区域、按 `len(border_colors) == 1` 归色，然后
-    `黑子 + 黑围空 − 白子 − 白围空 − komi`。本函数做的事**逐点同构**，
-    区别只在两点实现方式：
-      · `score()` 是 Python 双层循环 + 栈式 flood fill，本函数用
-        `scipy.ndimage.label`（4 邻域、同 `_STRUCT3`）批量标号 —— 连通性一致；
-      · `score()` 用 `set()` 收集 border colors，本函数用**两次 4 邻域膨胀**
-        （`binary_dilation(black)` / `binary_dilation(white)`）问「这个区域有没有
-        黑色邻子 / 白色邻子」—— 这是 `len(border_colors) ∈ {0,1,2}` 的等价问法，
-        且比收集集合更便宜。
-    ⇒ 不变式：`ownership_map(board).sum() == GoBoard.score() + komi`。
-      由 `tests/test_v7_area.py::test_ownership_sum_agrees_with_go_board_score`
-      在随机盘面上逐位对拍。
+def _shift4(a, dr, dc):
+    """把 `(B,n,n)` 数组按 4 邻域平移一格，**移出盘面的位置填 0**。
 
-    ⚠ **没有死子判定 —— 这是有意保留的**（spec §5.1 的白捡二 + 对齐口径优先）。
-    `score()` 的 docstring 自陈「没有死子判定」，所以一块**没被提掉**的对方死子
-    会让它周围的空点变成「两色共邻」的中立区域，同族的死子点自己仍算它的颜色。
-    对局双方应在 pass 认输前提掉对方的死子。
+    用切片赋值而不是 `np.roll`：`np.roll` 会**环绕**（第一行接到最后一行），
+    而棋盘的边界外是「没有邻点」⇒ 必须是 0。环绕会让边界上的 vital / dame
+    判定读到对面的子，是静默错。
 
-    ---- 与官方 stdata 的 ch18/19 的实测偏差（**不是 bug，是已知的口径差**）----
-    用 `katago/stdata` 的 `zzb28c512` 批（第一个含 19×19 行的 npz，**1254 行**）
-    对拍：把官方 ch1/ch2 还原成盘面喂给本函数，再与官方 ch18/19 逐点比 ——
-    **没有一行完全相同**。偏差的方向是**我们比官方多**：
+    ⚠ 第 0 轴（batch）**不**动：`_STRUCT3` 与本函数都保证样本间不互串。
+    """
+    out = np.zeros_like(a)
+    src = [slice(None), slice(None), slice(None)]
+    dst = [slice(None), slice(None), slice(None)]
+    if dr == -1:
+        src[1], dst[1] = slice(1, None), slice(0, -1)
+    elif dr == 1:
+        src[1], dst[1] = slice(0, -1), slice(1, None)
+    if dc == -1:
+        src[2], dst[2] = slice(1, None), slice(0, -1)
+    elif dc == 1:
+        src[2], dst[2] = slice(0, -1), slice(1, None)
+    out[tuple(dst)] = a[tuple(src)]
+    return out
 
-    ==============================  ========  =====================================
-    项                                数值      说明
-    ==============================  ========  =====================================
-    ch18 官方总点数                    73,298   其中 **4,148** 是空点、其余是子
-    ch18 我们总点数                    95,113   其中 **6,089** 是空点
-    「我们多出来」的点                 21,896   19,913 个**子** + 1,983 个空点
-    「官方多出来」的点                    81
-    受影响的行                        295/1254   且缺失的子**不集中在 1 气的块上**
-    ==============================  ========  =====================================
 
-    最小的例子：一个被黑子四面围住的单空点（形如 `.O.O. / O.O.O / .O.O.` 的中心）
-    按 Tromp-Taylor 归黑，**官方给中立**。合理猜测：官方在算 area 之前**先提掉了
-    死子**（于是围住死子的那片空与外面的空连成一片、重新按边界颜色分类），
-    而 `GoBoard.score()` 不做这件事。
+def _vital_pairs(b, rid, nreg, pc, nchain, suicide_legal):
+    """Benson 的 vital 表：区域 `R` 对链 `C` 是否 vital（= `R` 的**每个点**都邻接 `C`）。
 
-    ⚠ **本轮刻意不去补死子判定**（brief 明确要求）：那要猜「官方用什么判据判死」
-    （块气？局部搜索？`Board` 内部字段？），猜错会得到一个**既不等于 `score()`、
-    也不等于官方**的第三种口径，而这类偏差是静默的（不会抛异常，只表现为训练分布
-    偏移）。先把「与 `score()` 逐点同构 + `sum == score() + komi`」这个可证的
-    不变式钉住（`tests/test_v7_area.py`），死子判定作为**单独一件事**带着判据来做。
-    ⇒ 因此 **stdata 不能直接当 ch18/19 的对拍 oracle**，只有上面那两条
-      （ch3/4/5 与 ch9-13）可以，见 `tests/test_v7_planes.py`。
+    官方定义在 `board.cpp:1980`（"A region is vital for a pla group if all its
+    spaces are adjacent to that pla group"），实现在 `buildRegion` 的逐点过滤
+    （`board.cpp:2033-2049`）。本函数是那份过滤的**稀疏向量化**。
+
+    Returns:
+        `(vp_r, vp_c, vital_count)`：`vp_r/vp_c` 是所有 vital 的
+        `(区域号, 链号)` 对（**只含 vital 的对**），`vital_count[c]` 是链 `c`
+        的 vital 区域数（官方 `vitalCountByPlaHead`）。
+
+    ⚠ **去重必须按「(点, 链)」而不是按「(区域, 链)」**。同一个空点可能在两个方向
+      上都邻接同一条链（U 形眼是常态），按 `(区域, 链)` 去重会把它数成 2 ⇒
+      那个区域被判成 vital ⇒ 一条本该判死的链被判活。这是本函数唯一的坑。
+    ⚠ **`suicide_legal=False` 时只过滤空点**（`board.cpp:2036`：
+      `if(isVlenNonZero && (isMultiStoneSuicideLegal || colors[loc] == C_EMPTY))`）——
+      区域里混着的**对方子**不参与过滤。官方训练数据两种规则都有
+      （`configs/training/gatekeeper1.cfg:35` 的 `multiStoneSuicideLegals = false,true`）。
+    """
+    width = nchain + 1
+    flat_rid = rid.reshape(-1)
+    in_region = rid > 0
+    # 只有空点参与过滤（suicide 合法时全部点参与）
+    eligible = in_region if suicide_legal else (in_region & (b == 0))
+    elig_flat = eligible.reshape(-1)
+    keys = []
+    for dr, dc in _NB4_DIRS:
+        nb = _shift4(pc, dr, dc)
+        m = elig_flat & (nb.reshape(-1) > 0)
+        if m.any():
+            keys.append(np.flatnonzero(m).astype(np.int64) * width + nb.reshape(-1)[m])
+    if not keys:
+        return (np.zeros(0, np.int64), np.zeros(0, np.int64),
+                np.zeros(nchain + 1, np.int64))
+    # 第一步：按 (点, 链) 去重 —— 同一个点同一个链只留一次。
+    pt_ch = np.unique(np.concatenate(keys))
+    pt = pt_ch // width
+    ch = pt_ch - pt * width
+    # 第二步：按 (区域, 链) 聚合计数，与区域大小比 ⇒ 是否「每个点都邻接」。
+    # ⚠ 分母必须是**参与过滤的点数**，不是区域总点数：官方 `board.cpp:2036` 的
+    #   `if(isVlenNonZero && (isMultiStoneSuicideLegal || colors[loc] == C_EMPTY))`
+    #   意味着 suicide 不合法时**区域里的对方子不施加任何约束** —— 那颗子被跳过，
+    #   根本不进 `vitalForPlaHeadsLists` 的过滤。拿总点数当分母会让「含对方子的
+    #   区域」永远达不到 vital（`ucount ≤ 空点数 < 总点数`）⇒ 一条有两个真眼的
+    #   链被判死 ⇒ 它的眼位与整块属地被抹平。这是本函数唯一的第二个坑。
+    size = np.bincount(flat_rid[elig_flat], minlength=nreg + 1)
+    pair = flat_rid[pt] * width + ch
+    upair, ucount = np.unique(pair, return_counts=True)
+    up_r = upair // width
+    up_c = upair - up_r * width
+    vital = ucount >= size[up_r]
+    vp_r = up_r[vital]
+    vp_c = up_c[vital]
+    return (vp_r, vp_c,
+            np.bincount(vp_c, minlength=nchain + 1).astype(np.int64))
+
+
+def _area_for_pla(b, pc, nchain, pla, suicide_legal, result):
+    """官方 `Board::calculateAreaForPla(pla, safe=true, unsafe=true, suicide)`，
+    **就地**写 `result`（`board.cpp:1949-2244`）。
+
+    `pc` 是 pla 侧的全局链号（`(B,n,n)` int32，1..nchain，其余 0）。
+    ⚠ **`result` 是跨两次调用共享的同一个缓冲**：官方是
+      `calculateAreaForPla(P_BLACK,…)` 写完，再 `calculateAreaForPla(P_WHITE,…)`
+      在**同一块** `area` 上接着写（`board.cpp:1861-1862`）。
+      `:2233` 的 `result[cur]==C_EMPTY` 守卫（`board.cpp:2237`）正是靠这个
+      「黑先白后」的顺序才成立 —— **顺序不能换**，换了白就会覆盖黑已写的点。
+    """
+    opp = -pla
+    nonpla = (b == 0) | (b == opp)
+    rid, nreg = _ndi_label(nonpla, structure=_STRUCT3)
+    # 🔴 区域**只能从空点起头**（`board.cpp:2083-2086`：`colors[loc] != C_EMPTY`
+    #   那一支只更新 `atLeastOnePla` 然后 `continue`）。`scipy.ndimage.label` 会
+    #   老老实实把「被本方子四面围住的一颗对方子」也标成一个 1 点区域，而官方
+    #   根本不产生这个区域 —— 后果不是「多一个无用区域」，而是那个区域
+    #   `numInternal=0` 且 `!containsOpp` 不成立… 实际是 `containsOpp=true` 但
+    #   `:2221` 不看 `containsOpp` ⇒ 它被**无条件写成 pla 的属地**，一颗白子
+    #   在 ch18/19 上显示成黑。实测：随机 9×9 盘面上 116,640 格里有 3 格这样错。
+    #   合法对局里对方子必有 ≥1 气、因而总与某个空点连通，所以 stdata 对拍抓不到
+    #   它 —— 但本函数吃的是任意盘面数组，必须与官方逐格一致。
+    #   官方那个「未经过滤的 vital 初始表」（`board.cpp:2100-2120`，区域头相邻的
+    #   链先全部记为 vital）也就只对**真正从空点起头**的区域成立。
+    if (b == 0).any():
+        has_empty = np.bincount(rid[(b == 0)].reshape(-1),
+                                minlength=nreg + 1) > 0
+        rid = np.where(has_empty[rid], rid, 0)
+    at_least_one_pla = (pc != 0).any(axis=(1, 2))          # board.cpp:2077-2086
+
+    vp_r, vp_c, vital_count = _vital_pairs(b, rid, nreg, pc, nchain, suicide_legal)
+
+    # ---- Benson 定点迭代（board.cpp:2159-2195）--------------------------------
+    killed = np.zeros(nchain + 1, dtype=bool)
+    borders_non_pass_alive = np.zeros(nreg + 1, dtype=bool)
+    while True:
+        newly = (~killed) & (vital_count < 2)               # board.cpp:2168
+        newly[0] = False
+        if not newly.any():
+            break
+        killed |= newly
+        # 新判死的链**周边**的区域：从链上任意点做 4-邻域膨胀，只保留区域点。
+        around = np.zeros(b.shape, dtype=bool)
+        for dr, dc in _NB4_DIRS:
+            around |= _shift4(newly[pc], dr, dc)
+        just_bordered = (rid > 0) & around & ~borders_non_pass_alive[rid]
+        if not just_bordered.any():
+            continue
+        # `borders_non_pass_alive` 是**按区域号**的表，写入要落到号上
+        newly_bordered_rids = np.unique(rid[just_bordered])
+        borders_non_pass_alive[newly_bordered_rids] = True
+        # ⚠ 必须拿**区域号**去比 `vp_r`，不能用 `np.flatnonzero(just_bordered)`
+        #   —— 那是 `(B,n,n)` 的**扁平下标**，与区域号是两种东西。单样本时两者
+        #   数值都 < 361、偶然撞上而「看起来对」；B>1 时扁平下标远大于任何区域号
+        #   ⇒ `hit` 恒空 ⇒ Benson 的 vital 传播**整个失效**，且结果随 batch 组成
+        #   变化（已实测 135 行里 1 行单算与批算不一致）。
+        hit = np.isin(vp_r, newly_bordered_rids)
+        if hit.any():
+            vital_count -= np.bincount(vp_c[hit], minlength=nchain + 1)
+        vital_count[0] = 0
+
+    # ---- 无条件存活子（board.cpp:2202-2211，**允许覆盖**已有值）--------------
+    alive = ~killed
+    alive[0] = False
+    result[alive[pc]] = pla
+
+    # ---- 围空（board.cpp:2214-2243）-------------------------------------------
+    # ⚠ 三条判据的顺序就是优先级：前两条**无条件写**（会覆盖对方颜色），
+    #   第三条只在 `result` 仍为 C_EMPTY 时写。
+    # ⚠ `:2221` 的判据就是 `numInternalSpacesMax2 <= 1`（不是 `< 2` 之外的任何
+    #   东西），而 `:2233` **完全没有** `bordersNonPassAlive` 判据 —— 这两条是
+    #   官方大量「反直觉」输出的来源，不要"顺手修正"。
+    # ⚠ `atLeastOnePla` 是**整盘**级（`board.cpp:2077-2086` 扫全盘），不是逐区域；
+    #   它必须作用在**空间掩码**上 —— 区域表是全批一张，直接和 `(B,1)` 广播会
+    #   变成 `(B, nreg+1)`，那是彻底错位。
+    num_internal = np.zeros(nreg + 1, dtype=np.int64)
+    adj_pla = _ndi_binary_dilation(pc != 0, structure=_STRUCT3)
+    internal = (rid > 0) & ~adj_pla                  # board.cpp:2052-2054
+    if internal.any():
+        num_internal = np.minimum(
+            2, np.bincount(rid[internal].reshape(-1), minlength=nreg + 1))
+    contains_opp = np.zeros(nreg + 1, dtype=bool)   # board.cpp:2056-2057
+    opp_stones = b == opp
+    if opp_stones.any():
+        contains_opp = np.bincount(rid[opp_stones].reshape(-1),
+                                   minlength=nreg + 1) > 0
+
+    should_mark_r = ((num_internal <= 1) | (~contains_opp)) & ~borders_non_pass_alive
+    should_mark_r[0] = False
+    if_empty_r = ~contains_opp                  # board.cpp:2233
+    if_empty_r[0] = False
+    gate = at_least_one_pla.reshape(-1, 1, 1)
+    in_region = rid > 0
+    should_mark = should_mark_r[rid] & in_region & gate
+    if should_mark.any():
+        result[should_mark] = pla
+    if_empty = if_empty_r[rid] & in_region & gate & (result == 0)
+    if if_empty.any():
+        result[if_empty] = pla
+    return result
+
+
+def _independent_life_seki(b, basic, atari):
+    """`calculateIndependentLifeAreaHelper` 的双活过滤（`board.cpp:2247-2327`）。
+
+    🔴 **两个触发条件命中任一即整块判双活**（这是官方输出大量中立的原因）：
+
+      ① `board.cpp:2270`：**己方子整链 1 气**（在气）⇒ 属地被当成双活。
+      ② `board.cpp:2272-2275`：**接触 dame** —— 任一 4 邻点是「两色都没认领的
+         空点」（`colors[adj]==C_EMPTY && basicArea[adj]==C_EMPTY`）。
+
+    命中后沿 `basicArea == pla` 做 4-邻接 flood，**整块**标 `isSeki`
+    （`board.cpp:2280-2292`）；最后只输出 `~isSeki` 的块（`:2303-2326`）。
+
+    ⚠ 触发 ② 是**大多数**局面里 area 被抹平的真凶 —— 不是「提死子」。
+    ⚠ 官方**既不提子也不做死子判定**：`calculateAreaForPla` 的输入只有
+      `colors`，输出直接写 `area`。死子在 area 里就是「对方子落在被对方围的空区
+      里」，由 `containsOpp` 与上面的双活过滤自然处理。
+    """
+    unclaimed = (b == 0) & (basic == 0)               # 两色都没认领的空点 = dame
+    dame = _ndi_binary_dilation(unclaimed, structure=_STRUCT3) if unclaimed.any() \
+        else np.zeros(b.shape, dtype=bool)
+    owned_stone_atari = atari & (b == basic)           # 触发①
+    seed = (basic != 0) & (dame | owned_stone_atari)
+    if not seed.any():
+        return np.zeros(basic.shape, dtype=bool)
+    seki = np.zeros(basic.shape, dtype=bool)
+    for sign in (1, -1):
+        block = basic == sign
+        if not block.any() or not (seed & block).any():
+            continue
+        labelled, num = _ndi_label(block, structure=_STRUCT3)
+        hit = np.unique(labelled[seed & block])
+        hit = hit[hit > 0]
+        if hit.size:
+            seki |= np.isin(labelled, hit)
+    return seki
+
+
+def area_ownership_map(boards, *, is_multi_stone_suicide_legal=False,
+                      tax_rule=TAX_NONE):
+    """返回 `(B, n, n)` int8 的**逐点归属图**（官方 ch18/ch19 的绝对色口径），
+    取值 −1/0/+1（−1=白 / 0=中立 / +1=黑）。
+
+    ---- 算法：逐字照抄官方 `Board::calculateAreaForPla`（`board.cpp:1949-2244`）----
+    四层（层 1–3 是 `basicArea`，两条官方分支**共用**）：
+
+      1. **链标注**：黑、白各自 4-邻接连通块（`board.cpp` 的 `chain_head` /
+         `next_in_chain`）。本仓用 `scipy.ndimage.label`（`go_rules._STRUCT3`）
+         —— 该结构元第 0 轴是单位阵 ⇒ 逐样本独立，块号全批唯一。
+      2. **Benson 定点迭代**（`board.cpp:1949-2195`，对黑、白各跑一遍）：
+         先把「空点 ∪ 对方子」按 4 邻接切成**区域**（⚠ 区域里**可以含对方子**
+         —— 与「只 label 空点」不是同一族对象），再算每条链的 **vital 区域数**
+         （区域 vital 于某链 ⟺ 区域**每个参与过滤的点**都邻接该链），任一链
+         vital 数 < 2 即判死（`:2168`），迭代到不动点。**判死的链不写进 area。**
+      3. **无条件存活子 + 围空**（`board.cpp:2202-2243`）：无条件存活的链**整块**
+         写自己的颜色（允许覆盖）；随后每个区域按三条判据落笔 ——
+         `:2221`「内部空 ≤ 1 且不邻接任何非 pass-alive 子」、
+         `:2222`「不含对方子且不邻接任何非 pass-alive 子」，
+         两条都**无条件覆盖**；`:2233`「不含对方子」则**只在仍为 C_EMPTY 时写**。
+         🔴 **黑先白后**（`board.cpp:1861-1862`）—— `:2237` 的 C_EMPTY 守卫
+         依赖它，**顺序不能换**。
+         然后 `nonPassAliveStones` 兜底（`board.cpp:1865-1873`）：仍为空的
+         **子**归自己的颜色。到此 `basicArea` 完成。
+      4. **按 tax 规则分岔**（`nninputs.cpp:2391-2439`）—— 🔴 这是**两个不同
+         的官方函数**，不是同一个函数的参数差异：
+         · `tax_rule == TAX_NONE` ⇒ 官方走 `Board::calculateArea`
+           （`board.cpp:1853-1874`），**没有**第 4 层，直接返回 `basicArea`。
+         · `tax_rule ∈ {TAX_SEKI, TAX_ALL}` ⇒ 官方走
+           `Board::calculateIndependentLifeArea(keepTerritories=false,
+           keepStones=true)`（`board.cpp:1876-1937`），**多一层双活过滤**：
+           见 :func:`_independent_life_seki` 的两个触发，命中即整块抹成中立；
+           最后 `keepStones=true` 按 `basicArea == colors` 把子补回
+           （`board.cpp:1927-1935`）。
+         ⚠ 默认 `TAX_NONE` 不是「随便挑的默认值」，而是 `calculate_area` 唯一
+           能走到的分支（`AREA+TAX_SEKI/ALL` 在那里抛 `NotImplementedError`），
+           所以默认值必须等于 `calculateArea` 的语义，否则生产路径整个是错的。
+
+    ⚠ **全程不读 `ko_loc`**：官方 `calculateArea*` 也一个 ko 都不读
+      （劫只影响 ch6/7/8）。
+    ⚠ `is_multi_stone_suicide_legal` 对应 `board.cpp:2036`：它决定 Benson 的
+      vital 过滤**是否也检查区域里的对方子**。`False`（本仓默认，等于
+      `DEFAULT_RULES_FLAGS` 的 bit5=0）时只过滤空点。
+      ⚠ 官方真正传进去的是 `nnInputParams.getSuicideLegalForPassAlive(hist)`
+      （`nninputs.cpp:964`）= `multiStoneSuicideLegal || alwaysComputePassAlive
+      UnderSuicideRules`，后半个来自 `hist.modes`，**19 个全局通道里没有任何一个
+      编码它** ⇒ 对 `globalInputNC[:,8]==0` 的行，从 stdata **无法**恢复真值。
+
+    ---- 与 `GoBoard.score()`（`go_rules.py:2261`）的关系：**已脱钩** ----
+    🔴 旧版本这里写的是 Tromp-Taylor 区域计分，并有一条
+      `sum == GoBoard.score() + komi` 的不变式。那条不变式**已退役**
+      （`tests/test_v7_area.py::test_ownership_sum_agrees_with_go_board_score`
+      现在断言的是官方语义）：官方 area **不是** Tromp-Taylor ——
+      Benson 会杀链、双活过滤会抹整块，两者在真实对局里都会大面积生效。
+      `GoBoard.score()` 是 Tromp-Taylor 计分口径，本仓**一个字都没动**
+      （spec §7.1 钉死），它与本函数是两个独立的量，不要互相"对齐"。
+
+    ---- 仍然存在、且**本函数无法闭合**的两处不可比 ----
+      1. **TERRITORY 口径的行**：官方 `nninputs.cpp:2407-2421` 只在
+         `encorePhase >= 2` 时才置 `hasAreaFeature`，而 encore 阶段本仓没有
+         （spec §2.6 D2）⇒ 那类行的官方 ch18/19 要么恒 0，要么来自
+         `secondEncoreStartColors`（`:2456-2467`）。stdata **给不出**
+         `secondEncoreStartColors` ⇒ 不可比。对拍时必须先按官方自己的
+         `globalInputNC[:,9]` 把这些行剔掉，否则会把「官方恒 0」误读成
+         「我们算错了」（实测 301 行里有 85 行落在这里，剔掉前 row_exact 是
+         0.0000、剔掉后是 1.000000）。
+      2. **`multiStoneSuicideLegal == false` 的行**：见上面 `getSuicideLegal
+         ForPassAlive` 那条 —— 真值不可从 stdata 恢复。
+    对拍数字、逐规则组的分解、以及这些分组为什么必须先剔除，见
+    `tests/test_v7_area_official.py`。
     """
     b = _as_batch_boards(boards)
     B, n, _ = b.shape
-
     empty = b == 0
-    labelled, num = _ndi_label(empty, structure=_STRUCT3)
 
-    if num:
-        region = labelled > 0
-        reg_id = labelled[region]
-        # 「区域里有没有黑色/白色邻子」= 该区域任一点的 4 邻域里有黑/白子。
-        # `binary_dilation` 的 `origin` 默认居中，`_STRUCT3` 的第 0 轴是单位阵，
-        # 所以每个 batch 元素各自膨胀、不会跨样本。
-        near_black = _ndi_binary_dilation(b == 1, structure=_STRUCT3)[region]
-        near_white = _ndi_binary_dilation(b == -1, structure=_STRUCT3)[region]
+    # ---- 1. 链标注（块号全批唯一：`_STRUCT3` 第 0 轴是单位阵 ⇒ 不跨样本）----
+    blk, nblk = _ndi_label(b == 1, structure=_STRUCT3)
+    wht, nwht = _ndi_label(b == -1, structure=_STRUCT3)
 
-        touches_black = np.zeros(num + 1, dtype=bool)
-        touches_white = np.zeros(num + 1, dtype=bool)
-        touches_black[reg_id[near_black]] = True
-        touches_white[reg_id[near_white]] = True
-        touches_black[0] = False
-        touches_white[0] = False
+    basic = np.zeros(b.shape, dtype=np.int8)
+    _area_for_pla(b, blk, nblk, 1, is_multi_stone_suicide_legal, basic)
+    _area_for_pla(b, wht, nwht, -1, is_multi_stone_suicide_legal, basic)
 
-        # 只有「恰好一种颜色」才归属 —— 这就是 `score()` 的 `len(border_colors)==1`。
-        owner_of_region = np.zeros(num + 1, dtype=np.int8)
-        owner_of_region[touches_black & ~touches_white] = 1
-        owner_of_region[touches_white & ~touches_black] = -1
-        region_owner = owner_of_region[labelled]
-    else:
-        # 满盘无空点：没有区域，只有子。
-        region_owner = np.zeros((B, n, n), dtype=np.int8)
+    # `nonPassAliveStones=true` / basicArea 兜底：仍为空的点归**该点自己的颜色**
+    # （`board.cpp:1892-1898`）⇒ 本实现里就是「所有子都进 basicArea」。
+    unclaimed_stones = (basic == 0) & ~empty
+    basic[unclaimed_stones] = b[unclaimed_stones]
 
-    own = np.where(b > 0, np.int8(1), np.where(b < 0, np.int8(-1), region_owner))
+    if tax_rule == TAX_NONE:
+        # 官方 `calculateArea`（`board.cpp:1853-1874`）：**没有**双活过滤，
+        # basicArea 原样就是结果。`AREA + TAX_NONE` 走的是这一支 ⇒ 下面算气数
+        # 是白算，所以这个 early-return 必须留在算 atari **之前**。
+        return basic.astype(np.int8, copy=False)
+
+    # ---- 触发①要用的「整链 1 气」（`board.cpp:2270` 的 getNumLiberties）----
+    # 气数用 `go_rules._distinct_liberty_counts`（**去重**空点口径，与 17 通道
+    # ch10/11|ch14/15 同一份实现，见本模块 docstring 的「不要另写一份块气算法」）。
+    atari = np.zeros(b.shape, dtype=bool)
+    for labelled, num in ((blk, nblk), (wht, nwht)):
+        if not num:
+            continue
+        libs = _distinct_liberty_counts(labelled, num, empty)
+        atari |= (libs == 1)[labelled]
+
+    seki = _independent_life_seki(b, basic, atari)
+    own = np.where((basic != 0) & ~seki, basic, np.int8(0))
+    # keepStones=true（`board.cpp:1927-1935`）的判据是
+    # `basicArea[loc] == colors[loc]` —— **不是**「这里有子」。一颗被对方的
+    # 围空分支（`:2221`/`:2222`）改写成对方颜色的己方子，官方**不会**补回，
+    # 它就以对方颜色出现在 ch18/19 上；本实现必须照抄这个条件。
+    keep = (basic == b) & ~empty
+    own[keep] = basic[keep]
     return own.astype(np.int8, copy=False)
 
 
@@ -471,7 +725,13 @@ def calculate_area(boards, to_play, rules_flags=0):
             f'  逐位相同，会被当成「无归属」静默污染训练。tax=SEKI/ALL 的对局应当\n'
             f'  在规则条件化那一步被显式拦下（或先补齐本分支）。')
 
-    own = area_ownership_map(b)                                # 绝对盘面色
+    # ⚠ 这是 `calculate_area` 里**唯一**新增的一行，且**不是**改分支顺序：
+    #   `FLAG_MULTISTONE_SUICIDE`（bit5）本来就住在 `rules_flags` 里
+    #   （见下方位布局段），只是此前没人把它解出来喂给 Benson 的 vital 过滤
+    #   （官方 `board.cpp:2036`）。分支顺序（TERRITORY 恒 0 / TAX 抛错）与
+    #   `nninputs.cpp:2391-2425` 逐行一致，**一个字都没动**。
+    own = area_ownership_map(
+        b, is_multi_stone_suicide_legal=bool(rules_flags & FLAG_MULTISTONE_SUICIDE))
     pla = own * np.asarray(to_play).reshape(B, 1, 1).astype(np.int8)
     out[:, 0] = pla
     out[:, 1] = -pla
@@ -597,6 +857,31 @@ def _history_move(my, op, k):
     slot = _HISTORY_SLOTS[2 * k + 1]
     src = op if who == 'op' else my
     return src[:, slot].astype(np.int64, copy=False)
+
+
+def _history_prefix_ok(my, op, k, hl):
+    """第 ``k`` 手是否落在「有效历史前缀」内（官方 ``nninputs.cpp:2511-2556``）。
+
+    🔴 官方的 ch0..4 是**递归嵌套**的：第 2 手的 pass 标志只在
+    「第 1 手存在 **且** 第 1 手轮次正确 **且** 第 2 手存在 **且** 第 2 手轮次正确」
+    时才写；第 3 手同理要求前两手都满足。⇒ 判定是**前缀**性质，不是逐格独立。
+
+    而落点通道 ch9..13（:2518/:2527/:2536/:2545/:2554）用的是**同一组嵌套
+    条件**，只是「非 pass 时写坐标」而非「写 1」—— 所以两侧的「哪些手算数」
+    必须一致，否则会出现「第 k+1 手落在 ch9+k 却没有 ch0+k」的矛盾局面。
+
+    轮次正确性由 :data:`_HISTORY_SLOTS` 的 ``('op','my','op','my','op')``
+    交错保证（`my_hist`/`op_hist` 本就是相对 ``to_play`` 的，见
+    :func:`history_five` 的交错规则表），所以这里只需要长度前缀。
+
+    Args:
+        k: 0 起的手序。
+        hl: ``(B,)`` 真实可用手数。
+
+    Returns:
+        ``(B,)`` bool。
+    """
+    return np.asarray(hl).reshape(-1) > k
 
 
 def _as_to_play(to_play, B):
@@ -1034,6 +1319,8 @@ def global_features_v7(game_row, my_hist, op_hist, prev_board=None,
     ch              语义（官方）                                来源
     ==============  =========================================  ====================
     0-4             「第 ``k+1`` 手是不是 pass」                 ``my_hist``/``op_hist``
+                    ⚠ 官方是**递归嵌套**闸门：第 k 手要求前 k-1 手
+                    全部存在且轮次正确（:2511-2556），**不是逐格独立**
     5               ``currentSelfKomi(nextPlayer)/20``          局表 `g_komi`
                     clip 到 ``±(bArea+1)``；**符号随 to_play 翻**
     6 / 7           ko 规则：simple=(0,0) / positional=(1,+0.5)
@@ -1043,11 +1330,25 @@ def global_features_v7(game_row, my_hist, op_hist, prev_board=None,
     10 / 11         tax：none=(0,0) / seki=(1,0) / all=(1,1)     `rules_flags`
     12 / 13         ``encorePhase > 0`` / ``> 1``               简单局恒 0
     14              ``passWouldEndPhase``                        `pass_would_end_phase`
-    15 / 16         ``playoutDoublingAdvantage`` 非 0 ⇒ 1 /
-                    0.5·pda                                      无 PDA ⇒ 恒 0
-    17              ``hasButton``                                `rules_flags`
+    15 / 16         ``playoutDoublingAdvantage``：整块被 ``if(pda!=0)``
+                    包住 ⇒ 无 PDA 时**两格都 0**               本仓无 PDA ⇒ 恒 0
+    17              ``hasButton``（被 ``if(hist.hasButton)`` 包住）
+                                                             `rules_flags`
     18              贴目 × 棋盘奇偶三角波                        `komi_parity_wave`
     ==============  =========================================  ====================
+
+    ⚠ **ch15/16/17 是「条件写入」，不是常量**（`nninputs.cpp:2673-2680`）::
+
+        if(nnInputParams.playoutDoublingAdvantage != 0) {
+          rowGlobal[15] = 1.0;
+          rowGlobal[16] = 0.5f * playoutDoublingAdvantage; }
+        ...
+        if(hist.hasButton) rowGlobal[17] = 1.0;
+
+    🔴 读源码时**极易看错**：只看这两行会以为「ch15/ch17 恒 1」。
+    实测官方 ``globalInputNC``（2,235 行）：ch15 非零率 **3.85%**、
+    ch16 非零率 **3.85%**（两者同步 ⇒ 同一条件）、ch17 非零率 **22.33%**
+    ⇒ **都不是恒 1**。本仓无 PDA ⇒ ch15/16 恒 0 才是对的。
 
     ⚠⚠⚠ **这份定义以 spec §2.3 为准**。**任务书里给的那串「禁贴/禁入/气/提子数/
     自手贴/ko 计数/上次吃子数/距上次吃子回合数/simple-ko 阻塞合法性/局内经过回合/
@@ -1113,7 +1414,8 @@ def global_features_v7(game_row, my_hist, op_hist, prev_board=None,
         raise ValueError(f'需要每人最近 3 手（5 格交错用 3+2），'
                          f'实得 my={my.shape} / op={op.shape}')
     tp = _as_to_play(to_play, B)
-    area = BOARD_SIZE * BOARD_SIZE if board_area is None else int(board_area)
+    area = (BOARD_SIZE * BOARD_SIZE if board_area is None
+            else int(np.asarray(board_area).reshape(-1)[0]))
 
     # ⚠ `prev_board` / `prev_prev_board` **只校验形状、不参与取值**（spec §2.3 的
     #   19 维没有一维需要历史盘面，见本函数 docstring）。仍然校验，是为了让
@@ -1137,8 +1439,15 @@ def global_features_v7(game_row, my_hist, op_hist, prev_board=None,
     hl = _resolve_history_length(my, op, history_length, B)
 
     # ---- ch0..4 · 过去 5 手各自是不是 pass（物理手序，与 ch9..13 同一份）---
+    # 🔴 官方是**递归嵌套**闸门（`nninputs.cpp:2511-2556`）：第 k 手只有在
+    #     「前面 k-1 手全部存在且轮次正确」时才有资格被检查。我们原来按
+    #     `(move<0) & (k < hl)` **逐格独立判断** —— 当中间某手缺失而后面的手
+    #     存在时，会在不该有 1 的格上给出 1。
+    #     官方结构：if(have1){ if(pla1==opp){ if(pass1) g[0]=1; else ch9;
+    #       if(have2){ if(pla2==pla){ ... } } } }
+    #     ⇒ 「有效前缀长度」= 第一个不满足条件的手之前的手数。
     for k in range(HISTORY_MOVES):
-        out[:, k] = (_history_move(my, op, k) < 0) & (k < hl)
+        out[:, k] = (_history_move(my, op, k) < 0) & _history_prefix_ok(my, op, k, hl)
 
     sk = self_komi(_komi_of(game_row, B), tp, area)
 
@@ -1163,16 +1472,31 @@ def global_features_v7(game_row, my_hist, op_hist, prev_board=None,
     out[:, 11] = (tax == TAX_ALL).astype(np.float32)
 
     # ---- ch12 / ch13 · encorePhase ----------------------------------------
+    # 官方 `nninputs.cpp:2660-2665`：ch12 = encorePhase > 0、ch13 = encorePhase > 1
     out[:, 12] = float(encore_phase > 0)
     out[:, 13] = float(encore_phase > 1)
 
     # ---- ch14 · passWouldEndPhase ------------------------------------------
+    # 官方 `nninputs.cpp:2667-2668`
     out[:, 14] = pass_would_end_phase(my, op, hl).astype(np.float32)
 
-    # ---- ch15 / ch16 · playoutDoublingAdvantage ---------------------------
-    # 本仓无 PDA（spec §2.2：15/16 恒 0，保留不裁剪）。
+# ---- ch15 / ch16 · playoutDoublingAdvantage ---------------------------
+    # 官方 `nninputs.cpp:2673-2676`，**整块被 `if(pda != 0)` 包住**：
+    #     if(nnInputParams.playoutDoublingAdvantage != 0) {
+    #       rowGlobal[15] = 1.0;
+    #       rowGlobal[16] = 0.5f * playoutDoublingAdvantage; }
+    # ⇒ 无 PDA 时两格都**保持 0**。本仓无 PDA ⇒ 恒 0。
+    # ⚠ 官方注释（:2671-2672）说「parameter 15 在非零时训练行为有**不连续**」，
+    #   容易误读成「15 恒 1」—— 实际那个不连续正是**由 PDA 是否非零**触发的，
+    #   所以 15 与 16 同生共死。本仓无 PDA ⇒ 15 = 0。
+    #   （实测官方 globalInputNC：ch15 非零率 3.85%、ch16 非零率 3.85%、
+    #     两者完全同步 ⇒ 印证它们由同一个条件写入。）
 
-    # ---- ch17 · hasButton --------------------------------------------------
+# ---- ch17 · hasButton --------------------------------------------------
+    # 官方 `nninputs.cpp:2679-2680`，**被 `if(hist.hasButton)` 包住** ⇒
+    # 标的是「这局的规则里**开了** button」，而非「机制存在」。
+    # 实测官方 globalInputNC：ch17 非零率 22.33%，与我们按
+    # `rules_flags & FLAG_HAS_BUTTON` 得到的取值域相容。
     out[:, 17] = ((fl & FLAG_HAS_BUTTON) != 0).astype(np.float32)
 
     # ---- ch18 · 贴目 × 棋盘奇偶三角波 ---------------------------------------

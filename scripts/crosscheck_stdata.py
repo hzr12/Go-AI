@@ -53,14 +53,19 @@ ch9 每一行只差 1 个点（361 个点里），逐格一致率因此高达 0.
     ch7 / ch20/21   NOT_COMPARABLE      官方只在 encore 行置位，而
                                        ``spatial_channels_v7`` 没有
                                        encore_phase 入参 ⇒ 结构上到不了
-    ch18 / ch19     KNOWN_DIVERGENT     官方算 area 前先提死子，本仓
-                                       ``GoBoard.score()`` 不做（spec §5.1
-                                       刻意保留）⇒ 对不齐是**已知口径差**
+ch18 / ch19     ALIGNED             Benson + 围空 + 双活过滤；本工具按官方
+                                        自己的全局列**逐行**喂规则，只比
+                                        TERRITORY 之外的行（TERRITORY 要
+                                        ``secondEncoreStartColors``，
+                                        stdata 给不出 ⇒ 不可比）
     其余            ALIGNED             可当 oracle
     ==============  ==================  ==========================================
 
 ⚠ ``ALIGNED`` 的含义是**「本仓与官方逐位一致」**，实测就是 1.000000。门槛
   ``--min-rate 1.0`` 之所以能当门禁，靠的就是这个集合里没有一个通道到不了 1.0。
+  ch18/19 要做到这一点，**不能**用一套默认 ``rules_flags`` 跑全样本 ——
+  官方 ch18/19 是逐行按规则分岔的（``nninputs.cpp:2391-2439``）。所以本工具对
+  这两个通道按官方 ``globalInputNC`` 逐行分派，并剔掉 TERRITORY 行。
 
 ⚠ **归档缺失时本脚本「报错退出」，而 pytest 里的 ``skipif`` 是「跳过」。**
   这是刻意的差异：这个工具的存在意义就是「回答一个问题」，归档不在就回答不了，
@@ -165,12 +170,15 @@ SPATIAL_SPEC = {
     16: (NOT_COMPARABLE,
          'stdata 无「前二手盘」⇒ 同上，比出来的 0.7076 是巧合'),
     17: (ALIGNED, '梯子 working-move（依赖 to_play，实测官方恒 +1）'),
-    18: (KNOWN_DIVERGENT,
-         '官方算 area 前**先提死子**，本仓 `GoBoard.score()` 不做'
-         '（spec §5.1 刻意保留）⇒ 对不齐是已知口径差，**不是 bug**'),
-    19: (KNOWN_DIVERGENT,
-         '同 ch18：官方算 area 前**先提死子**，本仓 `GoBoard.score()` 不做 '
-         '(spec §5.1 刻意保留) ⇒ 对不齐是已知口径差，**不是 bug**'),
+    18: (ALIGNED,
+         'Benson 无条件存活（`board.cpp:2159-2195`）+ 围空（`:2214-2243`）+ '
+         'tax≠NONE 时的双活整块过滤（`:2264-2296`），逐字照抄 '
+         '`board.cpp:1853-2327`。官方按规则分岔（`nninputs.cpp:2391-2439`），'
+         '本工具据官方自己的 `globalInputNC` **逐行**喂 tax/suicide，'
+         '且**只比 TERRITORY 之外的行**（TERRITORY 要 '
+         '`secondEncoreStartColors`，stdata 给不出 ⇒ 不可比，'
+         '行数记在 `n_rows_not_comparable`）'),
+    19: (ALIGNED, '同 ch18'),
     20: (NOT_COMPARABLE, 'second-encore 起始子 · ' + _ENCORE_NC),
     21: (NOT_COMPARABLE, '同上 · ' + _ENCORE_NC),
 }
@@ -334,10 +342,13 @@ def boards_from_spatial(spatial):
 def _diff_stats(mine, official, stone):
     """差异分布，**按「子 vs 空点」拆开**。
 
-    为什么要拆：ch18/19 的 21,896 个差异点里 **19,913 个是子、1,983 个是空点**
-    —— 拆开才知道偏差集中在「死子本身」还是「死子周围那片空」。这一个拆分就是
-    「官方先提死子」这个猜测最硬的线索（一个被黑子四面围住的单空点按
-    Tromp-Taylor 归黑，官方却给中立）。
+    为什么要拆：修复前 ch18/19 的 21,896 个差异点里 **19,913 个是子、1,983 个
+    是空点**，分布本身就能否掉「官方先提死子」—— 提子只会动**子**，
+    而真正的成因（Benson 判死 + 双活整块过滤）**两边都动**。
+    ⚠ 这段 docstring 曾经把该拆分写成「『官方先提死子』这个猜测最硬的线索」。
+      那是**错的**，已作废：官方 `calculateArea*` 既不提子也不做死子判定
+      （`board.cpp:1949-2327` 的输入只有 `colors`）。留着会让下一个人重复这个
+      已被推翻的诊断。
     """
     extra = mine & ~official
     missing = ~mine & official
@@ -352,7 +363,62 @@ def _diff_stats(mine, official, stone):
     }
 
 
-def compare_spatial(spatial, ko):
+#: ch18 / ch19：官方是**逐行按规则分岔**的（`nninputs.cpp:2391-2439`），而本工具
+#: 默认用**一套** `rules_flags` 跑全样本 ⇒ 对这两个通道，全样本 `row_exact` 不是
+#: 对齐率。官方分支与可重建性：
+#:   AREA   + TAX_NONE            → `calculateArea`（无双活过滤）        可重建
+#:   AREA   + TAX_SEKI/TAX_ALL    → `calculateIndependentLifeArea`        可重建
+#:   TERRITORY（任意 tax）          → 仅 `encorePhase >= 2` 才发 area，且兜底要
+#:                                   `secondEncoreStartColors`            **不可重建**
+#: 所以本工具对 ch18/19 只在**可比子集**（`globalInputNC[:,9] == 0`）上按官方自己
+#: 的 tax 列逐行分派后算 `row_exact`；不可比的行数记在 `n_rows_not_comparable`。
+_AREA_CHANNELS = (18, 19)
+
+
+def _area_rows_by_rule(glob):
+    """官方 `globalInputNC` → ch18/19 的**逐行规则**与可比行掩码。
+
+    ⚠ `globalInputNC[:,8]` 是 `hist.rules.multiStoneSuicideLegal`，而官方传给
+      `calculateArea*` 的是 `getSuicideLegalForPassAlive(hist)`
+      （`nninputs.cpp:964`）= 那个标志 `|| alwaysComputePassAliveUnderSuicideRules`，
+      后半个来自 `hist.modes`、**19 个全局通道都没编码**。实测把 `ch8 == 0` 的行
+      按 `False` 喂仍逐位相等（301 行 / 4368 行上都是 1.000000），所以这里取
+      `ch8` 本身；这个假设一旦被推翻，表现是 ch18/19 的 `row_exact` 掉下来，
+      而不是静默变好。
+    """
+    if glob is None:
+        return None, None
+    tax = np.where(glob[:, 10] < 0.5, TAX_NONE,
+                   np.where(glob[:, 11] > 0.5, TAX_ALL, TAX_SEKI))
+    suicide = glob[:, 8] > 0.5
+    comparable = glob[:, 9] < 0.5          # 非 TERRITORY
+    return (tax, suicide), comparable
+
+
+def _area_ownership_by_rule(boards, glob):
+    """按官方分支逐行算 ch18/19（不可重建的 TERRITORY 行留 0）。"""
+    from src.data.feature_v7 import area_ownership_map
+    rule, comparable = _area_rows_by_rule(glob)
+    if rule is None or not comparable.any():
+        return (np.zeros(boards.shape, bool), np.zeros(boards.shape, bool),
+                comparable)
+    tax, suicide = rule
+    m18 = np.zeros(boards.shape, bool)
+    m19 = np.zeros(boards.shape, bool)
+    for t in (TAX_NONE, TAX_SEKI, TAX_ALL):
+        for s in (False, True):
+            sel = comparable & (tax == t) & (suicide == s)
+            if not sel.any():
+                continue
+            own = area_ownership_map(boards[sel],
+                                     is_multi_stone_suicide_legal=s,
+                                     tax_rule=t)
+            m18[sel] = own > 0
+            m19[sel] = own < 0
+    return m18, m19, comparable
+
+
+def compare_spatial(spatial, ko, glob=None):
     """逐通道算 ``row_exact`` / ``cell_agree`` / 差异分布 / 资格。"""
     boards = boards_from_spatial(spatial)
     n = boards.shape[-1]
@@ -364,10 +430,27 @@ def compare_spatial(spatial, ko):
     assert mine.shape == (B, SPATIAL_CHANNELS, n, n)
     stone = boards != 0
 
+    # ch18/19 换成「按官方规则逐行分派 + 只看可比行」的口径（见 _AREA_CHANNELS）
+    area18 = area19 = None
+    area_cmp = None
+    if glob is not None:
+        area18, area19, area_cmp = _area_ownership_by_rule(boards, glob)
+        mine[:, 18] = area18
+        mine[:, 19] = area19
+
     out = {}
     for ch in range(SPATIAL_CHANNELS):
         same = mine[:, ch] == spatial[:, ch]
         elig, reason = SPATIAL_SPEC.get(ch, (NOT_COMPARABLE, '⚠ 未登记的通道！'))
+        if area_cmp is not None and area_cmp.any():
+            same = same[area_cmp]
+            ch_cmp = mine[area_cmp, ch]
+            off_cmp = spatial[area_cmp, ch]
+            nz_ours, nz_off = int(ch_cmp.sum()), int(off_cmp.sum())
+            diff = _diff_stats(ch_cmp, off_cmp, stone[area_cmp])
+        else:
+            nz_ours, nz_off = int(mine[:, ch].sum()), int(spatial[:, ch].sum())
+            diff = _diff_stats(mine[:, ch], spatial[:, ch], stone)
         row = {
             'channel': ch,
             'scope': 'spatial',
@@ -375,9 +458,11 @@ def compare_spatial(spatial, ko):
             'reason': reason,
             'row_exact': float(same.all(axis=(1, 2)).mean()),
             'cell_agree': float(same.mean()),
-            'ours_nz': int(mine[:, ch].sum()),
-            'official_nz': int(spatial[:, ch].sum()),
-            'diff': _diff_stats(mine[:, ch], spatial[:, ch], stone),
+            'ours_nz': nz_ours,
+            'official_nz': nz_off,
+            'diff': diff,
+            'n_rows_compared': int(same.shape[0]),
+            'n_rows_not_comparable': int(B - same.shape[0]),
         }
         # 逐格会骗人：整张对不上、但逐格还很高 ⇒ 必须显式点出来。
         row['cell_agree_misleads'] = bool(
@@ -555,7 +640,7 @@ MISLEAD_CASE = ('ch9', 0.000000, 0.997200,
 
 
 def build_report(spatial, glob, ko, sample_info):
-    rows = compare_spatial(spatial, ko)
+    rows = compare_spatial(spatial, ko, glob)
     if glob is not None:
         rows.update(compare_global(glob))
     tally = {ALIGNED: 0, KNOWN_DIVERGENT: 0, NOT_COMPARABLE: 0}

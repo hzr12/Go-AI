@@ -60,19 +60,29 @@ def _make_npz(boards):
       否则「官方」这三格恒 0、本仓算出真值 ⇒ ``--min-rate`` 会因为一个
       **夹具造出来的**假偏差而红，测的就不是门禁的资格范围了。
       官方在这三个通道上不做任何额外处理，所以它们本就可以当 oracle。
+    ⚠ ch18/19 同样用本仓的 :func:`area_ownership_map` 当真值填，**理由完全
+      一样**：这两个通道现在是 ``ALIGNED``，若夹具把它们留成 0，等于凭空造出
+      一个「我们算错了」的偏差，门禁就会因为**夹具**红而不是因为实现红。
+      夹具的 ``globalInputNC`` 全 0 ⇒ 官方口径是 AREA + TAX_NONE +
+      ``multiStoneSuicideLegal=false`` + 非 TERRITORY ⇒ 正好是
+      ``tax_rule=TAX_NONE`` 那一支。
     """
-    from src.data.feature_v7 import liberties_123
+    from src.data.feature_v7 import TAX_NONE, area_ownership_map, liberties_123
 
     B = boards.shape[0]
     packed = np.zeros((B, SPATIAL_C, PACKED_BYTES), np.uint8)
     on_board = np.ones((B, N, N), bool)
     libs = liberties_123(boards).astype(bool)
+    own = area_ownership_map(boards, tax_rule=TAX_NONE)
+    area18, area19 = own > 0, own < 0
     for i in range(B):
         packed[i, 0] = _pack_plane(on_board[i])
         packed[i, 1] = _pack_plane(boards[i] > 0)
         packed[i, 2] = _pack_plane(boards[i] < 0)
         for k in range(3):
             packed[i, 3 + k] = _pack_plane(libs[:, k][i])
+        packed[i, 18] = _pack_plane(area18[i])
+        packed[i, 19] = _pack_plane(area19[i])
     glob = np.zeros((B, GLOBAL_C), np.float32)
     buf = io.BytesIO()
     np.savez(buf, binaryInputNCHWPacked=packed, globalInputNC=glob)
@@ -194,12 +204,38 @@ def test_not_comparable_channels_are_never_reported_as_aligned(report, ch, why):
         f'ch{ch} 的原因里找不到「{why}」⇒ 读者无从判断这个 0 是不是缺陷')
 
 
-def test_known_divergent_channels_are_labelled_with_their_cause(report):
-    """ch18/ch19 必须是 ``KNOWN_DIVERGENT`` 且**附上原因**（不是「还没查出来」）。"""
+SP18_REASON = cc.SPATIAL_SPEC[18][1]
+
+
+def test_ch18_ch19_are_aligned_and_say_which_subset_is_bit_exact(report):
+    """ch18/ch19 必须是 ``ALIGNED``，且原因里必须写清「在哪个子集上 1.000000」。
+
+    ⚠ **旧断言（已作废）**：这两个通道曾是 ``KNOWN_DIVERGENT``，原因写的是
+      「官方算 area 前**先提死子**」。那条根因是**错的** —— 官方
+      ``Board::calculateArea*``（``board.cpp:1853-1937``）既不提子也不做死子
+      判定，它的输入只有 ``colors``。真正的成因是两层算法：
+      **Benson 无条件存活**（``:2159-2195``，vital 区 < 2 即判死）与
+      **双活整块过滤**（``:2264-2296``）。按正确算法实现后，官方 stdata 上
+      可比子集的逐行精确相等率是 **1.000000**。
+    🔴 所以这里同时**删掉**了 ``'死子' in reason`` 那条断言：它会把一个已被
+      推翻的诊断钉成契约，让下一个人照着错的方向去改实现。
+    """
     for ch in (18, 19):
         row = next(r for r in report['spatial'] if r['channel'] == ch)
-        assert row['eligibility'] == cc.KNOWN_DIVERGENT
-        assert '死子' in row['reason'], '必须写清「官方先提死子」这个口径差'
+        assert row['eligibility'] == cc.ALIGNED, (
+            f'ch{ch} 是 {row["eligibility"]}，实测在可比子集上已逐位 1.0 '
+            f'⇒ 应为 ALIGNED')
+        # 「是不是真的对齐」由数字说话，而不是靠 reason 里写没写某个数。
+        assert row['row_exact'] == 1.0, (
+            f'ch{ch} 标了 ALIGNED 但 row_exact={row["row_exact"]:.6f} '
+            f'(比了 {row["n_rows_compared"]} 行，剔除 '
+            f'{row["n_rows_not_comparable"]} 行)')
+        assert row['cell_agree'] == 1.0
+        assert '死子' not in row['reason'], (
+            f'ch{ch} 的原因里仍出现「死子」⇒ 那个根因已被推翻，别再钉它')
+        assert 'TERRITORY' in SP18_REASON, (
+            'ch18 的原因必须说明剔掉了哪些行，否则 1.0 会被误读成'
+            '「全样本都对上了」')
 
 
 def test_eligibility_map_covers_every_channel_with_no_silent_default():

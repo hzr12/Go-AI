@@ -546,8 +546,12 @@ def test_output_schema_is_complete_and_self_describing(tmp_path):
         assert info['rows'] == 2
         assert info['policy_topk'] == s2n.POLICY_TOPK
         # 通道资格表逐项来自 crosscheck_stdata，不重抄
-        assert info['known_divergent']['spatial'] == [18, 19]
-        assert info['aligned_channels'] == [0, 1, 2, 3, 4, 5, 6, 8, 14, 17]
+        # ⚠ ch18/19 已于「Benson + 双活过滤」落地后从 KNOWN_DIVERGENT 升为 ALIGNED
+        #   （实测逐位 1.000000，706 行 ours_nz == off_nz）。原先这里断言
+        #   `known_divergent == [18, 19]` 是把**已被推翻的根因**（官方先提死子）
+        #   固化成了门禁 —— 现在没有任何 KNOWN_DIVERGENT 通道。
+        assert info['known_divergent']['spatial'] == []
+        assert info['aligned_channels'] == [0, 1, 2, 3, 4, 5, 6, 8, 14, 17, 18, 19]
         assert set(info['not_comparable']['spatial']) == \
             {7, 9, 10, 11, 12, 13, 15, 16, 20, 21}
         assert '逐行' in info['game_ids_semantics']
