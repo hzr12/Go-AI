@@ -243,18 +243,38 @@ class RoPE2D(nn.Module):
                            dim=-1).flatten(-2)
 
     def forward(self, x, pos):
-        """x: ``(B, Hh, N, head_dim)``；``pos``: ``(B, N, 2)`` 整数，行列坐标。
+        """x: ``(B, Hh, N, head_dim)``；``pos``: ``(B, N, 2)`` 整数，**``(行, 列)``**。
 
-        ⚠ 行在前、列在后，与 `freq` 的轴顺序 ``(r, c)`` 一致 —— 写反了不会
-        报错，只会让棋盘的行列可分性互换，而 19×19 正方盘面上**测不出来**。
+        🔴 ``freq[..., 0]`` 乘的是**列**，``freq[..., 1]`` 乘的是**行** ——
+        与 ``pos`` 的 ``(行, 列)`` 顺序**相反**，这不是笔误。
+
+        官方 ``desc.cpp`` 的 ``TransformerAttentionDesc::computeRopeCosSin``：
+
+            float freqX = ropeFreqs[(h * numPairs + p) * 2 + 0];
+            float freqY = ropeFreqs[(h * numPairs + p) * 2 + 1];
+            ...
+            for(int y = 0; y < nnYLen; y++)
+              for(int x = 0; x < nnXLen; x++) {
+                float angle = (float)x * freqX + (float)y * freqY;
+
+        即 **第 0 个频率配 x（列）、第 1 个配 y（行）**。而 ``desc.cpp`` 里紧邻的
+        注释说「前 numPairsPerDim 对是 height、接着是 width」—— 那句描述的是
+        **非learnable（固定 theta）分支**，其 ``emb = cat([y*freqs, x*freqs])``
+        顺序与 learnable 分支**相反**。照那句注释写 learnable 分支就会写反。
+
+        ⚠ **这个错误在任何正方盘面上都测不出来**：19×19 的行列数相同，行列互换
+        只是一个有效对称，policy 输出仍然「看着合理」。只有拿官方权重逐位对拍
+        才能发现（我们是这么发现的）。
         """
         b, _, n, d = x.shape
         if d != self.head_dim:
             raise ValueError(f'head_dim 不符：传入 {d}，本层 {self.head_dim}')
         pos = pos.to(x.device).reshape(b, n, 2)
-        f = self.freq.to(x.dtype)                       # (Hh, pairs, 2)
-        ang = (f[None, :, :, 0].unsqueeze(2) * pos[:, None, :, 0:1]
-               + f[None, :, :, 1].unsqueeze(2) * pos[:, None, :, 1:2])
+        row = pos[:, None, :, 0:1]                     # y
+        col = pos[:, None, :, 1:2]                     # x
+        f = self.freq.to(x.dtype)                      # (Hh, pairs, 2)
+        ang = (f[None, :, :, 0].unsqueeze(2) * col     # freqX * x
+               + f[None, :, :, 1].unsqueeze(2) * row)  # freqY * y
         return self._rotate(x, ang.cos(), ang.sin())
 
 
