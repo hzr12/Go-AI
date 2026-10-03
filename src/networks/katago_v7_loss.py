@@ -60,6 +60,12 @@ LOSS_COEFFS = {
     'score_stdev': 0.001,
     'score_mean': 0.0015,
     'lead': 0.0060,
+    # varTimeLeft（官方 sv3Mul 六通道的下标 3）。系数与 lead 同档：两者都
+    # 是「局面不确定性」的标量，量纲都是 0~数百，Huber δ 取 8。
+    # ⚠ 训练数据 col22 里存的**已经是最终物理量**（见 COL_VAR_TIME_LEFT），
+    #   而 `out['var_time_left']` 已乘过 VARIANCE_TIME_MULTIPLIER=40，
+    #   两者口径一致，可直接回归。
+    'var_time_left': 0.0060,
     'scoring': 0.25,
     'futurepos': 1.0,      # ⚠ 0.25 已内嵌在公式里（spec §4.5 #11）
     'seki': 1.0,           # ⚠ 自适应因子，见 `_seki_adaptive_scale`
@@ -355,6 +361,25 @@ class KataGoV7Loss(nn.Module):
         # ---- 9 lead（系数 0.0060，w_lead，δ=8）----
         terms['lead'] = _weighted_mean(
             huber(out['lead'].float(), score_t, 8.0), w_of('lead'))
+
+        # ---- 9b varTimeLeft（官方 sv3[3]，系数 0.0060，δ=8）----
+        # ⚠ **不能用 `w_of('lead')`**。实测（zzb28c512nfd4 三个成员、12748 行）
+        #   各权重列与 col22 非零模式的一致率：
+        #     col29 w_lead          19.7% 非零，一致率仅 **27.4%**  ← 错
+        #     col25 global_weight  100%  非零，一致率 87.4%（= col22 自身非零率）
+        #   `w_lead` 的门控跟着 **lead 有没有值**（col21）走，而 varTimeLeft
+        #   在 lead 缺失的 66% 行里照样有值。复用它会白白丢掉三分之二的数据。
+        # ⇒ 用 `game_weight`（与 `score_stdev` 一致），即整行有效即参与。
+        # ⚠ 标签或输出任一缺失时**跳过**而不是喂 0 —— 喂 0 会把这一路往
+        #   「方差恒 0」的方向硬拉，比不训练更糟。`out.get` 而非 `out[...]`
+        #   是为了让只构造了部分输出的测试桩也能跑通（真实模型恒有该键）。
+        vtl_t = labels.get('var_time_left')
+        vtl_p = out.get('var_time_left')
+        if vtl_t is not None and vtl_p is not None:
+            terms['var_time_left'] = _weighted_mean(
+                huber(vtl_p.float(), T(vtl_t).reshape(-1), 8.0),
+                None if labels.get('game_weight') is None
+                else T(labels['game_weight']).reshape(-1))
 
         # ---- 10 scoring（**0.25 在系数表里**，w_scoring）----
         sc_t = T(labels['scoring']).reshape(b, -1)

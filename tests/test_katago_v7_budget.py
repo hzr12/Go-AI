@@ -39,19 +39,25 @@ from src.networks.katago_v7 import (  # noqa: E402
 #: 硬预算（spec §1.2 C1）。超了就是结构改动没同步预算。
 BUDGET_TOTAL = 5_850_000
 #: spec §6.1 的目标值。
-SPEC_TOTAL = 5_561_832
+#:
+#: 🔴 2026-10-03 从 5,561,832 改为 **5,562,121**（+289），两处结构改动：
+#:   1. `value_head.scores` 由 hidden→3 扩到 hidden→6（官方 `sv3Mul`
+#:      的 `out_channels=6`），+96×3 +3 = **+291**
+#:   2. `policy_head.out` 的 `bias=True` → `False`。官方 `p2Conv` 是**裸 1×1
+#:      conv**，bias 由前面的 `p1BN` 承担，多一个 bias 反而与官方不符，**−2**
+SPEC_TOTAL = 5_562_121
 
-#: 逐子模块的 spec 数字。`value_head` 在 spec 里被拆成「value 头 26,886」与
-#: 「ownership/scoring/futurepos/seki 384」两行，本实现把四个 1×1 小头并进了
-#: `ValueHead`（它们本来就吃同一个 `VV`），故这里断言合并后的 27,270。
+#: 各子模块期望值（spec §6.1）。`value_head` 含 spec 未单列的
+#: ownership/scoring/futurepos/seki 四个 1×1 小头（共 384 参数），
+#: 与官方 value 头 26,886 一起构成 27,561。
 EXPECTED = {
     'stem': 50_688,
     'global_fc': 4_864,
     'blocks_each': 493_056,
     'blocks_total': 5_423_616,
     'trunkfinal': 512,
-    'policy_head': 38_834,
-    'value_head_with_small': 27_270,   # = 26_886 + 384
+    'policy_head': 38_832,
+    'value_head_with_small': 27_561,   # = 27,177 + 384
     'scorebelief_head': 16_048,
 }
 
@@ -79,7 +85,7 @@ def test_total_is_under_hard_budget(net):
     got = _n(net)
     assert got <= BUDGET_TOTAL, f'超硬预算 {BUDGET_TOTAL:,}：{got:,}'
     margin = BUDGET_TOTAL - got
-    assert margin == 288_168, f'余量应为 288,168（4.9%），实测 {margin:,}'
+    assert margin == 287_879, f'余量应为 287,879（4.9%），实测 {margin:,}'
 
 
 def test_submodule_param_counts_match_spec(net):
@@ -218,7 +224,14 @@ def test_gpool_policy_three_stats():
     assert torch.allclose(out[:, 2 * c:], x.amax(dim=(2, 3)))
 
 
-def test_gpool_value_three_stats_no_max():
+def test_gpool_value_second_slot_is_scaled_mean_third_is_max():
+    """value 头的 gpool：``mean``、``mean·(√A−14)/10``、**``max``**。
+
+    🔴 第三段是 max。旧实现写成第三个缩放 mean（``mean·((√A−14)²/100 − 0.1)``），
+    那让第三段与第一段**线性相关**、不携带新信息，等于浪费三分之一的池化维度。
+    官方 ``eigenbackend.cpp::poolRowsValueHead`` 的第三行是 ``(*out)(c + 2*C, n) = m``
+    （``m`` 是该通道空间维最大值）。
+    """
     x = torch.arange(2 * 3 * 4 * 4, dtype=torch.float32).reshape(2, 3, 4, 4)
     out = gpool_value(x)
     assert out.shape == (2, 9)
@@ -227,9 +240,10 @@ def test_gpool_value_three_stats_no_max():
     mean = x.mean(dim=(2, 3))
     assert torch.allclose(out[:, :c], mean)
     assert torch.allclose(out[:, c:2 * c], mean * (d / 10.0))
-    assert torch.allclose(out[:, 2 * c:], mean * (d * d / 100.0 - 0.1))
-    # value 池化**没有 max** —— 三项都只是 mean 的缩放
-    assert not torch.allclose(out[:, 2 * c:], x.amax(dim=(2, 3)))
+    # 第三段 = max
+    assert torch.allclose(out[:, 2 * c:], x.amax(dim=(2, 3)))
+    # 且它**不等于**任何 mean 的仿射（本例中 max 与 mean 差异显著）
+    assert not torch.allclose(out[:, 2 * c:], mean * (d * d / 100.0 - 0.1))
 
 
 def test_gpool_scales_are_constants_at_19x19():
@@ -403,12 +417,12 @@ def test_score_stdev_softplus_term_lands_near_huber_delta():
 
     # 裁决值：实测 13.8599，与 δ=10 同量级。判据取「落在 δ 的 3 倍以内」而不是
     # 「等于 δ」—— 初值不必等于目标，只要别差两个数量级。
-    assert means[1.0] == pytest.approx(13.8599, abs=0.05), means
+    assert means[1.0] == pytest.approx(14.8824, abs=0.05), means
     assert means[1.0] <= 3.0 * HUBER_DELTA_SCORE_STDEV, \
         f'beta=1.0 的初值 {means[1.0]} 与 δ={HUBER_DELTA_SCORE_STDEV} 差太远'
     # spec 字面值：实测 277.2534，是 δ 的 27 倍。这一行是**回归哨兵** ——
     # beta 若被改回 0.05，它会连同上面那条一起变红。
-    assert means[0.05] == pytest.approx(277.2534, abs=0.05), means
+    assert means[0.05] == pytest.approx(278.2364, abs=0.05), means
     assert means[0.05] > 20.0 * HUBER_DELTA_SCORE_STDEV
 
 
@@ -445,10 +459,10 @@ def test_score_stdev_loss_term_is_inside_huber_delta_at_the_ruled_out_beta():
             # （`_weighted_mean` 在 game_weight 恒 1 时就是 mean）。
             got[beta] = float(huber(o['score_stdev'].float(), target,
                                     HUBER_DELTA_SCORE_STDEV).mean())
-    assert got[1.0] == pytest.approx(8.83, abs=0.05), got
+    assert got[1.0] == pytest.approx(9.9922, abs=0.05), got
     assert got[1.0] <= HUBER_DELTA_SCORE_STDEV, \
         f'beta=1.0 下 loss #7 的公式值 {got[1.0]} 仍在 δ 之外 ⇒ 仍在线性段'
-    assert got[0.05] == pytest.approx(272.22, abs=0.5), got
+    assert got[0.05] == pytest.approx(273.345, abs=0.5), got
 
     # 反证：#7 的公式值确实随 beta 变（否则上面全是恒真的断言）。
     assert got[0.05] != got[1.0]
@@ -477,7 +491,7 @@ def test_score_stdev_beta_is_a_pure_constant_so_params_are_untouched():
     sa = a.state_dict()
     assert set(sa) == set(sb)
     assert all(tuple(sa[k].shape) == tuple(sb[k].shape) for k in sa)
-    assert _n(a) == _n(b) == SPEC_TOTAL == 5_561_832
+    assert _n(a) == _n(b) == SPEC_TOTAL == 5_562_121
 
 
 # --------------------------------------------------------------------------- #

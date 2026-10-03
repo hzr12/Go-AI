@@ -38,14 +38,17 @@ npz 里。本模块把它翻译成本仓 V7 模型与 `KataGoV7Loss` 需要的�
 3      scoreMean（搜索侧的连续估计）
 4-19   四组分差分布，每组 ``(P, P, P, 分数)``，**三 P 之和恒为 1.000000**
 20     **实际终局分差**（建 scorebelief 目标用；和棋记 0）
-21     lead（非零率 39%）
-22     方差量（与分差相关 −0.036）
-25/26  ``global_weight`` / ``w_policy_player``（恒 1）
-27/28  ``w_ownership`` / ``w_policy_opp``
-29     ``w_lead`` —— **非零数与 col21 的 lead 非零数逐行相等**，交叉验证通过
-33/34  ``w_futurepos`` / ``w_scoring``
-35     ``w_value``（实测恒 0）
-47     komi（±7.5）
+    21     lead（非零率 39%）
+    22     **varTimeLeft** —— 官方「winloss 期望到达时间」，见 `COL_VAR_TIME_LEFT`
+    23     恒0（源码 `//Unused`）
+    25/26  ``global_weight`` / ``w_policy_player``（恒 1）
+    27/28  ``w_ownership`` / ``w_policy_opp``
+    29     ``w_lead`` —— **非零数与 col21 的 lead 非零数逐行相等**，交叉验证通过
+    30/31/32  ``policySurprise`` / ``policyEntropy`` / ``searchEntropy``
+             （⚠ 曾被误判为 shortterm 两列，见下方注释）
+    33/34  ``w_futurepos`` / ``w_scoring``
+    35     ``w_value``（实测恒 0）
+    47     komi（±7.5）
 =====  ==================================================================
 """
 
@@ -90,11 +93,57 @@ COL_W_SCORING = 34
 COL_W_VALUE = 35
 COL_KOMI = 47
 
-#: 已被实测否定的列名猜测，留着当反面记录：
-#: - col20 常被误当成「scoreMean 的第二个估计」。实测它是**实际终局分差**
-#:   （和棋时恒 0，且 scorebelief 目标恰为中心两桶 50/50），col3 才是 scoreMean。
-#: - col22 只能确定是与分差无关的方差量，具体语义（variance time？）未定。
-UNRESOLVED_COLUMNS = (COL_SCORE_MEAN, 22)
+#: ``varTimeLeft``（=官方 ``sv3Mul`` 六通道的**第 3 路**，下标 3）。
+#:
+#: 🔴 **2026-10-03 已由源码定案**（此前是「语义未定」的猜测列）。权威依据是
+#: ``cpp/dataio/trainingwrite.cpp:603-616``：
+#:
+#:     // Expected time of arrival of winloss variance, in turns
+#:     {
+#:       double sum = 0.0;
+#:       for(int i = whiteValueTargetsIdx+1; i<whiteValueTargets.size(); i++) {
+#:         ...
+#:         double variance = (nextWL - prevWL) * (nextWL - prevWL);
+#:         sum += turnsFromNow * variance;
+#:       }
+#:       rowGlobal[22] = (float)sum;
+#:     }
+#:
+#: 即「winloss 期望到达时间」，训练侧存的**已经是最终物理量**，不是 raw。
+#: 实测（``zzb28c512nfd4`` 两个成员、9211 行）交叉验证：
+#:   · 全非负（负值 0 个）⇒ softplus 类输出 ✔
+#:   · 范围 [0, 465.53]、均值 10.95 ⇒ 与 KataGo 典型 5~20 同量级 ✔
+#:   · 与 ``col3 scoreMean`` 相关 −0.003、与 ``col20 终局分差`` 相关 −0.003
+#:     ⇒ 它是**方差/时间**量，不是分差 ✔
+#:   · 非零率 87.1%
+#:
+#: ⚠ 注意它**不是** ``varianceTimeMultiplier=40`` 那个换算的输入 ——
+#:   官方 nneval.cpp 读的是网络 raw ``sv3[3]`` 再乘 40，而 col22 是训练数据里
+#:   已经算好的目标值。用它做监督时直接回归该值即可，不要再乘 40。
+COL_VAR_TIME_LEFT = 22
+
+#: 🔴 **官方 stdata 里不存在 shorttermWinlossError / shorttermScoreError 两列。**
+#:
+#: 已逐一核对 ``trainingwrite.cpp`` 里**全部** ``rowGlobal[n] =`` 赋值
+#: （col 21~69全覆盖），结论：
+#:
+#:   · col 22 = varTimeLeft（见上）
+#:   · col 23 = 恒 0（源码注释就写 ``//Unused``）
+#:   · col 30 / 31 / 32 = ``policySurprise`` / ``policyEntropy`` / ``searchEntropy``
+#:     —— ⚠ 这三列**曾经**被统计特征误判成 shortterm 两列（分布相近、中位数
+#:     0.705 vs 0.708），查源码后被推翻。它们是搜索统计量，与 ``sv3[4:6]`` 无关。
+#:
+#: 原因：``shorttermX = sqrt(softplus(raw)² · mult)`` 需要**NN 的 raw 输出**，
+#: 而训练数据是搜索侧生成的、当时还没有 NN 输出可依；KataGo 自己训这几路时
+#: 也是先训主干、再用自对弈重解析补的（见 ``reanalysisData``）。
+#:
+#: ⇒ **后果**：``ValueHead.scores`` 扩到 6 通道后，后两路
+#:   （``shorttermWinlossError`` / ``shorttermScoreError``）**没有对应标签**，
+#:   无法监督。若强行训练只能靠自对弈阶段重新生成带 raw 输出的 stdata。
+#:   目前这两路权重必须保持 0，导出到引擎后恒为 ``sqrt(softplus(bias)·mult)``
+#:   的常量 —— 对 MCTS 无害（引擎只在 ``useUncertainty`` 时才读，且只影响
+#:   pruning 启发式），但**不能声称已训练**。
+UNRESOLVED_COLUMNS = (COL_SCORE_MEAN,)
 
 
 def _unpack_bits(packed):
@@ -259,6 +308,11 @@ def to_v7_labels(d, network=None, policy_topk=16, drop_non_19x19=True):
         'score': sel(g[:, COL_FINAL_SCORE]).astype(np.float32),
         'score_mean_hint': sel(g[:, COL_SCORE_MEAN]).astype(np.float32),
         'lead_hint': sel(g[:, COL_LEAD]).astype(np.float32),
+        # varTimeLeft —— 官方 `sv3Mul` 六通道的下标 3（语义见 COL_VAR_TIME_LEFT）。
+        # ⚠ 存的是**最终物理量**，不是 raw：官方训练侧算好才落盘
+        #   （trainingwrite.cpp:603-616），而 `ValueHead` 输出的
+        #   `var_time_left` 已乘过 VARIANCE_TIME_MULTIPLIER，两端口径一致。
+        'var_time_left': sel(g[:, COL_VAR_TIME_LEFT]).astype(np.float32),
         'score_distr': sb,
         'ownership': sel(vt[:, 0]).astype(np.float32)[:, None, :],
         'seki': sel(vt[:, 1]).astype(np.float32)[:, None, :],

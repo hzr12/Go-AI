@@ -544,11 +544,12 @@ V7_STAGE1_SCORE_TERMS = (
     'ownership',        # #4  w_ownership
     'scorebelief_pdf',  # #5  w_score
     'scorebelief_cdf',  # #6  w_score
-    'score_stdev',      # #7  **仅 game_weight**（见上方注释）
+    'score_stdev',      # #7  **只 game_weight**，见系数表旁注
     'score_mean',       # #8  w_score
-    'lead',             # #9  w_lead —— **该键不存在**，`w_of` 缺键返回 ones
+    'lead',             # #9  w_lead（**唯一例外**：`w_of` 缺省是 ones）
+    'var_time_left',    # #9b **game_weight**（不是 w_lead，见 loss 旁注实测）
     'scoring',          # #10 w_scoring
-    'seki',             # #12 自适应系数 × w_seki
+    'seki',             # #12 自适应系数，见 w_seki
 )
 
 

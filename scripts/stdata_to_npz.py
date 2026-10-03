@@ -135,6 +135,7 @@ from src.data.katago_npz import (  # noqa: E402
     COL_LOSS,
     COL_NORESULT,
     COL_SCORE_MEAN,
+    COL_VAR_TIME_LEFT,
     COL_WIN,
     COL_W_FUTUREPOS,
     COL_W_LEAD,
@@ -206,6 +207,11 @@ GLOBAL_TARGET_COLUMNS = {
     'score_mean': (COL_SCORE_MEAN,),
     'final_score': (COL_FINAL_SCORE,),
     'lead': (COL_LEAD,),
+    # 🔴 varTimeLeft = 官方 `sv3Mul` 六通道的**第 3 路**（下标 3）。
+    # 语义已由 `trainingwrite.cpp:603-616` 定案（winloss 期望到达时间），
+    # 实测交叉验证通过（全非负 / 与分差零相关 / 均值 10.95）。
+    # ⚠ 训练数据里存的**已经是最终物理量**，直接回归，不要再乘 40。
+    'var_time_left': (COL_VAR_TIME_LEFT,),
     'global_weight': (COL_GLOBAL_WEIGHT,),
     'komi': (COL_KOMI,),
     'w_policy_player': (COL_W_POLICY_PLAYER,),

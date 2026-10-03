@@ -192,17 +192,33 @@ def test_stage1_score_family_coefficients_are_exactly_zero():
 
 
 def test_stage1_score_family_contributes_nothing_but_is_still_computed(net, v7_batch):
-    """被关掉的 8 项：贡献恒 0 **且**仍然出现在 `terms`/`weighted` 里。"""
+    """被关掉的 score 系各项：贡献恒 0 **且**仍然出现在 `terms`/`weighted` 里。
+
+    ⚠ ``var_time_left`` 是**条件项**（2026-10-03）：官方 stdata 里有 col22，
+    但老批次 / 老 fixture 的 labels 里可能没这个键，缺标签时**整项跳过**。
+    这与「标签为 0」是两种不同的语义 —— 跳过才是对的，喂 0 会把这一路往
+    「方差恒为 0」的方向硬拉。所以断言要分两拨。
+    """
     sp, gl, moves, lbl = v7_batch
     lossf = build_v7_stage1_loss()
     net.eval()
     with torch.no_grad():
         out = net(torch.from_numpy(sp.astype(np.float32)),
                   torch.from_numpy(gl.astype(np.float32)))
-    res = lossf(out, v7_loss_labels(lbl, moves))
-    # 结构保留：12 项一个不少，且逐项值都拿得出来（段 2/3 读的就是它们）。
-    assert set(res['terms']) == set(LOSS_COEFFS)
+    labels = v7_loss_labels(lbl, moves)
+    res = lossf(out, labels)
+
+    # 本 fixture 无 var_time_left 标签 ⇒ 该项被跳过，不该出现在 terms 里。
+    assert 'var_time_left' not in labels, \
+        'fixture 若已带该标签，本测试的跳过断言需改成「有标签」分支'
+    assert 'var_time_left' not in res['terms']
+
+    expect = set(LOSS_COEFFS) - {'var_time_left'}
+    assert set(res['terms']) == expect, \
+        f'terms 键集不符：多 {set(res["terms"]) - expect}，缺 {expect - set(res["terms"])}'
     for k in V7_STAGE1_SCORE_TERMS:
+        if k not in res['terms']:
+            continue
         assert np.isfinite(float(res['terms'][k])), \
             f'{k} 的逐项值不是有限值：结构没保住（段 2/3 会拿到垃圾）'
         assert float(res['weighted'][k]) == 0.0, \
@@ -210,6 +226,31 @@ def test_stage1_score_family_contributes_nothing_but_is_still_computed(net, v7_b
     # 贡献确实为 0：段 1 的总 loss 恰好等于四个主目标之和。
     total = sum(float(res['weighted'][k]) for k in V7_STAGE1_TERMS)
     assert float(res['loss']) == pytest.approx(total, rel=1e-5, abs=1e-7)
+
+
+def test_var_time_left_is_computed_when_label_present(net, v7_batch):
+    """反向对照：`var_time_left` 标签存在时，这一项必须**真的被算出来**。
+
+    钉住「跳过」不等于「永远不算」—— 否则标签接上后该项会静默保持缺失。
+    """
+    sp, gl, moves, lbl = v7_batch
+    lossf = build_v7_stage1_loss()
+    net.eval()
+    with torch.no_grad():
+        out = net(torch.from_numpy(sp.astype(np.float32)),
+                  torch.from_numpy(gl.astype(np.float32)))
+    labels = v7_loss_labels(lbl, moves)
+    assert 'var_time_left' not in labels
+
+    b = sp.shape[0]
+    labels['var_time_left'] = np.abs(
+        np.random.default_rng(0).normal(10.0, 3.0, size=b)).astype(np.float32)
+    res = lossf(out, labels)
+
+    assert 'var_time_left' in res['terms'], '标签齐备却没算这一项'
+    assert np.isfinite(float(res['terms']['var_time_left']))
+    # 段 1 权重为 0 ⇒ 加权后仍是 0（但逐项值必须是真的）
+    assert float(res['weighted']['var_time_left']) == 0.0
 
 
 def test_score_terms_would_not_be_zero_if_weights_were_on(net, v7_batch):

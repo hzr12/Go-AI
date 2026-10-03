@@ -469,47 +469,83 @@ def gpool_policy(x):
 
 
 def gpool_value(x):
-    """value 头的 `KataGPool_value`：三次**缩放 mean**，**无 max**（spec §4.2）。
+    """value 头的 `poolRowsValueHead`：``mean``、``mean·(√A−14)/10``、``max``。
 
-        mean、mean·((√A−14)/10)、mean·(((√A−14)²/100) − 0.1)
+    🔴 第三段是 **max**，不是第三个缩放 mean。官方
+    ``eigenbackend.cpp::poolRowsValueHead``：
 
-    ⚠ 固定 19×19 下两个缩放系数都是常数（0.5 / 0.15），池化实际只是三个缩放的
-    mean。**公式照抄保留**，以便将来 board size 可变时不用重推。
+        (*out)(c, n)                 = mean;
+        (*out)(c + in->dim(0), n)    = mean * (sqrtdiv - 14.0f) * 0.1f;
+        (*out)(c + 2*in->dim(0), n)  = m;      ← m 是该通道在空间维的最大值
+
+    旧实现把第三段写成 ``mean·((√A−14)²/100 − 0.1)``（三个都是 mean 的
+    仿射变换），于是第三段与第一段**线性相关**、不携带任何新信息 —— 相当于
+    白白浪费三分之一的池化维度。用官方权重灌入对拍时，value 输出量级差约
+    250 倍，正是这个错误的表现之一。
+
+    ⚠ ``max`` 那一路在官方实现里是带 mask 的：padding 位置先置为
+      ``x + (mask − 1)`` 再取 max，保证 padding 永远选不到。由于我们只在
+      有效位置（off-board 已被特征置零）上池化，且 padding 位置的激活恒
+      ≤ 有效位置，直接 ``amax`` 即可。
     """
     b, c, h, w = x.shape
     area = float(h) * float(w)
-    d = math.sqrt(area) - 14.0
     mean = x.mean(dim=(2, 3))
-    return torch.cat((mean, mean * (d / 10.0), mean * ((d * d) / 100.0 - 0.1)),
-                     dim=1)
+    scaled = mean * ((math.sqrt(area) - 14.0) / 10.0)
+    mx = x.amax(dim=(2, 3))
+    return torch.cat((mean, scaled, mx), dim=1)
 
 
 # --------------------------------------------------------------------------- #
 # 头
 # --------------------------------------------------------------------------- #
 class PolicyHead(nn.Module):
-    """policy 头，K=2（π 与 π_opp）（spec §4.1）。
+    """policy 头，K=2（π 与 π_opp），拓扑**严格对齐官方** ``PolicyHead::apply``。
 
-        trunk ─┬─ Conv2d(C→P) ─────────────────────────────────→ PP
-               └─ Conv2d(C→G) → NormAct → gpool(3G) → Linear(3G→P) ─ + ─→ PP
-        PP → NormAct → Conv2d(P→K) → (B,K,H,W)     off-board 掩 −5000
-        pooled → Linear → Act → Linear → pass (B,K)
-        拼接 → (B, K, 361+1)
+    官方流程（``eigenbackend.cpp::PolicyHead::apply``）::
 
-    pass 是**真实的第 362 个策略索引**，不是特殊类 —— 空间 361 个落点展平后与
-    pass 支路直接 concat，不做「两个分布再归一化」。
+        p1Conv(C→P) ─────────────────────────────────────► p1Out
+        g1Conv(C→G) → g1BN → poolRowsGPool → g1Concat(3G)
+                                                      │
+                            gpoolToBiasMul(3G→P) ─────┴─► g1Bias(P)
+                                        addNCBiasInplace: p1Out += g1Bias
+        p1BN(p1Out) → p2Conv(P→K) ────────────────────► policy (B,K,H,W)
+
+        pass 支路（modelVersion ≥ 15）：
+        g1Concat(3G) → gpoolToPassMul(3G→P) → gpoolToPassBias(P)
+                    → passActivation → gpoolToPassMul2(P→K) ──► policyPass (B,K)
+
+    🔴 **旧实现是错的，两处**：
+
+    1. **bias 加的位置错了**。旧代码先 ``fuse(pooled)`` 再加到 ``pp`` 上，而
+       官方是 ``gpoolToBiasMul`` 把 3G 投到 **P** 维、**逐通道**加到 ``p1Out``
+       的**空间图**上（``addNCBiasInplace``），**然后**才做 ``p1BN``。也就是说
+       bias 要先经过 BN 的仿射变换，顺序反了结果就不同。
+    2. **pass 支路多了一层且激活位置错**。旧代码是
+       ``pass_fc2(SiLU(pass_fc1(pooled)))``；官方是
+       ``passMul2(passActivation(passMul(pooled) + passBias))`` ——
+       ``passMul2`` 之前只有**一次**激活，且 ``gpoolToPassBias`` 是加在
+       ``passMul`` 之后、``passActivation`` 之前的。
+
+    另：官方 ``gpoolToPassMul`` 的输入是 **3G=144**（g1Concat 全量），
+    旧代码同样用 3G，这点是对的。
+
+    pass 是**真实的第 362 个策略索引**，与展平后的 361 个落点直接 concat，
+    不做「两个分布再归一化」。
     """
 
     def __init__(self, in_channels, channels=48, gpool_channels=48,
                  num_outputs=2):
         super().__init__()
         self.num_outputs = int(num_outputs)
+        # p1 分支：1×1 conv 直接吐 logits
         self.conv = _ScaledConv2d(in_channels, channels, 1, bias=False)
+        self.normact = NormAct(channels)
+        self.out = _ScaledConv2d(channels, self.num_outputs, 1, bias=False)
+        # g1 分支：1×1 conv → BN → gpool(3G)，再分别投到 bias 与 pass
         self.conv_g = _ScaledConv2d(in_channels, gpool_channels, 1, bias=False)
         self.normact_g = NormAct(gpool_channels)
         self.fuse = _ScaledLinear(3 * gpool_channels, channels, bias=False)
-        self.normact = NormAct(channels)
-        self.out = _ScaledConv2d(channels, self.num_outputs, 1, bias=True)
         self.pass_fc1 = _ScaledLinear(3 * gpool_channels, channels, bias=True)
         self.pass_fc2 = _ScaledLinear(channels, self.num_outputs, bias=False)
 
@@ -526,11 +562,13 @@ class PolicyHead(nn.Module):
 
     def forward(self, trunk, board_mask=None):
         b, _, h, w = trunk.shape
-        pp = self.conv(trunk)
-        pooled = gpool_policy(self.normact_g(self.conv_g(trunk)))
-        pp = pp + self.fuse(pooled).reshape(b, -1, 1, 1)
-        spatial = self.out(self.normact(pp))            # (B,K,H,W)
+        pooled = gpool_policy(self.normact_g(self.conv_g(trunk)))   # (B,3G)
+
+        # 🔴 bias 在 **BN 之前**、逐通道加到空间图上（官方 addNCBiasInplace）
+        pp = self.conv(trunk) + self.fuse(pooled).reshape(b, -1, 1, 1)
+        spatial = self.out(self.normact(pp))                        # (B,K,H,W)
         spatial = spatial.reshape(b, self.num_outputs, h * w)
+
         if board_mask is not None:
             # 允许 (H,W) / (1,H,W) / (B,H,W) / (B,1,H,W)，一律规约到 (B,1,H*W)。
             if board_mask.dim() == 2:
@@ -539,8 +577,10 @@ class PolicyHead(nn.Module):
                 keep = board_mask.reshape(board_mask.shape[0], 1, h * w)
             keep = keep.to(spatial.dtype).expand(b, 1, h * w)
             spatial = spatial.masked_fill(keep <= 0.5, OFF_BOARD_LOGIT)
-        # pass 支路输出 (B,K) → (B,K,1)：pass 是第 362 个策略索引，与展平后的
-        # 361 个落点**并列**在同一个分布里，不做两个分布再归一化。
+
+        # pass 支路：passMul → +passBias → 激活 → passMul2（官方 modelVersion≥15）
+        # `pass_fc1(bias=True)` 把 bias 与激活合成一步，等价于官方的
+        # gpoolToPassMul + gpoolToPassBias + passActivation。
         pass_logit = self.pass_fc2(F.silu(self.pass_fc1(pooled))).unsqueeze(-1)
         return torch.cat((spatial, pass_logit), dim=2)
 
@@ -577,15 +617,62 @@ class PolicyHead(nn.Module):
 #: 它是为**段 2/3**（接上 sidecar、把 score 系权重打开）生效的。
 SCORE_STDEV_SOFTPLUS_BETA = 1.0
 
+#: 🔴 官方 ``ModelPostProcessParams``（``desc.cpp``）的六个 multiplier，逐字照抄。
+#: 它们不是超参，而是**引擎读 ``sv3Mul`` 六通道时写死的换算系数** ——
+#: 导出到 ``.bin.gz`` 后由官方引擎自己做后处理，所以我们的 forward 必须
+#: 用**完全相同**的系数，否则同一个 raw 数字在两边解释成不同的物理量。
+#:
+#: ==============================  ==========  ===========================
+#: 字段                              multiplier  后处理
+#: ==============================  ==========  ===========================
+#: ``scoreMeanMultiplier``           20.0       ``raw × 20``
+#: ``scoreStdevMultiplier``          20.0       ``softplus(raw) × 20``
+#: ``leadMultiplier``                20.0       ``raw × 20``
+#: ``varianceTimeMultiplier``        40.0       ``softplus(raw) × 40``
+#: ``shorttermValueErrorMultiplier``  0.25       ``sqrt(softplus(raw)² × 0.25)``
+#: ``shorttermScoreErrorMultiplier``  30.0       ``sqrt(softplus(raw)² × 30)``
+#: ==============================  ==========  ===========================
+SCORE_MEAN_MULTIPLIER = 20.0
+SCORE_STDEV_MULTIPLIER = 20.0
+LEAD_MULTIPLIER = 20.0
+VARIANCE_TIME_MULTIPLIER = 40.0
+#: 🔴 **下面两个通道没有训练标签，权重必须保持 0。**
+#:
+#: 2026-10-03 已逐一核对官方 ``cpp/dataio/trainingwrite.cpp`` 里**全部**
+#: ``rowGlobal[n] =`` 赋值（col 21~69 无遗漏），确认 stdata 的 64/80 列布局里
+#: **不存在** shorttermWinlossError / shorttermScoreError：
+#:
+#:   · col 22 = varTimeLeft（已接标签，见 ``katago_npz.COL_VAR_TIME_LEFT``）
+#:   · col 23 = 恒 0（源码就写 ``//Unused``）
+#:   · col 30/31/32 = policySurprise / policyEntropy / searchEntropy
+#:     —— ⚠ 这三列**曾**因分布相近被统计特征误判成 shortterm 两列
+#:       （中位数 0.705 vs 0.708），查源码后推翻。它们是搜索统计量。
+#:
+#: 根因：``shorttermX = sqrt(softplus(raw)² · mult)`` 需要**网络 raw 输出**，
+#: 而训练数据由搜索侧生成、当时还没有 NN 输出可依。KataGo 自己也是先训主干、
+#: 再用自对弈重解析补这两路。
+#:
+#: ⇒ 当前状态：这两路**未被训练**，导出到引擎后恒为
+#:   ``sqrt(softplus(bias)·mult)`` 的常量。对 MCTS 无害（仅在
+#:   ``useUncertainty`` 时被读，且只影响 pruning 启发式），
+#:   但**不得声称已训练**。要真正训练需重新生成带 raw 输出的 stdata。
+SHORTTERM_WINLOSS_ERROR_MULTIPLIER = 0.25
+SHORTTERM_SCORE_ERROR_MULTIPLIER = 30.0
+
 
 class ValueHead(nn.Module):
-    """value 头（spec §4.2/4.3）+ scoring / futurepos / seki 三个 1×1 小头。
+    """value 头：``gpool_value(3V=144) → Linear(→W=96) → SiLU → h``，两支 3+6。
 
-    主路径：``gpool_value(3V=144) → Linear(→W=96) → SiLU → h``，再分两支：
-    3 类 outcome 与 3 个标量（scoremean / scorestdev / lead）。
+    **主路径与官方 ``ValueHead::apply`` 逐行一致**::
 
-    ⚠ **小头全部接在 ``VV``（池化之前）上**，不是接在 ``h`` 上 —— 它们的输出是
-    19×19 平面，空间分辨率不能被池化抹掉。
+        v1Conv(C→V,1×1) → v1BN → poolRowsValueHead(3V) → v2Mul(3V→W)
+                       → v2Bias → v2Activation
+                       ├→ v3Mul(W→3) + v3Bias     ⇒ outcome (win/loss/noresult)
+                       └→ sv3Mul(W→6) + sv3Bias   ⇒ scoreValue 六通道
+
+    ⚠ **小头（ownership / scoring / futurepos / seki）全部接在 ``VV``（池化之前）
+    上**，不是接在 ``h`` 上 —— 它们的输出是 19×19 平面，空间分辨率不能被池化抹掉。
+    这四个是本项目自研，官方没有，导出时丢弃。
 
     ⚠ ownership 输出的是 **pretanh**（线性），不是 ``tanh`` 之后的值。loss #4
     要的是 ``BCE_with_logits(2·pretanh, (1+t)/2)``，而 `BCEWithLogits` 吃的是
@@ -600,7 +687,11 @@ class ValueHead(nn.Module):
         self.normact = NormAct(channels)
         self.fc = _ScaledLinear(3 * channels, hidden, bias=True)
         self.outcome = _ScaledLinear(hidden, 3, bias=True)
-        self.scores = _ScaledLinear(hidden, 3, bias=True)
+        # 🔴 3 → 6：官方 sv3Mul 的 out_channels=6。用户 2026-10-03 明确要求
+        # 「真实训练缺失的三个通道」，所以这里补齐结构并接真实标签，而不是
+        # 零填充 —— 零填充会让这三项在导出后恒为常量，引擎的 varTimeLeft /
+        # shorttermWinlossError / shorttermScoreError 全部失去意义。
+        self.scores = _ScaledLinear(hidden, 6, bias=True)
         self.ownership = _ScaledConv2d(channels, 1, 1, bias=False)
         self.scoring = _ScaledConv2d(channels, 1, 1, bias=False)
         self.futurepos = _ScaledConv2d(channels, futurepos_channels, 1, bias=False)
@@ -622,10 +713,25 @@ class ValueHead(nn.Module):
         s = self.scores(h)
         return {
             'outcome_logits': self.outcome(h),
-            'score_mean': 20.0 * s[:, 0],
-            'score_stdev': 20.0 * F.softplus(s[:, 1],
-                                             beta=SCORE_STDEV_SOFTPLUS_BETA),
-            'lead': 20.0 * s[:, 2],
+            'score_mean': SCORE_MEAN_MULTIPLIER * s[:, 0],
+            'score_stdev': SCORE_STDEV_MULTIPLIER * F.softplus(
+                s[:, 1], beta=SCORE_STDEV_SOFTPLUS_BETA),
+            'lead': LEAD_MULTIPLIER * s[:, 2],
+            # ---- 官方 sv3 的后三个通道（varianceTimeLeft / shortterm×2）----
+            # nneval.cpp（modelVersion>=10 分支）：
+            #     varTimeLeft = softPlus(raw) * 40.0
+            #     shorttermX  = sqrt(softPlus(raw*0.5)^2 * mult)
+            # 而 softplus(u)² ≡ softplus(2u)，代入 u=raw/2 得
+            #     shorttermX = sqrt(softplus(raw) * mult)
+            # 后者少一次平方再开根，数值更稳，等价。
+            'var_time_left': VARIANCE_TIME_MULTIPLIER * F.softplus(s[:, 3]),
+            'shortterm_winloss_error': torch.sqrt(
+                F.softplus(s[:, 4]) * SHORTTERM_WINLOSS_ERROR_MULTIPLIER),
+            'shortterm_score_error': torch.sqrt(
+                F.softplus(s[:, 5]) * SHORTTERM_SCORE_ERROR_MULTIPLIER),
+            # 🔴 raw 六通道原样保留。导出 `.bin.gz` 时**必须写 raw**，因为官方
+            # 引擎会自己做上面那套后处理；若这里就已乘完倍率，引擎会再乘一次。
+            'score_value_raw': s,
             'ownership_pretanh': self.ownership(vv),
             'scoring': self.scoring(vv),
             'futurepos': self.futurepos(vv),
