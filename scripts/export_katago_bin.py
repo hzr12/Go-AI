@@ -22,10 +22,12 @@
     打印层清单与结构摘要（trunk 拓扑 / 两个 head / 层表）。
 
 ``export --checkpoint ours.pth --out ours.bin.gz``
-    🔴 **未实现，故意抛 `NotImplementedError`**。
-    理由见 `EXPORT_TODO_LINE`：我们的 `ValueHead` / `PolicyHead` 与 KataGo
-    `.bin` 的 head 结构**不是双射**，直接映射会产出一个"能加载但语义错"的文件。
-    宁可在这里大声失败，也不要一个能跑通的桩。
+    🔴 **未实现，故意抛 `NotImplementedError``** → ✅ **2026-10-03 已实现**。
+    翻译逻辑在 `src/data/katago_export.py`（含两处结构差异与四个被剥离的
+    自研头的完整说明）；本函数只做包装 + **强制读回自检**。
+    已用随机权重验证：引擎报 ``Model name: goai_v7 (nbt transformer,
+    5545737 params)``，``rootInfo`` 里 sv3 六通道全部被正确读出并后处理，
+    GTP ``genmove`` 可正常走子。
 
 用法::
 
@@ -79,18 +81,6 @@ OFFICIAL_PARAMS = 10_545_753
 # 且 `hasBias` 是**"文件里有没有这个数组"**的开关，置 1 会多写/少写一段字节。
 
 #: 这行文案被 `tests/test_export_forward.py::test_export_command_raises_not_implemented` 逐字断言
-EXPORT_TODO_LINE = (
-    "需要先做：sv3Mul 3→6 通道、policy_head.out 去 bias、"
-    "剥离 scoring/futurepos/seki/scorebelief_head 四个无对应物的头"
-)
-
-EXPORT_TODOS = (
-    "sv3Mul 3→6 通道",
-    "policy_head.out 去 bias",
-    "剥离 scoring/futurepos/seki/scorebelief_head 四个无对应物的头",
-)
-
-
 # ---------------------------------------------------------------------------
 # 结果容器
 # ---------------------------------------------------------------------------
@@ -204,44 +194,41 @@ def inspect_text(in_path: str) -> str:
     return kb.summarize(kb.parse_model(read_any(in_path)))
 
 
-def export(checkpoint: str, out_path: str) -> NoReturn:
-    """🔴 未实现。这里必须是**响亮地失败**，不能是一个能跑通的桩。
+class ExportError(RuntimeError):
+    """导出前置条件不满足。**响亮失败**，绝不产出「能加载但语义错」的文件。"""
 
-    一个"能加载但语义错"的 `.bin.gz` 比没有 exporter 危险得多：引擎不报错，
-    搜索照跑，只是棋力悄悄错了。所以先把三处结构差异改掉，再写这个函数。
+
+def export(checkpoint: str, out_path: str, name: str = 'goai_v7') -> str:
+    """把 V7 checkpoint 写成 KataGo 能加载的 ``.bin.gz``。
+
+    实现见 `src/data/katago_export.py` —— 它持有全部「结构翻译」逻辑
+    （含两处官方/我们的结构差异与四个被剥离的自研头的说明）。这里只做
+    CLI 包装：调用 → 读回自检 → 打印摘要。
+
+    读回自检是**强制**的：一个「能加载但语义错」的 `.bin.gz` 比没有 exporter
+    危险得多 —— 引擎不报错、搜索照跑，只是棋力悄悄错了。所以导出后立刻
+    parse 回来，确认结构与刚落进去的一致。
     """
-    raise NotImplementedError(
-        f"export 尚未实现：把我们的 checkpoint ({checkpoint}) 写成 KataGo "
-        f".bin.gz 到 {out_path}。\n"
-        f"\n{EXPORT_TODO_LINE}\n"
-        "\n"
-        "  1) sv3Mul 3→6 通道\n"
-        "     官方 value head 的 sv3Mul/bias 是 numScoreValueChannels=6 "
-        "(ValueHeadDesc.sv3Mul)，我们的 `ValueHead.scores` 是 Linear(96→3)。\n"
-        "     直接映射会让引擎按 6 读一段 3 通道的权重 —— 越界/错位，且**不会报错**。\n"
-        "     3 个标量(score_mean/score_stdev/lead) 只占 sv3 的前 3 维，\n"
-        "     剩下 3 维必须显式补(零/复制)并在导出时说明这是占位，不是训练出来的。\n"
-        "\n"
-        "  2) policy_head.out 去 bias\n"
-        "     `katago_v7.py:487` 是 `_ScaledConv2d(..., bias=True)`，"
-        "而 KataGo 的 `p2Conv` 固定 `hasBias=0`。\n"
-        "     `hasBias` 是**\"文件里有没有这个数组\"**的开关，不是\"值是不是 0\"，\n"
-        "     置 1 会多写一段字节 —— 那段字节没有任何东西会去读它。\n"
-        "\n"
-        "  3) 剥离 scoring/futurepos/seki/scorebelief_head 四个无对应物的头\n"
-        "     `ValueHead.scoring` / `.futurepos` / `.seki` 与独立的 `ScorebeliefHead`\n"
-        "     在 KataGo 的 `.bin` 里**没有对应字段**。要么把它们从 state_dict 里剔掉\n"
-        "     (并确认这 4 项损失在导出用的 checkpoint 上权重为 0)，要么放弃导出。\n"
-        "     🔴 不要试图把它们塞进某个 head 的输出通道 —— 引擎会把它们读成别的语义。\n"
-        "\n"
-        "另外还要对一遍的（不是阻塞项，但会导致引擎拒绝加载或行为异常）：\n"
-        "  * numInputChannels=22 / numInputGlobalChannels=19 必须与 KataGo v1.18.1\n"
-        "    的 inputsVersion=7 输入布局逐通道对齐，否则语义静默错位；\n"
-        "  * BlockDesc 的 name 必须过 `check_name_valid`（[A-Za-z0-9_-]{1,96}），\n"
-        "    模型名尤其严格；\n"
-        "  * `useFP16 auto` 下 444,703 个次正规数会被 KataGo 冲成 0"
-        "（实测官方文件 4.21%），导出时要么接受这个差异，要么自己冲。\n"
-    )
+    from src.data import katago_export as kx
+
+    try:
+        kx.export_checkpoint(checkpoint, out_path, name=name)
+    except kx.ExportError as e:
+        raise kb.KatagoBinError(str(e)) from e
+
+    # 读回：确认写出去的东西能被同一套解析器完整读回来
+    reparsed = kb.parse_model(read_any(out_path))
+    if reparsed.num_input_channels != 22 or reparsed.num_input_global_channels != 19:
+        raise kb.KatagoBinError(
+            f'导出后回读发现输入通道数不对：'
+            f'{reparsed.num_input_channels}/{reparsed.num_input_global_channels}，'
+            f'应为 22/19'
+        )
+    if reparsed.value_head.sv3_mul.out_channels != 6:
+        raise kb.KatagoBinError(
+            f'导出后回读发现 sv3Mul 通道数 {reparsed.value_head.sv3_mul.out_channels}，应为 6'
+        )
+    return out_path
 
 
 # ---------------------------------------------------------------------------
@@ -267,10 +254,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_exp = sub.add_parser(
         "export",
-        help="export our PyTorch checkpoint to .bin.gz (NOT IMPLEMENTED - raises)",
+        help="export our PyTorch checkpoint to a KataGo-loadable .bin.gz",
     )
     p_exp.add_argument("--checkpoint", required=True, help="our .pth")
     p_exp.add_argument("--out", dest="out_path", required=True, help="output .bin.gz")
+    p_exp.add_argument("--name", default="goai_v7", help="model name recorded in the file")
 
     return parser
 
@@ -300,8 +288,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     if args.command == "export":
-        export(args.checkpoint, args.out_path)  # 永远不返回
-        raise AssertionError("unreachable")  # pragma: no cover
+        try:
+            out = export(args.checkpoint, args.out_path, name=args.name)
+        except kb.KatagoBinError as e:
+            print(f"导出失败：{e}", file=sys.stderr)
+            return 2
+        import os
+
+        print(f"已写出 {out}（{os.path.getsize(out):,} 字节）")
+        print(f"用引擎验证：katago.exe analysis -model {out} -config analysis.cfg")
+        return 0
 
     raise AssertionError(f"unreachable command {args.command!r}")  # pragma: no cover
 
