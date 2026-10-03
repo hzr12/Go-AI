@@ -344,38 +344,49 @@ trunk → Conv2d(256→V=48, 1×1, bias=False) → NormAct → VV (B,48,19,19)
 Linear(144→W=96, bias=True) → SiLU → h (B,96)
    ├─ Linear(96→3, bias=True) → outcome_logits        {胜,负,无结果}
    └─ Linear(96→3, bias=True) → scoremean = 20·x₀
-                                 scorestdev = 20·SoftPlus(x₁, 0.05)
+                                 scorestdev = 20·SoftPlus(x₁, 0.05)  ← 字面值，见下方裁决
                                  lead       = 20·x₂
 ```
 
 `KataGPool_value` 第三个统计量换成 `mean·(((√A−14)²/100) − 0.1)`（二次 board-size 缩放，**无 max**）。
 ⚠ **固定 19×19 下 `((√A−14)/10)=0.5`、`(((√A−14)²/100)−0.1)=0.15` 都是常数** ⇒ value 池化实际只是三个缩放的 mean。公式照抄保留，以便将来泛化。
 
-> 🔴 **待裁决：`scorestdev` 的 `SoftPlus(x₁, 0.05)` 与 §4.5 loss #7 自相矛盾。**
+> ✅ **已裁决（2026-10-03）：`scorestdev` 的 `beta` 取 `1.0`，不再是未决项。**
 >
-> 2026-10-02 端到端冒烟训练（`scripts/smoke_train_v7.py`，302 行 / 40 步）实测：
-> **这一项 40 步内变化 −0.0%**，是 12 项里唯一不动的。硬算：
+> 上面的 `SoftPlus(x₁, 0.05)` 是**本 spec 的原始字面值**，保留在正文里不改 ——
+> 它是下面这条推导链的一环（推导的正是「字面值为什么错」）。**代码不实现它**：
+> `src/networks/katago_v7.py::SCORE_STDEV_SOFTPLUS_BETA = 1.0`。
+>
+> **推导链**（`F.softplus(x, beta) = log(1+exp(beta·x))/beta`，代入 x=0）：
 >
 > ```
-> F.softplus(0, 0.05) = log(2)/0.05 = 13.86  ⇒  ×20 = 277   ← 预测初值
-> loss #7 的目标 = std(softmax(scorebelief)) = 5~20,  δ=10    ← 初始偏差 260
-> 系数 0.001 × AdamW 步长 ~3e-4  ⇒  需 ~9 万步才挪到位，真实训练约 1 万步
+> softplus(0, beta) = log(2)/beta   ⇒   预测初值 = 20·log(2)/beta
+>   beta = 0.05  ⇒  13.86 → ×20 = 277.26    ← spec 字面值
+>   beta = 1.0   ⇒   0.69 → ×20 =  13.86    ← 裁决值（PyTorch F.softplus 默认）
+> loss #7 的目标 = std(softmax(scorebelief)) = 5~20,  δ=10
 > ```
 >
-> ⇒ 按字面写法，**loss #7 等于没有学习信号**。取默认 `beta=1.0` 则
-> `20·softplus(0,1) = 13.86`，与目标同量级、起点即可用。
+> 2026-10-02 端到端冒烟训练（`scripts/smoke_train_v7.py`，302 行 / 40 步）实测
+> **字面值那一版这一项 40 步内变化 −0.0%**，是 12 项里唯一不动的。硬算：
+> 系数 0.001 × AdamW 步长 ~3e-4 ⇒ 需 ~9 万步才从 277 挪到 10 量级，
+> 真实训练约 1 万步 ⇒ 按字面写法 **loss #7 等于没有学习信号**。
 >
-> **现状**：`src/networks/katago_v7.py` **逐字实现 spec 的 0.05**（已批准的 spec
-> 是契约，不擅自改），但提成具名常量 `SCORE_STDEV_SOFTPLUS_BETA`，
-> 裁决后只改这一行，头部结构 / 参数量 / 预算均不受影响。
-> **本行在裁决前视为「已知缺陷」，不得当作可训练项排期。**
+> **裁决后的实测**（`tests/test_katago_v7_budget.py` 的
+> `test_score_stdev_softplus_term_lands_near_huber_delta` 与
+> `test_score_stdev_loss_term_is_inside_huber_delta_at_the_ruled_out_beta`；
+> seed 0 初始化 + seed 7 输入 / B=64，真实 forward）：
 >
-> 🔴 **状态：未决，且「改成 `1.0`」的建议尚未获批准。**
-> 本轮实现结束时该常量仍是 `0.05`（`src/networks/katago_v7.py:534`）。
-> 因此 **12 项里有 1 项（#7）在当前代码里等效于没有学习信号** ——
-> 引用 §4.5 的「12 项 loss」做排期时，**第 7 项要减掉**。
-> 任何文档/表格都**不得**把它写成「已定 `1.0`」或「已修」。
-> 详见配套 spec 的「悬而未决」表与 §9.10 第 20 行。
+> | | 预测初值 `score_stdev.mean()` | loss #7 公式值 | 与 δ=10 |
+> |---|---:|---:|---|
+> | `beta=0.05`（字面值） | **277.2534** | **272.22** | ✗ 27 倍，梯度被常数偏差支配 |
+> | **`beta=1.0`（裁决值）** | **13.8599** | **8.83** | ✓ **落在 δ 以内**（二次段，梯度有效） |
+>
+> ⚠ **段 1 不受本裁决影响**：`V7_STAGE1_SCORE_TERMS` 8 项系数逐个 0.0，
+> `score_stdev` 的 `weighted` 恒 0 ⇒ 段 1 的四个主目标（policy / π_opp /
+> value / futurepos）**逐位不变**（有测试钉住）。本裁决是为**段 2/3**
+> （接上 sidecar、把 score 系权重打开）生效的。
+> ⚠ **纯常量**：头部拓扑、参数量（**5,561,832**）、预算测试全部不受影响
+> （同样有测试钉住）。
 
 ### 4.3 Ownership 头
 
@@ -1666,7 +1677,7 @@ policy top16 计数  763 .. 943
 | value | −15.9% | | futurepos | −12.4% |
 | ownership | −14.8% | | policy | −0.5% |
 | scorebelief_pdf | −13.7% | | seki | 0.0%（`w_seki` 缺省 0 ✓） |
-| | | | **score_stdev** | **−0.0%** ← 见 §4.2（🔴 **未获批准改 `1.0`**，当前仍是 `0.05`） |
+| | | | **score_stdev** | **−0.0%** ← 该列是 `beta=0.05`（spec 字面值）那一版的实测；**已裁决改 `1.0`**，见 §4.2 |
 
 ⚠ **`scoring` 开局就占 83/104**（随机预测 vs ±120 目标，MSE ≈ 1.4e4），
 梯度范数在 step 20 冲到 365、被 clip 到 5 ⇒ 早期有效步长被压得很小。
@@ -1810,7 +1821,7 @@ ch10 **99.4%** 落在 pla 子上、ch11/ch12/ch13 = **99.4 / 97.9 / 96.7%**。
 | # | 位置 | 偏差 | 状态 |
 |---|---|---|---|
 | 1 | §6.1 | 「块小计 ×11 = 5,479,680」行标签张冠李戴（该数不是 11 的倍数；11 块实为 **5,423,616**） | **已订正**，测试钉住 |
-| 2 | §4.2 | `scorestdev` 的 `SoftPlus(x₁, 0.05)` 与 loss #7 的 δ=10 矛盾，实测该项无学习信号 | **待裁决**，提为 `SCORE_STDEV_SOFTPLUS_BETA` |
+| 2 | §4.2 | `scorestdev` 的 `SoftPlus(x₁, 0.05)`（**spec 字面值**）与 loss #7 的 δ=10 矛盾，实测该项无学习信号 | ✅ **已裁决为 `1.0`**（2026-10-03）。推导链与实测数字见 §4.2；`spec` 正文保留 `0.05` 作为字面值记录，**代码不实现它**（`SCORE_STDEV_SOFTPLUS_BETA = 1.0`） |
 | 3 | §5 | 原设计（build 加列 + 局表并入主 npz）被「不 rebuild + 实时算 + 独立 sidecar」取代 | **已重写** |
 | 4 | §5.4 | 批契约从「4 元组 + dict」被实现成「5 元组」 | **已订正回 4 元组** |
 | 5 | §7.4 #6 | 验收锚点从「与旧 17ch 逐位相等」换成「与官方 stdata 逐位对拍」 | **已替换** |
@@ -1828,7 +1839,7 @@ ch10 **99.4%** 落在 pla 子上、ch11/ch12/ch13 = **99.4 / 97.9 / 96.7%**。
 | 17 | §7.4 #6 / §9.4 / §9.8 | **ch3/4/5 = 1.000000**、**ch14/ch17 = 1.000000**（200 npz / 4,368 行；ch14 非零格 22,528 == 22,528）⇒ 气桶不分色 / 桶是 `==1/2/3` 而非 `>=3` / 整块去重 / ch14 与 `to_play` 无关（**实测非假设**）均已证实 | **已订正**（好消息，补进 spec） |
 | 18 | §2.2 | 历史门控曾**被解析两次**：函数内算对，输出行独立重算并抄了 `cur[:,0]`（ch14）而非 `out[:,1]`（ch15），`history=1` 时**恰好差一手**。是 `go_rules.py:170-177` 的教训在 V7 里的**第二次复刻**（第一次是 17 通道 U 形块两个 bucket 同时漏） | **已修**；spec 加警示：**门控只能解析一次，只调一处实现** |
 | 19 | §5.3.3 / §9.9 | 两个**未列**的 `RE` 形式：`W+3 zi`（单位后缀，**2 局**）、`W+0,25`（欧洲逗号小数，**1 局**） | **已订正**；两者都有显式分支 |
-| 20 | §4.5 #7 / §4.2 | `SCORE_STDEV_SOFTPLUS_BETA` 仍是 `0.05`（**逐字实现 spec**）；预测初值 277、冒烟 40 步该项 **−0.0%** ⇒ 建议改 `1.0`，**尚未获批准** | **未决** —— 不得当作可训练项排期，也不得写成「已定」 |
+| 20 | §4.5 #7 / §4.2 | `SCORE_STDEV_SOFTPLUS_BETA` 原为 `0.05`（**逐字实现 spec 字面值**），预测初值 277.26、冒烟 40 步该项 **−0.0%** | ✅ **已裁决为 `1.0`**（2026-10-03）。实测预测初值 **13.86**、loss #7 公式值 **8.83**（落在 δ=10 以内）⇒ #7 **恢复为可训练项**。⚠ 段 1 的 8 项 score 系数仍逐个 0.0 ⇒ 段 1 四个主目标**逐位不变**；纯常量 ⇒ 结构/参数（5,561,832）/预算不变 |
 | 21 | §7.5 / 新增 §9.11 | `tests/test_huber_loss.py::test_no_new_cli_params` 把 `train_sft.py` 的 flag 整个冻结（D1 零新增/零删除/零改名）；`test_policy_loss_default_is_ce` 钉死 `--policy-loss` 的 **default = `ce`**。🔴 **A4 已把它从 61 扩到 65**（`--soft-index` / `--soft-weight` / `--soft-only-sampling` / `--soft-every`），且 **`soft_ce` 已接进 CLI**（choices == `{huber, ce, soft_ce}`）⇒ 「段 2 无法从命令行启动」**已作废** | **已订正**（冻结集本身保留，价值在「新增必须一次留痕」） |
 | 22 | §7.5 / 新增 §9.11 | **两个文档校验测试已删**（用户决定）：`tests/test_run_txt_sync.py`（整文件）与 `tests/test_param_budget.py::test_run_txt_records_are_consistent`（要求 run.txt 保留 `# v18 架构参数` 小节，而 v18 已退役） | **已记录**；⚠ **随之失去的保证：run.txt 里的数字/flag 与实测值的自动比对**（🔴 **已咬过一次**：run.txt 缩到 55 行，`run.txt:700` 悬空） |
 | 23 | §5.7 / §5.2 / 配套 spec §1.2·§3 | **`soft_mask` 语义**：`0` 被写成「one-hot CE」。**代码为准**（`train_sft.py::soft_cross_entropy`）：`mask=0` 贡献**恰好 0**，不退化、不插值；分母恒为 `B` | 🔴 **已订正**。「二选一」保留（那句没错），错的是「0 = one-hot CE」。⇒ **段 2 必须配 `--soft-only-sampling`**，否则 1% 软行把 policy 项缩小 ~100× |
@@ -2063,7 +2074,7 @@ B7 的对拍工具给**每个通道**打一个 `eligibility` 标签，共三档�
 | `backbone.py:581`（`def _sdpa`） | ✅ 有效 |
 | `src/search/mcts.py:250-253`（`cache_key`） | ✅ 有效（⚠ 路径是 **`src/search/`** 不是 `src/game/`） |
 | `go_rules.py:170-177` / `:1446` / `:1551` / `:2261` / `:2269` / `:2420` | ✅ 有效 |
-| `kata_v7.py:534`（`SCORE_STDEV_SOFTPLUS_BETA = 0.05`） | ✅ 有效 |
+| `kata_v7.py::SCORE_STDEV_SOFTPLUS_BETA = 1.0`（spec 字面值是 `0.05`，已裁决改） | ✅ 有效 |
 | `kata_v7_loss.py:195-204`（`_weighted_mean` 不除 `Σw`）/ `:291-293` / `:362-368` | ✅ 有效 |
 | `dataset.py:40`（`FUTUREPOS_SENTINEL`）/ `:278-323`（权重契约）/ `:737-742`（`outcome_black`） | ✅ 有效 |
 | `train_sft.py:1601-1647`（`soft_cross_entropy`）/ `:767-791`（`resolve_policy_loss_kind`）/ `:2379`（`--soft-only-sampling`）/ `:2805-2816`（收窄训练行） | ✅ 有效 |

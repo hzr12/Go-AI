@@ -898,12 +898,23 @@ def test_health_block_reports_rmse_on_the_default_path():
     assert h['train_top1'] == pytest.approx(0.5), h
     assert h['train_top5'] == pytest.approx(1.0), h
     assert h['policy_ce_random'] == pytest.approx(math.log(a)), h
-    # ⚠ `policy_entropy` 的**符号**是既有约定，不是笔误：实现报的是 Σ p·log p，
-    #   也就是**负**熵，取值 ∈ [−log A, 0]（均匀时 = −5.89，学到之后升向 0）。
-    #   这条断言按该约定写；改符号会让它与历史 run 的曲线不可比，且本轮门禁
-    #   （`test_every_loss_curve_has_a_baseline`）只给 entropy 配了 6 个键之一，
-    #   没有基线对，改动不受任何门禁保护 ⇒ 要改必须是一次显式裁决。
-    assert -math.log(a) - 1e-6 <= h['policy_entropy'] <= 0.0, h
+    # 🔴 `policy_entropy` 的符号：**2026-10-03 已裁决改成真熵**，本断言随之改写。
+    #
+    #   **旧约定（已作废）**：实现报的是 `Σ p·log p`，那不是熵，是 **−H** ⇒
+    #   取值 ∈ [−log A, 0]，均匀时 ≈ **−5.89**，学到后**升向 0**。旧断言写的是
+    #   `-log(a) - 1e-6 <= h['policy_entropy'] <= 0.0`。
+    #   **为什么必须改**：指标名叫 entropy 而方向是反的 —— 读者看到曲线从 −5.89
+    #   升到 0 会以为策略在**变乱**，真实情况是**变锐**（熵在降）。
+    #   ⚠ 旧约定当时只是「把既成事实写进了测试」，**没有**任何论证支持它对；
+    #   覆盖面上它也只由 `test_health_metric_is_reported` 的「键在不在」间接护住，
+    #   符号本身无门禁 ⇒ 要改正是一次显式裁决，而不是静默改数字。
+    #   **新约定**：`H = −Σ p·log p`，取值 ∈ [0, log A]，均匀时 = log(362)
+    #   ≈ 5.8926，学到后**下降** ⇒ 曲线方向与指标名一致。
+    #   **代价**：历史 run 的这条曲线符号翻转，换算关系逐位成立 **新值 = −旧值**
+    #   （见下面的 `test_policy_entropy_is_true_entropy_and_flips_sign`）。
+    #   ⚠ 故意**不同时上报两个口径** —— 那会让 SwanLab 里出现两条含义重叠、
+    #   符号相反的曲线，比一个反了的曲线更难读。
+    assert 0.0 <= h['policy_entropy'] <= math.log(a) + 1e-6, h
     # 两个 value 键的值可**逐项复算**（防止有人把两个键写反，或把
     # `value_t` 与 `value_logit` 搞混 —— 那正是 `compute_value_loss` 历史上
     # 咬过人的方向）。
@@ -913,6 +924,106 @@ def test_health_block_reports_rmse_on_the_default_path():
         float(torch.sqrt(((pred - tgt) ** 2).mean())), abs=1e-6), h
     assert h['value_rmse'] < h['value_rmse_zero'], \
         '会预测的模型必须低于恒预测 0 的基线，否则这对比没有意义'
+
+
+def test_policy_entropy_is_true_entropy_and_flips_sign():
+    """🔴 `policy_entropy` 的**口径**与**换算关系**（2026-10-03 裁决的两个锚点）。
+
+    三件事一起钉，缺一件就留了回归的口子：
+
+    1. **均匀分布 ⇒ log(动作数)** —— 19 路 361+1 = 362 个动作，log(362)
+       ≈ 5.8926。真熵在均匀时取上界，这是「报的是 H 而不是 −H」最直接的判据：
+       旧口径在这里给的是 **−5.89**。
+    2. **确定性分布 ⇒ ≈ 0** —— 真熵在下界。
+    3. **旧值 = −新值** —— 换算关系逐位成立，历史 run 的曲线才能被平移过来读。
+    """
+    a = ACTION
+
+    def reported(logits):
+        """走 main() 里那段健康度代码本身（不重算公式），返回它报的值。"""
+        h = _run_health_block({
+            'policy_logits': logits,
+            'value_logit': torch.zeros(logits.shape[0], 1),
+            'move_t': torch.zeros(logits.shape[0], dtype=torch.long),
+            'value_t': torch.zeros(logits.shape[0], 1),
+        })
+        return h['policy_entropy']
+
+    # (1) 均匀：全零 logits ⇒ softmax 均匀。
+    uni = reported(torch.zeros(4, a))
+    assert uni == pytest.approx(math.log(a), abs=1e-6), uni
+    assert abs(uni - 5.8926) < 1e-3, f'实测 {uni}，与 log(362)≈5.8926 不符'
+
+    # (2) 确定性：一路 +60、其余 −60 ⇒ softmax 已是 one-hot（float32 下
+    #     非主项 exp(−120) 已下溢到 0），真熵必须 ≈ 0。
+    det_logits = torch.full((4, a), -60.0)
+    det_logits[:, 7] = 60.0
+    det = reported(det_logits)
+    assert det == pytest.approx(0.0, abs=1e-6), det
+
+    # (3) 换算关系：旧口径 `Σ p·log p` 与新口径逐位互为相反数。
+    #     用一批**非平凡** logits（真熵严格落在 (0, log A) 内）而不是上面两个
+    #     端点 —— 端点上 `new == -old` 是恒真的（0/−logA），证明不了什么。
+    g = torch.Generator().manual_seed(23)
+    lp = torch.randn(8, a, generator=g).log_softmax(-1)
+    new_val = float(-(lp.exp() * lp).sum(-1).mean())      # H
+    old_val = float((lp.exp() * lp).sum(-1).mean())       # −H（旧实现）
+    assert 0.0 < new_val < math.log(a), new_val            # 真的落在内区间
+    assert new_val == pytest.approx(-old_val, abs=1e-6), (new_val, old_val)
+    # 且上报的那个数**就是 H 本身**（不是 −H、也不是任何归一化后的东西）：
+    # 同一批 logits 走 main() 里的健康度代码，与本地算的 H 必须逐位相等。
+    probe = torch.randn(8, a, generator=torch.Generator().manual_seed(31))
+    lp2 = probe.log_softmax(-1)
+    assert reported(probe) == float(-(lp2.exp() * lp2).sum(-1).mean())
+
+
+def test_stage1_four_objectives_are_bit_identical_across_score_stdev_betas(net,
+                                                                         v7_batch):
+    """🔴 `SCORE_STDEV_SOFTPLUS_BETA` 0.05 → 1.0 对**段 1 逐位无影响**。
+
+    为什么这条不能省：段 1 的 8 项 score 系系数逐个 0.0（`test_stage1_score_family_
+    coefficients_are_exactly_zero`），而 `score_stdev` 是**唯一没有行权重可用**
+    的一项（只有 `game_weight`）⇒ 一旦有人顺手把 beta 改回去、或把系数表动一下，
+    段 1 的四个主目标会**静默**跟着变，而曲线看上去仍然「在学」。
+
+    所以这里不是断言「近似相等」，是断言 `float(...)` 的**逐位相等**（`==`，
+    不是 `pytest.approx`）—— 近似相等挡不住「值确实动了但动得小」。
+    """
+    from src.networks import katago_v7 as k7
+
+    sp, gl, moves, lbl = v7_batch
+    sp_t = torch.from_numpy(sp.astype(np.float32))
+    gl_t = torch.from_numpy(gl.astype(np.float32))
+    labels = v7_loss_labels(lbl, moves)
+
+    snap = {}
+    orig = k7.SCORE_STDEV_SOFTPLUS_BETA
+    try:
+        for tag, beta in (('old', 0.05), ('new', 1.0)):   # spec 字面值 / 裁决值
+            k7.SCORE_STDEV_SOFTPLUS_BETA = beta
+            lossf = build_v7_stage1_loss()
+            net.eval()
+            with torch.no_grad():
+                res = lossf(net(sp_t, gl_t), labels)
+            snap[tag] = {
+                'terms': {t: float(res['terms'][t]) for t in V7_STAGE1_TERMS},
+                'weighted': {t: float(res['weighted'][t]) for t in V7_STAGE1_TERMS},
+                # 反证：#7 **确实**变了（否则下面那条「逐位不变」是因为 beta
+                # 根本没进到 forward 里，而不是因为段 1 真的不受影响）
+                'sd': float(res['terms']['score_stdev']),
+            }
+    finally:
+        k7.SCORE_STDEV_SOFTPLUS_BETA = orig
+
+    assert snap['new']['sd'] != snap['old']['sd'], \
+        'beta 改了但 #7 的公式值没变 ⇒ 测的不是「beta 影响段 1」这件事'
+    for t in V7_STAGE1_TERMS:
+        assert snap['old']['terms'][t] == snap['new']['terms'][t], \
+            f'段 1 的 {t} 逐项值随 beta 变了：{snap["old"]["terms"][t]} → ' \
+            f'{snap["new"]["terms"][t]}'
+        assert snap['old']['weighted'][t] == snap['new']['weighted'][t], \
+            f'段 1 的 {t}（加权后）随 beta 变了：{snap["old"]["weighted"][t]} → ' \
+            f'{snap["new"]["weighted"][t]}'
 
 
 def test_health_block_reports_3class_accuracy_on_the_v7_path(net, v7_batch):

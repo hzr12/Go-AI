@@ -520,18 +520,37 @@ class PolicyHead(nn.Module):
         return torch.cat((spatial, pass_logit), dim=2)
 
 
-#: ``scorestdev = 20·SoftPlus(x₁, beta)`` 里的 beta（spec §4.2 写 0.05）。
+#: ``scorestdev = 20·SoftPlus(x₁, beta)`` 里的 beta。**spec §4.2 的字面写法是
+#: `0.05`，已裁决改为 `1.0`**（2026-10-03）—— 下面保留推导链，因为「为什么不能
+#: 随手改这个数」正是这段推导本身，而「spec 写的是 0.05」是推导的一环。
 #:
-#: ⚠ **这一行与 spec §4.5 loss #7 自相矛盾，实现前需要裁决。**
-#: ``F.softplus(x, beta) = log(1+exp(beta·x))/beta``，故 beta=0.05 时
-#: ``softplus(0, 0.05) = 13.86``，再乘 20 得 **277**。而 loss #7 的目标是
-#: ``std(softmax(scorebelief))``（量级 5~20）、Huber 的 δ=10 —— 拿 277 去回归
-#: 10 量级的目标，初期梯度会被这个常数偏差完全支配。
-#: 若取默认 ``beta=1.0``，则 ``20·softplus(0,1) = 13.86``，与 δ=10 同量级。
+#: 🔴 **裁决依据：softplus(beta) 的量纲标定。**
+#: ``F.softplus(x, beta) = log(1+exp(beta·x))/beta``，代入 x=0 得
+#: ``softplus(0, beta) = log(2)/beta`` ⇒ **预测初值 = 20·log(2)/beta**：
 #:
-#: 这里**逐字实现 spec 的 0.05**（已批准的 spec 是契约，不擅自改），但把它提成
-#: 这个具名常量：裁决之后只改这一行，头部结构、参数量、预算均不受影响。
-SCORE_STDEV_SOFTPLUS_BETA = 0.05
+#: ==========  ==========================  ==========================
+#: beta        20·softplus(0,beta) 初值    与 loss #7 的目标（5~20，δ=10）
+#: ==========  ==========================  ==========================
+#: 0.05        **277.26**（spec 字面值）   ✗ 高出 27 倍 ⇒ 初期梯度被常数偏差支配
+#: **1.0**     **13.86**（本常量）        ✓ 与 δ=10 同量级，起点即可用
+#: ==========  ==========================  ==========================
+#:
+#: 取默认 ``beta=1.0``（PyTorch ``F.softplus`` 的默认值）后，这一项从「等效于
+#: 没有学习信号」恢复为正常可训练项。
+#:
+#: ⚠ **实测（`tests/test_katago_v7_budget.py::
+#: test_score_stdev_softplus_term_lands_near_huber_delta` 与
+#: test_score_stdev_loss_term_is_inside_huber_delta_at_the_ruled_out_beta`）**：
+#: seed 0 初始化 + seed 7 输入（B=64）跑真实 forward，
+#: ``score_stdev.mean()``：beta=0.05 → **277.2534**，beta=1.0 → **13.8599**；
+#: 落到 loss #7 的公式值：beta=0.05 → **272.22**，beta=1.0 → **8.83**
+#: （Huber δ=10 ⇒ 落在 δ **以内**，此时是二次段、梯度仍有效）。
+#:
+#: ⚠ **这是纯常量，不改结构**：头部拓扑、参数量（**5,561,832**）、预算测试全部
+#: 不受影响（有测试钉住）。另 ⚠ **段 1 不训 score**（8 项系数逐个 0.0），所以本
+#: 改动对段 1 的四个主目标（policy / π_opp / value / futurepos）**逐位无影响**，
+#: 它是为**段 2/3**（接上 sidecar、把 score 系权重打开）生效的。
+SCORE_STDEV_SOFTPLUS_BETA = 1.0
 
 
 class ValueHead(nn.Module):

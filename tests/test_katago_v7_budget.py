@@ -16,6 +16,7 @@ spec §6.1 里「**块小计 ×11 = 5,479,680**」这一行的**标签是错的*
 就是它。见 `test_block_subtotal_is_not_the_stem_plus_global_sum`。
 """
 
+import inspect
 import math
 import os
 import sys
@@ -23,13 +24,16 @@ import sys
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+from src.networks import katago_v7  # noqa: E402
 from src.networks.katago_v7 import (  # noqa: E402
-    GAIN_SILU, NBT_TF_CFG, NormAct, Nbt2TransformerBlock, NbtTfNet,
-    RMSNormMask, build_katago_v7_net, gpool_policy, gpool_value,
+    GAIN_SILU, NBT_TF_CFG, SCORE_STDEV_SOFTPLUS_BETA, NormAct,
+    Nbt2TransformerBlock, NbtTfNet, RMSNormMask, build_katago_v7_net,
+    gpool_policy, gpool_value,
 )
 
 #: 硬预算（spec §1.2 C1）。超了就是结构改动没同步预算。
@@ -327,6 +331,153 @@ def test_backward_reaches_every_parameter(net):
     assert not missing, f'{len(missing)} 个参数没有梯度：{missing[:8]}'
     assert all(torch.isfinite(p.grad).all() for p in net.parameters()), \
         '有参数的梯度是 NaN/Inf'
+
+
+# --------------------------------------------------------------------------- #
+# SCORE_STDEV_SOFTPLUS_BETA：spec 字面值 0.05 → 已裁决 1.0（2026-10-03）
+# --------------------------------------------------------------------------- #
+#: loss #7 的 Huber δ（`katago_v7_loss.py::forward` 里那个 `10.0`）。
+HUBER_DELTA_SCORE_STDEV = 10.0
+
+
+class _swapped_beta:
+    """临时改 `katago_v7.SCORE_STDEV_SOFTPLUS_BETA`（`forward` 每次调用现读它）。
+
+    ⚠ 必须改**模块全局**而不是传参：`ValueHead.forward` 里是
+    `F.softplus(s[:,1], beta=SCORE_STDEV_SOFTPLUS_BETA)`，那个名字在调用时
+    才解析 ⇒ 只有全局才是真正生效的那个开关。用 `with ... as _` 拿回原值，
+    保证即使断言失败也不会把常量留在 0.05 上污染后面的测试。
+    """
+
+    def __init__(self, beta):
+        self.beta = float(beta)
+
+    def __enter__(self):
+        self.orig = katago_v7.SCORE_STDEV_SOFTPLUS_BETA
+        katago_v7.SCORE_STDEV_SOFTPLUS_BETA = self.beta
+        return self
+
+    def __exit__(self, *exc):
+        katago_v7.SCORE_STDEV_SOFTPLUS_BETA = self.orig
+        return False
+
+
+def test_score_stdev_softplus_beta_is_one():
+    """常量必须**精确**是 1.0（不是「大概是 1」）。
+
+    spec §4.2 的字面值是 `0.05`，正文里保留着（它是推导链的一环）—— 但**代码**
+    实现的是裁决值 1.0。这条断言的作用是让「spec 字面值被抄进代码」立刻变红，
+    而不是等到 #7 又 40 步不动时才发现。
+    """
+    assert SCORE_STDEV_SOFTPLUS_BETA == 1.0
+
+
+def test_score_stdev_softplus_term_lands_near_huber_delta():
+    """🔴 实测：`softplus` 项在 beta=1.0 下与 δ=10 **同量级**，在 0.05 下差 27 倍。
+
+    `F.softplus(x, beta) = log(1+exp(beta·x))/beta` ⇒ x=0 时
+    `softplus(0, beta) = log(2)/beta` ⇒ 预测初值 `20·log(2)/beta`：
+    beta=0.05 → **277.26**，beta=1.0 → **13.86**。
+
+    这里跑**真实 forward**（seed 0 初始化 + seed 7 输入 / B=64）取实测值，而不是
+    停在纸上推导 —— 推导只能证明公式；实现里少乘一个 20、或漏掉 `beta=` 关键字
+    （`F.softplus` 的第二个位置参数就是 beta），纸面推导一律看不出来。
+    """
+    # 纸面：F.softplus(0, beta) = log(2)/beta
+    assert float(F.softplus(torch.tensor(0.0), beta=0.05)) == pytest.approx(
+        13.8629, abs=1e-3)
+    assert float(F.softplus(torch.tensor(0.0), beta=1.0)) == pytest.approx(
+        0.6931, abs=1e-3)
+
+    torch.manual_seed(0)
+    n = build_katago_v7_net().eval()
+    g = torch.Generator().manual_seed(7)
+    sp = torch.randn(64, 22, 19, 19, generator=g)
+    gl = torch.randn(64, 19, generator=g)
+
+    means = {}
+    with torch.no_grad():
+        for beta in (0.05, 1.0):
+            with _swapped_beta(beta):
+                means[beta] = float(n(sp, gl)['score_stdev'].mean())
+
+    # 裁决值：实测 13.8599，与 δ=10 同量级。判据取「落在 δ 的 3 倍以内」而不是
+    # 「等于 δ」—— 初值不必等于目标，只要别差两个数量级。
+    assert means[1.0] == pytest.approx(13.8599, abs=0.05), means
+    assert means[1.0] <= 3.0 * HUBER_DELTA_SCORE_STDEV, \
+        f'beta=1.0 的初值 {means[1.0]} 与 δ={HUBER_DELTA_SCORE_STDEV} 差太远'
+    # spec 字面值：实测 277.2534，是 δ 的 27 倍。这一行是**回归哨兵** ——
+    # beta 若被改回 0.05，它会连同上面那条一起变红。
+    assert means[0.05] == pytest.approx(277.2534, abs=0.05), means
+    assert means[0.05] > 20.0 * HUBER_DELTA_SCORE_STDEV
+
+
+def test_score_stdev_loss_term_is_inside_huber_delta_at_the_ruled_out_beta():
+    """裁决要的不只是「预测初值同量级」，而是**落进 δ 区间内**（Huber 二次段）。
+
+    上一条量的是网络输出 `score_stdev`；这一条量的是它**进 loss #7 之后**的
+    公式值（huber(预测, std(scorebelief), δ=10)）。落在 δ 以内 ⇒ 梯度还在二次段，
+    没有被线性段压掉 1/δ —— 那才是「这一项真的有学习信号」的直接判据。
+
+    实测（真实 net + 合成标签，段 2 的口径即 `game_weight=1`）：
+      beta=0.05 ⇒ 272.22（δ 的 27 倍）
+      beta=1.0  ⇒   8.83（**δ 以内**）
+    """
+    from src.networks.katago_v7_loss import KataGoV7Loss, huber
+
+    torch.manual_seed(0)
+    n = build_katago_v7_net().eval()
+    g = torch.Generator().manual_seed(7)
+    sp = torch.randn(8, 22, 19, 19, generator=g)
+    gl = torch.randn(8, 19, generator=g)
+    # 目标 = std(softmax(scorebelief))，官方口径 5~20；取一列实测值。
+    with torch.no_grad():
+        base = n(sp, gl)
+    target = base['scorebelief_logits'].float().softmax(-1).std(-1)
+    assert 0.0 < float(target.mean()) < 40.0, float(target.mean())
+
+    got = {}
+    with torch.no_grad():
+        for beta in (0.05, 1.0):
+            with _swapped_beta(beta):
+                o = n(sp, gl)
+            # `huber` 是**逐样本**的 ⇒ 要 mean 才等于 #7 的公式值
+            # （`_weighted_mean` 在 game_weight 恒 1 时就是 mean）。
+            got[beta] = float(huber(o['score_stdev'].float(), target,
+                                    HUBER_DELTA_SCORE_STDEV).mean())
+    assert got[1.0] == pytest.approx(8.83, abs=0.05), got
+    assert got[1.0] <= HUBER_DELTA_SCORE_STDEV, \
+        f'beta=1.0 下 loss #7 的公式值 {got[1.0]} 仍在 δ 之外 ⇒ 仍在线性段'
+    assert got[0.05] == pytest.approx(272.22, abs=0.5), got
+
+    # 反证：#7 的公式值确实随 beta 变（否则上面全是恒真的断言）。
+    assert got[0.05] != got[1.0]
+    # 顺带确认 `KataGoV7Loss` 里那一路读的是**同一个** δ=10（本测试把 δ 写成
+    # 自己的常量，所以必须核对它与实现同步，否则两条断言会在 δ 漂移时假绿）。
+    src = inspect.getsource(KataGoV7Loss.forward)
+    assert 'huber(out[\'score_stdev\'].float(), sb_std, %s)' % (
+        repr(HUBER_DELTA_SCORE_STDEV)) in src, \
+        'katago_v7_loss.py 里 #7 的 δ 与本测试的 HUBER_DELTA_SCORE_STDEV 不一致'
+
+
+def test_score_stdev_beta_is_a_pure_constant_so_params_are_untouched():
+    """beta 是**纯常量**：两种取值下参数量与 state_dict 形状必须完全一致。
+
+    没有这条的话，「改 beta 顺手改了 `scores` 那一层的形状」会被
+    `test_total_param_count_is_exact` 抓到，但抓不到**另一种**改法 ——
+    用 beta 去缩放某个 `Linear` 的输出维度而总数恰好不变。判据的形状：
+    逐键比对 `state_dict` 的形状，而不只是比总数。
+    """
+    torch.manual_seed(0)
+    a = build_katago_v7_net()
+    torch.manual_seed(0)
+    b = build_katago_v7_net()
+    with _swapped_beta(1.0):       # b 走裁决值；a 保持 spec 字面值 0.05
+        sb = b.state_dict()
+    sa = a.state_dict()
+    assert set(sa) == set(sb)
+    assert all(tuple(sa[k].shape) == tuple(sb[k].shape) for k in sa)
+    assert _n(a) == _n(b) == SPEC_TOTAL == 5_561_832
 
 
 # --------------------------------------------------------------------------- #

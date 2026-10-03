@@ -280,7 +280,6 @@ def rebuild_history_columns(moves, to_play, game_ids, *, past=HISTORY_PAST,
     offs = np.arange(1, past + 1, dtype=np.int64)
     for lo in range(0, n, max(1, int(chunk))):
         hi = min(lo + int(chunk), n)
-        b = hi - lo
         rows = np.arange(lo, hi, dtype=np.int64)
         j = rows[:, None] - offs[None, :]                  # (b, past)，可能为负
         ok = j >= 0
@@ -308,23 +307,34 @@ def rebuild_history_columns(moves, to_play, game_ids, *, past=HISTORY_PAST,
     return my, op
 
 
-def reference_history_row(i, moves, to_play, game_ids, slots=HISTORY_SLOTS):
+def reference_history_row(i, moves, to_play, game_ids, slots=HISTORY_SLOTS,
+                          past=HISTORY_PAST):
     """**逐行 Python 循环**的参考实现 —— 与向量化版刻意用不同的算法。
 
     它只作为对拍基准存在：:func:`rebuild_history_columns` 的正确性由
     ``tests/test_v7_dataset.py::test_rebuild_matches_independent_reference``
     拿它逐格比对保证。⚠ 不要把这个函数「优化」成向量化 —— 那会让对拍失去意义。
+
+    ⚠ ``past`` 必须与 :func:`rebuild_history_columns` 的那个一致（默认
+      :data:`HISTORY_PAST`）。🔴 两侧若不一致，这里会在**某一侧的历史被填满**
+      时提前停下（``while`` 条件里有 ``len(my) < slots and len(op) < slots``），
+      于是少看了几手、把 ``-1`` 当成真值 —— 而 ``-1`` 在 ch9..13 上与 pass
+      不可区分，**不报错**。往回看多少手不是「够填满槽位就行」：槽填满之后
+      还要继续看，才能把 ``my[1]`` / ``op[2]`` 填上。
     """
     my, op = [], []
     k = 1
-    while k <= len(moves) and len(my) < slots and len(op) < slots:
+    past = int(past)
+    while k <= past and k <= i:
         j = i - k
-        if j < 0 or int(game_ids[j]) != int(game_ids[i]):
+        if int(game_ids[j]) != int(game_ids[i]):
             break
         if int(to_play[j]) == int(to_play[i]):
-            my.append(int(moves[j]))
+            if len(my) < slots:
+                my.append(int(moves[j]))
         else:
-            op.append(int(moves[j]))
+            if len(op) < slots:
+                op.append(int(moves[j]))
         k += 1
     return (my + [-1] * slots)[:slots], (op + [-1] * slots)[:slots]
 
@@ -354,7 +364,8 @@ def verify_history_columns(my_hist, op_hist, moves, to_play, game_ids, *,
     for i in (int(x) for x in idxs):
         if i < 0 or i >= n:
             continue
-        want_my, want_op = reference_history_row(i, mv_all, tp_all, gid_all)
+        want_my, want_op = reference_history_row(i, mv_all, tp_all, gid_all,
+                                                 past=HISTORY_PAST)
         for side, want, got in (('my', want_my, my_hist[i]),
                                 ('op', want_op, op_hist[i])):
             if not np.array_equal(np.asarray(want, dtype=np.int16),
@@ -641,7 +652,6 @@ class V7Dataset(SupervisedDataset):
         逐局查表而不是预先展开成 ``(N,)``：展开要多 34.2M × 4 B = 137 MB，
         而每批只需要 B 个数（一个 B 长度的 Python 循环，512 行时是几十微秒）。
         """
-        b = int(np.asarray(idxs).size)
         if self._game_komi is None:
             return None            # ⇒ feature_v7._komi_of(None) ⇒ 贴目 0.0
         gid = np.asarray(self.game_ids)[np.asarray(idxs, dtype=np.int64)]

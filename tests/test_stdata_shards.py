@@ -406,7 +406,52 @@ def test_writer_docstring_no_longer_claims_peak_is_one_key(tmp_path):
 # --------------------------------------------------------------------------- #
 # 5 · 真实归档（行数均衡 + 划分）
 # --------------------------------------------------------------------------- #
+#: 🔴 真实归档这一档验证的是**偏移算术，不是规模**。全扫 1.5 GB 的
+#: ``2026-08-25npzs.tgz`` 实测 152.80 s（本测试一次要扫 3 遍），而
+#: `count_kept_rows` 的返回值与归档有多大无关 ⇒ 每个归档只读前这么多个成员。
+REAL_MEMBER_PROBE = 300
+
+#: ⚠ **限的是「成员数」，不是 `--limit` 的「行数」** —— 这个区别是承重的。
+#: `--limit` 命中后把返回值封顶成 `min(kept_shard, limit)`
+#: （`stdata_to_npz.py:993`），于是 `rows_kept_shard` **恒等于 limit**：
+#: 实测 limit ∈ {2000, 8000, 20000} × 3 个 shard_id，`rows_kept_shard` 每次都
+#: 精确等于 limit，偏移带来的归属变化被整个抹掉 ⇒ 那个测试会变成空转
+#: （它唯一还剩的断言 `base > prev_last` 退化成 `limit > 0`）。
+#: 限成员数则让 `limit` 保持 `None`，两个计数都是**未经封顶的真实值**。
+REAL_MEMBER_PROBE_DOC = """\
+⚠ **本测试验证的是「偏移跨归档累加」的逻辑，不是规模。**\
+`first_n_members` 把每个归档截到前 %d 个成员（真实归档、真实成员布局不变）。\
+限定成员数**不影响被验证的性质**：`count_kept_rows` 的 `limit` 仍是 `None`，\
+所以 `rows_kept` / `rows_kept_shard` 都不是封顶值，`member_base` 仍按每个成员\
+自己的 `n_keep` 推进 —— 偏移算术一字未改，只是输入变短了。\
+（**不要**改用 `--limit` 来提速：它按行数封顶返回值，会把偏移的影响抹成 0，\
+见 `REAL_MEMBER_PROBE` 上方的警告。）"""
+
+
+@pytest.fixture
+def first_n_members(monkeypatch):
+    """把 `count_kept_rows` 看得见的成员数限到前 `REAL_MEMBER_PROBE` 个。
+
+    只截**遍历范围**，不截任何计数 —— 见 `REAL_MEMBER_PROBE` 的警告。
+    """
+    real_iter = s2n.iter_npz_members
+
+    def probe(archive):
+        gen = iter(real_iter(archive))
+        try:
+            for i, item in enumerate(gen):
+                if i >= REAL_MEMBER_PROBE:
+                    return
+                yield item
+        finally:
+            gen.close()        # 触发 `iter_npz_members` 自己的 tf.close()
+
+    monkeypatch.setattr(s2n, 'iter_npz_members', probe)
+    return probe
+
+
 @needs_stdata
+@pytest.mark.slow
 def test_real_archive_shard_counts_are_balanced():
     """真实成员大小不均 ⇒ 每块行数应接近 1/N（允许差几个成员）。"""
     N = 4
@@ -420,9 +465,252 @@ def test_real_archive_shard_counts_are_balanced():
         assert abs(n - mean) / max(mean, 1) < 0.02, (sid, n, mean)
 
 
+# --------------------------------------------------------------------------- #
+# 6 · CLI 的分片参数校验（`--num-shards` / `--shard-id`）
+# --------------------------------------------------------------------------- #
+#: 每一组都必须被拒。`--count-only` 与 `convert` 两条路径对它们的判定必须一致
+#: （🔴 修之前 `--count-only` 只查 shard_id 越界、完全不看 num_shards）。
+ILLEGAL_SHARD_ARGVS = [
+    ['--num-shards', '1', '--shard-id', '0'],   # N=1 ⇒ 那个 --shard-id 是哑参数
+    ['--num-shards', '1', '--shard-id', '3'],
+    ['--num-shards', '0'],                      # 曾被静默夹成 1（不分片）
+    ['--num-shards', '-3'],
+    ['--num-shards', '0', '--shard-id', '0'],
+    ['--num-shards', '4'],                      # 说了要分 4 块却没说哪一块
+    ['--num-shards', '4', '--shard-id', '4'],   # 越界
+    ['--num-shards', '4', '--shard-id', '-1'],
+    ['--num-shards', '2', '--shard-id', '9'],
+]
+
+
+def _cli(arch, *extra):
+    return ['--source', '%s:%s' % (arch, NET_80)] + list(extra)
+
+
+@pytest.fixture
+def arch(tmp_path):
+    """一份合成归档（每成员行数故意不整除 N，见 :func:`_archive`）。"""
+    return _archive(str(tmp_path / 'cli.tar'))
+
+
+def test_shard_id_default_is_a_sentinel_not_zero():
+    """🔴 「不分片」与「第 0 块」在 `0` 上无法区分 ⇒ default 必须是 `None`。
+
+    修之前是 `default=0` 配 `if args.shard_id:`（**真值**判断）⇒ `--shard-id 0`
+    整个校验被跳过，而 0 恰恰是分块跑时最常用的那一块（第一个分片）。
+    """
+    ap = s2n.build_argparser()
+    assert ap.parse_args([]).shard_id is None, (
+        'default 必须是 None（None = 不分片）；0 会让「不分片」与「第 0 块」'
+        '在真值判断下混同')
+    assert ap.parse_args(['--shard-id', '0']).shard_id == 0
+
+
+def test_resolve_shard_args_normalizes_the_legal_pairs():
+    """三态：无 id + N=1 = 不分片 ⇒ 归一化成 ``(1, 0)``；分片 ⇒ 原样。"""
+    assert s2n.resolve_shard_args(1, None) == (1, 0)
+    assert s2n.resolve_shard_args(8, 0) == (8, 0)
+    assert s2n.resolve_shard_args(8, 7) == (8, 7)
+
+
+@pytest.mark.parametrize('num_shards,shard_id', [
+    (1, 0), (1, 3), (0, None), (0, 0), (-3, None), (-3, 1),
+    (4, None), (4, 4), (4, -1), (2, 9),
+])
+def test_resolve_shard_args_rejects_every_illegal_combination(
+        num_shards, shard_id):
+    with pytest.raises(ConversionError):
+        s2n.resolve_shard_args(num_shards, shard_id)
+
+
+def test_shard_id_zero_is_validated_not_skipped():
+    """🔴 缺陷 1：`--num-shards 1 --shard-id 0` 现在**必须**报错。
+
+    N=1 时 `shard_mask` 原样返回全部行 ⇒ 那个 `--shard-id` 根本不生效，是个哑
+    参数；收下它就是再收一个静默无操作参数，而本次要消灭的正是静默降级。
+    修之前 `if args.shard_id:` 让 0 跳过校验，所以本条测试在修复前是红的。
+    """
+    with pytest.raises(ConversionError):
+        s2n.resolve_shard_args(1, 0)
+
+
+def test_num_shards_below_one_is_an_error_not_a_silent_downgrade(tmp_path,
+                                                                 arch, capsys):
+    """🔴 缺陷 2：`--num-shards 0` / `-3` 曾静默降级成不分片，rc=0。
+
+    报出来的行数是**全量**行数 —— 数字看着完全正常。分片流程的整个前提是
+    「各块行数之和 == 全集行数」，这种失败只在最后对数时才发现，而那时已经
+    写完几 GB 了。
+    """
+    for nsh in ('0', '-3', '-1'):
+        rc = s2n.main(_cli(arch, '--count-only', '--num-shards', nsh))
+        assert rc != 0, f'--num-shards {nsh} 静默 rc=0（降级成了不分片）'
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert 'num-shards' in err and '>= 1' in err, err
+        assert '夹成 1' in err, err        # 说清为什么不静默
+
+
+def test_illegal_shard_args_are_rejected_identically_on_both_paths(tmp_path,
+                                                                   arch, capsys):
+    """🔴 缺陷 3：`--count-only` 与 `convert` 必须对同一组参数给出同一判定。
+
+    两条路径各写一份校验 —— 一个查一个不查 —— 就是同类漏洞的温床。
+    """
+    for extra in ILLEGAL_SHARD_ARGVS:
+        out_path = tmp_path / 'o.npz'
+        rc_count = s2n.main(_cli(arch, '--count-only',
+                                 '--out', str(out_path), *extra))
+        err_count = capsys.readouterr().err
+        rc_conv = s2n.main(_cli(arch, '--out', str(out_path), *extra))
+        err_conv = capsys.readouterr().err
+        assert rc_count == 2, (extra, rc_count, err_count)
+        assert rc_conv == rc_count, (extra, rc_count, rc_conv)
+        assert err_count.strip() and err_conv.strip(), (extra, err_count, err_conv)
+        # 参数非法时一个字节都不该落地（校验在写文件之前）
+        assert not out_path.exists(), extra
+
+
+def test_out_of_range_message_keeps_its_wording(tmp_path, arch, capsys):
+    """`test_stdata_shard.py::test_cli_rejects_out_of_range_shard_id` 依赖
+    stderr 里的「越界」二字 —— 别把报错文案改掉，否则那个文件会红。"""
+    rc = s2n.main(_cli(arch, '--count-only', '--num-shards', '4',
+                       '--shard-id', '9'))
+    assert rc == 2
+    assert '越界' in capsys.readouterr().err
+
+
+def test_num_shards_without_shard_id_is_rejected(tmp_path, arch, capsys):
+    """🔴 `--num-shards 4` 而不给 `--shard-id` 必须报错。
+
+    两种「善意默认」都只会在最后对数时才显形：默认第 0 块 ⇒ 用户以为参数没
+    生效；默认不分片 ⇒ **声称分 4 块却写出全集**，而输出里的行数完全正常。
+    """
+    rc = s2n.main(_cli(arch, '--count-only', '--num-shards', '4'))
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert '--shard-id' in err and '--num-shards 4' in err, err
+
+
+def test_no_shard_args_means_unsharded_all_rows(tmp_path, arch, capsys):
+    """不传 `--shard-id` ⇒ 不分片、全部行、rc=0（行为不变）。"""
+    rc = s2n.main(_cli(arch, '--count-only'))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert '块 →' not in out, out               # 不该出现分片那行
+    total = count_kept_rows(arch, NET_80)['rows_kept']
+    assert '保留 %d 行' % total in out, out
+    assert '合计：原始 %d 行' % count_kept_rows(arch, NET_80)['rows_raw'] in out
+
+
+def test_num_shards_one_alone_is_legal_and_equals_no_shard_args(tmp_path, arch,
+                                                                capsys):
+    """裁决：`--num-shards 1` **显式允许**，含义就是「不分片」，与不传等价。"""
+    a = s2n.main(_cli(arch, '--count-only'))
+    out_a = capsys.readouterr().out
+    b = s2n.main(_cli(arch, '--count-only', '--num-shards', '1'))
+    out_b = capsys.readouterr().out
+    assert a == 0 and b == 0
+    assert out_a == out_b
+
+
+def test_num_shards_one_with_shard_id_zero_is_rejected_but_convert_allows_it(
+        tmp_path, arch, capsys):
+    """🔴 裁决只加在 **CLI 层**：函数层 `convert(num_shards=1, shard_id=0)`
+    仍然合法且与不分片逐位相同（见 `test_num_shards_one_is_bit_identical_to_
+    unsharded`）—— 函数层用签名默认值 `shard_id=0` 表达「默认第 0 块」，那里
+    没有「未给」这个状态，CLI 才有，所以只有 CLI 需要区分。"""
+    rc = s2n.main(_cli(arch, '--count-only', '--num-shards', '1',
+                       '--shard-id', '0'))
+    assert rc == 2
+    assert '哑参数' in capsys.readouterr().err
+    # 函数层不受影响
+    meta = convert([(arch, NET_80)], str(tmp_path / 'x.npz'),
+                   num_shards=1, shard_id=0)
+    assert meta['shard']['num_shards'] == 1 and meta['shard']['shard_id'] == 0
+    assert meta['rows'] == count_kept_rows(arch, NET_80)['rows_kept']
+
+
+def test_shard_zero_is_still_the_first_shard_end_to_end(tmp_path, arch, capsys):
+    """🔴 改成 sentinel 之后，第 0 块必须**仍然**被当作「第 0 块」跑。
+
+    修法有个陷阱方向：`--shard-id` 变成 `None` 之后若忘了把归一化值喂下去，
+    `--shard-id 0` 会悄悄退化成不分片 ⇒ 第 0 块变成全集，而报告依然正常。
+    """
+    total = count_kept_rows(arch, NET_80)['rows_kept']
+    rc = s2n.main(_cli(arch, '--count-only', '--num-shards', '4',
+                       '--shard-id', '0'))
+    out = capsys.readouterr().out
+    assert rc == 0
+    per = [count_kept_rows(arch, NET_80, num_shards=4, shard_id=sid)
+           ['rows_kept_shard'] for sid in range(4)]
+    assert '第 0/4 块 → %d 行' % per[0] in out, out
+    assert per[0] < total, (per[0], total)   # 第 0 块 ≠ 全集（没退化成不分片）
+    assert sum(per) == total                 # 各块之和 == 全集行数
+
+
+def test_both_paths_receive_the_same_normalized_shard_args(tmp_path, arch,
+                                                           monkeypatch,
+                                                           capsys):
+    """🔴 `--count-only` 与 `convert` 必须收到**同一对**归一化参数。
+
+    不靠「跑出来行数一样」这种间接判据：直接录下两条路径各自收到的
+    ``(num_shards, shard_id)``。否则哪天有人在其中一条分支里改回
+    `args.shard_id`，`None` 就会在一条路径上变成「不分片」而在另一条上是 0。
+    """
+    seen = {}
+
+    def fake_count(archive, network=None, **kw):
+        seen['count'] = (kw['num_shards'], kw['shard_id'])
+        return {'rows_raw': 4, 'rows_kept': 4, 'rows_kept_shard': 4}
+
+    def fake_convert(archives, out_path, **kw):
+        seen['convert'] = (kw['num_shards'], kw['shard_id'])
+        return {'fake': True}
+
+    monkeypatch.setattr(s2n, 'count_kept_rows', fake_count)
+    monkeypatch.setattr(s2n, 'convert', fake_convert)
+    monkeypatch.setattr(s2n, 'render_report', lambda meta: '')
+
+    for argv, want in (
+            ([], (1, 0)),                                 # 不分片
+            (['--num-shards', '1'], (1, 0)),             # 显式 1 = 不分片
+            (['--num-shards', '8', '--shard-id', '0'], (8, 0)),   # 🔴 第 0 块
+            (['--num-shards', '8', '--shard-id', '7'], (8, 7)),
+    ):
+        seen.clear()
+        assert s2n.main(_cli(arch, '--count-only', *argv)) == 0, argv
+        assert seen['count'] == want, (argv, seen)
+        assert s2n.main(_cli(arch, *argv)) == 0, argv
+        assert seen['convert'] == want, (argv, seen)
+        capsys.readouterr()
+
+
+def test_convert_rejects_non_positive_num_shards(tmp_path, arch):
+    """🔴 `convert` 里的 `max(1, ...)` 降级：CLI 修好之后它对 CLI 已不可达，
+    但直接调 `convert()` 的代码仍会中招（而且 `meta['shard']` 还会把
+    num_shards 记成 1，看起来完全正常）⇒ 函数层也必须报错。"""
+    for nsh in (0, -3):
+        out = tmp_path / ('bad%d.npz' % nsh)
+        with pytest.raises(ConversionError):
+            convert([(arch, NET_80)], str(out), num_shards=nsh)
+        assert not out.exists(), nsh
+
+
+def test_convert_still_rejects_out_of_range_shard_id(tmp_path, arch):
+    for nsh, sid in ((4, 4), (4, -1), (2, 9)):
+        with pytest.raises(ConversionError):
+            convert([(arch, NET_80)], str(tmp_path / 'o.npz'),
+                    num_shards=nsh, shard_id=sid)
+
+
 @needs_stdata
-def test_real_archive_count_offset_accumulates_across_archives():
-    """跨归档偏移：第一块的 `rows_kept_shard` 与第二块的不该重叠。"""
+@pytest.mark.slow
+def test_real_archive_count_offset_accumulates_across_archives(first_n_members):
+    """跨归档偏移：第一块的 `rows_kept_shard` 与第二块的不该重叠。
+
+    %s
+    """ % (REAL_MEMBER_PROBE_DOC % REAL_MEMBER_PROBE,)
     N = 3
     base = 0
     prev_last = -1

@@ -1026,8 +1026,10 @@ def convert(archives, out_path, *, policy_topk=POLICY_TOPK, limit=None,
         archives: ``[(路径, 网络名), ...]``。每个归档**各自的**网络名 ——
             列数不同的归档（80 / 64）就是这么在同一个文件里对上的。
         limit: 每个归档**本块**最多保留多少行 19×19（`None` = 全量）。
-        num_shards / shard_id: 分片（见 :func:`shard_mask`）。``num_shards<=1``
-            时行为与不分片**逐位相同**。峰值内存 ≈ 未压缩总量 / ``num_shards``。
+        num_shards / shard_id: 分片（见 :func:`shard_mask`）。``num_shards == 1``
+            时行为与不分片**逐位相同**；``num_shards <= 0`` 是**非法值** ⇒ 报错，
+            不再被静默夹成 1（见函数体里的 🔴）。峰值内存 ≈ 未压缩总量 /
+            ``num_shards``。
         ram_budget_gb: 峰值内存上限（GB）。``0`` = 不检查。⚠ 估的是**未压缩
             总量 × :data:`RAM_OVERHEAD_FACTOR`**（见 :class:`NpzChunkedWriter`：
             zip 容器无法交错写成员 ⇒ 转换期必须把未压缩数据整个放内存）。
@@ -1042,7 +1044,17 @@ def convert(archives, out_path, *, policy_topk=POLICY_TOPK, limit=None,
             比没有更糟（下游不会报错，只会在训练中途崩）。
     """
     log = log or (lambda *a, **k: None)
-    num_shards = max(1, int(num_shards))
+    # 🔴 这里曾写 `num_shards = max(1, int(num_shards))` —— 那是**静默降级**，
+    # 而 CLI 校验修好之后它对 CLI 已经不可达了；留着它等于给直接调用
+    # `convert()` 的代码留一个「传 0/负数 ⇒ 悄悄拿到全集」的洞（`meta['shard']`
+    # 还会把 num_shards 记成 1，看起来完全正常）。降级本身就该报错。
+    num_shards = int(num_shards)
+    if num_shards < 1:
+        raise ConversionError(
+            f'num_shards={num_shards} 非法：必须 >= 1'
+            f'（1 = 不分片，与 shard_mask 的 num_shards<=1 语义一致）。'
+            f'\n  ⚠ 别指望它被夹成 1：那会让分片调用**静默**退回全量转换，'
+            f'而输出里的行数是个完全正常的数字。')
     shard_id = int(shard_id)
     if not 0 <= shard_id < num_shards:
         raise ConversionError(
@@ -1405,11 +1417,18 @@ def build_argparser():
                          '⚠ 实测峰值是**未压缩总量 ×1.19**（不是最大单键）：'
                          '全量 3.13M 行 ≈ 44.8 GB，13.9 GB 的机器必须分块。'
                          'N=8 时 ≈5.6 GB。分块后**各块串行跑**（并行的峰值是 '
-                         'N 倍之和）')
-    ap.add_argument('--shard-id', type=int, default=0, metavar='I',
-                    help='本块编号，0 <= I < N。逐块跑：'
+                         'N 倍之和）。'
+                         '⚠ 必须 N >= 1（1 = 不分片）；N <= 0 直接报错，'
+                         '**不**静默当成不分片。N >= 2 时**必须**同时给 '
+                         '--shard-id')
+    ap.add_argument('--shard-id', type=int, default=None, metavar='I',
+                    help='本块编号，2 <= N 且 0 <= I < N。逐块跑：'
                          '--num-shards 8 --shard-id 0/1/…/7'
-                         '（规则是全局行号取模，N 块严格构成全集的划分）')
+                         '（规则是全局行号取模，N 块严格构成全集的划分）。'
+                         '🔴 **不给 = 不分片**（default 是 None 而不是 0：'
+                         '「不分片」与「第 0 块」在 0 这个值上无法区分，'
+                         '真值判断会让最常用的第 0 块跳过校验）。'
+                         '给了就必须在分片（N >= 2），否则报错')
     ap.add_argument('--policy-topk', type=int, default=POLICY_TOPK,
                     help='policy 稀疏目标的 K')
     ap.add_argument('--ram-budget-gb', type=float, default=0.0,
@@ -1446,6 +1465,72 @@ def resolve_archives(args):
     return srcs
 
 
+def resolve_shard_args(num_shards, shard_id):
+    """CLI 的 ``--num-shards/--shard-id`` → 归一化后的 ``(num_shards, shard_id)``。
+
+    🔴 **整个文件里唯一一处分片参数校验** —— `--count-only` 与 `convert` 两条
+    路径都调它。两条路径各写一份校验就是「一个校验一个不校验」的温床：那正是
+    本函数修掉的那个洞（`--count-only` 曾经只查 ``shard_id`` 越界、完全不看
+    ``num_shards``，于是 ``--num-shards 0`` 静默变成不分片并把**全量行数**
+    当成本块行数报出来，rc=0、数字看着正常，没有任何异常信号）。
+
+    三态，不接受第四种
+    ------------------
+    ==========================  ==========================================
+    ``--num-shards 1`` 单独给   不分片 ⇒ 归一化成 ``(1, 0)``（合法）
+    ``--num-shards N`` 无 id     🔴 报错：N 块里到底是哪一块？
+    ``--num-shards N --shard-id I``  第 I/N 块（``N >= 2``、``0 <= I < N``）
+    ==========================  ==========================================
+
+    为什么不把 ``N >= 2 --shard-id`` 也当成合法
+    -------------------------------------------
+    ``shard_mask`` 对 ``num_shards <= 1`` 直接返回全部行（那是**函数层的合法
+    语义**，不归这里改），所以 ``--num-shards 1 --shard-id 0`` 里那个
+    ``--shard-id`` **根本不生效**：它是个哑参数。收下它 = 再收一个静默无操作
+    参数，而这次要消灭的正是「参数被静默降级」。N=1 的正确写法是一个都不传。
+
+    为什么 ``--num-shards N`` 无 ``--shard-id`` 要报错
+    --------------------------------------------------
+    若把它默认为「第 0 块」，用户会拿到第 0 块却以为参数没生效；若按「不分片」
+    处理，就会在**声称分 N 块的同时**写出全集 —— 分片流程的前提是「各块行数
+    之和 == 全集行数」，而这个输出**看起来是正常的数字**。两种默认值都只在
+    数字对不上时才显形，那时已经写完几 GB 了。
+
+    Raises:
+        ConversionError: 任何一种非法组合（⇒ CLI ``rc=2``，非 0）。
+    """
+    num_shards = int(num_shards)
+    if num_shards < 1:
+        # 🔴 不再 `max(1, ...)` 静默降级成不分片：分片的前提是各块行数之和
+        # == 全集行数，而降级后报出来的是**全量行数**，数字完全正常。
+        raise ConversionError(
+            f'--num-shards {num_shards} 非法：必须 >= 1（1 = 不分片）。'
+            f'\n  ⚠ 早先的实现把它静默夹成 1 ⇒ 变成分片流程里最坏的一种失败：'
+            f'仍然 rc=0、仍然报一个行数，只是那个行数是**全量**。'
+            f'分片流程的前提是「各块行数之和 == 全集行数」，'
+            f'而这个输出**看起来是正常的数字**。')
+    if shard_id is None:
+        if num_shards != 1:
+            raise ConversionError(
+                f'--num-shards {num_shards} 少了 --shard-id：分 {num_shards} 块'
+                f'时必须指明本块是第几号（0 <= I < {num_shards}）。'
+                f'\n  · 想要第 0 块 ⇒ --shard-id 0'
+                f'\n  · 想要全量（不分片）⇒ 别给 --num-shards')
+        return 1, 0                      # 不分片
+    shard_id = int(shard_id)
+    if num_shards < 2:
+        raise ConversionError(
+            f'--shard-id {shard_id} 只能在**分片**时给，而 --num-shards '
+            f'{num_shards} 不是分片（N 必须 >= 2）。'
+            f'\n  ⚠ N=1 时 `shard_mask` 原样返回全部行 ⇒ 这个 --shard-id '
+            f'是个**不生效的哑参数**。不分片就别传它。')
+    if not 0 <= shard_id < num_shards:
+        raise ConversionError(
+            f'--shard-id {shard_id} 越界：应有 '
+            f'0 <= --shard-id < --num-shards({num_shards})')
+    return num_shards, shard_id
+
+
 def main(argv=None):
     args = build_argparser().parse_args(argv)
 
@@ -1454,17 +1539,17 @@ def main(argv=None):
 
     try:
         archives = resolve_archives(args)
-        if args.shard_id and not args.num_shards > args.shard_id >= 0:
-            raise ConversionError(
-                f'--shard-id {args.shard_id} 越界：应有 '
-                f'0 <= --shard-id < --num-shards({args.num_shards})')
+        # 🔴 分片校验在分叉之前、只做一次 ⇒ `--count-only` 与 `convert` 对同一
+        #   组参数的合法性判定必然一致（归一化后的值直接喂给两条路径）。
+        num_shards, shard_id = resolve_shard_args(args.num_shards,
+                                                  args.shard_id)
         if args.count_only:
             infos = []
             base = 0                       # ⚠ 按过滤前的行数推进，与 convert 一致
             for p, n in archives:
                 info = count_kept_rows(p, n, limit=args.limit, log=log,
-                                       num_shards=args.num_shards,
-                                       shard_id=args.shard_id,
+                                       num_shards=num_shards,
+                                       shard_id=shard_id,
                                        global_offset=base)
                 infos.append(info)
                 base += info['rows_kept']
@@ -1472,25 +1557,25 @@ def main(argv=None):
             kept = sum(i['rows_kept'] for i in infos)
             log('\n合计：原始 %d 行 → 19×19 保留 %d 行（%.1f%%）'
                 % (raw, kept, 100.0 * kept / max(raw, 1)))
-            if args.num_shards > 1:
+            if num_shards > 1:
                 mine = sum(i['rows_kept_shard'] for i in infos)
                 log('  第 %d/%d 块 → %d 行（%.2f%% of 保留，理论值 %.2f%%）'
-                    % (args.shard_id, args.num_shards, mine,
+                    % (shard_id, num_shards, mine,
                        100.0 * mine / max(kept, 1),
-                       100.0 / args.num_shards))
+                       100.0 / num_shards))
             if args.json_path:
                 _dump(args.json_path, {'count_only': True, 'archives': infos,
                                        'rows_raw': raw, 'rows_kept': kept,
-                                       'shard_id': args.shard_id,
-                                       'num_shards': args.num_shards})
+                                       'shard_id': shard_id,
+                                       'num_shards': num_shards})
             return 0
         out = args.out or os.path.join('tmp', 'stdata_v7.npz')
         meta = convert(archives, out, policy_topk=args.policy_topk,
                        limit=args.limit, ram_budget_gb=args.ram_budget_gb,
                        keep_qvalue=args.keep_qvalue, compress=args.compress,
                        level=args.compress_level, log_every=args.log_every,
-                       log=log, num_shards=args.num_shards,
-                       shard_id=args.shard_id)
+                       log=log, num_shards=num_shards,
+                       shard_id=shard_id)
     except ConversionError as e:
         sys.stderr.write('stdata_to_npz: 失败\n%s\n' % e)
         return 2

@@ -4323,7 +4323,22 @@ def main():
                         'train_top1': float((_plg.argmax(-1) == _mtg).float().mean()),
                         'train_top5': float((_topk == _mtg[:, None]).any(-1).float().mean()),
                         'policy_ce_random': float(math.log(_plg.shape[-1])),
-                        'policy_entropy': float((_lp.exp() * _lp).sum(-1).mean()),
+                        # 🔴 `policy_entropy` 报的是**真熵** `H = −Σ p·log p`
+                        #   （所以 `_lp.exp() * _lp` 前面那个负号不能省）。
+                        #   取值 ∈ [0, log A]：均匀时 = log(362) ≈ 5.8926，
+                        #   学到之后**下降**（趋近 0），曲线方向与指标名一致。
+                        #
+                        # ⚠ **历史 run 的这条曲线符号翻转了**（2026-10-03 裁决）：
+                        #   旧实现报的是 `Σ p·log p`，那不是熵，是 **−H** ⇒
+                        #   取值 ∈ [−log A, 0]，均匀时 ≈ **−5.89**，学到后**升向 0**。
+                        #   换算关系逐位成立：**新值 = −旧值**（实测同一批 logits
+                        #   两式之和恒为 0.0，见 `tests/test_train_sft_v7.py::
+                        #   test_policy_entropy_is_true_entropy_and_flips_sign`）。
+                        #   判读旧曲线时注意符号：旧 run 的「−5.89 → 0」在图上
+                        #   看着像**变乱**（entropy 升），实际是**变锐**（熵降）。
+                        #   本仓**只有这一条**熵曲线 —— 故意不同时上报两个口径，
+                        #   那会让 SwanLab 里出现两条含义重叠、符号相反的曲线。
+                        'policy_entropy': float(-(_lp.exp() * _lp).sum(-1).mean()),
                         # ⚠ V7 的 value 是 3 分类 CE，没有「RMSE」这个口径可报：
                         # 压成标量的任何做法都是**新发明**的口径（且与 12 通道的
                         # `value_rmse` 不可比）⇒ V7 改报 `value_acc3`，这两个键给

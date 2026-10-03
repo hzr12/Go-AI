@@ -16,35 +16,41 @@ pip install onnx onnxruntime       # 可选：ONNX 导出与 CPU 推理
 #   python scripts/build_dataset.py --src data --out data/sgf_19x19_full.npz --board-size 19 --chunk-size 50000
 
 # ---------- 2. 局级 sidecar games.npz ----------
-# 产出 data/labels/games.npz（4 键 g_komi/g_score/g_rules/g_resign，约 1.2 MB）。
-# 规模：扫 169,878 个 SGF + 落 .npy（152 s，478K 行/s）→ 墙钟几十分钟；末行必打印匹配率报告。
+# 产出 data/labels/games.npz（4 键 g_komi/g_score/g_rules/g_resign_side，约 1.2 MB）。
+# 规模：扫 169,878 个 SGF + 落 .npy（152 s）→ 墙钟几十分钟；末行必打印匹配率报告。
+#   小规模先验：加 --limit-games 200 --out tmp/games_probe.npz；已有 tmp/materialized/ 可加 --reuse-scan。
 python scripts/build_games_sidecar.py --dataset data/sgf_19x19_full.npz --out data/labels/games.npz
-# 想先小规模验：加 --limit-games 200 --out tmp/games_probe.npz；已有 tmp/materialized/ 可加 --reuse-scan。
 
 # ---------- 3. KataGo 软标签（段 2 蒸馏用）----------
 # 产出 data/labels/kata_labels.npz。--exe/--model/--config 自动从 katago/ 下递归查找。
 # ⚠ --limit 0 才是「全部」；默认 500 会**只标 500 个位置**（不是打印上限，是硬截断）。
-# 规模：--game-frac 0.015 × 162,298 局 ≈ 2,434 局 × 100 手（move 100~199）≈ 2.4×10^5 行。
 python scripts/label_sgf.py --game-frac 0.015 --move-lo 100 --move-hi 200 --limit 0 --out data/labels/kata_labels.npz
-# join 到主数据集行号 → data/labels/soft_index.npz（命中行 × 362 策略，~10^5 量级）
+# join 到主数据集行号 → data/labels/soft_index.npz（命中行 × 362 策略）
 python scripts/build_soft_index.py --data data/sgf_19x19_full.npz --labels data/labels/kata_labels.npz --out data/labels/soft_index.npz
-# ⚠ 训练侧尚无 --soft-* CLI（未接线）⇒ 本步产物目前只能喂探针，段 1 仍训不到。
+# ⚠ 段 2 必须配 --soft-only-sampling（否则 mask=0 的行贡献恰好 0，policy 项被缩小约 100×）。
 
 # ---------- 4. 训练 ----------
-# 4a 现有 SFT：建网只看 scripts/train_sft.py 的 KATAGO_SE_CFG（12 通道 / 9,112,005 参数）——
-#     脚本里那些 --backbone-channels / --res-blocks / --attn-* 结构 flag **已归档，不参与建网**。
-#     产出 models/sft_19x19_{katago_se_npu4,v18_npu1}.pth。⚠ 该结构显存未实测，先跑单卡冒烟。
+# 4a SFT：建网只看 scripts/train_sft.py 的 KATAGO_SE_CFG（12 通道 / 9,112,005 参数）；
+#     那些 --backbone-channels / --attn-* 结构 flag **已归档，不参与建网**。显存未实测，先跑单卡。
 python run.py --sh shell/train_sft_npu_1card.sh          # 单卡冒烟，建议先跑这个
 python run.py --sh shell/train_sft_npu_4card_katago_se.sh # 4 卡正式；每卡 batch 别上调
-# 4b V7 端到端冒烟：吃 stdata 真实目标，40 步 / batch 8，CPU ~1 分钟。当前唯一能验 12 项 loss 的入口。
+# 4b V7（22 通道，--v7）：端到端冒烟吃 stdata 真实目标，40 步 / batch 8，CPU ~1 分钟。
 python scripts/smoke_train_v7.py --files 40 --rows 256 --batch 8 --steps 40 --device cpu
 
-# ---------- 5. 推理 / 自战 ----------
-# 5a WebUI：模拟数在界面「模拟数」下拉里选，没有 --simulations 这个选项；--priors-leaf 是开关不能带 1。
+# ---------- 5. 门禁（~3.5min）----------
+# ⚠ 必须先钉线程，否则 -n auto 的 worker 抢核比串行还慢（test_max_batch 10.8s → 115s）。
+#   setx OMP_NUM_THREADS 1（或每条命令前临时 set）
+# ⚠ pytest.ini 的 addopts 已带 -n auto，别再手动加 -n。慢的回归用 @pytest.mark.slow 标记，
+#   默认仍会跑（-m 只在命令行显式给）；当前没有值得单独跳过的，-m "not slow" 与全门禁同速。
+python -m pytest tests -q
+python -m pytest tests -q --durations=10   # 查最慢的 10 个
+# ⚠ 加 CLI flag 后必须登记 tests/test_huber_loss.py 的冻结集，否则门禁自己先红。
+
+# ---------- 6. 推理 / 自战 ----------
+# 6a WebUI：模拟数在界面「模拟数」下拉里选，没有 --simulations 这个选项；--priors-leaf 是开关不能带 1。
 python scripts/webui.py --model models/sft_19x19_v12.pth --device cpu --port 7860 --mode mcts --expand-topk 8 --num-threads 4
-# 5b 终端人机对弈（--human-color black|white）
+# 6b 终端人机对弈（--human-color black|white）／6c RL 自对弈（采集已是 N 步 lookahead）
 python scripts/cli_play.py --model models/sft_19x19_v12.pth --device cpu --simulations 400 --num-threads 8
-# 5c RL 自对弈：采集已换成 N 步 lookahead 推演（MCTS 参数在 2026-09-30 归档，不再生效）
 python run.py --sh shell/train_rl_npu_1card.sh --model models/sft_19x19_v12.pth
 
 # ---------- 常见失败 → 原因 ----------

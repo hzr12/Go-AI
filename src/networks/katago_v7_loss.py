@@ -35,8 +35,12 @@ spec §4.5 的表里每项都有一列「系数」，但同节末尾的说明是
 `metrics_pytorch.py` 一致，别给它补一个 `w_*`。
 
 #7 的目标 `std(softmax(scorebelief))` 是 5~20 量级，Huber 的 δ=10 同量级。
-⚠ 这与 `katago_v7.SCORE_STDEV_SOFTPLUS_BETA = 0.05` 矛盾（那个值让
-`score_stdev` 初始就在 277）—— 见该常量的注释。
+⚠ 这与 `katago_v7.SCORE_STDEV_SOFTPLUS_BETA = 0.05`（spec §4.2 的**字面值**，已弃用）
+# 矛盾 —— 那个值让 `score_stdev` 预测初值落在 **277.26**、本项公式值 **272.22**
+# （δ=10 的 27 倍），初期梯度被常数偏差完全支配。
+# ✅ **已裁决为 `SCORE_STDEV_SOFTPLUS_BETA = 1.0`**（2026-10-03）⇒ 实测预测初值
+# **13.86**、本项公式值 **8.83**，**落在 δ=10 以内**（Huber 二次段，梯度有效）。
+# 推导链与实测数字见该常量上方的注释块。纯常量 ⇒ 结构/参数量/预算不变。
 """
 
 import math
