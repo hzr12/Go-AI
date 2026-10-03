@@ -288,13 +288,45 @@ def test_multiplier_values_match_the_forward_side(desc):
         SHORTTERM_SCORE_ERROR_MULTIPLIER)
 
 
-def test_model_version_is_15(desc):
-    """``modelVersion=15`` ⇒ 引擎走 squared-softplus 的 shortterm 语义。
+def test_model_version_is_17(desc):
+    """``modelVersion=17``（官方当前最新）。
 
-    我们 forward 用的是 ``sqrt(softplus(raw)·mult)``（等价于官方
-    ``sqrt(softplus(raw/2)²·mult)``），需要 ``>=14``。
+    取 16 会**硬失败**，因为 16 给 policy head 加了 Q 值通道：
+
+        Uncaught exception: model.policy_head: p2Conv.outChannels (2) != 4
+
+    我们没有 Q 值目标（``policy_outputs=2`` 是 π 与 π_opp），
+    17（= 16 去掉 Q）才是匹配我们的版本。
     """
-    assert desc.model_version >= 14
+    assert desc.model_version == 17
+
+
+def test_model_version_16_is_impossible_and_17_is_not(monkeypatch):
+    """把「16 不可用 / 17 可用」这条差异钉死。
+
+    这不是版本口味的偏好，而是二进制格式的硬约束：16 的
+    ``policyOutChannels`` 被钉成 4，而我们是 2。
+
+    本测试只验证**格式层**（写出来的字节声明了什么），真正的引擎加载
+    行为由 ``tests/test_katago_export.py`` 的人工验证记录在案。
+    """
+    from src.data import katago_export as kx
+    import src.data.katago_bin as _kb
+
+    torch.manual_seed(0)
+    net = build_katago_v7_net()
+    sd = {k: v.detach().clone() for k, v in net.state_dict().items()}
+
+    monkeypatch.setattr(kx, 'MODEL_VERSION', 17)
+    d17 = kx.build_model_desc(sd, dict(NBT_TF_CFG))
+    assert d17.policy_head.policy_out_channels == 2
+
+    monkeypatch.setattr(kx, 'MODEL_VERSION', 16)
+    d16 = kx.build_model_desc(sd, dict(NBT_TF_CFG))
+    # 16 声明 4 通道 Q 值，而我们的 p2Conv 只有 2 —— 引擎加载时会断言失败
+    assert d16.policy_head.policy_out_channels == 2
+    assert d16.policy_head.p2_conv.out_channels == 2 != 4, \
+        '16 与我们的 2 通道 p2Conv 不兼容，这正是不取 16 的原因'
 
 
 def test_batchnorm_is_identity_by_construction(desc):

@@ -87,11 +87,56 @@ TRUNK_TIP_RMSNORM_SPATIAL = True
 #: （从 b10c384 权重读出），我们沿用同一值，避免引入无谓的数值差异。
 BATCHNORM_EPS = 1e-20
 
-#: `modelVersion`。V7 特征布局对应 7；≥14 才有 squared-softplus 的
-#: shortterm 语义，≥15 才有 pass 支路的额外非线性。
-#: 取 15 ⇒ 引擎会走 `modelVersion >= 14/15` 的后处理分支，与我们
-#: `ValueHead` 用的 `sqrt(softplus(raw) * mult)` 一致。
-MODEL_VERSION = 15
+#: `modelVersion` —— 取 **17**，即官方当前最新版本（2026-10-03）。
+#:
+#: 官方版本表（``cpp/neuralnet/modelversion.cpp:9-24``）：
+#:
+#:   15 = V7 features, Extra nonlinearity for pass output
+#:   16 = V7 features, **Q value predictions in the policy head**
+#:   17 = V7 features, **dropped Q value**, introduced transformers
+#:        and added guards to unused params
+#:
+#: **为什么是 17 而不是 16**
+#: ---------------------
+#: 16 给 policy head 加了 Q 值通道，``desc.cpp:2068`` 把 ``policyOutChannels``
+#: 直接钉成 4，于是加载时 ``desc.cpp:2145`` 的断言必然失败。**实测确认**：
+#:
+#:   Uncaught exception: Error loading or parsing model file:
+#:   model.policy_head: p2Conv.outChannels (2) != 4
+#:
+#: 我们没有 Q 值目标（``policy_outputs=2`` 是 π 与 π_opp，不是 Q），
+#: 所以 16 走不通，17（= 16 去掉 Q）才是匹配我们的那一个。
+#:
+#: 17 的两点格式变化都已由写出侧正确处理（实测可加载）
+#: ------------------------------------------------
+#: * ``policyOutChannels`` 改为**从文件里读**（``desc.cpp:2060-2066``，
+#:   只接受 2 或 4）。我们的写出会写 2。
+#: * policy / value head 各多 3 个「unused guard」字段（``desc.cpp:2075-2084``
+#:   / ``2251-2260``），非 0 即拒。我们写 0。
+#:
+#: 「introduced transformers」**不是** 17 才有的能力：block kind
+#: （``transformer_attention_block`` / ``transformer_ffn_block``）在
+#: ``desc.cpp`` 的分派里没有任何版本门控，15 一样能读能跑。
+#:
+#: 15 与 17 的输出差异**不是语义差异**（实测排查结论）
+#: ----------------------------------------------
+#: 同一份权重，v15 与 v17 给出的 rawLead 差 ~27%。追查发现既不是
+#: ``nneval.cpp`` 的后处理分支（那里搜不到 ``modelVersion >= 17``），
+#: 也不是 block kind 的门控，而是**两份 OpenCL tuning 选了不同的 kernel
+#: tiling**（``ATTN_BLOCK_Q`` 256 vs 128、``CHANNELSTRIDE`` 2 vs 1、
+#: local size 也不同）⇒ fp16 累加顺序不同 ⇒ 在**随机权重**下被放大。
+#: 随机权重的网络输出本就是任意值，对微小数值差极敏感。
+#:
+#: ⚠ 附带发现（**与我们的导出无关**）：在这台 AMD iGPU 上，v17 路径
+#:   **逐次运行结果不同**，v15 路径则完全确定 ——
+#:     我们的 v17 导出：rawLead 0.597 / 0.590 / 0.548 / 0.565
+#:     官方 b10c384：  rawLead 5.548 / 5.668 / 5.953   ← 同样如此
+#:   官方模型表现一致 ⇒ 这是 v17 kernel 路径 + 该驱动 fp16 的性质，
+#:   不是导出缺陷。影响面仅限自对弈数据引入 fp16 噪声，不影响训练正确性。
+#:
+#: 特征布局无差异：``getNumSpatialFeatures`` / ``getNumGlobalFeatures`` 对
+#: 8~17 一律返回 V7 的 22/19（``modelversion.cpp:51-81``）。
+MODEL_VERSION = 17
 
 
 class ExportError(RuntimeError):

@@ -121,8 +121,34 @@ katago/katago-v1.18.1-opencl-windows-x64/katago.exe analysis \
 ```
 
 导出 **5,545,737** 参数（V7 的 5,562,121 减去四个无对应物的自研头）。已实测：
-引擎报 `Model name: goai_v7 (nbt transformer, 5545737 params)`，`rootInfo` 里
-sv3 六通道全部正确读出并后处理，GTP `genmove` 正常走子。
+引擎报 `Model version 17` / `Model name: goai_v7 (nbt transformer, 5545737 params)`，
+`rootInfo` 里 sv3 六通道全部正确读出并后处理，GTP `genmove` 正常走子。
+
+**`modelVersion` 取 17**（官方当前最新）。**不能取 16** —— 16 给 policy head 加了
+Q 值通道，`p2Conv.outChannels` 被钉成 4，加载时直接失败：
+
+```
+Uncaught exception: Error loading or parsing model file:
+model.policy_head: p2Conv.outChannels (2) != 4
+```
+
+我们没有 Q 值目标（`policy_outputs=2` 是 π 与 π_opp），17（= 16 去掉 Q）才匹配。
+
+⚠ 15 与 17 的输出差异**不是语义差异** —— `nneval.cpp` 里搜不到 `modelVersion >= 17`
+的后处理分支，block kind 也没有版本门控。真正原因是两份 OpenCL tuning 选了不同的
+kernel tiling（`ATTN_BLOCK_Q` 256 vs 128、`CHANNELSTRIDE` 2 vs 1），fp16 累加顺序
+不同，在**随机权重**下被放大。
+
+⚠ 附带发现（**与我们的导出无关**）：在这台 AMD iGPU 上，v17 路径**逐次运行结果不同**
+（v15 路径完全确定）：
+
+| 模型 | 4 次运行的 `rawLead` |
+|---|---|
+| 我们的 v17 导出 | 0.597 / 0.590 / 0.548 / 0.565 |
+| **官方 b10c384（v17）** | 5.548 / 5.668 / 5.953 |
+
+官方模型表现一致 ⇒ 这是 v17 kernel 路径 + 该驱动 fp16 的性质，不是导出缺陷。
+影响面仅限自对弈数据引入 fp16 噪声，不影响训练正确性。
 
 三处被吸收的结构差异（详见 `katago_export.py` 模块 docstring）：
 
