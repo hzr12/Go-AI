@@ -594,16 +594,25 @@ def test_full_loss_forward_survives_a_nan_in_every_zero_weight_head():
     assert 'futurepos' not in r['nonfinite_terms'], \
         'futurepos 系数非 0，没坏就不该被点名'
 
+
 # --------------------------------------------------------------------------- #
-# ④ 权重本身是 inf —— 真机 NaN 的源头（2026-10-04 定位）
+# ④ 行权重本身是坏的 —— 真机 NaN 的源头（2026-10-04 定位）
 # --------------------------------------------------------------------------- #
-def test_weighted_mean_strips_an_inf_weight():
-    """无穷权重必须在 `_weighted_mean` 里就被摘掉，否则反向出 NaN。
+# 两档垃圾（实测 data/sgf_19x19_full.npz，其余浮点列全干净）：
+#     inf                          2,072,682 行 -> 反向 0*inf = NaN
+#     有限但 >exp(10)（最大 1.0018e38） 74,244 行 -> p*w 溢出成 inf
+# 来源都是 build_dataset.compute_game_weight 的 np.exp(avg/20)，
+# 而 parse_player_rating 的正则从棋手名里抓到了垃圾数字。
+#
+
+
+def test_weighted_mean_neutralises_a_bad_weight():
+    """坏权重必须在 `_weighted_mean` 里就被中和，否则反向出 NaN。
 
     机制（真机日志与本机制逐项吻合）：
 
-        v     = mean(p * inf) = inf               # 前向
-        v     <- nan_to_num <- c=0                # 段 1 的 c==0 只净化**前向值**
+        v      = mean(p * inf) = inf              # 前向
+        v      <- nan_to_num <- c=0               # 段 1 的 c==0 只净化**前向值**
         grad_v = 0                                 # c=0 乘出来的
         grad_p = grad_v * w = 0 * inf = **NaN**    # IEEE-754
 
@@ -611,47 +620,92 @@ def test_weighted_mean_strips_an_inf_weight():
     `坏在操作数` 还是空的（pred/std 确实都有限），而梯度已经是 NaN。
     """
     from src.networks.katago_v7_loss import _weighted_mean
-    w = torch.tensor([1.0, float('inf'), 2.0])
+    for bad_w in (float('inf'), 1.0018e38):
+        w = torch.tensor([1.0, bad_w, 2.0])
+        probe = {}
+        p = torch.tensor([0.5, 0.7, 0.9], requires_grad=True)
+        out = _weighted_mean(p, w, probe, 'score_stdev')
+        assert torch.isfinite(out), (bad_w, out)
+        # 净化必须**留下证据**：不报就成了「悄悄把坏数据吞掉」
+        assert probe.get('score_stdev:w_bad') == 1, (bad_w, probe)
+        out.backward()
+        assert torch.isfinite(p.grad).all(), (bad_w, p.grad)
+        # 好行的梯度不许被牵连成 0（替换 != 摘掉）
+        assert float(p.grad[0]) != 0.0, (bad_w, p.grad)
+
+
+def test_weight_ceiling_matches_the_data_build_cap():
+    """上限必须与 `build_dataset.compute_game_weight` 的夹持对齐。
+
+    两处各写一个数就会静默漂移：数据那边放宽、loss 这边不放宽 => 超限值
+    又能溜进来；反过来则会把合法的高等级（KGS 15d = exp(8.5) = 4915）
+    当成垃圾替换掉。
+
+    默认值这条**走真函数**而不是比字面量 —— 曾经手写过
+    ``1.6487212653767486``，与 ``math.exp(0.5)`` 差在第 8 位，正是这类
+    「两处各写一个数」的漂移。
+    """
+    import math
+    from scripts.build_dataset import compute_game_weight
+    from src.networks.katago_v7_loss import W_WEIGHT_CEILING, W_WEIGHT_DEFAULT
+    assert W_WEIGHT_CEILING == math.exp(10.0)
+    # 解析失败的默认评级 10 => 必须与真函数逐位相同
+    assert compute_game_weight(10, 10) == W_WEIGHT_DEFAULT, (
+        compute_game_weight(10, 10), W_WEIGHT_DEFAULT)
+    # 真实合法上限（KGS 15d = 170）必须**不受**上限影响
+    assert compute_game_weight(170, 170) < W_WEIGHT_CEILING
+    # 而重建后那档垃圾（抓到 123456 这种数字）会恰好落在上限上
+    assert compute_game_weight(1234560, 10) == W_WEIGHT_CEILING, \
+        '数据侧夹持的值必须仍等于 loss 侧上限（否则两端会静默分叉）'
+
+
+def test_oversized_weight_does_not_overflow_the_product():
+    """**有限但巨大**的权重会自己把 `p * w` 撑成 inf —— 只挡 inf 不够。
+
+    实测 `p=5, w=1e38 -> inf`（fp32 上限 3.4e38）。`score_stdev` 的 huber
+    输出只要差量超过约 8.25 就到 p=3.4，与 1e38 相乘即溢出。
+    """
+    from src.networks.katago_v7_loss import _weighted_mean, W_WEIGHT_DEFAULT
+    w = torch.tensor([1.65, 1.0018e38, 1.65])
+    p = torch.tensor([0.001, 5.0, 0.001], requires_grad=True)
     probe = {}
-    p = torch.tensor([0.5, 0.7, 0.9], requires_grad=True)
     out = _weighted_mean(p, w, probe, 'score_stdev')
-    assert torch.isfinite(out), out
-    # 净化必须**留下证据**：不报就成了「悄悄把坏数据吞掉」
-    assert probe.get('score_stdev:w_inf') == 1, probe
+    assert torch.isfinite(out), out          # 修复前这里是 inf
+    assert probe.get('score_stdev:w_bad') == 1, probe
     out.backward()
     assert torch.isfinite(p.grad).all(), p.grad
-    # 被摘掉的那行梯度恰好 0 —— 是 0 **不是** NaN，这正是本测试的判据
-    assert float(p.grad[1]) == 0.0, p.grad
+    # 坏权重被换成了默认值，所以这一行仍然**有**有限的梯度（不是被摘掉）
+    assert float(p.grad[1]) != 0.0, p.grad
+    assert W_WEIGHT_DEFAULT < 1e4
 
 
-def test_inf_game_weight_leaves_every_parameter_gradient_finite():
-    """真机签名的端到端回归：`game_weight` 里有 inf，全模型梯度仍须有限。
+def test_bad_game_weight_leaves_every_parameter_gradient_finite():
+    """真机签名的端到端回归：`game_weight` 坏，全模型梯度仍须有限。
 
     真机症状是**每个**参数都 NaN（5,562,121 / 5,562,121，连 `stem` 都是）——
-    因为 NaN 从 `score_stdev` 进 value head，再经 trunk 污染全部分支。
+    因为 NaN 从 `score_stdev` 进 value head、再经 trunk 污染全部分支。
     所以这里数的不是「某个头」，而是 `named_parameters()` 的**全集**。
     """
     from train_sft import build_v7_stage1_loss
     from src.networks.katago_v7 import build_katago_v7_net
     net = build_katago_v7_net(board_size=19)
     lf = build_v7_stage1_loss(action_size=A)
-    sp = torch.randn(B, 22, 19, 19)
-    gl = torch.randn(B, 19)
-    out = net(sp, gl)
+    out = net(torch.randn(B, 22, 19, 19), torch.randn(B, 19))
     lbl = _lbl()
     lbl['ownership'] = torch.zeros(B, 1, 19, 19)
     lbl['seki'] = torch.zeros(B, 1, 19, 19)
     lbl['futurepos'] = -torch.ones(B, 2, 361)
-    lbl['game_weight'] = torch.tensor([1.0, float('inf'), 2.0, 1.5])
+    lbl['game_weight'] = torch.tensor(
+        [1.0, float('inf'), 1.0018e38, 1.5])
     r = lf(out, lbl)
     assert torch.isfinite(r['loss']), '前向应保持有限'
-    # 证据不能因为「已修好」就消失：inf 权重的行数必须报出来
-    assert r['sanitized_rows'].get('score_stdev:w_inf') == 1, r['sanitized_rows']
+    # 证据不能因为「已修好」就消失：坏权重的行数必须报出来
+    assert r['sanitized_rows'].get('score_stdev:w_bad') == 2, r['sanitized_rows']
     assert r['nonfinite_terms'] == [], r['nonfinite_terms']
     r['loss'].backward()
     bad = [n for n, p in net.named_parameters()
            if p.grad is not None and not bool(torch.isfinite(p.grad).all())]
-    assert not bad, 'game_weight 里的 inf 污染了梯度：%s' % bad[:8]
+    assert not bad, 'game_weight 坏值污染了梯度：%s' % bad[:8]
 
 
 def test_zero_coefficient_guard_still_keeps_the_graph():

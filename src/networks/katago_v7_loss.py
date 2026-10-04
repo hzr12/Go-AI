@@ -118,6 +118,19 @@ SEKI_EMA_MOMENTUM = 0.99
 #: 真实模型里 842 桶恰好等概率是零测度，所以这层是兜底，不是已观测到的故障。
 SCORE_STDEV_TARGET_FLOOR = 1e-3
 
+#: 行权重的上界 = ``exp(10)``，与 ``build_dataset.compute_game_weight`` 的指数
+#: 夹持**同一个数**（那边把 ``exp`` 的指数夹在 10 ⇒ 权重 ≤ exp(10)）。任何超过
+#: 它的值都只可能是 ``parse_player_rating`` 抓到了垃圾数字 —— 真实上限是
+#: 9d → ``exp(5.5)=244``、KGS 15d → ``exp(8.5)=4915``，全都远在此之下。
+#: **用 `math.exp` 现算、不写字面量**：手写的值与 `math.exp` 差过一次
+#: （1.6487212653767486 vs 1.6487212707001282），被
+#: ``test_weight_ceiling_matches_the_data_build_cap`` 抓出来过。
+W_WEIGHT_CEILING = math.exp(10.0)
+
+#: 评级解析失败时的默认权重 = ``exp(0.5)``：``parse_player_rating`` 解析不出
+#: 时返回默认 rating 10，``compute_game_weight(10, 10)`` 正是这个值。
+W_WEIGHT_DEFAULT = math.exp(0.5)
+
 
 def huber(pred, target, beta):
     """Huber，口径与 `train_sft.huber_loss` **逐位一致**（= `smooth_l1`）。
@@ -233,11 +246,17 @@ def _weighted_mean(per_sample, weight, probe=None, tag=''):
        变成 NaN ⇒ 系数非 0 的主目标也会被一行坏数据带崩。
        典型触发：`game_weight==0` 的行 + 该行的 `per_sample` 溢出。
 
-     **`w` 自己也可能是 `inf`** —— 这是真机 NaN 的**源头**（2026-10-04 定位）：
+     **`w` 自己也可能坏（非有限，或大得离谱）** —— 这是真机 NaN 的**源头**
+       （2026-10-04 定位）。
 
-       实测 ``data/sgf_19x19_full.npz`` 的 ``game_weights`` 有
-       **2,072,682 / 34,202,713 = 6.06% 是 inf**（其余浮点列全干净）。
-       来源是 ``build_dataset.compute_game_weight`` 的 ``np.exp(avg/20)``：
+       实测 ``data/sgf_19x19_full.npz`` 的 ``game_weights`` 有两档垃圾
+       （其余浮点列全干净）：
+
+       * ``inf`` —— 2,072,682 行 ⇒ 反向 ``0 * inf = NaN``
+       * 有限但 ``> exp(10)``（最大 1.0018e38）—— 74,244 行 ⇒
+         ``p * w`` 自己溢出成 ``inf``
+
+       来源都是 ``build_dataset.compute_game_weight`` 的 ``np.exp(avg/20)``：
        ``parse_player_rating`` 的正则 ``(\d+)([dk])`` 会从棋手名里抓到荒谬的
        大数（如 ``KGS:123456``）⇒ ``exp(61729)`` = inf。
 
@@ -255,25 +274,31 @@ def _weighted_mean(per_sample, weight, probe=None, tag=''):
        进 value head、再经 trunk 污染**全部**参数 —— 真机实测
        5,562,121 / 5,562,121（连 ``stem`` 都是），与这条链完全吻合。
 
-       ⇒ 无穷权重在任何口径下都没有意义，按 ``w==0`` 同一条语义把它摘掉。
+       ⇒ 坏权重一律**替换为默认权重**（:data:`W_WEIGHT_DEFAULT`），不是夹到
+       上限、也不是摘掉：夹到 ``exp(10)`` 会让这些行拿到 13000× 于正常行的
+       权重、反而**主导**整项；摘掉等于白丢 6% 的数据。而按「评级解析失败 →
+       默认评级」给值才是如实 —— 这些行的评级本来就是解析失败。
 
     Args:
         probe: 可选的诊断累加器（``{项名: 被净化的行数}``）。**净化是静默的**
             —— 不记下来就成了「这一项坏了但没人知道」，而段 1 有 9 项系数为 0，
             它们坏掉时对总 loss 毫无影响，正因如此更需要把线索报出来。
-            非有限权重记在 ``'{项名}:w_inf'`` 下，与 ``w==0`` 那条分开报。
+            坏权重记在 ``'{项名}:w_bad'`` 下，与 ``w==0`` 那条分开报。
     """
     if weight is None:
         return per_sample.mean()
     p = per_sample.reshape(-1)
     w = weight.reshape(-1)
-    bad_w = ~torch.isfinite(w)
+    bad_w = ~torch.isfinite(w) | (w > W_WEIGHT_CEILING)
     if bool(bad_w.any()):
         if probe is not None:
-            probe[tag + ':w_inf'] = int(bad_w.sum())
-        # 摘掉后这些行的 w 恒为 0 ⇒ 与 w==0 走同一条路（p 也会被下方的
-        # `where` 净化），于是 `p * w` 与它的反向都落在有限值上。
-        w = w.masked_fill(bad_w, 0.0)
+            probe[tag + ':w_bad'] = int(bad_w.sum())
+        # 替换成**有限**的默认值即可同时满足两头：
+        #   前向：`p * w` 不再溢出；
+        #   反向：`grad_p = grad_v * w` 里 w 有限 ⇒ 与 grad_v=0 相乘得 0，
+        #         不再是 `0 * inf = NaN`。
+        # w 是标签（requires_grad=False），改它不引入任何梯度。
+        w = torch.where(bad_w, torch.full_like(w, W_WEIGHT_DEFAULT), w)
     zero = (w == 0)
     if bool(zero.any()):
         clean = torch.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
