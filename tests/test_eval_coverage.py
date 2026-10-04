@@ -31,6 +31,7 @@ import argparse
 import ast
 import inspect
 import os
+import pathlib
 import re
 import sys
 import textwrap
@@ -161,6 +162,36 @@ def _build_parser():
             ast.copy_location(expr, node)
             exec(compile(expr, '<train_sft argparse>', 'eval'), scope)
     return ap
+
+
+def test_v7_shard_dir_in_run_txt_matches_the_converter_output():
+    """🔴 run.txt 里的 C 段 `--data` 必须**就是**转换器的输出目录。
+
+    2026-10-04 踩过：转换器把 8 个分片写在 `data/` 根下，而 C 段命令写的是
+    `--data data/stdata_v7`（那个目录**从来不存在**）⇒ 命令一跑就报
+    「既不是文件也不是目录」。
+
+    而它不能简单改成 `--data data`：`resolve_shards` 对目录是
+    「收集其中所有 `*.npz`」，而 `data/` 根下还有 `sgf_19x19_full.npz`
+    和 `labels/`，会把它们也当分片 ⇒ `V7PackedDataset._check_layout` 当场报错。
+
+    ⇒ 约定：**分片落在 `data/stdata/` 这个专用目录里**，转换器 `--out` 给
+    `data/stdata/stdata_v7.npz`，C 段 `--data data/stdata`。
+    """
+    txt = (pathlib.Path(ROOT) / 'run.txt').read_text(encoding='utf-8')
+    assert '--out data/stdata/stdata_v7.npz' in txt, \
+        '转换器 --out 应指向 data/stdata/ 目录内'
+    for ln in txt.splitlines():
+        if '--data data/stdata' in ln:
+            assert '--data data/stdata_v7' not in ln, \
+                f'C 段仍指向不存在的目录：{ln.strip()}'
+    # 真实存在的那个目录必须只含分片（否则 resolve_shards 会把别的 npz 也收进来）
+    d = pathlib.Path(ROOT) / 'data' / 'stdata'
+    if d.is_dir():
+        others = [p.name for p in d.iterdir()
+                  if p.is_file() and p.suffix == '.npz'
+                  and not p.name.startswith('stdata_v7_s')]
+        assert not others, f'data/stdata 下混进了非分片 npz：{others}'
 
 
 def test_eval_max_batches_flag_parses():

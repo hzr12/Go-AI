@@ -4417,6 +4417,10 @@ def main():
         #   所以「跳过占比」的分母恒 ≥ 分子。此前分母用的是 `step`，而它在 47 行
         #   之后才自增 ⇒ 连续溢出时会算出 133.33% 这种 > 100% 的荒谬比例。
         _n_attempted = 0
+        # 🔴 因跳步而**没有**推进 LR 计划的次数（见下面 scheduler.step 的门控）。
+        #   单独计数而不是复用 `_n_skipped`：后者是「GradScaler 跳了」，
+        #   两者当前恒等，但语义不同（AMP 关掉时前者会大于后者）。
+        _n_lr_frozen = 0
         # ---- SwanLab 上报用的「跨 micro-batch 沿用」量 ----
         # grad_norm 每个 optimizer.step() 只有一个值（clip_grad_norm_ 的返回值，
         # 在 unscale_ 之后取才是真值），而上报是每 micro-batch 打一次点 ⇒ 必须
@@ -4580,7 +4584,14 @@ def main():
                     value_loss = _w['value'] + _w['futurepos']
                     l2_report = compute_l2_report(optimizer.param_groups)
                     log_loss = opt_loss + l2_report
-                    _v7_terms_last = {k: float(x) for k, x in _w.items()}
+                    # ⚠ 必须 `.detach()`：`weighted` 的值是**带计算图**的张量，直接
+                    #   `float(x)` 每步都会触发一次
+                    #   `UserWarning: Converting a tensor with requires_grad=True
+                    #   to a scalar`（真机日志里每步刷一次），而且它走的是
+                    #   `Tensor.__float__` 的同步路径 —— 这是**打点路径**，
+                    #   不该为它付一次 D2H。值本身与 detach 无关（同一份数据）。
+                    _v7_terms_last = {k: float(x.detach())
+                                      for k, x in _w.items()}
                     # 🔴 哪一项算坏了，**当场点名**（2026-10-04 云端 910A 实跑）。
                     #   那个 run 的症状是「每步都溢出、loss 全 NaN、缩放值降到 160
                     #   仍 100% 跳过」，本地 fp32/fp16/bf16 都复现不出来 ⇒ 只有
@@ -4738,7 +4749,14 @@ def main():
                         torch.as_tensor(_grad_norm_last)))
                     scaler.step(optimizer)
                     scaler.update()
-                    if use_scaler and scaler.get_scale() < _scale_now:
+                    # 🔴 `scaler.step()` 在检出 inf 时**内部跳过**
+                    #   `optimizer.step()`，但对调用方是「成功返回」的 ⇒
+                    #   必须靠缩放值是否下降来判「这一步到底有没有生效」。
+                    #   `GradScaler` 只在**跳步**时降 scale（成功时它只等
+                    #   `growth_interval` 到才 ×2），所以这个判据是可靠的。
+                    _real_step = not (use_scaler
+                                      and scaler.get_scale() < _scale_now)
+                    if not _real_step:
                         _n_skipped += 1
                         # 🔴 溢出诊断必须**只在 rank0 打**（2026-10-04 云端实跑）：
                         #   这一段原本无条件 `logger.warning` + `_locate_overflow`，
@@ -4769,7 +4787,12 @@ def main():
                                     100.0 * _n_skipped
                                     / max(1, _n_attempted))
                     optimizer.zero_grad(set_to_none=True)
-                    if ema is not None:
+                    # 🔴 EMA 与 scheduler 同理：**跳过的步权重一动没动**，
+                    #   此时 `ema.update()` 会把 shadow 朝当前权重多拉一次
+                    #   （step 计数也照样 +1）⇒ EMA 的时间常数被"跳步"稀释，
+                    #   而 eval 又是在 EMA shadow 上评的（`eval_used_ema`）。
+                    #   100% 跳步时 shadow 会一路收敛到**初始权重**。
+                    if ema is not None and _real_step:
                         ema.update()
             except Exception as oom_exc:
                 # 同时捕获 CUDA 与 NPU 的 OOM（两后端异常类型不同）
@@ -4806,7 +4829,19 @@ def main():
                 logger.error("=" * 60)
                 sys.exit(1)
             if (i + 1) % _accum_steps == 0 or (i + 1) == n_batches:
-                scheduler.step()   # 每个 optimizer step 推进一步
+                if _real_step:
+                    scheduler.step()
+                else:
+                    # 🔴 **跳过的步不许推进 LR 计划**（2026-10-04 云端 910A 实跑）。
+                    #   `scaler.step()` 在检出 inf 时**内部跳过** `optimizer.step()`，
+                    #   但它对调用方是「成功返回」的 ⇒ 无条件 `scheduler.step()`
+                    #   会让 warmup/cosine 在**权重一动没动**的步上照样前进。
+                    #   实测那个 run 每步都被跳过 ⇒ 558 步的 warmup 被 0 次
+                    #   学习消耗掉，等于训练一开始就拿到一个已经退火的 LR。
+                    #   而且 PyTorch 会为此打
+                    #   `Detected call of lr_scheduler.step() before optimizer.step()`
+                    #   —— 那个警告**就是在说这件事**，之前被当成噪音忽略了。
+                    _n_lr_frozen += 1
             step += 1
 
             # 打点：stdout 与 SwanLab 频率解耦，且共用同一次设备同步。

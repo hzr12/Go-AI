@@ -123,6 +123,58 @@ def test_skip_rate_denominator_cannot_exceed_100():
         '两者必须在同一次 scaler.unscale_ 的紧邻前后自增（同一个 step 块内）'
 
 
+def test_scheduler_and_ema_do_not_advance_on_skipped_steps():
+    """🔴 跳过的步**不许**推进 LR 计划与 EMA。
+
+    `scaler.step()` 在检出 inf 时**内部跳过** `optimizer.step()`，但对调用方
+    是「成功返回」的 ⇒ 无条件 `scheduler.step()` 会让 warmup/cosine 在
+    **权重一动没动**的步上照样前进。
+
+    实测（云端 910A）：那个 run 每步都被跳过 ⇒ 558 步的 warmup 被 **0 次学习**
+    消耗掉，等于训练一开始就拿到一个已经退火的 LR。PyTorch 为此打的
+    `Detected call of lr_scheduler.step() before optimizer.step()` 警告
+    **正是在说这件事**，之前被当噪音忽略了。
+
+    EMA 同理：`ema.update()` 会把 shadow 朝当前权重多拉一次且 step 计数 +1，
+    而 eval 是在 EMA shadow 上评的（`eval_used_ema`）⇒ 100% 跳步时 shadow
+    会一路收敛到**初始权重**。
+    """
+    assert '_real_step = not (use_scaler' in SRC, \
+        '必须由缩放值是否下降判「这一步有没有真的生效」'
+    assert 'if _real_step:\n                    scheduler.step()' in SRC, \
+        'scheduler.step() 必须在 _real_step 门控内'
+    assert 'if ema is not None and _real_step:' in SRC, \
+        'ema.update() 必须在 _real_step 门控内'
+    assert '_n_lr_frozen += 1' in SRC, \
+        '跳过的步要单独计数（否则「LR 计划被空跑」这件事不可见）'
+
+
+def test_real_step_is_derived_from_scale_not_from_grads():
+    """⚠ 判据必须是「缩放值是否下降」，不能改成「扫梯度是否有限」。
+
+    `GradScaler` **只在跳步时**降 scale（成功时它只等 `growth_interval` 到才 ×2），
+    所以缩放值是 O(1) 的可靠信号；而扫 5.5M 个参数判有限性要在打点路径上
+    付一次全量 D2H —— 那正是本文件多处注释在避免的事。
+    """
+    seg = SRC[SRC.index('_real_step = not (use_scaler'):][:200]
+    assert 'get_scale() < _scale_now' in seg, seg
+    assert 'isfinite' not in seg, '不应在打点路径上扫梯度有限性'
+
+
+def test_terms_float_call_detaches_before_synchronising():
+    """⚠ 逐项 loss 取标量必须 `.detach()`。
+
+    `weighted` 的值是**带计算图**的张量，`float(x)` 每步触发一次
+    `UserWarning: Converting a tensor with requires_grad=True to a scalar`
+    （真机日志里每步刷一次），而且走的是 `Tensor.__float__` 的同步路径 ——
+    这是**打点路径**，不该为它付一次 D2H。
+    """
+    assert '_v7_terms_last = {k: float(x.detach())' in SRC, \
+        '逐项标量必须先 detach 再 float'
+    assert '_v7_terms_last = {k: float(x) for' not in SRC, \
+        '未 detach 的 float(x) 每步都会触发 requires_grad 警告'
+
+
 def test_overflow_diagnostics_are_rank0_only():
     """🔴 溢出诊断必须 `is_main` 门控。
 
@@ -130,8 +182,9 @@ def test_overflow_diagnostics_are_rank0_only():
     `_locate_overflow` 的后果。4 卡就是 4 份一模一样的文本，反而掩盖了
     「rank0 先炸」这个真正有用的信息。
     """
-    i = SRC.index('if use_scaler and scaler.get_scale() < _scale_now:')
-    blk = SRC[i:i + 1200]
+    # 判据随实现演进：现在是「算出 _real_step 之后，只在 not _real_step 时诊断」
+    i = SRC.index('_real_step = not (use_scaler')
+    blk = SRC[i:i + 2000]
     assert 'if is_main:' in blk, '溢出诊断未做 rank0 门控'
     # _locate_overflow 必须在门控之内
     assert blk.index('if is_main:') < blk.index('_locate_overflow('), \

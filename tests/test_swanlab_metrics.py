@@ -518,8 +518,14 @@ def test_terms_prefix_keeps_stdout_reading_bare_names():
 
     共用会把 stdout 变成 `loss_v7/policy=5.88`，而文档与测试都按裸名读它。
     """
-    assert "_v7_terms_last = {k: float(x) for k, x in _w.items()}" in MAIN, \
+    # ⚠ 键名仍是**裸 term 名**（不带 `loss_v7/` 前缀）—— stdout 那行按裸名排版。
+    #   `.detach()` 是 2026-10-04 加的：`weighted` 的值带计算图，`float(x)`
+    #   每步触发一次 requires_grad 警告 + 一次多余的 D2H 同步。
+    assert "_v7_terms_last = {k: float(x.detach())" in MAIN, \
         'stdout 用的裸名 dict 形状被改动'
+    # 反向：stdout 那处**不能**带前缀
+    _seg = MAIN.split('_v7_terms_last')[1][:200]
+    assert 'loss_v7/' not in _seg, 'stdout 的裸名 dict 里混进了上报前缀'
     assert "'%s=%.4f' % (k, v) for k, v in _v7_terms_last.items()" in MAIN
 
 

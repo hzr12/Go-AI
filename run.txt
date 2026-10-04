@@ -44,16 +44,25 @@ python scripts/build_soft_index.py --data data/sgf_19x19_full.npz --labels data/
 # ---------- 3c. 🔴 V7 分片（22 通道 V7 训练的唯一数据源）----------
 # 🔴 **V7 不能用 data/sgf_19x19_full.npz**（3420 万行那条路）：
 #    它**没有** ownership / futurepos / scoring / seki / scorebelief 标签，
-#    而 futurepos 是段 1 四个主目标之一。V7 只能吃本步产出的分片。
-#    代价：3,132,287 行 = 语料的 **9%**（取舍见文末「已知取舍」）。
-python scripts/stdata_to_npz.py --out data/stdata_v7.npz --num-shards 8 --convert-all
+#    而 futurepos 是段 A 四个主目标之一。V7 只能吃本步产出的分片。
+#    `--convert-all` 会纳入**全部三个** stdata 归档（2026-08-25 / 2026-07-30 /
+#    zzb28c512nfd4），实测合计 3,132,287 行 = 语料的 9%。
+# ⚠ 输出目录必须与 C 段 `--data` 一致：**分片要落在 `data/stdata/` 这个目录里**，
+#   而不是散在 `data/` 根 —— `resolve_shards` 对目录是「收集其中所有 *.npz」，
+#   根目录里还有 sgf_19x19_full.npz 与 labels/，会把它们也当分片。
+python scripts/stdata_to_npz.py --out data/stdata/stdata_v7.npz --num-shards 8 --convert-all
 # ⚠ **跑完必须验这一项**，它是 2026-10-04 踩过的坑：三处硬编码键表漏改会**静默丢标签**
 #   （不报错、形状全对、训练照跑，只是那一项 loss 永远没标签）：
-#   python -c "import numpy as np; z=np.load('data/stdata_v7_s0.npz',allow_pickle=True); \
+#   python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pickle=True); \
 #     assert 'var_time_left' in z.files, '缺 var_time_left：转换器没写'; \
 #     v=z['var_time_left']; print(v.shape, '非零率 %.1f%%'%(100*(abs(v)>1e-9).mean()))"
 #   期望：非零率 ~100%，量级 5~20（KataGo 典型值）
 # ⚠ 支持断点续做（已完成的分片自动跳过），中断后重跑同一条命令即可
+# ⚠ **内存**：`V7PackedDataset` 把给定目录下的分片**整个读进内存**（不做 mmap），
+#   实测单片 4.70 GB（`score_distr` 1.32 GB + `futurepos` 1.13 GB +
+#   ownership/scoring/seki 各 0.57 GB 占了大头）⇒ **8 片合计 37.6 GB**。
+#   本机（≈6.8 GB 可用）**装不下全量**：C 段要么单片跑，要么另做一个
+#   按 `--shard-id` 分组的子目录。`tmp/coding/c64/` 里有一份 64 行切片可先跑通路。
 
 # ---------- 4. 训练 ----------
 # 4a 冒烟测试（12 通道）：结构 flag **已压缩归档**，别再从 run.txt 里改结构。
@@ -64,7 +73,7 @@ python scripts/train_sft.py --data data/sgf_19x19_full.npz --device cpu --board-
 # 4b V7 冒烟测试（小样本，确认 loss 每项都在动）：约 40 秒 / batch 8 / CPU
 python scripts/smoke_train_v7.py --files 40 --rows 256 --batch 8 --steps 40 --device cpu
 # 4c V7 真实数据冒烟（可直接读 V7 分片，验证加载器 + eval + early-stop 全链路）：
-python scripts/train_sft.py --data data/stdata_v7 --v7 1 --device cpu \
+python scripts/train_sft.py --data data/stdata --v7 1 --device cpu \
   --batch-size 16 --epochs 1 --prefetch-workers 0 \
   --eval-every 16 --early-stop 1 --early-stop-patience 2 \
   --out tmp/v7_smoke.pth --log-every 8
@@ -92,7 +101,7 @@ python scripts/train_sft.py --data data/stdata_v7 --v7 1 --device cpu \
 #
 #   A/B 段：12 通道（`KATAGO_SE_CFG`，9,112,005 参数）—— 吃 `sgf_19x19_full.npz`
 #           + 可选 `soft_index.npz`。policy 目标 = 人类着法 one-hot（B 段命中行走软 CE）
-#   C 段  ：22 通道（`katago_v7.py`，5,562,121 参数）—— 吃 `data/stdata_v7` 分片。
+#   C 段  ：22 通道（`katago_v7.py`，5,562,121 参数）—— 吃 `data/stdata/` 分片。
 #           policy 目标 = KataGo 搜索分布的**软标签**（分片里 `policy_player_prob`）
 #
 #   两者 stem 形状不同，`load_state_dict` 会直接 RuntimeError（不是静默错位）。
@@ -238,7 +247,7 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
   --out models/b_v7_npu4.pth --swanlab 1 --ver b_v7_npu4 --swanlab-every 10
 
 # --- C 段：+ KataGo 原生数据（同模型，承接 B）--------------------------------
-# 数据：data/stdata_v7 分片（第 3c 步产出）。
+# 数据：data/stdata/ 分片（第 3c 步产出，8 片 / 3,132,287 行）。
 #   另：`sv3[3] varTimeLeft`（col22）在这里是真训练的；`sv3[4:6] shortterm`
 #   官方 stdata 无对应列 ⇒ 权重恒 0（见文末「已知限制」）。
 # ✅ 段 1 四个主目标：policy（软 CE）/ π_opp（软 CE）/ value / futurepos
@@ -246,7 +255,7 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
 
 # --- C-1  单卡 910A（batch 2800，LR 0.00377）--- ✅ 已用 64 行分片实测跑通
 torchrun --nproc_per_node=1 scripts/train_sft.py \
-  --data data/stdata_v7 --v7 1 --device npu --board-size 19 \
+  --data data/stdata --v7 1 --device npu --board-size 19 \
   --model models/b_v7_npu4.pth.latest \
   --policy-loss soft_ce --soft-weight 1.0 \
   --batch-size 2800 --epochs 1 --lr 0.00377 --weight-decay 0.0001 \
@@ -259,7 +268,7 @@ torchrun --nproc_per_node=1 scripts/train_sft.py \
 
 # --- C-2  2 卡 910A（每卡 2800，accum 1 ⇒ 有效 5600，LR 0.00533）---
 torchrun --nproc_per_node=2 scripts/train_sft.py \
-  --data data/stdata_v7 --v7 1 --device npu --board-size 19 \
+  --data data/stdata --v7 1 --device npu --board-size 19 \
   --model models/b_v7_npu4.pth.latest \
   --policy-loss soft_ce --soft-weight 1.0 \
   --batch-size 2800 --epochs 1 --lr 0.00533 --weight-decay 0.0001 \
@@ -272,7 +281,7 @@ torchrun --nproc_per_node=2 scripts/train_sft.py \
 
 # --- C-3  4 卡 910A（每卡 1000，accum 2 ⇒ 有效 8000，LR 0.00637）---
 torchrun --nproc_per_node=4 scripts/train_sft.py \
-  --data data/stdata_v7 --v7 1 --device npu --board-size 19 \
+  --data data/stdata --v7 1 --device npu --board-size 19 \
   --model models/b_v7_npu4.pth.latest \
   --policy-loss soft_ce --soft-weight 1.0 \
   --batch-size 1000 --epochs 1 --lr 0.00637 --weight-decay 0.0001 \
