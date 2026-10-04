@@ -501,6 +501,11 @@ def output_spec(policy_topk=POLICY_TOPK, keep_qvalue=False):
         ('score', np.float32, ()),
         ('score_mean_hint', np.float32, ()),
         ('lead_hint', np.float32, ()),
+        # 🔴 varTimeLeft（官方 sv3Mul 六通道的下标 3）。语义见
+        #   `katago_npz.COL_VAR_TIME_LEFT`（trainingwrite.cpp:603-616 定案）。
+        #   ⚠ 这三处**硬编码列表**（SPEC / chunk / 前向补齐）必须同步改 ——
+        #   落盘键不是从 labels dict 推导的，漏改任何一处都静默丢标签。
+        ('var_time_left', np.float32, ()),
         ('komi', np.float32, ()),
         ('game_weight', np.float32, ()),
         # ---- 平面目标 ----
@@ -571,6 +576,7 @@ def labels_to_chunk(labels, spatial_packed, policy_all, idx, source_id,
         'score': labels['score'],
         'score_mean_hint': labels['score_mean_hint'],
         'lead_hint': labels['lead_hint'],
+        'var_time_left': labels['var_time_left'],
         'komi': labels['komi'],
         'game_weight': labels['game_weight'],
         'score_distr': labels['score_distr'],
@@ -860,6 +866,7 @@ def npz_to_v7_labels(z, unpack=True):
         'score': z['score'],
         'score_mean_hint': z['score_mean_hint'],
         'lead_hint': z['lead_hint'],
+        'var_time_left': z['var_time_left'],
         'komi': z['komi'],
         'score_distr': z['score_distr'],
         'ownership': z['ownership'],
