@@ -614,6 +614,124 @@ def build_katago_v7_net(*, board_size=V7_BOARD_SIZE, use_checkpoint=1,
 # ---- V7 的特征装配（纯 numpy，可在预取 worker 里跑）------------------------
 #
 # --------------------------------------------------------------------------- #
+# V7 显存预检（2026-10-04 云端 910A：batch 3000 ⇒ 64 GB）
+# --------------------------------------------------------------------------- #
+#: V7 反向时**驻留**的激活，实测值（`saved_tensors_hooks`，B=16、fp32、本机 CPU）。
+#: 来源：`tmp` 里的量法 —— 用 `torch.autograd.graph.saved_tensors_hooks` 统计反向
+#: 真正被 autograd 存下来的张量字节，这才是决定峰值的那一份。
+#: 换算到 fp16（÷2）。
+V7_RESIDENT_MB_PER_SAMPLE = {
+    # 无 checkpoint：22 层注意力各存一份 (B,H,361,361)
+    False: 277.0,
+    # block 级 checkpoint：只留 block 输入；本机实测 6.9 MB/样本（40×）
+    True: 6.9,
+}
+
+#: 有 block checkpoint 时，**重算**单个 block 期间的瞬时峰值（fp16）。
+#: 一个 block 含 `num_inner_blocks`=2 个注意力，各 6 块 query 分块 ⇒
+#: 2 × (B,4,64,361) fp16 ≈ 0.55 MB/样本。量级远小于驻留量，但决定峰值上界。
+V7_TRANSIENT_MB_PER_SAMPLE_FP16 = 1.2
+
+
+def v7_peak_activation_bytes(batch, *, n_layers, heads, tokens, elem_size=2):
+    """V7 每层的注意力矩阵总字节（``(B, heads, T, T)``）。
+
+    这是**无 checkpoint** 口径：每样本每层 ``heads × T × T × elem_size``。
+
+     假设**完整注意力**（V7 的 `MHSA` 确实如此）：若将来给它加了窗口，
+       这个估算会**高估**，届时必须改成 ``T_window``。高估的方向是安全的
+       （宁可少报 batch 也不要 OOM 一次）。
+    """
+    return int(batch) * int(n_layers) * int(heads) * int(tokens) ** 2 * int(elem_size)
+
+
+def _device_total_bytes(device):
+    """设备显存总量（字节）；查不到返回 ``None``（宁可不知道，不要瞎猜）。"""
+    try:
+        t = str(device)
+        if t.startswith('npu'):
+            import torch_npu  # noqa: F401
+            return int(torch.npu.get_device_properties(
+                torch.npu.current_device()).total_memory)
+        if t.startswith('cuda'):
+            return int(torch.cuda.get_device_properties(
+                torch.cuda.current_device()).total_memory)
+    except Exception:  # noqa: BLE001 — 查不到就当没有，别因此拦住训练
+        return None
+    return None
+
+
+def v7_batch_memory_advice(args, logger, device, *, n_layers, heads, tokens,
+                           use_checkpoint=True):
+    """按 `--max-gpu-memory` 检查 V7 的 batch；明显超了就**启动前**报错。
+
+    为什么不等到 OOM：真机上 OOM 发生在第一个 batch 反向之后，那时已经白跑了
+    数据加载、模型构建、CANN 初始化（实测几分钟），而且 OOM 报的是
+    `OutOfMemoryError` 这种**看不出原因**的异常 —— 而原因其实只是一行乘法。
+
+     **checkpoint 感知**：开/关 block 级梯度检查点差 **40×**
+       （实测 6.9 vs 277.1 MB/样本）。而实测云端 910A 上 batch 3000 用了
+       **64 GB**（≈ 21.3 MB/样本）—— 远大于「有 checkpoint」该有的量级，
+       强烈提示**那个后端上 block 级 checkpoint 没真正生效**。
+       所以这里把当前**实际配置**对应的每样本字节打出来，让人一眼看出处在
+       哪个区间，而不必靠猜。
+
+     只在能查到设备显存时启用。查不到（CPU / 未装 torch_npu）就只打印估算值，
+      不拦 —— 本地冒烟不该被这个门控挡住。
+    """
+    ckpt = bool(use_checkpoint)
+    if ckpt:
+        # 驻留（fp16）+ 重算瞬时
+        per_sample = (V7_RESIDENT_MB_PER_SAMPLE[True] / 2.0
+                      + V7_TRANSIENT_MB_PER_SAMPLE_FP16)
+        basis = ('block 级 checkpoint 开：驻留 %.1f + 瞬时 %.1f = %.1f MB/样本'
+                 % (V7_RESIDENT_MB_PER_SAMPLE[True] / 2.0,
+                    V7_TRANSIENT_MB_PER_SAMPLE_FP16, per_sample))
+    else:
+        attn_mb = (n_layers * heads * tokens * tokens * 2) / 1e6
+        per_sample = attn_mb + V7_TRANSIENT_MB_PER_SAMPLE_FP16
+        basis = ('block 级 checkpoint **关**：注意力 %d 层 × %.3f MB = %.1f MB/样本'
+                 % (n_layers, attn_mb, attn_mb))
+    attn = per_sample * args.batch_size * 1e6
+    total = _device_total_bytes(device)
+    logger.info("[mem] V7 显存：%d 层 × %d 头 × %d² token | %s"
+                " | batch=%d ⇒ 约 %.1f GB",
+                n_layers, heads, tokens, basis, args.batch_size, attn / 1e9)
+    if not ckpt:
+        logger.warning("[mem] block 级 checkpoint 没开 —— 这是 40× 的差距"
+                       "（277 vs 6.9 MB/样本）。它由 KATAGO_SE_CFG['grad_checkpoint']"
+                       "决定，且与 --compile / --npu-graph-compile 互斥。")
+    if total is None:
+        logger.info("[mem] 查不到设备显存总量 ⇒ 跳过 batch 预检"
+                    "（--max-gpu-memory 本次不生效）")
+        return
+    frac = float(getattr(args, 'max_gpu_memory', 0.9) or 0.0)
+    budget = total * (frac if 0.0 < frac <= 1.0 else 0.9)
+    ratio = attn / budget
+    if ratio > 1.0:
+        safe = max(1, int(args.batch_size / ratio))
+        raise SystemExit(
+            "V7 的 batch 放不进显存：\n"
+            "  估算       = %.1f GB（batch=%d，%s）\n"
+            "  可用预算   = %.1f GB（设备总量 %.1f GB × --max-gpu-memory %.2f）\n"
+            "  ⇒ 需要 --batch-size %d 以下\n"
+            " **调小 --attn-window 没用**：V7 的 MHSA 没有窗口参数"
+            "（该旗标只对 12 通道路径有意义，而它同样没接进建网）。\n"
+            " 也别指望 --gradient-accumulation-steps：它只改有效 batch，"
+            "不降**每卡**的瞬时显存。\n"
+            "  ⇒ 要更大的有效 batch，用 --gradient-accumulation-steps 配合"
+            "更小的 --batch-size。"
+            % (attn / 1e9, args.batch_size, basis,
+               budget / 1e9, total / 1e9, frac, safe))
+    if ratio > 0.8:
+        logger.warning("[mem] batch=%d 的估算已达预算的 %.0f%%"
+                       "（%.1f / %.1f GB）—— 非注意力部分与碎片可能让它 OOM，"
+                       "建议 --batch-size %d 以下",
+                       args.batch_size, 100 * ratio, attn / 1e9, budget / 1e9,
+                       max(1, int(args.batch_size / ratio)))
+
+
+# --------------------------------------------------------------------------- #
 # 局级 sidecar（spec §5.3）→ V7Dataset 的逐局贴目
 # --------------------------------------------------------------------------- #
 def _sidecar_kwargs(dataset, games_npz):
@@ -3795,6 +3913,13 @@ def main():
     # 只加在 math 分支（NPU 恒走 math），SDPA/flash 路径不受影响。
     _attn_chunk = int(os.environ.get('GOAI_ATTN_QUERY_CHUNK', '64') or 0)
     _backbone.set_attn_query_chunk(_attn_chunk)
+    # 逐 chunk 梯度检查点（2026-10-04 新增）：分块只降瞬时峰值，**不降保留量** ——
+    # 每块的 softmax 输出都被 autograd 存着等反向。逐块 checkpoint 把占大头的
+    # 注意力矩阵变成「反向时一块一块重算」，**不依赖 block 级 checkpoint 是否生效**
+    # （实测云端 910A 上 64 GB ≈ 无 checkpoint 的估算值）。
+    # 默认开；GOAI_ATTN_CHUNK_CKPT=0 关闭。
+    _chunk_ckpt = os.environ.get('GOAI_ATTN_CHUNK_CKPT', '1') != '0'
+    _backbone.set_attn_chunk_checkpoint(int(_chunk_ckpt))
 
     # flash-attn 独立库启用决策：仅「Ampere+ CUDA 且走非 math 路径」时尝试加载。
     # 加载失败自动回退内置 SDPA，不影响训练启动。
@@ -3912,6 +4037,15 @@ def main():
         )
         _v7_lossf = build_v7_stage1_loss(
             action_size=args.board_size * args.board_size + 1).to(device)
+        # 启动前就把注意力显存算清楚（batch 3000 ⇒ 68.8 GB，真机实测 64 GB）
+        if is_main:
+            from src.networks.katago_v7 import MHSA as _MHSA
+            _n_att = sum(1 for m in model.modules() if isinstance(m, _MHSA))
+            v7_batch_memory_advice(
+                args, logger, device, n_layers=_n_att,
+                heads=NBT_TF_CFG['num_heads'],
+                tokens=V7_BOARD_SIZE * V7_BOARD_SIZE,
+                use_checkpoint=bool(_gc))
     else:
         model, _eff_cfg = build_katago_se_net(
             action_size=args.board_size * args.board_size + 1,  # +1 为 pass 类别
@@ -4822,7 +4956,13 @@ def main():
                 logger.error("%s 显存不足 (OOM)！当前 --batch-size=%d 过大。",
                              device.upper(), bs)
                 logger.error("window 注意力在 19x19 上把 batch 展开为 B*361，显存增长很快。")
-                logger.error("建议减小 --batch-size（如 128/96/64），或调小 --attn-window。")
+                logger.error(
+                    "建议减小 --batch-size。%s",
+                    " **V7 不要指望 --attn-window**：它的 MHSA 没有窗口参数，"
+                    "该旗标对 V7 完全无效（显存全在 361² 的完整注意力矩阵上）。"
+                    "要更大的有效 batch 请用 --gradient-accumulation-steps。"
+                    if _v7_on else
+                    "12 通道可考虑同时调小 --attn-window。")
                 logger.error("已保存进度至 %s.latest(.train_state)，可用 --resume 续训。",
                              args.out)
                 logger.error("已清理显存并退出，请调整参数后重跑。")

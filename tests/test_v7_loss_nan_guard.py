@@ -260,23 +260,78 @@ def test_score_stdev_two_pass_matches_torch_std_in_fp32():
 
 
 def test_score_stdev_target_has_a_gradient_bounding_floor():
-    """ `std` 目标必须有**下界**，否则它的反向在 fp16 上溢。
+    """ `std` 目标挂一个数值下界，挡住方差**下溢成恰好 0** 的极端。
 
-    实测（本地 fp32）：初始化时 842 桶近均匀 ⇒ `std ≈ 1.17e-7`
-    ⇒ `d(sqrt(v))/dv = 1/(2·std) ≈ 4.27e6`，**远超 fp16 的 65504** ⇒ 反向
-    溢出成 inf；再乘「段 1 系数 0」这个上游梯度（**0**），`0 × inf = NaN`
-    ⇒ 全部参数梯度 NaN ⇒ 每步都被 GradScaler 跳过。
+    **它不是 fp16 溢出保护** —— 那个说法2026-10-04 被实测推翻了：曾认为
+    初始化时 `std ≈ 1.17e-7` ⇒ `d(sqrt v)/dv ≈ 4.27e6` 远超 fp16 的 65504，
+    再乘上游梯度 `0` 变NaN。实测不成立，见
+    `test_measured_stdev_target_gradient_stays_finite_and_small`：那个因子乘的是
+    `coeff/B ≈ 3.3e-7`，峰值只有 **1.53**。
 
-     这与前向的「灾难性抵消」是**两个独立**的问题：前向用两遍算法修好了，
-      但反向的 `1/(2·std)` 只能靠**下界**钉住 —— `clamp_min` 在下界以下是常数、
-      梯度恰好 0，从根上拿掉那个爆炸因子（而不是靠降学习率绕）。
+    剩下的真实理由只有一个：`v` 若**恰好**为 0，`sqrt` 的反向是 `1/(2·0) = inf`。
+    真实模型里 842桶恰好等概率是零测度，所以这层是兜底而非已观测到的故障 ——
+    留着的代价是零（不改任何口径），但**理由必须写对**，否则下一次会有人拿它
+    当「NaN 已修」的证据。
     """
     from src.networks.katago_v7_loss import SCORE_STDEV_TARGET_FLOOR
-    # 导数上界必须远低于 fp16 上限（留 100 倍余量）
-    assert 1.0 / (2.0 * SCORE_STDEV_TARGET_FLOOR) < 655.04, \
-        '下界太小，钉不住 1/(2·std)'
+    # 下界为正 ⇒ `v→0` 时梯度恒 0，`1/(2·0) = inf` 这个点被钉掉
+    assert SCORE_STDEV_TARGET_FLOOR > 0.0, SCORE_STDEV_TARGET_FLOOR
     # 且下界要远低于任何有意义的展度（预测初值约 13.9）
     assert SCORE_STDEV_TARGET_FLOOR < 1e-2, SCORE_STDEV_TARGET_FLOOR
+
+
+def test_measured_stdev_target_gradient_stays_finite_and_small():
+    """实测钉住：#7 目标侧的整条反向链**有限且量级很小**。
+
+    这条测试的作用是**防回归**，不是证明历史上出现过这个故障。曾经的诊断是
+    「`1/(2·std) ≈ 4.27e6` 在 fp16 上溢出成 inf，再乘上游 0 变 NaN」。本测试
+    按那个诊断的完整链路复刻（近均匀 logits → 两遍 std → Huber → 系数 →
+    反向），量得：
+
+    ================ ======================================
+    `dL/dstd`                3.33e-07
+    `dL/dv`（= 上者 × 1/(2·std)） **1.53**
+    `dL/dsb_logits`          2.40e-12
+    NaN / inf                无
+    ================ ======================================
+
+    峰值 1.53 离 fp16 上限 65504 差**四个数量级** ⇒ 那条诊断不成立，真机 NaN
+    的源头仍未定位（见 `forward` 里 `_bad_operands` 的操作数级归因）。
+
+    因此这里断言的是**实测数字**，而不是某个安全边际：将来谁把 `coeff` 调大
+    一两个数量级、或去掉 `detach` 让上游不再是常数，这条会立刻响。
+    """
+    import torch.nn.functional as F
+
+    b, bins, coeff, delta = 3000, 842, 1e-3, 10.0
+    g = torch.Generator().manual_seed(0)
+    logits = (torch.randn(b, bins, generator=g) * 1e-4).float().requires_grad_(True)
+    pred = torch.full((b,), 13.86).requires_grad_(True)   # softplus beta=1.0 的实测初值
+
+    p = F.softmax(logits, dim=-1)
+    mu = p.mean(dim=-1, keepdim=True)
+    v = (p - mu).pow(2).mean(dim=-1)
+    v.retain_grad()
+    std = v.sqrt()
+    std.retain_grad()
+
+    # 近均匀 ⇒ std 落在 1e-7 量级，正是「1/(2·std) 很大」的前提
+    assert float(std.min().detach()) < 1e-6, float(std.min().detach())
+
+    per_sample = F.smooth_l1_loss(pred, std, beta=delta, reduction='none')
+    total = coeff * per_sample.mean()
+    total.backward()
+
+    d_std = float(std.grad.abs().max())
+    d_v = float(v.grad.abs().max())
+    d_logits = float(logits.grad.abs().max())
+    assert d_std == pytest.approx(3.33e-07, rel=0.05), d_std
+    assert d_v == pytest.approx(1.53, rel=0.05), d_v
+    assert d_logits == pytest.approx(2.40e-12, rel=0.1), d_logits
+    # 核心断言：全程无inf / 无 NaN，且离 fp16 上限极远
+    assert not torch.isnan(logits.grad).any()
+    assert not torch.isinf(logits.grad).any()
+    assert d_v < 655.04 / 100.0, d_v
 
 
 def test_score_stdev_floor_actually_clamps_near_uniform_targets():
@@ -401,8 +456,11 @@ def test_huber_is_numerically_robust_at_stage1_magnitudes():
 
     实测：`huber` = `F.smooth_l1_loss`，前向在 pred=13.86…1e4 全有限
     （fp32 与 fp16 都试过），反向导数被 clip 到 ±1（有界）。
-    ⇒ 这一项的问题**不在 huber**，而在它**目标**那一侧：
-    `std(softmax)` 的反向 `1/(2·std)`，初始化时 ≈ 4.27e6 ⇒ fp16 溢出。
+    ⇒ 这一项的问题**不在 huber**。
+
+    （本docstring 曾把矛头指向目标侧的 `1/(2·std) ≈ 4.27e6`，那个说法已被
+    `test_measured_stdev_target_gradient_stays_finite_and_small` 实测推翻 ——
+    峰值 `dL/dv` 只有 1.53。**真机 NaN 的源头至今未定位。**）
     """
     import torch.nn.functional as F
     for pred in (13.86, 100.0, 1e3, 1e4):

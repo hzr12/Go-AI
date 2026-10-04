@@ -157,8 +157,9 @@ def main():
         _row('方差(两遍)', dev2, 'sqrt 前')
         _row('std 原始', std_raw, 'fp16 下溢成 0 的风险点')
         _row('std 下界后', std_clamped,
-             '下界 %g ⇒ 1/(2·std) ≤ %.0f'
-             % (SCORE_STDEV_TARGET_FLOOR, 1.0 / (2 * SCORE_STDEV_TARGET_FLOOR)))
+             '下界 %g ⇒ v→0 时梯度恒 0（不是 fp16 溢出保护，见 '
+             'test_measured_stdev_target_gradient_stays_finite_and_small）'
+             % (SCORE_STDEV_TARGET_FLOOR,))
     _row('预测 score_stdev', out_det.get('score_stdev'),
          '= 20·softplus(s[:,1], beta=1)')
     # `s[:,1]`（scores 头的原始第 1 路）取不到：它没有单独暴露成输出键。

@@ -15,7 +15,11 @@ from src.networks.se_bottleneck import SEBottleneck
 
 
 class RMSNorm(nn.Module):
-    """RMSNorm（兼容 PyTorch 2.1，不依赖 nn.RMSNorm）。"""
+    """RMSNorm（兼容 PyTorch 2.1，不依赖 nn.RMSNorm）。
+
+    沿**最后一维**（token/通道维）求 RMS —— 与 `katago_v7.RMSNormMask`
+    （在空间维 ``(H,W)`` 上求）分工不同，两者不可互换。
+    """
 
     def __init__(self, channels, eps=1e-6):
         super().__init__()
@@ -23,7 +27,22 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
-        # 保持原有精度，不强制转 FP32（BF16 下减少转换开销）
+        # fp16 下平方和必须在 fp32 上做。`x²` 在 x 超过约 256 时就撞上 fp16 的
+        # 65504 上限⇒ `mean` 变 inf ⇒ `rsqrt(inf)=0`，前向看着「有限」（全 0），
+        # 但**存下来给反向的是 inf**，梯度就再也回不到有限值 —— 而 GradScaler
+        # 对这种与缩放值无关的 inf **无法恢复**（这正是真机「10240 一路降到
+        # 160仍 100% 跳过」那种表现的一种可能来源）。
+        #
+        # 910A 无 bf16、AMP 走 fp16，所以这条路径是现役的；V7 的
+        # `Nbt2TransformerBlock` 有 11 块 × 2 内块 × 2 个 norm = **44 处**走这里。
+        # 空间维那个孪生 `RMSNormMask` 早已因同样的理由硬化成 fp32，这里之前漏了。
+        #
+        # **只对 fp16 改**：bf16 的指数位与 fp32 相同（最大约 3.4e38），
+        # 不存在这个溢出，保持原样以免改变既有 bf16 数值；fp32/fp64 更是无需动。
+        if x.dtype == torch.float16:
+            xf = x.float()
+            rms = (xf.pow(2).mean(dim=-1, keepdim=True) + self.eps).rsqrt()
+            return (xf * rms * self.weight.float()).to(x.dtype)
         rms = (x.pow(2).mean(dim=-1, keepdim=True) + self.eps).rsqrt()
         return x * rms * self.weight
 
@@ -647,11 +666,33 @@ def _sdpa(q, k, v, dropout_p=0.0, use_math=False, scale=None):
         if step and nq > step:
             kt = k.transpose(-2, -1)
             outs = []
+            # **逐 chunk 梯度检查点**（2026-10-04 新增，为了真正省显存）。
+            #   分块只降**瞬时**峰值，**不降保留量** —— 每块的 softmax 输出
+            #   `(B,Hh,chunk,N)` 都被 autograd 存下来等反向，6 块加起来与
+            #   整条 `(B,Hh,N,N)` **一样多**。实测 V7（22 层注意力、N=361、4 头）
+            #   每样本每层 1.043 MB ⇒ B=3000 时约 68.8 GB。
+            #
+            #   为什么不能只靠 block 级 `torch.utils.checkpoint`：那依赖后端
+            #   autograd 的支持程度，而实测云端 910A 上 64 GB ≈ **无** checkpoint
+            #   的估算值（本地 CPU 上 checkpoint 是有效的：278.5 → 7.0 MB/样本，
+            #   40×）。逐 chunk 检查点把占大头的注意力矩阵从「保留」变成
+            #   「反向时一块一块重算」，**不依赖 block 级那层是否生效**。
+            #
+            # 行为变化只有一处：`dropout_p > 0` 时 mask 的取样位置会变
+            #     （分布等价、不逐位相同）。eval 态 dropout 恒 0，指标不受影响。
+            #     V7 的 `attn_dropout` 默认 0.0 ⇒ 这条对 V7 不适用。
+            use_ckpt = _attn_chunk_checkpoint and torch.is_grad_enabled() \
+                and q.requires_grad
             for i in range(0, nq, step):
-                a = (q[..., i:i + step, :] @ kt).softmax(dim=-1)
-                if dropout_p > 0.0:
-                    a = torch.nn.functional.dropout(a, p=dropout_p)
-                outs.append(a @ v)
+                if use_ckpt:
+                    outs.append(torch.utils.checkpoint.checkpoint(
+                        _attn_chunk_fn, q[..., i:i + step, :], kt, v,
+                        dropout_p, use_reentrant=False))
+                else:
+                    a = (q[..., i:i + step, :] @ kt).softmax(dim=-1)
+                    if dropout_p > 0.0:
+                        a = torch.nn.functional.dropout(a, p=dropout_p)
+                    outs.append(a @ v)
             return torch.cat(outs, dim=-2)
         attn = (q @ k.transpose(-2, -1))
         attn = attn.softmax(dim=-1)
@@ -717,6 +758,30 @@ def set_sdpa_force_math(flag: bool) -> None:
 # 默认 64：19 路棋盘 N=361 ⇒ 6 块，每份 (B,4,64,361) fp16 在 B=1000 下
 # 0.17 GiB（原 0.97）。设 0 或 ≥N 即退回原路径（逐位不变）。
 _attn_query_chunk = 64
+
+#: 逐 chunk 梯度检查点（2026-10-04 新增）。见 `_sdpa` math 分块循环里的说明。
+#: 默认开：它只影响**保留**的显存（反向时逐块重算），数学上逐位等价，唯一
+#: 例外是 `dropout_p > 0` 时 mask 取样位置会变（分布等价）。设 0 关闭。
+_attn_chunk_checkpoint = True
+
+
+def set_attn_chunk_checkpoint(flag: int) -> None:
+    """开关逐 chunk 检查点（0 = 关闭）。由训练脚本启动时调用。"""
+    global _attn_chunk_checkpoint
+    _attn_chunk_checkpoint = bool(flag)
+
+
+def _attn_chunk_fn(qc, kt, v, dropout_p):
+    """一个 query 块的注意力（``(B,Hh,chunk,N)``）。
+
+    必须是**模块级函数**：`torch.utils.checkpoint` 只接受可 pickle / 可重入的
+    callable，闭包与 lambda 在 `use_reentrant=False` 下也可能被
+    `torch.compile` 判为 graph break。
+    """
+    a = (qc @ kt).softmax(dim=-1)
+    if dropout_p > 0.0:
+        a = torch.nn.functional.dropout(a, p=dropout_p)
+    return a @ v
 
 
 def set_attn_query_chunk(n: int) -> None:
