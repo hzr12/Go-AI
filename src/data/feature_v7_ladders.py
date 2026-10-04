@@ -31,7 +31,7 @@ ch     语义                                                       依赖
 17     当前盘梯子的 **working-move 位置**（**仅对手方、且 >1 气**）  **依赖 to_play**
 =====  ==========================================================  ==============
 
-⚠ **ch14 与 to_play 无关**（``iterLadders`` 的签名里根本没有 player 参数），
+ **ch14 与 to_play 无关**（``iterLadders`` 的签名里根本没有 player 参数），
 **ch17 依赖 to_play**（官方条件是 ``board.colors[loc] == opp && libs > 1``，
 ``opp = getOpp(nextPlayer)``）。这是与 stdata 对拍时的关键事实。
 
@@ -46,7 +46,7 @@ ch     语义                                                       依赖
 history=1 ⇒ ch16 = ch15。本模块以 ``None`` 表示"该级历史不足"，
 ``ladder_channels`` 负责按上式回退。
 
-⚠ 官方还有一条 ``hideHistory``（对局已结束 / 已过正常阶段 / 保守 pass 等）。
+ 官方还有一条 ``hideHistory``（对局已结束 / 已过正常阶段 / 保守 pass 等）。
 本模块**不建模** ``hideHistory``：它在简单局里恒为 false（它的触发条件全是
 encore / 游戏结束相关，spec §2.6 D2 已说明我们没有 encore）。若真被触发，
 官方会令 prevPrev 复制的是 ``board`` 而不是 ``prevBoard``——只在同时满足
@@ -66,7 +66,7 @@ encore / 游戏结束相关，spec §2.6 D2 已说明我们没有 encore）。�
 3. **DFS 本身是「每块一次」**，且绝大多数块在**第一个攻/守节点**就终止
    （见 `search_is_ladder_captured` 的 base cases），不做无谓展开。
 
-⚠ **DFS 结果与「链的遍历顺序」无关**（这是能安全不还原 C++ 的
+ **DFS 结果与「链的遍历顺序」无关**（这是能安全不还原 C++ 的
 ``next_in_chain`` 环形链表的前提，已逐条核对）：
 - 所有 move list 只当**集合**用（去重后填进 buf）；
 - 唯一用到顺序的地方是 attacker 节点的启发式重排与"两个气不相邻时砍掉一个"
@@ -144,19 +144,19 @@ def _label_chains(colors, n):
     w = n + 2
     nb = _grid(n)
     g = colors.reshape(w, w)
-    # ⚠ **必须把墙排除掉**：内部颜色是 0/1/2、墙是 WALL=3，裸写 `g > 0` 会把
+    # **必须把墙排除掉**：内部颜色是 0/1/2、墙是 WALL=3，裸写 `g > 0` 会把
     # 整圈墙当成一个连通块（它本来就是连通的），后面每一行的块/气全错。
     stone = (g == BLACK) | (g == WHITE)
 
     # --- 1. 横向游程 ---
-    # ⚠ 切片别写成 `same_left[1:, 1:-1] = g[1:,1:-1] == g[:-1,1:-1]`：那个 `1:` 落在
+    # 切片别写成 `same_left[1:, 1:-1] = g[1:,1:-1] == g[:-1,1:-1]`：那个 `1:` 落在
     # **行**轴上，比的是「正上方」而不是「正左方」，于是横向游程整个判错（一条
     # 横排的 3 子会被拆成 3 个块）。左邻比较必须把 `1:` 放在**列**轴上。
     same_left = np.zeros((w, w), dtype=bool)
     same_left[1:-1, 1:] = g[1:-1, 1:] == g[1:-1, :-1]
     run_start = stone & ~same_left
     lab = np.where(run_start, np.arange(w * w).reshape(w, w), 0)
-    # ⚠ `accumulate` 的默认 axis 是 **0**、不是 None！直接对二维数组 accumulate
+    # `accumulate` 的默认 axis 是 **0**、不是 None！直接对二维数组 accumulate
     # 会变成「每列各自纵向取最大」，横向游程的语义整个丢掉 ⇒ 一条横着的 3 子连成一
     # 排会被拆成 3 个块。必须先 ravel（行主序）再 accumulate。
     lab = np.maximum.accumulate(lab.ravel()).reshape(w, w)
@@ -248,7 +248,7 @@ def assert_consistent(bd):
     stone = (arr[1:-1, 1:-1] == BLACK) | (arr[1:-1, 1:-1] == WHITE)
     assert np.array_equal(np.asarray(bd.chain_of).reshape(n + 2, n + 2)[
         1:-1, 1:-1] >= 0, stone), 'chain_of 与 colors 不一致'
-    # ⚠ 比**划分**而不是比块 id：增量落子每次都分配新 id（不复用槽位），id 本身
+    # 比**划分**而不是比块 id：增量落子每次都分配新 id（不复用槽位），id 本身
     # 与「从 colors 重算」的紧凑编号没有任何对应关系，只有「谁跟谁同块」要对。
     got = {frozenset(bd.ch_stones[cid]): bd.ch_libs[cid]
            for cid in range(len(bd.ch_stones)) if bd.ch_stones[cid]}
@@ -292,12 +292,12 @@ class _Board:
     ``undo`` 是快照回滚（C++ 的 undo 明确「不保证还原成原来的链表形状」，
     而本实现每次都从 `colors` 重建等价信息，所以无需逐项逆操作）。
 
-    ⚠ **``colors`` 是被「接管并原地修改」的**：第一次 :meth:`play` 就会往调用方
+     **``colors`` 是被「接管并原地修改」的**：第一次 :meth:`play` 就会往调用方
     传进来的那个数组里写子。调用方若还要拿一份**未被搜索污染的根盘**
     （``iterLadders`` 正是要：它要在整个扫描过程中按根盘的颜色判断
     ``colors[loc] == opp``），必须自己留副本。
 
-    ⚠ **内部一律用 Python list 存盘面与块表，不用 numpy 数组。**
+     **内部一律用 Python list 存盘面与块表，不用 numpy 数组。**
     假想落子每次要读写好几十个点，``numpy`` 的标量索引（每次 ~150 ns）比 list
     索引（~40 ns）贵 3~4 倍，而这条路径**每个盘面要走几万次**。实测（306 个
     stdata 盘面）这一项占掉约一半的 ladder 耗时。转换只在 ``__init__`` 发生一次。
@@ -373,7 +373,7 @@ class _Board:
     def bound_num_liberties_after_play(self, loc, pla):
         """``Board::getBoundNumLibertiesAfterPlay`` → ``(lowerBound, upperBound)``。
 
-        ⚠ **两处上游写法照抄，改动会直接让梯子判多**：
+         **两处上游写法照抄，改动会直接让梯子判多**：
         - ``potentialLibsFromCaps`` 是「被提块的大小**按重数累加**」；
         - ``numCaps`` / ``numConnectionLibs`` **都按方向数、不对块去重** ——
           同一个块从两个方向相邻就加两遍。
@@ -406,7 +406,7 @@ class _Board:
     def count_heuristic_connection_liberties_x2(self, loc, pla):
         """``Board::countHeuristicConnectionLibertiesX2``。
 
-        ⚠ 这里**不去重**块（C++ 直接 ``FOREACHADJ`` 累加），照抄。
+         这里**不去重**块（C++ 直接 ``FOREACHADJ`` 累加），照抄。
         """
         col, cof, libs = self.colors, self.chain_of, self.ch_libs
         total = 0
@@ -441,7 +441,7 @@ class _Board:
     def num_liberties_after_play(self, loc, pla, cap):
         """``Board::getNumLibertiesAfterPlay(loc, pla, max)``。
 
-        ⚠ 返回值与遍历顺序无关：返回的是 ``min(去重后的真实气数, cap)``，
+         返回值与遍历顺序无关：返回的是 ``min(去重后的真实气数, cap)``，
         所以本移植不还原 C++ 的 ``next_in_chain`` 环形顺序也不影响结果。
         """
         opp = BLACK + WHITE - pla
@@ -489,7 +489,7 @@ class _Board:
     # -- 落子 ---------------------------------------------------------------
     def play(self, loc, pla):
         """假设落子合法地落一手，返回可交给 :meth:`undo` 的快照记录。"""
-        # ⚠ ``ch_stones`` / ``ch_libs`` 必须**拷贝列表头**：_play 会原地 append
+        # ``ch_stones`` / ``ch_libs`` 必须**拷贝列表头**：_play 会原地 append
         # 新块并覆写槽位，若只存引用，undo 之后列表会残留被撤销那一手新建的槽位
         # （长度/内容都多于盘面实际有的块），后续 `_find_liberties` 就会按着
         # 一个不存在的块去数气 ⇒ 结果静默错。槽里的 tuple / frozenset 都是
@@ -570,7 +570,7 @@ class _Board:
         ch_libs[nid] = frozenset(libs)
 
         # 提子点四周的、非新块的块，各多一口气（仅提子方颜色，见 _Board docstring）。
-        # ⚠ 判据用 `chain_of >= 0` 而不是「颜色非空」：**墙点也是非空的**
+        # 判据用 `chain_of >= 0` 而不是「颜色非空」：**墙点也是非空的**
         # （C_WALL=3），而它的 chain_of 是 -1 ⇒ 会写到 ch_libs[-1] 去，
         # 把最后一个块的气的集合改坏，而且只在提子发生在**边线**时才触发。
         for cid in captured:
@@ -597,7 +597,7 @@ class _Board:
 def _put(buf, k, q):
     """把 ``q`` 写到 ``buf[k]``（按**下标**写，不是 append）。
 
-    ⚠ 必须按 C++ 的语义按下标写：``iterLadders`` 对 1 气的块**不清** ``buf``，
+     必须按 C++ 的语义按下标写：``iterLadders`` 对 1 气的块**不清** ``buf``，
     而 DFS 的根层又总是从下标 0 开始写。若这里用 ``append``，上一条链留下的
     长度会让根层写歪，链的结果直接错。
     """
@@ -653,7 +653,7 @@ def _find_liberty_gaining_captures(bd, loc, buf, buf_start, buf_idx):
 def search_is_ladder_captured(bd, loc, defender_first, buf):
     """``Board::searchIsLadderCaptured`` 的逐字移植（含那两个上限）。
 
-    ⚠ 与 C++ 一致地保留两处上游写法：
+     与 C++ 一致地保留两处上游写法：
     - 栈满（``stackSize``）⇒ 直接**判赢**（``returnValue = true``）；
     - 25000 节点预算耗尽 ⇒ 判**不赢**，并且**不还原** ``ko_loc``（上游漏了
       ``ko_loc = ko_loc_saved``）。两个上限在真实盘面上都不可达；照抄是为了
@@ -850,7 +850,7 @@ def search_is_ladder_captured_attacker_first_2_libs(bd, loc, buf, working_moves)
 def _flat_to_padded(flat, n):
     """盘面**紧凑**扁平下标（stride = n，本仓 ``ko`` 列的口径）→ 带墙下标。
 
-    ⚠ 两套下标不能混：外部（npz 的 ``ko`` 列、``pos_hash``、``to_v7_labels``）用的
+     两套下标不能混：外部（npz 的 ``ko`` 列、``pos_hash``、``to_v7_labels``）用的
     都是 ``r*n + c`` 的紧凑下标，而本模块内部（与 C++ 的 ``Loc`` 对齐）用的是
     带墙的 ``(r+1)*(n+2) + (c+1)``。19 路的 ``ko`` 点 ``(13,17)`` 紧凑下标是 264，
     带墙下标是 312 —— 传错的话劫禁判定会打在**完全无关的点上**，而且不报错。
@@ -896,7 +896,7 @@ def _iter_ladders(board, opp, ko_loc=-1):
     # 只有十来块**（实测 306 个 stdata 盘面：3214/306 ≈ 10.5 块/盘）。按块迭代
     # 把 361 次 Python 循环降到 ~10 次。
     #
-    # ⚠ **按块迭代不会改变结果**，已逐条核对（这也是「块表一次算好、整盘共享」
+    # **按块迭代不会改变结果**，已逐条核对（这也是「块表一次算好、整盘共享」
     #   的前提）：
     #   1. 同块所有子共享 `libs` 与 `colors`，所以 `addLadderFeature` 的两个条件
     #      在块内逐位相同 ⇒ ch14 置位等价于「整块置位」，幂等。
@@ -908,7 +908,7 @@ def _iter_ladders(board, opp, ko_loc=-1):
     #   仍按「块内最小扁平下标」排序 = 官方 y-major 扫描里这个块**第一次**被碰到
     #   的次序，逐位对齐上游。
     #
-    # ⚠⚠⚠ **循环里必须每步重新读 `bd.ch_libs`，不能把它缓存成局部变量。**
+    # **循环里必须每步重新读 `bd.ch_libs`，不能把它缓存成局部变量。**
     # `_play` 是**原地**改 `ch_libs` 这个 list 的，而 `undo` 是把 `bd.ch_libs`
     # **重新绑定**到一份快照 —— 于是缓存下来的那个局部变量从此指向一份
     # 「被搜索改过、且再也回不去」的表。第二条链读到的气数就是第一手假想落子
@@ -940,7 +940,7 @@ def _iter_ladders(board, opp, ko_loc=-1):
             ladder[np.asarray(stones, dtype=np.int64)] = True
             # 官方 addLadderFeature 的**两个**条件，逐字照抄：
             #   if(board.colors[loc] == opp && board.getNumLiberties(loc) > 1)
-            # ⚠ `libs > 1` 这半个条件**不能省**。1 气的块走的是
+            # `libs > 1` 这半个条件**不能省**。1 气的块走的是
             # `searchIsLadderCaptured` 分支，而官方在那里**故意不清**
             # workingMoves（沿用上一条链算出来的值）——真正的挡板就是这个
             # `> 1`。省掉它，一个「1 气、颜色 == opp」的梯子块会把**上一条
@@ -963,13 +963,13 @@ def ladder_channels(boards, to_play, prev_board=None, prev_prev_board=None,
     Args:
         boards: ``(B,19,19)`` int8，取值 −1/0/1（−1 = 白 / +1 = 黑）。
         to_play: ``(B,)`` int8 ±1，轮到谁落子（``+1`` = 黑先行）。
-            ⚠ **只有 ch17 依赖它**（官方条件 ``colors[loc] == opp && libs > 1``）；
+             **只有 ch17 依赖它**（官方条件 ``colors[loc] == opp && libs > 1``）；
             ch14/15/16 完全与它无关。
         prev_board: ``(B,19,19)`` int8 或 **None**。None = 历史不足一手 ⇒
             按官方语义回退**复制当前盘**（于是 ch15 == ch14）。
         prev_prev_board: 同上。None = 历史不足二手 ⇒ 回退复制 ``prev_board``
             解析后的结果（history=0 ⇒ ch16 == ch15；history=1 ⇒ ch16 == ch15）。
-            ⚠ 官方是**按行**判定 ``numTurnsOfHistoryIncluded`` 的；本签名用
+             官方是**按行**判定 ``numTurnsOfHistoryIncluded`` 的；本签名用
             ``None`` 表示**整批**不足。逐行混合的场景由调用方（B6 的邻行 gather）
             自行把「历史不足」的行填成该行当前盘再整批传进来。
         ko: 可选 ``(B,)`` int16，当前盘面**自带的** simple-ko 点（−1 = 无）。
@@ -982,7 +982,7 @@ def ladder_channels(boards, to_play, prev_board=None, prev_prev_board=None,
     Returns:
         ``(B,4,19,19)`` **float16**（``LADDER_DTYPE``），依次是
         ch14 / ch15 / ch16 / ch17，取值 {0.0, 1.0}。
-        ⚠ dtype 选 float16 是为了与 ``GoBoard.feature_planes`` /
+         dtype 选 float16 是为了与 ``GoBoard.feature_planes`` /
         ``feature_planes_batched`` 逐位对齐（``src/game/go_rules.py`` 里那句
         「两路必须一致，否则 RL/推理走单图与训练走批量会拿到不同精度的 planes」）。
         fp16 对 {0,1} 逐位无损。若下游想要 bool，用 ``!= 0`` 即可。
@@ -1019,13 +1019,13 @@ def ladder_channels(boards, to_play, prev_board=None, prev_prev_board=None,
     out[:, 0] = cur[:, 0]
     out[:, 3] = cur[:, 1]
     out[:, 1] = cur[:, 0] if pb is b else _ladder_row(pb, kos)
-    # ⚠⚠ ch16 的兜底是 **out[:,1]（即 ch15 的内容）**，不是 `cur[:,0]`（ch14 的）。
+    # ch16 的兜底是 **out[:,1]（即 ch15 的内容）**，不是 `cur[:,0]`（ch14 的）。
     # 官方第二行回退到的是 `prevBoard`：
     #     prevPrevBoard = (... < 2) ? prevBoard : hist.getRecentBoard(2);
     # 而 history=1 时 `pb` 正是**真正的上一手盘**、不等于当前盘 ⇒ 此处抄 ch14 会
     # 给出「当前盘」的 ch16 而不是「上一手盘」的，与官方正好差一手。
     #
-    # ⚠ 别把这个判断**第二次**从历史参数推一遍（`if prev_prev_board is None: 抄 ch15
+    # 别把这个判断**第二次**从历史参数推一遍（`if prev_prev_board is None: 抄 ch15
     # else: 抄 ch16`）。上面 `pb` / `p2b` 已经按官方原文解析过一次历史门控，这里只
     # 认「两个盘面是不是同一个数组对象」这一个事实。**同一口径写两遍必然发散** ——
     # `src/game/go_rules.py:170-177` 记的就是这类（批量侧的 liberty 口径与单图侧各写
@@ -1067,7 +1067,7 @@ def _current_row(boards, to_play, kos):
 def _ladder_row(boards, kos):
     """``(B,19,19)`` → ``(B,19,19) bool``：只要 ch14。
 
-    ⚠ ``opp`` 在 ch15/ch16 上**没有作用**（官方那两个 lambda 明确把
+     ``opp`` 在 ch15/ch16 上**没有作用**（官方那两个 lambda 明确把
     ``workingMoves`` 与颜色条件一起 ``(void)`` 掉了），故这里传 `-1` 占位 ——
     传什么都不会改变输出，但传一个固定值能省掉逐行读 to_play。
     """

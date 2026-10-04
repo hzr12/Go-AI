@@ -32,7 +32,7 @@ import 进自己的模块命名空间 —— 本文件的 `_classes_defined_in` 
 这正是 `backbone.py` 顶部特意写绝对导入的原因（见那里的注释：相对导入会让本文件的
 standalone 加载炸掉）。
 
-⚠ `MHSA` / `TransformerBlock` 也在 backbone 里，但**没有现役调用方**、不进任何块栈
+ `MHSA` / `TransformerBlock` 也在 backbone 里，但**没有现役调用方**、不进任何块栈
 （backbone.py 末节注释），故刻意不在清单里 —— 清单只收「真的会被建出来」的块。
 """
 import ast

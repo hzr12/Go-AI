@@ -133,7 +133,7 @@ def replay_to_move(text, board_size, target_move):
 class ProbeMCTS(MCTS):
     """记录每次**子节点前向**的两种 key。
 
-    ⚠ 为什么钩 `_eval_children` 而不是 `_expand`：`_expand` 每次模拟只调用一次
+     为什么钩 `_eval_children` 而不是 `_expand`：`_expand` 每次模拟只调用一次
       （mcts.py:956 在循环里逐 path 调），它记的是「被展开的叶子」——那些点几乎
       落在同一条搜索路径上、天然不重复，量出来永远是 0%。真正的量在**子节点**：
       每个叶子展开出 `expand_topk` 个孩子并一起前向（mcts.py:470），那是换位发生
@@ -276,7 +276,7 @@ def main():
           f"model={model or '(随机权重)'}")
     print(f"  语料={args.sgf_dir}  局数={args.n_games}  "
           f"手数={moves_list}  sims={sims_list}  threads={args.threads}")
-    print("  ⚠ 换位率是**位置与深度相关**的估计，且 dynamic_topk / solver 早停会"
+    print(" 换位率是**位置与深度相关**的估计，且 dynamic_topk / solver 早停会"
           "\n    低估它（见文件头）。看趋势，别只看单个数。")
     print("=" * 78)
 
@@ -348,7 +348,7 @@ def main():
             g_shal = statistics.mean(r["mergeA"] for r in shallow)
             print(f"\n  mergeA 平均：sims={min(sims_list)} → {g_shal:.1%}，"
                   f"sims={max(sims_list)} → {g_deep:.1%}"
-                  f"（{'随深度上升' if g_deep > g_shal else '未随深度上升 ⚠'}）")
+                  f"（{'随深度上升' if g_deep > g_shal else '未随深度上升 '}）")
         meanA = statistics.mean(r["mergeA"] for r in rows)
         meanB = statistics.mean(r["mergeB"] for r in rows)
         print(f"  全部：mergeA 均值 {meanA:.1%}，mergeB 均值 {meanB:.1%}"

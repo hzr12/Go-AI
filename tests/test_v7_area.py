@@ -6,7 +6,7 @@
     `board.cpp:1853-2327`）
   · `calculate_area`      —— 规则条件化 + 视角翻转（spec §2.5）
 
-    ---- 🔴 本文件曾经断言一个**错误的不变式**，已退役 ----
+    ---- 本文件曾经断言一个**错误的不变式**，已退役 ----
 旧版这里的核心断言是 `ownership_map(board).sum() == GoBoard.score() + komi`，
 配套一个 Tromp-Taylor 逐点参考实现。**那条不变式是错的**：官方 area 根本不是
 Tromp-Taylor 区域计分 —— 它多了两层算法（Benson 无条件存活 + 双活整块过滤），
@@ -68,7 +68,7 @@ def board(rows):
 # --------------------------------------------------------------------------- #
 # 参考实现：**独立写的**官方算法逐字抄写（`board.cpp:1853-2327`）
 #
-# ⚠ 这里**不能**再放 Tromp-Taylor 参考实现了：旧版那个 `_ref_ownership`
+# 这里**不能**再放 Tromp-Taylor 参考实现了：旧版那个 `_ref_ownership`
 #   编码的是「空区域 + 边界颜色集合」判定，与官方 area 不同族。它作为 oracle
 #   会把实现往回拽到旧口径 —— 而旧口径与官方 stdata 逐行 0 行相同。
 # --------------------------------------------------------------------------- #
@@ -114,7 +114,7 @@ def _regions(b, n, pla, chain):
     out = []
     for r in range(n):
         for c in range(n):
-            # 🔴 区域**只能从空点起头**（`board.cpp:2083-2086`：`colors[loc] !=
+            # 区域**只能从空点起头**（`board.cpp:2083-2086`：`colors[loc] !=
             #   C_EMPTY` 那一支只更新 `atLeastOnePla` 然后 continue）。被本方子
             #   四面围住的一颗对方子因此**不属于任何区域** —— 若让它当区域头，
             #   它会拿到一个「从未经过滤的 vital 初始表」（头部相邻的链全算
@@ -151,7 +151,7 @@ def _regions(b, n, pla, chain):
 def _ref_area_for_pla(b, n, pla, suicide_legal, result):
     """`Board::calculateAreaForPla(pla, safe=true, unsafe=true, suicide)`。
 
-    ⚠ `result` 由调用方填好 C_EMPTY **一次**（`board.cpp:1860-1862`：先
+     `result` 由调用方填好 C_EMPTY **一次**（`board.cpp:1860-1862`：先
       `std::fill`，再黑先白后共用同一块缓冲）—— 本函数里绝不能再填，否则白的
       那一遍会把黑的结果整个抹掉，`:2237` 的 C_EMPTY 守卫随之失效。
       这正是被测实现里那条「黑先白后顺序不能换」的由来。
@@ -265,7 +265,7 @@ def test_area_empty_board_is_all_zero():
 
     判别式：整块盘面是一片「四邻**谁都不相邻**」的空区域，`len(border_colors) == 1`
     不成立 ⇒ 中立（`GoBoard.score()` 里 black_territory/white_territory 都是 0）。
-    ⚠ 顺带钉住 dtype：空盘返回**全 0 的 int8 数组**而不是空数组/None ——
+     顺带钉住 dtype：空盘返回**全 0 的 int8 数组**而不是空数组/None ——
       一条空盘样本在真实 batch 里是常态（每个新开局的头几手）。
     """
     out = calculate_area(np.zeros((2, N, N), np.int8),
@@ -300,7 +300,7 @@ def test_area_single_point_enclosures():
     逐格而不是只看聚合值：三态里错一态时聚合值常常仍然对（一个 +1 和一个 −1
     抵消），而这正是归属图最容易错的地方。
 
-    ⚠ **旧 docstring 的理由是错的，结论恰好是对的**。旧版写「按 Tromp-Taylor
+     **旧 docstring 的理由是错的，结论恰好是对的**。旧版写「按 Tromp-Taylor
       归黑/归白」—— 现在这两个断言走的是完全不同的路径，且官方输出**确实**
       是 −1/+1，但理由是：
         · `(5,5)` 被 8 颗白子围住。对**黑**那一遍，它是 1 点区域、
@@ -339,11 +339,11 @@ def test_area_whole_region_is_filled_not_just_one_point():
 def test_area_stones_belong_to_their_own_colour():
     """有子的点归该子自己的颜色。
 
-    ⚠ **旧 docstring 说这是「区域计分 vs 领土计分」的分界** —— 那是 Tromp-Taylor
+     **旧 docstring 说这是「区域计分 vs 领土计分」的分界** —— 那是 Tromp-Taylor
       的分界，官方 area 不分这个：子归自己颜色来自 `nonPassAliveStones` 兜底
       （`board.cpp:1865-1873`：`result` 仍为 C_EMPTY 的**子**取自己的颜色），
       或者来自 Benson 的「无条件存活子」（`:2202-2211`）。
-      ⚠ **这条断言仍不是无条件的**：一颗被对方围空分支（`:2221`/`:2222`，两者
+       **这条断言仍不是无条件的**：一颗被对方围空分支（`:2221`/`:2222`，两者
         都**无条件覆盖**）改写过的己方子，在官方输出里是**对方颜色**；若它落在
         双活块里且 `basicArea != colors`，`keepStones`（`:1931`，判据是
         `basicArea == colors`）也不会补回 ⇒ 该点为中立。这两种情形由
@@ -419,7 +419,7 @@ def _ref_arr(b, suicide_legal=False, tax_rule=TAX_NONE):
 def test_ownership_matches_independent_reference():
     """**逐格**等价于一份独立写的官方算法参考实现（随机盘面 30 个 × 3 种 tax）。
 
-    ⚠ **旧版这条用的是 Tromp-Taylor 参考实现**（`_ref_ownership`）⇒ 它断言的是
+     **旧版这条用的是 Tromp-Taylor 参考实现**（`_ref_ownership`）⇒ 它断言的是
       旧口径，与官方**相反**。旧实现在真实 stdata 上与官方逐行 0 行相同。
       现在的 `_ref_area` 是 `board.cpp:1853-2327` 的纯 Python 抄写，与被测的
       向量化实现零共享代码 —— 这才是「两份独立实现」的对拍。
@@ -446,7 +446,7 @@ def test_ownership_full_board_and_one_stone_per_colour():
     以及「黑白各一颗子」（整块盘面是一大片空区、边界只有两种颜色 ⇒ 全中立）。
 
     两者都不是随机盘面容易覆盖到的分支。
-    ⚠ **旧 docstring 里「按 Tromp-Taylor 全部归黑（sum == 361）」那句已作废** ——
+     **旧 docstring 里「按 Tromp-Taylor 全部归黑（sum == 361）」那句已作废** ——
       那是旧口径的理由。官方语义下单颗黑子那一大片空区仍然归黑，但走的是
       `:2222`（`safeBigTerritories && !containsOpp && !borders && atLeastOnePla`），
       前提是那条链**没被 Benson 判死**；一颗孤子只有 1 个 vital 区域 ⇒ 判死
@@ -512,7 +512,7 @@ def test_scoring_territory_returns_all_zero():
     这是**对齐官方**、不是缺陷：官方的 territory 分支被 `encorePhase >= 2`
     二次条件包着，而本仓无 encore 机制（spec §2.6 D2）⇒ 正常阶段恒 0。
     SGF 缺 `RU` 时默认 AREA，所以绝大多数对局不走这条分支。
-    ⚠ 这条与「TAX 还没实现时静默返回全 0」在张量上完全一样 —— 所以下面两条
+     这条与「TAX 还没实现时静默返回全 0」在张量上完全一样 —— 所以下面两条
       必须钉「tax 分支抛异常」，否则 territory 的 0 与「算不出来」的 0
       永远分不开。
     """

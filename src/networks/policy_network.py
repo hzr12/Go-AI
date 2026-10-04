@@ -39,7 +39,7 @@ class PolicyNetwork(nn.Module):
 class FCPolicyHead(nn.Module):
     """v21 代遗留的全连接策略头（P4.1），逐项 **2,366,730** 参数。
 
-    ⚠ v21 架构已随其顶层构建函数一并删除，本类**没有现役架构调用方**；
+     v21 架构已随其顶层构建函数一并删除，本类**没有现役架构调用方**；
     保留是因为它仍是「生产头」规格的参照（tests/test_grad_checkpointing.py、
     tests/test_huber_loss.py 直接拿它当被测对象）。输入通道与 in_channels=
     184 的 v21 中间层配套，默认值沿用当时的规格，不随现役 12 通道输入改。
@@ -56,7 +56,7 @@ class FCPolicyHead(nn.Module):
     输出 362 = 19×19 + pass（动作空间含 pass 位），与既有 `PolicyNetwork` 的
     `torch.cat([x, pass_bias])` 拼出同一维度的做法等价，但 pass 位改成由 FC 学出来。
 
-    ⚠ 表里 policy 分项那一行有笔误：FC 128→256 被写成 32,896，正确值是
+     表里 policy 分项那一行有笔误：FC 128→256 被写成 32,896，正确值是
     32,768 + 256 = **33,024**。brief §3(b) 因此把合计当成「2,366,602」并以分项
     为准，但 2,366,602 是**任何**按表建出来的模块都达不到的数（nn.Linear(128,256)
     的 bias 恒为 256 个，去掉 bias 则是 32,768，合计变成 2,366,474）。表头自己写的

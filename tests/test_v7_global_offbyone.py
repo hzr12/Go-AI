@@ -34,7 +34,7 @@ def _gf(my=None, op=None, hl=None, komi=7.5, rules_flags=0, encore=0, to_play=1)
 def test_ch15_ch16_are_zero_without_pda():
     """官方 ``nninputs.cpp:2673-2676`` 整块被 ``if(pda != 0)`` 包住。
 
-    🔴 只看 ``rowGlobal[15] = 1.0`` 那一行会以为它恒 1 —— 实测官方
+     只看 ``rowGlobal[15] = 1.0`` 那一行会以为它恒 1 —— 实测官方
     ``globalInputNC`` 的 ch15 非零率只有 3.85%，与 ch16 完全同步
     （同一条件写入）。本仓无 PDA ⇒ 恒 0。
     """
@@ -77,7 +77,7 @@ def test_history_pass_flags_follow_the_official_slot_order():
 def test_history_pass_flag_respects_history_length():
     """``history_length`` 截断：只有落在长度内的槽位才判 pass。
 
-    ⚠ 造这个夹具时必须**把 ``my_hist`` 也填上落点** —— 只改 ``op_hist`` 而让
+     造这个夹具时必须**把 ``my_hist`` 也填上落点** —— 只改 ``op_hist`` 而让
     ``my_hist`` 留全 −1，会连带让 ``my[0]`` / ``my[1]`` 变成 pass，
     于是 ch1/ch3 被点亮，测的就不是截断而是别的东西（我第一版就踩了）。
     """
@@ -89,7 +89,7 @@ def test_history_pass_flag_respects_history_length():
 
 
 def test_history_prefix_gate_is_prefix_not_per_slot():
-    """🔴 官方是**递归嵌套**：第 k 手要求前 k-1 手都成立（``:2511-2556``）。
+    """ 官方是**递归嵌套**：第 k 手要求前 k-1 手都成立（``:2511-2556``）。
 
     构造「第 1 手存在、第 2 手缺失」：此时 ch1（=第 2 手）必须是 0，
     且**不能**因为后面某手有值就把中间的格子点亮。

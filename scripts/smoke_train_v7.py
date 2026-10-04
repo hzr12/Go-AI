@@ -12,7 +12,7 @@
 所以这里的代码刻意**不追求快**：单进程、batch 8、几百行数据、几十步。
 它要的是「每一项 loss 都从随机噪声级别掉下来」。
 
-⚠ **只读真实数据，不写任何产物**（不落盘 checkpoint、不改仓库文件）。
+ **只读真实数据，不写任何产物**（不落盘 checkpoint、不改仓库文件）。
 
 用法::
 
@@ -156,11 +156,11 @@ def main():
         if chg > 5 and abs(a) > 1e-6:
             worse.append((k, a, b, chg))
     if worse:
-        print('\n⚠ 变差的项：')
+        print('\n 变差的项：')
         for k, a, b, c in worse:
             print('   %-16s %.5f -> %.5f (%+.1f%%)' % (k, a, b, c))
     else:
-        print('\n✓ 全部 12 项都下降')
+        print('\n 全部 12 项都下降')
 
 
 if __name__ == '__main__':

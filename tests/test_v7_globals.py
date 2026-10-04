@@ -142,7 +142,7 @@ def test_all_channels_are_finite_and_in_declared_domain():
 def test_ch0_to_ch4_are_pass_flags_in_physical_turn_order():
     """ch0 = 第 1 手（最近）是不是 pass，……，ch4 = 第 5 手。
 
-    ⚠ 官方是 `PASS_LOC` / `NULL_LOC` **两个不同**的 loc ⇒ 「历史不足」在官方那里
+     官方是 `PASS_LOC` / `NULL_LOC` **两个不同**的 loc ⇒ 「历史不足」在官方那里
     是 0 而不是 1。本测试用一条「5 手全非 pass」的历史（全部有坐标），
     这样 pass 标志与顺序都不受历史不足干扰。
     """
@@ -199,7 +199,7 @@ def test_ch5_is_clipped_to_plus_minus_area_plus_one():
     """clip 的是 **selfKomi 本身**，官方原文 ``if(selfKomi > bArea+1.0f)``。"""
     lim = AREA + 1.0
     out = gfeat([[1, 2, 3, 4, 5, 6]], komi=100000.0, to_play=1)
-    # ⚠ fp16 的**相对**精度 ~2^-11 ≈ 4.9e-4 ⇒ 18.1 上绝对误差可达 ~0.009，
+    # fp16 的**相对**精度 ~2^-11 ≈ 4.9e-4 ⇒ 18.1 上绝对误差可达 ~0.009，
     #   所以这里必须用相对容差，写绝对容差会逼出「把 clip 值改小」的假修复。
     assert out[0, 5] == pytest.approx(lim / KOMI_SCALE, rel=2e-3)
     out = gfeat([[1, 2, 3, 4, 5, 6]], komi=-100000.0, to_play=1)
@@ -368,7 +368,7 @@ def test_ch18_parity_wave_has_all_three_segments_of_the_triangle():
     附近被穿透，所以 wave ∈ [−0.5, 0.5]。把公式写成 ``|delta − 0.5|`` 之类的
     常见替代会在过波谷那两行上符号相反。
 
-    🔴 **与真实官方数据的成批对拍不在这里**，在
+     **与真实官方数据的成批对拍不在这里**，在
     ``tests/test_v7_assemble.py::test_global_ch18_matches_official_batch`` ——
     那里直接读官方 ``globalInputNC`` 的**原始 float32** ch5/ch18（不经打印
     截断），所以能逐位命中；这里刻意用手算值，避免「把打印出来的 4 位小数
@@ -481,7 +481,7 @@ def test_default_flags_are_what_a_sidecar_row_without_ru_produces():
 def test_sidecar_mapping_is_explicitly_lossy_for_tax_and_ko():
     """spec §5.3 的 1 位 tax / 1 位 ko 表达不了全部组合 ⇒ 本函数写明丢了什么。
 
-    ⚠ 这是**有损兼容垫片**，不是最终映射：sidecar 想支持全部 8 种组合，得先把
+     这是**有损兼容垫片**，不是最终映射：sidecar 想支持全部 8 种组合，得先把
     它的打包改成 ``rules_flags_from`` 的布局。
     """
     # tax 的 1 位 = 1 ⇒ 只能按 TAX_SEKI 解读（TAX_ALL 在 1 位下不可区分）
@@ -495,7 +495,7 @@ def test_sidecar_mapping_is_explicitly_lossy_for_tax_and_ko():
 
 def test_sidecar_tax_seki_makes_calculate_area_raise_instead_of_returning_zero(
         ds_row):
-    """🔴 有损映射的**后果必须显式**：tax≠NONE 时 ``calculate_area`` 抛错。
+    """ 有损映射的**后果必须显式**：tax≠NONE 时 ``calculate_area`` 抛错。
 
     静默返回全 0 与「TERRITORY 恒 0」在张量上逐位相同，会被当成「无归属」
     污染训练（``calculate_area`` 的 docstring 记着这个理由）。
@@ -581,7 +581,7 @@ def test_batch_is_row_independent(ds_row):
     rows = [[1, 2, 3, 4, 5, 6], [-1, -1, -1, -1, -1, -1], [7, -1, 8, -1, 9, -1]]
     komis = [7.5, 0.0, -6.5]
     tps = [1, -1, 1]
-    # ⚠ 两边都要传 history_length：否则「全 −1」那行在 single 里被推成 ply 0
+    # 两边都要传 history_length：否则「全 −1」那行在 single 里被推成 ply 0
     #   而在 batched 里被当成 5 手齐全，ch0..4 就会不一致（推不出来的差异）。
     single = np.vstack([gfeat([r], komi=k, to_play=[tp], history_length=5)
                         for r, k, tp in zip(rows, komis, tps)])

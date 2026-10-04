@@ -22,7 +22,7 @@
   7. ③ 源断言：value 侧无 BCE / 无稳健损失 / 无 sigmoid；两个损失都在 helper 里；
      策略侧零改动；value 侧不新增 CLI 参数（D1）
 
-⚠ 与 `tests/test_rl_ppo_policy.py` 的分工：那个文件钉**策略侧**（`test_rl_ppo_policy.py:352`
+ 与 `tests/test_rl_ppo_policy.py` 的分工：那个文件钉**策略侧**（`test_rl_ppo_policy.py:352`
   断言 `train_epochs` 源码里没有 `F.mse_loss`），本文件钉**value 侧**。两处断言互补、
   不重叠 —— 路线图 P3-D ③ 明确要求这一点。
 """

@@ -117,7 +117,7 @@ def lookahead(ai, board, my_hist, op_hist, to_play, n_actions, n_channels,
     if not order:
         return LookaheadResult({}, masked, n - 1, 0.0, root_value)
 
-    # ⚠ IndexError 修复（实测对局 131 手触发）：child_states 会跳过 play() 拒绝的
+    # IndexError 修复（实测对局 131 手触发）：child_states 会跳过 play() 拒绝的
     # 着法，因此 levels[0] 可能比 order 短，下方 `out[kept[i]] = ...` 的对位索引
     # 就会越界。先用 play/undo 过滤出真正可下的 kept，与 levels[0] 一一对应。
     kept = []

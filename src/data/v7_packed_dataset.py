@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """V7 **预算特征**分片的训练视图：读 ``stdata_to_npz.py`` 产出的 npz。
 
-⚠ **不要与 ``src/data/v7_dataset.py`` 混淆**
+ **不要与 ``src/data/v7_dataset.py`` 混淆**
 ------------------------------------------------
 那个模块里的 ``V7Dataset`` 是 :class:`~src.data.dataset.SupervisedDataset` 的
 **子类**，吃 **board 级** 布局（``boards`` / ``my_hist`` / ``moves`` …），
@@ -34,7 +34,7 @@
    ``round(λ·100)``），不是两个桶的概率 —— 权威定义见
    ``katago_v7_loss.build_score_distr_target``。
 
-⚠ ``var_time_left`` 缺席
+ ``var_time_left`` 缺席
 -----------------------
 现有 ``data/stdata_v7_s*.npz`` 生成于本项目把 col22 接进转换器**之前**
 （``meta_json.created = 2026-10-03T11:10:01``），因此**没有** ``var_time_left`` 键。
@@ -68,7 +68,7 @@ class V7PackedDataError(RuntimeError):
 def _permute_move_scalar(moves: np.ndarray, tform: int, bs: int) -> np.ndarray:
     """单个着法编号在 8 个 dihedral 变换下的重编号（与 dataset 侧同源）。
 
-    ⚠ 必须与 ``dataset.permute_move_vector`` / ``_dihedral_batch`` 用**同一套**
+     必须与 ``dataset.permute_move_vector`` / ``_dihedral_batch`` 用**同一套**
     约定（``t >= 4`` 先沿 W 翻转，逆序；``k = t % 4`` 次逆时针 90°），
     否则空间平面转了、标签没转 —— 监督信号会指向错误的格点。
     """
@@ -173,7 +173,7 @@ class V7PackedDataset:
 
     def describe(self) -> str:
         miss = [k for k in ('var_time_left',) if not self._has(k)]
-        extra = ('\n    ⚠ 缺 %s —— 这些分片生成于 col22 接线之前，'
+        extra = ('\n 缺 %s —— 这些分片生成于 col22 接线之前，'
                  '需重跑 `stdata_to_npz.py` 才能训这一项' % miss) if miss else ''
         return ('V7PackedDataset: %d 行 / %d 分片，键 %d 个%s'
                 % (self.N, len(self.shard_paths), len(self._shards), extra))
@@ -196,7 +196,7 @@ class V7PackedDataset:
     def moves(self) -> np.ndarray:
         """本行的目标着法（= ``policy_player_rank[:,0]``）。
 
-        ⚠ 语义与 board 级路径**不同**：那边 ``moves[i]`` 是「第 i 行之后实际走的
+         语义与 board 级路径**不同**：那边 ``moves[i]`` 是「第 i 行之后实际走的
         那手」，监督目标要靠 ``moves[idxs+1]`` 取；而本分片每行**自带**该行的
         答案。所以 ``_v7_labels_and_moves`` 对本类改走 ``next_move``
         （见该函数的 ``sample_spatial`` 分支）—— 否则整体错位一行。
@@ -213,7 +213,7 @@ class V7PackedDataset:
         """每行所属棋局。**按棋局切 train/eval 是防泄漏的关键** ——
         同一局相邻位置若同时落在两侧，eval 指标会虚高。
 
-        ⚠ 分片内的 ``game_ids`` 是**块内局部行号**（见 ``meta_json`` 的
+         分片内的 ``game_ids`` 是**块内局部行号**（见 ``meta_json`` 的
         ``game_ids_note``），分片间会重复。这里统一加上分片偏移，造出
         全局唯一 id —— 否则第 0 片与第 1 片都会出现 id=0 的「同一局」。
         """
@@ -245,7 +245,7 @@ class V7PackedDataset:
         # stdata 的 `policyTargetsNCMove` 是两通道：index 0 = 行棋方（player）、
         # index 1 = 对手（opp），见 `trainingwrite.cpp:552-568`
         # （policyTarget0 → rowGlobal[26] w_policy_player，policyTarget1 → [28]）。
-        # ⚠ 旧实现**只做了 player**，而 `v7_loss_labels` 又用 `next_move`（= player
+        # 旧实现**只做了 player**，而 `v7_loss_labels` 又用 `next_move`（= player
         #   的 rank[0]）去填 `policy_opp` —— 于是 #1 与 #2 两个 loss 项拿的是
         #   **同一个**目标，π_opp 白训。这两路必须分开。
         def soft_from(prefix: str) -> np.ndarray:
@@ -256,7 +256,7 @@ class V7PackedDataset:
             cnt = np.where(ok, pb, 0.0).astype(np.float64)
             cnt[cnt < 0] = 0.0
             den = cnt.sum(axis=1, keepdims=True)
-            # 🔴 `*_prob` 是 KataGo 的**访问计数**（实测一行 853/16/12/4/1/1，和 887），
+            # `*_prob` 是 KataGo 的**访问计数**（实测一行 853/16/12/4/1/1，和 887），
             #   必须归一化；全零行退回均匀分布而非 NaN。
             nrm = np.where(den > 0, cnt / np.where(den > 0, den, 1.0),
                            np.full_like(cnt, 1.0 / POLICY_TOPK))

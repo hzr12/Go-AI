@@ -8,7 +8,7 @@
 而 **81.1%** 的局 `RE` 是认输（无分差；spec §5.3.3 记的 75.2% 偏低，见
 `sgf_parser.parse_result` 的实测表）。
 
-⛔ **主 npz 一个字节都不动。** 本脚本只读它，产物是独立的 `games.npz`（≈1.2 MB）。
+ **主 npz 一个字节都不动。** 本脚本只读它，产物是独立的 `games.npz`（≈1.2 MB）。
 逐行存会是 3.6 B/行 ⇒ 123 GB，所以**局级**而非逐行。
 
 怎么把 sidecar 的第 `g` 行对到正确的 SGF（§5.3.4 哈希锚点法）
@@ -27,12 +27,12 @@
 3. 独立扫语料：每个 SGF 重放到**第 1..20 手之后**，把每个前缀的 `pos_hash` 存进排序表
 4. 二分匹配 ⇒ `sidecar[game_id] = 那个 SGF 的元数据`
 
-⚠ **为什么存 20 个前缀而不是只存 ply-20。** `min(20, L//2)` 在 `L < 40` 时**不是 20**：
+ **为什么存 20 个前缀而不是只存 ply-20。** `min(20, L//2)` 在 `L < 40` 时**不是 20**：
 实测主数据集有 **134 局 `L < 40`、2 局 `L < 20`**，硬编码 ply 20 会漏掉这 136 局。
 存 1..20 全部前缀（169,878 局 × 20 = 3.4M 个散列 = 27 MB）就把它们全兜住了。
 代价：每个 SGF 一次重放到第 20 手，20 次 `pos_hash`（批量算，摊薄后 ~µs/个）。
 
-⚠ **同 id 多段行的裁决。** id 被复用时，一个 `game_ids` 值对应两段行，且 sidecar 是
+ **同 id 多段行的裁决。** id 被复用时，一个 `game_ids` 值对应两段行，且 sidecar 是
 **按 id 索引**的（训练侧 `sidecar[game_ids[idxs]]`），所以两段必须给出同一个值。
 本脚本取**行数更多的那段**（完整的局，而非 `play()` 失败留下的残段），并把冲突数打进
 覆盖报告 —— 不静默取第一个。
@@ -90,7 +90,7 @@ NEEDED_KEYS = ('boards', 'to_play', 'ko', 'game_ids')
 #: —— 除以 100 正好是 6.5 / 7.5 / 5.5 / 4.5 / 3.75 / 3.25 这一组**像样贴目**，
 #: 而除以 2 得到 325/375/275/225 全都不是。共 2,163 局（1.62%）。
 #:
-#: ⚠ spec §5.3.1 的 `KM` 分布表**没有列这一族**（那张表的前 8 项合计 96.5%，
+#: spec §5.3.1 的 `KM` 分布表**没有列这一族**（那张表的前 8 项合计 96.5%，
 #: 剩下的 3.5% 装得下它们），所以这不是与 spec 冲突，而是 spec 未覆盖。
 #: 不修正的话 `g_komi=650` 会把全局 ch5（`currentSelfKomi/20`）顶到 32.5。
 KOMI_OUTLIER_ABS = 100.0
@@ -106,7 +106,7 @@ def _log(msg: str = '') -> None:
 def npz_member_meta(npz_path: str, key: str) -> Tuple[Tuple[int, ...], np.dtype]:
     """取 npz 里某成员的 `(shape, dtype)`，**不解压成员本体**。
 
-    ⚠ 为什么不能用 `np.load(npz)[key].shape`：`np.load` 的 NpzFile 是**懒解压**的，
+     为什么不能用 `np.load(npz)[key].shape`：`np.load` 的 NpzFile 是**懒解压**的，
     但 `__getitem__` 会把整个成员读进内存才返回数组 —— 对 `boards` 就是 12.3 GB。
     这里直接读 zip 成员里的 `.npy` 文件头（几十字节）。
     """
@@ -136,7 +136,7 @@ def ensure_materialized(dataset: str, out_dir: str, keys: Sequence[str] = NEEDED
     要几十分钟，而它只依赖一个**不 rebuild** 的主 npz ⇒ 天然是稳定缓存。
     一致性用 shape + dtype 判定；不一致（换了数据集）就重做。
 
-    ⚠ 仍然复用 `kata_label_join.materialize_dataset` 这个**已测过的**落盘函数
+     仍然复用 `kata_label_join.materialize_dataset` 这个**已测过的**落盘函数
     （它内部用 `open_memmap` 建完整形状再分块填 —— 文档里记着「先写头再 append」
     会产出前段全 0 的坏文件），本脚本不重写一遍。
     """
@@ -171,7 +171,7 @@ def contiguous_runs(game_ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.nd
 
     半开区间 `[starts[i], ends[i])`，`ids[i]` 是该段的 `game_ids` 值。
 
-    ⚠ **为什么按「连续段」而不是按「distinct id」建表**：实测 `game_ids` 不是升序
+     **为什么按「连续段」而不是按「distinct id」建表**：实测 `game_ids` 不是升序
     （是 0..162297 的一个置换，`np.diff` 里有负数），而且 `build_dataset.py:314-316`
     的 id 复用 bug 会让**同一个 id 出现在两段不连续的行**上。后者一旦按 distinct id
     建表就会把两段行的锚点算成一个，锚到错误的局面。
@@ -217,7 +217,7 @@ def anchor_rows_cross(starts: np.ndarray, ends: np.ndarray, ply: int = ANCHOR_PL
     所以这里**不改变匹配结果**，只加一道计数：两个锚点解析到不同的 SGF 就打
     `n_anchor_disagree` 进覆盖报告 —— 让这个边界**可见**，而不是静默取一个。
 
-    ⚠ **这道校验是部分检测，不是证明。** 散列表只存到第 20 手，所以能查的偏移上界
+     **这道校验是部分检测，不是证明。** 散列表只存到第 20 手，所以能查的偏移上界
     是 20。可检出区间是「残段长度 ∈ [a1//2, a1)」（两个探针一个落在残段、一个落在
     完整局里）；残段 ≥ `a1` 时两个探针都在残段里，查不出来 —— 此时该段的元数据
     归属**真的有歧义**，只能靠「distinct id 数 == 段数」这条全局不变式来排除
@@ -270,7 +270,7 @@ def plan_sources(sgf_dirs: Sequence[str],
                  log: Callable[[str], None] = _log) -> Tuple[List[str], List[str]]:
     """枚举语料，返回 `(archives, files)`，两者都按 realpath 去重 + 排序。
 
-    ⚠ **必须去重**：默认的 `--sgf-dirs` 是 `["data", "data/games/games"]`，而
+     **必须去重**：默认的 `--sgf-dirs` 是 `["data", "data/games/games"]`，而
     `data/games/games` 就在 `data` 下面 —— 递归 glob 会把 `data/games/games` 的
     133,604 个文件**扫两遍**。同一个 SGF 出现两次会在 `pos_hash` 表里产生重复项，
     匹配率报告随之失真。
@@ -281,7 +281,7 @@ def plan_sources(sgf_dirs: Sequence[str],
     files: Dict[str, str] = {}
     for d in sgf_dirs:
         if not os.path.exists(d):
-            log(f'[sidecar] ⚠ 语料路径不存在，跳过：{d}')
+            log(f'[sidecar] 语料路径不存在，跳过：{d}')
             continue
         pats = (os.path.join(d, '**', '*.tgz'), os.path.join(d, '**', '*.tar.gz'))
         for pat in pats:
@@ -306,7 +306,7 @@ def iter_sgf_bytes(archives: Sequence[str], files: Sequence[str]) -> Iterable[Tu
         try:
             tf = tarfile.open(a, 'r|gz')
         except (tarfile.TarError, OSError) as e:
-            _log(f'[sidecar] ⚠ 打不开 {a}：{e}')
+            _log(f'[sidecar] 打不开 {a}：{e}')
             continue
         with tf:
             for m in tf:
@@ -334,7 +334,7 @@ def replay_anchor_positions(game, max_offset: int = ANCHOR_PLY
     Returns:
         `(boards (K,19,19) int8, to_play (K,) int8, ko (K,) int16, offsets (K,) int8)`
 
-    ⚠ **落子/提子/判罚必须与 `build_dataset._emit` 逐步一致**，否则散列全不同而
+     **落子/提子/判罚必须与 `build_dataset._emit` 逐步一致**，否则散列全不同而
     join 结果为空 —— 且这个症状看不出原因：
     * 用同一个 `GoBoard`（`go_rules.py`，其 `play()` 走 TT 判罚）；
     * 坐标 `target = -1 if pass else r*19 + c`，棋盘大小固定 19（主数据集只有 19 路，
@@ -377,7 +377,7 @@ def _empty_positions() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
 def parse_komi(props: Dict[str, str], fix_outlier: bool = True) -> Tuple[float, bool]:
     """从 SGF 属性取 `KM`，返回 `(贴目, 是否被离群修正)`。
 
-    ⚠ **缺失填 0.0**（spec §5.3.1 的表里「缺」占 2.22%），但**不能靠
+     **缺失填 0.0**（spec §5.3.1 的表里「缺」占 2.22%），但**不能靠
     `komi != 7.5` 判缺失** —— `GameRecord.komi` 的默认值就是 7.5，判不出。
     所以查属性本身（`has_komi` 同源）。
 
@@ -442,7 +442,7 @@ class AnchorIndex:
         Returns:
             `(sgf_idx int64 (-1 = 未匹配), 每查询的匹配位置数 int64, 命中掩码 bool)`
 
-        ⚠ 同一 `pos_hash` 可能对应多个 SGF（语料里有重复棋谱；同一个常见布局也能被
+         同一 `pos_hash` 可能对应多个 SGF（语料里有重复棋谱；同一个常见布局也能被
         不同局走到 —— 实测 `--limit-games 50` 的探针里，**每一个**锚点都有副本）。
         取**排序后第一条**（= 扫描顺序里最早的那个）。因此 `sgf_idx` 是**单值抽样**
         而不是集合 —— 要判「这两个锚点是不是同一局」必须走
@@ -492,7 +492,7 @@ def distinct_signature_counts(index: 'AnchorIndex', queries: np.ndarray,
                               sig: np.ndarray, chunk: int = 32768) -> np.ndarray:
     """每个查询的命中里，有多少个**不同的内容签名**（= 不同的棋）。
 
-    ⚠ 这是「元数据会不会挂错」的直接度量：`counts > 1` 只说明有副本（无害），
+     这是「元数据会不会挂错」的直接度量：`counts > 1` 只说明有副本（无害），
     而**签名 > 1** 说明**不同的局**走到了同一个局面 —— 此时 `lookup` 取的
     「最早那份」的 `KM/RE/RU` 未必属于本局。实测探针里这类情况存在（重复棋谱）。
 
@@ -531,7 +531,7 @@ def cross_consistency(index: 'AnchorIndex', primary: np.ndarray,
     Returns:
         `(不一致数, 无法判定数, 主锚点歧义数, 交叉锚点歧义数)`
 
-    ⚠ **必须比集合，不能比「第一条命中」。** 实测探针：`--limit-games 50` 里 5 个段
+     **必须比集合，不能比「第一条命中」。** 实测探针：`--limit-games 50` 里 5 个段
     的交叉锚点（偏移 10）命中 **4~10 个不同的局** —— 同一个常见布局被很多局走到。
     拿第一条比就会把这些**布局歧义**误报成「这一段跨了两局」。真集合相交就不误报。
 
@@ -574,14 +574,14 @@ class CorpusScan:
         self.resign = np.empty(0, np.bool_)
         self.re = np.empty(0, np.int8)     # 0 未识别/无结果 1 数值 2 和棋 3 认输
         #: 每局**是谁认输**：0 = 黑 / 1 = 白 / -1 = 非认输。
-        #: ⚠ 用 -1 而不是 None/0 占位，因为 0 在这里有实义（黑认输）——
+        #: 用 -1 而不是 None/0 占位，因为 0 在这里有实义（黑认输）——
         #: 拿 0 当「无信息」的默认值会让「白认输」与「什么都不知道」混成一类。
         #: `resign` 只是 bool，**恢复不出方向**，所以这一列必须自己落盘。
         self.resign_side = np.empty(0, np.int8)
         self.has_komi = np.empty(0, np.bool_)
         #: 每局的**内容签名** = 它最后一个被记录前缀（偏移 `min(20, 手数)`）的散列。
         #:
-        #: ⚠ **交叉校验必须比签名，不能比局号。** 语料里有重复棋谱（spec §5.0 说
+        #: **交叉校验必须比签名，不能比局号。** 语料里有重复棋谱（spec §5.0 说
         #: 「36,274 **唯一** SGF」⇒ tgz 成员里本来就有重复），同一个局面在散列表里
         #: 因此对应**多个局号**。拿局号去比会把「同一局的两个副本」误判成
         #: 「这一段跨了两局」。
@@ -609,12 +609,12 @@ def derive_outcome(g_re, g_score, g_resign_side) -> np.ndarray:
     `RE_CLASS_DRAW` / `RE_CLASS_UNKNOWN`  ——          2
     ============  ==================================  ================
 
-    ⚠ **SCORE 分支不减贴目。** `g_score` 是 SGF 的最终分差，符号已经是**黑−白**
+     **SCORE 分支不减贴目。** `g_score` 是 SGF 的最终分差，符号已经是**黑−白**
       且**含贴目**（`ResultInfo.score` 的约定），再减一次 `g_komi` 会把
       `B+2.5 / KM[7.5]` 这类局翻成白胜 —— 这是这个契约里最容易写错的一步。
-    ⚠ **按 `g_re` 分派，不看另一列。** 复用旧 `.scan.npz` 缓存时两列可能来自不同
+     **按 `g_re` 分派，不看另一列。** 复用旧 `.scan.npz` 缓存时两列可能来自不同
       扫描批次，一个「RESIGN 却残留了分差」的样本仍按认输判。
-    ⚠ 两个「理论上不可达」的退化情形，按上面那张表**字面**取值、不额外兜底，
+     两个「理论上不可达」的退化情形，按上面那张表**字面**取值、不额外兜底，
       因为它们一旦发生就说明上游坏了，静默修正只会把坏数据藏起来：
       `SCORE` 但 `g_score` 是 `NaN`（`NaN > 0` 为假 ⇒ 判白胜）、
       `RESIGN` 但 `g_resign_side == -1`（≠ 0 ⇒ 判黑胜）。
@@ -657,7 +657,7 @@ def scan_corpus(sgf_dirs: Sequence[str] = (), parser: Optional[SGFParser] = None
     个 SGF 就全命中了，不必扫完 17 万局。调用方**不要**指望看到它被就地缩短 ——
     缩短靠的是重新绑定，所以它必须是本函数的局部视图（调用方传一份副本）。
 
-    ⚠ 这里**必须由 `scan_corpus` 自己查**：散列表是它的局部产物，调用方在
+     这里**必须由 `scan_corpus` 自己查**：散列表是它的局部产物，调用方在
     `scan_corpus` 返回之前拿不到它 —— 让调用方闭包捕获 `index` 会永远拿到 `None`。
 
     全量模式传 `None` ⇒ 结果与扫描顺序无关。
@@ -700,7 +700,7 @@ def scan_corpus(sgf_dirs: Sequence[str] = (), parser: Optional[SGFParser] = None
         go = np.concatenate(off_buf)
         is_sig = go < 0                      # 见 SIG_OFFSET
         if is_sig.any():
-            # ⚠ 按**局号的最大值 +1** 定尺寸，不能按批内行数 —— 批里每个局贡献
+            # 按**局号的最大值 +1** 定尺寸，不能按批内行数 —— 批里每个局贡献
             # 21 行（20 前缀 + 1 签名），按行数会把 sig 撑成 21 倍长，尾部全是
             # 未初始化的垃圾（症状是交叉校验随机报「不一致」）。
             need = int(gi[is_sig].max()) + 1
@@ -771,7 +771,7 @@ def scan_corpus(sgf_dirs: Sequence[str] = (), parser: Optional[SGFParser] = None
         score_l.append(ri.score)
         rules_l.append(int(parse_rules(ru)))
         resign_l.append(bool(ri.is_resign))
-        # ⚠ 方向只在这一行能拿到（`ResultInfo.resign_side` 是 None/0/1），
+        # 方向只在这一行能拿到（`ResultInfo.resign_side` 是 None/0/1），
         # 而落盘侧用 -1 表示「非认输」—— 因为 0 在那边有实义（黑认输）。
         resign_side_l.append(-1 if ri.resign_side is None else int(ri.resign_side))
         recls_l.append(cls)
@@ -911,10 +911,10 @@ def build_sidecar(dataset: str, sgf_dirs: Sequence[str], out: str,
     g_rules = np.full(G, RULES_DEFAULT, np.int8)
     g_resign = np.zeros(G, np.bool_)
     g_re = np.full(G, RE_CLASS_UNKNOWN, np.int8)
-    # ⚠ 未匹配的局回落到 `-1`（「非认输」），**不是** 0 —— 0 有实义（黑认输）。
+    # 未匹配的局回落到 `-1`（「非认输」），**不是** 0 —— 0 有实义（黑认输）。
     # 回落成 0 会让 `derive_outcome` 把它们判成黑认输，凭空造出一批标签。
     g_resign_side = np.full(G, -1, np.int8)
-    # ⚠ 左索引是 **slot**（`sidecar[game_ids]` 的下标），右索引才是**语料局号**。
+    # 左索引是 **slot**（`sidecar[game_ids]` 的下标），右索引才是**语料局号**。
     # 两者不是一回事：语料 17 万局、sidecar 16 万局，且 slot 只按升序排。
     # 写反了就是 `IndexError`，或更糟 —— 在大小恰好相同时静默串味。
     sel = sgf_of_best >= 0
@@ -962,7 +962,7 @@ def build_sidecar(dataset: str, sgf_dirs: Sequence[str], out: str,
 
 
 def print_report(rep: Dict[str, object], log: Callable[[str], None] = _log) -> None:
-    """覆盖报告。⚠ **未匹配的局不许静默**：数字必须打在 stdout 上。"""
+    """覆盖报告。 **未匹配的局不许静默**：数字必须打在 stdout 上。"""
     G = int(rep['n_games'])  # type: ignore[arg-type]
     m, u = int(rep['n_matched']), int(rep['n_unmatched'])  # type: ignore[arg-type]
     log('')
@@ -980,7 +980,7 @@ def print_report(rep: Dict[str, object], log: Callable[[str], None] = _log) -> N
     log(f'  锚点段命中      {rep["n_runs_hit"]} 段')
     log(f'                  布局歧义：主锚点 {rep["n_anchor_ambiguous"]} 段 / '
         f'交叉锚点 {rep["n_anchor_ambiguous_cross"]} 段（歧义时取最早那份）')
-    log(f'                  ⚠ 元数据有风险：{rep["n_anchor_multi_game"]} 段的局面被'
+    log(f' 元数据有风险：{rep["n_anchor_multi_game"]} 段的局面被'
         f'**不同的棋**走到 ⇒ 取的未必是本局的 KM/RE/RU')
     log(f'  锚点交叉校验    跨局 {rep["n_anchor_disagree"]} 段 / '
         f'无法判定 {rep["n_anchor_inconclusive"]} 段')
@@ -1027,7 +1027,7 @@ def _load_scan_cache(path: str) -> Tuple[Optional[CorpusScan], Optional[AnchorIn
         scan.rules = z['rules']
         scan.resign = z['resign']
         scan.re = z['re']
-        # ⚠ 这一列**不能**从旧的 `resign`（bool）推出来 —— bool 没有方向。
+        # 这一列**不能**从旧的 `resign`（bool）推出来 —— bool 没有方向。
         # 缺键就抛 KeyError，被下面的 except 吞成 `(None, None)` ⇒ 调用方**重扫**。
         # 宁可重扫一遍 133,604 局，也不能静默填一个方向错乱的默认值。
         scan.resign_side = z['resign_side']

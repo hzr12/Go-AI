@@ -12,7 +12,7 @@
 
 本机可用内存不到 10 GB ⇒ **不分块必然 OOM**。分 8 块后 ≈5.6 GB。
 
-⚠ 那个 14.0 KB/行 与 `uncompressed_bytes_estimate` 算出的 11.9 KB/行 差 19%
+ 那个 14.0 KB/行 与 `uncompressed_bytes_estimate` 算出的 11.9 KB/行 差 19%
 （zip/deflate 工作缓冲 + 对齐 + 页碎片）⇒ `RAM_OVERHEAD_FACTOR = 1.19`。
 **别按未压缩量估**：`--ram-budget-gb` 是唯一能在开跑前拦住"装不下"的闸门，
 按未压缩量估会在临界配置上放行一个必然 OOM 的任务，而 OOM 发生在写了几 GB 之后，
@@ -95,7 +95,7 @@ def test_global_offset_actually_shifts_ownership():
 
 
 def test_offset_must_count_unfiltered_rows():
-    """🔴 分片最经典的错：偏移按**过滤后**的行数推进。
+    """ 分片最经典的错：偏移按**过滤后**的行数推进。
 
     那样每块的全局行号会随自己的过滤结果漂移 ⇒ 有些行落进两块（重复）、
     有些块谁都不落（丢失），而 `a_rows == budget` 那道检查**抓不到**（两边
@@ -189,7 +189,7 @@ def test_subset_labels_is_identity_on_full_index():
 
 
 def test_subset_labels_does_not_touch_same_length_non_row_keys():
-    """⚠ 判据是「第 0 轴长度 == `_kept`」，所以一个**恰好也是 n 行、但不是行轴**
+    """ 判据是「第 0 轴长度 == `_kept`」，所以一个**恰好也是 n 行、但不是行轴**
     的键会被误切。当前 `to_v7_labels` 没有这种键，但这是本函数的隐含假设，
     用测试写明：将来新增键若不满足，行数会与 `_kept` 不符而被写手抓住。"""
     labels = _fake_labels(5, seed=3)
@@ -294,7 +294,7 @@ def test_num_shards_one_is_bit_identical_to_unsharded(tmp_path):
     arch = _archive(str(tmp_path / 'a.tar'))
     convert([(arch, NET_80)], str(tmp_path / 'x.npz'))
     convert([(arch, NET_80)], str(tmp_path / 'y.npz'), num_shards=1, shard_id=0)
-    # ⚠ 一次只能有一个 npz 打开（`NpzFile` 底层是同一个 zip 句柄，第二个
+    # 一次只能有一个 npz 打开（`NpzFile` 底层是同一个 zip 句柄，第二个
     #   `np.load` 会把第一个的句柄置空）—— 先各自读完再比。
     import json
 
@@ -396,7 +396,7 @@ def test_overhead_factor_is_applied_and_documented():
 
 
 def test_writer_docstring_no_longer_claims_peak_is_one_key(tmp_path):
-    """⚠ 防回归：`NpzChunkedWriter` 曾写着"峰值不叠加 ⇒ 峰值 = 最大单键"，
+    """ 防回归：`NpzChunkedWriter` 曾写着"峰值不叠加 ⇒ 峰值 = 最大单键"，
     那是**错的**（实测 44.8 GB vs 最大单键 10.55 GB）。有人照它做优化就会
     把 5.6 GB 的配置当成够用。"""
     doc = s2n.NpzChunkedWriter.__doc__
@@ -407,12 +407,12 @@ def test_writer_docstring_no_longer_claims_peak_is_one_key(tmp_path):
 # --------------------------------------------------------------------------- #
 # 5 · 真实归档（行数均衡 + 划分）
 # --------------------------------------------------------------------------- #
-#: 🔴 真实归档这一档验证的是**偏移算术，不是规模**。全扫 1.5 GB 的
+#: 真实归档这一档验证的是**偏移算术，不是规模**。全扫 1.5 GB 的
 #: ``2026-08-25npzs.tgz`` 实测 152.80 s（本测试一次要扫 3 遍），而
 #: `count_kept_rows` 的返回值与归档有多大无关 ⇒ 每个归档只读前这么多个成员。
 REAL_MEMBER_PROBE = 300
 
-#: ⚠ **限的是「成员数」，不是 `--limit` 的「行数」** —— 这个区别是承重的。
+#: **限的是「成员数」，不是 `--limit` 的「行数」** —— 这个区别是承重的。
 #: `--limit` 命中后把返回值封顶成 `min(kept_shard, limit)`
 #: （`stdata_to_npz.py:993`），于是 `rows_kept_shard` **恒等于 limit**：
 #: 实测 limit ∈ {2000, 8000, 20000} × 3 个 shard_id，`rows_kept_shard` 每次都
@@ -420,7 +420,7 @@ REAL_MEMBER_PROBE = 300
 #: （它唯一还剩的断言 `base > prev_last` 退化成 `limit > 0`）。
 #: 限成员数则让 `limit` 保持 `None`，两个计数都是**未经封顶的真实值**。
 REAL_MEMBER_PROBE_DOC = """\
-⚠ **本测试验证的是「偏移跨归档累加」的逻辑，不是规模。**\
+ **本测试验证的是「偏移跨归档累加」的逻辑，不是规模。**\
 `first_n_members` 把每个归档截到前 %d 个成员（真实归档、真实成员布局不变）。\
 限定成员数**不影响被验证的性质**：`count_kept_rows` 的 `limit` 仍是 `None`，\
 所以 `rows_kept` / `rows_kept_shard` 都不是封顶值，`member_base` 仍按每个成员\
@@ -470,7 +470,7 @@ def test_real_archive_shard_counts_are_balanced():
 # 6 · CLI 的分片参数校验（`--num-shards` / `--shard-id`）
 # --------------------------------------------------------------------------- #
 #: 每一组都必须被拒。`--count-only` 与 `convert` 两条路径对它们的判定必须一致
-#: （🔴 修之前 `--count-only` 只查 shard_id 越界、完全不看 num_shards）。
+#: （ 修之前 `--count-only` 只查 shard_id 越界、完全不看 num_shards）。
 ILLEGAL_SHARD_ARGVS = [
     ['--num-shards', '1', '--shard-id', '0'],   # N=1 ⇒ 那个 --shard-id 是哑参数
     ['--num-shards', '1', '--shard-id', '3'],
@@ -495,7 +495,7 @@ def arch(tmp_path):
 
 
 def test_shard_id_default_is_a_sentinel_not_zero():
-    """🔴 「不分片」与「第 0 块」在 `0` 上无法区分 ⇒ default 必须是 `None`。
+    """ 「不分片」与「第 0 块」在 `0` 上无法区分 ⇒ default 必须是 `None`。
 
     修之前是 `default=0` 配 `if args.shard_id:`（**真值**判断）⇒ `--shard-id 0`
     整个校验被跳过，而 0 恰恰是分块跑时最常用的那一块（第一个分片）。
@@ -525,7 +525,7 @@ def test_resolve_shard_args_rejects_every_illegal_combination(
 
 
 def test_shard_id_zero_is_validated_not_skipped():
-    """🔴 缺陷 1：`--num-shards 1 --shard-id 0` 现在**必须**报错。
+    """ 缺陷 1：`--num-shards 1 --shard-id 0` 现在**必须**报错。
 
     N=1 时 `shard_mask` 原样返回全部行 ⇒ 那个 `--shard-id` 根本不生效，是个哑
     参数；收下它就是再收一个静默无操作参数，而本次要消灭的正是静默降级。
@@ -537,7 +537,7 @@ def test_shard_id_zero_is_validated_not_skipped():
 
 def test_num_shards_below_one_is_an_error_not_a_silent_downgrade(tmp_path,
                                                                  arch, capsys):
-    """🔴 缺陷 2：`--num-shards 0` / `-3` 曾静默降级成不分片，rc=0。
+    """ 缺陷 2：`--num-shards 0` / `-3` 曾静默降级成不分片，rc=0。
 
     报出来的行数是**全量**行数 —— 数字看着完全正常。分片流程的整个前提是
     「各块行数之和 == 全集行数」，这种失败只在最后对数时才发现，而那时已经
@@ -554,7 +554,7 @@ def test_num_shards_below_one_is_an_error_not_a_silent_downgrade(tmp_path,
 
 def test_illegal_shard_args_are_rejected_identically_on_both_paths(tmp_path,
                                                                    arch, capsys):
-    """🔴 缺陷 3：`--count-only` 与 `convert` 必须对同一组参数给出同一判定。
+    """ 缺陷 3：`--count-only` 与 `convert` 必须对同一组参数给出同一判定。
 
     两条路径各写一份校验 —— 一个查一个不查 —— 就是同类漏洞的温床。
     """
@@ -582,7 +582,7 @@ def test_out_of_range_message_keeps_its_wording(tmp_path, arch, capsys):
 
 
 def test_num_shards_without_shard_id_is_rejected(tmp_path, arch, capsys):
-    """🔴 `--num-shards 4` 而不给 `--shard-id` 必须报错。
+    """ `--num-shards 4` 而不给 `--shard-id` 必须报错。
 
     两种「善意默认」都只会在最后对数时才显形：默认第 0 块 ⇒ 用户以为参数没
     生效；默认不分片 ⇒ **声称分 4 块却写出全集**，而输出里的行数完全正常。
@@ -617,7 +617,7 @@ def test_num_shards_one_alone_is_legal_and_equals_no_shard_args(tmp_path, arch,
 
 def test_num_shards_one_with_shard_id_zero_is_rejected_but_convert_allows_it(
         tmp_path, arch, capsys):
-    """🔴 裁决只加在 **CLI 层**：函数层 `convert(num_shards=1, shard_id=0)`
+    """ 裁决只加在 **CLI 层**：函数层 `convert(num_shards=1, shard_id=0)`
     仍然合法且与不分片逐位相同（见 `test_num_shards_one_is_bit_identical_to_
     unsharded`）—— 函数层用签名默认值 `shard_id=0` 表达「默认第 0 块」，那里
     没有「未给」这个状态，CLI 才有，所以只有 CLI 需要区分。"""
@@ -633,7 +633,7 @@ def test_num_shards_one_with_shard_id_zero_is_rejected_but_convert_allows_it(
 
 
 def test_shard_zero_is_still_the_first_shard_end_to_end(tmp_path, arch, capsys):
-    """🔴 改成 sentinel 之后，第 0 块必须**仍然**被当作「第 0 块」跑。
+    """ 改成 sentinel 之后，第 0 块必须**仍然**被当作「第 0 块」跑。
 
     修法有个陷阱方向：`--shard-id` 变成 `None` 之后若忘了把归一化值喂下去，
     `--shard-id 0` 会悄悄退化成不分片 ⇒ 第 0 块变成全集，而报告依然正常。
@@ -653,7 +653,7 @@ def test_shard_zero_is_still_the_first_shard_end_to_end(tmp_path, arch, capsys):
 def test_both_paths_receive_the_same_normalized_shard_args(tmp_path, arch,
                                                            monkeypatch,
                                                            capsys):
-    """🔴 `--count-only` 与 `convert` 必须收到**同一对**归一化参数。
+    """ `--count-only` 与 `convert` 必须收到**同一对**归一化参数。
 
     不靠「跑出来行数一样」这种间接判据：直接录下两条路径各自收到的
     ``(num_shards, shard_id)``。否则哪天有人在其中一条分支里改回
@@ -676,7 +676,7 @@ def test_both_paths_receive_the_same_normalized_shard_args(tmp_path, arch,
     for argv, want in (
             ([], (1, 0)),                                 # 不分片
             (['--num-shards', '1'], (1, 0)),             # 显式 1 = 不分片
-            (['--num-shards', '8', '--shard-id', '0'], (8, 0)),   # 🔴 第 0 块
+            (['--num-shards', '8', '--shard-id', '0'], (8, 0)), # 第 0 块
             (['--num-shards', '8', '--shard-id', '7'], (8, 7)),
     ):
         seen.clear()
@@ -688,7 +688,7 @@ def test_both_paths_receive_the_same_normalized_shard_args(tmp_path, arch,
 
 
 def test_convert_rejects_non_positive_num_shards(tmp_path, arch):
-    """🔴 `convert` 里的 `max(1, ...)` 降级：CLI 修好之后它对 CLI 已不可达，
+    """ `convert` 里的 `max(1, ...)` 降级：CLI 修好之后它对 CLI 已不可达，
     但直接调 `convert()` 的代码仍会中招（而且 `meta['shard']` 还会把
     num_shards 记成 1，看起来完全正常）⇒ 函数层也必须报错。"""
     for nsh in (0, -3):
@@ -888,7 +888,7 @@ def test_cli_convert_all_does_not_require_shard_id(tmp_path, capsys,
                                                    monkeypatch):
     """一条命令跑完 ⇒ 不得报「少了 --shard-id」。
 
-    ⚠ ``--convert-all`` 自己遍历 0..N-1，所以**不该**过 ``resolve_shard_args``
+     ``--convert-all`` 自己遍历 0..N-1，所以**不该**过 ``resolve_shard_args``
       那条「N>=2 必须配 --shard-id」的三态表。但 ``num_shards`` 本身的合法性
       仍要查（``--num-shards 0`` 必须报错，不能静默变成不分片）。
     """

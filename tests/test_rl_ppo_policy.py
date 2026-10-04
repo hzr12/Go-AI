@@ -402,7 +402,7 @@ def test_train_epochs_source_wires_ppo_only():
     assert '_compute_advantage(' in src, "A 未走 _compute_advantage（z - v_old）"
     assert '_adapt_kl_coef(' in src, "缺 β 自适应"
     assert '2.0 * kl_target' in src, "缺 2×kl-target 提前中止条件"
-    # 旧实现残留 = 变异红。⚠ 'logq' 这一格在 2026-09-30 **反转**：B2 之后 logq
+    # 旧实现残留 = 变异红。 'logq' 这一格在 2026-09-30 **反转**：B2 之后 logq
     # 正是该出现在训练循环里的东西（旧的 CE 回归才是「logq 残留」）。现在要防的
     # 反面是「B2 被悄悄摘掉」—— 即 logq 采到了却没进 policy loss。
     assert 'F.mse_loss' not in src, "策略侧回退成 MSE 回归"

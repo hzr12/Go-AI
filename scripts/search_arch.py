@@ -19,7 +19,7 @@
                  **真正被反向保留**的张量总量，因此天然正确反映
                  gradient checkpointing（backbone 开了 checkpoint 后
                  只保留块输入，value head 未开则全量保留）。
-                 ⚠ 检查点的**语义由本探针钉死**（见 measure 的
+                  检查点的**语义由本探针钉死**（见 measure 的
                  use_checkpoint 参数）：主干的 checkpoint 实现怎么改，
                  计量口径都不动——否则 k 标定会随实现漂移。
 
@@ -280,7 +280,7 @@ def calib_factor():
 def project(cfg, batch, anchor=ANCHOR, in_channels=12):
     """给出某配置在目标 batch 下的预测指标（in_channels 默认 12，零回归）。
 
-    ⚠ 返回值的**口径分两类**，引用时不能混为一谈：
+     返回值的**口径分两类**，引用时不能混为一谈：
     * **本机实测**：params（sum(p.numel())）、flops（batch=1 forward hook）；
     * **自 v18 锚点外推（误差未知）**：act_gb（探针实测保留字节 × batch 线性
       外推 × calib_factor() 单点标定）、total_gb（act + 常驻开销）、step_s

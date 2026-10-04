@@ -87,7 +87,7 @@ def test_parse_result(re_str, score, is_draw, is_resign):
 
 
 def test_parse_result_distinguishes_draw_from_absent():
-    """⚠ 和棋与「无结果」**必须**能分开 —— 这是 `ResultInfo` 存在的全部理由。
+    """ 和棋与「无结果」**必须**能分开 —— 这是 `ResultInfo` 存在的全部理由。
 
     两者的 `score` 都是 0.0 / None 的组合不同：`is_draw` 是唯一判据。若实现退回
     「score=None 表示一切未知」，训练侧就无法把和棋（合法终局）从残局里摘出来。
@@ -129,7 +129,7 @@ def test_game_record_exposes_result_info_and_rules():
 
 
 def test_game_record_komi_missing_is_distinguishable_from_7_5():
-    """⚠ `GameRecord.komi` 默认值是 7.5，所以「没有 KM」与「KM[7.5]」在 `komi`
+    """ `GameRecord.komi` 默认值是 7.5，所以「没有 KM」与「KM[7.5]」在 `komi`
     上不可区分。sidecar 的 `g_komi` 约定「缺失填 0」，靠的必须是 `has_komi`。"""
     a = parse_sgf_string('(;SZ[19];B[dd];W[pp])')
     b = parse_sgf_string('(;SZ[19]KM[7.5];B[dd];W[pp])')
@@ -162,7 +162,7 @@ def test_parse_rules_missing_defaults_to_area():
 
 
 def test_parse_rules_only_bit0_is_ever_set():
-    """⚠ **tax / ko / suicide / button 这四位在当前语料里无来源**，必须恒为 0。
+    """ **tax / ko / suicide / button 这四位在当前语料里无来源**，必须恒为 0。
 
     不是「碰巧没测到」而是结构性的：实测 45% 有 `RU` 的局里只有 `Chinese` 与
     `Japanese` 两个取值，`RU` 是单个词，压根没提到税/劫/自杀/还子。所以 `g_rules`
@@ -202,7 +202,7 @@ def _sgf(n_moves, km=None, re_str='B+R', ru=None, seed=0, illegal_last=False,
          pts=None):
     """造一局 19 路 SGF。
 
-    ⚠ **`seed` 必须让每局的落子序列真的不同**：同一条确定性序列造出来的多局在每个
+     **`seed` 必须让每局的落子序列真的不同**：同一条确定性序列造出来的多局在每个
     手数上都落在同一局面，于是 ply-20 锚点**互相匹配** —— 匹配率 100% 但元数据
     全串到同一局上，测试反而测不出「对上正确的 SGF」。所以按 seed 从格点里随机取序
     （仍然两两不相邻 ⇒ 全部合法）。
@@ -236,7 +236,7 @@ def _write_sgf(path, text):
 def _build_npz(sgf_dir, out_npz):
     """用**真实的** `build_dataset.build` 从 SGF 目录造一个小 npz。
 
-    ⚠ 必须走真代码：`contiguous_runs` / `anchor_rows` 的语义（行 `i` = 已走满
+     必须走真代码：`contiguous_runs` / `anchor_rows` 的语义（行 `i` = 已走满
     `i` 手、id 可以复用）都是 `build_dataset` 决定的，自己手搓 npz 会把
     待测契约一起改掉。
     """
@@ -314,7 +314,7 @@ def test_sidecar_dtypes_match_spec(tiny):
     assert z['g_resign'].dtype == np.bool_
     assert z['g_re'].dtype == np.int8
     assert z['g_resign_side'].dtype == np.int8
-    # ⚠ A 阶段的硬 outcome 标签要靠 `g_re`（RE 四分类）+ `g_resign_side`（谁认输），
+    # A 阶段的硬 outcome 标签要靠 `g_re`（RE 四分类）+ `g_resign_side`（谁认输），
     # 光有 `g_resign`（bool）定不出方向 ⇒ 这两列是**必须**的，不是可选的冗余。
     # 契约见 `tests/test_sidecar_re_labels.py` 与 `derive_outcome`。
     assert set(z.files) == {'g_komi', 'g_score', 'g_rules', 'g_resign',
@@ -378,7 +378,7 @@ def test_anchor_is_immune_to_game_id_reuse(tmp_path):
 
 
 def test_anchor_crosscheck_flags_a_run_that_spans_two_games(tmp_path):
-    """⚠ id 复用的**危险变体**：该段跨了两局，必须**报出来**。
+    """ id 复用的**危险变体**：该段跨了两局，必须**报出来**。
 
     `broken` 留下 15 行（走满 14 手后第 15 手非法 ⇒ 15 行已 append），`good_a` 有
     40 行 ⇒ 同一个 `game_id` 的段长 55。主锚点 `a1 = min(20, 55//2) = 20` 落在
@@ -449,7 +449,7 @@ def test_unmatched_game_is_nan_not_garbage(tmp_path):
     assert rep['match_rate'] == 2 / 3
     assert rep['n_games'] == 3
 
-    # ⚠ **`g_score` 是 NaN 有两个来源，必须分开看**：认输（matched 但无分差）与
+    # **`g_score` 是 NaN 有两个来源，必须分开看**：认输（matched 但无分差）与
     # 未匹配（连贴目都不知道）。这里三局的贴目都非 0，所以 `g_komi == 0` 唯一地
     # 标出未匹配的那一局。
     a, b = (int(np.flatnonzero(z['g_komi'] == v)[0]) for v in (7.5, 5.5))
@@ -470,7 +470,7 @@ def test_unmatched_game_is_nan_not_garbage(tmp_path):
 
 
 def test_report_prints_unmatched_count(tmp_path, capsys):
-    """⚠ 覆盖报告**必须**把未匹配数打在 stdout 上（「不静默填垃圾」）。"""
+    """ 覆盖报告**必须**把未匹配数打在 stdout 上（「不静默填垃圾」）。"""
     full = tmp_path / 'sgf_all'
     _write_sgf(str(full / 'a.sgf'), _sgf(40, km='7.5', re_str='B+2.5', seed=21))
     _write_sgf(str(full / 'b.sgf'), _sgf(40, km='5.5', re_str='W+R', seed=22))
@@ -486,7 +486,7 @@ def test_report_prints_unmatched_count(tmp_path, capsys):
 
 
 def test_sidecar_slot_order_follows_game_id_not_corpus_order(tmp_path):
-    """⚠ **slot 下标与语料局号不是一回事**，写反了会静默串味。
+    """ **slot 下标与语料局号不是一回事**，写反了会静默串味。
 
     这里让两者**故意错开**：语料里多一个 `aa_extra.sgf`，它的 `RE[]` 让
     `parse_result_to_value` 返回 `None` ⇒ `build_dataset` 拒收它 ⇒ 它进了语料
@@ -548,7 +548,7 @@ def test_corpus_scan_covers_tgz_and_plain_files(tmp_path):
 
 
 def test_plan_sources_dedupes_overlapping_dirs(tmp_path):
-    """⚠ 默认的 `--sgf-dirs` 是 `["data", "data/games/games"]`，后者就在前者底下。
+    """ 默认的 `--sgf-dirs` 是 `["data", "data/games/games"]`，后者就在前者底下。
 
     不去重就会把 133,604 个 SGF 扫两遍 ⇒ 散列表出现重复项、匹配率报告失真。
     """
@@ -561,7 +561,7 @@ def test_plan_sources_dedupes_overlapping_dirs(tmp_path):
 
 
 def test_anchor_crosscheck_does_not_false_alarm_on_a_shared_opening(tmp_path):
-    """⚠ 交叉锚点命中**多个局**不是「跨局」，是**布局歧义** —— 两者必须分开。
+    """ 交叉锚点命中**多个局**不是「跨局」，是**布局歧义** —— 两者必须分开。
 
     真实语料里同一个常见布局（实测 `--limit-games 50` 探针的偏移 10）被 **4~10 个
     不同的局**走到。若拿「第一条命中」去比主锚点，就会把这些**布局歧义**误报成
@@ -599,7 +599,7 @@ def test_anchor_crosscheck_does_not_false_alarm_on_a_shared_opening(tmp_path):
 
 
 def test_distinct_signature_counts_separates_duplicates_from_different_games():
-    """⚠ `counts > 1`（有副本，无害）与「签名 > 1」（**不同的棋**，元数据可能挂错）
+    """ `counts > 1`（有副本，无害）与「签名 > 1」（**不同的棋**，元数据可能挂错）
     是两件事，必须能分开数 —— 否则报告里那个数没有行动价值。"""
     idx = B.AnchorIndex()
     idx.n_sgf = 4
@@ -615,7 +615,7 @@ def test_distinct_signature_counts_separates_duplicates_from_different_games():
 
 
 def test_dataset_npz_is_opened_read_only(tiny, tmp_path):
-    """⛔ 主数据集必须纯只读。比对运行前后的 sha256。"""
+    """ 主数据集必须纯只读。比对运行前后的 sha256。"""
     _tmp, npz, sgf_dir, _ = tiny
     before = hashlib.sha256(open(npz, 'rb').read()).hexdigest()
     B.build_sidecar(npz, [str(sgf_dir)], str(tmp_path / 'games.npz'),
@@ -671,7 +671,7 @@ def test_replay_prefixes_match_dataset_rows(tiny):
     pb, tp, kp, offs = B.replay_anchor_positions(game)
     assert offs.tolist() == list(range(1, 21))
     # 散列逐位相等（比逐行比数组更直接地测「两侧口径一致」）。
-    # ⚠ 对齐关系：数据行 `i` = **已走满 i 手**的局面（`build_dataset.py:303` 先
+    # 对齐关系：数据行 `i` = **已走满 i 手**的局面（`build_dataset.py:303` 先
     # append 盘面再 `play()`），所以 SGF 侧的第 k 个前缀对上数据行 **k**，行 0 是空枰。
     h_ds = B.pos_hash_block(boards, to_play, ko)
     h_sgf = B.pos_hash_block(pb, tp, kp)

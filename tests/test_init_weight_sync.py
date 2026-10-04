@@ -12,7 +12,7 @@
 `shell/train_sft_npu_4card_v21.sh` 不传 `--resume`/`--model` ⇒ from-scratch
 ⇒ 当时 `SHARD_GRAD_OP` 的第一步 all-gather 把 4 份不同的随机权重拼成一个逻辑权重。
 
-⚠ 换轨（2026-10-01，FSDP1 → DDP）**没有作废这个 bug，也没有作废 Task 1 的修复**：
+ 换轨（2026-10-01，FSDP1 → DDP）**没有作废这个 bug，也没有作废 Task 1 的修复**：
 DDP 的 `DistributedDataParallel.__init__` 在**它自己构造时**也会把 rank0 的
 params/buffers 广播出去（`_ddp_init_helper` → `_sync_module_states`），而那个构造点
 在 EMA 构造**之后** —— 依赖它会让 rank1~3 的 EMA shadow 抓住各自被丢弃的随机权重，
@@ -66,7 +66,7 @@ commit**，不是当前文件。下次改 `train_sft.py` 后右列会变，**左
 既有的 `_main_body_calls`（见下方 §`坐标约定`）。这与 `test_dist_wrap.py` 里
 `_ddp_construct_calls()` 的做法一致。
 
-⚠ 相对实现计划的一处修正（是**原测试自己不可满足**，不是削弱断言）
+ 相对实现计划的一处修正（是**原测试自己不可满足**，不是削弱断言）
 ------------------------------------------------------------------
 `test_broadcast_covers_every_parameter_once` 原本用
 `torch.nn.Linear(4, 3, bias=True)` 并注释「3 个参数张量」、断言
@@ -162,7 +162,7 @@ def test_sync_call_precedes_dist_wrap():
     `isinstance(n.func, ast.Name) and n.func.id == fname`，且**限定在 `main()`
     子树**，所以 helper 里的引用不会被算进来。
 
-    ⚠ 判据本身（`sync < wrap`）**没有**因为换轨而放宽：2026-10-01 之前这里锚的是
+     判据本身（`sync < wrap`）**没有**因为换轨而放宽：2026-10-01 之前这里锚的是
     已删除的 `_wrap_fsdp1(`。之所以还要单独钉这一条（而不只靠
     `sync < EMA < wrap` 传递推出），是因为它是**不依赖其它测试文件**的直接断言 ——
     `EMA < wrap` 那半条在 `tests/test_dist_wrap.py` 里，两边任一被改坏都能定位到。
@@ -403,7 +403,7 @@ def test_checksum_depends_on_every_parameter():
     · 「`acc + s * 0.5`」⇒ 实得期望值的一半；
     · 「`acc + s.abs()`」⇒ 实得**正**的绝对值。
 
-    ⚠ 偏移量取**负数**是刻意的：`_ThreeParam` 的基线是全 0，若用 `+1.0` 则所有输入
+     偏移量取**负数**是刻意的：`_ThreeParam` 的基线是全 0，若用 `+1.0` 则所有输入
     非负，`abs()` 变成恒等 —— 符号不敏感的 checksum 就混过去了，而它会放过一个
     「权重恰好是 rank0 取负」的 rank。负偏移让 abs()/取负类变异无处躲。
 
@@ -412,7 +412,7 @@ def test_checksum_depends_on_every_parameter():
     """
     mod = _load_module()
     dtype, base = _captured_checksum(mod, _ThreeParam())
-    # ⚠ fp32 不是「精度没写对」，是 **910A 没有 fp64**（2026-10-01 云端实测：
+    # fp32 不是「精度没写对」，是 **910A 没有 fp64**（2026-10-01 云端实测：
     #   `Device do not support double dtype now` + AICPU kernel 挂掉）。见下面
     #   `test_checksum_contract_after_losing_fp64`。期望值 −4 / −15 / −1 在
     #   **fp32 里也是精确整数**，所以下面所有 `==` 判定仍然严格，无需容差。

@@ -308,7 +308,7 @@ def test_outcome_three_way_from_winrates():
 def test_outcome_is_to_play_view_and_black_view_flips():
     """`outcome` 是 **to_play 视角**；`outcome_black` 在白走时两个结论互换。
 
-    ⚠ 不能写 `outcome * to_play`：`0 * -1 == 0`，会把「白胜」也报成「黑胜」。
+     不能写 `outcome * to_play`：`0 * -1 == 0`，会把「白胜」也报成「黑胜」。
     """
     bs = 9
     data = _toy_dataset(bs=bs, game_lens=(4,), seed=8)

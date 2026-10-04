@@ -127,7 +127,7 @@ def infer_value_head(state):
     键给 None，调用方据此跳过重建）。
 
     - `value_channels`：`value.downsample.0.weight` 的 out 维。两代都在，形状
-      不会说谎。⚠ 旧实现查的是 `value.value_head.0.weight` —— 那个键**两代都
+      不会说谎。 旧实现查的是 `value.value_head.0.weight` —— 那个键**两代都
       不存在**（value 头一直是 `downsample` Sequential + 残差块 + `fc`），
       所以过去这条推断等于没跑，value_channels 恒为默认 64。
     - `value_res_blocks`：`res_blocks.N` 的最大 N+1（旧命名 `resN` 折成 N-1）。
@@ -331,7 +331,7 @@ class GoAI:
         )
         self.model = _build_for_in_channels(self.in_channels, **net_kwargs).to(
             self.device)
-        # ⚠ 这里就进 eval，别等下面那行 —— torch.compile 的 warmup 前向在
+        # 这里就进 eval，别等下面那行 —— torch.compile 的 warmup 前向在
         # `self.model.eval()`（下面）**之前**就跑，而训练出来的模型可能带 grad
         # checkpointing（train_sft 默认开）：GC 只在 training 态生效，warmup 时
         # 模型默认 training=True 会让 compile 撞上 GC 互斥守卫并静默回退 eager
@@ -651,7 +651,7 @@ class GoAI:
                 # 失败模式 F5：MCTS 5 元组路径喂进来的预计算特征通道数与模型不符。
                 # 17ch 模型配现行 MCTS（那边还钉着 n_channels=12）就会落在这里。
                 #
-                # ⚠ `src/search/mcts.py:905` 那个预取 worker 用
+                # `src/search/mcts.py:905` 那个预取 worker 用
                 # `except Exception: prefetch_leaf.prefetch = None` 吞掉本异常
                 # —— **不要**把它「修」成只捕获特定异常或去掉：那层 except 存在的
                 # 理由是预取失败必须退回同步评估（叶子随后会在 evaluate 路径上重新

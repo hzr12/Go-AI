@@ -299,7 +299,7 @@ def test_policy_dense_from_sparse_renormalizes():
 def test_sparse_policy_accepted_as_labels(lossf):
     """标签给稀疏 (idx, val) 时走 densify。
 
-    ⚠ 与稠密给法**不会**逐位相等：top-16 截断丢了尾部质量，重归一化后仍是
+     与稠密给法**不会**逐位相等：top-16 截断丢了尾部质量，重归一化后仍是
     另一个合法分布。这里用**尖峰**分布做 fixture（真实 visit 分布是尖的；
     362 维随机 softmax 是近似均匀的，top-16 只能覆盖 4% —— 拿它当 fixture
     会得到一个「K=16 太小」的错误结论），并断言残留 < 1%，兼作 K 的哨兵。
@@ -307,7 +307,7 @@ def test_sparse_policy_accepted_as_labels(lossf):
     out = _out()
     lb = _labels()
     # 几何衰减的 visit 分布（0.7^i 归一化）：真实 MCTS 分布的尾部是衰减的，
-    # top-16 能覆盖 99.6%。⚠ 不能用「尖峰 + 平尾」做 fixture：0.6 的质量摊在
+    # top-16 能覆盖 99.6%。 不能用「尖峰 + 平尾」做 fixture：0.6 的质量摊在
     # 359 个着法上时，每个只有 0.0017，**任何** K=16 都捞不回来，会得到一个
     # 「K 太小」的错误结论。
     decay = torch.tensor([0.7 ** i for i in range(ACTION_SIZE)])

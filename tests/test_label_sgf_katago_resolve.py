@@ -50,7 +50,7 @@ def test_is_appimage_detects_type2(tmp_path):
 
 
 def test_is_appimage_rejects_plain_elf(tmp_path):
-    """⚠ 关键：AppImage 本身就是 ELF。只查 ELF 魔数会把两者当成同一个东西 ——
+    """ 关键：AppImage 本身就是 ELF。只查 ELF 魔数会把两者当成同一个东西 ——
     这正是当初只校验「是 ELF」就发包、结果在目标环境跑不起来的原因。"""
     assert L.is_appimage(_fake_plain_elf(tmp_path / "katago")) is False
 
@@ -88,7 +88,7 @@ def test_resolve_uses_apprun_when_already_extracted(tmp_path):
 
 
 def test_resolve_collects_bundled_libdirs(tmp_path):
-    """⚠ libzip 假警报的修复点：捆绑 so 的目录必须被收集出来交给 ldd。"""
+    """ libzip 假警报的修复点：捆绑 so 的目录必须被收集出来交给 ldd。"""
     exe = _fake_appimage(tmp_path / "katago")
     root = tmp_path / "squashfs-root"
     (root / "usr" / "lib").mkdir(parents=True)
@@ -143,7 +143,7 @@ def test_missing_libs_parses_not_found(monkeypatch):
 @pytest.mark.skipif(not sys.platform.startswith("linux"),
                     reason="需要 ldd")
 def test_missing_libs_passes_appimage_libdirs_to_ldd(monkeypatch):
-    """⚠ 假警报修复：必须把 libdirs 拼进 LD_LIBRARY_PATH 再跑 ldd，
+    """ 假警报修复：必须把 libdirs 拼进 LD_LIBRARY_PATH 再跑 ldd，
     否则 AppImage 自带的 libzip 会被报成缺失。"""
     seen = {}
 

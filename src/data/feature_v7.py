@@ -19,7 +19,7 @@
     「(空点 q, 邻子 p, 块号 g)」按 4 个方向拆成 4 张表后按**块号**去重，
     **每个 (q, g) 关联只数一次**。
 
-⚠ **不要在本模块里另写一份块气算法。** 17 通道的 ch10/11/14/15（「己/敌 × 气 1/2」）
+ **不要在本模块里另写一份块气算法。** 17 通道的 ch10/11/14/15（「己/敌 × 气 1/2」）
 与 V7 的 ch3/4/5（「不分色的 气 1/2/3」）是**同一个量的不同切片**，共享实现才能
 保证两条路径逐位相同。仓库里已经吃过一次「同一口径写两遍」的亏：
 `go_rules.py:170-177` 记着入射计数口径的一次真 bug（U 形块被多算 ⇒ 通道 10/11 与
@@ -40,7 +40,7 @@ ch3/4 与 17 通道的 ch10/11|ch14/15 逐位对拍，把这个契约钉住。
   · 19 维全局特征 —— `global_features_v7`（spec §2.3）；
   · 历史门控的**唯一**解析点 —— `resolve_ladder_boards`。
 
-⚠ **`history_gated` 与 `ladder_channels` 内部的那份门控不是两份口径**：
+ **`history_gated` 与 `ladder_channels` 内部的那份门控不是两份口径**：
   两者是同一条官方原文的两种触发方式（`history_gated` 供只想拿盘面的调用方
   用；`ladder_channels` 自己那份是为了保住 `pb is b` / `p2b is pb` 的快路径）。
   装配层**只经 `resolve_ladder_boards` 解析一次**，绝不第三次推导 ——
@@ -105,7 +105,7 @@ LADDER_CH_BASE = 14
 HISTORY_MOVES = 5
 
 # ---- `rules_flags` 位定义（spec §2.5 的三个分支）------------------------------
-# ⚠ **这不是 KataGo 的 `Rules` 对象**，是把「计分方式 × 税收方式」压进一个 int，
+# **这不是 KataGo 的 `Rules` 对象**，是把「计分方式 × 税收方式」压进一个 int，
 #   供本仓的预取器从局表 `g_rules`（SGF `RU`）直接喂。
 #   bit0 = 计分方式：0=AREA / 1=TERRITORY
 #   bit1..2 = 税收方式：0=NONE / 1=SEKI / 2=ALL
@@ -159,7 +159,7 @@ def liberties_123(boards, to_play=None):
       · `label` 释放 GIL，而 union-find 在纯 numpy/Python 里要么退化成 Python 循环
         （拿不到批量加速），要么自己写一套带路径压缩的迭代版本（代码量与出错面
         都远大于收益）。
-      · ⚠ **未登记依赖**：`requirements.txt` 里**没有** `scipy`，但 `go_rules.py`
+      · **未登记依赖**：`requirements.txt` 里**没有** `scipy`，但 `go_rules.py`
         已经在 import 它。本模块沿用现状（不新增依赖类别），但这是一个应该补的
         记账缺口 —— 见任务报告。
 
@@ -168,7 +168,7 @@ def liberties_123(boards, to_play=None):
             +1=黑，`go_rules.GoBoard.board` 同）。
         to_play: `(B,)` ±1。**不参与取值** —— ch3/4/5 不分色，见下方警告。
 
-    ⚠ **`to_play` 为什么是摆设**：V7 的 ch3/4/5 是**不分色**的气桶（一组三格，
+     **`to_play` 为什么是摆设**：V7 的 ch3/4/5 是**不分色**的气桶（一组三格，
     不是六格），本仓的 npz 侧只有 `boards` 就够算。保留这个形参是为了和
     `feature_planes_batched` 的调用点同形；**它既不读也不校验**。
     真正「分色」的气桶在 17 通道里是 ch10/11（气 1）与 ch14/15（气 2），
@@ -249,7 +249,7 @@ def history_five(boards, my_hist, op_hist, to_play=None):
     out = np.zeros((B, HISTORY_MOVES, n, n), dtype=bool)
     upper = n * n
     for ch in range(HISTORY_MOVES):
-        # ⚠ 交错顺序取自 `_HISTORY_SLOTS`（模块级唯一定义），**不是在这里重写一遍**
+        # 交错顺序取自 `_HISTORY_SLOTS`（模块级唯一定义），**不是在这里重写一遍**
         #   —— 全局 ch0..4（pass 标志）要用同一份顺序。见该常量的注释。
         col = _history_move(my, op, ch)
         valid = (col >= 0) & (col < upper)
@@ -281,7 +281,7 @@ def history_gated(prev_board, prev_prev_board, boards, offset=LADDER_CH_BASE):
 
     ⇒ history=0 时 **ch15 == ch14**、**ch16 == ch15**；
       history=1 时 **ch16 == ch15**。
-    ⚠ 关键在**第二行回退到 `prevBoard` 而不是回退到 `board`**：history=1 时
+     关键在**第二行回退到 `prevBoard` 而不是回退到 `board`**：history=1 时
       prevPrev 复制的是 prev，不是当前盘。把第二行写成「< 2 ? board : ...」会在
       history=1 上给出错误（当前盘而非前一手盘）的 ch16 —— 这是这条规则唯一的坑。
 
@@ -293,7 +293,7 @@ def history_gated(prev_board, prev_prev_board, boards, offset=LADDER_CH_BASE):
         prev_board: `(B,n,n)` 或 `None`（= 邻行 gather 失败/这一行没有上一手）。
         prev_prev_board: `(B,n,n)` 或 `None`。
         offset: ladder 块的基通道号，必须是 `LADDER_CH_BASE`(14)。
-            ⚠ **它不参与取值**（回退只看两个入参是不是 `None`），只是把「这三块
+             **它不参与取值**（回退只看两个入参是不是 `None`），只是把「这三块
             盘面对应 ch14/15/16」这条约定钉在签名上，让调用点自解释；
             传别的值直接报错，免得出现「算对了却写进了错的通道」这种静默错。
 
@@ -318,7 +318,7 @@ def history_gated(prev_board, prev_prev_board, boards, offset=LADDER_CH_BASE):
         return arr
 
     prev = _resolve(prev_board, cur, 'prev_board')
-    # ⚠ 第二级回退的兜底是 `prev`（**不是** `cur`）—— 见 docstring 的坑。
+    # 第二级回退的兜底是 `prev`（**不是** `cur`）—— 见 docstring 的坑。
     prev_prev = _resolve(prev_prev_board, prev, 'prev_prev_board')
     return GatedBoards(prev, prev_prev)
 
@@ -328,7 +328,7 @@ def history_gated(prev_board, prev_prev_board, boards, offset=LADDER_CH_BASE):
 # --------------------------------------------------------------------------- #
 #: 4 邻域的四个偏移（`(dr, dc)`），顺序与官方 `board.cpp` 的 `adj_offsets`
 #: （`board.cpp:39-42`：`{-(x_size+1), -1, +1, x_size+1}`）一致。
-#: ⚠ 只在**本模块的私有 helper** 里用；不要拿去改 `go_rules._NB4` 之类。
+#: 只在**本模块的私有 helper** 里用；不要拿去改 `go_rules._NB4` 之类。
 _NB4_DIRS = ((-1, 0), (1, 0), (0, -1), (0, 1))
 
 
@@ -339,7 +339,7 @@ def _shift4(a, dr, dc):
     而棋盘的边界外是「没有邻点」⇒ 必须是 0。环绕会让边界上的 vital / dame
     判定读到对面的子，是静默错。
 
-    ⚠ 第 0 轴（batch）**不**动：`_STRUCT3` 与本函数都保证样本间不互串。
+     第 0 轴（batch）**不**动：`_STRUCT3` 与本函数都保证样本间不互串。
     """
     out = np.zeros_like(a)
     src = [slice(None), slice(None), slice(None)]
@@ -368,10 +368,10 @@ def _vital_pairs(b, rid, nreg, pc, nchain, suicide_legal):
         `(区域号, 链号)` 对（**只含 vital 的对**），`vital_count[c]` 是链 `c`
         的 vital 区域数（官方 `vitalCountByPlaHead`）。
 
-    ⚠ **去重必须按「(点, 链)」而不是按「(区域, 链)」**。同一个空点可能在两个方向
+     **去重必须按「(点, 链)」而不是按「(区域, 链)」**。同一个空点可能在两个方向
       上都邻接同一条链（U 形眼是常态），按 `(区域, 链)` 去重会把它数成 2 ⇒
       那个区域被判成 vital ⇒ 一条本该判死的链被判活。这是本函数唯一的坑。
-    ⚠ **`suicide_legal=False` 时只过滤空点**（`board.cpp:2036`：
+     **`suicide_legal=False` 时只过滤空点**（`board.cpp:2036`：
       `if(isVlenNonZero && (isMultiStoneSuicideLegal || colors[loc] == C_EMPTY))`）——
       区域里混着的**对方子**不参与过滤。官方训练数据两种规则都有
       （`configs/training/gatekeeper1.cfg:35` 的 `multiStoneSuicideLegals = false,true`）。
@@ -396,7 +396,7 @@ def _vital_pairs(b, rid, nreg, pc, nchain, suicide_legal):
     pt = pt_ch // width
     ch = pt_ch - pt * width
     # 第二步：按 (区域, 链) 聚合计数，与区域大小比 ⇒ 是否「每个点都邻接」。
-    # ⚠ 分母必须是**参与过滤的点数**，不是区域总点数：官方 `board.cpp:2036` 的
+    # 分母必须是**参与过滤的点数**，不是区域总点数：官方 `board.cpp:2036` 的
     #   `if(isVlenNonZero && (isMultiStoneSuicideLegal || colors[loc] == C_EMPTY))`
     #   意味着 suicide 不合法时**区域里的对方子不施加任何约束** —— 那颗子被跳过，
     #   根本不进 `vitalForPlaHeadsLists` 的过滤。拿总点数当分母会让「含对方子的
@@ -419,7 +419,7 @@ def _area_for_pla(b, pc, nchain, pla, suicide_legal, result):
     **就地**写 `result`（`board.cpp:1949-2244`）。
 
     `pc` 是 pla 侧的全局链号（`(B,n,n)` int32，1..nchain，其余 0）。
-    ⚠ **`result` 是跨两次调用共享的同一个缓冲**：官方是
+     **`result` 是跨两次调用共享的同一个缓冲**：官方是
       `calculateAreaForPla(P_BLACK,…)` 写完，再 `calculateAreaForPla(P_WHITE,…)`
       在**同一块** `area` 上接着写（`board.cpp:1861-1862`）。
       `:2233` 的 `result[cur]==C_EMPTY` 守卫（`board.cpp:2237`）正是靠这个
@@ -428,7 +428,7 @@ def _area_for_pla(b, pc, nchain, pla, suicide_legal, result):
     opp = -pla
     nonpla = (b == 0) | (b == opp)
     rid, nreg = _ndi_label(nonpla, structure=_STRUCT3)
-    # 🔴 区域**只能从空点起头**（`board.cpp:2083-2086`：`colors[loc] != C_EMPTY`
+    # 区域**只能从空点起头**（`board.cpp:2083-2086`：`colors[loc] != C_EMPTY`
     #   那一支只更新 `atLeastOnePla` 然后 `continue`）。`scipy.ndimage.label` 会
     #   老老实实把「被本方子四面围住的一颗对方子」也标成一个 1 点区域，而官方
     #   根本不产生这个区域 —— 后果不是「多一个无用区域」，而是那个区域
@@ -466,7 +466,7 @@ def _area_for_pla(b, pc, nchain, pla, suicide_legal, result):
         # `borders_non_pass_alive` 是**按区域号**的表，写入要落到号上
         newly_bordered_rids = np.unique(rid[just_bordered])
         borders_non_pass_alive[newly_bordered_rids] = True
-        # ⚠ 必须拿**区域号**去比 `vp_r`，不能用 `np.flatnonzero(just_bordered)`
+        # 必须拿**区域号**去比 `vp_r`，不能用 `np.flatnonzero(just_bordered)`
         #   —— 那是 `(B,n,n)` 的**扁平下标**，与区域号是两种东西。单样本时两者
         #   数值都 < 361、偶然撞上而「看起来对」；B>1 时扁平下标远大于任何区域号
         #   ⇒ `hit` 恒空 ⇒ Benson 的 vital 传播**整个失效**，且结果随 batch 组成
@@ -482,12 +482,12 @@ def _area_for_pla(b, pc, nchain, pla, suicide_legal, result):
     result[alive[pc]] = pla
 
     # ---- 围空（board.cpp:2214-2243）-------------------------------------------
-    # ⚠ 三条判据的顺序就是优先级：前两条**无条件写**（会覆盖对方颜色），
+    # 三条判据的顺序就是优先级：前两条**无条件写**（会覆盖对方颜色），
     #   第三条只在 `result` 仍为 C_EMPTY 时写。
-    # ⚠ `:2221` 的判据就是 `numInternalSpacesMax2 <= 1`（不是 `< 2` 之外的任何
+    # `:2221` 的判据就是 `numInternalSpacesMax2 <= 1`（不是 `< 2` 之外的任何
     #   东西），而 `:2233` **完全没有** `bordersNonPassAlive` 判据 —— 这两条是
     #   官方大量「反直觉」输出的来源，不要"顺手修正"。
-    # ⚠ `atLeastOnePla` 是**整盘**级（`board.cpp:2077-2086` 扫全盘），不是逐区域；
+    # `atLeastOnePla` 是**整盘**级（`board.cpp:2077-2086` 扫全盘），不是逐区域；
     #   它必须作用在**空间掩码**上 —— 区域表是全批一张，直接和 `(B,1)` 广播会
     #   变成 `(B, nreg+1)`，那是彻底错位。
     num_internal = np.zeros(nreg + 1, dtype=np.int64)
@@ -520,7 +520,7 @@ def _area_for_pla(b, pc, nchain, pla, suicide_legal, result):
 def _independent_life_seki(b, basic, atari):
     """`calculateIndependentLifeAreaHelper` 的双活过滤（`board.cpp:2247-2327`）。
 
-    🔴 **两个触发条件命中任一即整块判双活**（这是官方输出大量中立的原因）：
+     **两个触发条件命中任一即整块判双活**（这是官方输出大量中立的原因）：
 
       ① `board.cpp:2270`：**己方子整链 1 气**（在气）⇒ 属地被当成双活。
       ② `board.cpp:2272-2275`：**接触 dame** —— 任一 4 邻点是「两色都没认领的
@@ -529,8 +529,8 @@ def _independent_life_seki(b, basic, atari):
     命中后沿 `basicArea == pla` 做 4-邻接 flood，**整块**标 `isSeki`
     （`board.cpp:2280-2292`）；最后只输出 `~isSeki` 的块（`:2303-2326`）。
 
-    ⚠ 触发 ② 是**大多数**局面里 area 被抹平的真凶 —— 不是「提死子」。
-    ⚠ 官方**既不提子也不做死子判定**：`calculateAreaForPla` 的输入只有
+     触发 ② 是**大多数**局面里 area 被抹平的真凶 —— 不是「提死子」。
+     官方**既不提子也不做死子判定**：`calculateAreaForPla` 的输入只有
       `colors`，输出直接写 `area`。死子在 area 里就是「对方子落在被对方围的空区
       里」，由 `containsOpp` 与上面的双活过滤自然处理。
     """
@@ -566,7 +566,7 @@ def area_ownership_map(boards, *, is_multi_stone_suicide_legal=False,
          `next_in_chain`）。本仓用 `scipy.ndimage.label`（`go_rules._STRUCT3`）
          —— 该结构元第 0 轴是单位阵 ⇒ 逐样本独立，块号全批唯一。
       2. **Benson 定点迭代**（`board.cpp:1949-2195`，对黑、白各跑一遍）：
-         先把「空点 ∪ 对方子」按 4 邻接切成**区域**（⚠ 区域里**可以含对方子**
+         先把「空点 ∪ 对方子」按 4 邻接切成**区域**（ 区域里**可以含对方子**
          —— 与「只 label 空点」不是同一族对象），再算每条链的 **vital 区域数**
          （区域 vital 于某链 ⟺ 区域**每个参与过滤的点**都邻接该链），任一链
          vital 数 < 2 即判死（`:2168`），迭代到不动点。**判死的链不写进 area。**
@@ -575,11 +575,11 @@ def area_ownership_map(boards, *, is_multi_stone_suicide_legal=False,
          `:2221`「内部空 ≤ 1 且不邻接任何非 pass-alive 子」、
          `:2222`「不含对方子且不邻接任何非 pass-alive 子」，
          两条都**无条件覆盖**；`:2233`「不含对方子」则**只在仍为 C_EMPTY 时写**。
-         🔴 **黑先白后**（`board.cpp:1861-1862`）—— `:2237` 的 C_EMPTY 守卫
+          **黑先白后**（`board.cpp:1861-1862`）—— `:2237` 的 C_EMPTY 守卫
          依赖它，**顺序不能换**。
          然后 `nonPassAliveStones` 兜底（`board.cpp:1865-1873`）：仍为空的
          **子**归自己的颜色。到此 `basicArea` 完成。
-      4. **按 tax 规则分岔**（`nninputs.cpp:2391-2439`）—— 🔴 这是**两个不同
+      4. **按 tax 规则分岔**（`nninputs.cpp:2391-2439`）—— 这是**两个不同
          的官方函数**，不是同一个函数的参数差异：
          · `tax_rule == TAX_NONE` ⇒ 官方走 `Board::calculateArea`
            （`board.cpp:1853-1874`），**没有**第 4 层，直接返回 `basicArea`。
@@ -589,22 +589,22 @@ def area_ownership_map(boards, *, is_multi_stone_suicide_legal=False,
            见 :func:`_independent_life_seki` 的两个触发，命中即整块抹成中立；
            最后 `keepStones=true` 按 `basicArea == colors` 把子补回
            （`board.cpp:1927-1935`）。
-         ⚠ 默认 `TAX_NONE` 不是「随便挑的默认值」，而是 `calculate_area` 唯一
+          默认 `TAX_NONE` 不是「随便挑的默认值」，而是 `calculate_area` 唯一
            能走到的分支（`AREA+TAX_SEKI/ALL` 在那里抛 `NotImplementedError`），
            所以默认值必须等于 `calculateArea` 的语义，否则生产路径整个是错的。
 
-    ⚠ **全程不读 `ko_loc`**：官方 `calculateArea*` 也一个 ko 都不读
+     **全程不读 `ko_loc`**：官方 `calculateArea*` 也一个 ko 都不读
       （劫只影响 ch6/7/8）。
-    ⚠ `is_multi_stone_suicide_legal` 对应 `board.cpp:2036`：它决定 Benson 的
+     `is_multi_stone_suicide_legal` 对应 `board.cpp:2036`：它决定 Benson 的
       vital 过滤**是否也检查区域里的对方子**。`False`（本仓默认，等于
       `DEFAULT_RULES_FLAGS` 的 bit5=0）时只过滤空点。
-      ⚠ 官方真正传进去的是 `nnInputParams.getSuicideLegalForPassAlive(hist)`
+       官方真正传进去的是 `nnInputParams.getSuicideLegalForPassAlive(hist)`
       （`nninputs.cpp:964`）= `multiStoneSuicideLegal || alwaysComputePassAlive
       UnderSuicideRules`，后半个来自 `hist.modes`，**19 个全局通道里没有任何一个
       编码它** ⇒ 对 `globalInputNC[:,8]==0` 的行，从 stdata **无法**恢复真值。
 
     ---- 与 `GoBoard.score()`（`go_rules.py:2261`）的关系：**已脱钩** ----
-    🔴 旧版本这里写的是 Tromp-Taylor 区域计分，并有一条
+     旧版本这里写的是 Tromp-Taylor 区域计分，并有一条
       `sum == GoBoard.score() + komi` 的不变式。那条不变式**已退役**
       （`tests/test_v7_area.py::test_ownership_sum_agrees_with_go_board_score`
       现在断言的是官方语义）：官方 area **不是** Tromp-Taylor ——
@@ -676,7 +676,7 @@ def calculate_area(boards, to_play, rules_flags=0):
     通道顺序 `[pla 归属, opp 归属]`，两格取值都 ∈ {−1, 0, +1}：
     **+1 = 该点归 pla（`to_play` 这一方）、−1 = 归 opp、0 = 中立**。
     两格是**同一张归属图的两个视角**：ch19 == −ch18（opp 视角把符号翻过来）。
-    ⚠ 这样安排的理由是让**「0 = 中立」在两格里都成立** —— 下游二值化
+     这样安排的理由是让**「0 = 中立」在两格里都成立** —— 下游二值化
       （`> 0` / `< 0`）两格对称，且任意一格单独用都读得出完整的三态。
       官方是两条 bool 平面（pla 有 / opp 有），二值化后逐位等价。
 
@@ -687,10 +687,10 @@ def calculate_area(boards, to_play, rules_flags=0):
         elif (SCORING_AREA && (SEKI|ALL))       calculateIndependentLifeArea(keepStones=true)
         elif (SCORING_TERRITORY)                # 仅 encorePhase >= 2 才置位 ⇒ 恒 0
 
-    ⚠ **顺序要紧**：官方先判 AREA。所以 `SCORING_TERRITORY` + `TAX_SEKI` 落在
+     **顺序要紧**：官方先判 AREA。所以 `SCORING_TERRITORY` + `TAX_SEKI` 落在
       第三分支（**返回全 0**）而不是第二分支；本实现照抄这个顺序。
 
-    ⚠ **TERRITORY ⇒ 全 0 —— 这是对齐官方，不是缺陷。** 官方的 territory 分支被
+     **TERRITORY ⇒ 全 0 —— 这是对齐官方，不是缺陷。** 官方的 territory 分支被
       `encorePhase >= 2` 二次条件包着，而本仓无 encore 机制（spec §2.6 D2），
       ⇒ 正常阶段 territory 计分的对局 ch18/19 恒 0。SGF 缺 `RU` 时默认 AREA，
       所以绝大多数对局走的是第一个分支。
@@ -721,11 +721,11 @@ def calculate_area(boards, to_play, rules_flags=0):
             f'官方语义：只统计「**无条件活**」的区域 —— 一块子连同它的全部气构成的\n'
             f'区域若被对方子完全封住（对外不再有任何共享气），整片算该方属地；\n'
             f'被对方分断/共享气的块不算。keepStones=true 表示死子也留在图里。\n'
-            f'⚠ 这里**故意抛错而不是返回全 0**：全 0 与「TERRITORY 恒 0」在张量上\n'
+            f' 这里**故意抛错而不是返回全 0**：全 0 与「TERRITORY 恒 0」在张量上\n'
             f'  逐位相同，会被当成「无归属」静默污染训练。tax=SEKI/ALL 的对局应当\n'
             f'  在规则条件化那一步被显式拦下（或先补齐本分支）。')
 
-    # ⚠ 这是 `calculate_area` 里**唯一**新增的一行，且**不是**改分支顺序：
+    # 这是 `calculate_area` 里**唯一**新增的一行，且**不是**改分支顺序：
     #   `FLAG_MULTISTONE_SUICIDE`（bit5）本来就住在 `rules_flags` 里
     #   （见下方位布局段），只是此前没人把它解出来喂给 Benson 的 vital 过滤
     #   （官方 `board.cpp:2036`）。分支顺序（TERRITORY 恒 0 / TAX 抛错）与
@@ -751,7 +751,7 @@ GLOBAL_CHANNELS = 19
 SPATIAL_DTYPE = np.float16
 GLOBAL_DTYPE = np.float16
 
-#: `currentSelfKomi` 的归一化除数。⚠ **V7 是 20，V3/V4 是 15** —— 实测官方
+#: `currentSelfKomi` 的归一化除数。 **V7 是 20，V3/V4 是 15** —— 实测官方
 #: `globalInputNC[:,5]` 上 komi=7.5 的行恰好是 0.375 = 7.5/20（若是 /15 会是
 #: 0.5）。这属于「同一份语义、随模型版本换常数」的一类，只写一个数会静默错。
 KOMI_SCALE = 20.0
@@ -763,14 +763,14 @@ KOMI_CLIP_MARGIN = 1.0
 # --------------------------------------------------------------------------- #
 # `rules_flags` 位布局 —— **在 `calculate_area` 既有布局上扩展，不另起一套**
 # --------------------------------------------------------------------------- #
-# ⚠ 为什么不能给全局特征另定一套位：``calculate_area``（本文件，已提交、已被
+# 为什么不能给全局特征另定一套位：``calculate_area``（本文件，已提交、已被
 #   ``tests/test_v7_area.py`` 钉住）读的是 **bit0 = 计分 / bit1..2 = 税收**。
 #   两套布局并存就是「同一口径写两遍」，而本仓已经吃过这个亏 ——
 #   ``go_rules.py:170-177`` 记着入射计数口径被写了两遍、导致 U 形块的
 #   ch10/11 与 ch14/15 **两个 bucket 同时漏**；``feature_v7_ladders.py`` 也记着
 #   历史门控被解析两次、ch16 抄错了通道。
 #   ⇒ 本布局是既有布局的**严格超集**：`calculate_area` 一行都不用改。
-# ⚠ **掩码就是「被覆盖的那几位本身」**（不是「左移后的结果」）：取出时统一写
+# **掩码就是「被覆盖的那几位本身」**（不是「左移后的结果」）：取出时统一写
 #   ``(fl & MASK) >> 位移``。把掩码写错一位就会与 ``rules_flags_from`` 的打包
 #   错开 —— 首版就栽在这儿两次（``0b110 << 1`` / ``0b110 << 3`` 都是 3 位宽，
 #   实际要的是 2 位宽的 ``0b11 << 位移``），症状是「改 ko 规则会连 ch10 一起
@@ -812,14 +812,14 @@ def rules_flags_from(scoring=SCORING_AREA, tax=TAX_NONE, ko=KO_SIMPLE,
 def rules_flags_from_sidecar(g_rules):
     """sidecar ``games.npz`` 的 ``g_rules``（spec §5.3 的打包）→ 本布局。
 
-    ⚠ **spec §5.3 的打包与本布局不同，而且是「有意压窄」的**：
+     **spec §5.3 的打包与本布局不同，而且是「有意压窄」的**：
     那边是 ``bit0=计分 / bit1=tax / bit2=ko / bit3=suicide / bit4=button`` ——
     ``tax`` 只给了 **1 位**，表达不了 ``TAX_SEKI`` 与 ``TAX_ALL`` 的区别。
 
     本函数做**显式有损映射**并写明丢了什么：
       · ``tax`` 的 1 位 ``0`` ⇒ ``TAX_NONE``；``1`` ⇒ **按 ``TAX_SEKI`` 解读**
         （``TAX_ALL`` 在 1 位编码下与 ``TAX_SEKI`` 不可区分）。
-        ⚠ 这会让 ``calculate_area`` 对这类局抛 ``NotImplementedError``（它对
+         这会让 ``calculate_area`` 对这类局抛 ``NotImplementedError``（它对
         ``TAX_SEKI``/``TAX_ALL`` 尚未实现）—— **这是故意的**：静默返回全 0 会
         与「TERRITORY 恒 0」在张量上逐位相同，被当成「无归属」污染训练
         （见 `calculate_area` 的 docstring）。
@@ -842,7 +842,7 @@ def rules_flags_from_sidecar(g_rules):
 # --------------------------------------------------------------------------- #
 # 过去 5 手的**物理手序**（ch9..13 与全局 ch0..4 共用这一份）
 # --------------------------------------------------------------------------- #
-# ⚠ 这份顺序在两处被用到（ch9..13 的落点通道、全局 ch0..4 的 pass 标志），
+# 这份顺序在两处被用到（ch9..13 的落点通道、全局 ch0..4 的 pass 标志），
 #   所以它是**模块级唯一定义**、两处都从它取。写两遍就是下一次「通道顺序
 #   静默错位」的入口 —— 而通道错位**不报任何错**，只是标签指向错误的点。
 #: 第 ``k`` 项给出「物理手序第 ``k+1`` 手（``k=0`` 是最近一手）」的来源：
@@ -862,7 +862,7 @@ def _history_move(my, op, k):
 def _history_prefix_ok(my, op, k, hl):
     """第 ``k`` 手是否落在「有效历史前缀」内（官方 ``nninputs.cpp:2511-2556``）。
 
-    🔴 官方的 ch0..4 是**递归嵌套**的：第 2 手的 pass 标志只在
+     官方的 ch0..4 是**递归嵌套**的：第 2 手的 pass 标志只在
     「第 1 手存在 **且** 第 1 手轮次正确 **且** 第 2 手存在 **且** 第 2 手轮次正确」
     时才写；第 3 手同理要求前两手都满足。⇒ 判定是**前缀**性质，不是逐格独立。
 
@@ -915,7 +915,7 @@ def _as_ko(ko, B):
 def _ko_plane(kos, B, n):
     """``ko`` 点掩码 → ``(B,n,n)`` bool（ch6）。
 
-    ⚠ 越界的 ``ko`` 值（脏数据）**静默跳过**而不是抛错：它只会让一个点不被点亮，
+     越界的 ``ko`` 值（脏数据）**静默跳过**而不是抛错：它只会让一个点不被点亮，
     而抛错会让整个预取 worker 死掉 —— 两者相比，显式丢一个点更可控。真正的
     合法性判定在 ``go_rules`` 侧，不靠这个通道（`go_rules.py:2416` 同一判断）。
     """
@@ -962,7 +962,7 @@ def resolve_ladder_boards(boards, prev_board=None, prev_prev_board=None,
     ⇒ 历史不足时**回退复制**，不是置 0。history=0 ⇒ ch15 == ch14、
     **ch16 == ch15**；history=1 ⇒ **ch16 == ch15**。
 
-    ⚠⚠ **第二级回退的兜底是 ``prev``（解析**之后**的），不是 ``board``。**
+     **第二级回退的兜底是 ``prev``（解析**之后**的），不是 ``board``。**
     history=1 时 ``prev`` 是真正的上一手盘、并不等于当前盘；回退到 ``board``
     会让 ch16 差一手。这是这条规则唯一的坑，也正是
     ``feature_v7_ladders.py`` 里「别把门控从历史参数再推一遍」那条注释的由来 ——
@@ -974,7 +974,7 @@ def resolve_ladder_boards(boards, prev_board=None, prev_prev_board=None,
     两个「整批缺失」标志；``ladder_channels`` 拿到的要么是 ``None``
     （= 它自己内部按官方原文回退，那**一次**），要么是已解析好的等价数组。
 
-    ⚠ **「整批缺失 ⇒ 传 None」不是纯优化，是正确性要求。**
+     **「整批缺失 ⇒ 传 None」不是纯优化，是正确性要求。**
     ``ladder_channels`` 判定回退用的是**数组身份**（``pb is b`` / ``p2b is pb``，
     见它的 docstring —— 那是刻意设计，因为它把「同一份门控事实」用了两次而
     不想再解析一遍）。本函数若在「整批缺失」时传一份 ``boards.copy()``，
@@ -1018,7 +1018,7 @@ def resolve_ladder_boards(boards, prev_board=None, prev_prev_board=None,
         return arr, False
 
     prev, prev_missing = _gate(prev_board, prev_valid, cur, 'prev_board')
-    # ⚠ 兜底是上面**已解析**的 prev —— 见 docstring 的坑。
+    # 兜底是上面**已解析**的 prev —— 见 docstring 的坑。
     prev_prev, prev_prev_missing = _gate(prev_prev_board, prev_prev_valid, prev,
                                          'prev_prev_board')
     return LadderBoards(prev, prev_prev, prev_missing, prev_prev_missing)
@@ -1063,9 +1063,9 @@ def spatial_channels_v7(boards, to_play, ko, my_hist, op_hist,
     ``to_play`` 恒 +1，见 ``tests/test_v7_ladders.py``），对拍不失真；
     ② 于是 ch0/1/2/3/4/5/9-13 这一整块**与 to_play 无关**，在 8 路 dihedral
     增广下不需要任何视角修正（spec §5.6）。
-    ⚠ 因此 ch1/ch2 与官方在 ``to_play=-1`` 时**是对调关系**。这是有意的口径，
+     因此 ch1/ch2 与官方在 ``to_play=-1`` 时**是对调关系**。这是有意的口径，
       已在 ``tests/test_v7_assemble.py`` 里逐项钉住，不留给下游去猜。
-    ⚠ 对照：ch18/19 **仍按官方的 pla/opp 相对视角**（`calculate_area` 的既有
+     对照：ch18/19 **仍按官方的 pla/opp 相对视角**（`calculate_area` 的既有
       口径），所以这一块是 to_play 相关的 —— 别把 ch1/ch2 的绝对色口径外推过去。
 
     ---- dtype ----
@@ -1075,7 +1075,7 @@ def spatial_channels_v7(boards, to_play, ko, my_hist, op_hist,
 
     ---- 已实测与官方 stdata **逐位对齐**的通道 ----
     ch3 / ch4 / ch5（气桶）、ch9..ch13 的顺序（颜色分布）、ch14 / ch17（梯子，
-    实测 1.000000 / 4368 行）。🔴 **ch18/19 对不齐**（官方算 area 前先提死子，
+    实测 1.000000 / 4368 行）。 **ch18/19 对不齐**（官方算 area 前先提死子，
     本仓 ``score()`` 不做 ⇒ 0 行完全相同；实测数字见 ``area_ownership_map``
     的 docstring）。若某个已对齐的通道掉下来，**查这里的组装顺序，不要改底层
     实现**。
@@ -1127,14 +1127,14 @@ def spatial_channels_v7(boards, to_play, ko, my_hist, op_hist,
                                  prev_valid, prev_prev_valid)
     out[:, 14:18] = ladder_channels(
         b, tp,
-        # ⚠ 整批缺失时传 `None`，让 `ladder_channels` 自己走它那份（唯一的）
+        # 整批缺失时传 `None`，让 `ladder_channels` 自己走它那份（唯一的）
         #   门控解析、并保住 `is` 快路径。见 `resolve_ladder_boards` 的 docstring。
         None if gate.prev_all_missing else gate.prev,
         None if gate.prev_prev_all_missing else gate.prev_prev,
         ko=kos)
 
     # ---- ch18 / ch19 · 当前区域（官方是两条 bool 平面）--------------------
-    # ⚠ `calculate_area` 返回**带符号**的两视角（+1=归 pla / −1=归 opp），而官方
+    # `calculate_area` 返回**带符号**的两视角（+1=归 pla / −1=归 opp），而官方
     #   ch18/19 是两条**布尔**平面（pla 有 / opp 有）。这里做二值化，否则 −1
     #   会让「有归属」的点与「on-board」的点在张量上混同，而且无法与
     #   `unpack_binary_input` 的解包结果对拍。
@@ -1152,7 +1152,7 @@ def spatial_channels_v7(boards, to_play, ko, my_hist, op_hist,
 class GameRow(NamedTuple):
     """局级标量（sidecar ``games.npz`` 的一行，spec §5.3）里本模块要用的字段。
 
-    ⚠ **局级而非逐行**：逐行存是 3.6 B/行 ⇒ 34.2M 行 123 GB；局级是 1.2 MB。
+     **局级而非逐行**：逐行存是 3.6 B/行 ⇒ 34.2M 行 123 GB；局级是 1.2 MB。
       读取口径是 ``sidecar[game_ids[idxs]]``（spec §5.3）。
     """
 
@@ -1166,7 +1166,7 @@ def _komi_of(game_row, B):
     接受 :class:`GameRow`、任何有 ``komi`` 属性的对象、或含 ``'komi'`` 键的
     mapping —— 三者都覆盖得到（sidecar 读取、NamedTuple 夹具、裸 dict）。
 
-    ⚠ ``komi`` 为 ``nan`` 时取 **0.0**：SGF 里 **2.2% 的局没有 `KM``**，而 0.0
+     ``komi`` 为 ``nan`` 时取 **0.0**：SGF 里 **2.2% 的局没有 `KM``**，而 0.0
       是该情形的惯例默认。这里显式兜住，而不是让 ``nan`` 顺着 clip 污染
       全局 ch5 **和** ch18（后者是三角波输入，nan 会毁掉整条曲线）。
     """
@@ -1194,7 +1194,7 @@ def self_komi(komi, to_play, board_area):
     官方（spec §2.3）：黑走 ⇒ ``+komi``，白走 ⇒ ``−komi``，再 clip 到
     ``±(bArea + 1.0)``。⇒ **符号随 ``to_play`` 翻转**。
 
-    ⚠ **spec §2.6 D3 的有意偏差**：官方这个量还含 **draw-jitter** 与
+     **spec §2.6 D3 的有意偏差**：官方这个量还含 **draw-jitter** 与
     （encore 下的）``whiteBonusScore``，本仓直接用局表 ``g_komi`` —— 因为
     jitter 在 SGF 里根本不存在（它只在 KataGo 搜索时按 seed 加）。
     实测官方 ``globalInputNC[:,5]`` 上会看到 5.424 / 7.9 这类「非整数贴目」，
@@ -1228,18 +1228,18 @@ def komi_parity_wave(self_komi_, board_area, scoring_rule=SCORING_AREA,
     「有效 goodness」是 ``0 1 1 1 2 3 3 3 4 …``，这个函数既难学又与棋盘
     面积的奇偶强相关（很像 xor）。加上 ``0.5 × (0 -1 0 1 0 -1 …)`` 之后
     就近似线性了 —— 官方干脆把这个 xor 直接作为输入喂进来。
-    ⚠ 源码里紧跟着的一句注释就是「若改动这个特征的下标，必须同步改
+     源码里紧跟着的一句注释就是「若改动这个特征的下标，必须同步改
     ``model.py`` 里乘进 scorebelief parity 向量的那个下标」—— spec §2.3 记的
     「V3/V4=13、V6=15、V7=18」正是这条注释的产物。
 
-    ⚠ **门控与官方一致**：``SCORING_TERRITORY`` 且 ``encorePhase < 2`` ⇒ 恒 0。
+     **门控与官方一致**：``SCORING_TERRITORY`` 且 ``encorePhase < 2`` ⇒ 恒 0。
       这与 spec §2.5 的「territory 对局 ch18/19 恒 0」是同一族规则
       （实测官方 ``globalInputNC[:,9]==1`` 的行里 ``[:,18]`` 绝大多数是 0）。
 
-    ⚠ ``board_area`` **奇偶才起作用**：19×19（361）与 11×11（121）都走
+     ``board_area`` **奇偶才起作用**：19×19（361）与 11×11（121）都走
       ``komiFloor = floor((selfKomi-1)/2)*2 + 1`` 这一支；偶数盘走另一支。
 
-    ✅ **实测验证**：官方 stdata ``2026-08-25npzs.tgz`` 的 ``globalInputNC``
+     **实测验证**：官方 stdata ``2026-08-25npzs.tgz`` 的 ``globalInputNC``
       上取 7 组不同贴目/盘面，手工按上式复算 **全部命中**（例如 19 路
       komi 7.5 ⇒ ``floor(6.5/2)*2+1 = 7``、delta 0.5 ⇒ wave **0.5**，官方
       那一格就是 0.5；komi 6.68 ⇒ floor 5、delta 1.68 ⇒ wave **−0.32**，
@@ -1268,7 +1268,7 @@ def pass_would_end_phase(my_hist, op_hist, history_length):
     「这一手 pass 会结束阶段」⟺「**上一手已经是 pass**」。上一手永远是对手落的
     ⇒ 看 ``op_hist[:, 0]``。
 
-    ⚠ **历史不足时必须给 False。** ``my_hist`` / ``op_hist`` 用 ``-1`` 同时表示
+     **历史不足时必须给 False。** ``my_hist`` / ``op_hist`` 用 ``-1`` 同时表示
     「pass」与「无此手」，两者在 ch9..13 上输出相同（空），在这里**不同** ——
       开局第一手（ply 0）没有任何上一手，若当成 pass 会把整段开局的 ch14 打成 1。
       所以只在 ``history_length >= 1`` 时才认这个 pass 标志。
@@ -1284,12 +1284,12 @@ def _resolve_history_length(my_hist, op_hist, history_length, B):
 
     ``None`` 时按「六个历史槽**全**是 ``-1`` ⇒ ply 0」推导，否则当成 5 手齐全。
 
-    ⚠ **为什么默认 5 而不是「有几个不是 −1 就数几个」**：后者会把「历史不足」
+     **为什么默认 5 而不是「有几个不是 −1 就数几个」**：后者会把「历史不足」
       也报成 pass —— 而官方的 ``PASS_LOC`` 与 ``NULL_LOC`` 是**不同**的 loc
       （``-1`` 只对应后者），官方对缺失历史给的是 **0**。默认 5 只在 ply ≥ 5 的
       行上生效，而 spec §5.3.4 实测 **100% 的局 ≥ 20 手** ⇒ 开局前几行是唯一
       可能不准的地方，而它们本来就靠 ply 0 判定兜住了。
-    ⚠ 已知的一处边缘偏差：ply 1 且第 0 手恰好是 pass 时会被当成 ply 0 ⇒
+     已知的一处边缘偏差：ply 1 且第 0 手恰好是 pass 时会被当成 ply 0 ⇒
       ch14 给 False 而不是 True。影响面 = 「开局第一手就 pass」的局 × 开局那一
       行；调用方在意就显式传 ``history_length``。
     """
@@ -1319,7 +1319,7 @@ def global_features_v7(game_row, my_hist, op_hist, prev_board=None,
     ch              语义（官方）                                来源
     ==============  =========================================  ====================
     0-4             「第 ``k+1`` 手是不是 pass」                 ``my_hist``/``op_hist``
-                    ⚠ 官方是**递归嵌套**闸门：第 k 手要求前 k-1 手
+                     官方是**递归嵌套**闸门：第 k 手要求前 k-1 手
                     全部存在且轮次正确（:2511-2556），**不是逐格独立**
     5               ``currentSelfKomi(nextPlayer)/20``          局表 `g_komi`
                     clip 到 ``±(bArea+1)``；**符号随 to_play 翻**
@@ -1337,7 +1337,7 @@ def global_features_v7(game_row, my_hist, op_hist, prev_board=None,
     18              贴目 × 棋盘奇偶三角波                        `komi_parity_wave`
     ==============  =========================================  ====================
 
-    ⚠ **ch15/16/17 是「条件写入」，不是常量**（`nninputs.cpp:2673-2680`）::
+     **ch15/16/17 是「条件写入」，不是常量**（`nninputs.cpp:2673-2680`）::
 
         if(nnInputParams.playoutDoublingAdvantage != 0) {
           rowGlobal[15] = 1.0;
@@ -1345,12 +1345,12 @@ def global_features_v7(game_row, my_hist, op_hist, prev_board=None,
         ...
         if(hist.hasButton) rowGlobal[17] = 1.0;
 
-    🔴 读源码时**极易看错**：只看这两行会以为「ch15/ch17 恒 1」。
+     读源码时**极易看错**：只看这两行会以为「ch15/ch17 恒 1」。
     实测官方 ``globalInputNC``（2,235 行）：ch15 非零率 **3.85%**、
     ch16 非零率 **3.85%**（两者同步 ⇒ 同一条件）、ch17 非零率 **22.33%**
     ⇒ **都不是恒 1**。本仓无 PDA ⇒ ch15/16 恒 0 才是对的。
 
-    ⚠⚠⚠ **这份定义以 spec §2.3 为准**。**任务书里给的那串「禁贴/禁入/气/提子数/
+     **这份定义以 spec §2.3 为准**。**任务书里给的那串「禁贴/禁入/气/提子数/
     自手贴/ko 计数/上次吃子数/距上次吃子回合数/simple-ko 阻塞合法性/局内经过回合/
     对局结果」不是 V7 的全局输入** —— V7 的 19 维里没有「提子数」「距上次吃子
     回合数」「对局结果」（结果在 ``globalTargetsNC`` 侧，是**目标**不是输入）。
@@ -1366,14 +1366,14 @@ def global_features_v7(game_row, my_hist, op_hist, prev_board=None,
       3. ch18 的三角波从官方源码取到原文，并在 7 组真实官方数据上验算全部命中
          （`tests/test_v7_assemble.py` 有成批对拍）。
 
-    ⚠ **缺 `RU` 时的默认值**：SGF 语料里 **55% 的局没有 `RU`**（spec §5.3.2），
+     **缺 `RU` 时的默认值**：SGF 语料里 **55% 的局没有 `RU`**（spec §5.3.2），
       且从 `RU` 字符串解析不出 tax/ko/suicide/button 的可靠组合 ⇒ 这四位一律取
       **默认值**（:data:`DEFAULT_RULES_FLAGS`：AREA + TAX_NONE + KO_SIMPLE +
       单子禁着 + 无 button），于是全局 ch6/7/8/10/11/17 = ``(0,0) / 0 / (0,0) /
       0``。**扩展位留着**：拿到可靠的规则来源后，只要改
       :func:`rules_flags_from_sidecar` 或直接传 ``rules_flags``，本函数一行都不用改。
 
-    ⚠ **段 1 不以 score 系为主目标**：语料里 **约 81% 的 SGF 是认输**（无分差，
+     **段 1 不以 score 系为主目标**：语料里 **约 81% 的 SGF 是认输**（无分差，
       spec §5.3.3），而本函数**不产出任何 score 相关维度** —— 官方也没有
       （score 在 ``globalTargetsNC`` 侧）。段 1 只训 policy / value / futurepos。
 
@@ -1417,7 +1417,7 @@ def global_features_v7(game_row, my_hist, op_hist, prev_board=None,
     area = (BOARD_SIZE * BOARD_SIZE if board_area is None
             else int(np.asarray(board_area).reshape(-1)[0]))
 
-    # ⚠ `prev_board` / `prev_prev_board` **只校验形状、不参与取值**（spec §2.3 的
+    # `prev_board` / `prev_prev_board` **只校验形状、不参与取值**（spec §2.3 的
     #   19 维没有一维需要历史盘面，见本函数 docstring）。仍然校验，是为了让
     #   「传错了形状」在装配层就炸掉，而不是等到将来给它们接上特征时才发现
     #   一直传的是错的形状。
@@ -1439,7 +1439,7 @@ def global_features_v7(game_row, my_hist, op_hist, prev_board=None,
     hl = _resolve_history_length(my, op, history_length, B)
 
     # ---- ch0..4 · 过去 5 手各自是不是 pass（物理手序，与 ch9..13 同一份）---
-    # 🔴 官方是**递归嵌套**闸门（`nninputs.cpp:2511-2556`）：第 k 手只有在
+    # 官方是**递归嵌套**闸门（`nninputs.cpp:2511-2556`）：第 k 手只有在
     #     「前面 k-1 手全部存在且轮次正确」时才有资格被检查。我们原来按
     #     `(move<0) & (k < hl)` **逐格独立判断** —— 当中间某手缺失而后面的手
     #     存在时，会在不该有 1 的格上给出 1。
@@ -1486,7 +1486,7 @@ def global_features_v7(game_row, my_hist, op_hist, prev_board=None,
     #       rowGlobal[15] = 1.0;
     #       rowGlobal[16] = 0.5f * playoutDoublingAdvantage; }
     # ⇒ 无 PDA 时两格都**保持 0**。本仓无 PDA ⇒ 恒 0。
-    # ⚠ 官方注释（:2671-2672）说「parameter 15 在非零时训练行为有**不连续**」，
+    # 官方注释（:2671-2672）说「parameter 15 在非零时训练行为有**不连续**」，
     #   容易误读成「15 恒 1」—— 实际那个不连续正是**由 PDA 是否非零**触发的，
     #   所以 15 与 16 同生共死。本仓无 PDA ⇒ 15 = 0。
     #   （实测官方 globalInputNC：ch15 非零率 3.85%、ch16 非零率 3.85%、

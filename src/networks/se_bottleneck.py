@@ -21,7 +21,7 @@ class SEGate(nn.Module):
     —— 参数对账、逐通道权重的可读性、以及 `test_param_groups` 那一类按
     「卷积 vs 全连接」分组的逻辑都更省事。
 
-    ⚠ 数值口径：910A 无 bf16、AMP 走 fp16，而 `sigmoid` 的输出恒在 `(0,1)`，
+     数值口径：910A 无 bf16、AMP 走 fp16，而 `sigmoid` 的输出恒在 `(0,1)`，
     逐通道相乘**不会**放大激活值，所以这里不需要额外的 fp32 兜底。两个
     `nn.Linear` 的累加在 fp16 下仍然可能溢出，但那是它前面 BN 已经归一化过的
     张量，量级与 `ResBlock` 里同样的两级结构一致。
@@ -70,11 +70,11 @@ class SEBottleneck(nn.Module):
        本块 **87,050** 参数，同宽度的 `ResBlock` 是 461,440 —— 省下的 5.3 倍
        正是 9.25M 预算能装下 17 个块的前提。
 
-    ⚠ SE 的输入是**块入口的 x**（KataGo 的 `applySE(input, afterConv3, ...)`），
+     SE 的输入是**块入口的 x**（KataGo 的 `applySE(input, afterConv3, ...)`），
     不是 `conv3` 的输出：门控描述的是「这一层该关注哪些通道」，用块入口才与
     该层的输入分布对齐。
 
-    ⚠ 关于梯度检查点：本块的 BN 与 `ResBlock` 的 BN 在 `GC_LEGACY` 段里是同类
+     关于梯度检查点：本块的 BN 与 `ResBlock` 的 BN 在 `GC_LEGACY` 段里是同类
     东西，重算时的 running stats 还原由 `backbone.py` 的 `_BatchNormStatGuard`
     统一兜住（`_collect_batchnorms` 遍历 `modules()`，本块的两个 BN 自动被收进去），
     这里**不需要**、也刻意不做任何 BN 统计的额外处理。

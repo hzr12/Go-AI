@@ -4,7 +4,7 @@
 这个转换器里有**五件错了之后不报错、或者只在换批次时才炸**的事：
 
 1. **19×19 过滤** —— 9/11/13 路与非方阵混在同一个成员里，漏过滤就是静默错位；
-2. 🔴 **列布局按成员分派** —— 实测归档里 64 列与 80 列**混着**（见
+2. **列布局按成员分派** —— 实测归档里 64 列与 80 列**混着**（见
    `stdata_to_npz.resolve_member_network` 的 docstring 的实测表）；
    「列数不同的归档经映射后得到同一组全局目标」是最容易错的地方；
 3. **top-16 稀疏 policy 的打包 / 解包往返** —— 稠密化在 362 维上做，
@@ -89,7 +89,7 @@ def _pack_spatial(spatial):
 def _semantic_values(n, offset=0.0):
     """每个语义列一个**可辨认**的值（越界/错位一眼能看出来）。
 
-    ⚠ `outcome_hard` 那三列是**合法的概率行**（和为 1，三个值互不相同）
+     `outcome_hard` 那三列是**合法的概率行**（和为 1，三个值互不相同）
       —— 否则会被 `check_plausibility` 判成 SUSPECT，而一个 fixture 不该
       靠"检测器闭嘴"才通过。
     """
@@ -106,7 +106,7 @@ def _semantic_values(n, offset=0.0):
 def _fake_npz(n=6, board=19, net=NET_80, policy_support=40, seed=0):
     """一个形状完整的合成 stdata 成员。
 
-    ⚠ `globalTargetsNC` 里**每一列**都填了「列号当值」的哨兵
+     `globalTargetsNC` 里**每一列**都填了「列号当值」的哨兵
     （`col i == 1000 + i`），只有本仓 `COL_*` 指到的列放真值
     ⇒ 任何一处列号写错，读出来的就是 1000+某数，一眼可见。
     """
@@ -190,17 +190,17 @@ def _write_archive(path, members, net=NET_80):
 def test_keeps_only_19x19_and_drops_small_and_non_square(tmp_path):
     """9/13 路与**非方阵**都必须丢掉，且丢掉的数量要记账。
 
-    ⚠ 非方阵（10×11）是 `board_size_from_packed` 记 0 的那种行：静默凑成
+     非方阵（10×11）是 `board_size_from_packed` 记 0 的那种行：静默凑成
       邻近边长的话，18 路的行会被当成 19 路喂进模型。
     """
     n = 5
     d = _fake_npz(n=n, board=19)
     sp = np.zeros((n, SPATIAL_CHANNELS, BOARD_STRIDE, BOARD_STRIDE), dtype=bool)
-    sp[0, 0, :19, :19] = True                      # 19 路 ✔
+    sp[0, 0, :19, :19] = True # 19 路
     sp[1, 0, :9, :9] = True                        # 9 路
     sp[2, 0, :13, :13] = True                      # 13 路
     sp[3, 0, :10, :11] = True                      # 非方阵
-    sp[4, 0, :19, :19] = True                      # 19 路 ✔（带特征）
+    sp[4, 0, :19, :19] = True # 19 路 （带特征）
     sp[4, 18, :5, :5] = True                       # 唯一有内容的行
     d['binaryInputNCHWPacked'] = _pack_spatial(sp)
 
@@ -235,7 +235,7 @@ def test_whole_archive_of_small_boards_is_reported_not_silently_empty(tmp_path):
 # 2 · 列布局：64 列与 80 列必须映射到同一组全局目标
 # --------------------------------------------------------------------------- #
 def test_same_semantics_land_on_the_same_columns_in_both_layouts():
-    """🔴 最容易错的一处：两个列族的**同名列号一致**，映射结果必须逐位相同。
+    """ 最容易错的一处：两个列族的**同名列号一致**，映射结果必须逐位相同。
 
     `_fake_npz` 把「列号当值」的哨兵（1000+i）铺满每一列，只有 `COL_*`
     指到的列放真值 ⇒ 任何一处列号写错，这里立刻炸。
@@ -254,7 +254,7 @@ def test_same_semantics_land_on_the_same_columns_in_both_layouts():
             continue
         assert np.array_equal(a[key], b[key]), f'{key} 在两个列族上不一致'
     # 逐项点名，避免"集合相等但值都是哨兵"这种假绿
-    # ⚠ 用 approx：`globalTargetsNC` 是 float32，0.6 存不精确，`==` 会假失败
+    # 用 approx：`globalTargetsNC` 是 float32，0.6 存不精确，`==` 会假失败
     assert a['komi'].tolist() == pytest.approx([v['komi']] * 3)
     assert a['final_score'].tolist() == pytest.approx([v['final_score']] * 3)
     assert a['lead'].tolist() == pytest.approx([v['lead']] * 3)
@@ -271,7 +271,7 @@ def test_same_semantics_land_on_the_same_columns_in_both_layouts():
 
 
 def test_every_semantic_column_is_a_tuple_of_column_numbers():
-    """🔴 `GLOBAL_TARGET_COLUMNS` 的每个值都必须是**元组**。
+    """ `GLOBAL_TARGET_COLUMNS` 的每个值都必须是**元组**。
 
     写成 `'w_policy_opp': (COL_W_POLICY_OPP)`（少一个逗号）就是一个 int，
     `max(max(v) ...)` 会当场抛 `TypeError`，而 `g[:, 47]` 会静默取错一列。
@@ -311,7 +311,7 @@ def test_network_is_required_only_when_column_count_is_ambiguous():
 
 
 def test_mixed_layouts_in_one_archive_are_dispatched_per_member(tmp_path):
-    """🔴 实测两个 `.tgz` 都混着 64/80 列 ⇒ 逐成员分派，不按归档名分派。
+    """ 实测两个 `.tgz` 都混着 64/80 列 ⇒ 逐成员分派，不按归档名分派。
 
     这条用合成归档复现那个实测事实：同一个 tar 里先 80 列成员、后 64 列成员，
     两种都要进同一个 npz，且 `meta` 里要分别记账。
@@ -321,7 +321,7 @@ def test_mixed_layouts_in_one_archive_are_dispatched_per_member(tmp_path):
            _fake_npz(n=4, net=NET_64, seed=2))
     arch = _write_archive(str(tmp_path / 'mixed.tar'), [a80, a64])
     out = str(tmp_path / 'o.npz')
-    # ⚠ 故意给一个**只对得上其中一种布局**的 --network：逐成员分派不许被它带偏
+    # 故意给一个**只对得上其中一种布局**的 --network：逐成员分派不许被它带偏
     meta = s2n.convert([(arch, NET_80)], out, log_every=0)
 
     assert meta['rows'] == 7
@@ -374,7 +374,7 @@ def test_column_count_different_archives_produce_identical_targets(tmp_path):
 def test_top16_policy_roundtrips_through_the_sparse_format(tmp_path):
     """存 top-16、用 `policy_dense_from_sparse` 还原 ⇒ **恰好等于那个 top-16 子分布**。
 
-    ⚠ 往返一致的前提是「rank + 权重」两列都没错位。⚠ 注意断言的对象是
+     往返一致的前提是「rank + 权重」两列都没错位。 注意断言的对象是
       **截断后的 16 个动作**重新归一化的结果（`renormalize=True` 的语义），
       **不是**原始 40 个动作的全分布 —— 后者按定义就还原不出来，而丢掉的
       那部分质量正是 `policy_*_resid` 记的账。
@@ -397,7 +397,7 @@ def test_top16_policy_roundtrips_through_the_sparse_format(tmp_path):
                 want = np.zeros(ACTION_SIZE, np.float64)
                 want[order] = src[order]
                 want /= want.sum()
-                # ⚠ `policy_dense_from_sparse` 收 (B,K) —— 单行也要留 2 维
+                # `policy_dense_from_sparse` 收 (B,K) —— 单行也要留 2 维
                 got = policy_dense_from_sparse(
                     z[f'policy_{who}_rank'][i:i + 1],
                     z[f'policy_{who}_prob'][i:i + 1], ACTION_SIZE).numpy()[0]
@@ -434,7 +434,7 @@ def test_topk_truncation_resid_is_zero_when_support_fits_in_k(tmp_path):
 def test_policy_resid_never_returns_nan_for_an_all_zero_row():
     """全零 visit 行（占位样本）⇒ `resid = 0`，不是 nan。
 
-    ⚠ nan 会在报告里伪装成「K 太小」，是最难查的那类假信号。
+     nan 会在报告里伪装成「K 太小」，是最难查的那类假信号。
     """
     got = s2n.policy_resid(np.zeros((1, ACTION_SIZE)), np.zeros((1, 16)))
     assert got.tolist() == [0.0]
@@ -447,7 +447,7 @@ def test_policy_resid_never_returns_nan_for_an_all_zero_row():
 def test_emitted_game_ids_are_unique_so_every_neighbor_is_rejected(tmp_path):
     """stdata 没有着法序列 ⇒ `game_ids` 逐行唯一 ⇒ `gather_neighbors` 全不可用。
 
-    ⚠ 越界也判不可用，但**跨局**这条是独立的一层：这里所有 `j` 都在界内，
+     越界也判不可用，但**跨局**这条是独立的一层：这里所有 `j` 都在界内，
       判不可用**只能**来自 `game_ids` 不相等。
     """
     d = _fake_npz(n=12, net=NET_80, seed=3)
@@ -495,7 +495,7 @@ def test_cross_game_guard_rejects_the_boundary_and_keeps_the_interior():
 # --------------------------------------------------------------------------- #
 def test_spatial_stays_bit_packed_and_known_divergent_channels_are_untouched(
         tmp_path):
-    """🔴 ch18/ch19（死子口径差）必须**逐位原样**带入，不许在转换期"修"。
+    """ ch18/ch19（死子口径差）必须**逐位原样**带入，不许在转换期"修"。
 
     同时钉住输入的存储格式：`(N,22,46) uint8`，不是解包后的
     `(N,22,19,19)`（那会让体积翻 8 倍）。
@@ -546,7 +546,7 @@ def test_output_schema_is_complete_and_self_describing(tmp_path):
         assert info['rows'] == 2
         assert info['policy_topk'] == s2n.POLICY_TOPK
         # 通道资格表逐项来自 crosscheck_stdata，不重抄
-        # ⚠ ch18/19 已于「Benson + 双活过滤」落地后从 KNOWN_DIVERGENT 升为 ALIGNED
+        # ch18/19 已于「Benson + 双活过滤」落地后从 KNOWN_DIVERGENT 升为 ALIGNED
         #   （实测逐位 1.000000，706 行 ours_nz == off_nz）。原先这里断言
         #   `known_divergent == [18, 19]` 是把**已被推翻的根因**（官方先提死子）
         #   固化成了门禁 —— 现在没有任何 KNOWN_DIVERGENT 通道。
@@ -563,7 +563,7 @@ def test_output_schema_is_complete_and_self_describing(tmp_path):
 
 
 def test_komi_out_of_physical_domain_is_flagged_not_silently_written(tmp_path):
-    """🔴 `COL_KOMI=47` 实测是 selfKomi，值域可以到 ±94 ⇒ 必须**打标记**。
+    """ `COL_KOMI=47` 实测是 selfKomi，值域可以到 ±94 ⇒ 必须**打标记**。
 
     这条锁死处理方式：**按原样写入 + 逐批标进 `suspect_columns`**，
     既不改值也不静默 —— 凭空发明一个贴目比留一个已知错位的值更难查。
@@ -588,7 +588,7 @@ def test_komi_out_of_physical_domain_is_flagged_not_silently_written(tmp_path):
 def test_soft_outcome_triples_pass_the_plausibility_check():
     """软 outcome（行和恒为 1、`max < 0.999`）**不得**被判成 SUSPECT。
 
-    ⚠ 这条是「检测器不许假报警」的约束：实测三个归档上
+     这条是「检测器不许假报警」的约束：实测三个归档上
       `globalTargetsNC[:,0:3]` 都是软分布，早先按「必须 one-hot」写的那版
       检测器对着真实数据一路狂响 —— 那样的检测器比没有更糟。
     """
@@ -607,7 +607,7 @@ def test_soft_outcome_triples_pass_the_plausibility_check():
 def test_failed_conversion_leaves_no_partial_npz(tmp_path, monkeypatch):
     """写到一半失败时**不留半截文件**（约束 5：行数对不上的 npz 比没有更糟）。
 
-    ⚠ 故障注入在 ``_write_member`` 上而不是主循环里：主循环失败时文件还没
+     故障注入在 ``_write_member`` 上而不是主循环里：主循环失败时文件还没
       建（`close()` 才建），那种"失败"证明不了任何东西。这里让 zip 已经
       建好、写第 3 个成员时炸 ⇒ ``discard()`` 必须把它删掉。
     """
@@ -645,7 +645,7 @@ def test_writer_rejects_more_rows_than_the_header_declares(tmp_path):
 
 
 def test_reader_roundtrips_into_the_12_item_loss(tmp_path):
-    """🔴 「产出结构正确」的可执行定义：读回来的标签能直接喂 `KataGoV7Loss`。
+    """ 「产出结构正确」的可执行定义：读回来的标签能直接喂 `KataGoV7Loss`。
 
     没有这条，「键名对不对」就只能靠人读键名猜；而**拼错键名不报错**，
     只会静默少算一项 loss（训练照跑，曲线看着"正常"）。
@@ -763,7 +763,7 @@ def test_real_archive_converts_and_matches_the_official_packing(tmp_path):
 
 @needs_stdata
 def test_real_b28_komi_is_flagged_as_suspect(tmp_path):
-    """🔴 真实 zzb 批上 `komi` 必须被标成 SUSPECT（实测 col47 到 ±41.5）。
+    """ 真实 zzb 批上 `komi` 必须被标成 SUSPECT（实测 col47 到 ±41.5）。
 
     这条把上面那条合成测试钉在**真实数据**上：检测器不是理论摆设。
     """

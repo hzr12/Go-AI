@@ -290,7 +290,7 @@ def test_optimizer_state_save_resume_roundtrip():
     _run(opt, net, gs[3:])          # 参考：不中断的 fused 轨迹（6 步）
 
     # (a) fused → fused 同模式
-    # ⚠ 每次加载都用 `deepcopy(sd)`：`load_state_dict` **不**深拷贝内层动量张量，
+    # 每次加载都用 `deepcopy(sd)`：`load_state_dict` **不**深拷贝内层动量张量，
     #   加载后的优化器与传入的 state 共享同一批 tensor（实测 torch 2.12），续跑
     #   step 会把快照原地改掉 ⇒ (a) 的续跑会污染 (b) 的快照。生产里 tstate
     #   一次性用完即弃、无影响；别名问题只存在于「同一份快照加载两次」的测试里。

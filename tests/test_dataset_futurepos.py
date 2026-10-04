@@ -43,7 +43,7 @@ P8, P32 = FUTUREPOS_OFFSETS          # (8, 32)
 # 合成数据：三局，行 0..9 / 10..19 / 20..29。盘面用**每行一份随机的 ±1 图案**
 # 乘上一个按行交替的颜色。
 #
-# ⚠ 图案必须同时满足三件事，缺一个测试就测不出东西：
+# 图案必须同时满足三件事，缺一个测试就测不出东西：
 #   ① **两种颜色都出现**（否则「对手占位」可能是全 0，测不出方向）；
 #   ② **不对称**（棋盘格那种 (r+c) 奇偶图案在 8 个二面体对称下不变，会把
 #      `permute_soft` 的方向 bug 整个掩盖掉）；
@@ -150,7 +150,7 @@ def test_shape_dtype_and_value_domain(tmp_path):
 def test_labels_dict_and_w_keep_their_existing_keys(tmp_path):
     """启用 futurepos **只加键、且只动 `futurepos` 这一个既有键**。
 
-    🔴 `w['futurepos']` 正是 A6 要改的那个键（恒 0 → 有效性掩码），所以它是
+     `w['futurepos']` 正是 A6 要改的那个键（恒 0 → 有效性掩码），所以它是
     **唯一**允许变的既有键；其余每个键必须与未启用时**逐字节相同**。
     """
     data = _toy(LENS)
@@ -198,7 +198,7 @@ def test_values_match_hand_computed_opponent_occupancy(tmp_path):
 
 
 def test_opponent_is_relative_to_row_i_not_the_future_row(tmp_path):
-    """🔴 「对手」按**行 i 的 to_play** 定，不是按未来行的 to_play。
+    """ 「对手」按**行 i 的 to_play** 定，不是按未来行的 to_play。
 
     真实数据里 +8/+32 都是偶数偏移 ⇒ 两口径碰巧一致，所以**本例故意把
     ``to_play[i+8]`` 翻掉**来把两种口径拉开：不翻的话这条断言测不出任何东西。
@@ -220,7 +220,7 @@ def test_opponent_is_relative_to_row_i_not_the_future_row(tmp_path):
 # 3. 三种「不可用」情形（最容易静默出错的地方）
 # --------------------------------------------------------------------------- #
 def _assert_not_silent_empty(d, b, h, why):
-    """🔴 无效格**不许**是全 0（全 0 = 「对手一颗子都没占」这个合法标签）。"""
+    """ 无效格**不许**是全 0（全 0 = 「对手一颗子都没占」这个合法标签）。"""
     v = d['future'][b, h]
     assert np.all(v == FUTUREPOS_SENTINEL), f'{why}：应整块为 {FUTUREPOS_SENTINEL}'
     assert not np.any(v == 0.0), f'{why}：哨兵不能是全 0 —— 那是合法标签'
@@ -246,7 +246,7 @@ def test_case1_out_of_range_gets_sentinel_not_empty_board(tmp_path):
 
 
 def test_case2_cross_game_gets_sentinel_and_no_clamping(tmp_path):
-    """🔴 情形② 跨局：`game_ids[j] != game_ids[i]`。
+    """ 情形② 跨局：`game_ids[j] != game_ids[i]`。
 
     断言的重点是「**不许 clamp 到别局的行**」：`j` 在界内、盘面完全合法，
     只是不属于这一手。
@@ -269,7 +269,7 @@ def test_case2_cross_game_gets_sentinel_and_no_clamping(tmp_path):
 
 
 def test_case3_gather_valid_false_is_the_single_gate(tmp_path):
-    """🔴 情形③ `gather_neighbors` 的 `valid[offset]` 为 False。
+    """ 情形③ `gather_neighbors` 的 `valid[offset]` 为 False。
 
     做法：monkeypatch 一层，**把 gather 算出来的 valid 强制清掉一部分**，
     证明 `future` 的哨兵与权重**只由 `valid` 决定**——即使
@@ -316,7 +316,7 @@ def test_case3_gather_valid_false_is_the_single_gate(tmp_path):
 # 4. 只活一路 ⇒ 整块权重必须为 0（loss 不除 Σw，见 katago_v7_loss）
 # --------------------------------------------------------------------------- #
 def test_one_surviving_horizon_gives_zero_block_weight(tmp_path):
-    """🔴 单路存活：**`w['futurepos'] == 0` 但 `w['futurepos_h*']` 有一个 == 1**。
+    """ 单路存活：**`w['futurepos'] == 0` 但 `w['futurepos_h*']` 有一个 == 1**。
 
     为什么：`katago_v7_loss.py:362-368` 把 (b,2,bs²) 压成**一个**逐样本标量、
     只乘**一个**权重；`_weighted_mean` 又不除 Σw。给 w=1 会让另一路的 -1 哨兵
@@ -331,7 +331,7 @@ def test_one_surviving_horizon_gives_zero_block_weight(tmp_path):
     assert d['w']['futurepos_h1'][0] == 0.0, 'h1 应无效'
     _assert_not_silent_empty(d, 0, 1, '死掉的那一路')
     assert d['future'][0, 0].sum() > 0, '活的那一路必须仍有真值（不只是权重）'
-    # 🔴 整块权重必须是 0，尽管有一路活着
+    # 整块权重必须是 0，尽管有一路活着
     assert d['w']['futurepos'][0] == 0.0, (
         '只活一路时 w["futurepos"] 必须为 0：loss 的作用单位是整块 2×bs²')
 
@@ -353,7 +353,7 @@ def test_both_horizons_dead_gives_zero_everywhere(tmp_path):
 # 5. 对称增广
 # --------------------------------------------------------------------------- #
 def test_augmented_future_equals_permute_soft_and_keeps_sentinel(tmp_path):
-    """🔴 `future` 的增广必须**恰好**等于 `permute_soft` 的效果，
+    """ `future` 的增广必须**恰好**等于 `permute_soft` 的效果，
     且哨兵 -1 增广后仍是 -1（不会被当成下标、不会被 clamp、不会变成 0）。"""
     data = _toy(LENS)
     ds = _ds(data, _materialized(tmp_path, data))
@@ -439,7 +439,7 @@ def test_disabled_is_byte_identical_to_pre_a6_payload(tmp_path):
 
 
 def test_labels_false_never_touches_the_gather(tmp_path):
-    """🔴 `labels=False`（热路径）不得触发任何 gather / 物化。"""
+    """ `labels=False`（热路径）不得触发任何 gather / 物化。"""
     data = _toy(LENS)
     mat = _materialized(tmp_path, data)
     ds = SupervisedDataset(data, n_channels=12)
@@ -484,7 +484,7 @@ def test_enable_and_disable_toggle_cleanly(tmp_path):
 # 7. mmap 来源与惰性解析
 # --------------------------------------------------------------------------- #
 def test_live_gather_reads_the_npy_mmap_not_the_in_memory_column(tmp_path):
-    """🔴 boards 来源取 `.npy` 的 mmap，且**不回退**到 `self.boards`。
+    """ boards 来源取 `.npy` 的 mmap，且**不回退**到 `self.boards`。
 
     做法：把 `self.boards` 换成一份**不同的**数据，label 必须仍按 `.npy` 那份算
     —— 这同时证明「真的走了 source」和「没有静默用 self.boards」。

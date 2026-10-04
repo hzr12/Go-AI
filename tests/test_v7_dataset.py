@@ -54,7 +54,7 @@ CELLS = BOARD_SIZE * BOARD_SIZE
 class _RngFixed:
     """只吐出一组**预先给定**的 ``tforms`` 的假 rng。
 
-    ⚠ 为什么要它：`sample_batch_numpy(augment=True)` 内部自己调
+     为什么要它：`sample_batch_numpy(augment=True)` 内部自己调
       `rng.integers(0, 8, size=B)` 抽 tforms，那个调用我们**拦不住**也看不到
       （没有返回值）。想验证「第 k 行用了 t」就只能控制它抽到什么。
       真实 rng 做不到「保证某一行是某个值」，所以用这个替身。
@@ -168,7 +168,7 @@ def test_strict_alternation_gives_the_documented_slots():
 
 
 def test_non_alternating_to_play_still_lands_the_right_slot():
-    """🔴 **不能按奇偶取**：真实数据有 842 对同局相邻行 to_play 不翻转。
+    """ **不能按奇偶取**：真实数据有 842 对同局相邻行 to_play 不翻转。
 
     这里把第 10 行改成与第 9 行同色（该行本该是对手，实际是自己），断言
     `moves[9]` 落进 **my** 而不是 op —— 按奇偶的实现会把它放进 op[0]。
@@ -187,7 +187,7 @@ def test_non_alternating_to_play_still_lands_the_right_slot():
     # 但**不该在 op 侧开个洞** —— 槽位是按「该侧第几手」排的，不是按 k）
     assert my[i].tolist() == [mv[10], mv[9], mv[8]]
     assert op[i].tolist() == [mv[11], mv[7], -1]
-    # 🔴 **这正是「不能按奇偶取」的证据**：按局内位置奇偶会把 moves[9]
+    # **这正是「不能按奇偶取」的证据**：按局内位置奇偶会把 moves[9]
     # （同色，属 my）算成 op，把整个 op 侧错开一格。
     assert mv[9] not in op[i].tolist()
     wmy, wop = reference_history_row(i, mv, tp, gid)
@@ -206,7 +206,7 @@ def test_cross_game_rows_are_not_taken():
     # 第 20 行是第二局第 0 行 ⇒ 往前全是别的局 ⇒ 三个槽全空
     assert my[20].tolist() == [-1, -1, -1]
     assert op[20].tolist() == [-1, -1, -1]
-    # ⚠ 第 19 行是**第一局的末行**，局内还有 19 手历史 ⇒ **不该**是空的。
+    # 第 19 行是**第一局的末行**，局内还有 19 手历史 ⇒ **不该**是空的。
     #   把它当成空会把「局内历史够深」与「跨局被守卫拦住」两种情形混为一谈，
     #   而两者的正确行为完全不同。
     assert my[19].tolist() != [-1, -1, -1]
@@ -278,7 +278,7 @@ def test_rebuild_is_chunk_size_independent():
 # 2 · 防「优化回去」：npz 的 op_hist 是错的
 # --------------------------------------------------------------------------- #
 def test_raw_npz_op_hist_slots_are_swapped():
-    """🔴 直接吃 npz 的 ``op_hist`` 会让 **5 个历史通道错 4 个**。
+    """ 直接吃 npz 的 ``op_hist`` 会让 **5 个历史通道错 4 个**。
 
     这个测试的存在意义是**钉死一个已修的 bug**：若有人觉得
     ``rebuild_history_columns`` 太慢而「优化」成直接读 npz 的列，
@@ -358,7 +358,7 @@ def test_row_i_board_is_before_moves_i():
 def test_dihedral_is_identity_for_t0_and_8_ways_are_distinct():
     """`dihedral_batch` 收的是**单批** ``(B,C,H,W)`` + 逐行 ``tforms``。
 
-    ⚠ 传 ``(8,C,H,W)`` + ``tforms=arange(8)`` 恰好每一行一个 t，但那样测的是
+     传 ``(8,C,H,W)`` + ``tforms=arange(8)`` 恰好每一行一个 t，但那样测的是
       「整批一次跑完」；这里**逐个 t 单测**，这样 8 路里任何一路写反都会定位到
       具体的 t 而不是整批失败。
     """
@@ -377,12 +377,12 @@ def test_dihedral_is_identity_for_t0_and_8_ways_are_distinct():
 
 
 def test_dihedral_matches_dataset_augmentation():
-    """🔴 与 ``dataset.sample_batch_numpy`` 的增强**逐位对拍**。
+    """ 与 ``dataset.sample_batch_numpy`` 的增强**逐位对拍**。
 
     方向写反（`rot90` 是逆时针、镜像在 W 轴）不会报错，只是「loss 照降、
     棋力不涨」。所以两份实现必须一起改，这条测试是防漂移的唯一闸。
 
-    ⚠ ``dataset`` 的增广是**内联**在 ``sample_batch_numpy`` 里的（没有独立的
+     ``dataset`` 的增广是**内联**在 ``sample_batch_numpy`` 里的（没有独立的
     ``_symmetrize`` 可调）⇒ 不能直接对拍那个函数。改用**逐位重放**：构造一个
     必然抽出同一组 ``tforms`` 的 rng，两条路径各跑一次，比较输出。
     """
@@ -403,7 +403,7 @@ def test_dihedral_matches_dataset_augmentation():
     base = ds.sample_batch_numpy(idxs, augment=False)[0]
 
     for t in range(8):
-        # ⚠ **不能**要求「一批里全是同一个 t」：那需要 n 个独立同值抽样，
+        # **不能**要求「一批里全是同一个 t」：那需要 n 个独立同值抽样，
         #   `default_rng(seed).integers(0,8,n)` 给不出这样的 seed（会 skip）。
         #   改成**逐行**验证 —— 把 tforms 钉成「第 k 行 = t、其余行 = 0」，
         #   于是两路输出里第 k 行应当逐位等于 `dihedral(x[k], t)`。
@@ -428,7 +428,7 @@ def test_dihedral_preserves_value_set_per_row():
 # 4 · 行权重
 # --------------------------------------------------------------------------- #
 def test_missing_w_key_is_rejected_not_defaulted_to_one():
-    """🔴 ``KataGoV7Loss.w_of()`` 缺键返回全 1 ⇒ 「不写」不是「屏蔽」。"""
+    """ ``KataGoV7Loss.w_of()`` 缺键返回全 1 ⇒ 「不写」不是「屏蔽」。"""
     w = {k: np.ones(4, dtype=np.float32) for k in LOSS_W_KEYS}
     del w['lead']
     w['lead'] = np.zeros(4, dtype=np.float32)
@@ -458,7 +458,7 @@ def test_w_of_really_does_default_to_ones():
     base = _minimal_labels(3)
 
     def ownership_term(w):
-        # ⚠ forward 返回 {'loss', 'terms', 'weighted', ...}，逐项在 ['terms'] 里
+        # forward 返回 {'loss', 'terms', 'weighted', ...}，逐项在 ['terms'] 里
         lbl = {**base, 'w': w}
         return float(lossf(out, lbl)['terms']['ownership'])
 
@@ -497,7 +497,7 @@ def test_frozen_c_heads_are_the_nine_without_supervision():
 def test_dense_move_target_marks_invalid_as_all_zero():
     """``-1``（局末手 / 跨局 / 下一手是 pass）⇒ **全零行**，不是随便哪一类。
 
-    ⚠ 落点 ``361``（= ``CELLS``）是**合法的 pass 类**，不是越界 —— 把它当
+     落点 ``361``（= ``CELLS``）是**合法的 pass 类**，不是越界 —— 把它当
     越界会让「对手收官」这种真实情形退化成全零行（标签被静默抹掉）。
     """
     mv = np.array([0, 5, -1, CELLS, CELLS + 1, 1000], dtype=np.int64)
@@ -521,7 +521,7 @@ def test_dense_move_target_accepts_pass_class():
 # 6 · 与 train_sft 的两份实现逐位一致
 # --------------------------------------------------------------------------- #
 def test_matches_train_sft_v7_batch_features_bitwise():
-    """🔴 ``spatial_global`` 与 ``train_sft.v7_batch_features`` 必须逐位相同。
+    """ ``spatial_global`` 与 ``train_sft.v7_batch_features`` 必须逐位相同。
 
     `src` 不能反向依赖 `scripts`（会把 argparse / 设备探测拖进数据层），
     所以只能各写一份 + 对拍。这条测试是两份实现唯一的防漂移闸门。
@@ -554,7 +554,7 @@ def test_loss_label_translation_matches_train_sft():
 def test_future_rename_and_weights_pass_through_untouched():
     """``future`` → ``futurepos`` 只是改名；``w`` 必须**原样**透传。
 
-    🔴 ``w['futurepos']`` 绝不能改成 OR：loss 把 (b,2,bs²) 塌成逐样本标量后
+     ``w['futurepos']`` 绝不能改成 OR：loss 把 (b,2,bs²) 塌成逐样本标量后
     只乘一个权重，权重的最小作用单位是「整块」⇒ 只活一路时给 1 会把那一路
     的 -1 哨兵当真值拟合。
     """
@@ -562,7 +562,7 @@ def test_future_rename_and_weights_pass_through_untouched():
     ds.attach_futurepos(mode='live')
     ds.warm_futurepos()
     _, _, moves, lbl = ds.sample_batch_v7(np.arange(8), augment=False)
-    # ⚠ dataset 侧的键叫 ``future``，改名成 ``futurepos`` 发生在
+    # dataset 侧的键叫 ``future``，改名成 ``futurepos`` 发生在
     #   :func:`to_v7_loss_labels`（loss 叫 futurepos、dataset 叫 future）
     assert 'future' in lbl and 'futurepos' not in lbl
     out = to_v7_loss_labels(lbl, moves)
@@ -623,7 +623,7 @@ def test_sample_batch_v7_shapes_and_no_rng_when_not_augmenting():
 
 
 def test_augment_uses_one_tform_for_both_input_and_labels():
-    """🔴 ``tforms`` 抽一次同时喂空间量与标签 —— 「自己再抽一份」是静默错标签。"""
+    """ ``tforms`` 抽一次同时喂空间量与标签 —— 「自己再抽一份」是静默错标签。"""
     ds = V7Dataset(_tiny_dataset(), verify_history=None)
     rng = np.random.default_rng(4)
     _, _, moves, _ = ds.sample_batch_v7(np.arange(16), rng=rng, augment=True)
@@ -652,7 +652,7 @@ def test_game_komi_accepts_mapping_or_game_id_indexed_array():
 def test_labels_feed_all_twelve_loss_terms():
     """产物能喂满 12 项 loss 并反传（smoke 级，但足以证明键齐全）。
 
-    ⚠ ``KataGoV7Loss.forward`` 返回 ``{'loss', 'terms', 'weighted', ...}``，
+     ``KataGoV7Loss.forward`` 返回 ``{'loss', 'terms', 'weighted', ...}``，
       逐项值在 ``['terms']`` 里 —— 共 12 项。``loss`` 是已加权求和的标量。
     """
     from src.networks.katago_v7 import NbtTfNet
@@ -674,7 +674,7 @@ def test_labels_feed_all_twelve_loss_terms():
 
 
 def test_open_heads_are_off_on_this_corpus_so_they_get_no_gradient():
-    """🔴 A/C 阶段：SGF 语料没有标签的那 9 项必须**真的**没有梯度。
+    """ A/C 阶段：SGF 语料没有标签的那 9 项必须**真的**没有梯度。
 
     只断言 ``w=0`` 是不够的 —— `w=0` 只让 loss 的**数值**为 0，梯度照样流过
     那些头（``0 * x`` 的导数是 0，但共享主干的梯度仍然非 0）。真正的冻需要

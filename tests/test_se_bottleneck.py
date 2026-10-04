@@ -196,7 +196,7 @@ def test_se_gate_is_computed_from_the_block_input_not_conv3_output():
     `y == r * se(x) + x` 逐位成立；再单独断言 `se(x) != se(r)`，坐实两个候选
     输入在这个输入上确实不同（否则第一条断言就退化成恒等式，守不住任何东西）。
 
-    ⚠ 通道数取 160 而不是小值：SE 的隐藏层宽度是 `C // r`，`C=16, r=16` 时隐藏
+     通道数取 160 而不是小值：SE 的隐藏层宽度是 `C // r`，`C=16, r=16` 时隐藏
     层只有 1 维、`fc1` 的输出被 ReLU 整片夹到 0 ⇒ 门控退化成与输入无关的常数
     `sigmoid(b2)`，任何判别式都会空转绿。160 也正是生产形状（隐藏层 10 维）。
     """
@@ -230,7 +230,7 @@ def test_se_gate_reduction_defaults_to_16():
     # 可配：reduction=8 → 隐藏层 20；reduction 超过通道数时兜底到 1 维
     assert SEBottleneck(160, se_reduction=8).se.fc1.out_features == 20
     assert SEBottleneck(160, se_reduction=160).se.fc1.out_features == 1
-    # ⚠ 用 320 而不是 160：`160 // 160 == 1`，删掉下限那行这条仍会绿
+    # 用 320 而不是 160：`160 // 160 == 1`，删掉下限那行这条仍会绿
     assert SEBottleneck(160, se_reduction=320).se.fc1.out_features == 1
 
 
@@ -543,7 +543,7 @@ def test_alphanet_default_arch_is_untouched():
 def test_se_bottleneck_backbone_param_total_at_v18_target():
     """v18 目标形状 (C=160, 17 块, mix/4 注意力, value_res_blocks=2) 的实测装配量。
 
-    ⚠ **这条记录的数与任务书里的 9.25M 不是一回事**：同一形状下 `arch="resnet"`
+     **这条记录的数与任务书里的 9.25M 不是一回事**：同一形状下 `arch="resnet"`
     实测 8.85M（全网），`arch="convnext"` 5.57M，`arch="se_bottleneck"` 只有
     **3.99M**。也就是 SE 块在这个形状上把参数量砍到 resnet 的 0.45 倍 —— 9.25M
     那个标定值几乎肯定是 resnet 路径测出来的。想把 SE 路径的预算填到 9.25M，

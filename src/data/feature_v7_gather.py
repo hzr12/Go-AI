@@ -20,15 +20,15 @@ futurepos 标签（§5.1）           ``+8`` / ``+32``    训练标签侧
 散列 / 合法性（``pos_hash``）     ``-1`` 的 ``to_play`` / ``ko``
 ==============================  ==================  ==========================
 
-⚠ **offset 是「带符号的行增量」**：``j = i + offset``。混用方向正是这类 API
+ **offset 是「带符号的行增量」**：``j = i + offset``。混用方向正是这类 API
 最容易静默取错行的地方（brief 里就同时写过 ``offsets=(1,8,32)`` 与「offset 1
 = ``i-1``」），所以两组常见取法都给了具名常量，让调用点自解释、让错方向变成
 一眼能看出的负数或越界。
 
-⚠ **默认 ``offsets=(1, 8, 32)`` 是占位值，不是任何真实调用点的取法。**
+ **默认 ``offsets=(1, 8, 32)`` 是占位值，不是任何真实调用点的取法。**
 真实调用点只有两个，且都必须显式传参（见上面的两个常量）。
 
-⚠ **本模块不解析「历史不足 ⇒ 回退复制」那套门控**（那是
+ **本模块不解析「历史不足 ⇒ 回退复制」那套门控**（那是
 ``feature_v7.py::resolve_ladder_boards`` 的活，且必须**只解析一次**——
 ``feature_v7_ladders.py`` 曾把同一段门控解析两次、输出行抄错了通道）。本模块
 只回答一个问题：``i + offset`` 这一行**能不能用**。
@@ -45,7 +45,7 @@ futurepos 标签（§5.1）           ``+8`` / ``+32``    训练标签侧
 
 ⇒ 这与 P0 的「id 复用 bug」是同一类风险：**取到的数据看起来完全合法**。
 
-🔴 **因此 ``NeighborGather.boards[offset]`` 单独消费不安全。** 不可用行是 0，
+ **因此 ``NeighborGather.boards[offset]`` 单独消费不安全。** 不可用行是 0，
 而 0 是一张合法的空盘 —— 空盘上 ``iterLadders`` 什么也找不到，于是 ch15 变成
 全 0，**看起来像「这一手没有梯子」**。必须先看 ``valid[offset]``，再交给
 ``feature_v7.py::resolve_ladder_boards`` 做官方的回退复制。本模块的
@@ -70,7 +70,7 @@ LADDER_OFFSETS = (-1, -2)
 #: futurepos 标签要的两块未来盘面：``i+8`` / ``i+32``（spec §5.1 / §5.4）。
 FUTUREPOS_OFFSETS = (8, 32)
 
-#: 签名里的默认偏移。⚠ **这是占位值，不是任何真实调用点的取法**
+#: 签名里的默认偏移。 **这是占位值，不是任何真实调用点的取法**
 #: （真实取法见上面两个常量）。之所以仍保留，是因为它是任务书钦定的签名，
 #: 改掉会让调用方以为「默认值是有用的」。
 DEFAULT_OFFSETS = (1, 8, 32)
@@ -94,7 +94,7 @@ class NeighborGather(Mapping):
     ``ko`` 的口径是 ``GoBoard.ko_point``：**紧凑**扁平下标 ``r*n+c``，``-1`` = 无
     （与主数据集的 ``ko`` 列同口径，见 ``scripts/build_dataset.py:294``）。
 
-    ⚠ ``to_play`` / ``ko`` 在**没传对应列**时是 ``None``，不是全 ``-1`` ——
+     ``to_play`` / ``ko`` 在**没传对应列**时是 ``None``，不是全 ``-1`` ——
     全 ``-1`` 与「无劫」「无行棋方」无法区分，正是 ``src/data/pos_hash.py`
     docstring 警告的那类假信号。
     """
@@ -127,7 +127,7 @@ class NeighborGather(Mapping):
     # ---- 掩码与小列 --------------------------------------------------------
     @property
     def boards(self):
-        """``{offset: (B,19,19) int8}``。⚠ **不可用行是 0，必须配 ``valid`` 用。**"""
+        """``{offset: (B,19,19) int8}``。 **不可用行是 0，必须配 ``valid`` 用。**"""
         return self._boards
 
     @property
@@ -181,7 +181,7 @@ def _gather_column(col, j, valid):
     ``boards`` 走这条路径时返回 ``(B,19,19)``、小列走时返回 ``(B,)`` ——
     「先索引再按掩码覆盖 0」对两者是同一段代码。
 
-    ⚠ 不可用行的 ``j`` 可能越界，所以**先 clip 再覆盖 0**。clip 只影响不可用行：
+     不可用行的 ``j`` 可能越界，所以**先 clip 再覆盖 0**。clip 只影响不可用行：
     可用行的 ``j`` 由 :func:`gather_neighbors` 的 ``in_range`` 保证在界内，
     不会被 clip 改动。
     """
@@ -211,7 +211,7 @@ def gather_neighbors(boards_mmap, indices, offsets=DEFAULT_OFFSETS, *,
             默认 :data:`DEFAULT_OFFSETS` 是占位值。
         game_ids: 可选 ``(N,)`` 整数。**给了就启用跨局守卫**：
             ``game_ids[j] != game_ids[i]`` ⇒ 该行不可用。
-            ⚠ **必须给**：主数据集的 ``boards`` 是把 162,298 局首尾相接排成的
+             **必须给**：主数据集的 ``boards`` 是把 162,298 局首尾相接排成的
             一根大数组，**没有局的边界标记**，行号 ``i`` 与 ``i+8`` 可以分属两局。
             跨局取到的盘面**看起来完全合法**（它就是某个真实盘面），只是不属于
             这一手 ⇒ 静默错标签。
@@ -219,7 +219,7 @@ def gather_neighbors(boards_mmap, indices, offsets=DEFAULT_OFFSETS, *,
             :class:`NeighborGather`。
 
     Returns:
-        :class:`NeighborGather`。⚠ **``.boards[offset]`` 的不可用行填 0，
+        :class:`NeighborGather`。 **``.boards[offset]`` 的不可用行填 0，
         必须配 ``.valid[offset]`` 消费**；直接喂给 ``ladder_channels`` 会得到
         「ch15 全 0」这种看起来无害、实际是「盘面丢了」的通道。
 
@@ -246,7 +246,7 @@ def gather_neighbors(boards_mmap, indices, offsets=DEFAULT_OFFSETS, *,
     if idx.size and (int(idx.min()) < 0 or int(idx.max()) >= n_rows):
         raise ValueError(
             f'indices 越界：[{int(idx.min())}, {int(idx.max())}] 不在 [0, {n_rows})。'
-            f'⚠ 本函数**不为越界的 indices 兜底** —— 那是调用方取错了行号，'
+            f' 本函数**不为越界的 indices 兜底** —— 那是调用方取错了行号，'
             f'静默丢行会让样本数与 batch 形状对不上。')
 
     for name, col in (('game_ids', game_ids), ('to_play', to_play), ('ko', ko)):
@@ -265,7 +265,7 @@ def gather_neighbors(boards_mmap, indices, offsets=DEFAULT_OFFSETS, *,
                              '存在的意义就是取**别的**行；要当前盘就直接用 boards。')
         j = b_idx + off
         in_range = (j >= 0) & (j < n_rows)
-        # 跨局守卫。⚠ 先按 in_range 取 game_ids 再比 —— 越界的 j 不能读。
+        # 跨局守卫。 先按 in_range 取 game_ids 再比 —— 越界的 j 不能读。
         if gid is None:
             valid = in_range
         else:

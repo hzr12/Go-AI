@@ -168,7 +168,7 @@ def test_planes_channel_count_follows_model():
     所有子局面的批量特征）。任何一处退回写死 12 都会在这里转红——不是
     「不抛异常」，是**通道数**对不上。
 
-    ⚠ 第四个位置——worker 推测性预取（`mcts.py:929-932`）——**不被本用例
+     第四个位置——worker 推测性预取（`mcts.py:929-932`）——**不被本用例
     覆盖**：它在 worker 线程里把 `_cur_root_board` 克隆一份、沿路径再放
     一遍，然后**自己**调 `feature_planes_batched(...,
     n_channels=self._in_channels())`，与 `_planes1` 不是同一次计算。它由
@@ -207,7 +207,7 @@ def test_planes_channel_count_follows_model():
 def test_worker_prefetch_site_follows_model_channels():
     """site #4（`mcts.py:929-932` worker 推测性预取）必须按**模型**通道数建特征。
 
-    ⚠ 与 `_planes1` **不是**同一次计算：预取在 worker 线程里对克隆棋盘
+     与 `_planes1` **不是**同一次计算：预取在 worker 线程里对克隆棋盘
     自己调 `feature_planes_batched(..., n_channels=self._in_channels())`，
     从不经过 `_planes1`——所以 `test_planes_channel_count_follows_model`
     的 (a)(b)(c) 三段覆盖不到这里，本用例专门钉它。
@@ -430,7 +430,7 @@ def test_mismatched_planes_still_raise(tmp_path):
     # 17 通道 planes，这道门是「开」的（对照组）；但错配一旦真的发生，同一道
     # 门必须照旧响亮。两者缺一不可：只留对照组就成了空转。
     #
-    # ⚠ 规格订正（report §「规格冲突」）：本用例原先写成
+    # 规格订正（report §「规格冲突」）：本用例原先写成
     #   `MCTS(_SpyAI(17))._forward_level(...)` 必须抛——那断言的恰恰是
     #   **改前**的 bug（MCTS 钉死 12 → 17 通道模型吃 12 格 → 抛）。改完之后
     #   MCTS 造 17 格，门自然开着，所以错配改由直接送 planes 触发：出口
@@ -453,7 +453,7 @@ def test_worker_prefetch_swallow_does_not_hide_channel_mismatch_end_to_end():
     `_expand` 拿到没有 prefetch 的叶子会自己再前向一次（`_planes1` +
     `predict_batch`），异常在那里抛出，`search` 直接失败。
 
-    ⚠ 规格订正（report §「规格冲突」）：原用例靠「`in_channels=17` 而 MCTS
+     规格订正（report §「规格冲突」）：原用例靠「`in_channels=17` 而 MCTS
     仍造 12 通道 planes」触发错配——那正是**改前**的 bug 本身。改完之后 MCTS
     照模型造 17 格，错配不再发生，用例就变成了一个永假的断言（它此前能过，
     恰恰是因为钉死的 12 还在）。要验「吞异常不藏错」，必须让错配真的发生：

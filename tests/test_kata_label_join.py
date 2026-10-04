@@ -50,7 +50,7 @@ def test_pos_hash_is_deterministic():
 def test_pos_hash_is_uint64_and_sensitive_to_every_component():
     """盘面 / to_play / ko **三者任一**变化都必须改散列。
 
-    ⚠ 全程必须在 uint64 下算。int64 乘法溢出后再 `astype(uint64)` 会触发
+     全程必须在 uint64 下算。int64 乘法溢出后再 `astype(uint64)` 会触发
     `RuntimeWarning` 且高位置换逻辑不可控 —— 首版就是这么坏的，唯一性与
     单格敏感性全失，而症状是「join 偶尔对上」。这里断言没有 overflow 警告。
     """

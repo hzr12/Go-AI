@@ -2,7 +2,7 @@
 
     python tests/capture_baseline.py tests/baseline_in_channels.json
 
-⚠ 顺序是硬要求：这份 baseline 必须在 `src/search/mcts.py` /
+ 顺序是硬要求：这份 baseline 必须在 `src/search/mcts.py` /
 `src/search/light_rollout.py` 改动**之前**抓。它要证明的是「12 通道下改前的行为
 本来就对」，所以在改完代码之后再抓就只剩自我循环——抓到的永远是当前代码的指纹，
 零回归也就无从谈起。

@@ -95,7 +95,7 @@ def test_grad_norm_is_taken_after_unscale():
     unscale 之前梯度还乘着 loss scale（默认 1024），量出来的范数大三个数量级 ——
     曲线看着「梯度爆炸」，而那只是缩放的假值。
 
-    ⚠ 判据必须在 **main() 内**取位置，不能用 `CODE.index()` 找全文件第一个：
+     判据必须在 **main() 内**取位置，不能用 `CODE.index()` 找全文件第一个：
        `_locate_overflow` 的 docstring 里也会提到 `clip_grad_norm_`（解释
        「为什么诊断必须在 clip 之前」），而它定义在 main 之前 ⇒ 全文件搜索会
        命中那段说明文字，于是这条门禁变成在测文档而不是测代码。
@@ -250,7 +250,7 @@ def _fn_node(fn):
 
 import builtins
 
-# ⚠ 必须用 `builtins` 模块，不能用 `dir(__builtins__)`：在**被 import** 的测试
+# 必须用 `builtins` 模块，不能用 `dir(__builtins__)`：在**被 import** 的测试
 #   模块里 `__builtins__` 是一个 dict，`dir(dict)` 给的是 dict 的方法
 #   （keys/values/get…），`len`/`max` 一个都不在里面 ⇒ 顺序检查把它们全误报成
 #   「从未赋值」。这不是假设：这个 bug 让本文件第一次跑就红。
@@ -264,7 +264,7 @@ def _first_assign_lines(fn_node):
         if isinstance(n, (ast.For, ast.AsyncFor)):
             # 循环变量也是绑定：`for epoch in range(...)`（L2718）—— 本文件的
             # `epoch` 就是这么来的，漏掉它这条检查会一直误报。
-            # ⚠ 不含 `ast.comprehension`：推导式在 Python 3 是**独立作用域**，
+            # 不含 `ast.comprehension`：推导式在 Python 3 是**独立作用域**，
             #   它的目标不会成为函数局部变量。
             for nm in _bound_names(n.target):
                 out.setdefault(nm, n.lineno)
@@ -273,7 +273,7 @@ def _first_assign_lines(fn_node):
             continue
         tgts = n.targets if isinstance(n, ast.Assign) else [n.target]
         for t in tgts:
-            # ⚠ 必须递归进 Tuple/List：`opt_loss, log_loss = _loss_terms(...)`
+            # 必须递归进 Tuple/List：`opt_loss, log_loss = _loss_terms(...)`
             #   是本文件最常见的赋值形式，只认 Name 会把它们全误报成「从未赋值」
             #   —— 让这条检查一上来就红，等于没有检查。
             for nm in _bound_names(t):
@@ -305,7 +305,7 @@ def _assigned_before(fn, use_line, names):
     前者靠「属性存在」静态检查能抓到；后者只能靠**顺序**检查 —— Python 自己的
     静态工具（pyflakes/ruff）都不会报：它是个合法局部变量，只是用早了。
 
-    ⚠ 用 `if type(f) is ast.FunctionDef` 而非 `isinstance`：后者会把**嵌套**在
+     用 `if type(f) is ast.FunctionDef` 而非 `isinstance`：后者会把**嵌套**在
     `main()` 里的 `def`（例如 _build_param_groups 的内层闭包）也算进来，于是内层
     的局部名被误判成「main() 里已赋值」，正好放行我们要抓的那类 bug。
     """
@@ -431,12 +431,12 @@ def test_v7_config_keys_are_recorded(key):
 
 
 def test_config_arch_numbers_follow_the_v7_flag():
-    """🔴 结构数字必须**按 `--v7` 分派**，不得无条件取 12 通道那张表。
+    """ 结构数字必须**按 `--v7` 分派**，不得无条件取 12 通道那张表。
 
     这不是洁癖：一个 V7 run 的面板写着 `in_channels: 12` 时，「对比两次 run」
     这件最常用的事会得到错误答案 —— 而面板恰恰是第一个看的东西。
 
-    ⚠ 判据跑在 `ast.unparse` 的输出上（`INIT`），那是一行、无换行的形式 ⇒
+     判据跑在 `ast.unparse` 的输出上（`INIT`），那是一行、无换行的形式 ⇒
       只能按「键名到下一个键名之间」切片，不能按源码的多行排版写正则。
     """
     for key in ('arch/in_channels', 'arch/channels', 'arch/params_total',
@@ -463,7 +463,7 @@ def test_v7_config_references_nbt_tf_cfg_not_args():
 
 
 def test_v7_config_avoids_the_archived_flag_names():
-    """⚠ V7 的键名必须避开 `value_channels` / `policy_channels` 等归档名。
+    """ V7 的键名必须避开 `value_channels` / `policy_channels` 等归档名。
 
     `test_config_panel_has_no_archived_flags` 是按**引号内字面量**判泄漏的，
     所以写 `NBT_TF_CFG['value_channels']` 会让它误报（它要禁的是 args 上的
@@ -477,7 +477,7 @@ def test_v7_config_avoids_the_archived_flag_names():
 
 
 def test_v7_loss_terms_are_uploaded_not_only_printed():
-    """🔴 V7 的 12 项逐项 loss 必须进 SwanLab（此前**只**进 stdout）。
+    """ V7 的 12 项逐项 loss 必须进 SwanLab（此前**只**进 stdout）。
 
     为什么关键：段 1 有 9 项的权重是 0，而 `loss` 只是个总和 ——
     「四项在学」与「四项都塌了」在 `loss` 这一个数上长得一模一样。
@@ -489,7 +489,7 @@ def test_v7_loss_terms_are_uploaded_not_only_printed():
 
 
 def test_v7_zero_weight_terms_are_still_uploaded():
-    """⚠ 权重为 0 的项也**照报**（值恒 0）。
+    """ 权重为 0 的项也**照报**（值恒 0）。
 
     图上看得见「这一项存在但没在学」，比「曲线里根本没有这一项」更容易
     区分「没接上」与「接上了但权重是 0」。键从**权重函数**取而不是另写一份
@@ -514,11 +514,11 @@ def test_v7_terms_dict_is_initialised_outside_the_loop():
 
 
 def test_terms_prefix_keeps_stdout_reading_bare_names():
-    """⚠ stdout 的 `[step N v7]` 行按**裸 term 名**排版，两者不能共用一个 dict。
+    """ stdout 的 `[step N v7]` 行按**裸 term 名**排版，两者不能共用一个 dict。
 
     共用会把 stdout 变成 `loss_v7/policy=5.88`，而文档与测试都按裸名读它。
     """
-    # ⚠ 键名仍是**裸 term 名**（不带 `loss_v7/` 前缀）—— stdout 那行按裸名排版。
+    # 键名仍是**裸 term 名**（不带 `loss_v7/` 前缀）—— stdout 那行按裸名排版。
     #   `.detach()` 是 2026-10-04 加的：`weighted` 的值带计算图，`float(x)`
     #   每步触发一次 requires_grad 警告 + 一次多余的 D2H 同步。
     assert "_v7_terms_last = {k: float(x.detach())" in MAIN, \
@@ -539,7 +539,7 @@ def test_v7_run_level_keys_are_uploaded(key):
 
 
 def test_run_level_reports_actual_params_not_the_budget():
-    """🔴 `run/params_actual` 必须是**实测**参数量。
+    """ `run/params_actual` 必须是**实测**参数量。
 
     V7 的 `NBT_TF_CFG['params_total']` 是**预算值** 5,561,832，而实测建出来
     是 **5,562,121**（差 289，`tests/test_katago_v7_budget.py` 钉住后者）。
@@ -550,7 +550,7 @@ def test_run_level_reports_actual_params_not_the_budget():
 
 
 def test_v7_source_is_a_numeric_code_not_a_string():
-    """🔴 `run/v7_source` 必须是**数值码**，不能是 `'board_level'` 这种名字。
+    """ `run/v7_source` 必须是**数值码**，不能是 `'board_level'` 这种名字。
 
     这条是被真报错打出来的（2026-10-04，用户云端 run）：
     `Unsupported scalar string value: 'board_level'`。swanlab 的 metric 通道
@@ -568,7 +568,7 @@ def test_v7_source_is_a_numeric_code_not_a_string():
 
 @pytest.mark.parametrize('src_name', ['_init_swanlab', 'main'])
 def test_no_string_reaches_the_metric_channel(src_name):
-    """🔴 所有上报字典的值都必须是 bool/int/float —— 一个字符串都不许有。
+    """ 所有上报字典的值都必须是 bool/int/float —— 一个字符串都不许有。
 
     直接用 swanlab 自己的 `_transform_tensor_or_array` + 判定规则**实跑**，
     而不是自己重写一份类型白名单（重写的那份会与 SDK 漂）。
@@ -618,7 +618,7 @@ def test_no_string_reaches_the_metric_channel(src_name):
 
 
 def test_bool_metrics_are_accepted_by_the_sdk():
-    """⚠ bool 是**合法** metric（SDK 先判 bool，因为 bool 是 int 的子类）。
+    """ bool 是**合法** metric（SDK 先判 bool，因为 bool 是 int 的子类）。
 
     这条把「bool 也要转成 0/1」这类过度修正挡住 —— `eval_truncated` /
     `eval_used_ema` 直接报 bool 才是对的。
@@ -653,7 +653,7 @@ def test_target_side_metrics_are_uploaded(key):
 
 
 def test_target_metrics_only_appear_when_soft_rows_exist():
-    """⚠ 只在**真有软行**时产出，不给 `nan` 兜底。
+    """ 只在**真有软行**时产出，不给 `nan` 兜底。
 
     A 段不挂 `--soft-index` 时 `soft_mask` 恒 0 ⇒ 目标就是 one-hot、熵恒 0 ⇒
     「标签有多锐」这个问题不存在。报占位 `nan` 只会让图上多两条读不出来的线。
@@ -665,7 +665,7 @@ def test_target_metrics_only_appear_when_soft_rows_exist():
 
 
 def test_label_entropy_is_computed_on_soft_rows_only():
-    """🔴 熵只能在 `mask=1` 的行上算。
+    """ 熵只能在 `mask=1` 的行上算。
 
     `mask=0` 的行是 one-hot（熵 0），混进来会让均值被行数权重压平 ⇒
     曲线量到的是「batch 里有多少软行」而不是「标签有多锐」。

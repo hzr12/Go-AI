@@ -6,7 +6,7 @@ join 要算 `full.npz` 全部 3420 万行的位置 hash，**实测 127 秒**。�
 都重算太浪费；而 `pos_hash` 只依赖 `boards/to_play/ko` 三列（数据不变则结果不变），
 所以结果可以落盘复用。
 
-🔴 **缓存 key 必须覆盖全部四个输入**（A5，实现在 `src/data/kata_label_join.py`）：
+ **缓存 key 必须覆盖全部四个输入**（A5，实现在 `src/data/kata_label_join.py`）：
 
     (主 npz 的 行数 / distinct game_ids / mtime / size,
      标签 npz 的 行数 / distinct pos_hash / mtime / size,
@@ -35,7 +35,7 @@ join 要算 `full.npz` 全部 3420 万行的位置 hash，**实测 127 秒**。�
         --materialized-dir tmp/materialized \
         --out data/labels/soft_index.npz
 
-⚠ **`--materialized-dir` 在小内存机器上是必需的，不是可选优化。**
+ **`--materialized-dir` 在小内存机器上是必需的，不是可选优化。**
   `data/sgf_19x19_full.npz` 磁盘上只有 447 MB，但**解压后 13.4 GB**
   （`boards` 一列就 12.3 GB）—— 它是 `savez_compressed`，**压缩 npz 无法
   memmap**，不给 materialized_dir 就得整份进内存。本机实测总内存 13.9 GB，
@@ -47,7 +47,7 @@ join 要算 `full.npz` 全部 3420 万行的位置 hash，**实测 127 秒**。�
         materialize_dataset('data/sgf_19x19_full.npz','tmp/materialized')"
   产物约 11.7 GiB（`boards.npy` 占 11.2 GiB），`tmp/materialized/` 已在仓库里备好。
 
-  ⚠ materialize 必须**完整**：`.npy` 被截断时 `np.load(mmap_mode='r')` 照样
+   materialize 必须**完整**：`.npy` 被截断时 `np.load(mmap_mode='r')` 照样
     成功，只是行数偏少 ⇒ join 静默漏掉尾部所有命中。所以跑完后核对行数等于
     主 npz 的行数（34,202,713）。
 
@@ -84,7 +84,7 @@ CACHE_SCHEMA_HINT = 1
 def pos_hash_block(boards, to_play, ko):
     """位置 hash —— **直接复用 `src.data.pos_hash` 的唯一实现**。
 
-    ⚠ 不要在这里重抄一份散列实现：口径一旦与打标签端（`label_sfg.py` →
+     不要在这里重抄一份散列实现：口径一旦与打标签端（`label_sfg.py` →
       `probe0_join` → `pos_hash`）漂移，join 会**静默变成空**，而症状看起来
       像「这批局面真的没标签」。单点真相在 `src/data/pos_hash.py`。
     """
@@ -127,7 +127,7 @@ def main():
 
     el = time.time() - t0
     if not diag.get("out"):
-        print(f"\n⚠ 未写出 {args.out}（命中 0 行）。用时 {el:.0f}s")
+        print(f"\n 未写出 {args.out}（命中 0 行）。用时 {el:.0f}s")
         raise SystemExit(1)
 
     print(f"\n写入 {diag['out']}")

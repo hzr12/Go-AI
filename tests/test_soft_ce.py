@@ -290,7 +290,7 @@ def test_old_paths_ignore_the_new_kwargs(kind, eps):
 def test_default_kind_is_still_ce_flag_unchanged():
     """CLI 的 `--policy-loss` choices 含 `soft_ce`，**但默认仍是 `ce`**。
 
-    ⚠ **A4（2026-10-02）改写了这条断言，理由必须留着**：
+     **A4（2026-10-02）改写了这条断言，理由必须留着**：
 
     A2 交付时 `soft_ce` 只是**函数级** kind，CLI 侧 `--policy-loss` 的 choices
     冻结在 `['huber','ce']`，本文件与 `tests/test_huber_loss.py::

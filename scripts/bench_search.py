@@ -18,7 +18,7 @@
     python scripts/bench_search.py --device npu     # 4×910A 上跑（决策看这个）
     python scripts/bench_search.py --model none     # 随机权重（只验脚本，不看棋力）
 
-⚠ 本机是 torch+CPU：跑出来的曲线**只能验证脚本本身**。决策用的数字必须在
+ 本机是 torch+CPU：跑出来的曲线**只能验证脚本本身**。决策用的数字必须在
   4×910A 上取，因为 NPU 还有 `_NPU_BATCH_BUCKETS` 归桶与算子编译缓存的影响。
 """
 from __future__ import annotations
@@ -55,7 +55,7 @@ class ForwardProbe:
     为什么要它：「MCTS sims=48 每手约 48 次前向」这类结论，靠读代码是推不出来的
     （批处理把调用合并了）。这个探针把它变成实测数字。
 
-    ⚠ 通过实例属性遮蔽类方法，故必须在**构造 MCTS / 调 lookahead 之前**安装；
+     通过实例属性遮蔽类方法，故必须在**构造 MCTS / 调 lookahead 之前**安装；
       装晚了 MCTS 已经抓走了原方法，探针就接不到。
     """
 
@@ -265,7 +265,7 @@ def run_fwd(ai, positions, args, results):
     # ---- 判定：批量到底能不能把开销摊薄 ----
     # 基线取**最小 B**（单条前向）。用 B≈48 当基线没有意义：那既不回答「批处理
     # 有没有用」，也依赖扫描点里恰好有 48。
-    # ⚠ 相除必须用**未取整**的值：0.04/0.11 这种小数被四舍五入到 1 位后会塌成
+    # 相除必须用**未取整**的值：0.04/0.11 这种小数被四舍五入到 1 位后会塌成
     #   0.36 之类毫无意义的数（本脚本第一版的真 bug）。
     xs = sorted((r["B"], r["nn_per_s"], r["ms_samp"]) for r in rows)
     b_lo, t_lo, ms_lo = xs[0]
@@ -289,7 +289,7 @@ def run_fwd(ai, positions, args, results):
         print(f"\n    判定 {verdict[0]}：{verdict[1]}")
 
     if unstable:
-        print(f"\n    ⚠ 未进稳态：B={unstable} 补加热后 min/median 仍 < 0.7，"
+        print(f"\n 未进稳态：B={unstable} 补加热后 min/median 仍 < 0.7，"
               f"\n      这几档的数值不可信，**不要据此下比率结论**（重跑 / 加大 "
               f"--reps / 确认机器空载）")
 
@@ -350,7 +350,7 @@ def run_mcts(ai, positions, args, results, probe):
                   f"{row['pct_b1']:>6.1f}%")
 
     if unstable:
-        print(f"\n    ⚠ 未进稳态（min/median < 0.7，补加热后仍如此）：{unstable}"
+        print(f"\n 未进稳态（min/median < 0.7，补加热后仍如此）：{unstable}"
               f"\n      这几档数值不可信")
 
     results["mcts"] = {"rows": rows, "unstable": unstable}
@@ -422,7 +422,7 @@ def run_la(ai, positions, args, results, probe):
           f"{sm['max_batch']:>6} {sm['samp_per_ms']:>11.2f}")
 
     if unstable:
-        print(f"\n    ⚠ 未进稳态（min/median < 0.7，补加热后仍如此）：{unstable}"
+        print(f"\n 未进稳态（min/median < 0.7，补加热后仍如此）：{unstable}"
               f"\n      这几档数值不可信")
 
     results["la"] = {"rows": rows, "unstable": unstable}
@@ -510,7 +510,7 @@ def run_cmp(results, args):
                   f"{eq:>19.1f}{star} {'有':>4}")
         print("    ⇒ 读法：同样一笔墙钟，可以买「更浅的 minimax（无 π）」")
         print("      或「等量的 MCTS 节点（有 π）」。**π 是副产品，不额外计费。**")
-        print("      ⚠ 这张表只回答成本；**棋力谁强得靠 eval_elo 实测**，"
+        print(" 这张表只回答成本；**棋力谁强得靠 eval_elo 实测**，"
               "本脚本给不出。")
 
     results["cmp"] = {"n_rows": len(all_rows),
@@ -584,7 +584,7 @@ def main():
           f"amp={args.use_amp}")
     print(f"  positions={args.positions}  reps={args.reps}  "
           f"warmup={args.warmup}  budget={args.budget}s")
-    print("  ⚠ 本脚本报的是**单次运行**的中位数。同配置跨运行实测波动可达 1.7×"
+    print(" 本脚本报的是**单次运行**的中位数。同配置跨运行实测波动可达 1.7×"
           "\n    （本机 MCTS sims=8 出过 1201 ms 与 2029 ms），所以："
           "\n    · 下比率结论前**至少跑 2 次**；"
           "\n    · 绝对值以 min 更稳，别拿单次中位数当真值；"

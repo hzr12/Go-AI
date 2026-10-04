@@ -23,7 +23,7 @@ docstring 承诺的三条可证性质 + 与成员边界无关 + 那个经典错�
 1. 三条可证性质：并集 == 全集 / 两两不相交 / 大小至多差 1（大块数 == n % N）；
 2. ``num_shards <= 1`` 或 ``None`` ⇒ 原样返回全部行（以及 ``shard_id`` 越界
    仍然返回全部行这个反直觉角落）；
-3. 🔴 回归：多个成员（大小不均，模拟实测 ~63 行/成员）× 多个 shard，按
+3. 回归：多个成员（大小不均，模拟实测 ~63 行/成员）× 多个 shard，按
    **分片过滤前**的行数推进偏移 ⇒ 收集起来恰好是全集、无重复无丢失；并与
    **故意写错的参考实现**（按过滤后行数推进）对照，证明它真的会重复 + 丢失；
 4. 与成员边界无关：同样 200 行拆成 1×200 / 2×100 / 4×50 / 7×~29，
@@ -37,10 +37,10 @@ docstring 承诺的三条可证性质 + 与成员边界无关 + 那个经典错�
    「独立算一遍的期望值」逐个相等（能把「偏移按原始行数推进」和
    「偏移按过滤后行数推进」两种错都区分出来）。
 
-⚠ **本文件不断言任何吞吐量 / 耗时** —— 分片要买的是峰值内存，测耗时会写出一条
+ **本文件不断言任何吞吐量 / 耗时** —— 分片要买的是峰值内存，测耗时会写出一条
   在别人机器上随机红的测试。
 
-⚠「各块 ``game_ids`` 区间重叠」**不能**用来判断分片算错了：`labels_to_chunk`
+「各块 ``game_ids`` 区间重叠」**不能**用来判断分片算错了：`labels_to_chunk`
   给的是 ``arange(written, written + n)``，即**本块内**的行号，每块各自从 0 起
   ⇒ 跨块重叠是设计如此（``meta.shard.game_ids_note`` 明说了）。``shard_mask`` 的
   docstring 那么写是不准确的（见报告）；可判定的等价说法是「同一行被两块同时
@@ -109,7 +109,7 @@ def test_shards_are_pairwise_disjoint(n_rows, num_shards):
 def test_shard_sizes_differ_by_at_most_one(n_rows, num_shards, global_offset):
     """性质 ③：各块大小 ∈ ``{q, q+1}``（``q = n // N``），且大块数 == ``n % N``。
 
-    ⚠ 这条正是「与成员边界无关」的**可测形式**：成员大小不均也不会让某块偏大，
+     这条正是「与成员边界无关」的**可测形式**：成员大小不均也不会让某块偏大，
       所以偏移换成什么值都只影响「哪一块多拿那一行」，不影响大小分布。
     """
     sizes = [s2n.shard_mask(n_rows, global_offset, num_shards, s).size
@@ -125,7 +125,7 @@ def test_shard_sizes_differ_by_at_most_one(n_rows, num_shards, global_offset):
 def test_selection_is_exactly_the_modulo_rule(global_offset, shard_id):
     """归属判据就是 docstring 写的那一条：``(global_offset + j) % N == shard_id``。
 
-    🔴 这条**逐点**核对，而不是只核对三条性质 —— 换成切连续区间（同样满足三条
+     这条**逐点**核对，而不是只核对三条性质 —— 换成切连续区间（同样满足三条
       性质、同样与成员边界无关）时它会立刻红，而三条性质不会。
     """
     n_rows, num_shards = 341, 7
@@ -153,7 +153,7 @@ def test_result_is_ascending_int64_local_indices(global_offset):
 def test_num_shards_le_one_returns_every_row_verbatim(num_shards, global_offset):
     """``num_shards`` 为 ``None`` 或 ``<= 1`` ⇒ 原样返回 ``np.arange(n)``。
 
-    ⚠ ``convert`` 的承诺是「``num_shards<=1`` 时行为与不分片**逐位相同**」——
+     ``convert`` 的承诺是「``num_shards<=1`` 时行为与不分片**逐位相同**」——
       所以这里连偏移都不该看一眼。
     """
     n_rows = 65
@@ -164,7 +164,7 @@ def test_num_shards_le_one_returns_every_row_verbatim(num_shards, global_offset)
 
 @pytest.mark.parametrize('shard_id', [1, 4, 99, -1])
 def test_single_shard_ignores_shard_id_entirely(shard_id):
-    """⚠ **反直觉角落**（当前实现）：``num_shards<=1`` 时 ``shard_id`` **完全不看**，
+    """ **反直觉角落**（当前实现）：``num_shards<=1`` 时 ``shard_id`` **完全不看**，
     越界 / 负数也照样返回**全部**行。
 
     ⇒ ``shard_mask`` 自己不校验 ``shard_id``（校验在 `convert` 与 CLI 那一层），
@@ -204,7 +204,7 @@ def test_convert_rejects_out_of_range_shard_id(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# 3 · 🔴 回归钉子：偏移必须按「分片过滤**前**」的行数推进
+# 3 · 回归钉子：偏移必须按「分片过滤**前**」的行数推进
 # --------------------------------------------------------------------------- #
 #: 实测每个成员 ~63 行且大小不均；这里刻意不整除任何常见的分片数。
 MEMBER_ROWS = [63, 41, 63, 7, 63, 28, 12, 63]
@@ -218,12 +218,12 @@ def _select(member_rows, num_shards, *, offset_step='pre'):
     对应的源码是这两行::
 
         j = shard_mask(n_local, global_seen, num_shards, shard_id)
-        global_seen += n_local            # ⚠ 按分片过滤前的行数推进
+        global_seen += n_local # 按分片过滤前的行数推进
 
     Args:
         member_rows: 每个成员**进入分片**的行数（实测 ~63，大小不均）。
         num_shards: 块数。
-        offset_step: ``'pre'`` = 正确；``'post'`` = 🔴 **故意写错**的那个经典错
+        offset_step: ``'pre'`` = 正确；``'post'`` = **故意写错**的那个经典错
             （偏移按**分片过滤后**的行数 ``j.size`` 推进）。
 
     Returns:
@@ -277,7 +277,7 @@ def _claim_counts(got):
 
 
 def test_pre_filter_offset_partitions_every_member_exactly_once():
-    """🔴 核心回归：跨**全部成员 × 全部 shard** 收集起来的行恰好是全集。
+    """ 核心回归：跨**全部成员 × 全部 shard** 收集起来的行恰好是全集。
 
     这是那个经典错**唯一**能被抓到的形态 —— 它不抛异常、每块的行数也仍然
     "看着合理"（见 `test_the_classic_bug_is_invisible_in_the_row_counts`），
@@ -307,7 +307,7 @@ def test_no_row_is_claimed_by_two_shards():
 def test_each_shard_game_ids_is_a_local_running_counter():
     """本块内 ``game_ids`` 必须逐行唯一、逐 chunk 区间不重叠（跨局守卫的载体）。
 
-    ⚠ **不能**断言「各块 game_ids 区间不重叠」：``arange(written, written+n)``
+     **不能**断言「各块 game_ids 区间不重叠」：``arange(written, written+n)``
       每块各自从 0 起，跨块重叠是**设计如此**（``meta.shard.game_ids_note``
       明说「分块后各块的游戏编号不再全局唯一」）。`shard_mask` 的 docstring 把
       「各块 game_ids 区间重叠」写成那个经典错的症状，是不准确的（见报告）。
@@ -323,7 +323,7 @@ def test_each_shard_game_ids_is_a_local_running_counter():
 
 
 def test_the_classic_bug_really_duplicates_and_loses_rows():
-    """🔴 拿**故意写错的参考实现**在测试里现算一遍，证明它真的会坏。
+    """ 拿**故意写错的参考实现**在测试里现算一遍，证明它真的会坏。
 
     参考实现在 ``_select(offset_step='post')`` 里：偏移按**分片过滤后**的行数
     推进（``base += j.size``）。`stdata_to_npz.py` 一行都不动 —— 这条测试要
@@ -350,7 +350,7 @@ def test_the_classic_bug_really_duplicates_and_loses_rows():
 
 
 def test_the_classic_bug_is_invisible_in_the_row_counts():
-    """🔴 为什么这个错必须靠「行号归属」而不是「行数」来抓：错的实现给出的块大小
+    """ 为什么这个错必须靠「行号归属」而不是「行数」来抓：错的实现给出的块大小
     **仍然看着合理**（都落在理想值的 ±2 以内），转换期不会报任何错。
     """
     bad = _collect(MEMBER_ROWS, NUM_SHARDS, offset_step='post')
@@ -416,9 +416,9 @@ def _labels(n):
     * tuple（``policy_*_sparse`` = ``(idx, val)``）＋ 一个半行轴半标量的 tuple。
     * 标量诊断（``_kept`` / ``_dropped`` / ``_network``）。
 
-    ⚠ ``outcome`` 列装的是**行号**（真数据是 0/1/2）⇒ 切完能逐位核对切的是
+     ``outcome`` 列装的是**行号**（真数据是 0/1/2）⇒ 切完能逐位核对切的是
       哪几行，而不只是「长度对了」。
-    ⚠ ``legacy_probs`` 是**长度恰好等于 ``_kept`` 的非行轴数组** —— 刻意加的
+     ``legacy_probs`` 是**长度恰好等于 ``_kept`` 的非行轴数组** —— 刻意加的
       诱饵，见 `test_subset_labels_uses_the_kept_length_criterion`。
     """
     rows = np.arange(n, dtype=np.int64)
@@ -643,7 +643,7 @@ def test_count_pass_shards_sum_to_the_unsharded_total(mini_archive):
 
 @pytest.mark.parametrize('num_shards', [3, 7, 8])
 def test_count_pass_offsets_advance_by_kept_rows(mini_archive, num_shards):
-    """🔴 第 0 遍的偏移必须按**保留**行数推进（``member_base += n_keep``）。
+    """ 第 0 遍的偏移必须按**保留**行数推进（``member_base += n_keep``）。
 
     逐块行数与独立算出的期望值**逐个**相等 —— 这条能同时区分两种偏移推进：
     「按原始行数」（本fixture 里 140 ≠ 132）与「按分片过滤后行数」

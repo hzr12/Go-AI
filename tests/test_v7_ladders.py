@@ -75,11 +75,11 @@ def _unpad(stones, n=N):
 def _ref_partition(b):
     """**独立**的 4 连通块划分（纯 Python 洪水填充），返回 ``set[frozenset]``。
 
-    ⚠ 必须是**独立实现**：``_label_chains`` 本身就用「横向游程 + 竖向 union-find」，
+     必须是**独立实现**：``_label_chains`` 本身就用「横向游程 + 竖向 union-find」，
     拿它自己的输出去验它自己的等价物等于没验。这里只依赖「上下左右相邻且同色」
     这条定义。
 
-    ⚠ 比较用 ``set`` 而**不是 ``sorted(...)``** —— ``frozenset.__lt__`` 的语义是
+     比较用 ``set`` 而**不是 ``sorted(...)``** —— ``frozenset.__lt__`` 的语义是
     「真子集」，**不是全序**，拿它排序会得到一个既不稳定也不传递的顺序，逐项 zip
     对比只会报出对不齐的假差异（而且下一次运行顺序还可能变）。
     """
@@ -115,7 +115,7 @@ def _ref_liberties(b, chain):
 #: 把它的逃跑路线封死。官方算法：防守方只能下 (10,9)，下完 `moveListLen == 1`
 #: 且 `upperBoundLibs <= 1` ⇒ 进攻方下一手就提掉 ⇒ 判为梯子。
 #:
-#: ⚠ 这个形状用来钉 ch17 的 ``getNumLiberties(loc) > 1``：**只有 1 气 ⇒ 永远不进
+#: 这个形状用来钉 ch17 的 ``getNumLiberties(loc) > 1``：**只有 1 气 ⇒ 永远不进
 #: ch17**，哪怕这块正好是对手方的、哪怕上一条 2 气的链刚好留下了 working moves。
 LADDER_1LIB = _board([
     (9, 9, -1),
@@ -146,7 +146,7 @@ def test_empty_board_has_no_ladder():
 def test_plain_shape_without_ladder():
     """几块气数 ∉ {1,2} 的普通棋（官方 ``if(libs==1 || libs==2)`` 直接跳过）。
 
-    ⚠ 别顺手加一个「边角上的孤子」：19 路角上的孤子恰好是 **2 气**，会真的进
+     别顺手加一个「边角上的孤子」：19 路角上的孤子恰好是 **2 气**，会真的进
     候选、也会真的被判成梯子（角上的 2 气块追两步就没了），那样这条测试就变成
     在测别的东西了。
     """
@@ -205,7 +205,7 @@ def test_working_move_requires_more_than_one_liberty():
     两个都要满足。``LADDER_1LIB`` 的白子正好是 ``to_play=黑`` 的**对手方**、
     也**确实被判为梯子**（ch14 置位）—— 唯一挡住 ch17 的就是 ``> 1``。
 
-    ⚠ 这一条在移植里最容易漏：官方在 1 气的分支上**故意不清** ``workingMoves``
+     这一条在移植里最容易漏：官方在 1 气的分支上**故意不清** ``workingMoves``
     （沿用上一条 2 气链算出来的值），真正的挡板就是这个 ``> 1``。省掉它会把残留
     值泄进 ch17 —— 实测在 stdata 上凭空多出约 4% 的错行。
     """
@@ -335,7 +335,7 @@ def test_rejects_bad_shapes():
 def test_chain_extraction_handles_horizontal_runs_and_edges():
     """横向连排必须是**一个**块；L 形必须连成一块；边线上的子也必须正确成块。
 
-    ⚠ 这条钉的是 ``_label_chains`` 的两条易错切片：
+     这条钉的是 ``_label_chains`` 的两条易错切片：
     1. ``np.maximum.accumulate`` 的默认 axis 是 **0**（必须先 ``ravel()`` 才能得到
        行主序的「游程起点」）；
     2. 「左邻比较」的 ``1:`` 必须落在**列**轴上（写成行轴就变成跟「正上方」比）。
@@ -351,7 +351,7 @@ def test_chain_extraction_handles_horizontal_runs_and_edges():
         if stones:
             groups.setdefault(frozenset(stones), bd.ch_libs[cid])
 
-    # ⚠ 整块划分与**独立洪水填充**逐块比对。任一处切片写错（accumulate 的默认
+    # 整块划分与**独立洪水填充**逐块比对。任一处切片写错（accumulate 的默认
     # axis=0、或「左邻比较」的 `1:` 落到行轴上），一条横排的 3 子就会被拆成 3 块，
     # 这里立刻就炸 —— 而在下游它只表现为「某个远处的气数算错 ⇒ 梯子判定翻转」。
     got_partition = {frozenset(s) for s in bd.ch_stones if s}
@@ -362,7 +362,7 @@ def test_chain_extraction_handles_horizontal_runs_and_edges():
         f'少了 {sorted(map(_unpad, want_partition - got_partition))}')
     assert len(got_partition) == 6, '10 颗子应当恰好切成 6 块（3 + 3 + 4 个孤子）'
 
-    # ⚠ 下面每个 key 都必须是 ``frozenset``：``set`` 不可哈希，直接拿它去
+    # 下面每个 key 都必须是 ``frozenset``：``set`` 不可哈希，直接拿它去
     # ``dict.__contains__`` 会抛 ``TypeError: unhashable type: 'set'`` —— 那是**这条
     # 测试自己**的错，与被测代码无关。
     horizontal = frozenset(_pad(17, c) for c in (2, 3, 4))
@@ -376,7 +376,7 @@ def test_chain_extraction_handles_horizontal_runs_and_edges():
     assert len(groups[ell]) == 7, 'L 形的 7 个气'
 
     # 边线上的孤子：每块恰好 2 气，且只含自己。
-    # ⚠ 角落 (0,0) 的气是 (1,0)/(0,1) —— **不包含墙**；墙点不是空点。
+    # 角落 (0,0) 的气是 (1,0)/(0,1) —— **不包含墙**；墙点不是空点。
     for r, c in ((0, 0), (18, 18), (0, 18), (18, 0)):
         single = frozenset((_pad(r, c),))
         assert single in groups, f'({r},{c}) 必须自成一块'
@@ -452,7 +452,7 @@ def test_iter_ladders_matches_solving_each_chain_on_a_fresh_board():
     盘面上刻意放了多块 1 气 / 2 气的候选块（两个上角 + 两个下角），
     中间是那个 2 气的真梯子。
 
-    ⚠⚠ **「2 气的块」不是一眼定生死 —— 官方那条搜索会把逃跑路线整个走一遍。**
+     **「2 气的块」不是一眼定生死 —— 官方那条搜索会把逃跑路线整个走一遍。**
     实测：在只有中间那 5 颗子的空盘上，``searchIsLadderCaptured`` 一路
     「黑填 / 白长」追到 **(16,17)** 才把白提掉（34 个搜索节点）。所以诱饵里**任何一颗
     落在逃跑延长线上的子都会真的改变结论** —— 原始诱饵表里那颗 (16,17) 白子正好在
@@ -466,7 +466,7 @@ def test_iter_ladders_matches_solving_each_chain_on_a_fresh_board():
         (1, 5, 1), (0, 5, -1), (1, 4, -1), (1, 6, -1),
         (2, 4, -1), (2, 5, 1), (2, 3, 1), (2, 6, 1),
         (0, 17, -1), (0, 16, 1), (0, 18, 1), (1, 17, 1),
-        # ⚠ 不要把 (16, 17) 白子加回诱饵表 —— 见 docstring：它落在 (9,9) 那条梯子
+        # 不要把 (16, 17) 白子加回诱饵表 —— 见 docstring：它落在 (9,9) 那条梯子
         # 的逃跑延长线上，会让 (9,9) 真的不再是梯子。
         (17, 17, 1), (17, 16, -1), (17, 18, -1),
         (17, 0, -1), (18, 0, 1), (16, 0, 1), (17, 1, 1),
@@ -491,7 +491,7 @@ def test_iter_ladders_matches_solving_each_chain_on_a_fresh_board():
               else search_is_ladder_captured_attacker_first_2_libs(
                   fresh, loc, [], []))
         if ok:
-            # ⚠ `stones_` 是**带墙**扁平下标（`(r+1)*(n+2)+(c+1)`，19 路最大到 400），
+            # `stones_` 是**带墙**扁平下标（`(r+1)*(n+2)+(c+1)`，19 路最大到 400），
             # 而 `ref` 是 `(19,19)`＝361 格。`ref[np.asarray(stones_)] = True` 会把
             # 这些下标按**行轴**解释，越界成
             # ``IndexError: index 38 out of bounds for axis 0 with size 19`` ——
@@ -521,7 +521,7 @@ def test_board_is_never_mutated_by_iter_ladders():
 # ---------------------------------------------------------------------------
 # 与官方 stdata 逐位对拍
 # ---------------------------------------------------------------------------
-#: 归档路径。⚠ **流式读**（``r|gz``），**不要 ``getmembers()``** —— 1.5 GB 的
+#: 归档路径。 **流式读**（``r|gz``），**不要 ``getmembers()``** —— 1.5 GB 的
 #: 归档会被扫很久。
 STDATA = os.path.join('katago', 'stdata', '2026-08-25npzs.tgz')
 #: 取归档里**前** ``_N_FILES`` 个 npz 的**前** ``_ROWS_PER_FILE`` 个 19×19 行。
@@ -620,7 +620,7 @@ def test_matches_official_ch14_bit_exact(stdata_rows):
 def test_matches_official_ch17_and_documents_to_play_assumption(stdata_rows):
     """**ch17 与官方逐位 100% 相等，且只有 ``to_play = +1`` 这个假设能做到。**
 
-    ⚠ **这里声明用的是什么假设**：stdata 是**逐行独立样本**，官方没有直接给出
+     **这里声明用的是什么假设**：stdata 是**逐行独立样本**，官方没有直接给出
     ``nextPlayer``。ch17 的官方条件是 ``colors[loc] == opp``、
     ``opp = getOpp(nextPlayer)``，所以必须知道 ``to_play``。
     ``scripts/probe0_join.py`` 假定恒 ``+1``；本测试**沿用并实测复核**这个假定：
@@ -630,7 +630,7 @@ def test_matches_official_ch17_and_documents_to_play_assumption(stdata_rows):
     - ``to_play = -1``（白走 ⇒ opp = 黑）→ 实测逐位相等率 **0.186813**
       （200 个 npz / **4368** 行，816 行相等）。
 
-    ⚠ **0.186813 必须连样本量一起引用** —— 它随样本量明显漂移，因为归档是按 npz
+     **0.186813 必须连样本量一起引用** —— 它随样本量明显漂移，因为归档是按 npz
     顺序取前缀、**前几个文件不是随机样本**：
 
     ==================  ==========================

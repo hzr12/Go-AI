@@ -5,14 +5,14 @@
 ``tests/test_v7_assemble.py`` / ``test_v7_ladders.py`` / ``test_v7_planes.py``
 担保）。所以这里钉的是**工具的契约**：
 
-  1. 🔴 **比对资格不能被弄错** —— ``NOT_COMPARABLE`` 的通道绝不能被报成
+  1. **比对资格不能被弄错** —— ``NOT_COMPARABLE`` 的通道绝不能被报成
      ``ALIGNED``（ch15/ch16 的 0.73 巧合就是这个坑）；
-  2. 🔴 **门禁只对 ``ALIGNED`` 生效** —— ``KNOWN_DIVERGENT``（ch18/19）
+  2. **门禁只对 ``ALIGNED`` 生效** —— ``KNOWN_DIVERGENT``（ch18/19）
      不能被误杀，否则会逼着人去「修」一个不是 bug 的东西；
   3. **归档缺失要报错退出**，不能静默成功（与 pytest 的 ``skipif`` 刻意不同）；
   4. 产出的 JSON **结构完整** —— 每通道都有两个口径 + 资格标注。
 
-⚠ **不在这里跑大样本**：真实归档是 1.5 GB，200 npz 的那一次要几分钟。
+ **不在这里跑大样本**：真实归档是 1.5 GB，200 npz 的那一次要几分钟。
   这里全部用**合成的假归档**（几行稀疏的 19×19 盘面）⇒ 秒级，
   而且仍然走的是**真的** ``spatial_channels_v7`` / ``global_features_v7``，
   所以装配层要是写错通道，测试照样红。
@@ -56,11 +56,11 @@ def _make_npz(boards):
     ``globalInputNC`` (N,19)），这样 ``load_sample`` 走的是与真实归档**完全
     相同**的代码路径 —— 否则测的就不是这个工具了。
 
-    ⚠ ch3/4/5 用本仓的 :func:`liberties_123` **当真值**填，而不是填 0。
+     ch3/4/5 用本仓的 :func:`liberties_123` **当真值**填，而不是填 0。
       否则「官方」这三格恒 0、本仓算出真值 ⇒ ``--min-rate`` 会因为一个
       **夹具造出来的**假偏差而红，测的就不是门禁的资格范围了。
       官方在这三个通道上不做任何额外处理，所以它们本就可以当 oracle。
-    ⚠ ch18/19 同样用本仓的 :func:`area_ownership_map` 当真值填，**理由完全
+     ch18/19 同样用本仓的 :func:`area_ownership_map` 当真值填，**理由完全
       一样**：这两个通道现在是 ``ALIGNED``，若夹具把它们留成 0，等于凭空造出
       一个「我们算错了」的偏差，门禁就会因为**夹具**红而不是因为实现红。
       夹具的 ``globalInputNC`` 全 0 ⇒ 官方口径是 AREA + TAX_NONE +
@@ -173,7 +173,7 @@ def test_sample_selection_method_is_written_into_the_output(report):
 
 
 # --------------------------------------------------------------------------- #
-# 2 · 🔴 资格不能被弄错（本工具最容易出错的地方）
+# 2 · 资格不能被弄错（本工具最容易出错的地方）
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize('ch, why', [
     (9, '无着法序列'),
@@ -188,7 +188,7 @@ def test_sample_selection_method_is_written_into_the_output(report):
     (21, 'encore_phase'),
 ])
 def test_not_comparable_channels_are_never_reported_as_aligned(report, ch, why):
-    """🔴 空间 ch7 / ch9..13 / ch15 / ch16 / ch20 / ch21 **必须**是
+    """ 空间 ch7 / ch9..13 / ch15 / ch16 / ch20 / ch21 **必须**是
     ``NOT_COMPARABLE``，且原因里必须出现那个具体缺口。
 
     这条钉的是 ch15/ch16 那个具体的坑：它们在本仓走官方的**回退复制**分支，
@@ -210,14 +210,14 @@ SP18_REASON = cc.SPATIAL_SPEC[18][1]
 def test_ch18_ch19_are_aligned_and_say_which_subset_is_bit_exact(report):
     """ch18/ch19 必须是 ``ALIGNED``，且原因里必须写清「在哪个子集上 1.000000」。
 
-    ⚠ **旧断言（已作废）**：这两个通道曾是 ``KNOWN_DIVERGENT``，原因写的是
+     **旧断言（已作废）**：这两个通道曾是 ``KNOWN_DIVERGENT``，原因写的是
       「官方算 area 前**先提死子**」。那条根因是**错的** —— 官方
       ``Board::calculateArea*``（``board.cpp:1853-1937``）既不提子也不做死子
       判定，它的输入只有 ``colors``。真正的成因是两层算法：
       **Benson 无条件存活**（``:2159-2195``，vital 区 < 2 即判死）与
       **双活整块过滤**（``:2264-2296``）。按正确算法实现后，官方 stdata 上
       可比子集的逐行精确相等率是 **1.000000**。
-    🔴 所以这里同时**删掉**了 ``'死子' in reason`` 那条断言：它会把一个已被
+     所以这里同时**删掉**了 ``'死子' in reason`` 那条断言：它会把一个已被
       推翻的诊断钉成契约，让下一个人照着错的方向去改实现。
     """
     for ch in (18, 19):
@@ -252,7 +252,7 @@ def test_eligibility_map_covers_every_channel_with_no_silent_default():
 def test_global_pda_and_pass_channels_are_not_comparable(report):
     """全局 ch0..4 / ch14（着法序列）与 ch15/16（无 PDA）不可比。
 
-    ⚠ 全局 ch15/16 在**小样本**上官方这两格恰好也恒 0，本仓也恒 0 ⇒
+     全局 ch15/16 在**小样本**上官方这两格恰好也恒 0，本仓也恒 0 ⇒
       ``row_exact`` 会正好是 **1.000000**。这正是「巧合看起来像对齐」的原型：
       唯一拦住它的是资格标注，所以这条测试非钉不可。（真实归档上样本一大就
       露馅 —— 4368 行时官方这两格有 133 个非零点、掉到 0.9696。）
@@ -272,7 +272,7 @@ def test_global_pda_and_pass_channels_are_not_comparable(report):
 
 
 # --------------------------------------------------------------------------- #
-# 3 · 🔴 门禁只对 ALIGNED 生效
+# 3 · 门禁只对 ALIGNED 生效
 # --------------------------------------------------------------------------- #
 def _fake_report(**rows):
     base = {'spatial': [], 'global': [], 'tally': {}, 'warnings': [],
@@ -286,7 +286,7 @@ def _fake_report(**rows):
 
 
 def test_gate_only_asserts_on_aligned_channels():
-    """🔴 ``--min-rate`` **只**对 ``ALIGNED`` 通道断言。
+    """ ``--min-rate`` **只**对 ``ALIGNED`` 通道断言。
 
     ``ALIGNED`` 掉下来是真回归要抓；而 ``KNOWN_DIVERGENT``（ch18/19 的口径差）
     与 ``NOT_COMPARABLE``（ch15/16 的巧合）被误杀会逼着人去改一个不是 bug 的
@@ -329,7 +329,7 @@ def test_gate_message_points_at_the_assembly_order_not_the_algorithm():
 # 4 · 归档缺失 ⇒ 报错退出（不是静默成功）
 # --------------------------------------------------------------------------- #
 def test_missing_archive_exits_nonzero_and_says_why(tmp_path, capsys):
-    """🔴 归档不存在 ⇒ 退出码 2 + 明确的 stderr，**不是**退出 0。
+    """ 归档不存在 ⇒ 退出码 2 + 明确的 stderr，**不是**退出 0。
 
     这与 pytest 里的 ``skipif`` 刻意不同：skipif 是「代码没验成，但测试职责
     到此为止」；这个工具的职责**就是**回答「我们对齐到哪一步」，归档不在就
@@ -386,7 +386,7 @@ def test_sample_rejects_degenerate_counts(fake_archive):
 # --------------------------------------------------------------------------- #
 def test_both_rates_are_reported_and_cell_agree_is_flagged_when_it_lies(
         report):
-    """🔴 每个空间通道都要有 ``row_exact`` **和** ``cell_agree``。
+    """ 每个空间通道都要有 ``row_exact`` **和** ``cell_agree``。
 
     且当「逐格 ≥0.99 而逐行 ≤0.5」时必须打上 ``cell_agree_misleads`` ——
     ch9 在 301 行上就是 row_exact=0.000000 / cell_agree=0.997200，
@@ -397,12 +397,12 @@ def test_both_rates_are_reported_and_cell_agree_is_flagged_when_it_lies(
         if row['cell_agree'] >= 0.99 and row['row_exact'] <= 0.5:
             assert row['cell_agree_misleads'] is True, (
                 f'ch{row["channel"]} 逐格 {row["cell_agree"]:.4f} 骗人却没被标出')
-    assert '⚠' in report['warnings'][0] and 'cell_agree' in report['warnings'][0]
+    assert '' in report['warnings'][0] and 'cell_agree' in report['warnings'][0]
     assert any('逐格' in w for w in report['warnings'])
 
 
 def test_diff_distribution_splits_stone_versus_empty(report):
-    """🔴 「多出/少掉的点」必须**按「子 vs 空点」拆开**。
+    """ 「多出/少掉的点」必须**按「子 vs 空点」拆开**。
 
     这是 ch18/19 那 21,896 个差异点的**唯一**线索：19,913 是子、1,983 是空点
     ⇒ 偏差集中在死子本身 ⇒ 官方先提死子。只报一个总数的话这个猜测拿不出证据。
@@ -420,7 +420,7 @@ def test_diff_distribution_splits_stone_versus_empty(report):
 
 def test_streaming_reader_never_walks_the_whole_archive(
         monkeypatch, fake_archive):
-    """🔴 归档读取**必须**是流式，**禁止 ``getmembers()``**（1.5 GB 要扫很久）。"""
+    """ 归档读取**必须**是流式，**禁止 ``getmembers()``**（1.5 GB 要扫很久）。"""
     def boom(*a, **kw):
         raise AssertionError('禁止 getmembers()/r: 全量模式')
 

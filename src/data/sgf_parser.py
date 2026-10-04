@@ -23,7 +23,7 @@ _RE_MARGIN_RE = re.compile(r'^[+-]?\d+(?:[.,]\d+)?')
 #: `R`=Resign、`T`=Time(over)、`F`=Forfeit。实测 `data/games/games` 133,604 局：
 #: `B+R` 21.94% + `W+R` 21.75% + `W+Resign` 21.85% + `B+Resign` 15.55% = **81.09%**，
 #: `W+T` 0.12% + `B+T` 0.08% = 0.20%，`W+F` 0.02% + `B+F` 0.01% = 0.03%。
-#: ⚠ spec §5.3.3 记的是 75.2%（98,352 局）—— 本次全量重扫得 81.1%，spec 未更新。
+#: spec §5.3.3 记的是 75.2%（98,352 局）—— 本次全量重扫得 81.1%，spec 未更新。
 _RE_RESIGN_WORDS = frozenset({
     'r', 'resign', 'resigned', 't', 'time', 'timeout', 'f', 'forfeit',
     'forfeited', 'abandon', 'adjourn', 'adjourned',
@@ -54,13 +54,13 @@ class ResultInfo:
     | 认输 `W+R` / `W+T` / `W+F` | `None` | False | **True** | **1** |
     | 无结果 / 空 / `?` / `Void` / `B+` | `None` | False | False | None |
 
-    ⚠ **`score is None` 单独出现时无法区分「认输」与「无结果」** —— 训练侧若要
+     **`score is None` 单独出现时无法区分「认输」与「无结果」** —— 训练侧若要
     这个区别必须读 `is_resign`（`games.npz` 的 `g_resign` 就是它的落盘形式）。
     `score` 的符号约定是**黑−白**：`B+2.5 → +2.5`，`W+3.5 → -3.5`。
 
-    ⚠ `score` 是 SGF 的最终分差，**含贴目**，不是「净胜目数」。
+     `score` 是 SGF 的最终分差，**含贴目**，不是「净胜目数」。
 
-    ⚠ **`resign_side` 是「谁认输」，不是「谁赢」**：`B+R` ⇒ 0（黑认输 ⇒ 白赢）。
+     **`resign_side` 是「谁认输」，不是「谁赢」**：`B+R` ⇒ 0（黑认输 ⇒ 白赢）。
     它**只**在 `is_resign` 为 True 时有值，其余一律 None —— `B+` / `W+`（空分差，
     实测 95 局）胜负已定但分差不可知，那**不是认输**。语料里 63.8% 是认输，
     只有这一列能告诉训练侧方向；`games.npz` 的 `g_resign_side` 是它的落盘形式。
@@ -69,7 +69,7 @@ class ResultInfo:
     is_draw: bool
     is_resign: bool
     #: 0 = 黑认输 / 1 = 白认输 / None = 非认输。
-    #: ⚠ **必须放在末尾并带默认值**：全仓（`parse_result` 的 8 处 +
+    #: **必须放在末尾并带默认值**：全仓（`parse_result` 的 8 处 +
     #: `GameRecord.result_info` 的 default_factory）都用位置三元组构造。
     resign_side: Optional[int] = None
 
@@ -104,9 +104,9 @@ def parse_result(re_str: Optional[str]) -> ResultInfo:
         draw 0.07% / W+ 0.04% / B+ 0.03% / W+F 0.02% / B+F 0.01%      边角 0.17%
         W+3 zi / W+1 zi / W+0,25                                    带单位/逗号小数
 
-    ⚠ spec §5.3.3 记的认输占比是 75.2%（98,352 局），本次全量重扫是 **81.09%**
+     spec §5.3.3 记的认输占比是 75.2%（98,352 局），本次全量重扫是 **81.09%**
     （108,352 局）—— spec 的抽样脚本把 `B+Resign` 之类的写法归一过，比少了这一族。
-    ⚠ **每一种形态都有显式分支，没有一处靠 `except`** —— 靠异常判别未识别形态
+     **每一种形态都有显式分支，没有一处靠 `except`** —— 靠异常判别未识别形态
     会把「解析 bug」与「语料里的新形态」混成同一个症状。
     """
     s = (re_str or '').strip()
@@ -128,7 +128,7 @@ def parse_result(re_str: Optional[str]) -> ResultInfo:
     rest = (m.group('rest') or '').strip()
     if not rest:
         # `B+` / `W+`（空分差，实测 95 局）与裸 `B` / `W`：胜负已定但分差不可知。
-        # ⚠ 不拿贴目去猜分差 —— 实测 `KM[0]` 占 5.87%，猜出来的数是纯噪声。
+        # 不拿贴目去猜分差 —— 实测 `KM[0]` 占 5.87%，猜出来的数是纯噪声。
         return ResultInfo(None, False, False)
 
     low_rest = rest.lower()
@@ -149,7 +149,7 @@ def parse_result(re_str: Optional[str]) -> ResultInfo:
 def parse_rules(ru_str: Optional[str]) -> int:
     """解析 SGF `RU` 为 `g_rules` 的 bit 打包值。见模块级 `RULES_BIT_*` 常量。
 
-    ⚠ **tax / ko / suicide / button 这四位在当前语料里一律取默认值**，理由是
+     **tax / ko / suicide / button 这四位在当前语料里一律取默认值**，理由是
     实测它们**根本没有来源**（§5.3.2）：
 
     * 55.03% 的局**没有 `RU` 属性**；
@@ -213,7 +213,7 @@ class GameRecord:
     rules_flags: int = RULES_DEFAULT
     #: `KM` 属性**是否出现过**。
     #:
-    #: ⚠ 必须单独一个标志：`komi` 的默认值是 `7.5`，于是「没有 `KM`」与
+    #: 必须单独一个标志：`komi` 的默认值是 `7.5`，于是「没有 `KM`」与
     #: 「`KM[7.5]`」在 `komi` 上不可区分，而实测语料里 `KM` 缺失占 2.22%。
     #: sidecar 的 `g_komi` 约定「缺失填 0」，靠的就是这个标志而不是 `komi != 7.5`。
     has_komi: bool = False

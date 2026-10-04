@@ -7,14 +7,14 @@
    （policy / π_opp / value / futurepos）**逐项**有限。
 2. **段 1 不训 score 系**：8 项的权重逐项断言为 0，但 12 项**结构一个不少**地
    出现在返回值里（段 2/3 只改系数就能开回来，不需要动网络或 loss）。
-3. 🔴 **spawn 下 worker 重新 mmap、且不重复落盘**：`mp.Process` 在 Windows 上
+3. **spawn 下 worker 重新 mmap、且不重复落盘**：`mp.Process` 在 Windows 上
    是 spawn 而不是 fork，spawn **不继承内存** —— 父进程 warm 好的映射句柄到不了
    子进程。这两件事都**不报错**，只会表现为 OOM 或「读到的数据莫名其妙」，
    所以必须实测钉住，不能靠读代码。
 4. **默认路径逐位不变**：`--v7` 默认 0，12 通路的标签/取批/前向/损失一行都没改；
    `prefetch_workers` 的新默认是 12（C0 基准实测值）。
 
-⚠ **这里没有「断言吞吐 > X」的测试**：CI 机器的核数、页缓存、内存带宽都不同，
+ **这里没有「断言吞吐 > X」的测试**：CI 机器的核数、页缓存、内存带宽都不同，
    任何吞吐断言都会变成随机红灯，而红灯会训练所有人忽略这个文件里真正重要的
    那几条。
 """
@@ -194,7 +194,7 @@ def test_stage1_score_family_coefficients_are_exactly_zero():
 def test_stage1_score_family_contributes_nothing_but_is_still_computed(net, v7_batch):
     """被关掉的 score 系各项：贡献恒 0 **且**仍然出现在 `terms`/`weighted` 里。
 
-    ⚠ ``var_time_left`` 是**条件项**（2026-10-03）：官方 stdata 里有 col22，
+     ``var_time_left`` 是**条件项**（2026-10-03）：官方 stdata 里有 col22，
     但老批次 / 老 fixture 的 labels 里可能没这个键，缺标签时**整项跳过**。
     这与「标签为 0」是两种不同的语义 —— 跳过才是对的，喂 0 会把这一路往
     「方差恒为 0」的方向硬拉。所以断言要分两拨。
@@ -276,7 +276,7 @@ def test_score_terms_would_not_be_zero_if_weights_were_on(net, v7_batch):
 # 3. futurepos：承重语义（与 / 单路 / 哨兵）
 # --------------------------------------------------------------------------- #
 def test_futurepos_weight_is_and_not_or():
-    """🔴 `w['futurepos']` 是 h0 **AND** h1，绝不是 OR。
+    """ `w['futurepos']` 是 h0 **AND** h1，绝不是 OR。
 
     理由（`katago_v7_loss.py` 的 #11 + `_weighted_mean`）：loss 把
     `(b,2,bs²)` 塌成**一个**逐样本标量再乘**一个**权重，而 `_weighted_mean`
@@ -285,7 +285,7 @@ def test_futurepos_weight_is_and_not_or():
     头会学出一个恒 −0.76 的假平面。
 
     本测试用「靠近局尾」的行（只有 h0 或两路都死）来把这条钉死。
-    ⚠ **「只活 h1」在结构上不可能**：偏移是 +8 与 +32，而 `game_ids` 要求两路
+     **「只活 h1」在结构上不可能**：偏移是 +8 与 +32，而 `game_ids` 要求两路
     同局 ⇒ h1 活着必然 h0 也活着。所以 AND 与 OR 的差别**恰好**落在
     「只活 h0」这一种情形上，也就是本测试断言的那个。
     """
@@ -333,7 +333,7 @@ def test_futurepos_defaults_to_disabled_on_a_fresh_dataset():
 
 
 def test_outcome_black_is_not_outcome_times_to_play(ds):
-    """🔴 `outcome_black` 不能由 `outcome * to_play` 推出。
+    """ `outcome_black` 不能由 `outcome * to_play` 推出。
 
     `0 * -1 == 0` ⇒ 「白胜」会被报成「黑胜」。这条断言直接构造出那个反例：
     to_play=-1（白在走）且 outcome=0（白胜）时，黑方结果必须是 1（负）。
@@ -414,14 +414,14 @@ def test_policy_player_handles_pass_class(v7_batch):
 # 5. 对称增强：输入与标签必须同源
 # --------------------------------------------------------------------------- #
 def test_dihedral_batch_agrees_with_the_dataset_move_transform():
-    """🔴 `_dihedral_batch`（空间侧）与 `permute_move_vector`（标签侧）必须是**同一个**
+    """ `_dihedral_batch`（空间侧）与 `permute_move_vector`（标签侧）必须是**同一个**
     dihedral 群。
 
     这是「输入与标签同源」的全部内容：盘面上的点 `(r,c)` 经空间变换落到
     `(r',c')` 的同时，`next_move` / `moves` 那个下标必须也被映射到 `r'*bs+c'`。
     两者不同源的症状是**静默**的 —— loss 照降、top1 也可能看着正常，只有棋力不涨。
 
-    ⚠ 判据刻意**不**是「和 dataset 那段增强代码逐字比」：那需要把
+     判据刻意**不**是「和 dataset 那段增强代码逐字比」：那需要把
     `sample_batch_numpy` 内部的 `tforms` 拿出来（它拿不出来），于是只能退化成
     「我自己抄一遍和另一个我自己抄的比」—— 那是**循环论证**，改了 dataset 那边
     它照样绿。
@@ -498,7 +498,7 @@ def test_v7_labels_match_dataset_under_same_tform(ds):
 
 
 # --------------------------------------------------------------------------- #
-# 6. 🔴 spawn 下 worker 重新 mmap
+# 6. spawn 下 worker 重新 mmap
 # --------------------------------------------------------------------------- #
 # 探针跑在**真 spawn** 的子进程里。Windows 上不可能用 fork，所以这两条测试
 # **不能**偷用 fork 蒙混过去 —— 整个机制（不继承内存、句柄要重开）只存在于
@@ -516,7 +516,7 @@ _PROBE_MOD = r'''
 import pickle
 import sys
 
-# ⚠ 必须在**任何** `src.*` import 之前把仓库根塞进 sys.path：探针文件落在
+# 必须在**任何** `src.*` import 之前把仓库根塞进 sys.path：探针文件落在
 # tmp_path 下，`python probe.py` 不会把 cwd 放进 sys.path，而 spawn 起的 worker
 # 又只继承 `sys.path` 的**值**（`PYTHONPATH` 会被继承，这里靠显式 insert）。
 _ROOT = sys.argv[1]
@@ -563,7 +563,7 @@ def run(payload, res_q):
         with open(payload['pkl'], 'rb') as fh:
             ds = pickle.load(fh)
 
-        # 🔴 **必须留住一个强引用**（`_inherited`），理由见
+        # **必须留住一个强引用**（`_inherited`），理由见
         # `test_worker_reopens_mmap_instead_of_inheriting` 的登记注释：`attach_futurepos`
         # 会整体重建 `self._fp`，那份被 pickle 复制过来的 boards 是**最后一个**
         # 引用它的对象，一重建就被回收，分配器随即把同一块地址交给新加载的映射
@@ -585,7 +585,7 @@ def run(payload, res_q):
             # **降级成 ndarray 视图**（共享同一块映射、不复制）。所以这里判的
             # 不是「类型还是不是 memmap」，而是「映射还挂着」—— base 链上能
             # 找到 memmap 才说明是按需分页而不是整份物化。
-            # ⚠ 这一条才是「确实重开了」的**语义**判据：传进来的那份是普通
+            # 这一条才是「确实重开了」的**语义**判据：传进来的那份是普通
             # ndarray（`inherited_was_memmap` 为假），所以「重开后 base 链上有
             # memmap」不可能在没重开的情况下成立。
             'mmap_backed': _base_chain_has_memmap(reopened),
@@ -647,7 +647,7 @@ def _run_probe_spawn(probe_path, payload):
 
 
 def test_pickling_a_memmap_materializes_its_whole_payload(tmp_path):
-    """🔴 **前提**本身也要钉：pickle 一个 `np.memmap` 会把**整份数据**塞进去。
+    """ **前提**本身也要钉：pickle 一个 `np.memmap` 会把**整份数据**塞进去。
 
     这是「12.3 GB × worker 数」最直接的成因，也是
     `tests/test_train_sft_v7.py::test_worker_reopens_mmap_instead_of_inheriting`
@@ -727,7 +727,7 @@ def _warmed_parent_with_materialized_boards(tmp_path, npz, mat):
 
 
 def test_worker_reopens_mmap_instead_of_inheriting(tmp_path):
-    """🔴 在**真 spawn** 子进程里：worker 重新 mmap，而不是用继承来的那份数据。
+    """ 在**真 spawn** 子进程里：worker 重新 mmap，而不是用继承来的那份数据。
 
     为什么必须实测：Windows（以及 macOS 3.8+）上 `mp.Process` 是 **spawn**，
     spawn **不继承内存** —— 父进程里 `warm_futurepos()` 解析好的 boards 会随
@@ -737,7 +737,7 @@ def test_worker_reopens_mmap_instead_of_inheriting(tmp_path):
     （本探针在所有平台上都 `mp.set_start_method('spawn', force=True)`，所以
     「Windows spawn / Linux fork」这个差异**不**是本测试的敏感来源。）
 
-    ⚠⚠ **登记（2026-10-02）：原 `assert r['id_changed']` 这一条是错的，已改判据**
+     **登记（2026-10-02）：原 `assert r['id_changed']` 这一条是错的，已改判据**
     ------------------------------------------------------------------------
     原断言用 `id(reopened) != inherited_id` 判定「worker 有没有重开」。这是
     **地址比较**，而 CPython 会回收地址：`attach_futurepos(source=..., mode=
@@ -778,7 +778,7 @@ def test_worker_reopens_mmap_instead_of_inheriting(tmp_path):
 
 
 def test_worker_does_not_rewrite_the_boards_file(tmp_path):
-    """🔴 落盘**只在父进程发生一次**；worker 里重开映射**绝不**再次落盘。
+    """ 落盘**只在父进程发生一次**；worker 里重开映射**绝不**再次落盘。
 
     这是「12.3 GB × worker 数」最容易写出来的地方：`_futurepos_boards` 的第三条
     分支会调落盘函数，而 worker 是在第一次做邻行 gather 时才惰性走到那里的 ——
@@ -823,7 +823,7 @@ def test_v7_flag_defaults_to_off():
 
 
 def test_katago_se_cfg_is_untouched():
-    """🔴 `KATAGO_SE_CFG` 没被删也没被改（12 通道 / 9.11M 仍是唯一现役基线）。"""
+    """ `KATAGO_SE_CFG` 没被删也没被改（12 通道 / 9.11M 仍是唯一现役基线）。"""
     from scripts.train_sft import KATAGO_SE_CFG
     assert KATAGO_SE_CFG['in_channels'] == 12
     assert KATAGO_SE_CFG['params_total'] == 9_112_005
@@ -843,10 +843,10 @@ def test_default_path_payload_is_unchanged_by_v7(ds):
 # --------------------------------------------------------------------------- #
 # 7. 上报面：健康度**两条路**各自取对的头
 # --------------------------------------------------------------------------- #
-# 🔴 下面这几条 exec 的是 main() 里那段**真实语句**，不是复刻一份 —— 健康度必须
+# 下面这几条 exec 的是 main() 里那段**真实语句**，不是复刻一份 —— 健康度必须
 #   **就地**构造在 `if _do_swanlab:` 分支里（不许抽成 helper：
 #   `tests/test_swanlab_metrics.py` 的三条门禁按字面量在 main() 里定位它，见
-#   `scripts/train_sft.py` 上报分支里那段 🔴 注释）。做法与
+# `scripts/train_sft.py` 上报分支里那段 注释）。做法与
 #   `tests/test_huber_loss.py::test_log_loss_identity` 同源：抠 AST → exec。
 def _health_block_node():
     """main() 里 `if _do_swanlab:` 分支下那段 `with torch.no_grad():` 的 AST。"""
@@ -902,7 +902,7 @@ def test_build_param_groups_partitions_v7_exactly_once(net):
 
 
 def test_health_block_reports_rmse_on_the_default_path():
-    """🔴 12 通道默认路径：6 个键齐、值**可精确复算**、基线真的垫底。
+    """ 12 通道默认路径：6 个键齐、值**可精确复算**、基线真的垫底。
 
     **为什么这条以前不存在**：B8 把健康度抽成 `compute_training_health()` 时，
     只给 V7 那条路补了运行时断言，12 通道那一侧的
@@ -918,7 +918,7 @@ def test_health_block_reports_rmse_on_the_default_path():
     # ⇒ top1 必为 4/8 = 0.5、top5 必为 8/8 = 1.0，可以**精确**断言而不是
     # 「看起来在合理范围内」。
     logits = torch.full((b, a), -1.0)
-    # ⚠ 下面**不用** `logits[:4, moves[:4]] = 6.0`：切片与张量索引混用时
+    # 下面**不用** `logits[:4, moves[:4]] = 6.0`：切片与张量索引混用时
     #   高级索引会广播成 4×4 的**笛卡尔积**（实测 torch 2.12：四行四列全被置
     #   成 6.0），于是 top1 变成 1/8 而不是 1/2。用 `arange` 配对索引。
     logits[torch.arange(4), moves[:4]] = 6.0
@@ -939,21 +939,21 @@ def test_health_block_reports_rmse_on_the_default_path():
     assert h['train_top1'] == pytest.approx(0.5), h
     assert h['train_top5'] == pytest.approx(1.0), h
     assert h['policy_ce_random'] == pytest.approx(math.log(a)), h
-    # 🔴 `policy_entropy` 的符号：**2026-10-03 已裁决改成真熵**，本断言随之改写。
+    # `policy_entropy` 的符号：**2026-10-03 已裁决改成真熵**，本断言随之改写。
     #
     #   **旧约定（已作废）**：实现报的是 `Σ p·log p`，那不是熵，是 **−H** ⇒
     #   取值 ∈ [−log A, 0]，均匀时 ≈ **−5.89**，学到后**升向 0**。旧断言写的是
     #   `-log(a) - 1e-6 <= h['policy_entropy'] <= 0.0`。
     #   **为什么必须改**：指标名叫 entropy 而方向是反的 —— 读者看到曲线从 −5.89
     #   升到 0 会以为策略在**变乱**，真实情况是**变锐**（熵在降）。
-    #   ⚠ 旧约定当时只是「把既成事实写进了测试」，**没有**任何论证支持它对；
+    # 旧约定当时只是「把既成事实写进了测试」，**没有**任何论证支持它对；
     #   覆盖面上它也只由 `test_health_metric_is_reported` 的「键在不在」间接护住，
     #   符号本身无门禁 ⇒ 要改正是一次显式裁决，而不是静默改数字。
     #   **新约定**：`H = −Σ p·log p`，取值 ∈ [0, log A]，均匀时 = log(362)
     #   ≈ 5.8926，学到后**下降** ⇒ 曲线方向与指标名一致。
     #   **代价**：历史 run 的这条曲线符号翻转，换算关系逐位成立 **新值 = −旧值**
     #   （见下面的 `test_policy_entropy_is_true_entropy_and_flips_sign`）。
-    #   ⚠ 故意**不同时上报两个口径** —— 那会让 SwanLab 里出现两条含义重叠、
+    # 故意**不同时上报两个口径** —— 那会让 SwanLab 里出现两条含义重叠、
     #   符号相反的曲线，比一个反了的曲线更难读。
     assert 0.0 <= h['policy_entropy'] <= math.log(a) + 1e-6, h
     # 两个 value 键的值可**逐项复算**（防止有人把两个键写反，或把
@@ -968,7 +968,7 @@ def test_health_block_reports_rmse_on_the_default_path():
 
 
 def test_policy_entropy_is_true_entropy_and_flips_sign():
-    """🔴 `policy_entropy` 的**口径**与**换算关系**（2026-10-03 裁决的两个锚点）。
+    """ `policy_entropy` 的**口径**与**换算关系**（2026-10-03 裁决的两个锚点）。
 
     三件事一起钉，缺一件就留了回归的口子：
 
@@ -1020,7 +1020,7 @@ def test_policy_entropy_is_true_entropy_and_flips_sign():
 
 def test_stage1_four_objectives_are_bit_identical_across_score_stdev_betas(net,
                                                                          v7_batch):
-    """🔴 `SCORE_STDEV_SOFTPLUS_BETA` 0.05 → 1.0 对**段 1 逐位无影响**。
+    """ `SCORE_STDEV_SOFTPLUS_BETA` 0.05 → 1.0 对**段 1 逐位无影响**。
 
     为什么这条不能省：段 1 的 8 项 score 系系数逐个 0.0（`test_stage1_score_family_
     coefficients_are_exactly_zero`），而 `score_stdev` 是**唯一没有行权重可用**
@@ -1094,7 +1094,7 @@ def test_health_block_reports_3class_accuracy_on_the_v7_path(net, v7_batch):
 
 
 def test_health_block_never_touches_the_12ch_names_under_v7():
-    """🔴 V7 下 `policy_logits` / `value_logit` / `value_t` 在 main() 里**未被绑定**。
+    """ V7 下 `policy_logits` / `value_logit` / `value_t` 在 main() 里**未被绑定**。
 
     （V7 走 `model(state, gl)` 返回 dict，不产出 `(policy_logits, value_logit)`
     二元组；`value_t` 那条路也不存在。）所以健康度块里任何一处对它们的**无条件**
@@ -1147,7 +1147,7 @@ def _default_of(flag):
 
 
 # --------------------------------------------------------------------------- #
-# 8. 🔴 `warm_futurepos()` 必须在父进程、`fork` 之前
+# 8. `warm_futurepos()` 必须在父进程、`fork` 之前
 # --------------------------------------------------------------------------- #
 def _main_tree():
     import ast
@@ -1172,7 +1172,7 @@ def _calls_named(fn, name):
 
 
 def test_warm_futurepos_is_called_in_main_before_the_prefetcher_fork():
-    """🔴 `warm_futurepos()` 的调用点必须在 `_BatchPrefetcher(...)` **之前**。
+    """ `warm_futurepos()` 的调用点必须在 `_BatchPrefetcher(...)` **之前**。
 
     这是本次接线里唯一一处「顺序错了不报错」的调用：`warm_futurepos()` 做的是
     **惰性解析**，若它排在预取器之后，解析就发生在**每个 worker 里**
@@ -1285,7 +1285,7 @@ def test_prefetch_worker_reports_errors_instead_of_dying():
 def test_prefetcher_next_returns_v7_quadruple(tmp_path):
     """`_BatchPrefetcher(v7=True).next()` 返回 `(spatial, gl, moves, labels)`。
 
-    ⚠ 这里用 `prefetch-workers=1` 之外的方式构造（`_StubMP`）不可行 —— payload
+     这里用 `prefetch-workers=1` 之外的方式构造（`_StubMP`）不可行 —— payload
     的拼接逻辑必须真跑，所以这里起**真进程**（默认 start method，Windows 上
     就是 spawn）。数据只有 16 行，进程启动的固定开销可以接受。
     """
@@ -1374,7 +1374,7 @@ def test_v7_rejects_soft_index(tmp_path):
 def test_soft_ce_end_to_end_with_soft_only_sampling(tmp_path):
     """`--policy-loss soft_ce` + `--soft-only-sampling` 端到端跑通（12 通道路径）。
 
-    ⚠ **段 2 必须配 `--soft-only-sampling`**：`soft_ce` 的 `mask=0` 的行贡献
+     **段 2 必须配 `--soft-only-sampling`**：`soft_ce` 的 `mask=0` 的行贡献
     **恰好 0**（不是退化成 one-hot CE）⇒ 34.2M 行上只有约 1% 的行贡献时，
     policy 项被缩小约 100×。这条断言那两件事同时成立：掩码确实生效（贡献 0）、
     且收窄行空间之后软行占比≈1。
@@ -1431,7 +1431,7 @@ def test_soft_ce_end_to_end_with_soft_only_sampling(tmp_path):
     loss.backward()
     assert logits.grad is not None and torch.isfinite(logits.grad).all()
     # 掩码生效的直接后果：第 2 行的**梯度必须恰好为 0**（它没被教任何东西）。
-    # ⚠ 这一条是段 2 的核心语义：「只训软行」不是靠 `--soft-weight 0` 实现的，
+    # 这一条是段 2 的核心语义：「只训软行」不是靠 `--soft-weight 0` 实现的，
     # 而是靠掩码把那些行的梯度直接掐掉。
     assert torch.allclose(logits.grad[1], torch.zeros(A), atol=1e-8), \
         'mask=0 的行拿到了梯度'

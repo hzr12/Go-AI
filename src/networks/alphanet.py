@@ -90,7 +90,7 @@ class AlphaGoNet(nn.Module):
         Returns:
             policy: (batch, action_size) logits
             value:  (batch, 1) 黑方视角价值，值域 [-1,1]（-1=白胜 1=黑胜）。
-                     ⚠ 不是「sigmoid 映射到 [0,1] 的胜率」：`ValueNetwork` 是
+                      不是「sigmoid 映射到 [0,1] 的胜率」：`ValueNetwork` 是
                      裸线性输出（无 Tanh），口径按 `inference.py:6` 的
                      「tanh 后落在 [-1,1]」解释。要胜率请自行做 (v+1)/2，
                      不要套 sigmoid。
@@ -101,9 +101,9 @@ class AlphaGoNet(nn.Module):
         return policy, value
 
     def get_policy(self, observation: torch.Tensor) -> torch.Tensor:
-        """⚠ 若同时需要 policy 和 value，请用 forward() 避免 backbone 重复计算。"""
+        """ 若同时需要 policy 和 value，请用 forward() 避免 backbone 重复计算。"""
         return self.policy(self.backbone(observation))
 
     def get_value(self, observation: torch.Tensor) -> torch.Tensor:
-        """⚠ 若同时需要 policy 和 value，请用 forward() 避免 backbone 重复计算。"""
+        """ 若同时需要 policy 和 value，请用 forward() 避免 backbone 重复计算。"""
         return self.value(self.backbone(observation))

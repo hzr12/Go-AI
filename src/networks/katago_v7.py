@@ -31,7 +31,7 @@
    ``_sdpa_force_math`` / flash-attn 开关 / batch 上限对两个模型一致生效 ——
    spec §6.2 的注意力显存账就是按这条路径估的。
 
-⚠ **RoPE 的形状是 spec 唯一未逐字确定的一处**：spec §3.2 只给出参数形状
+ **RoPE 的形状是 spec 唯一未逐字确定的一处**：spec §3.2 只给出参数形状
 ``(H, 16, 2)``，没有给「2」的语义。本实现取**二维频率**（``[...,0]`` 乘行坐标、
 ``[...,1]`` 乘列坐标，角度 = 二者加权和），它是 2D 旋转位置编码的直接推广，
 且**参数量与 spec 完全一致**。若日后核对 ``model_pytorch.py`` 发现官方是别的
@@ -144,7 +144,7 @@ class NormAct(nn.Module):
     模块 docstring 第 1 条。参数量 ``2C``（γ + β），全网**无 running stats**，
     因此与 batch 大小无关，也不会在按 group 采样时漂移。
 
-    ⚠ **γ 的初值是 ``norm_scale / scale``，不是 1。** ``norm_scale`` 就是
+     **γ 的初值是 ``norm_scale / scale``，不是 1。** ``norm_scale`` 就是
     ``K``：第 ``i`` 个 trunk 块取 ``1/√(i+1)``，trunk 末端取 ``1/√(B+1)``。
     忘了乘它，残差流的方差会随深度线性增长，深层激活直接饱和。
     """
@@ -245,7 +245,7 @@ class RoPE2D(nn.Module):
     def forward(self, x, pos):
         """x: ``(B, Hh, N, head_dim)``；``pos``: ``(B, N, 2)`` 整数，**``(行, 列)``**。
 
-        🔴 ``freq[..., 0]`` 乘的是**列**，``freq[..., 1]`` 乘的是**行** ——
+         ``freq[..., 0]`` 乘的是**列**，``freq[..., 1]`` 乘的是**行** ——
         与 ``pos`` 的 ``(行, 列)`` 顺序**相反**，这不是笔误。
 
         官方 ``desc.cpp`` 的 ``TransformerAttentionDesc::computeRopeCosSin``：
@@ -262,7 +262,7 @@ class RoPE2D(nn.Module):
         **非learnable（固定 theta）分支**，其 ``emb = cat([y*freqs, x*freqs])``
         顺序与 learnable 分支**相反**。照那句注释写 learnable 分支就会写反。
 
-        ⚠ **这个错误在任何正方盘面上都测不出来**：19×19 的行列数相同，行列互换
+         **这个错误在任何正方盘面上都测不出来**：19×19 的行列数相同，行列互换
         只是一个有效对称，policy 输出仍然「看着合理」。只有拿官方权重逐位对拍
         才能发现（我们是这么发现的）。
         """
@@ -317,7 +317,7 @@ class MHSA(nn.Module):
     def forward(self, t, pos):
         """``t``: ``(B, N, C)`` token 序列；``pos``: ``(B, N, 2)`` 行列坐标。"""
         b, n, c = t.shape
-        # 🔴 q **不**预乘 scale。scale 作为参数交给 `_sdpa`，由它按所选后端决定
+        # q **不**预乘 scale。scale 作为参数交给 `_sdpa`，由它按所选后端决定
         #    怎么施加（math 手动乘、SDPA 透传 scale=、flash 手动抵消它的写死值）。
         #    旧写法「预乘 q + scale=None」只在 math 路径（V100/910A）正确；
         #    走 SDPA 路径时 SDPA 会再乘一次 1/sqrt(d) ⇒ 注意力 logits 小 32 倍，
@@ -360,7 +360,7 @@ class TransformerBlock(nn.Module):
 
     内部一律用 ``(B, N, C)`` token 序列，块的最后再转回 ``(B, C, H, W)``。
 
-    ⚠ 归一化用 `backbone.RMSNorm`，它在**最后一维**（即 C）上求 RMS，所以
+     归一化用 `backbone.RMSNorm`，它在**最后一维**（即 C）上求 RMS，所以
     token 布局必须是 ``(B,N,C)`` 而不是 ``(B,C,N)`` —— 传反了不会报错，只会让
     归一化跨 token 进行，训练能收敛但形状测试全绿、指标莫名其妙。
     它与 `RMSNormMask`（在空间维 ``(H,W)`` 上求）分工不同，两者不可互换。
@@ -471,7 +471,7 @@ def gpool_policy(x):
 def gpool_value(x):
     """value 头的 `poolRowsValueHead`：``mean``、``mean·(√A−14)/10``、``max``。
 
-    🔴 第三段是 **max**，不是第三个缩放 mean。官方
+     第三段是 **max**，不是第三个缩放 mean。官方
     ``eigenbackend.cpp::poolRowsValueHead``：
 
         (*out)(c, n)                 = mean;
@@ -483,7 +483,7 @@ def gpool_value(x):
     白白浪费三分之一的池化维度。用官方权重灌入对拍时，value 输出量级差约
     250 倍，正是这个错误的表现之一。
 
-    ⚠ ``max`` 那一路在官方实现里是带 mask 的：padding 位置先置为
+     ``max`` 那一路在官方实现里是带 mask 的：padding 位置先置为
       ``x + (mask − 1)`` 再取 max，保证 padding 永远选不到。由于我们只在
       有效位置（off-board 已被特征置零）上池化，且 padding 位置的激活恒
       ≤ 有效位置，直接 ``amax`` 即可。
@@ -515,7 +515,7 @@ class PolicyHead(nn.Module):
         g1Concat(3G) → gpoolToPassMul(3G→P) → gpoolToPassBias(P)
                     → passActivation → gpoolToPassMul2(P→K) ──► policyPass (B,K)
 
-    🔴 **旧实现是错的，两处**：
+     **旧实现是错的，两处**：
 
     1. **bias 加的位置错了**。旧代码先 ``fuse(pooled)`` 再加到 ``pp`` 上，而
        官方是 ``gpoolToBiasMul`` 把 3G 投到 **P** 维、**逐通道**加到 ``p1Out``
@@ -564,7 +564,7 @@ class PolicyHead(nn.Module):
         b, _, h, w = trunk.shape
         pooled = gpool_policy(self.normact_g(self.conv_g(trunk)))   # (B,3G)
 
-        # 🔴 bias 在 **BN 之前**、逐通道加到空间图上（官方 addNCBiasInplace）
+        # bias 在 **BN 之前**、逐通道加到空间图上（官方 addNCBiasInplace）
         pp = self.conv(trunk) + self.fuse(pooled).reshape(b, -1, 1, 1)
         spatial = self.out(self.normact(pp))                        # (B,K,H,W)
         spatial = spatial.reshape(b, self.num_outputs, h * w)
@@ -589,21 +589,21 @@ class PolicyHead(nn.Module):
 #: `0.05`，已裁决改为 `1.0`**（2026-10-03）—— 下面保留推导链，因为「为什么不能
 #: 随手改这个数」正是这段推导本身，而「spec 写的是 0.05」是推导的一环。
 #:
-#: 🔴 **裁决依据：softplus(beta) 的量纲标定。**
+#: **裁决依据：softplus(beta) 的量纲标定。**
 #: ``F.softplus(x, beta) = log(1+exp(beta·x))/beta``，代入 x=0 得
 #: ``softplus(0, beta) = log(2)/beta`` ⇒ **预测初值 = 20·log(2)/beta**：
 #:
 #: ==========  ==========================  ==========================
 #: beta        20·softplus(0,beta) 初值    与 loss #7 的目标（5~20，δ=10）
 #: ==========  ==========================  ==========================
-#: 0.05        **277.26**（spec 字面值）   ✗ 高出 27 倍 ⇒ 初期梯度被常数偏差支配
-#: **1.0**     **13.86**（本常量）        ✓ 与 δ=10 同量级，起点即可用
+#: 0.05 **277.26**（spec 字面值） 高出 27 倍 ⇒ 初期梯度被常数偏差支配
+#: **1.0** **13.86**（本常量） 与 δ=10 同量级，起点即可用
 #: ==========  ==========================  ==========================
 #:
 #: 取默认 ``beta=1.0``（PyTorch ``F.softplus`` 的默认值）后，这一项从「等效于
 #: 没有学习信号」恢复为正常可训练项。
 #:
-#: ⚠ **实测（`tests/test_katago_v7_budget.py::
+#: **实测（`tests/test_katago_v7_budget.py::
 #: test_score_stdev_softplus_term_lands_near_huber_delta` 与
 #: test_score_stdev_loss_term_is_inside_huber_delta_at_the_ruled_out_beta`）**：
 #: seed 0 初始化 + seed 7 输入（B=64）跑真实 forward，
@@ -611,13 +611,13 @@ class PolicyHead(nn.Module):
 #: 落到 loss #7 的公式值：beta=0.05 → **272.22**，beta=1.0 → **8.83**
 #: （Huber δ=10 ⇒ 落在 δ **以内**，此时是二次段、梯度仍有效）。
 #:
-#: ⚠ **这是纯常量，不改结构**：头部拓扑、参数量（**5,561,832**）、预算测试全部
-#: 不受影响（有测试钉住）。另 ⚠ **段 1 不训 score**（8 项系数逐个 0.0），所以本
+#: **这是纯常量，不改结构**：头部拓扑、参数量（**5,561,832**）、预算测试全部
+#: 不受影响（有测试钉住）。另 **段 1 不训 score**（8 项系数逐个 0.0），所以本
 #: 改动对段 1 的四个主目标（policy / π_opp / value / futurepos）**逐位无影响**，
 #: 它是为**段 2/3**（接上 sidecar、把 score 系权重打开）生效的。
 SCORE_STDEV_SOFTPLUS_BETA = 1.0
 
-#: 🔴 官方 ``ModelPostProcessParams``（``desc.cpp``）的六个 multiplier，逐字照抄。
+#: 官方 ``ModelPostProcessParams``（``desc.cpp``）的六个 multiplier，逐字照抄。
 #: 它们不是超参，而是**引擎读 ``sv3Mul`` 六通道时写死的换算系数** ——
 #: 导出到 ``.bin.gz`` 后由官方引擎自己做后处理，所以我们的 forward 必须
 #: 用**完全相同**的系数，否则同一个 raw 数字在两边解释成不同的物理量。
@@ -636,7 +636,7 @@ SCORE_MEAN_MULTIPLIER = 20.0
 SCORE_STDEV_MULTIPLIER = 20.0
 LEAD_MULTIPLIER = 20.0
 VARIANCE_TIME_MULTIPLIER = 40.0
-#: 🔴 **下面两个通道没有训练标签，权重必须保持 0。**
+#: **下面两个通道没有训练标签，权重必须保持 0。**
 #:
 #: 2026-10-03 已逐一核对官方 ``cpp/dataio/trainingwrite.cpp`` 里**全部**
 #: ``rowGlobal[n] =`` 赋值（col 21~69 无遗漏），确认 stdata 的 64/80 列布局里
@@ -645,7 +645,7 @@ VARIANCE_TIME_MULTIPLIER = 40.0
 #:   · col 22 = varTimeLeft（已接标签，见 ``katago_npz.COL_VAR_TIME_LEFT``）
 #:   · col 23 = 恒 0（源码就写 ``//Unused``）
 #:   · col 30/31/32 = policySurprise / policyEntropy / searchEntropy
-#:     —— ⚠ 这三列**曾**因分布相近被统计特征误判成 shortterm 两列
+#: —— 这三列**曾**因分布相近被统计特征误判成 shortterm 两列
 #:       （中位数 0.705 vs 0.708），查源码后推翻。它们是搜索统计量。
 #:
 #: 根因：``shorttermX = sqrt(softplus(raw)² · mult)`` 需要**网络 raw 输出**，
@@ -670,11 +670,11 @@ class ValueHead(nn.Module):
                        ├→ v3Mul(W→3) + v3Bias     ⇒ outcome (win/loss/noresult)
                        └→ sv3Mul(W→6) + sv3Bias   ⇒ scoreValue 六通道
 
-    ⚠ **小头（ownership / scoring / futurepos / seki）全部接在 ``VV``（池化之前）
+     **小头（ownership / scoring / futurepos / seki）全部接在 ``VV``（池化之前）
     上**，不是接在 ``h`` 上 —— 它们的输出是 19×19 平面，空间分辨率不能被池化抹掉。
     这四个是本项目自研，官方没有，导出时丢弃。
 
-    ⚠ ownership 输出的是 **pretanh**（线性），不是 ``tanh`` 之后的值。loss #4
+     ownership 输出的是 **pretanh**（线性），不是 ``tanh`` 之后的值。loss #4
     要的是 ``BCE_with_logits(2·pretanh, (1+t)/2)``，而 `BCEWithLogits` 吃的是
     无界 logit；``tanh`` 只在**推理/导出**时施加（`ownership()` 方法）。
     futurepos 同理：loss #11 自己带 ``tanh``，所以头是线性的。
@@ -687,7 +687,7 @@ class ValueHead(nn.Module):
         self.normact = NormAct(channels)
         self.fc = _ScaledLinear(3 * channels, hidden, bias=True)
         self.outcome = _ScaledLinear(hidden, 3, bias=True)
-        # 🔴 3 → 6：官方 sv3Mul 的 out_channels=6。用户 2026-10-03 明确要求
+        # 3 → 6：官方 sv3Mul 的 out_channels=6。用户 2026-10-03 明确要求
         # 「真实训练缺失的三个通道」，所以这里补齐结构并接真实标签，而不是
         # 零填充 —— 零填充会让这三项在导出后恒为常量，引擎的 varTimeLeft /
         # shorttermWinlossError / shorttermScoreError 全部失去意义。
@@ -729,7 +729,7 @@ class ValueHead(nn.Module):
                 F.softplus(s[:, 4]) * SHORTTERM_WINLOSS_ERROR_MULTIPLIER),
             'shortterm_score_error': torch.sqrt(
                 F.softplus(s[:, 5]) * SHORTTERM_SCORE_ERROR_MULTIPLIER),
-            # 🔴 raw 六通道原样保留。导出 `.bin.gz` 时**必须写 raw**，因为官方
+            # raw 六通道原样保留。导出 `.bin.gz` 时**必须写 raw**，因为官方
             # 引擎会自己做上面那套后处理；若这里就已乘完倍率，引擎会再乘一次。
             'score_value_raw': s,
             'ownership_pretanh': self.ownership(vv),
@@ -753,7 +753,7 @@ class ScorebeliefHead(nn.Module):
     桶下标自变量（``0.05`` 的分差步长与 ``parity``）在 ``__init__`` 里算好注册成
     buffer，**不进 checkpoint**（由 spec §6.1 的 ``1→96 ×2`` 无 bias 可证）。
 
-    ⚠ ``parity(i)·global[18]`` 那一路是 spec §2.3 ch18 的镜像：那个通道是
+     ``parity(i)·global[18]`` 那一路是 spec §2.3 ch18 的镜像：那个通道是
     「komi × 棋盘奇偶三角波」，乘进分差桶的奇偶性里，让网络在相邻两桶之间
     感知贴不贴和。它是 V7 相对 V3/V4/V6 唯一的全局通道新增（源码注释互证）。
     """

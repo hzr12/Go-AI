@@ -37,7 +37,7 @@ D2：为什么是 Linear-only
    A100 上 OOM 的元凶（CUDA Graphs 私有内存池不归还），NPU 上同样要避开。
 4. **显存是真实风险**：本项目 4 卡 910A 常驻已到 26.7~31.1GB / 32GB，
    图模式额外的 workspace/图缓冲极易再炸。默认关闭即为此。
-5. **不得二次包装**：⚠ `torch.compile` 返回的 `OptimizedModule` 本身也是
+5. **不得二次包装**： `torch.compile` 返回的 `OptimizedModule` 本身也是
    `nn.Module`，而 `model.modules()` 是惰性生成器。边遍历边替换会让它走进
    新包进去的 `_orig_mod`，那个 Linear 立刻又满足 `isinstance(..., nn.Linear)`
    → 无限套娃（实测 `RecursionError: maximum recursion depth exceeded`，
@@ -100,7 +100,7 @@ def _code_span(lo, hi):
 def _dist_wrap_lineno():
     """分布式包裹点的源码行号：`main()` 体内 `DistributedDataParallel(...)` 的调用节点。
 
-    ⚠ **必须走 AST 的 `Call` 节点，不能在源码文本里搜 `DistributedDataParallel(`**。
+     **必须走 AST 的 `Call` 节点，不能在源码文本里搜 `DistributedDataParallel(`**。
     那个字符串在 `train_sft.py` 里有四处，其中三处不是调用点：
       · L27   `from torch.nn.parallel import DistributedDataParallel`（在 `main()` 之前
               ⇒ 拿它当下界会让「包裹点在编译分支之后」这条断言**恒假**）；
@@ -118,7 +118,7 @@ def _dist_wrap_lineno():
     assert len(hits) == 1, (
         'main() 里 DistributedDataParallel 的**调用**节点应恰好 1 个（实得 %d：%s）—— '
         '0 个说明分布式包裹被删了，多个说明有一处在错误的位置被包裹。'
-        '⚠ 别改成在源码文本里搜这个名字，见本函数 docstring。' % (len(hits), hits))
+        ' 别改成在源码文本里搜这个名字，见本函数 docstring。' % (len(hits), hits))
     return hits[0]
 
 
@@ -198,7 +198,7 @@ class _Net(nn.Module):
 def _is_wrapper(m):
     """编译包装体：真 `OptimizedModule` 与桩 `_StubCompiled` 都靠 `_orig_mod` 认。
 
-    ⚠ 断言「替换生效了没有」时**必须**先排除包装体：包装体把原 Linear 挂在
+     断言「替换生效了没有」时**必须**先排除包装体：包装体把原 Linear 挂在
     `_orig_mod` 下，而 `_orig_mod` 又是它自己的直接子模块，于是任何
     `isinstance(child, nn.Linear)` 的遍历在替换后照样能摸到那些 Linear ——
     照直断言「一个都不该剩」会永远为假，看不出替换到底生效没有。
@@ -316,7 +316,7 @@ def test_cuda_compile_path_untouched():
     **调用节点**）作结束标记：这个测试要圈的是「CUDA 分支自身的代码」，而分布式
     包裹紧随其后。
 
-    ⚠ 换轨记录：2026-10-01 之前这里锚的是 `_wrap_fsdp1`（FSDP1 时代），再往前是
+     换轨记录：2026-10-01 之前这里锚的是 `_wrap_fsdp1`（FSDP1 时代），再往前是
     `DistributedDataParallel`（DDP 时代）。**两次都因为同一个原因坏掉**：按源码文本
     找一个「可能消失也可能被注释/docstring 命中」的字符串当下界，在换轨后要么恒假
     （命中 `main()` 之前的 import 行）要么恒真（命中解释性文字）。所以现在两端都
@@ -573,7 +573,7 @@ def test_failure_midway_rolls_back_everything(monkeypatch):
 
 
 def test_collect_before_replace_never_double_wraps(spy_compile):
-    """⚠ 不得二次包装：每个 Linear 只被编译一次，键里只多**一段** `_orig_mod.`。
+    """ 不得二次包装：每个 Linear 只被编译一次，键里只多**一段** `_orig_mod.`。
 
     这条锁的是本文件开头第 5 条性质。`torch.compile` 返回的 OptimizedModule 本身
     也是 `nn.Module`；若边遍历边替换，`modules()` 会走进新包进去的 `_orig_mod`，

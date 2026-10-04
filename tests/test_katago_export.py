@@ -1,4 +1,4 @@
-"""🔴 回归测试：V7 → KataGo ``.bin.gz`` 的导出链路。
+""" 回归测试：V7 → KataGo ``.bin.gz`` 的导出链路。
 
 背景（2026-10-03）
 ------------------
@@ -61,7 +61,7 @@ def desc(sd):
 def test_input_channels_are_22_and_19(desc):
     """输入通道数必须等于官方 V7 布局。
 
-    ⚠ 这不是「随便填的」：`fillRowV7` 按固定下标写 22 个空间通道，引擎只认
+     这不是「随便填的」：`fillRowV7` 按固定下标写 22 个空间通道，引擎只认
     自己那套。改了就是静默的语义错位。
     """
     assert desc.num_input_channels == 22
@@ -89,7 +89,7 @@ def test_stem_conv_is_3x3(desc, sd):
 
 
 def test_value_sv3_has_six_channels(desc):
-    """🔴 `sv3Mul` 必须是 6 通道（官方 `ValueHeadDesc.sv3Mul.out_channels=6`）。
+    """ `sv3Mul` 必须是 6 通道（官方 `ValueHeadDesc.sv3Mul.out_channels=6`）。
 
     若仍是 3，引擎会按 6 去读一段 3 通道的权重 —— 越界/错位且**不报错**。
     """
@@ -108,7 +108,7 @@ def test_value_outcome_has_three_channels(desc):
 def test_policy_pass_branch_is_wired(desc, sd):
     """pass 支路三层齐全：mul(3G→P) / bias(P) / act / mul2(P→K)。
 
-    ⚠ 我们的 `pass_fc1` 是 `Linear(3G→P, bias=True)`，把官方的
+     我们的 `pass_fc1` 是 `Linear(3G→P, bias=True)`，把官方的
     `gpoolToPassMul` + `gpoolToPassBias` **合并**成一步 ——
     `Linear(xW+b)` 与 `MatMul` 后 `MatBias` 数值上完全等价。
     """
@@ -123,7 +123,7 @@ def test_policy_pass_branch_is_wired(desc, sd):
 
 
 def test_policy_p2_conv_has_no_bias(desc, sd):
-    """🔴 `p2_conv`（`policy_head.out`）**不带 bias**。
+    """ `p2_conv`（`policy_head.out`）**不带 bias**。
 
     官方 `p2Conv` 固定 `hasBias=0`；bias 由前面的 `p1BN` 承担。
     `hasBias` 是「文件里有没有这个数组」的**存在性开关**，不是「值是不是 0」——
@@ -141,7 +141,7 @@ def test_policy_p2_conv_has_no_bias(desc, sd):
 # 2. attn/ffn 粒度差异（真实踩过的坑）
 # --------------------------------------------------------------------------- #
 def test_one_inner_unit_expands_to_two_official_blocks(desc):
-    """🔴 我们的融合 TransformerBlock 要展开成官方**两个** block。
+    """ 我们的融合 TransformerBlock 要展开成官方**两个** block。
 
     官方 ``BlockStack`` 是 ``attn`` / ``ffn`` **交替**堆叠
     （b10c384 每块 4 个单元 = 2×(attn+ffn)）；我们的 ``TransformerBlock``
@@ -209,7 +209,7 @@ def test_trunk_tip_rmsnorm_is_spatial(desc):
 
 
 def test_activation_silu_is_3_not_1(desc):
-    """🔴 官方 ``ACTIVATION_SILU == 3``（1 是 RELU）。
+    """ 官方 ``ACTIVATION_SILU == 3``（1 是 RELU）。
 
     这个搞错过一次：把 SiLU 写成 1，引擎不会报错，只是网络行为完全不对。
     """
@@ -228,7 +228,7 @@ def test_activation_silu_is_3_not_1(desc):
 # 3. 被剥离的自研头
 # --------------------------------------------------------------------------- #
 def test_stripped_heads_do_not_appear_in_the_file(desc, sd):
-    """🔴 4 个自研头**不得**出现在 ``.bin`` 里。
+    """ 4 个自研头**不得**出现在 ``.bin`` 里。
 
     官方 ``.bin`` 没有它们的字段；硬塞进某个 head 的输出通道，引擎会把它
     读成别的语义。所以这里断言它们既不在 desc 结构里、参数也没被算进去。
@@ -259,7 +259,7 @@ def test_exported_param_count_is_model_minus_stripped_heads(desc):
 # 4. 存在性开关与类型
 # --------------------------------------------------------------------------- #
 def test_multipliers_are_textfloat_not_float(desc):
-    """🔴 multiplier 在文件里是 ``TextFloat``（字符串浮点），不是 float。
+    """ multiplier 在文件里是 ``TextFloat``（字符串浮点），不是 float。
 
     ``ModelDesc.write`` 读的是 ``.text`` 属性；传 float 会
     ``AttributeError: 'float' object has no attribute 'text'``。
@@ -273,7 +273,7 @@ def test_multipliers_are_textfloat_not_float(desc):
 
 
 def test_multiplier_values_match_the_forward_side(desc):
-    """🔴 文件里的 multiplier 必须与 `ValueHead` forward 侧用的**完全一致**。
+    """ 文件里的 multiplier 必须与 `ValueHead` forward 侧用的**完全一致**。
 
     否则同一个 raw 在训练侧与引擎侧被解释成不同的物理量。导出路径
     **不乘**任何倍率 —— 引擎会自己做后处理。
@@ -355,7 +355,7 @@ def test_roundtrip_byte_identical(desc, tmp_path):
 
 
 def test_conv_weight_layout_survives_roundtrip(desc, sd, tmp_path):
-    """🔴 conv 权重布局：文件里是 ``(y,x,ic,oc)``，torch 里是 ``(oc,ic,y,x)``。
+    """ conv 权重布局：文件里是 ``(y,x,ic,oc)``，torch 里是 ``(oc,ic,y,x)``。
 
     搞反了形状照样能对上（元素总数一样），但**空间权重全错**。
     """
@@ -370,7 +370,7 @@ def test_conv_weight_layout_survives_roundtrip(desc, sd, tmp_path):
 def test_matmul_weight_layout_survives_roundtrip(desc, sd, tmp_path):
     """MatMul 的布局是 ``(out, in)``，与 torch 的 ``nn.Linear.weight`` **一致**。
 
-    🔴 这条容易搞反，且搞反了**形状刚好对得上**（元素总数一样），但会做
+     这条容易搞反，且搞反了**形状刚好对得上**（元素总数一样），但会做
     出 ``Wᵀ·x`` 而不是 ``W·x`` —— 引擎不报错，只是网络行为完全错。
 
     权威依据 ``eigenbackend.cpp`` 的 ``MatMulLayer``：

@@ -29,9 +29,9 @@ CLI::
     def write_weights(w):
         writestr("@BIN@")                                     # 标记，前面没有空格
         f.write(struct.pack(f'<{N}f', *w))                     # 裸 little-endian float32
-        writestr("\n")                                        # ⚠ 二进制块之后也有 "\n"
+        writestr("\n") # 二进制块之后也有 "\n"
 
-⚠ **反直觉之处 / 踩坑清单**（每一条都对应官方源码的一行，不写下来下一个人会重踩）
+ **反直觉之处 / 踩坑清单**（每一条都对应官方源码的一行，不写下来下一个人会重踩）
 =============================================================================
 
 1. **`@BIN@` 前面恰好一个 `\n`，后面也恰好一个 `\n`**。
@@ -51,7 +51,7 @@ CLI::
 
 4. **卷积权重：文件序 `y,x,ic,oc`，内存序 `oc,ic,y,x` col-major**
    （`desc.cpp:133-154`）。写入端 `torch.permute(w,(2,3,1,0))`。
-   ⚠ 本模块把权重**按文件序原样存**（`ConvDesc.weights`），因为那样 round-trip
+    本模块把权重**按文件序原样存**（`ConvDesc.weights`），因为那样 round-trip
    是纯 memcpy、零位错风险；permute 由 `to_torch_weight()` / `from_torch_weight()` 负责。
 
 5. **MatMul 权重：文件序 `ic,oc`，内存序 `oc,ic`**（`desc.cpp:463-478`）。
@@ -96,7 +96,7 @@ CLI::
 15. **`cgroupSize != 0` 被 C++ 明确拒绝**（`desc.cpp:1086-1087`）：grouped spatial RMSNorm
     没实现。`spatial` 标志本身是支持的。
 
-16. **🔴 千万别用"扫到下一个 `\\n`"或"扫到下一个 `@`"来定位 float 块的结尾** ——
+16. ** 千万别用"扫到下一个 `\\n`"或"扫到下一个 `@`"来定位 float 块的结尾** ——
     float32 载荷里**本来就会出现**这些字节。实测官方 b10c384 文件的 328 个载荷里
     含有 **129,087 个 `0x0A`(换行)** 和 **115,326 个 `0x40`('@')**，也就是说
     "扫换行"这种最自然的写法**几乎立刻就会跑飞**（实测：第一个换行就在载荷第 8 字节）。
@@ -111,7 +111,7 @@ CLI::
     mean、variance、[scale]、[bias] 是**连续**的 `@BIN@` 块，两个块之间只有块尾 `\n`。
     官方文件里有 **67 个**块的前导文本为空。⇒ 别假设"每个 `@BIN@` 前面都有 token"。
 
-18. ⚠ `_iter_float_arrays`（本模块内部用来数 float / 数次正规数的遍历器）按
+18. `_iter_float_arrays`（本模块内部用来数 float / 数次正规数的遍历器）按
     **dataclass 字段声明顺序**递归，而**序列化顺序是另一回事** ——
     最明显的是 `TransformerFFNDesc` 的字段序是 `pre_ln, linear1, linear2, linear_gate`，
     但 writer 发出的是 `pre_ln, linear1, linear_gate, linear2`（`desc.cpp:1391-1393`）。
@@ -392,12 +392,12 @@ class _Reader:
     def floats(self, count: int, name: str) -> np.ndarray:
         """复刻 `readFloats` 的 `binaryFloats=true` 分支。
 
-        ⚠ 与 C++ 的两处**故意**不同：
+         与 C++ 的两处**故意**不同：
         1. C++ 会把 fp32 次正规数冲成 0（`desc.cpp:89-90`）—— 我们不做，见模块
            docstring 坑 #2，否则 round-trip 对不上。
         2. C++ 在 big-endian 上会翻转字节 —— 我们显式按 `<f4` 读，与平台无关。
 
-        ⚠ 坑 #16：这里**必须**按 `count` 精确读 `4*count` 字节。
+         坑 #16：这里**必须**按 `count` 精确读 `4*count` 字节。
         float32 载荷里会出现 `\\n`(0x0A) 和 `@`(0x40)（实测官方文件分别有
         129,087 和 115,326 个），扫描分隔符定位块尾一定跑飞。
         """
@@ -492,7 +492,7 @@ def _as_f32(values: Any) -> np.ndarray:
 class ConvDesc:
     """`ConvLayerDesc`（`desc.h:15-41`）。
 
-    ⚠ `weights` 是**文件序** `y,x,ic,oc`（`desc.cpp:133-154`），长度
+     `weights` 是**文件序** `y,x,ic,oc`（`desc.cpp:133-154`），长度
     `conv_y*conv_x*in_channels*out_channels`。内存 / torch 序是 `oc,ic,y,x`，
     用 `to_torch_weight()` 转换。
     """
@@ -600,7 +600,7 @@ class ConvDesc:
 class BatchNormDesc:
     """`BatchNormLayerDesc`（`desc.h:43-75`）。
 
-    ⚠ 坑 #6：`has_scale` / `has_bias` 是**"文件里有没有这个数组"**的开关。
+     坑 #6：`has_scale` / `has_bias` 是**"文件里有没有这个数组"**的开关。
     为假时 C++ 不读文件、自己填 1.0 / 0.0（`desc.cpp:235-249`）。序列化时为假
     就不写那个数组，否则多出 8*num_channels 字节。
     """
@@ -617,7 +617,7 @@ class BatchNormDesc:
 
     @property
     def num_parameters(self) -> int:
-        """⚠ 只数可学习的 scale + bias。mean / variance 是 running stats，不是参数。
+        """ 只数可学习的 scale + bias。mean / variance 是 running stats，不是参数。
         复刻 `desc.cpp:278-282`（含那条 "Count the learnable scale and bias" 注释）。"""
         return (self.num_channels if self.has_scale else 0) + (
             self.num_channels if self.has_bias else 0
@@ -633,7 +633,7 @@ class BatchNormDesc:
     def compute_merged(self) -> Tuple[np.ndarray, np.ndarray]:
         """复刻 `computeMerged`（`desc.cpp:284-291`），给推理侧对齐用。
 
-        ⚠ 这会**读**权重、不改 IR —— exporter 不该调用它，否则 round-trip 就废了。
+         这会**读**权重、不改 IR —— exporter 不该调用它，否则 round-trip 就废了。
         """
         merged_scale = self.scale / np.sqrt(self.variance + float(self.epsilon))
         merged_bias = self.bias - merged_scale * self.mean
@@ -686,7 +686,7 @@ class BatchNormDesc:
 class ActivationDesc:
     """`ActivationLayerDesc`（`desc.h:77-91`）。
 
-    ⚠ 坑 #9：`model_version < 11` 时文件里**没有** kind token，C++ 硬编码成 RELU
+     坑 #9：`model_version < 11` 时文件里**没有** kind token，C++ 硬编码成 RELU
     （`desc.cpp:402-404`）。序列化由 `TrunkDesc.write` 之类按 model_version 决定
     写不写，所以这里不需要额外标志位。
     """
@@ -726,7 +726,7 @@ class ActivationDesc:
 class MatMulDesc:
     """`MatMulLayerDesc`（`desc.h:93-114`）。
 
-    ⚠ 坑 #5：文件序 `ic,oc`（`desc.cpp:463-478`），torch / 内存序 `oc,ic`。
+     坑 #5：文件序 `ic,oc`（`desc.cpp:463-478`），torch / 内存序 `oc,ic`。
     """
 
     name: str
@@ -816,7 +816,7 @@ class MatBiasDesc:
 class RMSNormDesc:
     """`RMSNormLayerDesc`（`desc.h:238-258`）：trunk tip 的最终 norm（v>=15）。
 
-    ⚠ 坑 #15：`cgroup_size != 0` 被 C++ 明确拒绝（`desc.cpp:1086-1087`），
+     坑 #15：`cgroup_size != 0` 被 C++ 明确拒绝（`desc.cpp:1086-1087`），
     grouped spatial RMSNorm 没实现。`spatial` 本身是支持的。
     """
 
@@ -917,7 +917,7 @@ class TransformerRMSNormDesc:
 class TransformerAttentionDesc:
     """`TransformerAttentionDesc`（`desc.h:280-321`）。
 
-    ⚠ 坑 #12：learnable RoPE 前面有一个 `rope_freqs_name`、fixed RoPE 前面有一个
+     坑 #12：learnable RoPE 前面有一个 `rope_freqs_name`、fixed RoPE 前面有一个
     `rope_theta_name`，C++ 读掉就丢弃（`desc.cpp:1226` / `desc.cpp:1246`）。
     它们**在文件里**，所以要存要写回。
 
@@ -1109,7 +1109,7 @@ class TransformerAttentionDesc:
 class TransformerFFNDesc:
     """`TransformerFFNDesc`（`desc.h:323-345`）。
 
-    ⚠ `use_swiglu` 时 `linear_gate` 才在文件里（`desc.cpp:1391-1393`）。
+     `use_swiglu` 时 `linear_gate` 才在文件里（`desc.cpp:1391-1393`）。
     """
 
     name: str
@@ -1397,7 +1397,7 @@ class GlobalPoolingResidualBlockDesc:
 class NestedBottleneckDesc:
     """`NestedBottleneckResidualBlockDesc`（`desc.h:198-232`）= `nested_bottleneck_block`。
 
-    ⚠ 坑 #8：**递归**。`blocks` 里每个子块自己还带 tag（`desc.cpp:799`）。
+     坑 #8：**递归**。`blocks` 里每个子块自己还带 tag（`desc.cpp:799`）。
     """
 
     name: str
@@ -1754,11 +1754,11 @@ class SGFMetadataEncoderDesc:
 class TrunkDesc:
     """`TrunkDesc`（`desc.h:380-421`）。
 
-    ⚠ 坑 #9 / #11：通道数共 6 个（numBlocks 之后），第 4 个是源码里标 `//unused` 的
+     坑 #9 / #11：通道数共 6 个（numBlocks 之后），第 4 个是源码里标 `//unused` 的
     `dilated_num_channels`，但它在文件里，必须原样往返。写入端填 `c_gpool`
     （`export_model_pytorch.py:682`），第 3 个 `regular_num_channels` 填 `c_mid - c_gpool`。
 
-    ⚠ `trunk_norm_kind` 决定 trunk tip 是 `BatchNormDesc` 还是 `RMSNormDesc`
+     `trunk_norm_kind` 决定 trunk tip 是 `BatchNormDesc` 还是 `RMSNormDesc`
     （`desc.cpp:1752-1765`），两者在文件里互斥。
     """
 
@@ -1978,7 +1978,7 @@ def _block_has_transformer(block: Block) -> bool:
 class PolicyHeadDesc:
     """`PolicyHeadDesc`（`desc.h:423-457`）。
 
-    ⚠ 坑 #9：`gpool_to_pass_bias` / `pass_activation` / `gpool_to_pass_mul2` 只在
+     坑 #9：`gpool_to_pass_bias` / `pass_activation` / `gpool_to_pass_mul2` 只在
     `model_version >= 15` 时在文件里（`desc.cpp:2096-2105`）。v<15 时 C++ 构造默认对象，
     我们也放"未使用"的空对象，且不写。
     """
@@ -2182,7 +2182,7 @@ class PolicyHeadDesc:
 class ValueHeadDesc:
     """`ValueHeadDesc`（`desc.h:459-491`）。
 
-    ⚠ `sv3_mul` / `sv3_bias` 的宽度是版本决定的：v>=9 -> 6，v8 -> 4，v>=4 -> 2，更早 -> 1
+     `sv3_mul` / `sv3_bias` 的宽度是版本决定的：v>=9 -> 6，v8 -> 4，v>=4 -> 2，更早 -> 1
     （`desc.cpp:2307-2330`）。宽度**不在文件里**，由 `model_version` 推导。
     """
 
@@ -2352,7 +2352,7 @@ class ValueHeadDesc:
 class ModelDesc:
     """`ModelDesc`（`desc.h:508-597`）—— 整个 `.bin.gz`。
 
-    ⚠ 坑 #10：`sha256` **不是文件的一部分**，是 loader 算出来传进来的
+     坑 #10：`sha256` **不是文件的一部分**，是 loader 算出来传进来的
     （`desc.cpp:2467`）。所以它有字段、但不序列化；解析器也不从文件读它。
 
     后面 4 个 `num_*_channels` 是从 head 推导出来的（`desc.cpp:2608-2611`），
@@ -2625,7 +2625,7 @@ def maybe_gunzip(data: bytes) -> bytes:
 def read_model_bytes(data: bytes, sha256: str = "") -> Tuple[ModelDesc, int]:
     """解析（自动 gunzip），返回 `(ModelDesc, 消耗的字节数)`。
 
-    ⚠ **消耗的字节数通常是 `len - 1`**：文件最后一个字节是最后一个 `@BIN@` 块的
+     **消耗的字节数通常是 `len - 1`**：文件最后一个字节是最后一个 `@BIN@` 块的
     尾随 `\\n`，C++ 与我们都不消费它（坑 #1）。这个返回值就是给 round-trip diff 用的。
     """
     raw = maybe_gunzip(data)
@@ -2665,7 +2665,7 @@ def save_model_file(model: ModelDesc, path: str) -> None:
 
 
 def count_parameters(model: ModelDesc) -> int:
-    """KataGo `getNumParameters` 口径（⚠ BN 只数 scale+bias，不数 mean+variance）。"""
+    """KataGo `getNumParameters` 口径（ BN 只数 scale+bias，不数 mean+variance）。"""
     return model.num_parameters
 
 
@@ -2681,10 +2681,10 @@ def count_file_floats(model: ModelDesc) -> int:
 def _iter_float_arrays(obj: Any) -> Iterator[np.ndarray]:
     """结构化遍历 IR 里**每一个**非空 float 数组（含 `rope_freqs` 这种没有独立层的）。
 
-    ⚠ 不能靠 `iter_layers`：那个只吐叶子"层"，attention 块本身不是叶子，
+     不能靠 `iter_layers`：那个只吐叶子"层"，attention 块本身不是叶子，
     它的 `rope_freqs` 就漏掉了。本函数按 dataclass 字段递归，与序列化器看到的完全一致。
 
-    ⚠ 坑 #18：这里的顺序是**dataclass 字段声明顺序**，**不是落盘顺序**
+     坑 #18：这里的顺序是**dataclass 字段声明顺序**，**不是落盘顺序**
     （`TransformerFFNDesc` 是 `linear1, linear2, linear_gate` vs 落盘的
     `linear1, linear_gate, linear2`）。所以本函数只可用于**顺序无关**的统计。
     要真实落盘顺序请用 `_Writer.floats` 探针。
@@ -2709,7 +2709,7 @@ def _iter_float_arrays(obj: Any) -> Iterator[np.ndarray]:
 def count_subnormals(model: ModelDesc) -> int:
     """文件里有多少个 fp32 次正规数（`abs(x)` 非零但 `< FLT_MIN`）。
 
-    ⚠ KataGo 读的时候会**把它们冲成 0**（`desc.cpp:89-90`），我们为了 round-trip
+     KataGo 读的时候会**把它们冲成 0**（`desc.cpp:89-90`），我们为了 round-trip
     保留原值。这个数字告诉你"如果要做数值等价性比对，需要额外容忍多少差异"。
 
     实测 `kata1-tf2-b10c384-s2941M-d5872M.bin.gz`：**444,703 / 10,557,657 = 4.21%**，

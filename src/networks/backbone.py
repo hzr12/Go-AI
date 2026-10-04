@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint  # noqa: F401  （`torch.utils.checkpoint` 的显式 import）
 
-# ⚠ 绝对导入而非 `from .se_bottleneck import …`：
+# 绝对导入而非 `from .se_bottleneck import …`：
 # `tests/test_backbone_block_classes.py` 用 `spec_from_file_location` 把本文件
 # **当独立脚本**加载（没有包上下文），相对导入会 `ImportError: attempted relative
 # import with no known parent package`。绝对导入与本仓其余跨包引用的写法一致
@@ -123,7 +123,7 @@ GRAD_CHECKPOINT_DEFAULTS = {
 #: 旧路径的**段粒度**：`checkpoint_sequential(blocks, len(blocks), x)` 的粒度
 #: 就是「每块一段」，所以旧路径必须逐块，不能并段。
 #:
-#: ⚠ 这**不是**一个可以随手「顺手统一」的默认值 —— 它是旧路径显存口径的一部分。
+#: 这**不是**一个可以随手「顺手统一」的默认值 —— 它是旧路径显存口径的一部分。
 #: v18 形状（17 块、192 通道）实测留给反向的字节：
 #:     逐块（本值）  16 个段入口   ≈ 与 HEAD 的 `checkpoint_sequential` 一致
 #:     并段                1 个段入口   ≈ 省 16×
@@ -158,7 +158,7 @@ GC_PER_BLOCK_DEFAULT = {
 #
 # 与分片并行的关系：分片包装本来就是按块类切（每个块是一个 wrap unit），逐块检查点
 # 与它 1:1 对齐，重算时只重新 all-gather 一个 unit —— 段级则会让重算横跨多个 unit。
-# ⚠ 留下这段是为了**别再犯同一个错**：本表里现役只有 `legacy`，而 `legacy` 是
+# 留下这段是为了**别再犯同一个错**：本表里现役只有 `legacy`，而 `legacy` 是
 # **逐块**；任何新增的分段主干请直接沿用逐块，除非愿意像上面那样实测重算峰值。
 
 
@@ -182,7 +182,7 @@ class _BatchNormStatGuard:
     `CheckpointError: A different number of tensors was saved during the original
     forward and recomputation`。要么关掉 determinism 检查（那会连带关掉对真正
     非确定性的防护），要么改用本类。
-    ⚠ 归一化数值本身两者**相同**（`training=True` 时 BN 一律按 batch 统计归一化，
+     归一化数值本身两者**相同**（`training=True` 时 BN 一律按 batch 统计归一化，
     `track_running_stats` 只决定要不要写 buffer）—— 所以本方案不碰计算图，
     只在重算前后把三个 buffer 还原，输出/梯度/`determinism_check` 全部一字不变，
     而 buffer 与单次前向**逐位相等**（含 `num_batches_tracked` 回到 1）。
@@ -258,7 +258,7 @@ def assert_grad_checkpoint_compile_compatible(module, where=''):
     不可预期（段的重算要么被 Dynamo 拆成 graph break、要么整段退化成 eager），
     在 NPU/TorchAir 上还会让图捕获跨过 `saved_tensors_hooks` 这个动态边界。
 
-    ⚠ 覆盖面：这里只能看见**本子树内**的 `_orig_mod`。若整个模型被
+     覆盖面：这里只能看见**本子树内**的 `_orig_mod`。若整个模型被
     `torch.compile(model)` 包住（`inference.py` 的 CUDA `--compile` 路径），
     `module` 是被包在里面的那个原始模块、自树扫不到 —— 那一条要在**编译的调用点**
     上再查一次，用同一个函数（`assert_grad_checkpoint_compile_compatible(model)`
@@ -453,7 +453,7 @@ def _checkpointed(runner, args, bns):
 
     def context_fn():
         # 第二个 context 只在**重算期间**进入（实测进入 1 次），第一个包原前向。
-        # ⚠ 传的是 `_recompute_ctx()` —— **实例**不是工厂：checkpoint 拿到的
+        # 传的是 `_recompute_ctx()` —— **实例**不是工厂：checkpoint 拿到的
         #   是「已构造好的上下文管理器」，直接 `with` 它。
         return contextlib.nullcontext(), _recompute_ctx()
 
@@ -484,7 +484,7 @@ class GradCheckpointMixin:
     * `set_grad_checkpointing()` 可以在**不重建模型**的情况下切换 —— 属性不进
       `state_dict`（既不是 parameter 也不是 buffer），所以切换前后存档逐位相同。
 
-    ⚠ **开关属于「调用 `run_segment` 的那个模块」**（接线必读）
+     **开关属于「调用 `run_segment` 的那个模块」**（接线必读）
     ----------------------------------------------------------
     开关是**普通实例属性**，不自动向子模块传播。若某个全网类持有 mixin 而
     `forward` 只调 `self.backbone(x)`，那么 `net.set_grad_checkpointing(True)`
@@ -615,7 +615,7 @@ def _sdpa(q, k, v, dropout_p=0.0, use_math=False, scale=None):
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
             v = v.to(torch.bfloat16)
-        # 🔴 flash-attn 的 `scale` 在 kernel 里写死为 1/sqrt(head_dim)，Python 侧没有
+        # flash-attn 的 `scale` 在 kernel 里写死为 1/sqrt(head_dim)，Python 侧没有
         # 参数可传。调用方若传了别的 `scale`，必须在这里手动预乘 q 把它抵消掉，
         # 否则 SDPA 路径（已透传 scale）和 flash 路径会给出不同结果。
         if scale is not None:
@@ -633,7 +633,7 @@ def _sdpa(q, k, v, dropout_p=0.0, use_math=False, scale=None):
             q = q * scale
         step = _attn_query_chunk
         nq = q.shape[-2]
-        # ⚠ query 分块（2026-10-01）：**峰值**显存由「同时活着的最大张量」决定，
+        # query 分块（2026-10-01）：**峰值**显存由「同时活着的最大张量」决定，
         # 不是总量。整条 (B,Hh,N,N) 分数矩阵在 N=361、4 head、fp16 下是
         #   1000×4×361×361×2B = 0.97 GiB/份，softmax+dropout 再各留一份 ⇒
         # 一次调用峰值约 2.9 GiB、反向要重取约 2 份。
@@ -641,7 +641,7 @@ def _sdpa(q, k, v, dropout_p=0.0, use_math=False, scale=None):
         # 有关 ⇒ 按 query 切块在数学上**精确**，峰值变成 ∝ chunk 而不是 ∝ N。
         # chunk=64 时每份 0.97 → 0.17 GiB（5.6×）。
         #
-        # ⚠ 唯一的**行为**变化：`dropout_p > 0`（训练态）时 mask 的随机取样位置
+        # 唯一的**行为**变化：`dropout_p > 0`（训练态）时 mask 的随机取样位置
         # 会变（分布等价、**不逐位相同**）。eval 态 dropout 恒为 0（见
         # `attn_drop_p`），故评估指标不受影响。
         if step and nq > step:
@@ -659,7 +659,7 @@ def _sdpa(q, k, v, dropout_p=0.0, use_math=False, scale=None):
             attn = torch.nn.functional.dropout(attn, p=dropout_p)
         return attn @ v
     # SDPA 路径：SDPA 自带默认缩放 1/sqrt(d)，但 PyTorch>=2.1 支持显式 `scale=`。
-    # 🔴 必须把调用方传入的 `scale` 透传进去，否则本函数会**无条件**套用 1/sqrt(d)：
+    # 必须把调用方传入的 `scale` 透传进去，否则本函数会**无条件**套用 1/sqrt(d)：
     #   - 调用方传 `scale=None`（V7 的 MHSA，旧写法预乘过 q）⇒ 恰好 1/sqrt(d)，巧合正确
     #   - 调用方传 `scale=self.scale`（本文件里 815/882/1040 三处）⇒ 被**忽略**，
     #     只剩 1/sqrt(d)。当 self.scale != 1/sqrt(head_dim) 时结果就是错的。
@@ -837,7 +837,7 @@ class MultiHeadSelfAttention(nn.Module):
         比旧路径少一次整块拷贝，且消除旧 view(B,Hh,d,N,ws²) 的 kernel/position
         divmod 交换 bug（旧「窗口」实为 raster 展平序列上起点 (n·ws²) mod N 的
         1D 循环滑窗，并非 2D 局部窗口）。
-        ⚠ 语义与旧 checkpoint 不兼容（旧权重在 scramble 语义下训练，需重训/重评估）。
+         语义与旧 checkpoint 不兼容（旧权重在 scramble 语义下训练，需重训/重评估）。
         """
         ws = self.window_size
         B, Hh, N, d = t.shape
@@ -864,7 +864,7 @@ class MultiHeadSelfAttention(nn.Module):
           - 块状窗口的 partition 重排仅 O(N·C)（滑动窗口的 1/ws² 搬运量），
             注意力恢复为标准 MHA 形状 (B*nW, Hh, ws², ws²)——直接走
             FlashAttention / SDPA 高效内核，注意力矩阵不物化。
-          - 语义变更：滑动 → 块状。⚠ 与滑动窗口 checkpoint 不兼容，需重训。
+          - 语义变更：滑动 → 块状。 与滑动窗口 checkpoint 不兼容，需重训。
 
         q,k,v: (B, Hh, N, head_dim)（q 已预乘 scale），N=H*W。返回 (B, N, C)。
         """
@@ -905,7 +905,7 @@ class MultiHeadSelfAttention(nn.Module):
             position 按 divmod(n·ws²+w, N) 交换了——「窗口」实为 raster 展平
             序列上的 1D 循环滑窗，并非 docstring 宣称的 2D 局部窗口。本版修正
             为以 (i,j) 为中心的真 2D 局部窗口（见 _local_windows）。
-            ⚠ 与旧 checkpoint 不兼容（旧权重在 scramble 语义下训练，需重训/重评估）。
+             与旧 checkpoint 不兼容（旧权重在 scramble 语义下训练，需重训/重评估）。
           - 性能：k/v 用 pad + Tensor.unfold strided view + 一次满带宽拷贝，
             消除 F.unfold im2col（profiler 占 27.6%）与二次重排；全链零 slice
             分块节点；q 只取窗口中心（= 自身位置，O(N·d) 小拷贝，不再为它做
@@ -1133,7 +1133,7 @@ class SharedBackbone(GradCheckpointMixin, nn.Module):
     注意力块内部的计算模式由 attn_mode 控制（全局/窗口/轴向），
     通过 --attn-mode 配置；窗口大小由 --attn-window 控制。
 
-    ⚠ mixin 写在 `nn.Module` **前面**（P4.6b fix B5）
+     mixin 写在 `nn.Module` **前面**（P4.6b fix B5）
     ------------------------------------------------
     mixin 优先于 `nn.Module`。本类的方法名（`_init_grad_checkpointing` /
     `grad_checkpointing` / `set_grad_checkpointing` / `run_segment` /
@@ -1370,7 +1370,7 @@ class MHSA(MultiHeadSelfAttention):
         self.scale = self.head_dim ** -0.5
         self.attn_drop = dropout
         # 父类 forward 的 window/sparse 分支会读 mode/window_size；本类只用 global。
-        # ⚠ 这两个属性是**惰性占位**，不是安全网：父类 forward 还会读
+        # 这两个属性是**惰性占位**，不是安全网：父类 forward 还会读
         # `self.ln1/ln2/ffn/ffn_drop`，本类**刻意不建**这些，
         # 所以误用父类 forward 照样 AttributeError。填它们只是为了让
         # `getattr(m, 'mode', None)` 这类查询拿到合法值，不至于在别处炸出

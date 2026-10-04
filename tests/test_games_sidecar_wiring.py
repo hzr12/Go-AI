@@ -72,7 +72,7 @@ def _sidecar(path, n_games, komi=None):
 # 接上
 # --------------------------------------------------------------------------- #
 def test_komi_reaches_the_dataset_and_through_to_ch5(tmp_path):
-    """🔴 贴目必须真的进到全局特征，不能只是「命令没报错」。"""
+    """ 贴目必须真的进到全局特征，不能只是「命令没报错」。"""
     d = _board_npz(tmp_path / 'board.npz')
     s = _sidecar(tmp_path / 'games.npz', 4)
     off = load_from_path(str(d), BOARD, 0, v7=True)
@@ -87,7 +87,7 @@ def test_komi_reaches_the_dataset_and_through_to_ch5(tmp_path):
 
 
 def test_ch5_is_nonzero_only_with_the_sidecar(tmp_path):
-    """🔴 全局 ch5 = currentSelfKomi/20：接 sidecar 后应等于 komi/20。"""
+    """ 全局 ch5 = currentSelfKomi/20：接 sidecar 后应等于 komi/20。"""
     from src.data.feature_v7 import global_features_v7
 
     d = _board_npz(tmp_path / 'board.npz')
@@ -106,7 +106,7 @@ def test_ch5_is_nonzero_only_with_the_sidecar(tmp_path):
 
 
 def test_default_off_is_bitwise_unchanged(tmp_path):
-    """⚠ 不给 `--games-npz` ⇒ 逐位等于接入前的行为（这个旗默认关闭）。"""
+    """ 不给 `--games-npz` ⇒ 逐位等于接入前的行为（这个旗默认关闭）。"""
     d = _board_npz(tmp_path / 'board.npz')
     ds = load_from_path(str(d), BOARD, 0, v7=True)
     assert ds._game_komi is None
@@ -118,7 +118,7 @@ def test_default_off_is_bitwise_unchanged(tmp_path):
 # 口径：按 game_id 索引，不是按行号
 # --------------------------------------------------------------------------- #
 def test_indexing_is_by_game_id_not_by_row(tmp_path):
-    """🔴 同一局的所有行必须拿到**同一个**贴目。
+    """ 同一局的所有行必须拿到**同一个**贴目。
 
     若误按行号索引，`per_game > 1` 时同一局的不同行会拿到不同贴目 ——
     而 19×19 语料是 162,298 局**首尾相接**的一根大数组，这条错了极隐蔽。
@@ -138,7 +138,7 @@ def test_indexing_is_by_game_id_not_by_row(tmp_path):
 
 
 def test_komi_zero_means_missing_not_real(tmp_path):
-    """⚠ `g_komi == 0` 是 sidecar 的**缺失约定**，不是「这局真的贴 0」。
+    """ `g_komi == 0` 是 sidecar 的**缺失约定**，不是「这局真的贴 0」。
 
     两种情况在特征里都表现为 ch5=0，本测试钉住的是「别把 0 当成需要特殊处理
     的异常值」—— 也就是不需要过滤、不需要报错。
@@ -155,7 +155,7 @@ def test_komi_zero_means_missing_not_real(tmp_path):
 # 失败要早、要响
 # --------------------------------------------------------------------------- #
 def test_short_sidecar_raises_instead_of_silently_zero_filling(tmp_path):
-    """🔴 sidecar 短于 game_id 空间 ⇒ 当场报错。
+    """ sidecar 短于 game_id 空间 ⇒ 当场报错。
 
     短了只能靠 `.get(g, 0.0)` 补 0，而 0 会被当成「真贴目 0」写进 ch5/ch18 ——
     那不是缺失标记，是一个**假真值**，且不报任何错。
@@ -168,7 +168,7 @@ def test_short_sidecar_raises_instead_of_silently_zero_filling(tmp_path):
 
 
 def test_missing_key_raises_rather_than_partial_load(tmp_path):
-    """🔴 键名对不上 ⇒ 报错，不逐键补齐（拼错键名不报错，只会静默少一项）。"""
+    """ 键名对不上 ⇒ 报错，不逐键补齐（拼错键名不报错，只会静默少一项）。"""
     d = _board_npz(tmp_path / 'board.npz')
     bad = tmp_path / 'games.npz'
     np.savez_compressed(bad, g_komi=np.full(4, 7.5, np.float16))  # 只有 1 个键
@@ -203,7 +203,7 @@ def test_diag_counts_are_reported(tmp_path):
 
 
 def test_nondefault_rules_are_surfaced_not_hidden(tmp_path, capsys):
-    """⚠ `g_rules` 接不进特征，但**必须报出来**（不能悄悄按简单局算）。
+    """ `g_rules` 接不进特征，但**必须报出来**（不能悄悄按简单局算）。
 
     官方 `calculateArea` 只吃标量 `rules_flags`，逐局化会抛
     "truth value is ambiguous" ⇒ 已知缺口。缺口可以留，隐瞒不行。
@@ -222,7 +222,7 @@ def test_nondefault_rules_are_surfaced_not_hidden(tmp_path, capsys):
 
 
 def test_packed_shards_ignore_the_flag(tmp_path):
-    """⚠ `--games-npz` 对 C 段（stdata 分片）无意义：贴目已在行里。"""
+    """ `--games-npz` 对 C 段（stdata 分片）无意义：贴目已在行里。"""
     packed = tmp_path / 'stdata_v7_s0.npz'
     n = 2
     # packed 分片有必需键契约（见 V7PackedDataset._check_layout），补齐

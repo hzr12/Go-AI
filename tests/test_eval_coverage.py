@@ -165,7 +165,7 @@ def _build_parser():
 
 
 def test_v7_shard_dir_in_run_txt_matches_the_converter_output():
-    """🔴 run.txt 里的 C 段 `--data` 必须**就是**转换器的输出目录。
+    """ run.txt 里的 C 段 `--data` 必须**就是**转换器的输出目录。
 
     2026-10-04 踩过：转换器把 8 个分片写在 `data/` 根下，而 C 段命令写的是
     `--data data/stdata_v7`（那个目录**从来不存在**）⇒ 命令一跑就报

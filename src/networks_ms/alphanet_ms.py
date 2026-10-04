@@ -140,7 +140,7 @@ class MultiHeadSelfAttention(nn.Cell):
         t: (B, Hh, N, d) -> (B, N, Hh, ws*ws, d)
         实现：pad 后对 ws² 个偏移分别取切片再 concat。MS 无 Tensor.unfold，
         故用显式切片；GRAPH_MODE 下 ws 为常量，循环在编译期展开。
-        ⚠ 内存：会物化 (B,N,Hh,ws²,d)，与 torch 版同量级（sparse 模式本身就贵）。
+         内存：会物化 (B,N,Hh,ws²,d)，与 torch 版同量级（sparse 模式本身就贵）。
         """
         ws = self.window_size
         B, Hh, N, d = t.shape

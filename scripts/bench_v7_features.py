@@ -19,7 +19,7 @@
 4. **内存高水位**：单 worker 处理一个 batch 的峰值 RSS。
 5. **batch 规模曲线**：32 / 64 / 128 / 256 / 512 / 1024。
 
-⚠ **刻意不做的事**（否则脚本就成了调参器）
+ **刻意不做的事**（否则脚本就成了调参器）
 ------------------------------------------
 * **不跑全量 34.2M 行。** 用分层采样（见 :func:`stratified_indices`），理由写在
   那里：「只测前 N 行」会系统性低估，开局空盘是最快的路径。
@@ -82,13 +82,13 @@ DEFAULT_NPZ = os.path.join(REPO, 'data', 'sgf_19x19_full.npz')
 DEFAULT_MAT = os.path.join(REPO, 'tmp', 'materialized')
 DEFAULT_OUT = os.path.join(REPO, 'benchmarks', 'bench_v7_features.json')
 
-#: 采样用的固定种子。⚠ 固定住是为了让「同一台机器上两次跑的数字可比」，
+#: 采样用的固定种子。 固定住是为了让「同一台机器上两次跑的数字可比」，
 #: 而不是为了让结果好看 —— 复杂度分层本身是**确定性**的（按分数取 top-M）。
 SEED = 20261002
 
 #: 局级标量的占位。本仓 SGF 语料 55% 的局没有 ``RU``，于是 ``rules_flags``
 #: 恒取 :data:`DEFAULT_RULES_FLAGS`（``global_features_v7`` docstring 已定），
-#: 贴目取最常见的 7.5。⚠ 这两个常量只影响全局 19 维的**取值**，不影响耗时
+#: 贴目取最常见的 7.5。 这两个常量只影响全局 19 维的**取值**，不影响耗时
 #: （它们只做标量位运算，见 ``components`` 里 ``global`` 那一项的实测）。
 GAME_ROW = GameRow(komi=7.5, rules_flags=DEFAULT_RULES_FLAGS)
 
@@ -99,7 +99,7 @@ GAME_ROW = GameRow(komi=7.5, rules_flags=DEFAULT_RULES_FLAGS)
 def open_columns(mat_dir):
     """按需分页打开 materialize 后的五列。
 
-    ⚠ 必须是 ``mmap_mode='r'``：``npz`` 的压缩成员对 mmap **无效**，
+     必须是 ``mmap_mode='r'``：``npz`` 的压缩成员对 mmap **无效**，
     ``np.load('x.npz', mmap_mode='r')`` 不报错但会把整个成员解压进内存
     （boards 是 12.35 GB，本机 14.9 GB ⇒ 任何 numpy 临时量都足以把它推过 OOM）。
     这条禁令由 ``feature_v7_gather._reject_npz`` 在运行期兜着。
@@ -126,7 +126,7 @@ def npz_column_slice(npz_path, key, start, count):
     （boards = 12.35 GB）。``zipfile`` 的成员流可以逐段读，于是取 4096 行
     只花 1.4 MB。
 
-    ⚠ 依赖 ``.npy`` 成员里 1-D-per-row 的布局（``.npy`` 的数据段是 C 序连续
+     依赖 ``.npy`` 成员里 1-D-per-row 的布局（``.npy`` 的数据段是 C 序连续
     的），所以「行」= 固定 ``prod(shape[1:])`` 字节。这正是主数据集的布局。
     """
     with zipfile.ZipFile(npz_path) as z:
@@ -160,7 +160,7 @@ def complexity_scores(cols, pool):
     * ``20 * has_ko`` —— 有劫点。``search_is_ladder_captured`` 每次 DFS 都会
       读 ko 判 capture，且带劫的局面搜索树明显更深。
 
-    ⚠ 用 ``liberties_123`` 当代理是有代价的：**它在采样阶段就把这些盘面读热了**。
+     用 ``liberties_123`` 当代理是有代价的：**它在采样阶段就把这些盘面读热了**。
       这对组件计时是好事（我们要测 CPU 而不是 USB 卷），但「gather 冷缓存」
       那一项必须另取**没被采样阶段碰过**的行 —— 见 :func:`measure_gather`。
     """
@@ -175,7 +175,7 @@ def stratified_indices(cols, n_rows, n_first, n_random, n_complex, pool_size,
                        seed=SEED):
     """分层采样：前 N 行 / 均匀随机 M 行 / 复杂度 top-K 行。
 
-    ⚠ **为什么必须分层**：只测前 N 行会系统性低估 —— 开局空盘是最快的路径。
+     **为什么必须分层**：只测前 N 行会系统性低估 —— 开局空盘是最快的路径。
       本脚本因此额外构造一个「复杂度 top-K」层，并**三层的吞吐都报出来**。
       实测结论见报告：前 N 层与随机层只差 ~10%，而复杂度层比随机层慢
       **4-9 倍** ⇒ 「盘面复杂度」是真正的分层维度，「开局」不是。
@@ -247,7 +247,7 @@ def measure_components(cols, idx, batch, reps=3):
       ⇒ **3** 次盘面 fancy-index（任务书钦定的那三个 offset）。
     * ``spatial`` —— ``spatial_channels_v7``（含 3 块盘面的梯子搜索）。
     * ``spatial_1search`` —— 同上但**不传** prev/prev_prev ⇒ ``ladder_channels``
-      走 ``pb is b`` 快路径，**只跑一次**梯子搜索。⚠ **取值与 ``spatial``
+      走 ``pb is b`` 快路径，**只跑一次**梯子搜索。 **取值与 ``spatial``
       不同**（ch15/ch16 会等于 ch14），它只用来把「3 次搜索 vs 1 次搜索」的
       增量分离出来。
     * ``ladder_3`` / ``ladder_1`` —— 直接调 ``ladder_channels`` 的两次成本。
@@ -326,13 +326,13 @@ def measure_components(cols, idx, batch, reps=3):
 def _worker(wi, mat_dir, task_q, res_q):
     """预取 worker。
 
-    ⚠ **刻意与 ``train_sft.py::_prefetch_worker`` 同形**：拿 ``(step, pos, 行号)``
+     **刻意与 ``train_sft.py::_prefetch_worker`` 同形**：拿 ``(step, pos, 行号)``
     的任务、算完把 payload 放回队列、主进程按 ``pos`` 排序拼回整批。
     不同的地方只有两处，都是 V7 必需的：① 传的是 **mmap 路径**而不是 dataset
     对象（34.2M 行的 boards 在 spawn 下根本没法 pickle 过队列）；② payload
     是 V7 的 ``(spatial, global)``。
 
-    ⚠ **不许在这里 import torch**：``train_sft.py`` 的
+     **不许在这里 import torch**：``train_sft.py`` 的
     ``tests/test_prefetch_fork_order.py`` 钉死了「预取 worker 不碰设备上下文」
     （4 卡实测每卡凭空多占 ~24 GiB ⇒ OOM）。本脚本同理。
     """
@@ -452,7 +452,7 @@ def measure_workers(mat_dir, idx, batch, workers, warm_batches=1, bench_batches=
                 errors.append(r[5])
         batches.append((step, int(sub.size), t_start, time.perf_counter()))
 
-    # ⚠ **warmup 不计入稳态**：稳态 = 第 warm_batches 批**完成**之后到最后一批
+    # **warmup 不计入稳态**：稳态 = 第 warm_batches 批**完成**之后到最后一批
     # 完成。把 warm 批的时间算进来会低估吞吐（第一批要付 import / 首次触碰
     # 页表 / numpy 首次 dispatch 的钱），不算进来则符合预取深度 ≥1 的真实语义。
     timed_b = [b for b in batches if b[0] >= warm_batches]
@@ -493,7 +493,7 @@ def measure_workers(mat_dir, idx, batch, workers, warm_batches=1, bench_batches=
 def _peak_wset_mb():
     """本进程的峰值工作集（MB）。
 
-    ⚠ **必须显式给 argtypes**：``GetProcessMemoryInfo`` 的第二个形参是指针，
+     **必须显式给 argtypes**：``GetProcessMemoryInfo`` 的第二个形参是指针，
     不声明时 ctypes 按 32 位 int 传 ⇒ 在 x64 上调用**静默失败返回 0**
     （症状是「峰值内存恒为 0」，不是报错）。本函数实测踩过。
     """
@@ -546,7 +546,7 @@ def _mem_worker(mat_dir, batches, task_q, res_q):
 def measure_memory(mat_dir, idx, batch, io='warm', workers=1):
     """单 worker 处理**一个** batch 的峰值 RSS（MB）。
 
-    ⚠ **口径**是进程峰值工作集（PeakWorkingSetSize），它**包含** mmap 到的
+     **口径**是进程峰值工作集（PeakWorkingSetSize），它**包含** mmap 到的
     文件页 —— 那些页是可回收的，所以这个数字是**上界**；真正的匿名内存
     （Python + numpy + scipy + 那一批的中间量）要小得多。报告里两个都给出，
     并且 :func:`judge` 用「8 × 峰值 vs 物理内存」判红。
@@ -614,7 +614,7 @@ def _physical_mem_mb():
 def cache_state_probe(cols, n_rows_probe=2000, seed=SEED + 313):
     """探 ``boards.npy`` 的**页缓存状态** —— 它决定「冷读」这个说法成不成立。
 
-    ⚠ **必须用随机行，不能用 stride**：本机实测（同一个未缓存的文件）
+     **必须用随机行，不能用 stride**：本机实测（同一个未缓存的文件）
     stride-12 的读是 **1.2 µs/行**（341 MB/s，硬盘读预取吃到了红利），而随机
     行是 **6500 µs/行**。两者差 5000 倍 ⇒ 用 stride 探缓存状态会**永远**得出
     「已缓存」，哪怕一行都没缓存。
@@ -622,7 +622,7 @@ def cache_state_probe(cols, n_rows_probe=2000, seed=SEED + 313):
     用 2000 个随机行做探针：已缓存 ⇒ ~5 µs/行（10 ms 一趟）；未缓存 ⇒
     ~6.5 ms/行（13 s 一趟）。阈值取 0.5 ms/行。
 
-    ⚠ **为什么必须探**：本机物理内存 14.9 GB，``boards.npy`` 是 12.35 GB。
+     **为什么必须探**：本机物理内存 14.9 GB，``boards.npy`` 是 12.35 GB。
     跑过几轮之后部分区间会被文件缓存收进去，于是「冷读」会随跑过几轮而漂移
     （实测同一份数据、同一个 B，冷读在 11 ms/行与 0.02 ms/行之间跳）⇒
     不探这个状态，两次跑的数字没法互相比较。
@@ -657,7 +657,7 @@ def measure_gather(cols, n_rows, batch, offsets, n_trials=6, seed=SEED):
     14.9 GB 的机器上，跑过几轮就有区间被缓存收进去，于是同一个脚本第二次跑
     的「冷读」可能整个是热的。
 
-    ⚠ 所以每个区间都**跑两遍**（第二遍必热），并报
+     所以每个区间都**跑两遍**（第二遍必热），并报
     ``cold_over_warm_ratio``：
 
     * ratio ≫ 1 ⇒ 这个区间第一遍是真冷，用它；
@@ -667,11 +667,10 @@ def measure_gather(cols, n_rows, batch, offsets, n_trials=6, seed=SEED):
     这样「冷」是被每区间实测证明的，而不是假设的。样本数因此会少于
     ``n_trials``（``n_valid`` 给出实际有效的个数）。
 
-    ⚠ **另两条实测结论，别再重试**：
+     **另两条实测结论，别再重试**：
     ① 「造一个没读过的临时文件来量冷读」在 Windows 上**不成立** ——
        刚写完的数据仍在回写缓存里（实测：写 3 GB 后立刻随机读 = 1.7 µs/行）。
     ② stride 探针**不能**用来判缓存状态（见 :func:`cache_state_probe`）。
-    """
     Args:
         offsets: 要量的偏移元组（任务书钦定 ``(1, 8, 32)``；ladder 用
             ``(-1, -2)``）。
@@ -696,7 +695,7 @@ def measure_gather(cols, n_rows, batch, offsets, n_trials=6, seed=SEED):
         gather_neighbors(mm, idx, offsets, **kw)
         w = (time.perf_counter() - t0) / batch * 1e3
         ratio = (c / w) if w > 0 else float('inf')
-        # ⚠ 判据：冷热差不到 10 倍 ⇒ 第一遍就已经命中页缓存，这个区间不是冷样本。
+        # 判据：冷热差不到 10 倍 ⇒ 第一遍就已经命中页缓存，这个区间不是冷样本。
         valid = ratio >= 10.0
         regions.append({'region_lo': lo, 'cold_ms_per_row': round(c, 4),
                         'warm_ms_per_row': round(w, 4),
@@ -725,7 +724,7 @@ def measure_gather(cols, n_rows, batch, offsets, n_trials=6, seed=SEED):
     res['regions'] = regions
 
     # ---- 并发探针：同样的读，线程 1 / 4 / 8，看**聚合**吞吐 ----
-    # ⚠ 探针本身也受缓存状态影响，所以它只作**旁证**。要判存储，以
+    # 探针本身也受缓存状态影响，所以它只作**旁证**。要判存储，以
     # :func:`cache_state_probe` 为准（它明确说了这些行在不在缓存里）。
     from concurrent.futures import ThreadPoolExecutor
     probe = {}
@@ -767,10 +766,10 @@ def measure_materialize(npz_path, mat_dir, full_decompress=True):
        boards 12.35 GB + 四个小列 0.65 GB。
     2. **小列的真实端到端耗时**：``materialize_dataset`` 跑 ``to_play`` /
        ``ko`` / ``game_ids`` / ``my_hist`` / ``op_hist``（若已存在则跳过，
-       并把已测的耗时记进 ``previous_runs``）。⚠ 注意这一步会**跳过已存在的
+       并把已测的耗时记进 ``previous_runs``）。 注意这一步会**跳过已存在的
        文件**—— 脚本不会删掉别人跑好的结果。
     3. **boards 的解压速率**：**流式**读压缩成员（不用
-       ``np.load(npz)['boards']``，那会一次吃 12.35 GB）。⚠
+       ``np.load(npz)['boards']``，那会一次吃 12.35 GB）。
        ``materialize_dataset`` 本身**在本机跑不了 boards**——它第 276 行
        ``arr = z[k]`` 会把整个成员解压进内存，12.35 GB / 14.9 GB = 83%，
        剩下的 2.5 GB 要装 Windows + Python + numpy 的全部临时量 ⇒ 没有余量。
@@ -890,7 +889,7 @@ def measure_env():
 def judge(env, comps, workers, mem, gather=None):
     """按**实测**数字判「3.04 ms/行」的预算是否成立，并给出推荐值。
 
-    ⚠ 这个函数只做算术，**不含任何为了让预算成立而调的参数**。预算不成立
+     这个函数只做算术，**不含任何为了让预算成立而调的参数**。预算不成立
     就直接写不成立 —— 本脚本的存在就是为了拿到这个真答案。
     """
     out = {}
@@ -916,7 +915,7 @@ def judge(env, comps, workers, mem, gather=None):
         out['single_process_slowest_stratum'] = {
             'stratum': by_rps[0][0], 'rows_per_s': by_rps[0][1]['rows_per_s']}
         # ---- 梯子占比：这一项是 C0 存在的核心理由，单独算清楚 ----
-        # ⚠ 用 ladder_1（单次搜索）×3 作分子而不是 ladder_3：实测
+        # 用 ladder_1（单次搜索）×3 作分子而不是 ladder_3：实测
         # ladder_3/3 ≈ ladder_1（见 components 里两者之比），说明 ladder 的成本
         # **线性于搜索次数**、没有可摊的固定开销；这样分子不会把 spatial 里
         # 非 ladder 的那部分（fp16 缓冲 / 装配 / gate）算进来。
@@ -970,7 +969,7 @@ def judge(env, comps, workers, mem, gather=None):
     out['best_cold'] = b_cold
 
     # ---- 预算判定：冷热**各判一次** ----
-    # ⚠ 之所以要判两次：特征计算是纯 CPU（热缓存下 gather 只占 0.02%），
+    # 之所以要判两次：特征计算是纯 CPU（热缓存下 gather 只占 0.02%），
     # 而冷读被数据卷的随机读延迟钉死。两个数差 ~4 倍，**哪个是部署态取决于
     # boards.npy 放在哪种总线上**（见 env.disk）—— 所以两个都要给，不能只挑
     # 好看的那一个。
@@ -1119,7 +1118,7 @@ def run(args):
         k: (v[1] if isinstance(v, tuple) else v) for k, v in strata.items()}
     result['sampling']['method'] = (
         '分层采样：① 前 N 行 ② 均匀随机 M 行 ③ 复杂度分 top-K 行'
-        '（分数 = 子数 + 3×2 气子数 + 20×有劫）。⚠ 只测前 N 行会系统性'
+        '（分数 = 子数 + 3×2 气子数 + 20×有劫）。 只测前 N 行会系统性'
         '低估（开局空盘是最快路径），所以三层都报。')
 
     batches = [int(x) for x in args.batch.split(',') if x]
@@ -1132,7 +1131,7 @@ def run(args):
         for name, (idx, _meta) in strata.items():
             comps[name] = {}
             for bs in batches:
-                # ⚠ **默认先读热**：组件分解要回答的是「CPU 要多久」，不是
+                # **默认先读热**：组件分解要回答的是「CPU 要多久」，不是
                 # 「USB 卷要多久」。冷 I/O 单独由 gather / workers 的 cold 档
                 # 负责 —— 两者的比值就是存储给流水线上的一刀。
                 prime = None if args.no_prime else _prime_cache(cols, idx)
@@ -1204,7 +1203,7 @@ def run(args):
         need = batch0 * (args.warm_batches + args.bench_batches)
         ios = [x for x in args.io.split(',') if x]
         combos = [(io, int(k)) for io in ios for k in layers]
-        # ⚠ **每个 (io, workers) 组合抽一组全新的行**。复用同一组行会让
+        # **每个 (io, workers) 组合抽一组全新的行**。复用同一组行会让
         # ``io='cold'`` 名不副实：第一个组合跑完，这些行已经在页缓存里，
         # 后面的组合量到的是热读 ⇒ 「workers 越多越慢（因为 I/O 争抢）」
         # 这个结论会被伪造成「workers 越多越快」。所以按组合数把数据集切成

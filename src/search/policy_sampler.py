@@ -148,7 +148,7 @@ def sample_move(ai, board, my_hist, op_hist, to_play, topk=12, width=4, depth=2,
         mc: 当前手数（温度衰减用）。
         rng: 采样源（默认全局 np.random；测试传 Generator）。
 
-    ⚠ 调用方负责：把 `sample.action` 落到盘上，若 `board.play()` 拒绝（理论上
+     调用方负责：把 `sample.action` 落到盘上，若 `board.play()` 拒绝（理论上
     不会：q 只在合法点上有质量，但 pass 槽与 ko 规则仍可能拒绝），要回退 pass
     并**用同一个分布**重算 logq（既有约定，见 `selfplay_train` 的采样段）。
     """

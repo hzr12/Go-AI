@@ -32,8 +32,8 @@
         --data data/sgf_19x19_full.npz --v7 1 --device npu --board-size 19 \
         --games-npz data/labels/games.npz
 
-⚠ 只读不写：不建 checkpoint、不碰 optimizer、不改任何状态。
-⚠ 不依赖 torch_npu 也能跑（`--device cpu`）—— 那样只会得到「全都正常」，
+ 只读不写：不建 checkpoint、不碰 optimizer、不改任何状态。
+ 不依赖 torch_npu 也能跑（`--device cpu`）—— 那样只会得到「全都正常」，
   但可以确认脚本本身没写错。
 """
 from __future__ import annotations
@@ -72,7 +72,7 @@ def _fin(v):
 def _row(name, v, note=''):
     mean, finite, dt, amax = _fin(v)
     print('  %-18s %-16s %-9s %-12s %s'
-          % (name, 'finite' if finite else '🔴 NON-FINITE', dt,
+          % (name, 'finite' if finite else ' NON-FINITE', dt,
              '%.6g' % amax, note))
     return finite
 
@@ -128,7 +128,7 @@ def main():
 
     ctx = (torch.autocast(device_type=dev.type, dtype=amp_dtype)
            if args.amp else torch.no_grad())
-    # ⚠ **不能**用 `no_grad` 跑前向：第 [4] 段要反向一次，而反向需要计算图。
+    # **不能**用 `no_grad` 跑前向：第 [4] 段要反向一次，而反向需要计算图。
     #   打印用的副本另做（`out_det`），loss 用带图的那份（`out`）。
     with ctx:
         out = net(sp_t, gl_t)
@@ -161,7 +161,7 @@ def main():
              % (SCORE_STDEV_TARGET_FLOOR, 1.0 / (2 * SCORE_STDEV_TARGET_FLOOR)))
     _row('预测 score_stdev', out_det.get('score_stdev'),
          '= 20·softplus(s[:,1], beta=1)')
-    # ⚠ `s[:,1]`（scores 头的原始第 1 路）取不到：它没有单独暴露成输出键。
+    # `s[:,1]`（scores 头的原始第 1 路）取不到：它没有单独暴露成输出键。
     #   若上面的「预测」或「std 原始」有一项 NON-FINITE，那一项就是根因；
     #   需要更细的归因时在这里按需 hook `net.value_head.scores`。
 
@@ -174,14 +174,14 @@ def main():
              '系数=%g' % lossf.coeff.get(k, float('nan')))
     print()
     print('  加权总 loss   : %s | total_finite=%s'
-          % ('finite' if bool(torch.isfinite(res['loss'])) else '🔴 NON-FINITE',
+          % ('finite' if bool(torch.isfinite(res['loss'])) else ' NON-FINITE',
              res['total_finite']))
     print('  逐项点名      : %s' % (res['nonfinite_terms'] or '（无）'))
     print('  坏在操作数    : %s' % (res['nonfinite_operands'] or '（无）'))
     print('  按 w=0 净化行 : %s' % (res['sanitized_rows'] or '（无）'))
 
     # ---- ④ 反向：谁收到了 inf/nan ----
-    # 🔴 **必须在 clip 之前看**（与 train_sft 同一个坑）：`clip_grad_norm_` 在
+    # **必须在 clip 之前看**（与 train_sft 同一个坑）：`clip_grad_norm_` 在
     #   `total_norm = inf` 时算 `clip_coef = 0` 并原地 `mul_(0)` ⇒ `inf × 0 = NaN`
     #   ⇒ clip 之后「inf 个数」结构上恒为 0，看到的 nan 全是 clipper 造的。
     print('\n[4] 反向一次（统计 inf / nan 的参数）—— clip **之前**')
@@ -192,7 +192,7 @@ def main():
     gn = torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
     print('\n[4b] clip_grad_norm_ 返回的总范数 = %s'
           % ('finite' if bool(torch.isfinite(torch.as_tensor(float(gn))))
-             else '🔴 NON-FINITE（clip 前确有 inf）'))
+             else ' NON-FINITE（clip 前确有 inf）'))
     print('     clip 后 inf 元素数必然是 0（clip_coef=0 ⇒ inf×0=NaN），'
           '所以「NaN 模块名单」才是真正出过 inf 的位置。')
     _report_grads(net, after_clip=True)
@@ -218,11 +218,11 @@ def _report_grads(net, after_clip=False):
                                        n_grad))
     print('  [%s] NaN 元素 %d | Inf 元素 %d' % (tag, tot_nan, tot_inf))
     if bad_mod:
-        print('  [%s] 🔴 按模块点名：' % tag)
+        print(' [%s] 按模块点名：' % tag)
         for m, (i, n) in sorted(bad_mod.items(), key=lambda x: -(x[1][0] + x[1][1])):
             print('     %-30s inf=%-6d nan=%d' % (m, i, n))
     else:
-        print('  [%s] ✓ 梯度全部有限' % tag)
+        print(' [%s] 梯度全部有限' % tag)
 
     print('\n[probe] 若 [3] 报 NON-FINITE 而 [4] 也报 NaN：把上面两段的点名'
           '合起来就是根因（哪一项 / 哪个操作数 / 哪个模块）。')

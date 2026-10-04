@@ -31,7 +31,7 @@ from src.game.go_rules import GoBoard, SYMMETRIES, _check_n_channels
 
 #: ``future``（futurepos 标签）里**不可用行**的哨兵值。
 #:
-#: 🔴 为什么不能是 0：0/1 恰好是「对手一颗子都不占」这个**完全合法的标签**，
+#: 为什么不能是 0：0/1 恰好是「对手一颗子都不占」这个**完全合法的标签**，
 #: 所以「盘面丢了」与「对手没占点」在纯 {0,1} 下不可区分，且不可逆
 #: （这与 `src/data/pos_hash.py` 警告的「假信号」是同一类病）。
 #: `-1.0` 落在标签域 {0,1} 之外 ⇒ ① 不是「无占用」；② 也不是「对方占满」
@@ -43,7 +43,7 @@ FUTUREPOS_SENTINEL = np.float32(-1.0)
 def permute_soft(soft, tforms, board_size):
     """按每个样本的对称变换重排软策略（362 维）向量。
 
-    ⚠ **这是软标签接入里唯一会「静默出错」的地方**。
+     **这是软标签接入里唯一会「静默出错」的地方**。
     `sample_batch_numpy` 会对 `states` 施加 8 种对称增强、对 `moves_out` 施加
     `SYMMETRIES[t]` 重映射；若软 policy 不同步重排，训练**不会报任何错**，
     只是标签指向错误的点 —— 表现为「loss 正常下降、指标好看，但棋力不涨」。
@@ -72,7 +72,7 @@ def permute_soft(soft, tforms, board_size):
 
     # 8 种变换的**逆置换**表：inv[t][j] = 「目标位 j 该从哪个源位取值」。
     #
-    # ⚠ 方向极易搞反，这里是踩过的坑：若直接写
+    # 方向极易搞反，这里是踩过的坑：若直接写
     #       out[:, perms[t]] = soft[:, :]
     #   或 `out = soft[:, perms[t]]`（gather），得到的都是**逆变换**——
     #   因为 `out[j] = soft[perms[j]]` 意味着「源 perms[j] 移到 j」，
@@ -101,7 +101,7 @@ def permute_soft(soft, tforms, board_size):
 def _permute_future(future, tforms, board_size):
     """按每个样本的对称变换重排 ``future`` 的最后一维（(B,2,bs²) 扁平占用图）。
 
-    🔴 **为什么复用 `permute_soft` 而不是另写一份置换**：置换方向极易搞反
+     **为什么复用 `permute_soft` 而不是另写一份置换**：置换方向极易搞反
     （见 `permute_soft` 上面那段踩坑注释），而 `future` 是**标签**——方向错了
     不报错，只是 loss 照降、棋力不涨。本文件里唯一已被
     `tests/test_dataset_soft_labels.py::test_soft_argmax_agrees_with_moves_out_after_augment`
@@ -139,7 +139,7 @@ def permute_move_vector(moves, tforms, board_size):
     `moves_out` 对 pass 的处理逐字一致：默认填 `bs*bs`，只对
     `0 <= mv < bs*bs` 做重映射）。
 
-    ⚠ 为什么 `next_move` 也必须走这里：`states` 施加增强时，若只重映射 `moves`
+     为什么 `next_move` 也必须走这里：`states` 施加增强时，若只重映射 `moves`
     而漏掉 `next_move`，policy_opp 的标签就会指向被翻转前的点 —— 与
     `permute_soft` 同类的静默错误（loss 照降、棋力不涨）。
 
@@ -185,7 +185,7 @@ class SupervisedDataset:
               （己方/对方眼位、双方块气=2、劫禁点掩码）**全部**从下面已有的
               `boards` / `to_play` / `ko` 三列现算，npz **不需要**新增列
               （键盘点见 P4.3 report）。
-        ⚬ 通道数必须在**数据侧与模型侧同时**改（模型侧 = `scripts/train_sft.py`
+         通道数必须在**数据侧与模型侧同时**改（模型侧 = `scripts/train_sft.py`
           的 `KATAGO_SE_CFG['in_channels']`，现为 12），
           只改一侧得到的是形状错或静默错值，不是零回归。
         """
@@ -221,7 +221,7 @@ class SupervisedDataset:
         # `tests/test_dataset_soft_labels.py::test_placeholder_labels_are_zeros_
         # with_zero_weights` 在**默认构造**的 dataset 上断言 `w['futurepos'].sum()
         # == 0`，`tests/test_prefetch_labels.py::test_future_placeholder_stays_
-        # zeros_through_the_prefetcher` 断言 `future` 全零。⚠ **不要**为了「让
+        # zeros_through_the_prefetcher` 断言 `future` 全零。 **不要**为了「让
         # futurepos 默认生效」去改那两条测试——它们钉的是 A6 之前的历史契约。
         # `self._fp` 见 `attach_futurepos`；None = 未启用。
         self._fp = None
@@ -270,7 +270,7 @@ class SupervisedDataset:
     def soft_row_mask(self):
         """``(N,) bool``：该行是否有软标签（`--soft-only-sampling` 收窄行空间用）。
 
-        ⚠ 没挂软标签时返回**全 False**（而不是全 True）—— 收窄到 0 行必须
+         没挂软标签时返回**全 False**（而不是全 True）—— 收窄到 0 行必须
         让调用方立刻发现，而不是悄悄退回「全量采样」。
         """
         if self.soft_row is None:
@@ -300,7 +300,7 @@ class SupervisedDataset:
     # ``w['futurepos_h1']``         (B,)；``i+32`` 那一路有效才 1.0
     # =============================  ==========================================
     #
-    # 🔴 **为什么 `w['futurepos']` 是「与」而不是「或」**：
+    # **为什么 `w['futurepos']` 是「与」而不是「或」**：
     # `src/networks/katago_v7_loss.py:362-368` 把 `future` reshape 成 (b,2,bs²)
     # 之后压成**一个逐样本标量**，再乘**一个**权重；`_weighted_mean` 又是
     # `(per_sample * weight).mean()`（**刻意不除 Σw**）。⇒ 权重的最小作用单位是
@@ -317,7 +317,7 @@ class SupervisedDataset:
     # --------
     # 两路 h 是两个**不同时间点、同一局面**的未来盘面，因此走**同一个**
     # `tforms`（镜像的是行 i 的盘面，两个未来时刻必须跟着一起镜像）。
-    # ⚠ 若将来两个 horizon 用了**不同**的 tforms，batch 内同一行就不存在
+    # 若将来两个 horizon 用了**不同**的 tforms，batch 内同一行就不存在
     # 「一个统一的镜像」了——`states` 旋转 90° 而 h1 没转，等于把 h1 当成
     # 「另一个镜像下的未来」在学，标签与输入不同源，且不报任何错。**所以两条
     # 路必须共用同一个 `tforms`，这条是契约不是实现细节。**
@@ -341,7 +341,7 @@ class SupervisedDataset:
         source:
             ``'live'`` 模式下 ``boards`` 的来源，可为
             ``None``（用 ``self.boards``）/ ``.npy`` 路径 / memmap / ndarray。
-            ⚠ 传 ``.npz`` 路径**会报错**：``gather_neighbors`` 的 ``_reject_npz``
+             传 ``.npz`` 路径**会报错**：``gather_neighbors`` 的 ``_reject_npz``
             会拦下（mmap 对 zip 压缩成员无效，会静默退化成整份 12.3 GB 解压）。
         dataset_npz / materialized_dir:
             ``'live'`` 模式下「先落 .npy 再 mmap」的原料，见
@@ -406,7 +406,7 @@ class SupervisedDataset:
         137 MB。落盘耗时实测全量约 72s（478K 行/s），**一次落盘、之后反复扫描
         都只按需分页**。
 
-        🔴 **为什么这条路径绝不能靠惰性触发**
+         **为什么这条路径绝不能靠惰性触发**
         ``sample_batch_numpy`` 是在 ``_prefetch_worker``（``mp.Process`` fork 出来
         的子进程）里调的。惰性解析若发生在 fork 之后，**每个 worker 各解析一次**
         ⇒ 12.3 GB × worker 数（还可能同时写同一个路径互相踩坏）。所以：
@@ -486,7 +486,7 @@ class SupervisedDataset:
         的 False（``gather_neighbors`` 已把「越界」与「跨局」都算进同一个
         ``valid``）：越界（接近局尾）/ ``game_ids[j] != game_ids[i]``（跨局）。
 
-        ⚠ **不能单独消费 ``g.boards[offset]``**：它的不可用行被填 0，而 0 是
+         **不能单独消费 ``g.boards[offset]``**：它的不可用行被填 0，而 0 是
         「合法空盘」—— 会被读成「该点将来没人下」，也就是**把盘面丢了说成
         「对手一颗子都没占」**。所以先过 ``valid``，无效行写哨兵。
         """
@@ -505,7 +505,7 @@ class SupervisedDataset:
             cols = fp.get('cols')
             gid = cols['game_ids'] if cols is not None else self.game_ids
             if gid is None:
-                # ⚠ 无 game_ids ⇒ **无法验证同局**，一律不给标签（与 `next_move`
+                # 无 game_ids ⇒ **无法验证同局**，一律不给标签（与 `next_move`
                 # 同一口径，见 `_build_labels` 里那段说明）。`gather_neighbors` 在
                 # 缺 game_ids 时只做越界检查（valid = in_range），会把别局的盘面
                 # 当成这一手的未来 —— 那正是要防的串局，宁可一行都不给。
@@ -519,7 +519,7 @@ class SupervisedDataset:
                                        dtype=np.int8).reshape(B, 1, 1)
                 g = gather_neighbors(
                     self._futurepos_boards(), idxs, offsets=fp['offsets'],
-                    # ⚠ game_ids **必须给**：主数据集是 162,298 局首尾相接的一根
+                    # game_ids **必须给**：主数据集是 162,298 局首尾相接的一根
                     # 大数组、没有局边界标记，i 与 i+8/i+32 可以分属两局，跨局
                     # 取到的盘面**看起来完全合法**（它就是某个真实盘面）只是不属于
                     # 这一手 ⇒ 静默错标签。
@@ -553,14 +553,14 @@ class SupervisedDataset:
         values    : (B, 1) float32
         labels_dict : dict（见 `_build_labels` 的 docstring，键与形状都在那里钉死）
 
-        ⚠ **为什么 `labels=True` 是 4 元组 + dict、不是 5 元组**（spec §5.5）：
+         **为什么 `labels=True` 是 4 元组 + dict、不是 5 元组**（spec §5.5）：
         旧形状 `(states, moves, values, soft, mask)` 里**没有 dict 的位置**，
         而 V7 的 loss 需要那个装满 `next_move`/`outcome`/`score`/`sb_*`/`global`/
         `ownership`/`scoring`/`seki`/`future`/`w{...}`/`game_weight` 的 dict ——
         继续下去只会变成 6 元组、或 fork 两条路。4 元组让预取器只需搬运**一种**
         payload 形状。
 
-        ⚠ **软标签挂不挂，返回的元组长度都一样（都是 4 元组）**：未挂载时
+         **软标签挂不挂，返回的元组长度都一样（都是 4 元组）**：未挂载时
         `soft` 全 0、`soft_mask` 全 0（=「本批没有任何软标签」），而不是退回
         3 元组。理由同上：形状随数据分叉是 bug 的温床。
 
@@ -684,7 +684,7 @@ class SupervisedDataset:
         ``game_weight`` (B,) f32 · ``soft`` (B, bs²+1) f32 ·
         ``soft_mask`` (B,) f32 · ``w`` dict[str → (B,) f32] ·
         ``future`` (B, 2, bs²) f32（19 路时即 (B,2,361)，与 V7 对齐）·
-          ⚠ 取值域：有效格 ∈ {0,1}，**无效格恒为 -1.0**（`FUTUREPOS_SENTINEL`）；
+           取值域：有效格 ∈ {0,1}，**无效格恒为 -1.0**（`FUTUREPOS_SENTINEL`）；
           未启用 futurepos 时整块为 0。详见 `attach_futurepos` ·
         ``score``/``sb_center``/``sb_upper`` (B,) f32 · ``global`` (B,19) f32 ·
         ``ownership``/``scoring``/``seki`` (B,1,bs,bs) f32
@@ -704,7 +704,7 @@ class SupervisedDataset:
 
         # ---- next_move：由**下一行**的 moves 推出，跨局必须被守卫 ------------
         # 原设计 §5.2 的「行表新增 next_move 列」已作废（§5.8）：实时推。
-        # ⚠ 守卫不可省：数据里存在 **game_id 残行**（§5.3 的哈希锚点法对 id 复用
+        # 守卫不可省：数据里存在 **game_id 残行**（§5.3 的哈希锚点法对 id 复用
         #   免疫，但残行仍在），相邻两行**可能不是同一局**，不守卫就是把上一局的
         #   收官手当成 π_opp —— 又是一个不报错的静默错标签。
         nxt = idxs + 1
@@ -714,7 +714,7 @@ class SupervisedDataset:
             gi = np.asarray(self.game_ids)
             same_game = gi[nxt_safe] == gi[idxs]
         else:
-            # ⚠ 无 game_ids ⇒ **无法验证同局**，一律不给 next_move（而不是猜
+            # 无 game_ids ⇒ **无法验证同局**，一律不给 next_move（而不是猜
             #   「相邻行就是同局」——那正是要防的串局）。代价是这些行的
             #   policy_opp 权重恒 0；生产数据一定带 game_ids。
             same_game = np.zeros(B, dtype=bool)
@@ -734,7 +734,7 @@ class SupervisedDataset:
         wr = np.asarray(wr_src[idxs], dtype=np.float32)
         outcome = np.where(wr > 0, 0, np.where(wr < 0, 1, 2)).astype(np.int64)
         # 黑方视角：outcome 是 to_play 视角，to_play=1 表示黑在走 ⇒ 直接就是黑方结果；
-        # to_play=-1（白在走）时两个结论互换。⚠ 不能写 `outcome * to_play`：
+        # to_play=-1（白在走）时两个结论互换。 不能写 `outcome * to_play`：
         # outcome=0（to_play 胜）乘 -1 仍是 0，会把「白胜」也报成「黑胜」。
         to_play = np.asarray(self.to_play[idxs], dtype=np.int64)
         outcome_black = np.where(outcome == 2, 2,
@@ -751,7 +751,7 @@ class SupervisedDataset:
             if hit.any():
                 soft_mask[hit] = 1.0
                 soft[hit] = self.soft_policy[slots[hit]].astype(np.float32)
-                # ⚠ **软标签必须与 states 用同一个变换重排**。漏了这步不报错，
+                # **软标签必须与 states 用同一个变换重排**。漏了这步不报错，
                 #   只会让标签指向错误的点（loss 照降、棋力不涨）。
                 #   上面 states 走的是 `tforms`（augment=False 时恒等），故：
                 if permuted:
@@ -774,7 +774,7 @@ class SupervisedDataset:
             'score': np.zeros(B, dtype=np.float32),
             'scoring': np.zeros(B, dtype=np.float32),
             'seki': np.zeros(B, dtype=np.float32),
-            # 未启用 futurepos 时恒 0。⚠「未启用」不是「碰巧没数据」：opt-in 是
+            # 未启用 futurepos 时恒 0。「未启用」不是「碰巧没数据」：opt-in 是
             # `test_dataset_soft_labels.py:510` / `test_prefetch_labels.py:464`
             # 两条既有测试逼出来的（见 `__init__` 里的说明）。
             'futurepos': np.zeros(B, dtype=np.float32),
@@ -790,7 +790,7 @@ class SupervisedDataset:
         if self._fp is not None:
             future, w_h0, w_h1 = self._futurepos_target(
                 idxs, tforms if permuted else None)
-            # 🔴 整块权重是**与**：loss 的作用单位是整个 (2, bs²) 块（见
+            # 整块权重是**与**：loss 的作用单位是整个 (2, bs²) 块（见
             # `attach_futurepos` 的「权重契约」段），只活一路时给 1 会让另一路
             # 的 -1 哨兵被当真值拟合。
             w['futurepos'] = (w_h0 & w_h1).astype(np.float32)

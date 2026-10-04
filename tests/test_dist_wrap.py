@@ -361,7 +361,7 @@ def test_wrap_site_documents_why_sync_must_precede_ema():
     注释块是紧贴 `if is_dist:` 之上的那一段（不是紧贴构造调用 —— 中间隔着
     `if is_dist:` 那一行）。
 
-    ⚠ 本条的**意图只是取注释块**（上面那个 `assert stmt is not None` 是取块的
+     本条的**意图只是取注释块**（上面那个 `assert stmt is not None` 是取块的
     副产品，不是「包裹点必须在 `if is_dist` 内」这条不变量的守护）。变异测试确实
     观察到：把 `world_size == 1` 那条路径改坏（把包裹挪出 `if is_dist:`）时，**是
     这一句**把它抓住的 —— 纯属偶然，且失败信息指向错的地方（读者会以为要查注释）。
@@ -489,7 +489,7 @@ def test_all_optimizer_state_saves_use_plain_state_dict_under_is_main():
 # --------------------------------------------------------------------------- #
 # 7. FSDP 零残留：**代码级**全仓库所有 .py；**标记级**只扫 scripts/train_sft.py
 # --------------------------------------------------------------------------- #
-# ⚠ 范围（spec §7 I5 的对应写法，2026-10-01 评审收窄）：I5 说的是
+# 范围（spec §7 I5 的对应写法，2026-10-01 评审收窄）：I5 说的是
 #   ① `scripts/train_sft.py` 内零 FSDP **代码**引用；② 该文件里剩下的 FSDP 字样
 #     只许出现在带「历史/已退役」标记的注释或文档串里。
 # 「零残留」只在**代码级**是全仓库事实：①的前两条对 `train_sft.py` 判 AST，最后
@@ -539,7 +539,7 @@ def test_no_fsdp_symbol_is_referenced():
 def test_fsdp_mentions_are_only_marked_as_retired_history():
     """残留的 FSDP 字样只允许出现在**显式标了「历史 / 已退役」的注释或文档串**里。
 
-    ⚠ **扫描范围 = `scripts/train_sft.py`**（`SRC`），**不是全仓库**。这是
+     **扫描范围 = `scripts/train_sft.py`**（`SRC`），**不是全仓库**。这是
     spec §7 I5 收窄后的口径：I5 承诺的是「该文件内零 FSDP 代码引用 + 残留字样
     带退役标记」，而不是「全仓库注释都干净」。已知在范围外的一处：
     `src/networks/backbone.py`（2026-09 的逐块检查点论证里提到 auto_wrap 的切分
@@ -675,7 +675,7 @@ def test_no_fsdp_code_reference_anywhere_in_repo():
 # reducer 会抛 `Expected to mark a variable ready only once`。收益仅
 # **~36.27 MB/rank（0.106% 的卡）** —— 数字来自 torch 对该开关的定义「the saved
 # memory size will be equal to the **total gradients size**」，本模型即全量梯度
-# 9,067,443 × 4 B。⚠ 别把它和「分片下的梯度 + Adam 两矩 = 3 × 9.07 MB」那个量
+# 9,067,443 × 4 B。 别把它和「分片下的梯度 + Adam 两矩 = 3 × 9.07 MB」那个量
 # 搞混：那是另一处账（显存对比里的 +109 MB/rank），不是本开关省下的量。
 # 配上面这类风险不值 ⇒ 保持默认 False。
 
@@ -908,7 +908,7 @@ def test_ema_built_before_wrapping_still_updates(_gloo_pg):
     这里不模拟多 rank（world_size=1 跑不出跨 rank 发散），钉的是这条崩溃的
     **机理**：键空间必须一致。
 
-    ⚠ **这条断言的牙在哪里**（2026-10-01 评审记录）：原先写的是
+     **这条断言的牙在哪里**（2026-10-01 评审记录）：原先写的是
     `assert set(ema.shadow) == shadow_before`，而 `EMA.update()` 只**改写已有键的
     值**、从不改键集 ⇒ 那个等式**恒真**，红不了任何东西 —— 读的人却会以为
     「键空间一致」这件事在这里被守着，而实际上本条的全部牙都在

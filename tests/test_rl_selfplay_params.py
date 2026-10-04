@@ -1,6 +1,6 @@
 """selfplay_train 参数面 + self_play_game 两调用点的参数映射回归测试。
 
-⚠️ 本文件有**两段互不相干**的断言，请连同下面的分节注释一起读：
+ 本文件有**两段互不相干**的断言，请连同下面的分节注释一起读：
   · 第 1 段（_SPEC_TABLE / _MAPPED_DESTS ...）：self_play_game 两调用点的参数映射
     回归，原用于钉「并行 worker 漏传 rollout-steps」。
   · 第 2 段（_EXPECTED_PARAM_SURFACE ...）：P3.0 的 CLI 参数面清单（PPO/KL 三参数
@@ -69,7 +69,7 @@ _SPEC_TABLE = {
     'mix': 0.1,                     # --lookahead-mix 默认值（DEFAULT_MIX）
 }
 
-# ⚠ 2026-09-30（RL 去 MCTS）：`_SPEC_TABLE` 里**不再有任何 MCTS 参数**。
+# 2026-09-30（RL 去 MCTS）：`_SPEC_TABLE` 里**不再有任何 MCTS 参数**。
 # 原来 17 个（sims / expand_topk / expand_chunk / c_puct / virtual_loss /
 # mcts_threads / num_threads / spec_prefetch / use_rollout / rollout_lambda /
 # rollout_steps / leaf_ab_depth / use_diverse_rollout / mcts_vector_backup /
@@ -481,7 +481,7 @@ def test_delta_is_exactly_three_ppo_kl_params():
 
     把路线图 D11 的算式整条钉住：
       53（P3.0 前） → 56（P3.0 后） →(去 MCTS +5 推演参数)→ 61（现在）
-    ⚠ 2026-09-30：MCTS 参数**没有**被删除 —— 它们按 D1「忽略但留痕」保留在
+     2026-09-30：MCTS 参数**没有**被删除 —— 它们按 D1「忽略但留痕」保留在
     argparse 里（旧命令行一个字不用改），只是不再转发给任何接收方。所以这里
     不再断言「56 − 19 = 37」，而是断言「旧参数一个没少 + 新增恰好 5 个」。
     """

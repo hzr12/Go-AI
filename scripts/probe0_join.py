@@ -19,7 +19,7 @@ hash 口径 = (board 361B, to_play 1B, ko 2B)
     0 例因历史差异被拆开 ⇒ 同一局面必得同一 hash，无歧义
   · npz 侧**不需要 game_id**，直接从 boards/to_play/ko 三列算，完全绕开映射问题
 
-⚠ 内存：本机 13.9 GB，boards 是 3420万×361 = 12.3 GB。np.load 整列会爆，
+ 内存：本机 13.9 GB，boards 是 3420万×361 = 12.3 GB。np.load 整列会爆，
   所以全程分块（CHUNK）处理，只驻留当前块的 hash。
 """
 from __future__ import annotations
@@ -56,7 +56,7 @@ def pos_hash_block(boards, to_play, ko):
     # 向量化线性散列。逐行 blake2b 在 3420 万行上不可用（慢 ~100×）；本实现
     # 675K 行/s ⇒ 34.2M 行约 1 分钟。
     #
-    # ⚠ 溢出是有意的，但必须在**无符号**语义下算：int64 乘法会溢出成负数，
+    # 溢出是有意的，但必须在**无符号**语义下算：int64 乘法会溢出成负数，
     #   再 astype(uint64) 会触发 RuntimeWarning 且高位置换逻辑不可控
     #   （首版就是这么坏掉的：唯一性/单格敏感性全失）。
     # 做法：全部用 uint64 运算，溢出按 C 标准回绕 —— 2^64 的模对散列完全够用。

@@ -198,7 +198,7 @@ def _main_wiring_tail():
     `with maybe_autocast(...)`；`tail` 是**从它下一条开始、到第一条含
     `.backward()` 的语句为止**的连续语句切片（含 backward 那条）。
 
-    ⚠ 为什么扫「后面若干条」而不是「紧接着那一条」：本仓的
+     为什么扫「后面若干条」而不是「紧接着那一条」：本仓的
     `scaler.scale(opt_loss / _accum_steps).backward()` 是一条，但把它拆成
     `_b = opt_loss / _accum_steps; scaler.scale(_b).backward()` 是**语义中性**
     的合法重构。Fix2 的逐字子串断言会把这种重构误报成「backward 换了量」，
@@ -233,7 +233,7 @@ class _RecordingScaler:
     这是**唯一**能按行为区分 `opt_loss` 与 `log_loss` 的探针：两者只差一个
     python float 的 `l2_report`，梯度**逐位相同**（这正是 §3.1 的设计意图），
     所以「哪个张量收到了 backward」只能靠观察**对象身份/数值**，
-    而不能靠梯度。⚠ 因此调用方必须先确认 `l2_report` 显著非零（见
+    而不能靠梯度。 因此调用方必须先确认 `l2_report` 显著非零（见
     `test_log_loss_identity` 的前置断言），否则两者不可区分。
     """
 
@@ -313,7 +313,7 @@ def test_huber_matches_torch_reference():
     assert not torch.isclose(got, linear.sum(), rtol=1e-3), '归约滑成了 sum'
 
     # 默认 beta 必须 = 0.5（与 --huber-beta 默认一致）。
-    # ⚠ 不能写成 huber_loss(p,t) == huber_loss(p,t,beta=0.5)（P4.5-fix 更正）：
+    # 不能写成 huber_loss(p,t) == huber_loss(p,t,beta=0.5)（P4.5-fix 更正）：
     # 那是**自指**——只钉住「默认参数等于字面量 0.5」，不验任何数学，
     # 把 beta 默认改成 0.3 也照样绿。改成与**手写公式**（beta=0.5）比。
     assert float(huber_loss(p4, t4)) == pytest.approx(
@@ -433,7 +433,7 @@ def test_policy_loss_default_is_ce():
 
     assert ast.literal_eval(kw['--policy-loss']['default']) == 'ce', \
         '--policy-loss 默认必须是 ce（P4.5b 用户裁决）'
-    # ⚠ **A4（2026-10-02）改了这一条断言，理由必须留着**：
+    # **A4（2026-10-02）改了这一条断言，理由必须留着**：
     #   原来是 `== ['huber','ce']` 的**逐字**比较。A4 加了 `--soft-index` 等
     #   四个软标签旗后，`--policy-loss` 必须多接受 `soft_ce`
     #   （`--soft-index` 一给就把生效口径**派生**为 soft_ce，见
@@ -483,13 +483,13 @@ def test_policy_loss_default_is_ce():
 
     # help 文案必须记录「为什么默认不是 huber」，否则下一个人会再把它设成默认
     ap = _replay_parser()
-    # ⚠ A4 之后 metavar 是 `--policy-loss {huber,ce,soft_ce}`：choices 多了一项，
+    # A4 之后 metavar 是 `--policy-loss {huber,ce,soft_ce}`：choices 多了一项，
     #   argparse 就按 choices 渲染 metavar。**不要**把这里改回逐字查
     #   `{huber,ce}` —— 那等于把「soft_ce 已登记」这条又钉回字面量。
     entry = _help_entry(ap, '--policy-loss {huber,ce,soft_ce}')
     assert '默认**不是** huber' in entry, \
         f'--policy-loss 的 help 没写明「默认不是 huber」: {entry}'
-    # ⚠ **P4.5b-fix3：文案断言只留「机制」那一个 token，删掉三个纯数字。**
+    # **P4.5b-fix3：文案断言只留「机制」那一个 token，删掉三个纯数字。**
     #   Fix2 钉的是 ('1/A', '1/A²', 'A=82/170/362', '4.4') 四个 —— review 判它是
     #   「低价值、中等脆性」：一次合法的改写（把 1/A² 写成 (1/A)²、把
     #   `A=82/170/362` 改成 `A = 82 / 170 / 362`、或把 4.4 改成 4.415）就会红；
@@ -552,7 +552,7 @@ def test_value_loss_weight_default_is_one_no_compensation():
     assert _replay_parser().parse_args(['--data', 'd']).value_loss_weight == 1.0
 
     # 权重仍作用在 value 项上（只是默认值不再补偿）。
-    # ⚠ P4.5b：组合式搬进了 compose_losses（为了让「L2 项不进梯度」能被**按行为**
+    # P4.5b：组合式搬进了 compose_losses（为了让「L2 项不进梯度」能被**按行为**
     # 测，见 test_log_loss_identity），所以断言跟着搬：main() 必须把 args 传进去。
     assert 'opt_loss = policy_loss + value_loss_weight * value_loss' in \
         inspect.getsource(t.compose_losses), \
@@ -570,7 +570,7 @@ def test_value_loss_weight_default_is_one_no_compensation():
         f'--help 仍在把 5.0 说成默认值: {entry}'
     assert '1.0' in entry, f'--help 未写明默认值 1.0: {entry}'
 
-    # ⚠ run.txt / shell/** 不是本任务的文件：只扫描、不修改。若哪天有人往里
+    # run.txt / shell/** 不是本任务的文件：只扫描、不修改。若哪天有人往里
     # 加了显式的 --value-loss-weight，这个断言会红 —— 那正是需要复核的信号。
     for rel in (['run.txt'] + [os.path.join('shell', f) for f in
                                sorted(os.listdir(os.path.join(ROOT, 'shell')))]):
@@ -969,7 +969,7 @@ def test_gradient_scale_not_collapsed():
         f'ce 路径梯度不再逐位等于 D4 之前的量级：{gp_old:.6g}'
 
     # 1+2. P4.5 的交付口径（**当时**的默认：huber + huber，w=1.0）
-    #    ⚠ P4.5b 起 `--policy-loss` 默认已改回 ce，本段从「残余失衡的守卫」变成
+    # P4.5b 起 `--policy-loss` 默认已改回 ce，本段从「残余失衡的守卫」变成
     #    「历史口径的存档」：数字不许漂（它们是 report §8.1 表的根据），但不再
     #    描述当前默认。当前默认的比值由 test_policy_value_gradient_ratio 钉。
     pl, gp, gv = grads('huber', 1.0)
@@ -1044,7 +1044,7 @@ def test_huber_loss_api_truth_table():
 def test_losses_under_bf16_autocast():
     """BF16 路径（P4.1 的 NPU 部署口径）必须能跑、不 NaN、误差在容差内。
 
-    ⚠ `maybe_autocast()` 在 CPU 上返回 `nullcontext`（device 必须是
+     `maybe_autocast()` 在 CPU 上返回 `nullcontext`（device 必须是
     cuda/npu 才开），所以这里**显式**写 `torch.autocast(device_type='cpu',
     dtype=torch.bfloat16)` —— 这是对 NPU bf16 路径的**近似**（同一套 autocast
     机制与同一个 dtype，只是 device_type 不同）。断言的是「损失函数在低精度
@@ -1185,13 +1185,13 @@ def test_l2_report_uses_decay_group_only():
     assert isinstance(t.compute_l2_report(_opt(net, weight_decay=0.0).param_groups),
                       float), '全 no_decay 时也必须返回 float 0.0'
 
-    # (5) 每次调用**恰好一次** host 同步（⚠ P4.5b-fix3 新增）。
+    # (5) 每次调用**恰好一次** host 同步（ P4.5b-fix3 新增）。
     #     本函数在训练循环里**每个 micro-batch 都无条件跑**（不在
     #     `if _do_stdout or _do_swanlab:` 门控里），所以同步点个数比耗时更容易
     #     被放大：在 NPU/A100 上每次 `float()` 都是一次排空设备流水线的阻塞
     #     读回，而 CPU 上它几乎免费 —— **耗时测不出来，个数测得出来**。
     #     Fix2 是逐组 `float()` ⇒ 两个 decay 组 = 2 次；这里钉住 1 次。
-    #     ⚠ 2026-10-01 起断言从 `== 1` 放宽为 `<= 1`，并**不是**放弃了这条不变量：
+    # 2026-10-01 起断言从 `== 1` 放宽为 `<= 1`，并**不是**放弃了这条不变量：
     #       读回改成了 `torch.stack(_sqs).tolist()`（一发 D2H），而
     #       `torch.stack([a,b]).tolist()` 在 CPU 上**只派发 `aten.stack.default`** ——
     #       `.tolist()` 本身连算子都不派发（纯内存读），`_count_host_syncs` 只匹配
@@ -1304,7 +1304,7 @@ def test_log_loss_identity():
     # --- 接线：main() 必须 backward 第一个返回值、记日志第二个返回值，且
     #     l2_report 取自 optimizer.param_groups（不是 model.parameters()）---
     #
-    # ⚠ **P4.5b-fix3 更正**：Fix2 报告写「用行为而不是源码子串证明」，那句话
+    # **P4.5b-fix3 更正**：Fix2 报告写「用行为而不是源码子串证明」，那句话
     #   只对 `compose_losses` 成立 —— main() 的调用点当时是四条**逐字
     #   `in main_src`** 断言，正是 review 的 Important 3 点名的过度声明。
     #   下面改成**执行 main() 里那几条真实语句**（`_main_wiring_tail()` 返回的
@@ -1343,7 +1343,7 @@ def test_log_loss_identity():
         #   **空 dict**（段 1 的热路径必须与 A4 之前逐字相同：多传三个 None 会
         #   让 `compute_policy_loss` 的 ce/huber 分支行为不变，但断言「ce 与裸
         #   F.cross_entropy 逐位相等」的口径会变脆 —— 所以这里给 `{}`）。
-        # ⚠ 这不是放宽断言：`ns` 模拟的是 main() 在该点的**局部命名空间**，
+        # 这不是放宽断言：`ns` 模拟的是 main() 在该点的**局部命名空间**，
         #   A3/A4 让那里多了一个名字。§3.1 的恒等式与 (d)「backward 的是
         #   opt_loss」等断言一个字都没动。
         'soft_kwargs': {},
@@ -1408,7 +1408,7 @@ def test_log_loss_identity():
 def test_l2_report_precedes_optimizer_step():
     """`compute_l2_report` 必须在 `optimizer.step()` **之前**调用（§3.1「同一个 θ」）。
 
-    ⚠ 这条性质在 Fix2 里被**两处代码注释 + 一处报告**断言过，却**没有任何测试
+     这条性质在 Fix2 里被**两处代码注释 + 一处报告**断言过，却**没有任何测试
     钉住它**：把 `l2_report = compute_l2_report(...)` 挪到 step 之后，
     `test_log_loss_identity` 的恒等式仍成立（l2 只是个加数）、梯度仍逐位相同、
     四条子串也仍命中 —— 只有**报告出来的数**悄悄变成了
@@ -1444,7 +1444,7 @@ def test_no_new_cli_params():
 
     c 就是 `--weight-decay`（已默认 1e-4），裁决明确「不得新增任何 CLI 参数」。
 
-    ⚠ **P4.5b-fix3 修掉 review 指出的两个漏洞**（旧实现两处都太松）：
+     **P4.5b-fix3 修掉 review 指出的两个漏洞**（旧实现两处都太松）：
 
     1. **顺序敏感的位置比较。** 旧写法是 `list(kw) == expected`（61 元素的
        list 比较）：一次纯排版重排就红，而报错信息里的「新增=… 缺失=…」两个
@@ -1478,7 +1478,7 @@ def test_no_new_cli_params():
         '--early-stop', '--early-stop-patience', '--early-stop-metric',
         '--max-gpu-memory', '--c2net',
         # ---- A4（2026-10-02）新增的 4 个：软标签（KataGo 访问分布）----
-        # ⚠ **为什么要显式登记而不是删掉本测试**：D1 的门禁价值不在「61 这个
+        # **为什么要显式登记而不是删掉本测试**：D1 的门禁价值不在「61 这个
         #   数字」，而在「新增必须是一次**留痕**的改动」。删掉整个测试等于把
         #   门禁拆了；把 4 个名字写进冻结集，则下一个想加 `--soft-mask-eps`
         #   的人仍然会在这里红一次，并被迫把理由写在这里。
@@ -1486,7 +1486,7 @@ def test_no_new_cli_params():
         #   `tests/test_soft_cli.py` 钉（None / 1.0 / 0 / 1）。
         '--soft-index', '--soft-weight', '--soft-only-sampling', '--soft-every',
         # ---- B8（2026-10-02）新增的 1 个：V7 路径开关 ----
-        # ⚠ **为什么要显式登记而不是删掉本测试**：D1 的门禁价值不在「65 这个
+        # **为什么要显式登记而不是删掉本测试**：D1 的门禁价值不在「65 这个
         #   数字」，而在「新增必须是一次**留痕**的改动」。删掉整个测试等于把
         #   门禁拆了；把 `--v7` 写进冻结集，则下一个想加 `--v7-lr-mult` 的人
         #   仍然会在这里红一次，并被迫把理由写在这里。
@@ -1496,13 +1496,13 @@ def test_no_new_cli_params():
         #   的 SGF 是认输、只有 23.18% 有分差），不是调参口味。
         '--v7',
         # ---- 2026-10-04 新增的 1 个：局级 sidecar（逐局贴目）----
-        # ⚠ **为什么要显式登记而不是删掉本测试**：D1 的门禁价值不在旗子的个数，
+        # **为什么要显式登记而不是删掉本测试**：D1 的门禁价值不在旗子的个数，
         #   而在「新增必须是一次**留痕**的改动」。删掉整个测试等于把门禁拆了。
         #   把 `--games-npz` 写进冻结集，则下一个想加 `--games-komi-scale` 的人
         #   仍然会在这里红一次，并被迫把理由写在这里。
         #   语义：`build_games_sidecar.py` 的产物（局级 `g_komi`），接进 V7 的
         #   全局特征 ch5 / ch18。不给 ⇒ 贴目按 0（**默认关闭时逐位不变**）。
-        #   ⚠ 段位权重仍**不**做成 CLI：V7 的段位表是常量
+        # 段位权重仍**不**做成 CLI：V7 的段位表是常量
         #   （`V7_STAGE1_SCORE_TERMS`），理由同上。
         '--games-npz',
     }
@@ -1535,7 +1535,7 @@ def test_no_new_cli_params():
     #   (d) 注册点落在 main() 之外的函数（helper / 工厂）—— 上面的 kw 收不到
     # 三条断言把它们逐类堵死：调用总数必须等于冻结集个数、每个第一个实参必须是
     # 字符串字面量、每个名字必须在 main() 的登记集合里。
-    # ⚠ A4 之后「61」这个硬编码数也归到这里（65）：断言里的计数一旦写死，
+    # A4 之后「61」这个硬编码数也归到这里（65）：断言里的计数一旦写死，
     #   加旗时就只会红在「个数」这一行，报不出「新增了谁」。
     all_calls = [n for n in ast.walk(_module_tree())
                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
@@ -1593,13 +1593,13 @@ def test_optimizer_param_groups_unchanged():
 
     # AdamW 仍是 AdamW（解耦衰减的载体），没有被换成裸 SGD / LBFGS，
     # 且每一处构造都吃同一个 _build_param_groups 结果（本任务不得改优化器）。
-    # ⚠ P4.5b-fix3 **删掉**了原来这里的
+    # P4.5b-fix3 **删掉**了原来这里的
     #   `assert isinstance(_opt(net), torch.optim.AdamW)` ——
     #   `_opt()` 自己就是 `torch.optim.AdamW(...)`，断言它的返回值是 AdamW
     #   **永远为真**、永远不可能变红（review 的 Minor 第 1 条：不可证伪断言）。
     #   真正想说的「解耦衰减的载体还是 AdamW」由下面两条**可证伪**的检查承担：
     #   构造点数量与分组来源，以及 `_build_param_groups` 里没有渗进 L2。
-    # ⚠ P4.6 改写构造点断言（意图不变，见本文件 docstring「P4.6 追加」）：
+    # P4.6 改写构造点断言（意图不变，见本文件 docstring「P4.6 追加」）：
     #   AdamW 构造从 main() 移进 `build_adamw`（fused 设备策略/回退契约的唯一
     #   入口），故扫描范围从「main() 内」改为「**全模块**」，并钉三点——
     #   构造点没有丢（≥1）、每个都落在 build_adamw 内（绕过设备策略 ⇒ 红）、
@@ -1769,7 +1769,7 @@ def _grad_spaces(board=19, pol_kind='ce', val_kind='huber', w=1.0,
 def test_policy_value_gradient_ratio():
     """当前默认（policy=ce + value=huber, w=1.0）在生产头上的 policy:value 梯度比。
 
-    ⚠ **P4.5b-fix3：本测试的三个空间被重新定级，理由是它们携带的信息量差三个
+     **P4.5b-fix3：本测试的三个空间被重新定级，理由是它们携带的信息量差三个
     数量级。** 前几轮之所以出现 5.4 / 91.70 / 1.113 三个数，是因为没人写清
     「在哪个空间量、用哪个头、什么初值」；本 harness 已把量法逐字钉在上面的
     模块注释里。review 进一步逐个问「这个数到底在量什么」，结论如下 ——
@@ -1799,7 +1799,7 @@ def test_policy_value_gradient_ratio():
     cur = _grad_spaces(19, pol_kind='ce', val_kind='huber', w=1.0)
 
     # (1) 头参数空间：policy 强于 value。实测 91.70（eps=0.1）/ 101.92（one-hot）。
-    #     ⚠ 只钉**比值**，不钉两个绝对范数。Fix2 曾把 4.8710（rel=5e-3）与
+    # 只钉**比值**，不钉两个绝对范数。Fix2 曾把 4.8710（rel=5e-3）与
     #     0.0531（rel=1e-2）钉死 —— 那两个数 99% 由**头结构**（分类器宽度、
     #     GAP 的 H·W）决定，而 P4.2 就是要换 `FCPolicyHead`/`FCValueHead`。
     #     钉得最紧的地方恰恰是最架构依赖的地方：换头后它们必然漂，而漂移
@@ -1811,14 +1811,14 @@ def test_policy_value_gradient_ratio():
         f'变大：policy 侧被放大（损失或归约被换过？）'
         f'变小：policy 梯度被稀释 —— A 依赖回来了（见下一个测试）。'
         f'当前实测 91.70（eps=0.1）/ 101.92（one-hot）。'
-        f'⚠ 这个比值也被架构主导，且**没有**乘 `--value-lr-mult 5.0`（仓库真的'
+        f' 这个比值也被架构主导，且**没有**乘 `--value-lr-mult 5.0`（仓库真的'
         f'按 5× 学率更新 value 头）⇒ 头参数**更新幅度**之比是 91.7/5 = 18.3。')
     assert 0.005 < cur['param'][1] < 0.5, \
         f'value 头参数梯度量级异常: {cur["param"][1]:.5f}（实测 0.0531，区间放宽到 ' \
         f'[0.005, 0.5] 只挡「塌成 0 / 炸掉」）'
 
     # (2) 损失输入空间：value:policy = 1.1128。
-    #     ⚠ **Fix3 更正**：这个数**不是**「两个独立 harness 互相印证」，它是
+    # **Fix3 更正**：这个数**不是**「两个独立 harness 互相印证」，它是
     #     `--label-smoothing` 在近均匀初值下的**闭式恒等式**：
     #         CE   ‖∂L/∂logits‖ = (1−eps)·√(1−1/A) / √B   （每样本 ‖p−y‖/√B）
     #         Huber‖∂V/∂vpred‖  = sign(d) 均值归约 ⇒ √B/B = 1/√B
@@ -1846,7 +1846,7 @@ def test_policy_value_gradient_ratio():
     assert 0.05 < old_ratio < 1.0, \
         (f'P4.5 交付口径（huber）下 value 本该更强，比值却不在 (0.05, 1) 内: '
          f'{old_ratio:.3f}（实测 0.292）。参照系坏了。'
-         f'⚠ Fix2 曾把它钉成 ≈0.29±2%，同样是架构依赖的紧断言，已放宽。')
+         f' Fix2 曾把它钉成 ≈0.29±2%，同样是架构依赖的紧断言，已放宽。')
     assert ratio > 10 * old_ratio, \
         '换成 ce 之后 policy 梯度应放大约两个数量级（实测 316×）'
 
@@ -1934,7 +1934,7 @@ def test_ce_policy_gradient_is_action_space_independent():
             L = _huber_policy(logits, moves, eps, _BETA, reduce)
         return float(torch.autograd.grad(L, logits)[0].norm()), A
 
-    # ⚠ **P4.5b-fix3：整段对 eps ∈ {0.0, 0.1} 各跑一遍。**
+    # **P4.5b-fix3：整段对 eps ∈ {0.0, 0.1} 各跑一遍。**
     #   Fix2 只测 eps=0.0，而**生产默认是 eps=0.1**（`--label-smoothing`），
     #   于是「CE 与 A 无关」这条不变式在真正会跑的那条路径上**从没被检查过**。
     #   实测两个 eps 下的比值（CE 1.00511 / 1.00515，Huber-sum 0.22282 /

@@ -241,7 +241,7 @@ def _private_bytes():
         c.cb = ctypes.sizeof(_PMC)
         psapi = ctypes.WinDLL('psapi')
         k32 = ctypes.WinDLL('kernel32', use_last_error=True)
-        # ⚠ 三个原型都要显式声明：`GetCurrentProcess` 的返回值是 HANDLE(64 位)，
+        # 三个原型都要显式声明：`GetCurrentProcess` 的返回值是 HANDLE(64 位)，
         # 不声明 restype 会被按默认的 32 位 int 截断，句柄变成垃圾值，
         # `GetProcessMemoryInfo` 直接返回 0 —— 于是 `PrivateUsage` 一直是 0，
         # 峰值口径**静默**变成 null。
@@ -423,7 +423,7 @@ def test_bn_guard_is_actually_entered_only_on_recompute():
 def test_dropout_mask_reproduced_under_checkpointing():
     """同权重同输入、train 模式、同 seed：开关两侧的**前向与全部梯度**必须逐位相同。
 
-    ⚠ **必须包含反向**：检查点的前向与不开检查点的前向本来就是同一条计算
+     **必须包含反向**：检查点的前向与不开检查点的前向本来就是同一条计算
     （掩码相同），**只有重算那次前向**才会用到 RNG。实测（mutation
     `preserve_rng_state=False`）：只比前向的版本对这个错误改动**完全免疫**，
     28 个测试全绿 —— 所以这里比的是 fwd+bwd，并且先断言「重算确实发生过」
@@ -718,7 +718,7 @@ def test_assert_helper_is_public_and_callable_on_a_bare_model():
 def test_each_block_type_is_covered():
     """用 **forward 调用次数**证明覆盖（不是读代码）。
 
-    被检查点的段在 fwd+bwd 里每块至少跑 2 次（原前向 + 重算）。⚠ 段的**最后
+    被检查点的段在 fwd+bwd 里每块至少跑 2 次（原前向 + 重算）。 段的**最后
     一块**通常只跑 1 次：`torch.utils.checkpoint` 的 `early_stop=True`（默认）在
     「所有被留的张量都重算完」那一刻就抛 `_StopRecomputationError` 中止重算，
     段尾那几块不再重跑。所以判据是「除末块外每块 == 2、末块 >= 1」，而
@@ -819,7 +819,7 @@ def test_tap_position_is_that_blocks_output():
     """
     m = _small()
     _reset_bn(m)
-    # ⚠ 必须先打破 He 零初始化：`ResBlock.__init__` 里有 `nn.init.zeros_(bn2.weight)`，
+    # 必须先打破 He 零初始化：`ResBlock.__init__` 里有 `nn.init.zeros_(bn2.weight)`，
     # 于是**初值处残差块是恒等映射** ⇒ ResBlock #1 的输出与它的输入（stem 输出）
     # 逐位相同。不打破它，下面「抽头不是段入口」那条对照就恒真、整条测试空转。
     for blk in m.blocks:
@@ -1014,7 +1014,7 @@ def test_run_grad_segment_multi_input_signature():
 def test_no_grad_path_never_checkpoints():
     """`no_grad` 下**连 `torch.utils.checkpoint` 都不许被调用**（mixin 路径）。
 
-    ⚠ P4.6b fix B3 更正了这里原先的自相矛盾：本测试**抓不到**
+     P4.6b fix B3 更正了这里原先的自相矛盾：本测试**抓不到**
     `run_grad_segment` 里 `active = bool(use_checkpoint) and torch.is_grad_enabled()`
     的后半段 —— mixin 的 `grad_checkpointing_for()` 在更早的地方就用同一个
     `torch.is_grad_enabled()` 把 `use_checkpoint=False` 传下来了，所以删掉
@@ -1228,7 +1228,7 @@ def measure(batch=1, board=BOARD, channels=CH, in_channels=IN_CH,
     params = [p for p in m.parameters() if p.requires_grad]
     configs = [
         ('off/all', {'res': False, 'transformer': False}),
-        # ⚠ 每行都**显式**写全 kind：res / transformer 的默认都是 True，留空会
+        # 每行都**显式**写全 kind：res / transformer 的默认都是 True，留空会
         # 继承默认值 ⇒ 行的标签就不再等于实际组合（v21 时代 cross_attn_res
         # 默认值翻转踩过同一个坑）。
         ('on/res', {'res': True, 'transformer': False}),

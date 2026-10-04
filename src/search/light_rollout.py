@@ -112,7 +112,7 @@ class FastPolicy:
         logit = np.where(legal, logit, np.float32(-1e9)).astype(np.float32)
         if self.weights is not None:
             # 仅在显式提供线性权重时才计算完整特征（默认 FastPolicy 不触发）
-            # ⚠ `n_channels=nc`、下面的 `reshape(nc, -1)` 与
+            # `n_channels=nc`、下面的 `reshape(nc, -1)` 与
             #   `weights.shape[0] == nc` 是同一个契约的三个面（P4.13b 起三者
             #   同为 `self.n_channels`，由 MCTS 按所挂模型传入）。三个面必须一起
             #   改：只有它们一致，`tensordot` 才落在合法的 (nc,)×(nc,n*n) 上。

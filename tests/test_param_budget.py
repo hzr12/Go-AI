@@ -79,7 +79,7 @@ def test_value_head_table_in_run_txt_is_accurate():
 # （现役是 V7 / KATAGO_SE_CFG 12ch），而 run.txt 已改为「简洁」的一屏版，
 # 不再承载退役架构的参数表。与 test_run_txt_sync.py 属同一类保证，
 # 按同一决定移除。
-# ⚠ 随之失去的保证：run.txt 里的数字与实测值的自动比对。补参数时
+# 随之失去的保证：run.txt 里的数字与实测值的自动比对。补参数时
 #   需人工核对（README §「静默出错的坑」第 8 条记录了同类的 flag 冻结问题）。
 #   若日后 run.txt 再次变长、值得机器校验，应改为校验「run.txt 实际写了哪些
 #   数字」而不是「必须写 v18 的数字」。

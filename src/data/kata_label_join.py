@@ -24,7 +24,7 @@
 `np.load` 会 OOM。重写它还要重跑一遍 34.2M 的写入。sidecar 只增 M 行（M 是被
 标注到的行数，1% 约 34 万），几 MB。
 
-⚠ **同一局面会在多局里出现**（transposition）。`pos_hash` 因此在两侧都可能有
+ **同一局面会在多局里出现**（transposition）。`pos_hash` 因此在两侧都可能有
 重复，join 是**多对多**的。默认 `max_repeats=1`：每个被标注的局面只挂到
 **第一个**匹配的数据行。放宽它能把同一个搜索标签喂给多个出现处，但会按
 重复次数给高频局面加权（一个布局变例出现 50 次就压过别处 50 倍）。
@@ -67,7 +67,7 @@ _HASH_CHUNK = 200_000
 # --------------------------------------------------------------------------- #
 #: 散列口径的**人工**版本号。口径 = 「哪些列参与散列」+「怎么混」（见
 #: `HASH_SPEC_COLUMNS` 与 `src/data/pos_hash.py` 的 docstring）。
-#: ⚠ 只要「参与散列的输入集合」变了（例如将来把历史手数也纳入），这里必须 +1；
+#: 只要「参与散列的输入集合」变了（例如将来把历史手数也纳入），这里必须 +1；
 #: 「权重常量/种子变了」不需要动它 —— 那种变更由 `hash_spec_fingerprint()`
 #: 从**活常量**自动捕获（漏改人工版本号就不会有任何缓存被作废）。
 HASH_SPEC_VERSION = 1
@@ -104,7 +104,7 @@ def hash_spec_fingerprint():
 def _npz_member_rows(path, member):
     """只读 npz 成员 `.npy` 头里的行数，**不解压数据**。
 
-    ⚠ 为什么不用 `np.load(path)[member].shape[0]`：`np.load` 访问成员会先把
+     为什么不用 `np.load(path)[member].shape[0]`：`np.load` 访问成员会先把
     **整个成员解压进内存**再切片 —— 对 `boards` 就是 12.3 GB，本机 13.9 GB。
     npz 是 zip，`.npy` 的 shape 在文件头里，读头就够。
     """
@@ -131,7 +131,7 @@ def npz_fingerprint(path, id_key='game_ids'):
     * ``mtime``       —— 原地重写同一份数据（同名字节数）也能被发现。
     * ``size``        —— mtime 被 `touch -r` 之类抹平时还有一道兜底。
 
-    ⚠ 读 ``id_key`` 会解压**那一个成员**（`game_ids` 是 137 MB，可接受）；
+     读 ``id_key`` 会解压**那一个成员**（`game_ids` 是 137 MB，可接受）；
     缺该列时退回「读 `boards` 的头拿行数」，且 ``n_distinct`` 记 0 ——
     此时 mtime+size 仍是有效兜底。
     """
@@ -166,7 +166,7 @@ def join_cache_key(dataset_npz, labels_npz, max_repeats=1,
     Returns:
         ``(key_hex, meta_dict)``。``meta`` 存进产物文件，供失效时**逐项**报差异。
 
-    ⚠ 少任何一项都会退化成「命中率高但结果错」：换一批 SGF（主 npz 变）、
+     少任何一项都会退化成「命中率高但结果错」：换一批 SGF（主 npz 变）、
     换标签文件、或改了散列种子 —— 三者都会让旧缓存指向错误的行。
     """
     meta = {
@@ -265,7 +265,7 @@ def materialize_dataset(dataset_npz, out_dir, keys=DATASET_KEYS, progress=None):
     磁盘代价：``boards.npy`` 12.3 GB + 两个小列（F 盘余 695 GB，可接受）。
     一次落盘、之后反复扫描都省内存。
 
-    ⚠ 用 `open_memmap` 建**完整形状**的可写文件再分块填，而不是先写头再 append
+     用 `open_memmap` 建**完整形状**的可写文件再分块填，而不是先写头再 append
     —— 后者会在 `write_array` 时重复写文件头，得到一个前段全 0 的坏 `.npy`
     （实测踩过：形状对、值全 0、散列全错，且不报错）。
 
@@ -320,7 +320,7 @@ def scan_dataset_hashes(npz_path, keys=DATASET_KEYS, chunk=_HASH_CHUNK,
     cols, is_mmap = _open_columns(npz_path, materialized_dir, keys)
     if not is_mmap:
         # 明确告知：这一条路径会把整个成员读进内存
-        print('[join] ⚠ 未提供 materialized_dir：npz 成员会被整份解压，'
+        print('[join] 未提供 materialized_dir：npz 成员会被整份解压，'
               'boards 约 12.3 GB。本机 13.9 GB，余量极小。'
               '先跑 materialize_dataset()。', flush=True)
     boards = cols['boards']
@@ -350,7 +350,7 @@ def join_by_hash(dataset_hashes, label_hashes, max_repeats=1):
         两个等长数组：``row_index``（主数据集行号）、``label_index``（标签行号），
         按 ``row_index`` 升序。
 
-    ⚠ **两侧都可能有重复**。实现用「对标签散列去重 → 排序 → searchsorted」，
+     **两侧都可能有重复**。实现用「对标签散列去重 → 排序 → searchsorted」，
     而不是 `np.intersect1d`（后者在有重复时只给唯一值，标签与行的对应关系
     会丢）。代价是 O(N log N + M log M)，34.2M 行约几十秒。
     """
@@ -430,7 +430,7 @@ def build_sidecar(dataset_npz, labels_npz, out_path, max_repeats=1,
     Returns:
         诊断 dict（行数 / 命中率 / 重复倍数 / 实际写出的行数）。
 
-    ⚠ **不命中时也返回诊断但不写文件** —— 「标签与数据集无交集」是一个需要
+     **不命中时也返回诊断但不写文件** —— 「标签与数据集无交集」是一个需要
     立刻看见的结论，静默不写文件会让调用方以为跑成功了。
     """
     lab = load_kata_labels(labels_npz)
@@ -497,7 +497,7 @@ def build_soft_index(dataset_npz, labels_npz, out_path, max_repeats=None,
     Returns:
         诊断 dict，附 ``cache_hit`` / ``cache_key`` / ``stale_reason``。
 
-    ⚠ **不命中时也返回诊断但不写文件**（同 `build_sidecar`）：「标签与数据集
+     **不命中时也返回诊断但不写文件**（同 `build_sidecar`）：「标签与数据集
     无交集」必须立刻看见。
     """
     def _log(msg):
@@ -530,14 +530,14 @@ def build_soft_index(dataset_npz, labels_npz, out_path, max_repeats=None,
                     'hit_rate_vs_labels': (float(cached['hit_rate'])
                                            if 'hit_rate' in cached else 0.0),
                 }
-            # ⚠ **陈旧缓存：不静默复用。** 逐项列出差异再重建。
+            # **陈旧缓存：不静默复用。** 逐项列出差异再重建。
             stale = (stored_meta or {})
             for line in diff_cache_meta(stale, meta):
-                _log(f'[soft-index]   ⚠ 缓存已失效 · {line}')
-            _log(f'[soft-index] ⚠ 缓存陈旧（key {str(stored_key)[:12]} ≠ '
+                _log(f'[soft-index] 缓存已失效 · {line}')
+            _log(f'[soft-index] 缓存陈旧（key {str(stored_key)[:12]} ≠ '
                  f'{key[:12]}），正在重建 —— 复用它会**静默挂错标签**')
         elif os.path.isfile(out_path):
-            _log(f'[soft-index] ⚠ {out_path} 已存在但**没有缓存指纹**（旧版产物），'
+            _log(f'[soft-index] {out_path} 已存在但**没有缓存指纹**（旧版产物），'
                  f'重建 —— 无指纹的产物无法判断是否陈旧')
 
     lab = load_kata_labels(labels_npz)
@@ -563,7 +563,7 @@ def build_soft_index(dataset_npz, labels_npz, out_path, max_repeats=None,
         'dup_factor_max': int(dup.max()) if dup.size else 0,
     }
     if not hit:
-        _log('[soft-index] ⚠ join 命中 0 行：标签与数据集无交集。'
+        _log('[soft-index] join 命中 0 行：标签与数据集无交集。'
              '先确认散列口径一致（见 pos_hash.py），不要把「缓存陈旧」'
              '与「这批局面真的没标签」混为一谈 —— 后者根本不会命中缓存。')
         diag['n_hit'] = 0

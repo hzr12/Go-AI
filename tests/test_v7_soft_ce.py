@@ -101,7 +101,7 @@ def test_soft_policy_ce_matches_reference():
 
 
 def test_soft_ce_matches_the_12_channel_implementation():
-    """🔴 与 12 通路 `train_sft.soft_cross_entropy` **逐位一致**。"""
+    """ 与 12 通路 `train_sft.soft_cross_entropy` **逐位一致**。"""
     sys.path.insert(0, str(ROOT / 'scripts'))
     from train_sft import soft_cross_entropy
 
@@ -113,7 +113,7 @@ def test_soft_ce_matches_the_12_channel_implementation():
 
 
 def test_soft_ce_denominator_is_B_not_mask_sum():
-    """🔴 分母恒为 B（不是 Σmask）—— 12 通路的核心约定。
+    """ 分母恒为 B（不是 Σmask）—— 12 通路的核心约定。
 
     改成 sum/mask.sum() 会让软项量级随 batch 组成漂移，旋钮就失去意义。
     """
@@ -128,12 +128,12 @@ def test_soft_ce_denominator_is_B_not_mask_sum():
 
 
 def test_masked_rows_contribute_exactly_zero():
-    """🔴 逐行**二选一**：mask=0 的行贡献恰好 0，不退化成 one-hot CE。
+    """ 逐行**二选一**：mask=0 的行贡献恰好 0，不退化成 one-hot CE。
 
     验证手段：只改**被掩掉那几行**的 soft 目标，结果必须逐位不变 —— 若它们
     偷偷参与了求和，结果就会变。
 
-    ⚠ 掩码必须**部分为 1**。全 0 是「本批无软标签」的约定，会整体退回
+     掩码必须**部分为 1**。全 0 是「本批无软标签」的约定，会整体退回
     one-hot（见 `test_all_zero_mask_falls_back_to_onehot`），那属于另一条分支。
     """
     out = _out(b=4)
@@ -163,12 +163,12 @@ def test_masked_rows_contribute_exactly_zero():
 # 两路分离（π_opp 曾与 π 同源）
 # --------------------------------------------------------------------------- #
 def test_policy_and_policy_opp_use_different_targets():
-    """🔴 #1 与 #2 必须用**不同**的目标（历史上 π_opp 白训）。
+    """ #1 与 #2 必须用**不同**的目标（历史上 π_opp 白训）。
 
     断言方式是「#2 的值等于 `soft_opp` 在**通道 1** 上的软 CE，且**不等于**
     `soft` 在通道 1 上的软 CE」—— 直接证明它读的是 `soft_opp` 而不是 `soft`。
 
-    ⚠ 不能断言「两项数值不同」：那本来就成立（不同目标 + 不同通道），
+     不能断言「两项数值不同」：那本来就成立（不同目标 + 不同通道），
     证明不了任何东西。
     """
     out, lbl = _out(b=4), _labels(b=4)
@@ -200,7 +200,7 @@ def test_opp_falls_back_to_onehot_when_soft_opp_absent():
 # 回退与系数
 # --------------------------------------------------------------------------- #
 def test_all_zero_mask_falls_back_to_onehot():
-    """🔴 `soft_mask` 全 0 = 「本批无软标签」⇒ 必须退回 one-hot。
+    """ `soft_mask` 全 0 = 「本批无软标签」⇒ 必须退回 one-hot。
 
     否则 policy 拿到**恰好 0** 的梯度 —— 不报错、loss 照降、policy 根本没学。
     `SupervisedDataset` 在未挂 `--soft-index` 时正是这个状态。
@@ -215,7 +215,7 @@ def test_all_zero_mask_falls_back_to_onehot():
 
 
 def test_policy_soft_weight_is_not_a_term():
-    """⚠ 旋钮不是 term，不能进 `LOSS_COEFFS`。
+    """ 旋钮不是 term，不能进 `LOSS_COEFFS`。
 
     那是「有哪些 term」的清单，加旋钮会破坏 `set(terms)==set(LOSS_COEFFS)`
     （被 `test_train_sft_v7.py` 钉住）。
@@ -233,7 +233,7 @@ def test_soft_weight_scales_the_term_linearly():
 
 
 def test_soft_path_never_produces_fp64():
-    """⚠ 软 target 升 fp32，但绝不上 fp64（910A 无 fp64 硬件，会挂 AICPU）。"""
+    """ 软 target 升 fp32，但绝不上 fp64（910A 无 fp64 硬件，会挂 AICPU）。"""
     out, lbl = _out(b=4), _labels(b=4)
     lbl['soft'] = lbl['soft'].double()
     t = KataGoV7Loss()(out, lbl)['terms']['policy']

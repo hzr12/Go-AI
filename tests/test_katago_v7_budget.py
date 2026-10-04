@@ -40,7 +40,7 @@ from src.networks.katago_v7 import (  # noqa: E402
 BUDGET_TOTAL = 5_850_000
 #: spec §6.1 的目标值。
 #:
-#: 🔴 2026-10-03 从 5,561,832 改为 **5,562,121**（+289），两处结构改动：
+#: 2026-10-03 从 5,561,832 改为 **5,562,121**（+289），两处结构改动：
 #:   1. `value_head.scores` 由 hidden→3 扩到 hidden→6（官方 `sv3Mul`
 #:      的 `out_channels=6`），+96×3 +3 = **+291**
 #:   2. `policy_head.out` 的 `bias=True` → `False`。官方 `p2Conv` 是**裸 1×1
@@ -227,7 +227,7 @@ def test_gpool_policy_three_stats():
 def test_gpool_value_second_slot_is_scaled_mean_third_is_max():
     """value 头的 gpool：``mean``、``mean·(√A−14)/10``、**``max``**。
 
-    🔴 第三段是 max。旧实现写成第三个缩放 mean（``mean·((√A−14)²/100 − 0.1)``），
+     第三段是 max。旧实现写成第三个缩放 mean（``mean·((√A−14)²/100 − 0.1)``），
     那让第三段与第一段**线性相关**、不携带新信息，等于浪费三分之一的池化维度。
     官方 ``eigenbackend.cpp::poolRowsValueHead`` 的第三行是 ``(*out)(c + 2*C, n) = m``
     （``m`` 是该通道空间维最大值）。
@@ -357,7 +357,7 @@ HUBER_DELTA_SCORE_STDEV = 10.0
 class _swapped_beta:
     """临时改 `katago_v7.SCORE_STDEV_SOFTPLUS_BETA`（`forward` 每次调用现读它）。
 
-    ⚠ 必须改**模块全局**而不是传参：`ValueHead.forward` 里是
+     必须改**模块全局**而不是传参：`ValueHead.forward` 里是
     `F.softplus(s[:,1], beta=SCORE_STDEV_SOFTPLUS_BETA)`，那个名字在调用时
     才解析 ⇒ 只有全局才是真正生效的那个开关。用 `with ... as _` 拿回原值，
     保证即使断言失败也不会把常量留在 0.05 上污染后面的测试。
@@ -387,7 +387,7 @@ def test_score_stdev_softplus_beta_is_one():
 
 
 def test_score_stdev_softplus_term_lands_near_huber_delta():
-    """🔴 实测：`softplus` 项在 beta=1.0 下与 δ=10 **同量级**，在 0.05 下差 27 倍。
+    """ 实测：`softplus` 项在 beta=1.0 下与 δ=10 **同量级**，在 0.05 下差 27 倍。
 
     `F.softplus(x, beta) = log(1+exp(beta·x))/beta` ⇒ x=0 时
     `softplus(0, beta) = log(2)/beta` ⇒ 预测初值 `20·log(2)/beta`：

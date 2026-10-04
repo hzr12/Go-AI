@@ -10,7 +10,7 @@
 **唯一**的可执行 oracle。ch3/4/5 那一组实测**逐位相等**（400 行），
 ch9–13 那一组实测颜色分布与 spec §2.2 的「opp, pla, opp, pla, opp」吻合
 （ch9 100% 落在 opp 子上、ch10 99.4% 落在 pla 子上，……）。
-⚠ **ch18/19 不可对拍**（官方先提死子），理由与实测数字见
+ **ch18/19 不可对拍**（官方先提死子），理由与实测数字见
 `src/data/feature_v7.py::area_ownership_map` 的 docstring。
 
 复用 `tests/test_go_feature_planes_v21.py` 的组织方式（逐条钉一个行为 + 说清
@@ -109,7 +109,7 @@ _U_SHAPE = [
 ] + [_blank()] * (N - 4)
 
 # 单子三种气数：黑子恒在 (1,1)，用白子封掉四个邻点中的 1/2/3 个。
-# ⚠ 这些夹具里的**白子自己也会落进某个桶**（封边用的白子通常有 2~4 气），
+# 这些夹具里的**白子自己也会落进某个桶**（封边用的白子通常有 2~4 气），
 #   所以对它们一律用「只断言那颗黑子」的 `bucket_at`，不用整张图比较 ——
 #   整张图比较会把「白子的桶对不对」混进来，而白子的归属由上面两条夹具负责。
 _ONE_STONE_1_LIB = board([
@@ -235,7 +235,7 @@ def test_liberties_123_dedup_nucleus_called_once_per_colour_regardless_of_group_
       · 这里数调用次数，并钉死「6 颗子的 1 块」与「6 个单子块」以及「空盘」
         三种规模**次数相同**（都是 2 = 两个颜色各一次）。任何按块 / 按子分派的
         实现都会让这三个数发散。
-    ⚠ 这条**只**约束本模块的分派粒度；`_distinct_liberty_counts` 内部的 O(B·n²)
+     这条**只**约束本模块的分派粒度；`_distinct_liberty_counts` 内部的 O(B·n²)
       由 `go_rules` 自己的测试负责（spec §7.1：那边一字不改）。
     """
     import src.data.feature_v7 as fv
@@ -279,7 +279,7 @@ def test_liberties_123_large_single_group_is_not_quadratic():
     60 颗子按 O(k²) 逐颗子重扫是 3600 次 Python 级邻接判定（约 3–4 ms），
     相对空盘的 ~50 µs 已经是 60× 以上；向量化实测在同一量级（≈2×）。
     阈值取 20×：既能抓住 k² 退化，又留足了库版本差异的余量。
-    ⚠ 这是一条**上界**测试，所以它证不了「确实线性」，只证「没有二次退化」。
+     这是一条**上界**测试，所以它证不了「确实线性」，只证「没有二次退化」。
       线性由上面那条调用次数不变式 + `_distinct_liberty_counts` 的 O(B·n²)
       共同承担（那条是可证的，计时这条是防回归的粗网）。
     """
@@ -474,7 +474,7 @@ def test_history_gated_one_history_second_fallback_is_prev_not_current():
         **当前盘 / 前一手盘 / 前二手盘三块互不相同**；
       · 写错成 `(n < 2) ? board : ...` 时，`ch16 == ch15` 这条断言仍然成立
         （两边都等于 prev_board），只有额外钉住「`ch16 != 当前盘`」才抓得到。
-    ⚠ 官方第一行回退到 `board`、**第二行回退到 `prevBoard`** —— 不是都回退到
+     官方第一行回退到 `board`、**第二行回退到 `prevBoard`** —— 不是都回退到
       `board`。所以 ch16 在 history=1 时该是 prev 的副本。
     """
     cur = board(['.' * N] * N)
@@ -532,8 +532,8 @@ def test_history_gated_returns_named_fields_and_rejects_wrong_shapes_and_offset(
 def _first_stdata_19x19(limit_rows=1200):
     """从 stdata 的 tar 里流式取**第一批 19×19 行**的 22 空间通道。
 
-    ⚠ **按行取、不要按成员取**：`getmembers()` 要把整个 tar 走一遍。
-    ⚠ 19×19 由 ch0（on-board 掩码）的 1 的个数反推（约定见 spec §9.1 第 2 条）：
+     **按行取、不要按成员取**：`getmembers()` 要把整个 tar 走一遍。
+     19×19 由 ch0（on-board 掩码）的 1 的个数反推（约定见 spec §9.1 第 2 条）：
       同一个文件里混着 9/11/13/18 路与非方阵，直接喂 19×19 的重建盘面会静默错位。
     """
     bits_all = []
@@ -571,7 +571,7 @@ def test_stdata_ch345_liberty_channels_match_official_bit_for_bit():
       3. 气数是**整块去重**口径（与 `_group_liberty_count` 的 `set` 同义）——
          U 形块会把这条打出来；
       4. 4 邻域的连通性与盘面边界处理（结构元 `_STRUCT3` 逐样本独立）。
-    ⚠ 与 ch18/19 不同，这三个通道**官方不做任何额外处理**，所以可以当 oracle。
+     与 ch18/19 不同，这三个通道**官方不做任何额外处理**，所以可以当 oracle。
       （ch18/19 官方先提死子 ⇒ 不可对拍，见 `area_ownership_map` 的 docstring。）
     """
     spatial = _first_stdata_19x19()

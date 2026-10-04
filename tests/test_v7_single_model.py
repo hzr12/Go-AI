@@ -53,7 +53,7 @@ def _board_npz(path, n_games=4, per_game=4):
         ko=rng.integers(0, BOARD * BOARD, size=n).astype(np.int64),
         moves=rng.integers(0, A - 1, size=n).astype(np.int64),
         values=rng.choice([-1.0, 1.0], size=n).astype(np.float32),
-        # 🔴 to_play 必须是 ±1（`feature_v7` 明确拒绝 0/1）
+        # to_play 必须是 ±1（`feature_v7` 明确拒绝 0/1）
         to_play=rng.choice([-1, 1], size=n).astype(np.int64),
         game_ids=np.repeat(np.arange(n_games), per_game).astype(np.int64),
     )
@@ -64,7 +64,7 @@ def _board_npz(path, n_games=4, per_game=4):
 # 分派：board 级语料在 --v7 1 下必须是 V7Dataset
 # --------------------------------------------------------------------------- #
 def test_v7_board_level_dispatches_to_v7_dataset(tmp_path):
-    """🔴 board 级语料 + `--v7 1` ⇒ `V7Dataset`（而不是父类或 packed 类）。"""
+    """ board 级语料 + `--v7 1` ⇒ `V7Dataset`（而不是父类或 packed 类）。"""
     from src.data.v7_packed_dataset import V7PackedDataset
 
     p = _board_npz(tmp_path / 'board.npz')
@@ -76,7 +76,7 @@ def test_v7_board_level_dispatches_to_v7_dataset(tmp_path):
 
 
 def test_v7_board_level_emits_22_channels(tmp_path):
-    """🔴 产出的必须是 **22** 通道 —— 12 通道喂 V7 模型会形状不匹配。"""
+    """ 产出的必须是 **22** 通道 —— 12 通道喂 V7 模型会形状不匹配。"""
     p = _board_npz(tmp_path / 'board.npz')
     ds = load_from_path(str(p), BOARD, 0, v7=True)
     spatial, gl = ds.sample_batch_v7(np.arange(4), rng=np.random.default_rng(0),
@@ -86,7 +86,7 @@ def test_v7_board_level_emits_22_channels(tmp_path):
 
 
 def test_n_channels_12_does_not_downgrade_the_v7_input(tmp_path):
-    """⚠ `n_channels=12` 只管**继承来的 12 通道路径**，不得影响 V7 的 22。
+    """ `n_channels=12` 只管**继承来的 12 通道路径**，不得影响 V7 的 22。
 
     这正是本轮踩过的坑：构造器收到 12，若 V7 取样路径也用 12，前向就废了。
     """
@@ -99,7 +99,7 @@ def test_n_channels_12_does_not_downgrade_the_v7_input(tmp_path):
 
 
 def test_both_sources_feed_the_identical_architecture():
-    """🔴 A/B 与 C 必须是**同一个**架构 —— 「1 个模型」的全部含义。
+    """ A/B 与 C 必须是**同一个**架构 —— 「1 个模型」的全部含义。
 
     两边数据布局完全不同（一段实时算、一段预算好），但喂给模型的张量形状
     必须一致，否则 `load_state_dict` 承接就是空话。
@@ -118,12 +118,12 @@ def test_both_sources_feed_the_identical_architecture():
 # 软标签口径：不能再对段 3 误报
 # --------------------------------------------------------------------------- #
 def test_soft_ce_accepted_for_packed_without_soft_index():
-    """🔴 段 3（stdata 分片）的软标签内建，不该被「需要 --soft-index」拒掉。"""
+    """ 段 3（stdata 分片）的软标签内建，不该被「需要 --soft-index」拒掉。"""
     assert resolve_policy_loss_kind('soft_ce', None, v7_packed=True) == 'soft_ce'
 
 
 def test_soft_ce_still_rejected_for_board_level_without_soft_index():
-    """⚠ 反向仍要拒：board 级 V7 没挂软索引时 `soft_mask` 恒 0。
+    """ 反向仍要拒：board 级 V7 没挂软索引时 `soft_mask` 恒 0。
 
     放过去就是「以为在蒸馏、其实软项恒 0」—— 训练照跑、loss 照降、
     policy 根本没学。这条守卫是段 1/2 的生命线，不能因为段 3 而整体拆掉。
@@ -148,7 +148,7 @@ def test_no_soft_source_keeps_the_hard_path_untouched():
 # narrow_to_soft_rows：空训练集要报人话
 # --------------------------------------------------------------------------- #
 def test_empty_train_index_reports_the_real_cause(tmp_path):
-    """🔴 棋局太少导致训练集为空时，必须说清楚，而不是抛 numpy 的 IndexError。
+    """ 棋局太少导致训练集为空时，必须说清楚，而不是抛 numpy 的 IndexError。
 
     症状链：按棋局切 98/2 ⇒ `int(棋局数*0.98)==0` ⇒ `np.array([])` 的 dtype
     是 **float64** ⇒ 拿去索引报「arrays used as indices must be of integer」。
@@ -196,7 +196,7 @@ def test_mask_length_mismatch_is_caught(tmp_path):
 # 承接：A→B→C 的 load_state_dict 必须真的成立
 # --------------------------------------------------------------------------- #
 def test_weights_carry_from_board_level_to_packed_stage(tmp_path):
-    """🔴 A/B（board 级）训出的权重能被 C（packed）原样吃下。
+    """ A/B（board 级）训出的权重能被 C（packed）原样吃下。
 
     这是「1 个模型」的**可执行**定义：两边张量形状一致 ⇒ `strict=True`
     加载零缺失零多余。

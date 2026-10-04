@@ -124,7 +124,7 @@ def test_l2_report_accumulates_on_host_side():
     这不只是躲 AICPU：主机侧 fp64 比「设备侧 fp64 cast 后再乘」**更精确**
     （少一次设备侧舍入），所以 `test_log_loss_identity` 的恒等式容差不受影响。
 
-    ⚠ 关键是加法**也**必须在主机侧。踩过一次：为了让「每次调用只同步一次」，
+     关键是加法**也**必须在主机侧。踩过一次：为了让「每次调用只同步一次」，
       一度写成 `torch.stack` 之后再在设备上把两组 fp32 标量相加 ——
       fp32 在组平方和量级（~600）上的 ulp ≈ 6.1e-5，一次加法就吃掉
       `test_l2_report_uses_decay_group_only` 的 1.2e-6 容差
@@ -154,7 +154,7 @@ def test_l2_report_reads_device_to_host_exactly_once():
     """
     fn = _fn_node('compute_l2_report')
     # 只数**无歧义**的设备→主机读回：`.tolist()` 与 `.item()`。
-    # ⚠ `float(x)` 不静态计数：函数里合法的 `float(group.get('weight_decay'))`
+    # `float(x)` 不静态计数：函数里合法的 `float(group.get('weight_decay'))`
     #   （dict → Python float）和 `float(_sq)`（`_sq` 来自 `.tolist()`，已是
     #   Python float）都是**零同步**，把它们算进去是误报。
     #   静态类型推断在这里不成立（不跑 mypy/pyright），所以留给

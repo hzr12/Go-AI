@@ -409,7 +409,7 @@ def test_clone_isolation_of_both_derived_caches():
 def test_undo_restores_both_caches_exactly():
     """play/undo 之后两个派生缓存都要**逐项**回到落子前的状态。
 
-    ⚠ 这一段必须在 **19 路**上也做：`_pos_sorted` 只在走向量化的盘口上被维护
+     这一段必须在 **19 路**上也做：`_pos_sorted` 只在走向量化的盘口上被维护
     （小盘口维护它要 np.insert ~10 µs/手），而 `assert_pos_sorted_consistent` 在
     小盘口是**直接 return** 的 —— 只有一个 9 路 undo 用例时，那条不变量等于没测。
     变异测试证据：把 `_rollback_position` 里的 `np.delete` 去掉（回滚后 `_pos_sorted`
@@ -463,7 +463,7 @@ def test_resync_rebuilds_derived_caches():
 def test_vectorized_mask_raises_on_desync(n):
     """不就地 resync 就改盘面：向量化必须**抛**，不能静默算错。
 
-    ⚠ 关键在**成对**改写：一次「石头 -> 空」加一次「空 -> 石头」让空点数
+     关键在**成对**改写：一次「石头 -> 空」加一次「空 -> 石头」让空点数
     **保持不变**，所以任何「计数相等即认为没脱钩」的守卫都会放行。第一版守卫正是
     计数代理，被 review 抓到（9 路静默返回掩码、标量抛 —— 两条路径对同一个契约违反
     给出不同答案）。现在守卫是逐点比较，这里两种改写方式都要能抓住。
@@ -474,7 +474,7 @@ def test_vectorized_mask_raises_on_desync(n):
         if not _step_and_check(b, rng, f"脱钩前第 {t} 手", stats):
             break
 
-    # (a) 单点：空 -> 石。⚠ 必须**先把表建起来**（上面那 12 手已经建了），
+    # (a) 单点：空 -> 石。 必须**先把表建起来**（上面那 12 手已经建了），
     #     否则 `_ensure_groups()` 会按当前盘面重建 —— 那是「自愈」，不是脱钩。
     single = b.clone()
     single_empty = int(np.flatnonzero(single.board == 0)[0])

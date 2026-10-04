@@ -261,7 +261,7 @@ def test_soft_ce_reaches_the_loss_when_index_given(tmp_path):
 
 
 def test_old_path_is_bitwise_unchanged_without_soft_index():
-    """🔴 **没给 `--soft-index` ⇒ 逐位不变**（段 1 通路基线的保证）。
+    """ **没给 `--soft-index` ⇒ 逐位不变**（段 1 通路基线的保证）。
 
     三层都查：数据（三元组、不带 dict）、损失（与裸 `F.cross_entropy` 逐位）、
     以及「装配软项 kwarg」这一步本身在软标签缺席时必须是**空 dict**

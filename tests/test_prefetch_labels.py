@@ -122,7 +122,7 @@ def _make_pf(mod, ds, k=3, depth=2, labels=True):
 def _run_one_task(mod, pf, task, ds, seed=SEED):
     """让 `_prefetch_worker` 只处理 `task` 这一个，然后收工。
 
-    ⚠ 两个坑（都踩过）：
+     两个坑（都踩过）：
     1. worker 是 `while True`，处理完一个任务会回去 `get()` 下一个 ⇒ 必须喂
        一个 `None` 哨兵，否则它一直阻塞。
     2. 必须用**临时队列**喂，不能 `put` 回 `pf._task_q` —— 那是 FIFO，放回去
@@ -448,7 +448,7 @@ def test_worker_source_never_reopens_the_dataset(mod):
 
 
 def test_future_placeholder_stays_zeros_through_the_prefetcher(mod):
-    """🔴 **`future` 占位仍是全 0** —— A6（futurepos 邻行 gather）才填。
+    """ **`future` 占位仍是全 0** —— A6（futurepos 邻行 gather）才填。
 
     预取器只是搬运：它不许「顺手」把占位换成真值，也**不许**把占位丢掉。
     丢掉的症状是下游按 `future` 建张量的代码在真机上形状错，而预取路径下

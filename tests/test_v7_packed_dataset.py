@@ -122,7 +122,7 @@ def test_missing_required_key_raises(tmp_path):
 
 def test_wrong_spatial_shape_raises(tmp_path):
     p = tmp_path / 'bad2.npz'
-    # ⚠ `global` 是 Python 关键字，不能当 kwarg 传 ⇒ 用 dict 形式。
+    # `global` 是 Python 关键字，不能当 kwarg 传 ⇒ 用 dict 形式。
     #   （分片里的键**就叫** `global`。）
     np.savez_compressed(
         str(p),
@@ -139,10 +139,10 @@ def test_wrong_spatial_shape_raises(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# 🔴 语义陷阱（形状都合法，不报错但监督信号错）
+# 语义陷阱（形状都合法，不报错但监督信号错）
 # --------------------------------------------------------------------------- #
 def test_next_move_is_this_row_not_the_next(ds):
-    """🔴 分片每行自带答案；走 board 级的 ``moves[idxs+1]`` 会整体错位一行。"""
+    """ 分片每行自带答案；走 board 级的 ``moves[idxs+1]`` 会整体错位一行。"""
     idxs = np.arange(8, dtype=np.int64)
     lbl = ds._build_labels(idxs, np.zeros(8, np.int64), False)
     want = ds._gather('policy_player_rank', idxs)[:, 0]
@@ -156,7 +156,7 @@ def test_moves_property_matches_next_move(ds):
 
 
 def test_soft_policy_is_normalized_not_raw_counts(ds):
-    """🔴 ``policy_player_prob`` 是**访问计数**（和可达数百），必须归一化。"""
+    """ ``policy_player_prob`` 是**访问计数**（和可达数百），必须归一化。"""
     idxs = np.arange(8, dtype=np.int64)
     lbl = ds._build_labels(idxs, np.zeros(8, np.int64), False)
     raw = ds._gather('policy_player_prob', idxs).astype(np.float64)
@@ -177,7 +177,7 @@ def test_soft_only_touches_the_topk_slots(ds):
 
 
 def test_scorebelief_is_integer_pair_not_probabilities(ds):
-    """🔴 ``sb_center`` 是 ``round(score)``、``sb_upper`` 是 ``round(λ·100)``。
+    """ ``sb_center`` 是 ``round(score)``、``sb_upper`` 是 ``round(λ·100)``。
 
     喂浮点概率会被 ``build_score_distr_target`` 的 ``scatter_`` 静默算错。
     """
@@ -223,7 +223,7 @@ def test_permute_plane_keeps_values():
 
 
 def test_augment_moves_soft_and_next_move_consistently(ds):
-    """🔴 增强必须让「空间平面 / soft / next_move」指向**同一格**。
+    """ 增强必须让「空间平面 / soft / next_move」指向**同一格**。
 
     若只转空间平面而标签没转（或反之），形状全对、不报错，但监督信号指向
     错误的格点 —— 这类 bug 能把 top1 训到接近 0。
@@ -256,7 +256,7 @@ def test_augment_applies_to_all_plane_labels(ds):
 # var_time_left
 # --------------------------------------------------------------------------- #
 def test_var_time_left_absent_is_skipped_not_zero_filled(shard):
-    """⚠ 缺席时**不产出该键** —— loss 侧整项跳过。
+    """ 缺席时**不产出该键** —— loss 侧整项跳过。
 
     喂 0 会把这一路往「方差恒 0」硬拉，比不训练更糟。
     """
@@ -294,7 +294,7 @@ def test_multi_shard_gather_is_correct(tmp_path):
 
 
 def test_game_ids_are_globally_unique_across_shards(tmp_path):
-    """🔴 分片内 ``game_ids`` 是**块内局部行号**，分片间会重复。
+    """ 分片内 ``game_ids`` 是**块内局部行号**，分片间会重复。
 
     不去重就会把第 0 片和第 1 片的 id=0 当成「同一局」——
     按棋局切 train/eval 时同一局会同时落在两侧，eval 指标虚高。

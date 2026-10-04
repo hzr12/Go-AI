@@ -95,7 +95,7 @@ class KataLabeler:
     def wait_ready(self, deadline=240):
         """就绪探测。
 
-        ⚠ **不能靠日志判断**：config 里 `logDir` 已设，KataGo 把所有启动日志
+         **不能靠日志判断**：config 里 `logDir` 已设，KataGo 把所有启动日志
         （含 "Started, ready to begin handling requests"）写进日志文件，**stdout
         上只有 JSON 响应**。等那句日志会永久阻塞（第一版就是这么挂的）。
 
@@ -120,7 +120,7 @@ class KataLabeler:
     def _readline_timeout(self, timeout):
         """带超时的 readline。
 
-        ⚠ 直接 `readline()` 在引擎挂掉时会**永久阻塞**（管道没有数据也不返回），
+         直接 `readline()` 在引擎挂掉时会**永久阻塞**（管道没有数据也不返回），
           整个脚本就静默卡住。所以用后台线程 + join(timeout) 包装。
         """
         box = {}
@@ -167,14 +167,14 @@ class KataLabeler:
     def query_many(self, reqs, timeout=None):
         """**流水线**发一批请求、收一批响应。
 
-        ⚠ 为什么必须有这个：config 里 `numAnalysisThreads=16` 让引擎能同时搜 16 个
+         为什么必须有这个：config 里 `numAnalysisThreads=16` 让引擎能同时搜 16 个
           局面，但同步「发一条等一条」同一时刻只有 **1** 个请求在飞，引擎 15/16 的
           能力闲置（实测 0.42 局面/s vs 理论 6.7）。所以这里先一口气把整批都写进
           stdin，再逐条读响应 —— 响应带 id，按 id 归档，与到达顺序无关。
 
         返回 `(resps, errors)`，errors 是 `{rid: 错误串}`。
 
-        ⚠⚠ **不再因单个请求报错而抛异常**（P0）：真实语料里一定有一部分 SGF 是
+         **不再因单个请求报错而抛异常**（P0）：真实语料里一定有一部分 SGF 是
           坏记录 —— 让子/布局子被当普通着法塞进 moves、坐标错位、记录本身不合法。
           原实现 `raise`，等于「第一个坏局就把 13 万局的一整批打死」，实测就卡死在
           `Illegal move 72: F2`。改成「收集 + 交调用方隔离」后，坏局只损失它自己。
@@ -252,7 +252,7 @@ def first_bad_move(err):
 def classify_error(err):
     """把错误归成粗类，便于汇总时一眼看出是哪一类坏记录在拖累跳过率。
 
-    ⚠ `komi` 的判断**必须排在 `ko` 前面**：`"komi" in s` 会被裸的 `"ko" in s`
+     `komi` 的判断**必须排在 `ko` 前面**：`"komi" in s` 会被裸的 `"ko" in s`
       命中（子串），于是所有棋盘大小/贴目错误都会被误报成打劫分歧，把真正的
       illegal-move 占比掩盖掉。
     """
@@ -323,7 +323,7 @@ def dump_bad_game(path, err, chars=900):
 # --------------------------------------------------------------------------- #
 # 续跑指纹（Phase 0a）
 # --------------------------------------------------------------------------- #
-# ⚠⚠ **为什么必须有**：`.done.n` 只是一个裸游标，而 `positions` 的内容由一堆参数
+# **为什么必须有**：`.done.n` 只是一个裸游标，而 `positions` 的内容由一堆参数
 #   决定。原来只有一条守卫 `cursor > len(positions)` —— **单向**。于是：
 #     · 同样参数重跑        -> 无事可做，正确
 #     · 参数变小（局面变少） -> 拦住了
@@ -475,7 +475,7 @@ def build_queries(paths, move_lo, move_hi, max_games, seed, game_frac=0.0):
     else:
         sel = rng.sample(paths, max_games)
     out = []
-    # ⚠ 解析器在循环**外**构造：原实现每个文件 `SGFParser()` 一次，13 万次
+    # 解析器在循环**外**构造：原实现每个文件 `SGFParser()` 一次，13 万次
     #   多余构造。复用同一个实例无副作用（`_extract_moves` 等都是纯函数式用法）。
     parser = SGFParser()
     for gi, p in enumerate(sel):
@@ -501,7 +501,7 @@ def build_queries(paths, move_lo, move_hi, max_games, seed, game_frac=0.0):
 def find_katago_exe():
     """自动找 katago 可执行文件（跨 Windows/Linux）。
 
-    ⚠ **同名不同平台要挑对的**：soft_tag 包里同时有 `katago/katago`（Linux ELF）
+     **同名不同平台要挑对的**：soft_tag 包里同时有 `katago/katago`（Linux ELF）
       和（若在 Windows 上测试时）`katago/katago.exe`。按 glob 顺序取第一个会在
       Windows 上选中 ELF，报 `WinError 193 %1 不是有效的 Win32 应用程序`。
       故按平台显式偏好带后缀的那个。
@@ -544,7 +544,7 @@ _APPIMAGE_MAGIC = b"AI\x02"
 def is_appimage(path):
     """`path` 是否是 AppImage（仅识别 type 2 的 ELF 头布局）。
 
-    ⚠ 打包期只校验「是不是 ELF」是不够的：AppImage 本身就是 ELF，只有 offset 8
+     打包期只校验「是不是 ELF」是不够的：AppImage 本身就是 ELF，只有 offset 8
       的 `AI\\x02` 能把它和真正的裸二进制区分开。漏了这一条就会发出一个在目标
       环境完全跑不起来的包。
     """
@@ -564,7 +564,7 @@ def resolve_katago(exe):
       · AppImage 已解包 -> `squashfs-root/AppRun`（它会设好 LD_LIBRARY_PATH）
       · AppImage 未解包 -> 抛带指引的错，**不自动解包**
 
-    ⚠ 不自动解包是刻意的：解包会往包目录落 ~100MB 的 `squashfs-root/`，属于用户
+     不自动解包是刻意的：解包会往包目录落 ~100MB 的 `squashfs-root/`，属于用户
       可见的磁盘副作用，不该由脚本默认触发。手工解一次之后本函数直接复用，
       往后无需再介入。
     """
@@ -581,7 +581,7 @@ def resolve_katago(exe):
             f"      cd {base}\n"
             f"      ./{os.path.basename(exe)} --appimage-extract\n\n"
             f"  之后重跑本命令即可。")
-    # ⚠ 捆绑 so 的目录必须一并交给 ldd：AppRun 会设 LD_LIBRARY_PATH，裸 ldd
+    # 捆绑 so 的目录必须一并交给 ldd：AppRun 会设 LD_LIBRARY_PATH，裸 ldd
     #   看不到，于是把**自带的** libzip 报成「not found」（实测假警报）。
     #   用分段 join 而不是 "usr/lib" 这种字面斜杠 —— 后者在 Windows 上碰巧能过，
     #   但断言与跨平台行为会对不齐。
@@ -662,7 +662,7 @@ def main():
                          "1.5% ≈ 0.015。抽的是**局**，再在局内取 "
                          "--move-lo~--move-hi 区间")
     ap.add_argument("--max-visits", type=int, default=36,
-                    help="每局面的 search 预算。⚠ KataGo 实际达成 = 此值 + 1"
+                    help="每局面的 search 预算。 KataGo 实际达成 = 此值 + 1"
                          "（根节点首次展开也计一次 visit），属引擎口径而非 bug。"
                          "实测吞吐：32→1.39 / 48→0.93 局面/s（visits 越低越快，"
                          "但搜索深度浅、软标签的'搜索知识'变弱）")
@@ -758,7 +758,7 @@ def main():
     # repo 已在上面（SGF 目录探测处）算好：引擎**必须在项目根启动**
     #（KataGo 的 KataGoData/ 按 cwd 解析）
     #
-    # ⚠⚠ `cursor` 是「下一个待处理局面的下标」，**不是已写行数**。P0 之前这两者
+    # `cursor` 是「下一个待处理局面的下标」，**不是已写行数**。P0 之前这两者
     #   被混为一谈（`todo = range(done, len(positions))`），一旦跳过局面就错位：
     #   续跑会拿 `positions[i]` 去配第 i 行，而 i 已经不是它当初对应的局面 ——
     #   结果是**静默产出错位的标签**（pos_hash 与 policy 不再属于同一局面，
@@ -899,7 +899,7 @@ def main():
             f.close()
 
     # 拼成最终 npz。
-    # ⚠ 行数从**落盘文件长度**反推，不用 `cursor` 也不用 `n`：隔离局不写行，
+    # 行数从**落盘文件长度**反推，不用 `cursor` 也不用 `n`：隔离局不写行，
     #   续跑时 `n` 只统计本次，而文件里还有上次的行。pos_hash 是定长 uint64，
     #   拿它数行最可靠。
     out = {k: np.fromfile(f"{part}.{k}.part.npy", dtype=dt).reshape(-1, *sh)
@@ -913,7 +913,7 @@ def main():
                              ("move_idx", np.int32, ()))}
     m = int(out["pos_hash"].size)
     # 定长记录写在同一批 flush 下，各列**行数**必然一致；不一致说明文件被外部动过。
-    # ⚠ 必须比 shape[0]（行数）而不是 size（元素数）—— policy 是 (N, 362)，
+    # 必须比 shape[0]（行数）而不是 size（元素数）—— policy 是 (N, 362)，
     #   14 行就有 5068 个元素，拿 size 比会把正常数据误判成损坏。
     bad_cols = {k: v.shape[0] for k, v in out.items() if v.shape[0] != m}
     if bad_cols:
@@ -946,7 +946,7 @@ def main():
             print(f"  {k:12s} {c:6,d} 局")
         rate = len(skipped) / n_games_total
         if rate > 0.02:
-            print("  ⚠ 跳过率 >2%：多半是 sgf_parser 把 AB/AW 布局子并入了 moves。"
+            print(" 跳过率 >2%：多半是 sgf_parser 把 AB/AW 布局子并入了 moves。"
                   "应改用 KataGo 的 initialStones + initialPlayer 正规化，"
                   "并用 tmp/bench/verify.npz 回归 join 命中率。")
     else:

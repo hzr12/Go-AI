@@ -47,7 +47,7 @@ def _func(name):
 class _Log:
     """够用的 logger 替身：记录 info/warning，便于断言「说了什么」。
 
-    ⚠ 方法名就是 `info` / `warning`（代码按 logging 的形态调），所以记录用的
+     方法名就是 `info` / `warning`（代码按 logging 的形态调），所以记录用的
     列表必须换名字 —— 否则属性会把方法遮蔽，报 `'list' object is not callable`。
     """
 
@@ -178,7 +178,7 @@ def test_downgrade_only_touches_detail(monkeypatch):
 def test_downgrade_is_before_init_and_preflight_after():
     """顺序即语义：DETAIL 降级在通信域建立**之前**，自检在**之后**。
 
-    ⚠ 这条**与包裹层无关**：判据是「环境变量必须在通信域建立前改掉」，而不是
+     这条**与包裹层无关**：判据是「环境变量必须在通信域建立前改掉」，而不是
     「哪种包裹层在 DETAIL 下更贵」。2026-10-01 FSDP1 → DDP 换轨时降级**保留**、
     理由被改写过一次又再改回（spec §5.4：真理由是 DETAIL 会在建域时给每个 PG 套
     一层一致性检查 wrapper，**每次 collective 前跑一次 `monitored_barrier`** ——

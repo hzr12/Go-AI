@@ -35,10 +35,10 @@ spec §4.5 的表里每项都有一列「系数」，但同节末尾的说明是
 `metrics_pytorch.py` 一致，别给它补一个 `w_*`。
 
 #7 的目标 `std(softmax(scorebelief))` 是 5~20 量级，Huber 的 δ=10 同量级。
-⚠ 这与 `katago_v7.SCORE_STDEV_SOFTPLUS_BETA = 0.05`（spec §4.2 的**字面值**，已弃用）
+ 这与 `katago_v7.SCORE_STDEV_SOFTPLUS_BETA = 0.05`（spec §4.2 的**字面值**，已弃用）
 # 矛盾 —— 那个值让 `score_stdev` 预测初值落在 **277.26**、本项公式值 **272.22**
 # （δ=10 的 27 倍），初期梯度被常数偏差完全支配。
-# ✅ **已裁决为 `SCORE_STDEV_SOFTPLUS_BETA = 1.0`**（2026-10-03）⇒ 实测预测初值
+# **已裁决为 `SCORE_STDEV_SOFTPLUS_BETA = 1.0`**（2026-10-03）⇒ 实测预测初值
 # **13.86**、本项公式值 **8.83**，**落在 δ=10 以内**（Huber 二次段，梯度有效）。
 # 推导链与实测数字见该常量上方的注释块。纯常量 ⇒ 结构/参数量/预算不变。
 """
@@ -62,19 +62,19 @@ LOSS_COEFFS = {
     'lead': 0.0060,
     # varTimeLeft（官方 sv3Mul 六通道的下标 3）。系数与 lead 同档：两者都
     # 是「局面不确定性」的标量，量纲都是 0~数百，Huber δ 取 8。
-    # ⚠ 训练数据 col22 里存的**已经是最终物理量**（见 COL_VAR_TIME_LEFT），
+    # 训练数据 col22 里存的**已经是最终物理量**（见 COL_VAR_TIME_LEFT），
     #   而 `out['var_time_left']` 已乘过 VARIANCE_TIME_MULTIPLIER=40，
     #   两者口径一致，可直接回归。
     'var_time_left': 0.0060,
     'scoring': 0.25,
-    'futurepos': 1.0,      # ⚠ 0.25 已内嵌在公式里（spec §4.5 #11）
-    'seki': 1.0,           # ⚠ 自适应因子，见 `_seki_adaptive_scale`
+    'futurepos': 1.0, # 0.25 已内嵌在公式里（spec §4.5 #11）
+    'seki': 1.0, # 自适应因子，见 `_seki_adaptive_scale`
 }
 
 #: scorebelief 的桶数与中心（spec §4.4：桶数 = 2*(361+60) = 842，mid = 421）。
 #: 软标签 policy 项的**全局缩放**（对应 12 通路CLI 的 ``--soft-weight``）。
 #:
-#: ⚠ 它**不是** ``LOSS_COEFFS`` 里的一项 —— 那是「有哪些 term」的清单，加进去会
+#: 它**不是** ``LOSS_COEFFS`` 里的一项 —— 那是「有哪些 term」的清单，加进去会
 #:   破坏 ``set(terms) == set(LOSS_COEFFS)`` 这条被测试钉住的不变量。
 #:   它是 policy 项的**量级旋钮**：软 CE 的分母恒为 B（不是 Σmask），所以软项
 #:   的量级随「本批软行占比」线性变化，需要一个固定系数把它标定回来。
@@ -171,7 +171,7 @@ def policy_dense_from_sparse(idx, val, action_size=362, renormalize=True):
     和为 1 的合法分布。丢了多少由标签侧单独记账（``to_v7_labels`` 的
     ``policy_resid``），作为「K=16 够不够大」的哨兵。
 
-    ⚠ 接受 numpy 输入：整条数据链路（`dataset.py` / `katago_npz.py`）产出的
+     接受 numpy 输入：整条数据链路（`dataset.py` / `katago_npz.py`）产出的
     都是 numpy，在这里 `torch.as_tensor` 比要求上游先转一遍更不容易漏。
 
     Args:
@@ -192,7 +192,7 @@ def policy_dense_from_sparse(idx, val, action_size=362, renormalize=True):
 def seki_targets_from_plane(seki):
     """三值平面 ``(B,1,361) ∈ {−1,0,+1}`` → ``(sign (B,361) int64, neutral (B,361))``。
 
-    ⚠ **这一层是 spec 的缺口，需要核对。** loss #12 用的是
+     **这一层是 spec 的缺口，需要核对。** loss #12 用的是
     ``CE_sign[3] + 0.5·CE_neutral``，即标签必须同时给「三分类符号」与
     「是否中性」两个量；而 spec §5.4 的标签契约只给了一个 ``seki (B,1,361)``
     的三值平面。
@@ -222,7 +222,7 @@ def _weighted_mean(per_sample, weight, probe=None, tag=''):
     噪声水平（分母趋零）。`samplewise` 的语义是逐样本损失对 batch 取均值，
     行权重只作为逐样本的乘子。
 
-    🔴 **`w==0` 的行必须先摘掉非有限值**（2026-10-04 云端 910A 实测
+     **`w==0` 的行必须先摘掉非有限值**（2026-10-04 云端 910A 实测
        `(inf * 0).mean()` = **NaN**）。
        那些行按定义贡献恰好 0，而「inf × 0 = NaN」（IEEE-754）会让**整项**
        变成 NaN ⇒ 系数非 0 的主目标也会被一行坏数据带崩。
@@ -281,14 +281,14 @@ class KataGoV7Loss(nn.Module):
         永远学不动。分母那个 0.005 是「多大算大」的锚：EMA 远小于它时系数趋于
         ``8·0.005/0.005 = 8``，EMA 追上来后系数回落到 O(1)。
 
-        ⚠ EMA 只在**训练态**更新：`forward` 里用 `self.training` 挡着，
+         EMA 只在**训练态**更新：`forward` 里用 `self.training` 挡着，
         否则 eval/推理会顺手改 buffer，而 `.eval()` 下反复跑同一个 batch 得到
         不同 loss 是最難查的一类 bug。
         """
         cur = seki_loss.detach()
         if self.training:
             with torch.no_grad():
-                # 🔴 **NaN/Inf 一律不写进 buffer**（2026-10-04 云端 910A 实跑）。
+                # **NaN/Inf 一律不写进 buffer**（2026-10-04 云端 910A 实跑）。
                 #   `seki_ema` 是**注册 buffer** ⇒ 一次写入就是**永久**的：之后每一步
                 #   的 adaptive scale 都是 NaN ⇒ `terms['seki']` 是 NaN ⇒ 加权总
                 #   loss 是 NaN ⇒ **全部**参数梯度 NaN ⇒ GradScaler 永远跳步。
@@ -298,7 +298,7 @@ class KataGoV7Loss(nn.Module):
                 #   （211/98/8）—— 一个「每步重新发生」的溢出会让计数抖动，
                 #   而一个被 buffer 记住的 NaN 会给出恒定的结果。
                 #
-                #   ⚠ 更糟的是它**进 state_dict** ⇒ 存下来的 `.pth` 与
+                # 更糟的是它**进 state_dict** ⇒ 存下来的 `.pth` 与
                 #   `--resume` 都带着毒，换台机器续训照样每步 NaN。
                 #
                 #   为什么此前没被发现：段 1 的 seki 系数是 1.0 但**该项在 CPU 上
@@ -314,7 +314,7 @@ class KataGoV7Loss(nn.Module):
                 else:
                     self.seki_ema.mul_(SEKI_EMA_MOMENTUM).add_(
                         cur * (1.0 - SEKI_EMA_MOMENTUM))
-        # ⚠ 兜底：即使 buffer 在别处（加载旧 checkpoint、手工改写）已经是 NaN，
+        # 兜底：即使 buffer 在别处（加载旧 checkpoint、手工改写）已经是 NaN，
         #   也不能让它进 loss。`float()` 只在**标量** buffer 上调用，代价可忽略。
         if not torch.isfinite(self.seki_ema):
             return self._seki_fallback_scale()
@@ -323,7 +323,7 @@ class KataGoV7Loss(nn.Module):
     def _seki_fallback_scale(self):
         """「seki 极少」那个系数（`8·0.005/0.005 = 8`），**以 tensor 返回**。
 
-        ⚠ 必须是 tensor：本函数的返回值会进 `return {... 'seki_adaptive_scale':
+         必须是 tensor：本函数的返回值会进 `return {... 'seki_adaptive_scale':
           adaptive.detach()}`，给 Python float 会在那里抛
           `AttributeError: 'float' object has no attribute 'detach'` ——
           而那正是「NaN 兜底路径」本身，它一旦抛异常就等于**没兜**，
@@ -375,7 +375,7 @@ class KataGoV7Loss(nn.Module):
             v = w.get(name)
             return ones if v is None else T(v).reshape(-1)
 
-        # ⚠ seki 的行权重**不能**默认取 w_ownership（spec §4.5 #12 写的是
+        # seki 的行权重**不能**默认取 w_ownership（spec §4.5 #12 写的是
         # w_ownership，但那是「从 SGF 自造标签」时的口径）。在 stdata 上
         # seki 通道实测**极稀有**（~1e-4 的格子，前两批几乎全 0），而
         # w_ownership 在 91% 的行上是 1 ⇒ 复用它等于让 seki 头在 99.99%
@@ -392,10 +392,10 @@ class KataGoV7Loss(nn.Module):
         def soft_ce(target, ch):
             """某一通道的软 CE，口径与 12 通路 `soft_cross_entropy` 逐位一致。
 
-            ⚠ 逐行**二选一**（`mask=0` 的行贡献恰好 0，**不退化成 one-hot CE**）。
-            ⚠ 分母恒为 B（不是 Σmask）—— 软项量级随「本批软行占比」线性变化，
+             逐行**二选一**（`mask=0` 的行贡献恰好 0，**不退化成 one-hot CE**）。
+             分母恒为 B（不是 Σmask）—— 软项量级随「本批软行占比」线性变化，
               `policy_soft_weight` 就是标定量级的旋钮。
-            ⚠ 一律 fp32、绝不上 fp64（910A 无 fp64 硬件，设备侧 fp64 会挂 AICPU
+             一律 fp32、绝不上 fp64（910A 无 fp64 硬件，设备侧 fp64 会挂 AICPU
               且报错栈指向无关算子）。
             """
             tgt = T(target).reshape(-1, self.action_size)
@@ -407,14 +407,14 @@ class KataGoV7Loss(nn.Module):
             return w_soft * (per_row * mask).mean()
 
         # ---- 1 policy（系数 1.0，行权重恒 1）----
-        # 🔴 软标签（2026-10-04）：`labels['soft']` 形状是 **(B, A)**（只管
+        # 软标签（2026-10-04）：`labels['soft']` 形状是 **(B, A)**（只管
         #    **通道 0 = π**），不是 (B,K,A)。stdata 分片里
         #    `policy_player_prob` 存的就是 KataGo 搜索访问分布（实测一行
         #    853/16/12/4/1/1，和 887），归一化后即是软标签。
         #    缺席时退回 one-hot（board 级路径的老行为）。
         soft = labels.get('soft')
         soft_mask = labels.get('soft_mask')
-        # ⚠ `soft_mask` 全 0 是 `SupervisedDataset` 约定的「**本批无软标签**」
+        # `soft_mask` 全 0 是 `SupervisedDataset` 约定的「**本批无软标签**」
         #   （未挂 `--soft-index` 时它就是全 0）。若照字面走软 CE，policy 会拿到
         #   **恰好 0** 的梯度 —— 不报错、loss 照降、policy 根本没学。
         #   所以「有没有软标签」以 mask 是否有命中为准，缺席时退回 one-hot。
@@ -431,7 +431,7 @@ class KataGoV7Loss(nn.Module):
                 -(pi * logp[:, 0]).sum(-1), None)
 
         # ---- 2 π_opp（系数 0.15，局末手权重 0）----
-        # 🔴 必须用**对手侧**的目标：`labels['soft_opp']`（来自分片的
+        # 必须用**对手侧**的目标：`labels['soft_opp']`（来自分片的
         #    `policy_opp_prob`）。旧实现拿 player 的着法去填这一项，
         #    于是 #1 与 #2 拿到**同一个**目标，π_opp 白训。
         soft_opp = labels.get('soft_opp')
@@ -475,7 +475,7 @@ class KataGoV7Loss(nn.Module):
             (cdf_p - cdf_t).pow(2).sum(-1), w_of('score'))
 
         # ---- 7 scorestdev 自预测（系数 0.001，**仅 game_weight，无行权重**）----
-        # 🔴 `std` **不能**直接调 `F.softmax(...).std(-1)`（2026-10-04 云端 910A
+        # `std` **不能**直接调 `F.softmax(...).std(-1)`（2026-10-04 云端 910A
         #   实测点名到本项：加权 loss 非有限，逐项点名 = ['score_stdev']）。
         #
         # 根因：scorebelief 有 **842 个桶**，初始化时 logits 近均匀 ⇒ p ≈ 1/842
@@ -493,7 +493,7 @@ class KataGoV7Loss(nn.Module):
         _sb_p = F.softmax(sb_logits, dim=-1).float()
         _sb_mu = _sb_p.mean(dim=-1, keepdim=True)
         sb_std = (_sb_p - _sb_mu).pow(2).mean(dim=-1).sqrt()
-        # 🔴 **给 std 一个下界**（2026-10-04 云端 910A，第二轮）。
+        # **给 std 一个下界**（2026-10-04 云端 910A，第二轮）。
         #   上面修了**前向**（两遍算法），但真机仍点名到本项 ⇒ 坏的是**反向**：
         #   `d(sqrt(v))/dv = 1/(2·std)`。实测初始化时 std ≈ **1.17e-7**
         #   （842 桶近均匀）⇒ 局部导数 ≈ **4.27e6**，远超 fp16 的 65504 ⇒
@@ -509,7 +509,7 @@ class KataGoV7Loss(nn.Module):
         sb_std = sb_std.clamp_min(SCORE_STDEV_TARGET_FLOOR)
         # 操作数级归因：下一轮日志能直接看出是「预测」还是「目标」坏掉，
         # 而不必再猜（真机与本机的 std 实现不同，只有真机能回答）。
-        # ⚠ 下面的 `huber(out['score_stdev'].float(), sb_std, ...)` 是
+        # 下面的 `huber(out['score_stdev'].float(), sb_std, ...)` 是
         #   `tests/test_katago_v7_budget.py::test_score_stdev_loss_term_is_inside_
         #   huber_delta_at_the_ruled_out_beta` 按**字面量**钉住的（它要保证本路
         #   的 δ 与测试常量同步）⇒ **不要**把 `out['score_stdev'].float()` 提成一个
@@ -533,14 +533,14 @@ class KataGoV7Loss(nn.Module):
             huber(out['lead'].float(), score_t, 8.0), w_of('lead'))
 
         # ---- 9b varTimeLeft（官方 sv3[3]，系数 0.0060，δ=8）----
-        # ⚠ **不能用 `w_of('lead')`**。实测（zzb28c512nfd4 三个成员、12748 行）
+        # **不能用 `w_of('lead')`**。实测（zzb28c512nfd4 三个成员、12748 行）
         #   各权重列与 col22 非零模式的一致率：
         #     col29 w_lead          19.7% 非零，一致率仅 **27.4%**  ← 错
         #     col25 global_weight  100%  非零，一致率 87.4%（= col22 自身非零率）
         #   `w_lead` 的门控跟着 **lead 有没有值**（col21）走，而 varTimeLeft
         #   在 lead 缺失的 66% 行里照样有值。复用它会白白丢掉三分之二的数据。
         # ⇒ 用 `game_weight`（与 `score_stdev` 一致），即整行有效即参与。
-        # ⚠ 标签或输出任一缺失时**跳过**而不是喂 0 —— 喂 0 会把这一路往
+        # 标签或输出任一缺失时**跳过**而不是喂 0 —— 喂 0 会把这一路往
         #   「方差恒 0」的方向硬拉，比不训练更糟。`out.get` 而非 `out[...]`
         #   是为了让只构造了部分输出的测试桩也能跑通（真实模型恒有该键）。
         vtl_t = labels.get('var_time_left')
@@ -576,7 +576,7 @@ class KataGoV7Loss(nn.Module):
         seki_logits = out['seki_logits'].float()
         # 逐 (样本, 格) 对 3 个符号类做 CE：把类维放中间 ⇒
         # cross_entropy(input=(B,3,N), target=(B,N)) → (B,N)。
-        # ⚠ 误写成 reshape(B*3, N) 会让 cross_entropy 把 361 当类维，
+        # 误写成 reshape(B*3, N) 会让 cross_entropy 把 361 当类维，
         # 报「input batch_size 12 vs target 1444」—— 一眼能看出，但更糟的
         # 写法是 (B,3,N)→(B*N,3) 再转置，形状对而语义错，静默学错。
         ce_sign = F.cross_entropy(
@@ -591,12 +591,12 @@ class KataGoV7Loss(nn.Module):
         terms['seki'] = _wm('seki', seki_raw * adaptive, w_of('seki'))
 
         # ---- 装配：逐项乘**有效**系数（只乘一次）----
-        # 🔴 **净化数值，但绝不切断计算图**（2026-10-04 云端 910A 实跑）。
+        # **净化数值，但绝不切断计算图**（2026-10-04 云端 910A 实跑）。
         #   `0.0 * NaN == NaN`（IEEE-754，不是 0）⇒ 只要 13 项里任何一项算坏，
         #   加权总 loss 就是 NaN，而它一 NaN，**每一个**收到梯度的参数张量都是
         #   NaN —— 实测 317/322，正是这个签名。
         #
-        #   ⚠ **不能**用「c==0 就直接给 0.0」那种写法（我先写了这个版本）：
+        # **不能**用「c==0 就直接给 0.0」那种写法（我先写了这个版本）：
         #     那会把这些项从图里摘掉 ⇒ 它们的参数 `grad=None` ⇒ DDP 抛
         #     `Expected to have finished reduction in the prior iteration`
         #     （真机 2 卡实测，参数索引 308-321）。**安静地剪掉梯度不是修复，
@@ -616,7 +616,7 @@ class KataGoV7Loss(nn.Module):
         total = sum(weighted.values())
         # 逐项指认「哪一项坏了」。
         #
-        # ⚠ **不能只在 `total` 非有限时才扫**：正因上面保证了 c==0 的项不进加总，
+        # **不能只在 `total` 非有限时才扫**：正因上面保证了 c==0 的项不进加总，
         #   `total` 对这些项是**恒有限**的 ⇒ 那种写法下它们永远不会被点名，
         #   而它们恰恰是唯一「坏了但看不出来」的一类。
         #

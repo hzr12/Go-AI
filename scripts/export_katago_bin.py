@@ -6,7 +6,7 @@
 
     解析出来的**中间表示语义**对不对？转发写出的文件**真实引擎**认不认？
 
-⚠ 为什么 round-trip 不够：`serialize_model(parse_model(x)) == x` 对**任何**只要
+ 为什么 round-trip 不够：`serialize_model(parse_model(x)) == x` 对**任何**只要
 自洽的读写器都成立 —— 把 `linear_gate` 读进 `linear2`、把 `numBlocks` 读成
 `numBlocks+1`，往返照样逐字节一致，但权重已经张冠李戴。这两类 bug 互相掩盖。
 所以真正的验收必须是：**同一份官方权重，官方引擎加载前后给出同一份输出**。
@@ -22,7 +22,7 @@
     打印层清单与结构摘要（trunk 拓扑 / 两个 head / 层表）。
 
 ``export --checkpoint ours.pth --out ours.bin.gz``
-    🔴 **未实现，故意抛 `NotImplementedError``** → ✅ **2026-10-03 已实现**。
+     **未实现，故意抛 `NotImplementedError``** → **2026-10-03 已实现**。
     翻译逻辑在 `src/data/katago_export.py`（含两处结构差异与四个被剥离的
     自研头的完整说明）；本函数只做包装 + **强制读回自检**。
     已用随机权重验证：引擎报 ``Model name: goai_v7 (nbt transformer,
@@ -71,8 +71,8 @@ OFFICIAL_PARAMS = 10_545_753
 #     sv3Mul/bias  -> numScoreValueChannels    = 6      ← 关键
 #     ownership    -> numOwnershipChannels     = 1
 # 我们的 `ValueHead`（`src/networks/katago_v7.py:571-582`）：
-#     outcome : Linear(96 -> 3)    -> v3        (3)   ✔ 通道数对得上
-#     scores  : Linear(96 -> 3)    -> sv3       (3)   ✘ 官方要 6
+# outcome : Linear(96 -> 3) -> v3 (3) 通道数对得上
+# scores : Linear(96 -> 3) -> sv3 (3) 官方要 6
 #     ownership/scoring/futurepos/seki : 1x1 conv on VV
 #     ScorebeliefHead : 842 桶混合分布（katago_v7.py:612-647）
 # 我们的 `PolicyHead`（`katago_v7.py:487`）：
@@ -171,7 +171,7 @@ def forward_bytes(data: bytes) -> ForwardResult:
 def forward(in_path: str, out_path: Optional[str] = None) -> ForwardResult:
     """转发一个模型文件。可选写出到 `out_path`。
 
-    ⚠ 比较的是 **decompressed payload**。`.gz` 容器本身**必然**与官方文件不同 ——
+     比较的是 **decompressed payload**。`.gz` 容器本身**必然**与官方文件不同 ——
     官方是 KataGo 自带的 zlib 打的，我们用 Python `gzip`（`mtime=0`，保证可复现）。
     容器字节不可比，payload 才是模型本身。
     """

@@ -98,7 +98,7 @@ def test_overflow_warning_threshold_exists():
 # 跳过步的记账：两条被真日志打出来的错误（2026-10-04 云端 910A）
 # --------------------------------------------------------------------------- #
 def test_skip_rate_denominator_cannot_exceed_100():
-    """🔴 「跳过占比」的分母不能是 `step`。
+    """ 「跳过占比」的分母不能是 `step`。
 
     真日志里打出了 `累计跳过 4 步（占比 133.33%）` —— 分母比分子还小。根因：
     `_n_skipped += 1` 在 `scaler.step()` 那一行，而 `step += 1` 在 47 行**之后**
@@ -124,7 +124,7 @@ def test_skip_rate_denominator_cannot_exceed_100():
 
 
 def test_scheduler_and_ema_do_not_advance_on_skipped_steps():
-    """🔴 跳过的步**不许**推进 LR 计划与 EMA。
+    """ 跳过的步**不许**推进 LR 计划与 EMA。
 
     `scaler.step()` 在检出 inf 时**内部跳过** `optimizer.step()`，但对调用方
     是「成功返回」的 ⇒ 无条件 `scheduler.step()` 会让 warmup/cosine 在
@@ -150,7 +150,7 @@ def test_scheduler_and_ema_do_not_advance_on_skipped_steps():
 
 
 def test_real_step_is_derived_from_scale_not_from_grads():
-    """⚠ 判据必须是「缩放值是否下降」，不能改成「扫梯度是否有限」。
+    """ 判据必须是「缩放值是否下降」，不能改成「扫梯度是否有限」。
 
     `GradScaler` **只在跳步时**降 scale（成功时它只等 `growth_interval` 到才 ×2），
     所以缩放值是 O(1) 的可靠信号；而扫 5.5M 个参数判有限性要在打点路径上
@@ -162,7 +162,7 @@ def test_real_step_is_derived_from_scale_not_from_grads():
 
 
 def test_terms_float_call_detaches_before_synchronising():
-    """⚠ 逐项 loss 取标量必须 `.detach()`。
+    """ 逐项 loss 取标量必须 `.detach()`。
 
     `weighted` 的值是**带计算图**的张量，`float(x)` 每步触发一次
     `UserWarning: Converting a tensor with requires_grad=True to a scalar`
@@ -176,7 +176,7 @@ def test_terms_float_call_detaches_before_synchronising():
 
 
 def test_overflow_diagnostics_are_rank0_only():
-    """🔴 溢出诊断必须 `is_main` 门控。
+    """ 溢出诊断必须 `is_main` 门控。
 
     真日志（2 卡）里每条溢出消息都**打印两遍** —— 无条件 `logger.warning` +
     `_locate_overflow` 的后果。4 卡就是 4 份一模一样的文本，反而掩盖了
@@ -296,7 +296,7 @@ def test_locate_overflow_classification_is_index_independent():
 
 
 def test_clip_grad_norm_turns_inf_into_nan_and_hides_it():
-    """🔴 **本轮修的正是这个 bug 的成因**，先把机制钉死。
+    """ **本轮修的正是这个 bug 的成因**，先把机制钉死。
 
     `clip_grad_norm_(max_norm=1.0)` 在 `total_norm = inf` 时算出
     `clip_coef = 0` 并 `grad.mul_(0)` ⇒ `inf × 0 = NaN`。而
@@ -323,7 +323,7 @@ def test_clip_grad_norm_turns_inf_into_nan_and_hides_it():
 
 
 def test_locate_overflow_names_the_module_that_actually_had_inf():
-    """🔴 修复后的诊断必须指出**哪个模块**，而不是只给一个 LR 猜测的组名。
+    """ 修复后的诊断必须指出**哪个模块**，而不是只给一个 LR 猜测的组名。
 
     真机日志里三组全被打成 `backbone/policy`（组名是按 LR 比值猜的，
     `--value-lr-mult` 一改就失效）。而 `inf × 0 = NaN` 是**原地**写在同一个

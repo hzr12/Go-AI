@@ -48,7 +48,7 @@ A = 362
 # 核心前提：Tensor 输入不许走 numpy
 # --------------------------------------------------------------------------- #
 def test_tensor_input_never_touches_numpy(monkeypatch):
-    """🔴 给 Tensor 时**不许**调 `np.asarray` —— 那正是 NPU 崩溃的那一行。
+    """ 给 Tensor 时**不许**调 `np.asarray` —— 那正是 NPU 崩溃的那一行。
 
     用「把 numpy 转换打成会炸的」在 CPU 上复现 NPU 的前提：CPU 张量本来
     能被 numpy 消费，不这样就没法在无 NPU 的机器上钉住这条。
@@ -68,7 +68,7 @@ def test_tensor_input_never_touches_numpy(monkeypatch):
 
 
 def test_numpy_input_still_works(monkeypatch):
-    """⚠ 修设备问题不能**弄坏** numpy 输入那条路（dataset 侧给的就是 numpy）。"""
+    """ 修设备问题不能**弄坏** numpy 输入那条路（dataset 侧给的就是 numpy）。"""
     real = np.asarray
 
     def _boom(x):
@@ -102,7 +102,7 @@ def test_tensor_and_numpy_paths_are_bitwise_identical(moves):
 
 
 def test_out_of_range_and_sentinel_rows_are_all_zero():
-    """⚠ 非法行号与 `-1` 哨兵都必须**全零**，且**不是**随便某个类。
+    """ 非法行号与 `-1` 哨兵都必须**全零**，且**不是**随便某个类。
 
     `-1` 的语义是「没有下一手」（局末 / 跨局 / pass），对应
     `w['policy_opp'] == 0`；越界同理。交给 `F.one_hot(-1)` 的行为不是本仓
@@ -132,7 +132,7 @@ def test_grad_is_not_flowing_through_the_label():
 # 设备：结果留在输入所在设备（不要静默搬回主机）
 # --------------------------------------------------------------------------- #
 def test_result_stays_on_the_input_device():
-    """🔴 输出必须在 `moves` 所在设备 —— 否则每步多两次 H2D/D2H。
+    """ 输出必须在 `moves` 所在设备 —— 否则每步多两次 H2D/D2H。
 
     CPU 上这个断言平凡成立，但它是「不许退回 `.cpu()` 修法」的护栏：
     有人为了省事改成 `np.asarray(moves.cpu())` 时，本条在 CPU 上抓不到，
@@ -146,7 +146,7 @@ def test_result_stays_on_the_input_device():
 
 
 def test_non_contiguous_input_is_handled():
-    """⚠ 传进来的可能是**非连续**视图（切片 / 转置的 `moves`）。
+    """ 传进来的可能是**非连续**视图（切片 / 转置的 `moves`）。
 
     `.reshape(-1)` 而不是 `.view(-1)`：后者对非连续张量抛
     「view size is not compatible with input tensor's size」。
@@ -175,7 +175,7 @@ def test_float_tensor_moves_is_cast_not_rejected():
 # v7_loss_labels 端到端（真实崩溃点）
 # --------------------------------------------------------------------------- #
 def test_v7_loss_labels_accepts_a_tensor_for_moves():
-    """🔴 真实崩溃点是 `v7_loss_labels(lbl, move_t, ...)`，不是一个孤立函数。
+    """ 真实崩溃点是 `v7_loss_labels(lbl, move_t, ...)`，不是一个孤立函数。
 
     `move_t` 在训练循环里是 `torch.from_numpy(...).to(device)` 的结果 ⇒ NPU 上
     是设备张量。这里用「打掉 numpy 转换」在 CPU 上复现那个前提。
@@ -209,7 +209,7 @@ def test_v7_loss_labels_accepts_a_tensor_for_moves():
 def test_policy_opp_falls_back_to_next_move_when_absent():
     """board 级路径没有 `next_move_opp` ⇒ 退回 `next_move`（旧行为）。
 
-    ⚠ 这条退路在 stdata 上会让 #1/#2 拿到**同一个**目标（π_opp 白训），
+     这条退路在 stdata 上会让 #1/#2 拿到**同一个**目标（π_opp 白训），
     所以 packed 路径**必须**给 `next_move_opp` —— 由
     `tests/test_v7_soft_ce.py::test_policy_and_policy_opp_use_different_targets`
     钉住「两条路的标签真的不同」。

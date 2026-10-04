@@ -768,7 +768,7 @@ def _ppo_policy_loss(logits, mask, action, logp_old, adv, clip_eps, kl_coef,
     返回 (loss, stats)，stats = {'kl', 'clip_frac', 'entropy', 'w_mean', 'w_clip_frac'}
     （detach 后的 float）。
 
-    ★ B2（2026-09-30）：surrogate 的**两项都乘 w**，KL **不乘**。
+     B2（2026-09-30）：surrogate 的**两项都乘 w**，KL **不乘**。
       - 乘 w：surrogate 估的是 E_{q}[w·min(...)]，正是 J(π_θ) 的无偏（截断后有偏）
         估计。w 是常量（buffer 字段、无梯度），乘进 min 内部是对的 —— 不能先
         平均再乘，两个 surrogate 分支的 min 是**逐样本**取的。

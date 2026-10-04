@@ -5,7 +5,7 @@
 而且错了之后**不报错**——只会静默地把 9 盘的行当 19 盘、把权重列读错位。
 所以每条都必须有单测。
 
-⚠ 依赖 `katago/stdata/*.tgz`（1.5 GB）的那几条用 `pytest.mark.skipif` 跳过；
+ 依赖 `katago/stdata/*.tgz`（1.5 GB）的那几条用 `pytest.mark.skipif` 跳过；
 纯合成的几条（布局分派、topk、越界检查）**永远跑** —— 那些是最容易写错的部分。
 """
 
@@ -117,7 +117,7 @@ def test_unpack_rejects_wrong_channel_count():
 
 
 def test_unpack_rejects_wrong_packed_width():
-    """⚠ `np.unpackbits` 的 axis 默认 None 会**静默展平**，形状检查必须自己做。"""
+    """ `np.unpackbits` 的 axis 默认 None 会**静默展平**，形状检查必须自己做。"""
     with pytest.raises(ValueError, match='packed 形状不符'):
         unpack_binary_input(np.zeros((2, SPATIAL_CHANNELS, 40), dtype=np.uint8))
 
@@ -143,7 +143,7 @@ def test_non_square_mask_yields_zero_not_a_nearest_size():
 def test_policy_index_in_board_uses_stride_19_not_s_times_c():
     """stride=19：9 盘的合法索引是 ``r*19+c``（r,c ≤ 8），最大 160。
 
-    ⚠ 注意 81 是**合法**的（= 4*19+5），因为 stride=19 下 0..160 并非连续 ——
+     注意 81 是**合法**的（= 4*19+5），因为 stride=19 下 0..160 并非连续 ——
     把它当反例会让人误以为「索引 > s² 就是小盘」，而真正的判据是
     ``r<9 且 c<9``。pass 槽 361 不算盘内索引。
     """
@@ -273,7 +273,7 @@ def test_to_v7_labels_drops_non_19x19_and_reports_the_count():
 
 
 def test_seki_weight_defaults_to_zero_not_ownership():
-    """⚠ 没有 w_seki 时必须按 0 处理：stdata 的 seki 极稀有，复用 w_ownership
+    """ 没有 w_seki 时必须按 0 处理：stdata 的 seki 极稀有，复用 w_ownership
     等于让 seki 头在 99.99% 的行上被推向「全中性」，还被 #12 的 ×8 放大。"""
     d = _fake_npz(n=4)
     lb = to_v7_labels(read_katago_npz(_Npz(d), 'kata1-tf3-b11c768'))
@@ -305,7 +305,7 @@ def test_all_zero_outcome_maps_to_noresult():
 def _first_npz(archive, limit=1):
     """流式取前 ``limit`` 个 npz。
 
-    ⚠ **按行取，不要按成员取**：`getmembers()` 要把 1.5 GB 的 tgz 整个解一遍
+     **按行取，不要按成员取**：`getmembers()` 要把 1.5 GB 的 tgz 整个解一遍
     才能列出成员，实测要几分钟；而我们需要的是「前 N 个里有 19×19 的行」，
     顺序流式取通常几十个就够。
     """
@@ -347,7 +347,7 @@ def test_real_stdata_score_distr_matches_official_bin_offset():
     非零桶**逐位相等**。这比任何合成 fixture 都强。
     """
     from src.networks.katago_v7_loss import build_score_distr_target
-    # ⚠ 前几个文件常常整批是小盘（实测 2026-08-25 的头几个文件 19×19 占比 0），
+    # 前几个文件常常整批是小盘（实测 2026-08-25 的头几个文件 19×19 占比 0），
     # 取太少会永远 skip 掉这条 —— 那是本文件里最强的一条断言，不能靠运气。
     raw, scanned = _first_with_19x19(ARCHIVE_0825)
     if raw is None:

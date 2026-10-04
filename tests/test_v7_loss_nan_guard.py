@@ -88,7 +88,7 @@ def test_zero_coefficient_terms_are_exactly_the_stage1_ones():
     ('lead', 'lead'),
 ])
 def test_broken_zero_weight_term_does_not_poison_the_total(term, key):
-    """🔴 `0.0 * NaN == NaN`（IEEE-754），不是 0。
+    """ `0.0 * NaN == NaN`（IEEE-754），不是 0。
 
     段 1 有 **9 项系数为 0**。它们本来就不参与优化，却仍要算、还要进反向 ⇒
     纯浪费，且是 NaN 的现成通道：任何一项在 NPU 上算坏，**加权总 loss 就是
@@ -108,7 +108,7 @@ def test_broken_zero_weight_term_does_not_poison_the_total(term, key):
     ('lead', 'lead'),
 ])
 def test_broken_zero_weight_term_is_still_named(term, key):
-    """🔴 守卫不能「顺手把证据也吞掉」—— 必须点名。
+    """ 守卫不能「顺手把证据也吞掉」—— 必须点名。
 
     正因为 `total` 对零系数项恒有限，**只在 `total` 非有限时才逐项扫**的那种
     写法会让这些项永远不被发现：训练看起来正常，而那一项其实一直没在学。
@@ -122,7 +122,7 @@ def test_broken_zero_weight_term_is_still_named(term, key):
 
 
 def test_seki_broken_is_reported_via_sanitized_rows():
-    """⚠ `seki` 走的是另一条路：它的行权重全为 0 ⇒ 被**净化**成有限。
+    """ `seki` 走的是另一条路：它的行权重全为 0 ⇒ 被**净化**成有限。
 
     所以它不会出现在 `nonfinite_terms` 里（那一项确实已经有限了），
     但必须出现在 `sanitized_rows` 里 —— 否则「seki 头一直在吐 inf」这件事
@@ -144,7 +144,7 @@ def test_healthy_forward_names_nothing():
 
 
 def test_broken_nonzero_weight_term_is_not_masked():
-    """⚠ 反向底线：**系数非 0** 的项坏了必须让 `total` 非有限。
+    """ 反向底线：**系数非 0** 的项坏了必须让 `total` 非有限。
 
     守卫只允许跳过 c==0 的项。若它扩大到 c!=0，就会把「主目标坏了」这种
     最该立刻发现的故障伪装成正常训练。
@@ -159,7 +159,7 @@ def test_broken_nonzero_weight_term_is_not_masked():
 
 
 def test_every_zero_weight_head_still_gets_a_gradient():
-    """🔴 计算图**必须完整** —— 剪掉就等于把 NaN 换成 DDP 崩溃。
+    """ 计算图**必须完整** —— 剪掉就等于把 NaN 换成 DDP 崩溃。
 
     真机 2 卡实测：`Expected to have finished reduction in the prior iteration.
     Parameter indices which did not receive grad for rank 0: 308 309 310 311
@@ -197,7 +197,7 @@ def build_katago_v7_net_for_test():
 
 
 def test_nan_to_num_keeps_the_graph_and_passes_gradient():
-    """⚠ `nan_to_num` 的反向语义必须仍是「图活着」。
+    """ `nan_to_num` 的反向语义必须仍是「图活着」。
 
     前向：非有限 → 0；反向：**有限处透传梯度**、非有限处给 0。
     若哪天它变成 detach 语义，这条会先红。
@@ -223,7 +223,7 @@ def test_nan_guard_actually_sanitizes_forward_but_not_the_reported_term():
 
 
 def test_score_stdev_survives_near_uniform_distribution():
-    """🔴 根因回归：842 桶近均匀时 `std` 必须是有限值。
+    """ 根因回归：842 桶近均匀时 `std` 必须是有限值。
 
     softmax 在 842 个桶上近均匀 ⇒ p ≈ 1.19e-3 且彼此差极小 ⇒ 方差 ≈ 1e-10。
     朴素公式 `E[x²] − E[x]²` 在这个量级会**灾难性抵消**出负数 ⇒ sqrt → NaN。
@@ -260,14 +260,14 @@ def test_score_stdev_two_pass_matches_torch_std_in_fp32():
 
 
 def test_score_stdev_target_has_a_gradient_bounding_floor():
-    """🔴 `std` 目标必须有**下界**，否则它的反向在 fp16 上溢。
+    """ `std` 目标必须有**下界**，否则它的反向在 fp16 上溢。
 
     实测（本地 fp32）：初始化时 842 桶近均匀 ⇒ `std ≈ 1.17e-7`
     ⇒ `d(sqrt(v))/dv = 1/(2·std) ≈ 4.27e6`，**远超 fp16 的 65504** ⇒ 反向
     溢出成 inf；再乘「段 1 系数 0」这个上游梯度（**0**），`0 × inf = NaN`
     ⇒ 全部参数梯度 NaN ⇒ 每步都被 GradScaler 跳过。
 
-    ⚠ 这与前向的「灾难性抵消」是**两个独立**的问题：前向用两遍算法修好了，
+     这与前向的「灾难性抵消」是**两个独立**的问题：前向用两遍算法修好了，
       但反向的 `1/(2·std)` 只能靠**下界**钉住 —— `clamp_min` 在下界以下是常数、
       梯度恰好 0，从根上拿掉那个爆炸因子（而不是靠降学习率绕）。
     """
@@ -296,7 +296,7 @@ def test_score_stdev_floor_actually_clamps_near_uniform_targets():
 
 
 def test_operand_attribution_names_the_broken_side():
-    """🔴 必须能区分「预测坏」与「目标坏」。
+    """ 必须能区分「预测坏」与「目标坏」。
 
     逐项点名只说「哪一项」，而这一项内部有两个来源完全不同的操作数：
     预测来自 ValueHead、目标来自 scorebelief 头。本机与 NPU 的 kernel 不同，
@@ -311,7 +311,7 @@ def test_operand_attribution_names_the_broken_side():
 
 
 def test_total_finite_flag_distinguishes_sanitised_from_real():
-    """⚠ 日志要能说清「total 到底有限没有」。
+    """ 日志要能说清「total 到底有限没有」。
 
     零系数项会被净化成 0，所以「某项坏」时 total 往往**仍有限**。若日志一律
     写成「加权 loss 非有限」，就是在报一件没发生的事，看日志的人会以为训练
@@ -329,7 +329,7 @@ def test_total_finite_flag_distinguishes_sanitised_from_real():
 
 
 def test_weighted_mean_keeps_its_exact_semantics_when_finite():
-    """🔴 防护不能改动 spec §4.5 的口径 —— 分母恒为 batch 大小，不是 Σw。
+    """ 防护不能改动 spec §4.5 的口径 —— 分母恒为 batch 大小，不是 Σw。
 
     `samplewise` 的语义是「逐样本损失对 batch 取均值，行权重只作逐样本乘子」。
     有人会顺手改成 `/w.sum()`，那会让「整批 w=0」把这一项放大到噪声水平。
@@ -345,7 +345,7 @@ def test_weighted_mean_keeps_its_exact_semantics_when_finite():
 
 @pytest.mark.parametrize('bad', [float('inf'), float('nan')])
 def test_weighted_mean_survives_nonfinite_on_zero_weight_rows(bad):
-    """🔴 `inf × 0 = NaN`（IEEE-754）—— 一行坏数据不该带崩整项。
+    """ `inf × 0 = NaN`（IEEE-754）—— 一行坏数据不该带崩整项。
 
     那些行按定义贡献恰好 0，所以「inf/NaN × 0」的正确结果是 0，不是 NaN。
     典型触发：`game_weight == 0` 的行 + 该行的 `per_sample` 溢出。
@@ -361,7 +361,7 @@ def test_weighted_mean_survives_nonfinite_on_zero_weight_rows(bad):
 
 
 def test_weighted_mean_records_sanitised_rows_for_diagnostics():
-    """🔴 净化是**静默**的 —— 必须把「有几行本该是 0 而实际非有限」记下来。
+    """ 净化是**静默**的 —— 必须把「有几行本该是 0 而实际非有限」记下来。
 
     不记的话就成了「这一项坏了但没人知道」：段 1 有 9 项系数为 0，它们坏掉时
     对总 loss 毫无影响，正因如此更需要把线索报出来。
@@ -383,7 +383,7 @@ def test_weighted_mean_records_nothing_when_finite():
 
 
 def test_weighted_mean_does_not_swallow_nonzero_weight_rows():
-    """⚠ 反向底线：`w != 0` 的行坏了必须照常暴露。"""
+    """ 反向底线：`w != 0` 的行坏了必须照常暴露。"""
     from src.networks.katago_v7_loss import _weighted_mean
     got = _weighted_mean(torch.tensor([float('inf'), 1.0]),
                          torch.tensor([1., 1.]))
@@ -442,7 +442,7 @@ def test_seki_ema_is_a_persistent_buffer():
 
 
 def test_nan_seki_ema_no_longer_poisons_every_future_step():
-    """🔴 NaN 进 buffer 后必须**不写进去**，且后续每步的 scale 都有限。
+    """ NaN 进 buffer 后必须**不写进去**，且后续每步的 scale 都有限。
 
     这条对应实跑里最关键的现象：每步 nan 计数**完全一样**。一个「每步重新
     发生」的溢出会让计数抖动，而一个被 buffer 记住的 NaN 给出恒定结果。
@@ -459,7 +459,7 @@ def test_nan_seki_ema_no_longer_poisons_every_future_step():
 
 
 def test_nan_cur_does_not_overwrite_the_ema():
-    """⚠ 一步坏掉**不该抹掉**已有的 EMA 历史。"""
+    """ 一步坏掉**不该抹掉**已有的 EMA 历史。"""
     lf = _stage1()
     lf.train()
     good = torch.tensor(0.02)
@@ -472,9 +472,9 @@ def test_nan_cur_does_not_overwrite_the_ema():
 
 
 def test_healthy_seki_ema_still_adapts():
-    """⚠ 守卫不能把自适应**关掉**：正常路径必须照常更新 EMA。
+    """ 守卫不能把自适应**关掉**：正常路径必须照常更新 EMA。
 
-    ⚠ 用**递减**输入：常数输入下 EMA 一步就到不动点（`0.99·x + 0.01·x = x`），
+     用**递减**输入：常数输入下 EMA 一步就到不动点（`0.99·x + 0.01·x = x`），
       第二次调用起 scale 恒定 —— 那是数学正确，不是「没推进」。
     """
     lf = _stage1()
@@ -488,7 +488,7 @@ def test_healthy_seki_ema_still_adapts():
 
 
 def test_fallback_scale_is_a_tensor_not_a_float():
-    """⚠ 兜底返回的必须是 **tensor**。
+    """ 兜底返回的必须是 **tensor**。
 
     它的返回值会走 `return {... 'seki_adaptive_scale': adaptive.detach()}` ⇒
     给 Python float 会在那里抛 `AttributeError`，而那正是「NaN 兜底路径」
@@ -519,7 +519,7 @@ def test_full_loss_forward_survives_a_nan_in_every_zero_weight_head():
 
     这是「最坏情况」用例 —— 对应真机上「不知道是哪一项坏了」的那一刻。
 
-    ⚠ 只打**零系数**的那些：`futurepos` 在段 1 的系数是 1.0（非 0），它坏了
+     只打**零系数**的那些：`futurepos` 在段 1 的系数是 1.0（非 0），它坏了
       就该让总 loss 非有限 —— 那是另一条测试（`test_broken_nonzero_weight_term
       _is_not_masked`）的职责，混进来会让这条的前提失效。
     """

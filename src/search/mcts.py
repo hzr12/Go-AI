@@ -202,7 +202,7 @@ class MCTS:
         调用点上：12 通道 checkpoint 得到 12，声明别的通道数的模型拿到的就是
         它声明的那个值（v21 退役后现役构建器只剩 12，但本契约不钉死 12）。
 
-        ⚠ 缺失时**报错，绝不回退 12**（P4.13b）：回退等于把 MCTS 重新钉回旧
+         缺失时**报错，绝不回退 12**（P4.13b）：回退等于把 MCTS 重新钉回旧
           布局，并且会对通道数未知的模型**静默**喂 12 格特征——那正是这次要拆
           掉的东西。真错配仍要响亮：这里报的是「问不到」，`GoAI.predict_batch`
           的 F5 守卫报的是「问到了但对不上」，两层都不能被架空。
@@ -301,7 +301,7 @@ class MCTS:
         立即选它（我方必胜着，无需再探）；proven win 子节点（其 to_play 必胜）
         优先跳过，仅当全部子节点均 proven win 时才回退选择。
 
-        ⚠ 关键（num_threads=1 卡死的根因）：必须跳过「已占位(exanded)但仍无
+         关键（num_threads=1 卡死的根因）：必须跳过「已占位(exanded)但仍无
         children」的子节点。这类节点已被某个 worker 选中送去主线程展开、或是
         上一轮遗留的死节点。旧实现只看 `while cur.children` 下降、不认 expanded
         标记，于是单 worker 产出后立刻又选回同一个待展开叶子 → 判定 expanded
@@ -358,7 +358,7 @@ class MCTS:
         board = leaf.board
         to_play = leaf.to_play
         legal = board.get_legal_moves()
-        # ⚠ 2026-09 修复根因级 bug：legal 是 bool 掩码，旧写法 [int(m) for m in legal]
+        # 2026-09 修复根因级 bug：legal 是 bool 掩码，旧写法 [int(m) for m in legal]
         #   迭代出 True/False → int 后只有 0/1，candidates 退化为 {(0,0),(0,1),pass}
         #   三个着法（children dict key 反复覆盖）——MCTS 自项目创建起从未真正
         #   搜索过其他位置。改用 np.where 取真实合法坐标。
@@ -536,7 +536,7 @@ class MCTS:
         order = sorted(legal, key=lambda m: -p[m])[:width]
 
         # 逐层生成子树（每层节点 = 上层节点按 policy 选出的 width 个孩子）。
-        # ⚠ 修复重复前向：旧实现在生成下一层时对本层 forward 一次取 policy，
+        # 修复重复前向：旧实现在生成下一层时对本层 forward 一次取 policy，
         #   下面又对本层 forward 一次取静态价值——同一批节点白白多算一次。
         #   现改为生成过程中每层只 forward 一次，policy 与价值一次同时拿到，
         #   _leaf_ab 总前向次数从 depth+2 降到 depth+1（depth2/width4：4→3）。
@@ -843,7 +843,7 @@ class MCTS:
                         # 推测性预评估：占位后由本线程前向叶子（torch 前向释放
                         # GIL，与主线程 batch 评估重叠），主线程 _expand 命中即
                         # 复用，省掉每模拟 1 次叶子前向。
-                        # ⚠ 必须在锁外执行：deepcopy/特征/前向都很贵，若持锁跑
+                        # 必须在锁外执行：deepcopy/特征/前向都很贵，若持锁跑
                         #   会卡住其它 worker 的选路径，多线程并行度退回串行。
                         # 竞态安全：_expand 消费时置 None，未命中则主线程自行前向。
                         if self.spec_prefetch and leaf.board is None \

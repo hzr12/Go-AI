@@ -31,7 +31,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# ⚠ 临时文件一律放仓库内的 tmp/，**不要用系统 TEMP**：本机 TEMP 在 C 盘且
+# 临时文件一律放仓库内的 tmp/，**不要用系统 TEMP**：本机 TEMP 在 C 盘且
 #   空间/权限不稳，引擎日志被锁时也难以排查。路径集中在一处便于清理。
 TMPDIR = os.path.join(REPO, "tmp", "bench")
 os.makedirs(TMPDIR, exist_ok=True)
@@ -46,7 +46,7 @@ _COLS = "ABCDEFGHJKLMNOPQRST"
 def make_cfg(num_analysis, num_search, batch, cache_pow2=23, extra=""):
     """生成一个临时 config。
 
-    ⚠ 键名必须用 `numSearchThreads`（短名）。KataGo 会先自动加载
+     键名必须用 `numSearchThreads`（短名）。KataGo 会先自动加载
     `default_gtp.cfg`，其中已有 `numSearchThreads = 5`；若本文件再写
     `numSearchThreadsPerAnalysisThread`（长名），引擎会认为两个别名键都被指定
     而直接退出：`Cannot specify both ... in the same config`。

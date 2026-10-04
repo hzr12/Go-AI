@@ -56,7 +56,7 @@ def _fp(tmp_path, **kw):
     ("move_lo", 120),        # 窗口变了 -> 候选局面集合变
     ("move_hi", 180),
     ("max_games", 5000),     # 抽局方式变
-    ("game_frac", 0.5),      # ★ 就是这个：0.02 -> 全量，静默丢数据的那一步
+    ("game_frac", 0.5), # 就是这个：0.02 -> 全量，静默丢数据的那一步
     ("seed", 7),
     ("limit", 0),
 ])
@@ -106,7 +106,7 @@ def test_matching_fingerprint_resumes(tmp_path):
 
 
 def test_changed_game_frac_is_rejected(tmp_path):
-    """★ 本次修复的核心场景：game-frac 变大必须报错，而不是静默续跑。"""
+    """ 本次修复的核心场景：game-frac 变大必须报错，而不是静默续跑。"""
     out = str(tmp_path / "lbl.npz")
     L.save_resume_fingerprint(out, _fp(tmp_path))          # 之前跑的是 0.02
     with pytest.raises(SystemExit) as e:
@@ -176,7 +176,7 @@ def test_save_fingerprint_is_atomic(tmp_path):
 # 旧数据兼容：仓库里已有的 .done.n 没有指纹
 # --------------------------------------------------------------------------- #
 def test_legacy_done_n_without_fingerprint_still_resumes(tmp_path):
-    """⚠ 升级兼容：已经跑过的批次只有 `.done.n`、没有 `.done.json`。
+    """ 升级兼容：已经跑过的批次只有 `.done.n`、没有 `.done.json`。
 
     此时 `check_resume_fingerprint` 返回 `ok=True`（走「首次跑」那支），
     调用方据此**照常读 `.done.n`** ⇒ 已有游标继续有效，不会让用户重跑一遍。

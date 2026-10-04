@@ -87,7 +87,7 @@ def raw(model_bytes: bytes) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# 🔴 主测试：byte 级完全一致
+# 主测试：byte 级完全一致
 # ---------------------------------------------------------------------------
 
 
@@ -349,7 +349,7 @@ def test_parameter_count_matches_the_official_engine_log(model: ModelDesc) -> No
 
 
 def test_file_float_count_minus_params_equals_bn_running_stats(model: ModelDesc) -> None:
-    """⚠ `getNumParameters` 对 BN 只数 scale+bias，**不数 mean+variance**。
+    """ `getNumParameters` 对 BN 只数 scale+bias，**不数 mean+variance**。
 
     所以"文件里的 float 总数"必然比"官方日志的 params"大出差值
     = 所有 BN 的 `2 * num_channels`（mean + variance 两个数组）。
@@ -379,7 +379,7 @@ def test_float32_via_float64_is_bit_exact() -> None:
     """实测确认（不是假设）：float32 -> float64 -> float32 逐位一致。
 
     理由是 float64 能精确表示任何 float32（24 位有效位 < 53 位）。这条测试把这个
-    事实钉住，包括所有次正规数与边界值。⚠ 即便如此，本模块**仍然**不走
+    事实钉住，包括所有次正规数与边界值。 即便如此，本模块**仍然**不走
     Python float 中转 —— 序列化是 `ascontiguousarray(<f4).tobytes()` 的纯 memcpy。
     """
     rng = np.random.default_rng(20261003)
@@ -423,7 +423,7 @@ def test_weights_are_carried_verbatim_not_via_python_float(model: ModelDesc) -> 
 
 
 def test_subnormal_weights_are_preserved_not_flushed(model: ModelDesc) -> None:
-    """⚠ 坑 #2：KataGo 读的时候会把 fp32 次正规数冲成 0（`desc.cpp:89-90`）。
+    """ 坑 #2：KataGo 读的时候会把 fp32 次正规数冲成 0（`desc.cpp:89-90`）。
 
     我们**故意不冲**，否则 round-trip 对不上。这条测试把这个偏差钉在纸面上。
     官方文件里有 444,703 个次正规数（占 4.21%），全在 transformer FFN 权重里。
@@ -439,7 +439,7 @@ def test_subnormal_weights_are_preserved_not_flushed(model: ModelDesc) -> None:
 
 
 def test_text_floats_keep_their_verbatim_spelling(model: ModelDesc) -> None:
-    """⚠ 坑 #3：文本里的浮点数必须逐字保留。
+    """ 坑 #3：文本里的浮点数必须逐字保留。
 
     BN 的 epsilon 在文件里是字面量 `1e-20`；读成 float32 是 `9.999999682655225e-21`，
     从后者**永远拼不回** `1e-20`。所以 `TextFloat` 只存原文。
@@ -824,7 +824,7 @@ def test_bn_without_scale_does_not_emit_the_scale_array() -> None:
 def test_truncated_file_raises(model_bytes: bytes) -> None:
     """在多个不同位置砍断，都必须抛错，不许静默接受。
 
-    ⚠ 唯独砍掉**最后一个**字节（那个尾随 `\\n`）是合法的 —— 那是坑 #1，
+     唯独砍掉**最后一个**字节（那个尾随 `\\n`）是合法的 —— 那是坑 #1，
     单独由 `test_trailing_newline_is_optional_for_parsing_...` 覆盖。
     """
     raw = kb.maybe_gunzip(model_bytes)
@@ -881,7 +881,7 @@ def test_model_name_charset_is_enforced() -> None:
 
 
 def test_layer_names_have_no_length_limit(model: ModelDesc) -> None:
-    """⚠ 96 字符限制**只作用于模型名**。层名没有长度限制 —— 别把两者搞混。"""
+    """ 96 字符限制**只作用于模型名**。层名没有长度限制 —— 别把两者搞混。"""
     original = build_minimal_model(17)
     long_layer = "L" * 500
     original.policy_head.p2_conv.name = long_layer
@@ -1381,7 +1381,7 @@ def test_rope_disabled_attention_writes_neither() -> None:
 
 
 def test_unsupported_transformer_features_have_no_file_representation() -> None:
-    """⚠ exporter 侧 assert 掉的那些 transformer 特性，在 `.bin` 里**根本没有表示**：
+    """ exporter 侧 assert 掉的那些 transformer 特性，在 `.bin` 里**根本没有表示**：
 
     `export_model_pytorch.py:565-576` assert 了 `use_qk_norm` / `use_gab` / `use_tab` /
     `inline_registers` / `num_rw_registers`；`:606-609` assert 了 FFN 的
@@ -1448,7 +1448,7 @@ def test_struct_pack_little_endian_float32_layout_is_what_we_emit() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ⚠ float 载荷里可以出现分隔符字节 —— 块边界必须来自形状，不能靠扫描
+# float 载荷里可以出现分隔符字节 —— 块边界必须来自形状，不能靠扫描
 # ---------------------------------------------------------------------------
 
 
@@ -1509,7 +1509,7 @@ def _count_bin_blocks(model: ModelDesc) -> int:
 
 
 def test_float_payload_may_contain_newline_and_at_bin_bytes(raw: bytes, model: ModelDesc) -> None:
-    """🔴 这是本模块最容易被人重新踩的坑，用真实文件量化它。
+    """ 这是本模块最容易被人重新踩的坑，用真实文件量化它。
 
     实测 `kata1-tf2-b10c384-s2941M-d5872M.bin.gz` 的 328 个 float 载荷里
     **含有 129,087 个 `\\n`(0x0A) 和 115,326 个 `@`(0x40) 字节** —— 也就是说
@@ -1574,7 +1574,7 @@ def test_weights_containing_delimiter_bytes_roundtrip_exactly() -> None:
 
     # BN 的 4 个数组是**背靠背**写的，中间一个文本 token 都没有：
     # 第一个 `@BIN@` 之后紧跟第二个，中间只有块尾的 `\n`。
-    # ⚠ 必须从 BN 的 name token 之后开始找，否则会命中载荷里那个假的 `@BIN@`。
+    # 必须从 BN 的 name token 之后开始找，否则会命中载荷里那个假的 `@BIN@`。
     bn = parsed.trunk.blocks[0].desc.pre_bn  # type: ignore[union-attr]
     assert bn.num_channels == 8
     anchor = blob.find(b"model.blocks.0.norm\n")

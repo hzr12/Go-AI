@@ -24,7 +24,7 @@
     python scripts/crosscheck_stdata.py --json out.json
     python scripts/crosscheck_stdata.py --min-rate 1.0        # 门禁（只查 ALIGNED）
 
-🔴 **两个口径必须一起看，缺一不可**
+ **两个口径必须一起看，缺一不可**
 --------------------------------
 ``row_exact``（整张 19×19 完全相同才算这一行相等）是**唯一可以拿去做门禁**的
 口径；``cell_agree``（逐格）**会骗人**，而且骗得很厉害：
@@ -39,7 +39,7 @@ ch9 每一行只差 1 个点（361 个点里），逐格一致率因此高达 0.
 是整张对的。汇报 ch9 = 99.7% 对齐是把一个彻底错的通道说成几乎完美。
 ⇒ 脚本两个都印，但门禁只看 ``row_exact``，且**只对 ``ALIGNED`` 通道**断言。
 
-🔴 **比对资格（``eligibility``）—— 不许跳过这一列**
+ **比对资格（``eligibility``）—— 不许跳过这一列**
 -------------------------------------------------
 ``NOT_COMPARABLE`` 的通道**没有对齐率这回事**，报出来就是伪造证据：
 
@@ -61,13 +61,13 @@ ch18 / ch19     ALIGNED             Benson + 围空 + 双活过滤；本工具�
     其余            ALIGNED             可当 oracle
     ==============  ==================  ==========================================
 
-⚠ ``ALIGNED`` 的含义是**「本仓与官方逐位一致」**，实测就是 1.000000。门槛
+ ``ALIGNED`` 的含义是**「本仓与官方逐位一致」**，实测就是 1.000000。门槛
   ``--min-rate 1.0`` 之所以能当门禁，靠的就是这个集合里没有一个通道到不了 1.0。
   ch18/19 要做到这一点，**不能**用一套默认 ``rules_flags`` 跑全样本 ——
   官方 ch18/19 是逐行按规则分岔的（``nninputs.cpp:2391-2439``）。所以本工具对
   这两个通道按官方 ``globalInputNC`` 逐行分派，并剔掉 TERRITORY 行。
 
-⚠ **归档缺失时本脚本「报错退出」，而 pytest 里的 ``skipif`` 是「跳过」。**
+ **归档缺失时本脚本「报错退出」，而 pytest 里的 ``skipif`` 是「跳过」。**
   这是刻意的差异：这个工具的存在意义就是「回答一个问题」，归档不在就回答不了，
   静默退出 0 等于假装成功。测试里用 ``skipif`` 是因为测试的职责是验代码、
   不是保证归档存在；两者的失败语义不能混。
@@ -132,7 +132,7 @@ GLOBAL_ATOL = 2e-6
 _HISTORY_NC = ('stdata 是逐行独立样本、**无着法序列** ⇒ ch9..13 靠历史列重建，'
                '无从重建（spec §9.4）')
 
-#: 🔴 ch7 / ch20 / ch21 是**结构上到不了**的那三个通道，理由与 ch9..13 同类：
+#: ch7 / ch20 / ch21 是**结构上到不了**的那三个通道，理由与 ch9..13 同类：
 #: 官方**只在 encore 行**置位它们，而 ``spatial_channels_v7`` **没有 encore_phase
 #: 入参**（本仓压根不接这个维度）⇒ 那些行我们无论怎么填都是 0。
 #: 实测（301 行、恰好 1 行 encorePhase=2）三个通道都只在那 1 行上不一致，
@@ -207,7 +207,7 @@ GLOBAL_SPEC = {
     13: (ALIGNED, 'encorePhase>1（同上）'),
     14: (NOT_COMPARABLE, 'passWouldEndPhase ' + _PASS_NC),
     15: (NOT_COMPARABLE,
-         'PDA · stdata 不给重建它的依据（本仓无 PDA ⇒ 恒 0）。⚠ **小样本上官方'
+         'PDA · stdata 不给重建它的依据（本仓无 PDA ⇒ 恒 0）。 **小样本上官方'
          '这两格也恰好恒 0**（301 行），于是 row_exact 会显示 **1.000000** —— '
          '那是巧合不是对齐；样本一大就露馅（200 npz / 4368 行上官方有 133 个'
          '非零点 ⇒ 0.9696）'),
@@ -229,15 +229,15 @@ def load_sample(archive, npz_count=12, rows_per_npz=40, board_size=19):
     """从 stdata 归档里取**前** ``npz_count`` 个 npz 的**前** ``rows_per_npz``
     个 ``board_size``×``board_size`` 行。
 
-    ⚠ **流式读**（``r|gz`` + ``next()``），**禁止 ``getmembers()``**：那要把
+     **流式读**（``r|gz`` + ``next()``），**禁止 ``getmembers()``**：那要把
     1.5 GB 的归档整个走一遍才能开始干活（同一纪律见
     ``tests/test_katago_npz.py`` 与 ``scripts/probe_stdata_loss.py``）。
 
-    ⚠ **按行取，不要按成员取**：19×19 由 ch0（on-board 掩码）的 1 的个数反推。
+     **按行取，不要按成员取**：19×19 由 ch0（on-board 掩码）的 1 的个数反推。
       同一个 npz 里混着 9/11/13/18 路与非方阵，直接当 19×19 喂会**静默错位**
       （``board_size_from_packed`` 对非方阵记 0，这里靠它丢掉）。
 
-    ⚠ **前缀不是随机采样**：归档是按 npz 顺序排的，前几个文件与整批不同分布
+     **前缀不是随机采样**：归档是按 npz 顺序排的，前几个文件与整批不同分布
       ⇒ 任何命中率都必须**连样本量一起报**（`report['sample']` 会带上取法）。
 
     Returns:
@@ -248,7 +248,7 @@ def load_sample(archive, npz_count=12, rows_per_npz=40, board_size=19):
     if not os.path.isfile(archive):
         raise CrosscheckError(
             f'官方 stdata 归档不存在：{archive}\n'
-            f'  ⚠ 本工具**不静默跳过**（与 pytest 的 skipif 刻意不同）：'
+            f' 本工具**不静默跳过**（与 pytest 的 skipif 刻意不同）：'
             f'归档不在就回答不了「我们对齐到哪一步」。\n'
             f'  用 --archive 指定，或先下载 stdata 批次。')
     if npz_count < 1 or rows_per_npz < 1:
@@ -345,7 +345,7 @@ def _diff_stats(mine, official, stone):
     为什么要拆：修复前 ch18/19 的 21,896 个差异点里 **19,913 个是子、1,983 个
     是空点**，分布本身就能否掉「官方先提死子」—— 提子只会动**子**，
     而真正的成因（Benson 判死 + 双活整块过滤）**两边都动**。
-    ⚠ 这段 docstring 曾经把该拆分写成「『官方先提死子』这个猜测最硬的线索」。
+     这段 docstring 曾经把该拆分写成「『官方先提死子』这个猜测最硬的线索」。
       那是**错的**，已作废：官方 `calculateArea*` 既不提子也不做死子判定
       （`board.cpp:1949-2327` 的输入只有 `colors`）。留着会让下一个人重复这个
       已被推翻的诊断。
@@ -378,7 +378,7 @@ _AREA_CHANNELS = (18, 19)
 def _area_rows_by_rule(glob):
     """官方 `globalInputNC` → ch18/19 的**逐行规则**与可比行掩码。
 
-    ⚠ `globalInputNC[:,8]` 是 `hist.rules.multiStoneSuicideLegal`，而官方传给
+     `globalInputNC[:,8]` 是 `hist.rules.multiStoneSuicideLegal`，而官方传给
       `calculateArea*` 的是 `getSuicideLegalForPassAlive(hist)`
       （`nninputs.cpp:964`）= 那个标志 `|| alwaysComputePassAliveUnderSuicideRules`，
       后半个来自 `hist.modes`、**19 个全局通道都没编码**。实测把 `ch8 == 0` 的行
@@ -441,7 +441,7 @@ def compare_spatial(spatial, ko, glob=None):
     out = {}
     for ch in range(SPATIAL_CHANNELS):
         same = mine[:, ch] == spatial[:, ch]
-        elig, reason = SPATIAL_SPEC.get(ch, (NOT_COMPARABLE, '⚠ 未登记的通道！'))
+        elig, reason = SPATIAL_SPEC.get(ch, (NOT_COMPARABLE, ' 未登记的通道！'))
         if area_cmp is not None and area_cmp.any():
             same = same[area_cmp]
             ch_cmp = mine[area_cmp, ch]
@@ -482,7 +482,7 @@ def _group_rows(g):
     `RU` 的事）。这样每个规则的**每个取值**都被官方数据验证过，而不只是
     「默认值恰好对」。
 
-    ⚠ 必须连 ``encorePhase`` 一起分组：全局 ch12/ch13 由它门控，只按规则组合
+     必须连 ``encorePhase`` 一起分组：全局 ch12/ch13 由它门控，只按规则组合
       分组的话这两格会对着官方 encore 行报 0。
     """
     ko_rule = np.where(g[:, 6] > 0.5,
@@ -529,7 +529,7 @@ def _ours_global(g, groups):
 def _global_ch18(g):
     """全局 ch18 三角波：用官方 ch5 反推 ``selfKomi``（**精确代入**，非近似）。
 
-    ⚠ 不能走 ``global_features_v7``：那个 API 的 ``GameRow(komi=...)`` 是**整批
+     不能走 ``global_features_v7``：那个 API 的 ``GameRow(komi=...)`` 是**整批
       一个标量**，而官方 ch5 带 draw-jitter、逐行不同 ⇒ 只有逐行调
       ``komi_parity_wave`` 才拿得到精确代入。官方 ch5 上 komi=7.5 的行恰为
       0.375 = 7.5/20，而 ch18 用的正是同一个 selfKomi。
@@ -550,7 +550,7 @@ def _global_ch18(g):
 def compare_global(g):
     """全局 ``(B,19)`` 逐通道对拍。
 
-    ⚠ 全局通道**不是 19×19 平面** ⇒ 没有「逐格」口径，``cell_agree`` 记
+     全局通道**不是 19×19 平面** ⇒ 没有「逐格」口径，``cell_agree`` 记
       ``null`` 并注明原因。硬凑一个「逐元素一致率」只会让两个量长得像一回事。
     """
     B = g.shape[0]
@@ -560,7 +560,7 @@ def compare_global(g):
 
     out = {}
     for ch in range(GLOBAL_CHANNELS):
-        elig, reason = GLOBAL_SPEC.get(ch, (NOT_COMPARABLE, '⚠ 未登记的通道！'))
+        elig, reason = GLOBAL_SPEC.get(ch, (NOT_COMPARABLE, ' 未登记的通道！'))
         if ch == 18:
             # ch18 由 _global_ch18 逐行精确代入算出，见那里的说明。
             exact = hit18
@@ -654,16 +654,16 @@ def build_report(spatial, glob, ko, sample_info):
                    if glob is not None else None),
         'tally': tally,
         'warnings': [
-            '⚠ **逐格一致率（cell_agree）会骗人**：整张 19×19 全对才算一行相等'
+            ' **逐格一致率（cell_agree）会骗人**：整张 19×19 全对才算一行相等'
             '（row_exact）才是能用来做门禁的口径。实例：%s row_exact=%.6f / '
             'cell_agree=%.6f —— %s。' % MISLEAD_CASE,
-            '⚠ **eligibility 不是装饰**：`NOT_COMPARABLE` 的通道没有对齐率这'
+            ' **eligibility 不是装饰**：`NOT_COMPARABLE` 的通道没有对齐率这'
             '回事 —— stdata 缺重建它们所需的输入，比出来的数字是巧合。'
             'ch15/ch16 的 ~0.73 就是这么来的（我们走官方的回退复制分支，'
             '对齐的其实是 ch14）。',
-            '⚠ 任何命中率都要**连样本量一起引用**：取样是归档的**前缀**，'
+            ' 任何命中率都要**连样本量一起引用**：取样是归档的**前缀**，'
             '不是随机采样（见 sample.selection）。',
-            '⚠ 归档缺失时本工具**报错退出**（与 pytest 的 skipif 刻意不同：'
+            ' 归档缺失时本工具**报错退出**（与 pytest 的 skipif 刻意不同：'
             '工具回答不了问题就不该假装成功）。',
         ],
     }
@@ -672,10 +672,10 @@ def build_report(spatial, glob, ko, sample_info):
 def check_gate(report, min_rate):
     """``--min-rate`` 门禁：**只**对 ``ALIGNED`` 通道断言。
 
-    🔴 ``KNOWN_DIVERGENT`` 绝不能被误杀 —— ch18/19 对不齐是**已知口径差**
+     ``KNOWN_DIVERGENT`` 绝不能被误杀 —— ch18/19 对不齐是**已知口径差**
       （spec §5.1 刻意不补死子判定），拿它当回归会逼着人去「修」一个不是 bug
       的东西，或者反过来把阈值调到 0.44 来「迁就」它。
-    🔴 ``NOT_COMPARABLE`` 绝不能被当对齐率 —— 见上。
+     ``NOT_COMPARABLE`` 绝不能被当对齐率 —— 见上。
     """
     if min_rate is None:
         return []
@@ -686,7 +686,7 @@ def check_gate(report, min_rate):
         if row['row_exact'] < min_rate:
             bad.append(
                 'ch%s(%s) row_exact=%.6f < 门禁 %.6f —— '
-                '⚠ **查 `spatial_channels_v7` / `global_features_v7` 的组装顺序，'
+                ' **查 `spatial_channels_v7` / `global_features_v7` 的组装顺序，'
                 '不要改底层实现**'
                 % (row['channel'], row['scope'], row['row_exact'], min_rate))
     return bad
@@ -724,7 +724,7 @@ def render(report, verbose=False):
     for row in report['spatial']:
         note = '%s — %s' % (row['eligibility'], row['reason'])
         if row['cell_agree_misleads']:
-            note += ('  🔴 逐格 %.4f 看着完美而逐行只有 %.4f ⇒ 逐格在骗人'
+            note += (' 逐格 %.4f 看着完美而逐行只有 %.4f ⇒ 逐格在骗人'
                      % (row['cell_agree'], row['row_exact']))
         L.append('  %2d  %s  %s  %8d %8d  %s'
                  % (row['channel'], _fmt(row['row_exact']),
@@ -751,7 +751,7 @@ def render(report, verbose=False):
     L.append('')
     if any(r['scope'] == 'spatial' for r in report['spatial']):
         L.append('---- 「我们多出/少掉的点」按「子 vs 空点」的分布 ----')
-        L.append('  ⚠ 为什么要拆：只有分开才知道偏差落在「死子**本身**」还是'
+        L.append(' 为什么要拆：只有分开才知道偏差落在「死子**本身**」还是'
                  '「死子周围那片**空**」')
         L.append('     ⇒ 绝大部分落在子上 ⇒ 官方算 area 前先提死子')
         L.append('     （参考量，非本次运行：zzb28c512 批 1254 行上 ch18 的 '
@@ -804,7 +804,7 @@ def build_argparser():
                          '（裸数字 = 空间通道）')
     ap.add_argument('--min-rate', type=float, default=None,
                     help='门禁：ALIGNED 通道的 row_exact 下限（默认关）。'
-                         '⚠ 只对 ALIGNED 生效，KNOWN_DIVERGENT / '
+                         ' 只对 ALIGNED 生效，KNOWN_DIVERGENT / '
                          'NOT_COMPARABLE 不会被误杀')
     ap.add_argument('--json', dest='json_path', default=None,
                     help='把完整报告写到该 JSON 文件')
@@ -830,7 +830,7 @@ def main(argv=None):
             report['global'] = [r for r in report['global']
                                 if ('global', r['channel']) in only]
         report['warnings'] = [w for w in report['warnings']
-                              if not w.startswith('⚠ **逐格一致率')]
+                              if not w.startswith(' **逐格一致率')]
 
     bad = check_gate(report, args.min_rate)
     report['gate'] = {'min_rate': args.min_rate, 'violations': bad,
@@ -844,7 +844,7 @@ def main(argv=None):
         sys.stderr.write('crosscheck: 门禁未通过（min_rate=%.6f）\n'
                          % args.min_rate)
         for b in bad:
-            sys.stderr.write('  ✗ %s\n' % b)
+            sys.stderr.write(' %s\n' % b)
         return 1
     if args.min_rate is not None:
         print('门禁通过：所有 ALIGNED 通道的 row_exact ≥ %.6f'

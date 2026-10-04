@@ -16,7 +16,7 @@ idxs)`` → ``dataset.my_hist[idxs]``。只要本类把 ``my_hist`` / ``op_hist`
 （``tests/test_v7_dataset.py::test_matches_train_sft_v7_batch_features_bitwise``
 把这件事钉住）。
 
-🔴 重建历史列的原因：npz 的 ``op_hist`` 槽位是**错的**
+ 重建历史列的原因：npz 的 ``op_hist`` 槽位是**错的**
 ------------------------------------------------------------
 实测 ``data/sgf_19x19_full.npz``（34,202,713 行）：
 
@@ -26,7 +26,7 @@ idxs)`` → ``dataset.my_hist[idxs]``。只要本类把 ``my_hist`` / ``op_hist`
 ``op_hist[i, 0]``             ``moves[i-3]``  99.8%      ``moves[i-1]``
 ``op_hist[i, 1]``             ``moves[i-1]``  99.2%      ``moves[i-3]``
 ``op_hist[i, 2]``             恒 ``-1``                  ``moves[i-5]``
-``my_hist[i, 0]``             ``moves[i-2]``  99.9%  ✅   ``moves[i-2]``
+``my_hist[i, 0]`` ``moves[i-2]`` 99.9% ``moves[i-2]``
 ``my_hist[i, 1] / [2]``       恒 ``-1``                  ``moves[i-4/6]``
 =============================  ==========================  ==========
 
@@ -41,7 +41,7 @@ idxs)`` → ``dataset.my_hist[idxs]``。只要本类把 ``my_hist`` / ``op_hist`
   通道            实际内容                       应然内容
   ==============  ==========================  ==========================
   ch9  (op 0)     ``moves[i-3]``               ``moves[i-1]``
-  ch10 (my 0)     ``moves[i-2]``  ✅            ``moves[i-2]``
+  ch10 (my 0) ``moves[i-2]`` ``moves[i-2]``
   ch11 (op 1)     ``moves[i-1]``               ``moves[i-3]``
   ch12 (my 1)     空                            ``moves[i-4]``
   ch13 (op 2)     空                            ``moves[i-5]``
@@ -50,7 +50,7 @@ idxs)`` → ``dataset.my_hist[idxs]``。只要本类把 ``my_hist`` / ``op_hist`
 **5 个历史通道错 4 个**，且「错」得毫无征兆（不抛异常、loss 照降）。
 全局特征 ch0..ch4（5 个 pass 标志）与 ch14（``passWouldEndPhase``）同源同错。
 
-⚠ 本模块**绕开**那个 bug，**不改** ``build_dataset.py``（裁定：不修、不重建
+ 本模块**绕开**那个 bug，**不改** ``build_dataset.py``（裁定：不修、不重建
 npz —— 重建 34.2M 行要几小时，而 A 阶段已改走 ``V7Dataset``）。
 ``tests/test_v7_dataset.py::test_raw_npz_op_hist_slots_are_swapped`` 把这个坑
 钉成可执行断言，防止后人「优化」回去直接吃 ``op_hist``。
@@ -67,7 +67,7 @@ npz —— 重建 34.2M 行要几小时，而 A 阶段已改走 ``V7Dataset``）
 这样**不假设严格交替**。真实数据里 34,040,415 对同局相邻行中有 842 对
 ``to_play`` 不翻转（0.0025%），按奇偶取会把这批的槽位整体错一格。
 
-⚠ **pass 不需要特判**：``-1`` 在 ``my_hist`` / ``op_hist`` 里同时表示「pass」
+ **pass 不需要特判**：``-1`` 在 ``my_hist`` / ``op_hist`` 里同时表示「pass」
 与「无此手」，而这两者在 ch9..13 上输出**相同**（空），在全局 ch0..4 上也都是
 「算作 pass 标志」—— 与 ``feature_v7.history_five`` / ``_resolve_history_length``
 的既有约定一致。全量 ``moves`` 里 pass 只有 2,182 行（0.0064%）且局内位置全部
@@ -110,7 +110,7 @@ SGF 自打语料**没有**逐点 ownership、终局分差、seki 标签 ⇒ 这�
 12    seki                          ``w['seki']``              关
 =================================  =========================  ====================
 
-⚠ **#3 与 #7 无法用 ``w`` 掩掉。** ``KataGoV7Loss.forward`` 里
+ **#3 与 #7 无法用 ``w`` 掩掉。** ``KataGoV7Loss.forward`` 里
 ``terms['value']`` 的权重写死成 ``None``（⇒ ``_weighted_mean`` 走 ``.mean()``），
 ``terms['score_stdev']`` 的权重是 ``labels['game_weight']``（**没有** ``w`` 键）。
 ⇒ ① A/C 阶段必须提供**硬三分类** ``outcome``（本类给：``winrates`` 的符号，
@@ -119,12 +119,12 @@ SGF 自打语料**没有**逐点 ownership、终局分差、seki 标签 ⇒ 这�
 唯一在没有任何 scorebelief 监督的情况下仍有梯度的项，语义正确，但要注意它会
 在没有 pdf/cdf 目标的情况下单独塑造 scorebelief 的分布尺度。
 
-⚠ **键缺失 ⇒ 权重全 1。** ``KataGoV7Loss.w_of()`` 在 ``w`` 里找不到键时返回
+ **键缺失 ⇒ 权重全 1。** ``KataGoV7Loss.w_of()`` 在 ``w`` 里找不到键时返回
 ``torch.ones``。所以「屏蔽某头」必须**显式写 0**，不是「不写」——
 :func:`finalize_loss_weights` 把这条变成硬约束：``:data:`LOSS_W_KEYS`` 里每一项
 缺了就直接抛错。
 
-⚠ ``_build_labels`` 不给 ``w['lead']``，而 ``w_of('lead')`` 在缺键时返回全 1
+ ``_build_labels`` 不给 ``w['lead']``，而 ``w_of('lead')`` 在缺键时返回全 1
 ⇒ 直接用它的 ``w`` 会拿 ``labels['score']`` 的**零占位**去训 lead 头，把头推向
 恒 0。:func:`finalize_loss_weights` 显式补上这一项。
 """
@@ -174,16 +174,16 @@ BOARD_SIZE = 19
 
 #: :attr:`V7Dataset.rules_flags` 的默认值 = 简单局（AREA + 无税 + simple ko +
 #: 单子禁着 + 无 button），逐位等于 ``feature_v7.DEFAULT_RULES_FLAGS``。
-#: ⚠ 这里**自己定义**而不是 ``from ... import DEFAULT_RULES_FLAGS`` 再转出：
+#: 这里**自己定义**而不是 ``from ... import DEFAULT_RULES_FLAGS`` 再转出：
 #: 这个值是本模块的**公开契约**（:attr:`V7Dataset.rules_flags`），值变了必须在这里
 #: 看得见；``feature_v7.DEFAULT_RULES_FLAGS`` 是那边的实现细节。
-#: ⚠ 逐局规则化（``games.npz`` sidecar 的 ``g_rules``）**没有**接进来，原因见
+#: 逐局规则化（``games.npz`` sidecar 的 ``g_rules``）**没有**接进来，原因见
 #: :func:`spatial_global` 的标量约束：`calculate_area` 里的 `if` 收不了数组。
 DEFAULT_RULES_FLAGS_V7 = 0
 
 #: ``KataGoV7Loss.forward`` 会 ``w_of(...)`` 的**全部**键。
 #:
-#: 🔴 **这份清单就是 ``w_of`` 键缺失返回全 1 的那个漏洞的封口**。清单之外的键
+#: **这份清单就是 ``w_of`` 键缺失返回全 1 的那个漏洞的封口**。清单之外的键
 #: loss 不读；清单之内**缺一个**就意味着那一项被静默地按权重 1 训练。核对依据是
 #: ``katago_v7_loss.py`` 里每一处 ``w_of('...')`` 的字面量。
 LOSS_W_KEYS = ('policy_opp', 'ownership', 'score', 'lead', 'scoring',
@@ -191,17 +191,17 @@ LOSS_W_KEYS = ('policy_opp', 'ownership', 'score', 'lead', 'scoring',
 
 #: C 阶段训练 ``{policy, policy_opp, value}``、冻结其余 **9** 项对应的头。
 #:
-#: 🔴 **这 9 项是「必须冻」，不是「省算力才冻」。** 它们是 SGF 自打语料**没有
+#: **这 9 项是「必须冻」，不是「省算力才冻」。** 它们是 SGF 自打语料**没有
 #: 标签**的头（见模块 docstring 的 12 项表）。用零占位或 garbage 标签训，会把
 #: B 阶段从 stdata 学到的东西**毁掉**——而毁掉的症状与「没训过」完全一样
 #: （loss 曲线平、指标不动），事后分不清是「阶段没跑」还是「跑了但被 C 阶段
 #: 拉回零」。A 阶段同理：用 ``w=0`` 屏蔽掉，而不是喂零标签。
 #:
-#: ⚠ **显式清单，不由 ``w`` 表反推**：反推会随 ``w`` 表变动而漂移，而且语义
+#: **显式清单，不由 ``w`` 表反推**：反推会随 ``w`` 表变动而漂移，而且语义
 #: 不同 —— ``w`` 表说的是「这一批有没有标签」，这里说的是「这个阶段的训练
 #: 目标里有没有它」。两个问题碰巧重合，但改一处不该动另一处。
 #:
-#: ⚠ **9 项 ≠ 9 个参数组**：``score_stdev`` / ``score_mean`` / ``lead`` 共用
+#: **9 项 ≠ 9 个参数组**：``score_stdev`` / ``score_mean`` / ``lead`` 共用
 #: ``value_head.scores`` 这**一个** ``Linear(96→3)``，``scorebelief_pdf`` 与
 #: ``scorebelief_cdf`` 共用 ``scorebelief_head``。参数级的映射见
 #: ``scripts/train_v7.py::LOSS_TERM_TO_PARAM_PREFIX``（**只有那里**一份）。
@@ -230,13 +230,13 @@ def rebuild_history_columns(moves, to_play, game_ids, *, past=HISTORY_PAST,
 
     判据是**逐手的执子方**而不是局内位置的奇偶：``moves[i-k]`` 由
     ``to_play[i-k]`` 落下（按定义，行 ``i-k`` 的盘面是它落子**之前**的局面），
-    等于 ``to_play[i]`` 就是 ``my``。⚠ 这条不能用奇偶代替：真实数据里有 842 对
+    等于 ``to_play[i]`` 就是 ``my``。 这条不能用奇偶代替：真实数据里有 842 对
     同局相邻行的 ``to_play`` 不翻转。
 
     跨局守卫
     --------
     ``game_ids[i-k] != game_ids[i]`` 的那一手**不取**，且不占槽位。
-    ⚠ 不能 clamp 到边界行、也不能沿用上一行 —— 取到的盘面/着法**看起来完全
+     不能 clamp 到边界行、也不能沿用上一行 —— 取到的盘面/着法**看起来完全
     合法**（它就是某个真实落点），只是不属于这一手。
 
     Args:
@@ -245,7 +245,7 @@ def rebuild_history_columns(moves, to_play, game_ids, *, past=HISTORY_PAST,
         game_ids: ``(N,)`` 整数，局号。**必须给** —— 缺它就没法判同局，
             而跨局取到的东西不报错。
         past: 往回看多少手，**必须 ≥ ``2 * HISTORY_SLOTS``**。
-        chunk: 分块行数。⚠ 不是为了省时间，是为了**峰值内存**：全量 34.2M 行
+        chunk: 分块行数。 不是为了省时间，是为了**峰值内存**：全量 34.2M 行
             一次算需要 ``(N, past)`` 的中间量（int16 + 若干 bool 掩码），
             34.2M×6×(2+1+1+1+1) ≈ 1.2 GB；分块后降到 ``chunk×past×6`` B。
         verify: ``None`` / ``int``。给行数则在算完后调
@@ -313,10 +313,10 @@ def reference_history_row(i, moves, to_play, game_ids, slots=HISTORY_SLOTS,
 
     它只作为对拍基准存在：:func:`rebuild_history_columns` 的正确性由
     ``tests/test_v7_dataset.py::test_rebuild_matches_independent_reference``
-    拿它逐格比对保证。⚠ 不要把这个函数「优化」成向量化 —— 那会让对拍失去意义。
+    拿它逐格比对保证。 不要把这个函数「优化」成向量化 —— 那会让对拍失去意义。
 
-    ⚠ ``past`` 必须与 :func:`rebuild_history_columns` 的那个一致（默认
-      :data:`HISTORY_PAST`）。🔴 两侧若不一致，这里会在**某一侧的历史被填满**
+     ``past`` 必须与 :func:`rebuild_history_columns` 的那个一致（默认
+      :data:`HISTORY_PAST`）。 两侧若不一致，这里会在**某一侧的历史被填满**
       时提前停下（``while`` 条件里有 ``len(my) < slots and len(op) < slots``），
       于是少看了几手、把 ``-1`` 当成真值 —— 而 ``-1`` 在 ch9..13 上与 pass
       不可区分，**不报错**。往回看多少手不是「够填满槽位就行」：槽填满之后
@@ -356,7 +356,7 @@ def verify_history_columns(my_hist, op_hist, moves, to_play, game_ids, *,
     gid_all = np.asarray(game_ids)
     n = int(my_hist.shape[0])
     if idxs is None:
-        # ⚠ **固定取样而不是随机**：这个函数常在构造期调（verify=...），
+        # **固定取样而不是随机**：这个函数常在构造期调（verify=...），
         # 取样必须与随机数状态无关，否则同一份数据两次构造得到不同结论。
         step = max(1, n // max(1, int(nrows)))
         idxs = np.arange(0, n, step, dtype=np.int64)[:int(nrows)]
@@ -380,7 +380,7 @@ def verify_history_columns(my_hist, op_hist, moves, to_play, game_ids, *,
     if strict and bad:
         raise AssertionError(
             f'重建的历史列与独立参考实现不符（{len(bad)} 处，前几处 {bad[:4]}）。'
-            f'⚠ 这不是「取样太严」—— 重建口径只有一种可能出错的地方就是槽位分配。')
+            f' 这不是「取样太严」—— 重建口径只有一种可能出错的地方就是槽位分配。')
     return out
 
 
@@ -390,14 +390,14 @@ def verify_history_columns(my_hist, op_hist, moves, to_play, game_ids, *,
 def dihedral_batch(x, tforms):
     """对 ``(B,C,H,W)`` 施加逐行 8 路 dihedral 变换（4 旋转 × 2 镜像）。
 
-    ⚠ **与 ``dataset.sample_batch_numpy`` 的增强是同一套约定**（``t >= 4`` 先翻
+     **与 ``dataset.sample_batch_numpy`` 的增强是同一套约定**（``t >= 4`` 先翻
     W 轴 ``[..., ::-1]``，``k = t % 4`` 再顺时针转 ``k`` —— numpy 的 ``np.rot90``
     是逆时针，故取 ``-k``）。抄一份是因为 V7 的 22 通道空间量不走那条路径；
     方向写反不会报错，只是「loss 照降、棋力不涨」，所以
     ``tests/test_v7_dataset.py::test_dihedral_matches_dataset_augmentation``
     拿 dataset 的实现逐位对拍。
 
-    ⚠ **对称增广不在 :func:`spatial_global` 里做**：它必须与标签用的是**同一份**
+     **对称增广不在 :func:`spatial_global` 里做**：它必须与标签用的是**同一份**
     ``tforms``（见 :meth:`V7Dataset.sample_batch_v7`）。19 维全局量在棋盘翻转下
     不变，故只有 22 通道空间量要变换。
     """
@@ -423,7 +423,7 @@ def dihedral_batch(x, tforms):
 class _BatchGameRow:
     """``global_features_v7(game_row=...)`` 的逐批替身。
 
-    ⚠ **它是逐批的，不能是逐局的**：``feature_v7._komi_of`` 接受任何有 ``.komi``
+     **它是逐批的，不能是逐局的**：``feature_v7._komi_of`` 接受任何有 ``.komi``
     属性的对象并把它 reshape 成 ``(B,)``，所以一个装着 ``(B,) float32`` 数组的
     薄壳就够，不必为每行建一个 :class:`feature_v7.GameRow`。
     """
@@ -441,15 +441,15 @@ def spatial_global(dataset, idxs, *, boards=None, rules_flags=0):
         ``(B,22,19,19) float16`` / ``(B,19) float16``。dtype 与
         ``feature_v7`` 一致，AMP 下不必再升精度。
 
-    ⚠ **与 ``scripts/train_sft.py::v7_batch_features`` 逐位相同**
+     **与 ``scripts/train_sft.py::v7_batch_features`` 逐位相同**
     （``tests/test_v7_dataset.py::test_matches_train_sft_v7_batch_features_bitwise``
     钉住）。之所以这里要有一份而不能直接 import 那个：``src`` 反向依赖 ``scripts``
     会把训练脚本的 argparse / 设备探测拖进数据层（本仓 ``katago_v7_loss.huber``
     注释里记着同一条纪律）。**两份的实现必须一起改**，测试是防漂移的那道闸。
 
-    ⚠ **对称增强不在这里做** —— 见 :func:`dihedral_batch` 的说明。
+     **对称增强不在这里做** —— 见 :func:`dihedral_batch` 的说明。
 
-    ⚠ ``rules_flags`` 是**整批一个标量**，不是逐行。原因：``feature_v7.calculate_area``
+     ``rules_flags`` 是**整批一个标量**，不是逐行。原因：``feature_v7.calculate_area``
     里是 ``if scoring == SCORING_TERRITORY:``，传数组会在那一行炸成
     「truth value is ambiguous」。逐局规则化要等 ``games.npz`` sidecar 的规则来源
     可靠之后再做（那时按 ``rules_flags`` 分组跑）。
@@ -458,7 +458,7 @@ def spatial_global(dataset, idxs, *, boards=None, rules_flags=0):
 
     idxs = np.asarray(idxs, dtype=np.int64)
     src = dataset.boards if boards is None else boards
-    # 🔴 ``game_ids`` **必须给**：主数据集是 162,298 局首尾相接的一根大数组、
+    # ``game_ids`` **必须给**：主数据集是 162,298 局首尾相接的一根大数组、
     # **没有局的边界标记**，i 与 i-1/i-2 可以分属两局，而跨局取到的盘面
     # **看起来完全合法**（它就是某个真实盘面）只是不属于这一手。
     g = gather_neighbors(src, idxs, offsets=LADDER_OFFSETS,
@@ -488,7 +488,7 @@ def spatial_global(dataset, idxs, *, boards=None, rules_flags=0):
 def dense_move_target(moves, action_size=ACTION_SIZE):
     """``(B,)`` 着法 → ``(B, action_size)`` 稠密 one-hot；**``-1`` ⇒ 全零行**。
 
-    ⚠ ``-1`` 不是「随便哪个类」：``next_move`` 用 ``-1`` 表示「局末手 /
+     ``-1`` 不是「随便哪个类」：``next_move`` 用 ``-1`` 表示「局末手 /
     跨局 / 下一手是 pass」，语义是**没有下一手**，对应 ``w['policy_opp'] == 0``。
     交给 ``F.one_hot(-1)`` 的行为不是本仓可以依赖的契约（不同 PyTorch 版本不同），
     所以**显式**置零 —— 权重本来就是 0，全零行既安全又语义正确。
@@ -523,19 +523,19 @@ def to_v7_loss_labels(labels_dict, moves, *, action_size=ACTION_SIZE):
                                 dataset 叫 ``future``；值域与 -1 哨兵一致）
     ==========================  ==========================================
 
-    🔴 **幂等**：对本函数已经产出的 dict 再调一次，值不变。所以
+     **幂等**：对本函数已经产出的 dict 再调一次，值不变。所以
     ``scripts/train_sft.py::v7_loss_labels`` 叠在 ``V7Dataset`` 的 payload 上
     也是安全的（``tests/test_v7_dataset.py::test_loss_label_translation_matches_train_sft``
     用逐位对拍把这一点钉住）。
 
-    🔴 **``w['futurepos']`` 绝不能改成 OR**（承重语义，不是风格）：loss 的 #11 把
+     **``w['futurepos']`` 绝不能改成 OR**（承重语义，不是风格）：loss 的 #11 把
     ``future`` reshape 成 ``(b,2,bs²)`` 之后**塌成逐样本标量**再乘**一个**权重，
     而 ``_weighted_mean`` 是 ``(per_sample*weight).mean()``（**刻意不除 Σw**）⇒
     权重的最小作用单位是「整块 2×bs²」。只活一路时若给 1，那一路的 -1 哨兵会被
     当真值拟合 tanh，头会学出一个恒 −0.76 的假平面。dataset 给的**与**语义
     （``w_h0 & w_h1``）是唯一正确的口径，本函数**原样透传**。
 
-    🔴 **``outcome_black`` 不能由 ``outcome * to_play`` 推出**：``0 * -1 == 0``，
+     **``outcome_black`` 不能由 ``outcome * to_play`` 推出**：``0 * -1 == 0``，
     于是「白胜」会被报成「黑胜」。直接用 dataset 给的键。
     """
     lbl = dict(labels_dict)
@@ -556,12 +556,12 @@ def finalize_loss_weights(w, batch, *, futurepos_enabled=False):
     3. futurepos 启用时要求 ``futurepos_h0`` / ``futurepos_h1`` 也在（它们不参与
        loss，但**缺了就没法区分「只活一路」与「两路都死」**）。
 
-    ⚠ **就地修改并返回同一个 dict** —— ``_build_labels`` 每次都新建，这个对象是
+     **就地修改并返回同一个 dict** —— ``_build_labels`` 每次都新建，这个对象是
     本函数独占的；但调用方若跨 batch 复用同一个 ``w`` 会踩到，故 docstring 明写
     「返回值才是权威」。
     """
     if 'lead' not in w:
-        # 🔴 本函数存在的**首要**理由，且必须在缺键检查**之前**补：
+        # 本函数存在的**首要**理由，且必须在缺键检查**之前**补：
         # _build_labels 的 w 只有 policy/policy_opp/ownership/score/scoring/seki/
         # futurepos(+h0/h1)，唯独没有 lead，而 loss 的 #9 读 w_of('lead')。
         # 缺键时 w_of 返回全 1 ⇒ 拿 labels['score'] 的**零占位**训 lead 头，
@@ -571,7 +571,7 @@ def finalize_loss_weights(w, batch, *, futurepos_enabled=False):
     missing = [k for k in LOSS_W_KEYS if k not in w]
     if missing:
         raise KeyError(
-            f'w 缺 {missing}。🔴 KataGoV7Loss.w_of() 在键缺失时返回 torch.ones —— '
+            f'w 缺 {missing}。 KataGoV7Loss.w_of() 在键缺失时返回 torch.ones —— '
             f'「不写」不是「屏蔽」，那一项会被静默地按权重 1 训练。要屏蔽就显式给 0。'
             f'（现有键：{sorted(w)}）')
     if futurepos_enabled:
@@ -623,11 +623,11 @@ class V7Dataset(SupervisedDataset):
             raise V7ActionSizeError(
                 f'V7 固定 {BOARD_SIZE}x{BOARD_SIZE}（动作空间 {ACTION_SIZE} 类），'
                 f'实得 {self.board_size}x{self.board_size}。'
-                f'⚠ 不要为了迁就小盘面去改动作空间 —— 官方 checkpoint 的 policy 头是'
+                f' 不要为了迁就小盘面去改动作空间 —— 官方 checkpoint 的 policy 头是'
                 f'{ACTION_SIZE} 路，改了就接不上。')
         if self.game_ids is None:
             raise ValueError(
-                'V7Dataset 必须有 game_ids 列。⚠ 邻行 gather（ladder 的 ch15/ch16、\n'
+                'V7Dataset 必须有 game_ids 列。 邻行 gather（ladder 的 ch15/ch16、\n'
                 '  futurepos 的 i+8/i+32）的跨局守卫靠它：主数据集是 162,298 局首尾\n'
                 '  相接的一根大数组、没有局的边界标记，i 与 i±k 可以分属两局，而跨局\n'
                 '  取到的盘面**看起来完全合法**（它就是某个真实盘面）只是不属于这一手\n'
@@ -639,7 +639,7 @@ class V7Dataset(SupervisedDataset):
         self._game_rules = _normalize_game_scalar(game_rules_flags,
                                                   'game_rules_flags', int)
 
-        # 🔴 覆写历史列。放在 super().__init__ 之后：父类构造期会把 data 里那份
+        # 覆写历史列。放在 super().__init__ 之后：父类构造期会把 data 里那份
         #   （错的）赋给 self.my_hist / self.op_hist。
         self.my_hist, self.op_hist = rebuild_history_columns(
             self.moves, self.to_play, self.game_ids,
@@ -668,20 +668,20 @@ class V7Dataset(SupervisedDataset):
     def sample_batch_v7(self, idxs, *, rng=None, augment=True, boards=None):
         """同步取一个 V7 batch：``(spatial, global_features, moves, labels_dict)``.
 
-        ⚠ **``labels_dict`` 是 dataset 形状**（``next_move`` / ``future`` /
+         **``labels_dict`` 是 dataset 形状**（``next_move`` / ``future`` /
         ``outcome`` / ``w`` …），不是 loss 形状。翻译由
         :func:`to_v7_loss_labels` 做 —— 这样本函数与
         ``scripts/train_sft.py::_prefetch_worker(v7=True)`` 的 payload
         **逐位同形**，两条取批路径可以互换。
 
-        ⚠ **``tforms`` 在这里抽一次，同时喂空间量与 ``_build_labels``。**
+         **``tforms`` 在这里抽一次，同时喂空间量与 ``_build_labels``。**
         不能改用 ``sample_batch_numpy(..., labels=True)``：那份 ``tforms`` 是它
         内部抽的、本方法拿不到；而「自己再抽一份」是**静默错标签**（输入翻了、
         标签没翻 ⇒ loss 照降、棋力不涨）。也不能反推 —— 盘面本身对某组变换不变时
         （空盘、对称局面；训练早期大量如此）8 个候选输出完全相同，反推会挑一个
         **不一定等于真值**的 ``t``。
 
-        ⚠ **不抽 ``tforms``（``augment=False``）时不碰 RNG**，与
+         **不抽 ``tforms``（``augment=False``）时不碰 RNG**，与
         ``sample_batch_numpy`` 的评估路径同一口径。
         """
         idxs = np.asarray(idxs, dtype=np.int64)
@@ -723,7 +723,7 @@ def _normalize_game_scalar(value, name, cast):
     """把「逐局标量」归一成 ``{game_id: value}`` 或 ``None``。
 
     接受 mapping（键会被强转成 ``int``）或**按 game_id 索引**的一维数组。
-    ⚠ **拒绝**「按行号索引」的数组：那样两种传法的下标语义不同，而数组没有
+     **拒绝**「按行号索引」的数组：那样两种传法的下标语义不同，而数组没有
     自带说明，猜错的后果是**静默取到别局的贴目**（全局 ch5/ch18 跟着错，
     不报任何错）。所以数组必须比 `game_ids.max()+1` 短或等长，语义唯一。
     """

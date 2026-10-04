@@ -191,7 +191,7 @@ def play_game(black, white, board_size, max_moves):
     while passes < 2 and mc < max_moves:
         to_play = board.current_player
         legal = board.get_legal_moves()
-        # ⚠ 判据必须是 `not legal.any()`，不是 `len(legal) == 0`：掩码是长度恒为 n*n 的
+        # 判据必须是 `not legal.any()`，不是 `len(legal) == 0`：掩码是长度恒为 n*n 的
         # ndarray，`len(legal)` 永远是 n*n，这一支**从来没进过**（写成 len() 是个哑分支）。
         # 它本来就不是回归（老规则下也一样错），但 P2.6a 之后掩码里多了禁自杀与 PSK 两类
         # False，「无处可下」比以前更容易出现；一旦出现，`select()` 里的

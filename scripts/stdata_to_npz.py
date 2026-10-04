@@ -8,7 +8,7 @@
 把标签整理成 `KataGoV7Loss` 认的形状。这一步以前只存在于
 `smoke_train_v7.py::load_rows` 那种「读进内存立刻用掉」的临时函数里。
 
-🔴 **为什么必须是单个 `.npz`，而不是 memmap `.npy`**
+ **为什么必须是单个 `.npz`，而不是 memmap `.npy`**
 ----------------------------------------------------
 云端训练机 256 GB RAM 的用法是「**父进程整份载入 → fork → COW 共享给
 worker**」。所以：
@@ -18,7 +18,7 @@ worker**」。所以：
   · **磁盘紧张 ⇒ 不许留中间物**：一次写成，缓冲只驻留内存，崩了删掉重来，
     不生成第二份全量副本。
 
-🔴 **`globalTargetsNC` 的列数随网络版本变 —— 而且是「逐成员」变的**
+ **`globalTargetsNC` 的列数随网络版本变 —— 而且是「逐成员」变的**
 --------------------------------------------------------------
 实测三个归档里**混着多种布局**（`2026-08-25npzs.tgz` 全量 57,386 个成员）：
 
@@ -37,23 +37,23 @@ worker**」。所以：
 ⇒ 所以 :func:`resolve_member_network` **逐成员**分派：列数唯一就直接定；
 列数有歧义（64 有两个网络）就用**归档路径里的批次名**消歧；都定不下来就报错。
 
-🔴 **本文件里一个列号字面量都没有**（:data:`GLOBAL_TARGET_COLUMNS` 是唯一的
+ **本文件里一个列号字面量都没有**（:data:`GLOBAL_TARGET_COLUMNS` 是唯一的
 列号出处，每个都引用 `katago_npz` 的 ``COL_*`` 常量）—— 硬编码会在换批次时
 **静默错位**：不报错，只是权重列读成了别的语义。
 
-🔴 **输入保持 bit-packed `(N,22,46) uint8`**
+ **输入保持 bit-packed `(N,22,46) uint8`**
 -----------------------------------------
 `to_v7_labels` 会把空间通道解包成 `(N,22,19,19)` float32（方便对拍与喂 loss），
 但那**不是存储格式**：解包后每行 31.8 KB，3.2M 行 = 101 GB；packed 只要 3.24 GB。
 转换期解包一次是对的，存回去必须还是 packed。
 
-🔴 **policy 目标存 top-16 稀疏**（rank + 权重两列）
+ **policy 目标存 top-16 稀疏**（rank + 权重两列）
 -------------------------------------------------
 稠密 `(N,362)` 在 3.2M 行下是 2.3 GB，top-16 只要 410 MB。
 计算仍在 362 维稠密分布上做（`katago_v7_loss.policy_dense_from_sparse`），
 存储才截断。
 
-🔴 **ch18 / ch19 按原样写入，不在转换期「修」；`komi` 列已实测不是「本局贴目」**
+ **ch18 / ch19 按原样写入，不在转换期「修」；`komi` 列已实测不是「本局贴目」**
 ------------------------------------------------------------------------
 ch18/ch19：官方算 area 前先提死子，本仓 `GoBoard.score()` 不做（spec §5.1 刻意
 保留）⇒ 与本仓口径**已知不一致**，且**绝对量是批次特定的**（换归档不复现）。
@@ -173,7 +173,7 @@ POLICY_TOPK = 16
 #: 14.0–14.6 KB，而 spec 算出的未压缩是 11.9 KB/行 ⇒ **余量约 19%**。
 #: 那一部分来自 zip/deflate 的工作缓冲、`np.empty` 的对齐与页碎片。
 #:
-#: ⚠ **别把它删掉当"保守估计"**：``--ram-budget-gb`` 是唯一能在开跑前拦住
+#: **别把它删掉当"保守估计"**：``--ram-budget-gb`` 是唯一能在开跑前拦住
 #: "装不下"的闸门，按未压缩量估会在临界配置上**放行一个必然 OOM 的任务** ——
 #: 而 OOM 发生在写了几个 GB 之后，现场既没有堆栈也没有块边界可查。
 RAM_OVERHEAD_FACTOR = 1.19
@@ -198,7 +198,7 @@ class ConversionError(RuntimeError):
 # --------------------------------------------------------------------------- #
 #: ``globalTargetsNC`` 里「语义名 → 列号」的唯一映射。
 #:
-#: 🔴 **这里没有任何字面量**：每个列号都引用 `src/data/katago_npz.py` 的
+#: **这里没有任何字面量**：每个列号都引用 `src/data/katago_npz.py` 的
 #: ``COL_*`` 常量。那张常量表是在两个网络版本（64 列 / 80 列）上分别核对过的。
 #: 若哪天实测发现某版本列号不同构，**改 `katago_npz.py` 的常量表**，不要在这里
 #: 打补丁 —— 两份列号表必然分叉，而分叉的后果是**静默错标签**。
@@ -207,10 +207,10 @@ GLOBAL_TARGET_COLUMNS = {
     'score_mean': (COL_SCORE_MEAN,),
     'final_score': (COL_FINAL_SCORE,),
     'lead': (COL_LEAD,),
-    # 🔴 varTimeLeft = 官方 `sv3Mul` 六通道的**第 3 路**（下标 3）。
+    # varTimeLeft = 官方 `sv3Mul` 六通道的**第 3 路**（下标 3）。
     # 语义已由 `trainingwrite.cpp:603-616` 定案（winloss 期望到达时间），
     # 实测交叉验证通过（全非负 / 与分差零相关 / 均值 10.95）。
-    # ⚠ 训练数据里存的**已经是最终物理量**，直接回归，不要再乘 40。
+    # 训练数据里存的**已经是最终物理量**，直接回归，不要再乘 40。
     'var_time_left': (COL_VAR_TIME_LEFT,),
     'global_weight': (COL_GLOBAL_WEIGHT,),
     'komi': (COL_KOMI,),
@@ -227,7 +227,7 @@ GLOBAL_TARGET_COLUMNS = {
 def resolve_network_key(network, cols=None):
     """网络名 → `GLOBAL_TARGET_LAYOUT` 的键；给了 ``cols`` 就**核对列数**。
 
-    ⚠ ``network`` **不给默认值**是刻意的：64 列这一族有**两个**网络
+     ``network`` **不给默认值**是刻意的：64 列这一族有**两个**网络
     （``b40c768nbt`` 有 Q 值 / ``b28c512`` 没有），光看列数分不出来。
     猜错会让权重列静默错位，所以这条在 CLI 边界就报错。
     """
@@ -244,7 +244,7 @@ def resolve_network_key(network, cols=None):
     if cols is not None and int(cols) != int(layout['cols']):
         raise ConversionError(
             f'{key} 登记为 {layout["cols"]} 列，实测 {int(cols)} 列。'
-            f'⚠ 这说明 `GLOBAL_TARGET_LAYOUT` 与数据脱节了 —— '
+            f' 这说明 `GLOBAL_TARGET_LAYOUT` 与数据脱节了 —— '
             f'**别改本文件的列号去迁就**，去核对布局表。')
     return key
 
@@ -300,7 +300,7 @@ def batch_token(member_name):
     ``2026-08-25npzs/kata1-zhizi-b40c768nbt-s11472M-d5982M/3AF1….npz``
     → ``'kata1-zhizi-b40c768nbt'``。
 
-    🔴 **为什么需要它**：``64`` 列这一族有**两个**网络，光看列数分不出来；
+     **为什么需要它**：``64`` 列这一族有**两个**网络，光看列数分不出来；
       而归档路径里的批次名是数据自带的、可靠的消歧信号。
     """
     for part in member_name.split('/'):
@@ -313,7 +313,7 @@ def batch_token(member_name):
 def resolve_member_network(member_name, cols, default=None):
     """**逐成员**解析网络 → `GLOBAL_TARGET_LAYOUT` 的键。
 
-    🔴 **为什么必须逐成员而不是逐归档**
+     **为什么必须逐成员而不是逐归档**
     ----------------------------------
     实测两个归档里都**混着多种布局**（2026-08-25 的 57,386 个成员：
 
@@ -372,7 +372,7 @@ def resolve_member_network(member_name, cols, default=None):
 # --------------------------------------------------------------------------- #
 # 列值的**物理可能域**检查
 # --------------------------------------------------------------------------- #
-#: 🔴 **这不是「我猜的语义」，是「围棋里不可能出现的数」**
+#: **这不是「我猜的语义」，是「围棋里不可能出现的数」**
 #: ------------------------------------------------------
 #: 目的只有一个：**在列映射对不上的批次上当场抓出来，而不是让它混进训练**。
 #: 越界只说明「这一批的这几列读出来不是那个量」，**不说明该改成什么** ——
@@ -384,7 +384,7 @@ def resolve_member_network(member_name, cols, default=None):
 
 
 DOMAIN_HARD_BOUNDS = {
-    # 围棋贴目不会超过 ±30（官方自对弈是 7.5）。⚠ 实测 `kata1-tf3-b11c768` 上
+    # 围棋贴目不会超过 ±30（官方自对弈是 7.5）。 实测 `kata1-tf3-b11c768` 上
     # col47 ∈ {±7.5} 看着完美，而 zzb28c512 批上同一列到 **±51** —— 差 7 倍。
     'komi': (-30.0, 30.0),
     # 19×19 满盘 361 点 + 贴目，几百是硬上限。
@@ -412,7 +412,7 @@ def check_plausibility(targets, sample_cap=200_000):
     ⇒ 任一条不过就标 ``SUSPECT``。样本大时按行抽样（``sample_cap``），
       免得为了算 min/max 把整列扫两遍 —— 转换期内存已经吃满了。
 
-    ⚠ 第 3 条的实测结论与 `to_v7_labels` 的注释**不一致**：三个归档上
+     第 3 条的实测结论与 `to_v7_labels` 的注释**不一致**：三个归档上
       ``globalTargetsNC[:, 0:3]`` 都**恰好和为 1**，而且**大量行是软的**
       （实测 zzb28c512 上 ``max < 0.999`` 的行占多数，例如
       ``[0.8236, 0.1764, 0]``）⇒ 它是**软的三分类分布**，不是「硬 one-hot +
@@ -480,7 +480,7 @@ def output_spec(policy_topk=POLICY_TOPK, keep_qvalue=False):
     * ``spatial_packed`` 而不是 ``spatial`` —— bit-packed，不解包（约束 3）；
     * policy 四列是 ``(N,K) rank + 权重`` 而不是稠密 ``(N,362)``（约束 4）。
 
-    ⚠ 除这两处外**所有键的 dtype 与语义都与 `to_v7_labels` 逐字一致** ——
+     除这两处外**所有键的 dtype 与语义都与 `to_v7_labels` 逐字一致** ——
       少一处转换，就少一处「存的时候和读的时候口径不同」的可能。
     """
     cell = (BOARD, BOARD)
@@ -501,9 +501,9 @@ def output_spec(policy_topk=POLICY_TOPK, keep_qvalue=False):
         ('score', np.float32, ()),
         ('score_mean_hint', np.float32, ()),
         ('lead_hint', np.float32, ()),
-        # 🔴 varTimeLeft（官方 sv3Mul 六通道的下标 3）。语义见
+        # varTimeLeft（官方 sv3Mul 六通道的下标 3）。语义见
         #   `katago_npz.COL_VAR_TIME_LEFT`（trainingwrite.cpp:603-616 定案）。
-        #   ⚠ 这三处**硬编码列表**（SPEC / chunk / 前向补齐）必须同步改 ——
+        # 这三处**硬编码列表**（SPEC / chunk / 前向补齐）必须同步改 ——
         #   落盘键不是从 labels dict 推导的，漏改任何一处都静默丢标签。
         ('var_time_left', np.float32, ()),
         ('komi', np.float32, ()),
@@ -538,7 +538,7 @@ def policy_resid(policy_all, top_vals):
     （`to_v7_labels` 的 `policy_resid`）」—— 而 `to_v7_labels` 其实**没有**产出
     这个字段。本函数把它补齐：它是「K=16 够不够大」的哨兵，不补就永远没人知道。
 
-    ⚠ ``Σall == 0`` 的行记 **0** 而不是 nan —— 全零行会让哨兵自己变成 nan，
+     ``Σall == 0`` 的行记 **0** 而不是 nan —— 全零行会让哨兵自己变成 nan，
       而 nan 会在报告里伪装成「K 太小」。
     """
     all_sum = np.asarray(policy_all, dtype=np.float64).sum(1)
@@ -621,7 +621,7 @@ def shard_mask(n_rows, global_offset, num_shards, shard_id):
        切连续区间则要事先知道每个归档各有多少行（得多跑一遍计数）。
     ② 与成员边界无关 —— 成员大小不均（实测每个 npz 约 63 行）也不会让某块偏大。
 
-    ⚠⚠ **``global_offset`` 必须按「分片过滤**之前**」的行数推进。**
+     **``global_offset`` 必须按「分片过滤**之前**」的行数推进。**
     若误用过滤后的行数当偏移，每块算出的全局行号会随自己的过滤结果漂移
     ⇒ 从第 2 块起，同一行会同时落进两块（重复），另一些行谁都不落（丢失）。
     这是取模分片最经典的一个错，而且**全程不报任何错** ——
@@ -638,7 +638,7 @@ def shard_mask(n_rows, global_offset, num_shards, shard_id):
 def subset_labels(labels, j):
     """按**局部行下标** ``j`` 取 :func:`katago_npz.to_v7_labels` 结果的子集。
 
-    🔴 **不能写成 ``{k: v[j] for k, v in labels.items()}``** ——
+     **不能写成 ``{k: v[j] for k, v in labels.items()}``** ——
     `to_v7_labels` 的返回值混着四类东西，只有两类带行轴：
 
     ==========  ==========================================  ==============
@@ -654,7 +654,7 @@ def subset_labels(labels, j):
     新增带行轴的键时**不会漏切**（漏切会让块内行数与 ``game_ids`` 不符，
     而那正是写手 ``close()`` 里会当场报错的地方）。
 
-    ⚠ ``spatial`` 是**解包后 float32、每行 31.8 KB** —— 分片时切它纯属白切
+     ``spatial`` 是**解包后 float32、每行 31.8 KB** —— 分片时切它纯属白切
     （``labels_to_chunk`` 用的是 packed），但不能因为「用不上」就跳过：
     跳过会让这个键的行数与 ``_kept`` 不一致，将来谁改成用解包版就会静默错位。
     """
@@ -686,7 +686,7 @@ def subset_labels(labels, j):
 class NpzChunkedWriter:
     """攒块 → **顺序**写一个 `.npz`（每个键一个 ``<键>.npy`` 成员）。
 
-    🔴 **为什么不能"边收边追加"**
+     **为什么不能"边收边追加"**
     --------------------------
     zip 格式的每个成员都是一段**连续**的字节流，而 ``ZipFile`` 同一时刻只允许
     一个写句柄（多开直接 ``ValueError: another write handle open``）。
@@ -704,12 +704,12 @@ class NpzChunkedWriter:
     ② 逐键**校验** dtype / 形状 / 行数（本实现每个键都查，查错在写之前）；
     ③ 写完删掉该键的块缓冲（``self._chunks[key] = None``）—— 但这只在
        ``close()`` **逐键落盘**的那一刻才发生，此前**所有键的累积列都同时
-       在内存里**。⚠ 所以别把这句话读成"峰值 = 最大单键"：实测峰值是
+       在内存里**。 所以别把这句话读成"峰值 = 最大单键"：实测峰值是
        **未压缩总量**（3.13M 行 ≈ 37.4 GB）再加 :data:`RAM_OVERHEAD_FACTOR`
        的余量 ≈ 44.8 GB，**不是**最大单键 `score_distr` 的 10.55 GB。
        要降峰值只能分片（``--num-shards``），见模块说明。
 
-    ⚠ ``force_zip64=True`` 是必需的：``futurepos`` 单成员就 9.2 GB，
+     ``force_zip64=True`` 是必需的：``futurepos`` 单成员就 9.2 GB，
       超过 ZIP 的 4 GB 单成员上限（未压缩）/ 2 GB（压缩）。
     """
 
@@ -738,7 +738,7 @@ class NpzChunkedWriter:
         if self.queued + n > self.n_rows:
             raise ConversionError(
                 f'已缓冲 {self.queued} 行 + 这一块 {n} 行 > 头里声明的 '
-                f'{self.n_rows} 行。⚠ 第 0 遍的行数与第 1 遍对不上 —— '
+                f'{self.n_rows} 行。 第 0 遍的行数与第 1 遍对不上 —— '
                 f'归档在两遍之间变了？')
         for key, dt, tail in self.spec:
             a = np.asarray(chunk[key])
@@ -847,7 +847,7 @@ def npz_to_v7_labels(z, unpack=True):
 
     Returns:
         标签 dict，键与 `to_v7_labels` 一致，另有 ``'global'`` / ``'game_ids'`` /
-        ``'source_id'`` / ``'policy_*_resid'``。⚠ **不含** ``'spatial'`` 之外的
+        ``'source_id'`` / ``'policy_*_resid'``。 **不含** ``'spatial'`` 之外的
         输入侧诊断列（``board_mask`` 在 19×19 过滤后恒为 True，不占空间）。
     """
     if int(z['schema_version']) != SCHEMA_VERSION:
@@ -904,10 +904,10 @@ def load_v7_npz(path, unpack=True):
 
 def _render_suspect(archive, network, suspect):
     """列值越出物理可能域时的**大声**报告（写进 meta，也打到 stdout）。"""
-    L = ['', '🔴🔴 %s（%s）有 %d 个全局目标列读出来**物理上不可能**：'
+    L = ['', ' %s（%s）有 %d 个全局目标列读出来**物理上不可能**：'
          % (archive, network, len(suspect)),
-         '    ⚠ 列映射与该批数据对不上 ⇒ 这些列的标签是错的。',
-         '    ⚠ 本脚本**按原样写入并打标记**（见 meta_json.archives[*]'
+         ' 列映射与该批数据对不上 ⇒ 这些列的标签是错的。',
+         ' 本脚本**按原样写入并打标记**（见 meta_json.archives[*]'
          '.suspect_columns）—— **不猜、不改、不填 0**：',
          '      凭空发明一个值比留一个已知错位的值更难查。',
          '    列                    实测范围            应在        越界行占比']
@@ -925,10 +925,10 @@ def _render_suspect(archive, network, suspect):
 def iter_npz_members(archive):
     """流式产出 ``(成员名, NpzFile)``。
 
-    ⚠ **流式读，禁止 ``getmembers()``**：那要把整个 1.5 GB 归档走一遍才能开始
+     **流式读，禁止 ``getmembers()``**：那要把整个 1.5 GB 归档走一遍才能开始
       干活（同一纪律见 `crosscheck_stdata.load_sample` 与
       `scripts/build_dataset.py`）。
-    ⚠ 模式用 ``r|*`` 而不是 ``r|gz`` —— 三个归档里有一个是**不压缩**的
+     模式用 ``r|*`` 而不是 ``r|gz`` —— 三个归档里有一个是**不压缩**的
       ``.tar``，``r|gz`` 会在它上面直接抛异常。
     """
     if not os.path.isfile(archive):
@@ -951,24 +951,24 @@ def count_kept_rows(archive, network=None, limit=None, log=None,
                     num_shards=1, shard_id=0, global_offset=0):
     """数出这个归档过滤后有多少行 19×19（= 第 1 遍要写的行数）。
 
-    ⚠ **只解 ``binaryInputNCHWPacked`` 与 ``globalTargetsNC`` 两个成员**
+     **只解 ``binaryInputNCHWPacked`` 与 ``globalTargetsNC`` 两个成员**
       （``np.load`` 对 zip 成员是惰性的，其余 5 个成员不解）⇒ 这一遍比全量
       转换便宜一个数量级。第二个成员只为读**列数**（逐成员分派布局，见
       :func:`resolve_member_network`），它很小（N × 64 × 4 B）。
 
-    ⚠ **布局解不出来的成员不计数** —— 两遍必须对同一批成员达成一致，
+     **布局解不出来的成员不计数** —— 两遍必须对同一批成员达成一致，
       否则第 1 遍写的行数会比预算少，`convert` 会当场报错。
 
     分片
     ----
     ``num_shards``/``shard_id``/``global_offset`` 让这一遍只数**属于本块**的行。
-    🔴 **两遍必须用同一套全局偏移算术** —— `global_offset` 是「本归档之前
+     **两遍必须用同一套全局偏移算术** —— `global_offset` 是「本归档之前
     全部归档累计的 19×19 行数」（**过滤前**），`member_base` 每个成员按它
     自己保留的行数推进。任何一处改成「过滤后」，第 0 遍与第 1 遍就会对同一批
     行给出不同的归属，而 `convert` 的 ``a_rows != budget`` 检查**抓不到**
     （两边会一起错）。
 
-    ⚠ ``--limit`` 的语义随之变成「**本块**最多留多少行」，不再是整个归档的。
+     ``--limit`` 的语义随之变成「**本块**最多留多少行」，不再是整个归档的。
       所以 ``--limit`` + 分块只是抽样工具，**不能**用来重建某个已知名单 ——
       全量构建请不要带 ``--limit``（不带时 N 块严格构成全集的划分）。
     """
@@ -999,7 +999,7 @@ def count_kept_rows(archive, network=None, limit=None, log=None,
         kept += n_keep
         kept_shard += int(shard_mask(n_keep, member_base, num_shards,
                                      shard_id).size)
-        member_base += n_keep                     # ⚠ 按过滤前的行数推进
+        member_base += n_keep # 按过滤前的行数推进
         npz.close()
         if limit is not None and kept_shard >= limit:
             break
@@ -1041,9 +1041,9 @@ def convert(archives, out_path, *, policy_topk=POLICY_TOPK, limit=None,
         limit: 每个归档**本块**最多保留多少行 19×19（`None` = 全量）。
         num_shards / shard_id: 分片（见 :func:`shard_mask`）。``num_shards == 1``
             时行为与不分片**逐位相同**；``num_shards <= 0`` 是**非法值** ⇒ 报错，
-            不再被静默夹成 1（见函数体里的 🔴）。峰值内存 ≈ 未压缩总量 /
+            不再被静默夹成 1（见函数体里的 ）。峰值内存 ≈ 未压缩总量 /
             ``num_shards``。
-        ram_budget_gb: 峰值内存上限（GB）。``0`` = 不检查。⚠ 估的是**未压缩
+        ram_budget_gb: 峰值内存上限（GB）。``0`` = 不检查。 估的是**未压缩
             总量 × :data:`RAM_OVERHEAD_FACTOR`**（见 :class:`NpzChunkedWriter`：
             zip 容器无法交错写成员 ⇒ 转换期必须把未压缩数据整个放内存）。
         log: ``str -> None`` 的回调（进度）。
@@ -1053,11 +1053,11 @@ def convert(archives, out_path, *, policy_topk=POLICY_TOPK, limit=None,
 
     Raises:
         ConversionError: 任何一步对不上（列布局 / 两遍行数 / 写出行数）。
-            🔴 **失败时把半截文件删掉** —— 磁盘紧张，一个行数对不上的 npz
+             **失败时把半截文件删掉** —— 磁盘紧张，一个行数对不上的 npz
             比没有更糟（下游不会报错，只会在训练中途崩）。
     """
     log = log or (lambda *a, **k: None)
-    # 🔴 这里曾写 `num_shards = max(1, int(num_shards))` —— 那是**静默降级**，
+    # 这里曾写 `num_shards = max(1, int(num_shards))` —— 那是**静默降级**，
     # 而 CLI 校验修好之后它对 CLI 已经不可达了；留着它等于给直接调用
     # `convert()` 的代码留一个「传 0/负数 ⇒ 悄悄拿到全集」的洞（`meta['shard']`
     # 还会把 num_shards 记成 1，看起来完全正常）。降级本身就该报错。
@@ -1066,7 +1066,7 @@ def convert(archives, out_path, *, policy_topk=POLICY_TOPK, limit=None,
         raise ConversionError(
             f'num_shards={num_shards} 非法：必须 >= 1'
             f'（1 = 不分片，与 shard_mask 的 num_shards<=1 语义一致）。'
-            f'\n  ⚠ 别指望它被夹成 1：那会让分片调用**静默**退回全量转换，'
+            f'\n 别指望它被夹成 1：那会让分片调用**静默**退回全量转换，'
             f'而输出里的行数是个完全正常的数字。')
     shard_id = int(shard_id)
     if not 0 <= shard_id < num_shards:
@@ -1085,7 +1085,7 @@ def convert(archives, out_path, *, policy_topk=POLICY_TOPK, limit=None,
                                global_offset=archive_base)
         counts.append(info)
         total_rows += info['rows_kept_shard']
-        # ⚠ 下一归档的偏移按「过滤前」的行数推进（见 shard_mask 的警告）
+        # 下一归档的偏移按「过滤前」的行数推进（见 shard_mask 的警告）
         archive_base += info['rows_kept']
         if info['rows_kept'] == 0:
             raise ConversionError(
@@ -1106,7 +1106,7 @@ def convert(archives, out_path, *, policy_topk=POLICY_TOPK, limit=None,
         raise ConversionError(
             f'未压缩 {need / 1e9:.1f} GB > --ram-budget-gb 给的 '
             f'{ram_budget_gb:.1f} GB。\n'
-            f'  ⚠ 这不是"压缩后放不放得下"的问题：zip 容器无法交错写成员 ⇒ '
+            f' 这不是"压缩后放不放得下"的问题：zip 容器无法交错写成员 ⇒ '
             f'转换期必须把未压缩数据整个放内存（见 `NpzChunkedWriter`）。\n'
             f'  · **加 --num-shards N 把峰值除以 N**（推荐，见 --num-shards）\n'
             f'  · 降 `--limit` 先出小样本。\n'
@@ -1114,7 +1114,7 @@ def convert(archives, out_path, *, policy_topk=POLICY_TOPK, limit=None,
 
     writer = NpzChunkedWriter(out_path, spec, total_rows)
     written = members = source_counter = 0
-    global_seen = 0                 # ⚠ 按过滤前的行数推进，见 shard_mask
+    global_seen = 0 # 按过滤前的行数推进，见 shard_mask
     per_archive = []
     try:
         for (archive, network), cinfo in zip(archives, counts):
@@ -1139,7 +1139,7 @@ def convert(archives, out_path, *, policy_topk=POLICY_TOPK, limit=None,
                     key, how = resolve_member_network(mname, cols, network)
                 except ConversionError as e:
                     skipped_layout += 1
-                    log('  ⚠ 跳过 %s：%s' % (mname, str(e).splitlines()[0]))
+                    log(' 跳过 %s：%s' % (mname, str(e).splitlines()[0]))
                     npz.close()
                     continue
                 slot = per_network.setdefault(
@@ -1152,7 +1152,7 @@ def convert(archives, out_path, *, policy_topk=POLICY_TOPK, limit=None,
                 if idx.size == 0:
                     npz.close()
                     continue
-                # 🔴 列映射的**物理可能域**检查（见 check_plausibility）：
+                # 列映射的**物理可能域**检查（见 check_plausibility）：
                 # 这一批的 globalTargetsNC 若与登记表对不上，当场抓住并打标记，
                 # 而不是让它混进训练。**不猜、不改、不填 0。**
                 plaus = check_plausibility(extract_global_targets(
@@ -1183,7 +1183,7 @@ def convert(archives, out_path, *, policy_topk=POLICY_TOPK, limit=None,
                 # 换来的好处是**分片逻辑完全不影响标签计算路径**。
                 n_local = int(idx.size)
                 j = shard_mask(n_local, global_seen, num_shards, shard_id)
-                global_seen += n_local           # ⚠ 先按过滤前的行数推进
+                global_seen += n_local # 先按过滤前的行数推进
                 if j.size == 0:
                     labels = d = None
                     npz.close()
@@ -1243,7 +1243,7 @@ def convert(archives, out_path, *, policy_topk=POLICY_TOPK, limit=None,
             for nk, v in sorted(per_network.items()):
                 log('       布局 %-22s %d 列 %8d 行 %6d 成员（分派依据 %s%s）'
                     % (nk, v['cols'], v['rows'], v['members'], v['how'],
-                       '，⚠ 与登记表 %d 列不一致' % v['expected_cols']
+                       '， 与登记表 %d 列不一致' % v['expected_cols']
                        if v['cols'] != v['expected_cols'] else ''))
             if suspect:
                 log(_render_suspect(os.path.basename(archive),
@@ -1332,7 +1332,7 @@ def build_meta(*, out_path, per_archive, counts, n_rows, members,
                         if v[0] == KNOWN_DIVERGENT],
             'why': '官方算 area 前先提死子，本仓 GoBoard.score() 不做'
                    '（spec §5.1 刻意保留）⇒ 对不齐是已知口径差，**不是 bug**。'
-                   '⚠ 绝对量是**批次特定**的，换归档不复现 ⇒ 本转换器按原样写入，'
+                   ' 绝对量是**批次特定**的，换归档不复现 ⇒ 本转换器按原样写入，'
                    '**不在转换期"修"**：凭空发明第三种偏差比留着已知偏差更糟。'
                    '要按通道查某一批的 provenance 用 `source_id`。',
         },
@@ -1342,7 +1342,7 @@ def build_meta(*, out_path, per_archive, counts, n_rows, members,
             'global': [ch for ch, v in GLOBAL_SPEC.items()
                        if v[0] == NOT_COMPARABLE],
             'why': 'stdata 缺重建这些通道所需的输入（着法序列 / encore_phase），'
-                   '比出来的任何对齐率都是巧合。⚠ 它们同样**按原样写入** —— '
+                   '比出来的任何对齐率都是巧合。 它们同样**按原样写入** —— '
                    '私自改成 0 等于把「不可比」变成「看起来像已对齐」。',
         },
         'game_ids_semantics':
@@ -1362,14 +1362,14 @@ def build_meta(*, out_path, per_archive, counts, n_rows, members,
             '两边口径不同（crosscheck 的 NOT_COMPARABLE）。',
             'ch7 / ch20 / ch21：本仓源数据有 encore_phase 而 stdata 没有，'
             '不可比；按原样带入。',
-            '🔴 **`globalTargetsNC[:, 0:3]` 是软的三分类分布，不是硬 one-hot**：'
+            ' **`globalTargetsNC[:, 0:3]` 是软的三分类分布，不是硬 one-hot**：'
             '三个归档上都**恰好行和 = 1**，且大量行 `max < 0.999`'
             '（如 `[0.8236, 0.1764, 0]`）。`to_v7_labels` 用 `argmax` 压成硬 '
             '`outcome`，其「三列全 0 ⇒ 无结果」的兜底分支在这三个归档上'
             '**从不触发** ⇒ 置信度信息被丢掉。逐批的软标签占比见 '
             '`archives[*].plausibility.outcome_hard.frac_soft`。'
             '（按纪律**只报告不改 `src`**。）',
-            '🔴 **`COL_KOMI`(47) 读到的不是「本局贴目」，是 selfKomi'
+            ' **`COL_KOMI`(47) 读到的不是「本局贴目」，是 selfKomi'
             '（相对当前行棋方、带官方 draw-jitter）** —— 实测 `zzb28c512` 批上'
             'col47 ∈ [−41.5, 41.5]，而 `globalInputNC[:,5] × 20`（'
             '`feature_v7.KOMI_SCALE` 口径的 selfKomi）**逐行等于它**；'
@@ -1392,7 +1392,7 @@ def build_meta(*, out_path, per_archive, counts, n_rows, members,
 def parse_source(text):
     """``'路径:网络名'`` 或光 ``'路径'`` → ``(路径, 网络名或 None)``。
 
-    ⚠ 用 ``rpartition(':', 1)`` 而不是 ``split(':')`` —— Windows 的盘符
+     用 ``rpartition(':', 1)`` 而不是 ``split(':')`` —— Windows 的盘符
     （``F:\\...``）自带冒号，按第一个冒号切会把盘符切掉。
     """
     path, sep, network = text.rpartition(':')
@@ -1412,11 +1412,11 @@ def build_argparser():
     ap.add_argument('--source', action='append', type=parse_source, default=None,
                     metavar='ARCHIVE:NETWORK',
                     help='一个归档及其网络名，可重复；全部写进同一个 .npz。'
-                         '⚠ 网络名必填：64 列这一族有两个网络，列数分不出来')
+                         ' 网络名必填：64 列这一族有两个网络，列数分不出来')
     ap.add_argument('--archive', default=None,
                     help='单归档快捷方式（等价于一个 --source）')
     ap.add_argument('--network', default=None,
-                    help='该归档的**主**网络名。⚠ 可不给：实测归档里混着多种布局，'
+                    help='该归档的**主**网络名。 可不给：实测归档里混着多种布局，'
                          '默认**逐成员按列数分派**（列数有歧义时用归档路径里的'
                          '批次名消歧）。给了它只在消歧时当第二依据，'
                          '且它的列数与成员实测不符时会记进 '
@@ -1424,14 +1424,14 @@ def build_argparser():
     ap.add_argument('--out', default=None, help='输出 .npz 路径')
     ap.add_argument('--limit', type=int, default=None,
                     help='每个归档**本块**最多保留多少行 19×19（默认全量）。'
-                         '⚠ 是**过滤后**的行数')
+                         ' 是**过滤后**的行数')
     ap.add_argument('--num-shards', type=int, default=1, metavar='N',
                     help='把全量拆成 N 块分别转换，峰值内存 ≈ ÷N。'
-                         '⚠ 实测峰值是**未压缩总量 ×1.19**（不是最大单键）：'
+                         ' 实测峰值是**未压缩总量 ×1.19**（不是最大单键）：'
                          '全量 3.13M 行 ≈ 44.8 GB，13.9 GB 的机器必须分块。'
                          'N=8 时 ≈5.6 GB。分块后**各块串行跑**（并行的峰值是 '
                          'N 倍之和）。'
-                         '⚠ 必须 N >= 1（1 = 不分片）；N <= 0 直接报错，'
+                         ' 必须 N >= 1（1 = 不分片）；N <= 0 直接报错，'
                          '**不**静默当成不分片。N >= 2 时**必须**同时给 '
                          '--shard-id，除非用 --convert-all（它自己跑完全部 N 块）')
     ap.add_argument('--convert-all', action='store_true',
@@ -1440,13 +1440,13 @@ def build_argparser():
                          '自动跳过，中断后重跑同一条命令即可续做。产出 <out> 的 '
                          'N 个兄弟文件（foo_s0.npz … foo_s{N-1}.npz）加一份 '
                          '<out>.shards.json 清单（记录各块行数/文件/指纹）。'
-                         '⚠ 与 --shard-id 互斥（那是手动单块模式）；'
-                         '⚠ --count-only 时本参数让计数也逐块跑并打进清单')
+                         ' 与 --shard-id 互斥（那是手动单块模式）；'
+                         ' --count-only 时本参数让计数也逐块跑并打进清单')
     ap.add_argument('--shard-id', type=int, default=None, metavar='I',
                     help='本块编号，2 <= N 且 0 <= I < N。**手动单块模式**，'
                          '逐块跑：--num-shards 8 --shard-id 0/1/…/7'
                          '（规则是全局行号取模，N 块严格构成全集的划分）。'
-                         '🔴 **不给 = 不分片**（default 是 None 而不是 0：'
+                         ' **不给 = 不分片**（default 是 None 而不是 0：'
                          '「不分片」与「第 0 块」在 0 这个值上无法区分，'
                          '真值判断会让最常用的第 0 块跳过校验）。'
                          '给了就必须在分片（N >= 2），否则报错')
@@ -1454,12 +1454,12 @@ def build_argparser():
                     help='policy 稀疏目标的 K')
     ap.add_argument('--ram-budget-gb', type=float, default=0.0,
                     help='峰值内存上限（GB），超了就在开跑前报错（0 = 不检查）。'
-                         '⚠ 估的是**未压缩总量 ×1.19**（RAM_OVERHEAD_FACTOR，'
+                         ' 估的是**未压缩总量 ×1.19**（RAM_OVERHEAD_FACTOR，'
                          '实测）：zip 容器无法交错写成员，转换期必须把未压缩'
                          '数据整个放内存（见 `NpzChunkedWriter` 的 docstring）')
     ap.add_argument('--keep-qvalue', action='store_true',
                     help='保留 qValueTargetsNCMove（float32 (3,362) ≈ 4.3 KB/行）。'
-                         '⚠ V7 的 12 项 loss **不消费**它，默认丢弃只为省内存/磁盘')
+                         ' V7 的 12 项 loss **不消费**它，默认丢弃只为省内存/磁盘')
     ap.add_argument('--no-compress', dest='compress', action='store_false',
                     help='ZIP_STORED 不压缩（读得更快，体积约 14×）')
     ap.add_argument('--compress-level', type=int, default=1,
@@ -1489,7 +1489,7 @@ def resolve_archives(args):
 def shard_paths(out_path, num_shards, shard_id):
     """``out`` + ``(N, I)`` → 这一块的路径：``foo_s{I}.npz``（``num_shards<=1`` 时就是 ``out``）。
 
-    ⚠ 命名**不**加 ``_s`` 前缀的另一种方案是按块建子目录（``foo/s0.npz``）。
+     命名**不**加 ``_s`` 前缀的另一种方案是按块建子目录（``foo/s0.npz``）。
       选兄弟文件是因为 ``build_dataset.merge_shards`` 用的是 ``glob('*.npz')``
       扫同目录 —— 子目录会让它扫不到，兄弟文件能与既有习惯对齐。
     """
@@ -1511,7 +1511,7 @@ def convert_all_shards(archives, out_path, *, num_shards, log=print, **kw):
     ③ **清单**：写一份 ``<out>.shards.json``，记录每块的行数 / 文件 / 状态。
        只建了 1 块就开训是最容易发生的事故，清单让它显形。
 
-    ⚠ **跳过靠 ``.done`` 标记而不是「文件存在」**：npz 即使中途被杀也会留下
+     **跳过靠 ``.done`` 标记而不是「文件存在」**：npz 即使中途被杀也会留下
       一个**行数对不上**的合法 zip，而训练端不会报错、只会在中途崩
       （见 :class:`NpzChunkedWriter` 的约定 5）。标记由 ``convert`` 成功后写出。
 
@@ -1523,7 +1523,7 @@ def convert_all_shards(archives, out_path, *, num_shards, log=print, **kw):
         清单 dict（也写到 ``<out>.shards.json``）。
 
     Raises:
-        ConversionError: 任何一块失败。🔴 已完成的块**保留**（含 ``.done``），
+        ConversionError: 任何一块失败。 已完成的块**保留**（含 ``.done``），
             所以修掉问题后重跑同一条命令会从失败处继续。
     """
     out_path = os.path.abspath(out_path)
@@ -1578,7 +1578,7 @@ def convert_all_shards(archives, out_path, *, num_shards, log=print, **kw):
         % (len(done_n), num_shards, total_rows,
            os.path.basename(manifest_path), manifest['elapsed_seconds']))
     if len(done_n) < num_shards:
-        log('[all] ⚠ 还有 %d 块没跑完 —— **不要**用现有这几块开训，'
+        log('[all] 还有 %d 块没跑完 —— **不要**用现有这几块开训，'
             '重跑同一条命令即可续做。' % (num_shards - len(done_n)))
     return manifest
 
@@ -1586,7 +1586,7 @@ def convert_all_shards(archives, out_path, *, num_shards, log=print, **kw):
 def resolve_shard_args(num_shards, shard_id, convert_all=False):
     """CLI 的 ``--num-shards/--shard-id`` → 归一化后的 ``(num_shards, shard_id)``。
 
-    🔴 **整个文件里唯一一处分片参数校验** —— `--count-only` 与 `convert` 两条
+     **整个文件里唯一一处分片参数校验** —— `--count-only` 与 `convert` 两条
     路径都调它。两条路径各写一份校验就是「一个校验一个不校验」的温床：那正是
     本函数修掉的那个洞（`--count-only` 曾经只查 ``shard_id`` 越界、完全不看
     ``num_shards``，于是 ``--num-shards 0`` 静默变成不分片并把**全量行数**
@@ -1596,7 +1596,7 @@ def resolve_shard_args(num_shards, shard_id, convert_all=False):
     ------------------
     ==========================  ==========================================
     ``--num-shards 1`` 单独给   不分片 ⇒ 归一化成 ``(1, 0)``（合法）
-    ``--num-shards N`` 无 id     🔴 报错：N 块里到底是哪一块？
+    ``--num-shards N`` 无 id 报错：N 块里到底是哪一块？
     ``--num-shards N --shard-id I``  第 I/N 块（``N >= 2``、``0 <= I < N``）
     ==========================  ==========================================
 
@@ -1619,11 +1619,11 @@ def resolve_shard_args(num_shards, shard_id, convert_all=False):
     """
     num_shards = int(num_shards)
     if num_shards < 1:
-        # 🔴 不再 `max(1, ...)` 静默降级成不分片：分片的前提是各块行数之和
+        # 不再 `max(1, ...)` 静默降级成不分片：分片的前提是各块行数之和
         # == 全集行数，而降级后报出来的是**全量行数**，数字完全正常。
         raise ConversionError(
             f'--num-shards {num_shards} 非法：必须 >= 1（1 = 不分片）。'
-            f'\n  ⚠ 早先的实现把它静默夹成 1 ⇒ 变成分片流程里最坏的一种失败：'
+            f'\n 早先的实现把它静默夹成 1 ⇒ 变成分片流程里最坏的一种失败：'
             f'仍然 rc=0、仍然报一个行数，只是那个行数是**全量**。'
             f'分片流程的前提是「各块行数之和 == 全集行数」，'
             f'而这个输出**看起来是正常的数字**。')
@@ -1643,7 +1643,7 @@ def resolve_shard_args(num_shards, shard_id, convert_all=False):
         raise ConversionError(
             f'--shard-id {shard_id} 只能在**分片**时给，而 --num-shards '
             f'{num_shards} 不是分片（N 必须 >= 2）。'
-            f'\n  ⚠ N=1 时 `shard_mask` 原样返回全部行 ⇒ 这个 --shard-id '
+            f'\n N=1 时 `shard_mask` 原样返回全部行 ⇒ 这个 --shard-id '
             f'是个**不生效的哑参数**。不分片就别传它。')
     if not 0 <= shard_id < num_shards:
         raise ConversionError(
@@ -1660,7 +1660,7 @@ def main(argv=None):
 
     try:
         archives = resolve_archives(args)
-        # 🔴 分片校验在分叉之前、只做一次 ⇒ `--count-only` 与 `convert` 对同一
+        # 分片校验在分叉之前、只做一次 ⇒ `--count-only` 与 `convert` 对同一
         #   组参数的合法性判定必然一致（归一化后的值直接喂给两条路径）。
         if args.convert_all and args.shard_id is not None:
             raise ConversionError(
@@ -1669,7 +1669,7 @@ def main(argv=None):
                 '  · 想一条命令跑完 ⇒ 只给 --convert-all --num-shards 8\n'
                 '  · 想只跑第 3 块 ⇒ 只给 --shard-id 3')
         if args.convert_all:
-            # 🔴 `--convert-all` 自己会遍历 0..N-1 ⇒ **不能**先过那条
+            # `--convert-all` 自己会遍历 0..N-1 ⇒ **不能**先过那条
             #   「N>=2 必须配 --shard-id」的三态表。`convert_all=True` 让它
             #   只校验 `num_shards` 本身（`--num-shards 0` 照样报错）。
             num_shards, shard_id = resolve_shard_args(
@@ -1678,7 +1678,7 @@ def main(argv=None):
             num_shards, shard_id = resolve_shard_args(
                 args.num_shards, args.shard_id)
         if args.count_only:
-            # 🔴 `--convert-all --count-only` 必须**逐块**数，不能只数第 0 块 ——
+            # `--convert-all --count-only` 必须**逐块**数，不能只数第 0 块 ——
             #   那会报出「第 0/8 块 = 12.5%」而用户以为看到了全量的分配。
             #   逐块也顺带验证了「各块行数之和 == 全集」这个分片前提。
             if args.convert_all:
@@ -1702,7 +1702,7 @@ def main(argv=None):
                 tot = sum(s['rows'] for s in sharded_counts)
                 want = sharded_counts[0]['rows_all'] if sharded_counts else 0
                 log('[count] 各块合计 %d 行 / 全集 %d 行 %s'
-                    % (tot, want, '✓ 一致' if tot == want else '❌ 不一致！'))
+                    % (tot, want, ' 一致' if tot == want else ' 不一致！'))
                 if tot != want:
                     raise ConversionError(
                         f'各块行数之和 {tot} != 全集 {want} ⇒ 分片的偏移算术'
@@ -1716,7 +1716,7 @@ def main(argv=None):
                                            'shards': sharded_counts})
                 return 0
             infos = []
-            base = 0                       # ⚠ 按过滤前的行数推进，与 convert 一致
+            base = 0 # 按过滤前的行数推进，与 convert 一致
             for p, n in archives:
                 info = count_kept_rows(p, n, limit=args.limit, log=log,
                                        num_shards=num_shards,
@@ -1782,7 +1782,7 @@ def render_report(meta):
             100.0 * meta['rows'] / max(meta['rows_raw'], 1), meta['members'])]
     sh = meta.get('shard') or {}
     if int(sh.get('num_shards', 1)) > 1:
-        L.append('  ⚠ 分片：第 %d/%d 块（本块 %d 行，全量 %s 行）'
+        L.append(' 分片：第 %d/%d 块（本块 %d 行，全量 %s 行）'
                  '⇒ 单个 npz **不是**全量，训练要同时读入全部 N 块'
                  % (sh['shard_id'], sh['num_shards'], sh['rows_in_shard'],
                     sh['rows_all_shards']))
@@ -1794,10 +1794,10 @@ def render_report(meta):
         for nk, v in sorted(a.get('per_network', {}).items()):
             L.append('        %-24s %2d 列 %8d 行 %6d 成员  分派 %s%s'
                      % (nk, v['cols'], v['rows'], v['members'], v['how'],
-                        '  ⚠ 登记表是 %d 列' % v['expected_cols']
+                        ' 登记表是 %d 列' % v['expected_cols']
                         if v['cols'] != v['expected_cols'] else ''))
         if a.get('members_layout_unresolved'):
-            L.append('        ⚠ %d 个成员的布局解不出来，已跳过'
+            L.append(' %d 个成员的布局解不出来，已跳过'
                      % a['members_layout_unresolved'])
     L += ['-' * 78,
           '  体积 %s（%d B/行，%.1fs）'
@@ -1824,7 +1824,7 @@ def render_report(meta):
           '见 meta_json.game_ids_semantics）']
     if meta.get('suspect_columns'):
         L.append('-' * 78)
-        L.append('  🔴 列值越出物理可能域（**已按原样写入 + 打标记，不要用于训练**）:')
+        L.append(' 列值越出物理可能域（**已按原样写入 + 打标记，不要用于训练**）:')
         for archive, cols in meta['suspect_columns'].items():
             L.append('    %-46s %s'
                      % (os.path.basename(archive)[:46], sorted(cols)))

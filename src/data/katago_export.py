@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """把我们自训的 V7 checkpoint 写成 KataGo 能加载的 ``.bin.gz``。
 
-⚠ 为什么需要这一层
+ 为什么需要这一层
 ------------------
 ``.bin.gz`` 里存的不只是权重，还带一份**结构描述**（`ModelDesc` / `TrunkDesc` /
 `PolicyHeadDesc` / `ValueHeadDesc` / ...）。引擎完全按这份描述去读每个数组 ——
@@ -69,7 +69,7 @@ from src.data.katago_bin import (  # noqa: E402
 from src.networks.katago_v7 import build_katago_v7_net  # noqa: E402
 
 #: 官方 ``ActivationDesc`` 的枚举（``desc.h`` / ``nneval.cpp``）。
-#: 🔴 **SILU 是 3，不是 1**（1 是 RELU）—— 这个搞错过一次，见 README。
+#: **SILU 是 3，不是 1**（1 是 RELU）—— 这个搞错过一次，见 README。
 ACTIVATION_RELU = 1
 ACTIVATION_SILU_OFFICIAL = 3
 
@@ -127,7 +127,7 @@ BATCHNORM_EPS = 1e-20
 #: local size 也不同）⇒ fp16 累加顺序不同 ⇒ 在**随机权重**下被放大。
 #: 随机权重的网络输出本就是任意值，对微小数值差极敏感。
 #:
-#: ⚠ 附带发现（**与我们的导出无关**）：在这台 AMD iGPU 上，v17 路径
+#: 附带发现（**与我们的导出无关**）：在这台 AMD iGPU 上，v17 路径
 #:   **逐次运行结果不同**，v15 路径则完全确定 ——
 #:     我们的 v17 导出：rawLead 0.597 / 0.590 / 0.548 / 0.565
 #:     官方 b10c384：  rawLead 5.548 / 5.668 / 5.953   ← 同样如此
@@ -468,7 +468,7 @@ def build_model_desc(state_dict: Dict[str, Any], cfg: Dict[str, Any],
         model_version=MODEL_VERSION,
         num_input_channels=int(cfg['in_channels']),
         num_input_global_channels=int(cfg['global_channels']),
-        # 🔴 multiplier 在文件里是 **TextFloat**（字符串形式的浮点），
+        # multiplier 在文件里是 **TextFloat**（字符串形式的浮点），
         #   不是 float —— `ModelDesc.write` 读的是 `.text` 属性。
         td_score_multiplier=TextFloat(20.0),
         # 这六个必须与 `ValueHead` forward 侧用的完全一致

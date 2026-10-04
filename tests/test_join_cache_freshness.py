@@ -78,7 +78,7 @@ def _write_labels(path, dataset_hashes, which=(0, 1, 2)):
 class _Fixture:
     """一次性的 (主 npz, 标签 npz, 索引产物) 三元组。
 
-    ⚠ 只在 `tmp_path` 上落一次盘：`_build` 每调用一次都重写输入文件的话，
+     只在 `tmp_path` 上落一次盘：`_build` 每调用一次都重写输入文件的话，
       mtime 每次都变 ⇒ 缓存**永远**命不中（而那正是「缓存失效」测试要模拟的
       东西，会让「命中」用例假红）。
     """
@@ -127,7 +127,7 @@ def test_npz_fingerprint_changes_with_mtime(tmp_path):
 
 
 def test_npz_fingerprint_reads_rows_without_decompressing_boards(tmp_path):
-    """⚠ 指纹**不许**整列解压 `boards`（12.3 GB，本机 13.9 GB）。
+    """ 指纹**不许**整列解压 `boards`（12.3 GB，本机 13.9 GB）。
 
     这条是行为钉：`np.load(path)['boards']` 会先把整个成员解进内存。
     实现在无 `game_ids` 时只读 `.npy` 头 —— 这里用一个「boards 巨大但读不到」
@@ -154,7 +154,7 @@ def test_labels_fingerprint_uses_pos_hash(tmp_path):
 # 2. 散列口径指纹：改种子/权重必须让 key 变
 # --------------------------------------------------------------------------- #
 def test_hash_spec_fingerprint_is_derived_from_live_constants():
-    """⚠ 口径指纹必须**从 `pos_hash` 的活常量现算**，不能写死。
+    """ 口径指纹必须**从 `pos_hash` 的活常量现算**，不能写死。
 
     写死的版本号靠人记得改 —— 而漏改的后果就是旧缓存静默挂错标签。
     """
@@ -265,7 +265,7 @@ def test_legacy_index_without_key_is_rebuilt_with_a_warning(tmp_path):
 
 
 def test_stale_dataset_fingerprint_triggers_warning_and_rebuild(tmp_path):
-    """🔴 换主 npz ⇒ 缓存失效、**明确告警并列出差异**、重建。"""
+    """ 换主 npz ⇒ 缓存失效、**明确告警并列出差异**、重建。"""
     fx = _Fixture(tmp_path)
     diag, _ = fx.build()
     assert diag['matched_rows'] == 3
@@ -294,7 +294,7 @@ def test_stale_labels_fingerprint_triggers_warning_and_rebuild(tmp_path):
 
 
 def test_stale_hash_spec_version_triggers_warning_and_rebuild(tmp_path):
-    """🔴 改散列口径版本号 ⇒ 失效 + 告警（这是最隐蔽的一种）。"""
+    """ 改散列口径版本号 ⇒ 失效 + 告警（这是最隐蔽的一种）。"""
     fx = _Fixture(tmp_path)
     fx.build()
     again, logs = fx.build(hash_spec_version=HASH_SPEC_VERSION + 1)

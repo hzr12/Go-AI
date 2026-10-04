@@ -6,14 +6,14 @@ A 阶段（硬 outcome 标签）只需要三样东西：**这局是什么形态�
 
 三条要害
 --------
-1. ⚠ **`score is None` 单独出现分不清「认输」与「无结果」** —— 必须读
+1. **`score is None` 单独出现分不清「认输」与「无结果」** —— 必须读
    `resign_side` / `is_resign`。语料里 63.8% 是认输，把它和残局混成一类会让
    A 阶段的标签整体反转。
-2. ⚠ **`g_re` / `g_resign_side` 是局级标签**，搬运时左索引是 **slot**
+2. **`g_re` / `g_resign_side` 是局级标签**，搬运时左索引是 **slot**
    （`sidecar[game_ids]` 的下标）、右索引才是**语料局号**，两者不是一回事。
    写反了在两边大小恰好相同时会**静默串味**（见
    `test_re_labels_follow_slot_not_corpus_index`）。
-3. ⚠ **未匹配的局不许被当成某一类终局** —— 回落到 `RE_CLASS_UNKNOWN` /
+3. **未匹配的局不许被当成某一类终局** —— 回落到 `RE_CLASS_UNKNOWN` /
    `resign_side = -1`，`derive_outcome` 因此给 2（无信息），而不是白送一个胜负。
 """
 
@@ -80,7 +80,7 @@ def test_parse_result_resign_side(re_str, side):
 
 
 def test_resign_side_is_set_exactly_when_is_resign():
-    """⚠ 契约：`resign_side is not None` ⟺ `is_resign`。
+    """ 契约：`resign_side is not None` ⟺ `is_resign`。
 
     两者必须**同时**成立 —— 只看其中一个都会把「谁认输」和「有没有输」搞混。
     语料里 `B+` / `W+`（空分差，实测 95 局）胜负已定但分差不可知，那**不是认输**，
@@ -101,7 +101,7 @@ def test_resign_side_reveals_who_lost():
 
 
 def test_result_info_positional_construction_still_works():
-    """⚠ 新字段必须**放在末尾且带默认值**，否则全仓 8 处 `ResultInfo(a, b, c)`
+    """ 新字段必须**放在末尾且带默认值**，否则全仓 8 处 `ResultInfo(a, b, c)`
     的位置构造会一起炸（`sgf_parser.py` 内部 + `GameRecord` 的 default_factory）。"""
     ri = ResultInfo(2.5, False, False)
     assert (ri.score, ri.is_draw, ri.is_resign) == (2.5, False, False)
@@ -118,7 +118,7 @@ OUTCOME_BLACK, OUTCOME_WHITE, OUTCOME_DRAW = 0, 1, 2
 
 
 def test_derive_outcome_score_uses_black_minus_white_sign():
-    """⚠ `g_score` **已经是黑−白分差**（含贴目），所以判胜负**不减 komi**。
+    """ `g_score` **已经是黑−白分差**（含贴目），所以判胜负**不减 komi**。
 
     再减一次贴目会把 `B+2.5 / KM[7.5]` 这类局翻成白胜 —— 这是这个契约里最容易
     写错的一步，单独钉一条。
@@ -151,7 +151,7 @@ def test_derive_outcome_draw_and_unknown_are_both_draw_bucket():
 
 
 def test_derive_outcome_class_wins_over_the_other_fields():
-    """⚠ 契约是**按 `g_re` 分派**的：SCORE 看分差、RESIGN 看认输方，
+    """ 契约是**按 `g_re` 分派**的：SCORE 看分差、RESIGN 看认输方，
     彼此的另一个字段一律不看。
 
     钉这条是因为 REAL 数据里两列可能来自不同来源（sidecar 复用旧 `.scan.npz`
@@ -190,7 +190,7 @@ def _coords(pt):
 def _sgf(n_moves, km=None, re_str='B+R', ru=None, seed=0, pts=None):
     """造一局 19 路 SGF。
 
-    ⚠ `seed` 必须让每局的落子序列真的不同：同一条确定性序列造出来的多局在每个
+     `seed` 必须让每局的落子序列真的不同：同一条确定性序列造出来的多局在每个
     手数上都落在同一局面，锚点会**互相匹配** —— 匹配率 100% 但元数据全串到同一局，
     测试反而测不出「对上正确的 SGF」。
     """
@@ -230,7 +230,7 @@ RE_SIDE_TINY = [
     ('b.sgf', '0', 'B+R', 'Japanese'),         # RESIGN，**黑**认输
     ('c.sgf', '5.5', 'W+T', None),             # RESIGN，**白**认输（超时）
     ('d.sgf', '6.5', 'W+3.5', 'Japanese'),     # SCORE，白胜
-    # ⚠ DRAW 必须写 `0` 而不是 `draw`：`build_dataset.parse_result_to_value`
+    # DRAW 必须写 `0` 而不是 `draw`：`build_dataset.parse_result_to_value`
     #   只收 `B*` / `W*` / 可 float 的 0，`draw` 会被**拒收**（skip += 1）。
     ('e.sgf', '0', '0', None),
 ]
@@ -239,7 +239,7 @@ RE_SIDE_TINY = [
 @pytest.fixture()
 def re_tiny(tmp_path):
     sgf_dir = tmp_path / 'sgf'
-    # ⚠ seed 必须随**下标**变，不能用 `len(name)`（'a.sgf'..'e.sgf' 全是 5 字符 ⇒
+    # seed 必须随**下标**变，不能用 `len(name)`（'a.sgf'..'e.sgf' 全是 5 字符 ⇒
     # 同一个 seed ⇒ 五局落子序列完全相同 ⇒ 锚点互相匹配，元数据全串到同一局上）。
     for i, (name, km, re_str, ru) in enumerate(RE_SIDE_TINY):
         _write_sgf(str(sgf_dir / name),
@@ -260,7 +260,7 @@ def _build_sidecar(tmp_path, npz, sgf_dir):
 def test_sidecar_persists_re_class_and_resign_side(re_tiny):
     """每局两列都要对上**它自己那一局**的 `RE`，认输局还要分清黑白。
 
-    ⚠ 断言按 **slot**（= `game_id` 升序 = 文件名 glob 升序 a..e）写死，而不是按
+     断言按 **slot**（= `game_id` 升序 = 文件名 glob 升序 a..e）写死，而不是按
     贴目反查：b 与 e 的贴目都是 0，按 KM 分不开它们；而「谁的标签挂到哪个 slot 上」
     正是这套搬运最容易错的地方，逐 slot 钉死才测得到。
     """
@@ -347,7 +347,7 @@ def test_sidecar_re_labels_survive_npz_roundtrip(re_tiny):
 def test_scan_cache_roundtrip_keeps_resign_side(re_tiny):
     """`.scan.npz` 缓存的往返：`resign_side` 必须进得去也出得来。
 
-    ⚠ 旧缓存**恢复不出**这一列（`resign` 只是 bool，没有方向）⇒ 缺键时
+     旧缓存**恢复不出**这一列（`resign` 只是 bool，没有方向）⇒ 缺键时
     `_load_scan_cache` 必须返回 `(None, None)` 让调用方**重扫**，而不是静默
     填一个方向错乱的默认值。
     """
@@ -375,7 +375,7 @@ def test_scan_cache_roundtrip_keeps_resign_side(re_tiny):
 
 
 def test_re_labels_follow_slot_not_corpus_index(tmp_path):
-    """⚠ **slot 与语料局号不是一回事**，搬运写反了会静默串味。
+    """ **slot 与语料局号不是一回事**，搬运写反了会静默串味。
 
     构造：语料里多一个 `aa_extra.sgf`，它的 `RE[]` 为空 ⇒ `build_dataset` 拒收
     ⇒ 它进了语料散列表却**不在数据集里**。于是语料局号整体右移一位
@@ -411,7 +411,7 @@ def test_re_labels_follow_slot_not_corpus_index(tmp_path):
 
 
 def test_unmatched_game_falls_back_to_unknown_not_a_fake_result(tmp_path):
-    """⚠ 未匹配的局必须回落到 `RE_CLASS_UNKNOWN` / `resign_side = -1`。
+    """ 未匹配的局必须回落到 `RE_CLASS_UNKNOWN` / `resign_side = -1`。
 
     它**没有**终局信息 —— 若回落成「白认输」或某个具体类别，A 阶段就会凭空造出
     一批标签，而覆盖报告里的未匹配数也就失去了意义。

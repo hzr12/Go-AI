@@ -56,7 +56,7 @@ STDATA = os.path.join('katago', 'stdata', '2026-08-25npzs.tgz')
 needs_stdata = pytest.mark.skipif(
     not os.path.isfile(STDATA),
     reason=f'需要官方 stdata（{STDATA}，不在仓库里）。'
-           f'⚠ 跳过不等于「通过」—— 本仓唯一可执行 oracle 就是它。')
+           f' 跳过不等于「通过」—— 本仓唯一可执行 oracle 就是它。')
 
 #: 取归档里**前** ``_N_FILES`` 个 npz 的**前** ``_ROWS_PER_FILE`` 个 19×19 行。
 #: 固定取法 ⇒ 样本确定，任何偏差都是真回归而不是采样噪声（与 test_v7_ladders 同构）。
@@ -98,7 +98,7 @@ WHITE_STONES = [(8, 9), (10, 9), (9, 10),
 #: 区域归属的三个标记点（ch18 / ch19）：
 #:   (1,17) 四邻全是黑子 ⇒ 归黑； (17,17) 四邻全是白子 ⇒ 归白；
 #:   (0,0) 在「哪边都不邻」的大空区里 ⇒ 中立。
-#: ⚠ **旧注释的理由（"只邻黑子 ⇒ 归黑"，Tromp-Taylor 的区域/边界色判定）已作废**。
+#: **旧注释的理由（"只邻黑子 ⇒ 归黑"，Tromp-Taylor 的区域/边界色判定）已作废**。
 #:   官方 area 是 Benson + 围空：白先被黑用 `:2221` 写成 +1，再被白用 `:2221`
 #:   无条件覆盖回 −1（`board.cpp:2221`/`:1862`，黑先白后）；(1,17) 反过来 —— 白那
 #:   一遍没能覆盖（该区域 `bordersNonPassAlive`），于是留下 +1。**取值没变，路径
@@ -159,7 +159,7 @@ def _markers():
 # 通道 0 / 1 / 2 / 6 / 7 / 8 / 20 / 21 —— 语义手算，不依赖任何参考实现
 # --------------------------------------------------------------------------- #
 def test_ch0_is_on_board_not_the_black_stones():
-    """🔴 **ch0 = on-board**（全 1），**不是**任务书原文的「黑」。
+    """ **ch0 = on-board**（全 1），**不是**任务书原文的「黑」。
 
     官方 ``binaryInputNCHWPacked`` 的 ch0 是 on-board 掩码，本仓
     ``katago_npz.board_size_from_packed`` 靠 ch0 的 1 的个数反推棋盘边长
@@ -277,10 +277,10 @@ def test_ch14_ch17_equal_ladder_channels_and_ch15_ch16_follow_the_gating():
 def test_ch18_ch19_are_the_two_boolean_area_planes():
     """ch18 = 归 pla 的点、ch19 = 归 opp 的点（**两条布尔平面**，官方口径）。
 
-    ⚠ `calculate_area` 返回**带符号**的两视角（+1/−1/0）；装配层必须二值化 ——
+     `calculate_area` 返回**带符号**的两视角（+1/−1/0）；装配层必须二值化 ——
       否则 −1 会让「有归属的点」与「on-board 的点」在张量上混同，而且无法与
       `unpack_binary_input` 的解包结果对拍。
-    ⚠ **下面三个取值与旧版一模一样，但旧版的理由是错的**（见 `AREA_BLACK` 上方
+     **下面三个取值与旧版一模一样，但旧版的理由是错的**（见 `AREA_BLACK` 上方
       的注释：旧版按 Tromp-Taylor 的「只邻一种颜色」解释）。按官方算法重算，
       `(1,17)→ch18`、`(17,17)→ch19`、`(0,0)→中立` 仍然成立，走的却是另一条路
       （Benson + `:2221`/`:2222` 围空 + 黑先白后的覆盖）。所以这条现在钉的是
@@ -301,7 +301,7 @@ def test_ch18_ch19_are_the_two_boolean_area_planes():
 def test_territory_scoring_zeroes_ch18_ch19_and_is_flagged_in_global_ch9():
     """规则条件化落到张量上（spec §2.5）：TERRITORY ⇒ ch18/19 恒 0。
 
-    ⚠ **这是对齐官方，不是缺陷**：官方的 territory 分支被 ``encorePhase >= 2``
+     **这是对齐官方，不是缺陷**：官方的 territory 分支被 ``encorePhase >= 2``
       二次条件包着，而本仓无 encore 机制（spec §2.6 D2）。
     """
     terr = rules_flags_from(scoring=SCORING_TERRITORY)
@@ -332,7 +332,7 @@ def test_no_history_copies_ch14_into_ch15_and_ch15_into_ch16():
 def test_one_turn_of_history_copies_ch15_into_ch16():
     """history=1 ⇒ **ch16 == ch15**（不是 ch14！）。
 
-    ⚠ 这是这条门控唯一的坑，也是 ``feature_v7_ladders.py`` 里「别把门控从历史
+     这是这条门控唯一的坑，也是 ``feature_v7_ladders.py`` 里「别把门控从历史
       参数再推一遍」那条注释的由来 —— 那次是从同一个事实**推导两次**、第二次
       抄成了 ch14，于是 history=1 时 ch16 差了整整一手。本测试用一个
       「ch14 ≠ ch15」的前一手盘把这个坑钉死。
@@ -368,7 +368,7 @@ def test_resolve_ladder_boards_is_the_single_gating_point():
 
 
 def test_second_level_fallback_uses_the_resolved_prev_not_the_current_board():
-    """🔴 第二级回退的兜底是**已解析的 prev**，不是 ``board``。
+    """ 第二级回退的兜底是**已解析的 prev**，不是 ``board``。
 
     history=1 时 ``prev`` 是真正的上一手盘（≠ 当前盘）；回退到 ``board`` 会让
     ch16 差一手。这条与 :func:`test_one_turn_of_history_copies_ch15_into_ch16`
@@ -459,9 +459,9 @@ def test_ko_out_of_range_is_skipped_rather_than_raising():
 def _load_stdata():
     """流式取前 ``_N_FILES`` 个 npz 的前 ``_ROWS_PER_FILE`` 个 **19×19** 行。
 
-    ⚠ **流式读**（``r|gz``），**不要 ``getmembers()``** —— 1.5 GB 的归档会被扫很久
+     **流式读**（``r|gz``），**不要 ``getmembers()``** —— 1.5 GB 的归档会被扫很久
       （与 ``tests/test_v7_ladders.py`` 同一条纪律）。
-    ⚠ 19×19 由 ch0（on-board 掩码）的 1 的个数反推（spec §9.1 第 2 条）。
+     19×19 由 ch0（on-board 掩码）的 1 的个数反推（spec §9.1 第 2 条）。
     """
     S, G, KO = [], [], []
     tf = tarfile.open(STDATA, 'r|gz')
@@ -538,7 +538,7 @@ _NOT_COMPARABLE = {
     19: '同 ch18',
 }
 
-#: 必须**逐行 100% 精确相等**的通道。🔴 这些掉下来就是**组装顺序**出了问题 ——
+#: 必须**逐行 100% 精确相等**的通道。 这些掉下来就是**组装顺序**出了问题 ——
 #: 查 `spatial_channels_v7`，**不要改底层实现**。
 _PINNED_EXACT = (0, 1, 2, 3, 4, 5, 6, 8, 14, 17)
 
@@ -548,7 +548,7 @@ _PINNED_ZERO_BOTH = (8,)
 
 @needs_stdata
 def test_stdata_per_channel_match_table(stdata, capsys):
-    """🔴 **22 通道逐位对拍命中数字表**（`2026-08-25npzs.tgz`，前 12 个 npz 的
+    """ **22 通道逐位对拍命中数字表**（`2026-08-25npzs.tgz`，前 12 个 npz 的
     前 40 个 19×19 行 = **301 行**）。
 
     口径是**逐行精确相等率**（整张 19×19 平面完全相同才算这一行相等），并**同时
@@ -569,7 +569,7 @@ def test_stdata_per_channel_match_table(stdata, capsys):
         for ch, re, cell, onz, fnz in rows:
             note = _NOT_COMPARABLE.get(ch, '')
             if ch in _PINNED_EXACT:
-                note = (note + ' / ' if note else '') + '✔ 已钉 1.0'
+                note = (note + ' / ' if note else '') + ' 已钉 1.0'
             print('%3d  %10.6f  %10.6f  %7d  %7d  %s'
                   % (ch, re, cell, onz, fnz, note))
     # 钉死的通道必须仍是 1.0
@@ -577,7 +577,7 @@ def test_stdata_per_channel_match_table(stdata, capsys):
         re = rows[ch][1]
         assert re == 1.0, (
             f'ch{ch} 与官方逐行精确相等率掉到 {re:.6f}（应为 1.0）。'
-            f'\n⚠ **查 `spatial_channels_v7` 的组装顺序，不要改底层实现** —— '
+            f'\n **查 `spatial_channels_v7` 的组装顺序，不要改底层实现** —— '
             f'ch14/17 的算法由 tests/test_v7_ladders.py 担保（实测 1.000000 / 4368 行）。')
     # 恒 0 的通道：两边都必须全 0
     for ch in _PINNED_ZERO_BOTH:
@@ -585,13 +585,13 @@ def test_stdata_per_channel_match_table(stdata, capsys):
     # ch18/19：**正向**断言 —— 在本 harness 的默认 flags 恰好与官方一致的
     # 那个子集上必须逐位全对。
     #
-    # 🔴 **旧断言（已作废）**：这里原来写的是 `assert rows[ch][1] < 1.0`，
+    # **旧断言（已作废）**：这里原来写的是 `assert rows[ch][1] < 1.0`，
     #   失败信息写「那说明本仓也提了死子，去查死子」。**那个根因已被推翻** ——
     #   官方 `Board::calculateArea*`（`board.cpp:1853-1937`）既不提子也不做死子
     #   判定，它的输入只有 `colors`。照着那条信息去查死子会把人带进死胡同。
     #   现在改成正向断言：对齐了就是 1.0，对不上就报真实数字。
     #
-    # ⚠ 为什么不能直接断言全样本 == 1.0：`_assemble_stdata` 用**单一**默认
+    # 为什么不能直接断言全样本 == 1.0：`_assemble_stdata` 用**单一**默认
     #   `rules_flags`（AREA+TAX_NONE+`multiStoneSuicideLegal=false`）跑全部行，
     #   而官方 ch18/19 是**逐行按规则分岔**的（`nninputs.cpp:2391-2439`）。所以
     #   只有「官方自己是 AREA ∧ TAX_NONE ∧ ch8==0」的行才该全对 ——
@@ -599,7 +599,7 @@ def test_stdata_per_channel_match_table(stdata, capsys):
     #   双活过滤，本 harness 都喂不了。逐规则的完整分解（含
     #   `multiStoneSuicideLegal` 两种取值、4368 行）在
     #   `tests/test_v7_area_official.py`，那里是 1.000000 / 2282 行。
-    #   ⚠ 本前缀样本的 `AREA ∧ TAX_NONE` 行 `globalInputNC[:,8]` 全是 1，也就是
+    # 本前缀样本的 `AREA ∧ TAX_NONE` 行 `globalInputNC[:,8]` 全是 1，也就是
     #   说默认 flags 的 `multiStoneSuicideLegal=False` 在这批行上**没被考到** ——
     #   所以这里只断言到 `TAX_NONE` 这一层，别在这里假装覆盖了 suicide 口径。
     G = stdata[1]
@@ -614,7 +614,7 @@ def test_stdata_per_channel_match_table(stdata, capsys):
             f'ch{ch} 在 {int(subset.sum())} 条「官方=AREA+TAX_NONE」的'
             f'行上只有 {int(sub.sum())} 行逐位全对'
             f'（其中 {n_ch8} 行的 multiStoneSuicideLegal=1）。'
-            f'\n⚠ 这批行是本 harness 的默认 flags **恰好**覆盖官方分支的子集，'
+            f'\n 这批行是本 harness 的默认 flags **恰好**覆盖官方分支的子集，'
             f'掉下来就是 ch18/19 的实现回归 —— 查 '
             f'`area_ownership_map` / `_area_for_pla`，不要动装配层，也不要'
             f'去查死子（官方不做死子判定）。')
@@ -651,7 +651,7 @@ def test_stdata_ch3_ch4_ch5_stay_bit_exact_through_the_assembler(stdata):
 def test_stdata_ch1_ch2_match_under_the_documented_to_play_assumption(stdata):
     """ch1 / ch2 在 ``to_play = +1`` 下与官方逐位相同（官方 ch1 = pla = 黑）。
 
-    ⚠ 这条把「绝对色口径的对拍前提」写死：官方 stdata 的 ``to_play`` 实测恒 +1
+     这条把「绝对色口径的对拍前提」写死：官方 stdata 的 ``to_play`` 实测恒 +1
       （`tests/test_v7_ladders.py` 用 ``to_play=+1`` 才拿到 1.000000）。若哪天
       换成 ``to_play=-1`` 的批次，ch1/ch2 会整体对调 —— 那正是这条测试会红的
       时刻，而不是等训练静默学歪。
@@ -669,7 +669,7 @@ def test_stdata_ch1_ch2_match_under_the_documented_to_play_assumption(stdata):
 # --------------------------------------------------------------------------- #
 @needs_stdata
 def test_global_ch18_matches_official_batch(stdata, capsys):
-    """🔴 **ch18 与官方 ``globalInputNC[:,18]`` 逐行 100% 相等**（301/301）。
+    """ **ch18 与官方 ``globalInputNC[:,18]`` 逐行 100% 相等**（301/301）。
 
     用官方 ch5 反推 ``selfKomi``（``ch5 × 20``）——官方 ch5 已经含 draw-jitter，
     而 ch18 用的正是同一个 selfKomi，所以这是**精确**代入而不是近似。板面积
@@ -703,7 +703,7 @@ def test_global_ch18_matches_official_batch(stdata, capsys):
 
 @needs_stdata
 def test_global_rule_channels_match_official_batch(stdata, capsys):
-    """🔴 **规则条件化的 7 个通道（全局 ch6..ch11 + ch17）与官方逐位相等**。
+    """ **规则条件化的 7 个通道（全局 ch6..ch11 + ch17）与官方逐位相等**。
 
     喂进去的 ``rules_flags`` 是**从官方自己的 ch6..ch11/ch17 反解**的
     （``ko`` 的 3 态 / ``tax`` 的 3 态 / suicide / territory / button），
@@ -794,7 +794,7 @@ def test_global_channels_without_a_move_sequence_are_reported_not_faked(stdata):
     """ch0..4 / ch14 依赖着法序列，stdata 没有 ⇒ **如实标注不可对拍**。
 
     这里断言的是「我们给 0、官方给的不是 0」这个事实本身，而不是把阈值调松
-    让它绿。⚠ ch18/19 的教训：猜判据会得到「既不等于本仓也不等于官方」的第三种
+    让它绿。 ch18/19 的教训：猜判据会得到「既不等于本仓也不等于官方」的第三种
       口径，而这类偏差是**静默**的 —— 只会表现为训练分布偏移。
     """
     _, G, _ = stdata
@@ -807,7 +807,7 @@ def test_global_channels_without_a_move_sequence_are_reported_not_faked(stdata):
     assert G[:, 0:5].sum() > 0            # 官方不是 0 ⇒ 确实不可对拍
     # ch5 我们喂的 komi 是夹具值 ⇒ 也不与官方的 jittered 值可比
     assert out[:, 5].any() and G[:, 5].any()
-    # ch14（上一手是不是 pass）同理。⚠ 实测**这批官方数据里 ch14 恒 0**
+    # ch14（上一手是不是 pass）同理。 实测**这批官方数据里 ch14 恒 0**
     # （301 行），所以它在这批数据上无法被验证 —— 只能靠单测
     # （`tests/test_v7_globals.py::test_ch14_is_true_exactly_when_the_previous_move_was_a_pass`）。
     # 这里把「官方也没能验证它」这件事记下来，而不是让绿测暗示它被覆盖了。
@@ -821,7 +821,7 @@ def test_global_channels_without_a_move_sequence_are_reported_not_faked(stdata):
 def test_global_and_spatial_share_one_history_slot_order():
     """全局 ch0..4 与空间 ch9..13 **用同一份物理手序**（`feature_v7._HISTORY_SLOTS`）。
 
-    ⚠ 同一份顺序写两遍就是下一次「通道顺序静默错位」的入口，而通道错位**不报
+     同一份顺序写两遍就是下一次「通道顺序静默错位」的入口，而通道错位**不报
       任何错**，只是标签指向错误的点。本测试用「最近一手落在 ch0 且 ch9 的同
       一个点上」把两者钉在一起。
     """

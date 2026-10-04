@@ -323,7 +323,7 @@ def test_sft_scripts_lr_follows_sqrt_scaling_of_effective_batch():
     有效 batch = BATCH × WORLD_SIZE × GRAD_ACCUM。改变卡数、每卡 batch 或梯度
     累积时 LR 必须同步调整，否则等效学习率漂移（多卡尤其明显）。
 
-    ⚠ 2026-09-30 起 batch 档位换过：v21 在 4 卡 910A 上每卡 2000 会 OOM
+     2026-09-30 起 batch 档位换过：v21 在 4 卡 910A 上每卡 2000 会 OOM
     （活数据 20.09 GiB + 碎片 6.93 + runtime 4.36 ≈ 31.4 GiB / 32 GiB 可用
     27.6 GiB），改为每卡 1000 + 累积 2：**有效 batch 与 LR 都不变**，
     只有「每卡 batch」这一格变了 —— 所以本断言的等式必须含 ACCUM，否则它

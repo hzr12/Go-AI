@@ -144,7 +144,7 @@ def test_query_many_ignores_foreign_ids():
 
 
 def test_query_many_still_raises_on_engine_death():
-    """⚠ 边界：引擎真的死了**必须**抛，不能被 P0 的容错吞掉 —— 那是
+    """ 边界：引擎真的死了**必须**抛，不能被 P0 的容错吞掉 —— 那是
     基础设施故障，不是坏记录，静默继续只会得到空结果。"""
     lab = _lab([])                     # 立刻 EOF
     with pytest.raises(RuntimeError, match="意外退出"):
@@ -223,7 +223,7 @@ def test_labelled_rows_count_comes_from_file_length(tmp_path):
 
 
 def test_row_count_guard_compares_rows_not_elements():
-    """⚠ 这条钉的是守卫**自己**的 bug（2026-10-02 真实踩到）：收尾一致性检查
+    """ 这条钉的是守卫**自己**的 bug（2026-10-02 真实踩到）：收尾一致性检查
     拿 `v.size`（元素总数）跟行数比，而 policy 的形状是 (N, 362) —— 14 行就有
     5068 个元素，于是正常数据被误判成「文件被外部改动」并中止，标签已写完却拿不到。
 

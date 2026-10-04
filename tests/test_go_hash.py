@@ -289,7 +289,7 @@ def _triple_ko_board():
 def test_undo_restores_repetition_history():
     """undo() 必须把重复局面历史**精确**回滚（按出现次数回退，不按 set.discard）。
 
-    ⚠ P2.6a-2c 的结构改动：本用例原先用「**真的把闭合成手落一遍**」来制造重复局面，
+     P2.6a-2c 的结构改动：本用例原先用「**真的把闭合成手落一遍**」来制造重复局面，
     再验 `is_repetition()` / 计数回滚。那条脚手架现在**不可能**成立 —— TT 规则 6 下
     重复局面**永远造不出来**（掩码那句自 P2.6a-2b-1 就在，`play()` 那句由 P2.6a-2c 补齐，
     两条路径对这一手一致地拒）。所以改用 **pass** 造出同色的第二次出现：pass 不改染色，
@@ -754,7 +754,7 @@ def test_adoption_keeps_ko_point_but_drops_stale_legal_cache():
     所以从该局面开新局时那个点在**落子层**也是**可下**的 —— light_rollout 显式拷贝
     ko_point 要的是「保留这个信息位」这个语义，而**不是**任何禁令，所以不能在接管时清掉。
 
-    ⚠ 本用例断言**翻转过两次**，值得把两次的理由都写下来：
+     本用例断言**翻转过两次**，值得把两次的理由都写下来：
       1. P2.6a-2b-1 翻转**掩码层**：接管把历史重建成 `{当前局面}`，于是「提子之前那个
          染色」不在历史里，PSK 判不出那个回提点 —— 掩码因此**放行**它（正常对局下历史
          完整，PSK 独立禁掉它，两条掩码逐位相同，见
@@ -1182,7 +1182,7 @@ def test_docstring_distinguishes_the_two_keys():
 
     锁**三处**「键的分工」文本，且是**带方向**地锁（不只是子串存在）：
       1. `GoBoard.position_hash.__doc__` / `GoBoard.hash.__doc__`（方法 docstring）
-      2. **模块头** `go_rules.__doc__`（⚠ PSK 段）—— 以前不在锁内
+      2. **模块头** `go_rules.__doc__`（ PSK 段）—— 以前不在锁内
       3. 谓词侧见 `test_repetition_predicate_doc_pairs_with_the_position_key`
 
     方向锁：凡是写出「不用于……重复判定」的子句，该子句里都不得出现 `position_hash()`；
