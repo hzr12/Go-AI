@@ -90,13 +90,18 @@ def test_every_loss_curve_has_a_baseline():
 
 
 def test_grad_norm_is_taken_after_unscale():
-    """`grad_norm` 必须在 `scaler.unscale_()` **之后**取，否则是假值。
+    """`grad_norm` 必须在 `scaler.unscale_()` **之后**取才是真值。
 
     unscale 之前梯度还乘着 loss scale（默认 1024），量出来的范数大三个数量级 ——
-    曲线会稳定地「看起来很大」，正好掩盖它本该发现的溢出。
+    曲线看着「梯度爆炸」，而那只是缩放的假值。
+
+    ⚠ 判据必须在 **main() 内**取位置，不能用 `CODE.index()` 找全文件第一个：
+       `_locate_overflow` 的 docstring 里也会提到 `clip_grad_norm_`（解释
+       「为什么诊断必须在 clip 之前」），而它定义在 main 之前 ⇒ 全文件搜索会
+       命中那段说明文字，于是这条门禁变成在测文档而不是测代码。
     """
-    i_un = CODE.index('scaler.unscale_(optimizer)')
-    i_gn = CODE.index('clip_grad_norm_')
+    i_un = MAIN.index('scaler.unscale_(optimizer)')
+    i_gn = MAIN.index('clip_grad_norm_')
     assert i_un < i_gn, 'grad_norm 必须在 unscale_ 之后取'
 
 

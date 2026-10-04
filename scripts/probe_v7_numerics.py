@@ -180,10 +180,26 @@ def main():
     print('  坏在操作数    : %s' % (res['nonfinite_operands'] or '（无）'))
     print('  按 w=0 净化行 : %s' % (res['sanitized_rows'] or '（无）'))
 
-    # ---- ④ 反向：谁收到了 NaN ----
-    print('\n[4] 反向一次（统计 inf / nan 的参数）')
+    # ---- ④ 反向：谁收到了 inf/nan ----
+    # 🔴 **必须在 clip 之前看**（与 train_sft 同一个坑）：`clip_grad_norm_` 在
+    #   `total_norm = inf` 时算 `clip_coef = 0` 并原地 `mul_(0)` ⇒ `inf × 0 = NaN`
+    #   ⇒ clip 之后「inf 个数」结构上恒为 0，看到的 nan 全是 clipper 造的。
+    print('\n[4] 反向一次（统计 inf / nan 的参数）—— clip **之前**')
     net.zero_grad(set_to_none=True)
     res['loss'].backward()
+    _report_grads(net)
+
+    gn = torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+    print('\n[4b] clip_grad_norm_ 返回的总范数 = %s'
+          % ('finite' if bool(torch.isfinite(torch.as_tensor(float(gn))))
+             else '🔴 NON-FINITE（clip 前确有 inf）'))
+    print('     clip 后 inf 元素数必然是 0（clip_coef=0 ⇒ inf×0=NaN），'
+          '所以「NaN 模块名单」才是真正出过 inf 的位置。')
+    _report_grads(net, after_clip=True)
+
+
+def _report_grads(net, after_clip=False):
+    tag = 'clip 后' if after_clip else 'clip 前'
     tot_nan = tot_inf = 0
     bad_mod = {}
     for name, p in net.named_parameters():
@@ -194,18 +210,19 @@ def main():
         tot_nan += n
         tot_inf += i
         if n or i:
-            top = name.split('.')[0]
-            bad_mod[top] = bad_mod.get(top, 0) + max(n, i)
+            top = '.'.join(name.split('.')[:2])
+            cur = bad_mod.get(top, (0, 0))
+            bad_mod[top] = (cur[0] + i, cur[1] + n)
     n_grad = sum(1 for p in net.parameters() if p.grad is not None)
-    print('  参数张量 %d，收到梯度的 %d'
-          % (len(list(net.parameters())), n_grad))
-    print('  NaN 元素 %d | Inf 元素 %d' % (tot_nan, tot_inf))
+    print('  [%s] 参数张量 %d，收到梯度的 %d' % (tag, len(list(net.parameters())),
+                                       n_grad))
+    print('  [%s] NaN 元素 %d | Inf 元素 %d' % (tag, tot_nan, tot_inf))
     if bad_mod:
-        print('  🔴 按模块点名：')
-        for m, c in sorted(bad_mod.items(), key=lambda x: -x[1]):
-            print('     %-24s %d' % (m, c))
+        print('  [%s] 🔴 按模块点名：' % tag)
+        for m, (i, n) in sorted(bad_mod.items(), key=lambda x: -(x[1][0] + x[1][1])):
+            print('     %-30s inf=%-6d nan=%d' % (m, i, n))
     else:
-        print('  ✓ 梯度全部有限')
+        print('  [%s] ✓ 梯度全部有限' % tag)
 
     print('\n[probe] 若 [3] 报 NON-FINITE 而 [4] 也报 NaN：把上面两段的点名'
           '合起来就是根因（哪一项 / 哪个操作数 / 哪个模块）。')

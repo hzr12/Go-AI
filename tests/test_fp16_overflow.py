@@ -116,8 +116,11 @@ def test_skip_rate_denominator_cannot_exceed_100():
     i_a = SRC.index('_n_attempted += 1')
     i_s = SRC.index('_n_skipped += 1')
     assert i_a < i_s, '_n_attempted 必须先自增（否则某次跳过分母可能反而更小）'
-    assert abs(i_a - i_s) < 1200, \
-        '两者必须在同一个 optimizer-step 块内相邻自增，否则「同口径」只是注释里的承诺'
+    # 本轮把「诊断用 clip 返回的总范数」插进来后，两处自增之间多了几行
+    # ⇒ 断言改为「同一次 unscale 的紧邻前后」，这才是「同口径」真正要保证的。
+    i_un = SRC.index('scaler.unscale_(optimizer)')
+    assert i_a < i_un <= i_s, \
+        '两者必须在同一次 scaler.unscale_ 的紧邻前后自增（同一个 step 块内）'
 
 
 def test_overflow_diagnostics_are_rank0_only():
@@ -239,6 +242,69 @@ def test_locate_overflow_classification_is_index_independent():
     assert 'value head' in text, f'下标为 0 的 value 组被误判: {text}'
 
 
+def test_clip_grad_norm_turns_inf_into_nan_and_hides_it():
+    """🔴 **本轮修的正是这个 bug 的成因**，先把机制钉死。
+
+    `clip_grad_norm_(max_norm=1.0)` 在 `total_norm = inf` 时算出
+    `clip_coef = 0` 并 `grad.mul_(0)` ⇒ `inf × 0 = NaN`。而
+    `total_norm = inf ⇒ clip_coef = 0 < 1` ⇒ 这个分支**一定会进**。
+
+    ⇒ **clip 之后统计「inf 个数」结构上恒为 0**，看到的 nan 全是 clipper 造的。
+    真机日志里那行 `有 0 个 inf / 211 个 nan 参数` 就是这么来的，
+    它被读成「反向出了 NaN」，于是排查方向被带偏到 loss 与前向 ——
+    而**前向与 loss 都有限**，真凶是**反向出了 inf**。
+    """
+    p_inf = torch.nn.Parameter(torch.zeros(2))
+    p_ok = torch.nn.Parameter(torch.zeros(2))
+    p_inf.grad = torch.tensor([float('inf'), 0.0])
+    p_ok.grad = torch.tensor([1.0, 1.0])
+    gn = torch.nn.utils.clip_grad_norm_([p_inf, p_ok], max_norm=1.0)
+    assert not bool(torch.isfinite(torch.as_tensor(float(gn)))), \
+        '总范数应当是 inf'
+    # inf 已经变成 NaN —— 这就是「诊断排在 clip 之后就永远看不到 inf」的原因
+    assert int(torch.isinf(p_inf.grad).sum()) == 0, \
+        'clip 之后不该还有 inf（若这里有 inf，说明 clip_coef 没被算成 0）'
+    assert int(torch.isnan(p_inf.grad).sum()) >= 1, \
+        'inf 应被 clip 转成 NaN'
+    assert int(torch.isnan(p_ok.grad).sum()) == 0, '有限梯度不该变 NaN'
+
+
+def test_locate_overflow_names_the_module_that_actually_had_inf():
+    """🔴 修复后的诊断必须指出**哪个模块**，而不是只给一个 LR 猜测的组名。
+
+    真机日志里三组全被打成 `backbone/policy`（组名是按 LR 比值猜的，
+    `--value-lr-mult` 一改就失效）。而 `inf × 0 = NaN` 是**原地**写在同一个
+    张量上，所以「clip 后哪些张量是 NaN」= 「哪些张量原来是 inf」⇒ 归属仍然准确。
+    """
+    import torch.nn as _nn
+    from scripts.train_sft import _locate_overflow as _lo
+
+    class Tiny(_nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = _nn.Linear(4, 4)
+            self.value_head = _nn.Linear(4, 2)
+
+    net = Tiny()
+    opt = torch.optim.SGD(net.parameters(), lr=0.01)
+    net.backbone(torch.randn(2, 4)).sum().backward()
+    net.value_head(torch.randn(2, 4)).sum().backward()
+    net.value_head.weight.grad[0, 0] = float('inf')
+    # 先 clip（复现真机顺序：unscale → clip → 诊断）
+    gn = torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+
+    msgs = []
+
+    class _L:
+        def warning(self, fmt, *a):
+            msgs.append(fmt % a if a else fmt)
+
+    _lo(opt, _L(), phase='clip 前有 inf', named_params=dict(net.named_parameters()))
+    joined = '\n'.join(msgs)
+    assert 'value_head' in joined, f'未点名到真正出 inf 的模块：{msgs}'
+    assert '按模块点名' in joined, msgs
+
+
 def test_locate_overflow_handles_no_grads():
     """梯度全为 None 时不应抛异常。"""
     import logging
@@ -251,4 +317,5 @@ def test_locate_overflow_handles_no_grads():
             msgs.append(fmt % a if a else fmt)
 
     t._locate_overflow(opt, _L())
-    assert any('未在参数组中找到' in m for m in msgs), '应提示未找到 inf/nan'
+    assert any('没有 inf/nan' in m or '未在参数组中找到' in m
+               for m in msgs), f'应提示未找到 inf/nan：{msgs}'

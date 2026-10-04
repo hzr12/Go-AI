@@ -1016,19 +1016,27 @@ _HAS_FOREACH = hasattr(torch, '_foreach_mul_') and hasattr(torch, '_foreach_add_
 _OVERFLOW_WARN_SCALE = 1024.0
 
 
-def _locate_overflow(optimizer, logger, max_report=3):
-    """定位梯度 inf/nan 的来源参数组，只在溢出当步调用（开销可忽略）。
+def _locate_overflow(optimizer, logger, max_report=3, phase='unscale 后',
+                     named_params=None):
+    """定位参数组里的 inf/nan 梯度来源，只报不修（修是别处的责任）。
 
-    FP16 训练里「哪些参数在溢出」直接决定该调什么：value head 溢出通常指向
-    value_loss_weight / value_lr_mult 过大；backbone 溢出则更可能是注意力
-    logits 或 LR 本身。没有这一步就只能靠猜。
+    🔴 **必须在 `clip_grad_norm_` 之前调用**（2026-10-04 云端 910A 实测打出来的）。
+       `clip_grad_norm_(max_norm=1.0)` 的实现是
 
-    参数组按 **LR 比值**分类而非写死下标——opt_groups 的顺序一旦调整
-    （例如增删 no_decay 组），按下标判断就会误报。value 组的 LR 是基准的
-    value_lr_mult 倍（本项目默认 5.0），故取「LR 明显高于最低组」作为判据。
-    ⚠ `--value-loss-weight` 的默认已在 P4.5-fix 由 5.0 改为 1.0（删补偿），
-    下面的告警文案同步改了；`--value-lr-mult` 仍是 5.0（那是 LR 倍数、不是
-    损失补偿，不在本次裁决范围内）。
+           total_norm = ‖所有梯度‖                   # 有 inf ⇒ total_norm = inf
+           clip_coef  = max_norm/(total_norm + 1e-6)  # = 0
+           p.grad.mul_(clip_coef)                    # inf × 0 = NaN
+
+       `total_norm = inf ⇒ clip_coef = 0 < 1` ⇒ 这个分支**一定会进**。所以在
+       clip 之后统计，「inf 个数」**结构上恒为 0**，看到的 nan 全是 clipper 造的。
+
+       后果不是「报告不好看」，而是**方向性误导**：真机上那行
+       `有 0 个 inf / 211 个 nan 参数` 被读成「反向算出了 NaN」，排查方向偏向
+       loss 与前向；而实际上**前向与 loss 都有限**，真凶是**反向算出了 inf**。
+
+    Args:
+        named_params: ``{参数名: 参数}``，用于按模块点名。缺省则跳过该段
+            （拿不到名字时也要能跑，诊断不该反过来把训练搞崩）。
     """
     groups = optimizer.param_groups
     lrs = [float(g.get('lr', 0.0)) for g in groups]
@@ -1047,14 +1055,41 @@ def _locate_overflow(optimizer, logger, max_report=3):
             is_value = lrs[gi] > 1.5 * max(min_lr, 1e-12)
             bad.append((gi, lrs[gi], n_inf, n_nan, is_value))
     if not bad:
-        logger.warning("[fp16] GradScaler 报告溢出，但未在参数组中找到 inf/nan"
-                       "（可能出现在已被释放的中间张量里）")
+        logger.warning("[fp16] GradScaler 报告溢出，但此刻（%s）参数上没有 "
+                       "inf/nan —— 溢出可能发生在已被释放的中间张量里。", phase)
         return
     for gi, lr, n_inf, n_nan, is_value in bad[:max_report]:
-        logger.warning("[fp16] 梯度溢出：参数组 %d（%s, lr=%.2e）"
+        logger.warning("[fp16] 梯度溢出（%s）：参数组 %d（%s, lr=%.2e）"
                        "有 %d 个 inf / %d 个 nan 参数",
-                       gi, 'value head' if is_value else 'backbone/policy',
+                       phase, gi, 'value head' if is_value else 'backbone/policy',
                        lr, n_inf, n_nan)
+    # 🔴 **按模块点名**：组名只是按 LR 比值**猜**的（`--value-lr-mult` 一改 guess
+    #   就失效 —— 真机日志里三组全被打成 "backbone/policy" 就是这个原因），
+    #   而「哪个模块的梯度爆了」才是能直接定位的信息。
+    if named_params:
+        id2name = {id(p): n for n, p in named_params.items()}
+        mods = {}
+        for gi, _lr, _i, _n, _v in bad:
+            for p in groups[gi].get('params', []):
+                if p.grad is None:
+                    continue
+                ni = int(torch.isinf(p.grad).sum())
+                nn = int(torch.isnan(p.grad).sum())
+                if ni or nn:
+                    nm = id2name.get(id(p), '?')
+                    top = nm.split('.')[0] + '.' + (
+                        nm.split('.')[1] if '.' in nm[1:] else '')
+                    cur = mods.get(top, (0, 0))
+                    mods[top] = (cur[0] + ni, cur[1] + nn)
+        if mods:
+            top = sorted(mods.items(), key=lambda kv: -(kv[1][0] + kv[1][1]))[:8]
+            logger.warning("[fp16] 溢出按模块点名：%s",
+                           ', '.join('%s[inf=%d nan=%d]' % (n, i, j)
+                                     for n, (i, j) in top))
+            logger.warning("[fp16] ⚠ 下一个 %s 里这些 inf 会变成 NaN"
+                           "（clip_grad_norm_ 算出的 clip_coef=0，inf×0=NaN），"
+                           "所以**之后**再统计就看不到 inf 了。",
+                           'clip_grad_norm_')
     if any(b[4] for b in bad):
         logger.warning("[fp16] 溢出集中在 value head —— 优先下调 --value-loss-weight"
                        "（默认 1.0，无补偿）与 --value-lr-mult（默认 5.0）")
@@ -1062,7 +1097,6 @@ def _locate_overflow(optimizer, logger, max_report=3):
         logger.warning("[fp16] 溢出涉及 backbone/policy —— 优先下调 --lr；"
                        "NPU 上注意力被强制走 math 并物化 logits，"
                        "可考虑调小 --attn-window 降低 logits 幅度")
-
 
 def _ema_key(name: str) -> str:
     """EMA shadow 的键：去掉 torch.compile 往参数名里插的 '_orig_mod.' 段。
@@ -4680,11 +4714,28 @@ def main():
                     scaler.unscale_(optimizer)
                     # clip_grad_norm_ **返回 clip 前的总范数** —— 之前被丢弃了。它是
                     # fp16 溢出/梯度爆炸唯一的直接信号：这轮 910A 的 inf/nan 与
-                    # 16384→8192→4096 的缩放雪崩，本可以由它提前几分钟看到。
+                    # 缩放值雪崩，本可以由它提前几分钟看到。
                     # 必须在 unscale_ 之后取（unscale 前是按 scale 放大的假值）。
                     _gn = torch.nn.utils.clip_grad_norm_(
                         model.parameters(), max_norm=1.0)
                     _grad_norm_last = float(_gn)
+                    # 🔴 **溢出诊断的时机（2026-10-04 云端 910A 实测打出来的 bug）**
+                    #   `clip_grad_norm_(max_norm=1.0)` 在 `total_norm = inf` 时算出
+                    #   `clip_coef = 0` 并 `grad.mul_(0)` ⇒ **inf × 0 = NaN**，
+                    #   而 `inf ⇒ clip_coef = 0 < 1` 这个分支**一定会进**。
+                    #   ⇒ clip 之后统计「inf 个数」**结构上恒为 0**，看到的 nan
+                    #   **全是 clipper 造的**。
+                    #   此前诊断就排在 clip 之后，于是真机那行
+                    #   `有 0 个 inf / 211 个 nan` 被读成「反向出了 NaN」，排查
+                    #   方向被带偏到 loss 与前向 —— 而**前向与 loss 都有限**
+                    #   （本机逐项验证过），真凶是**反向出了 inf**。
+                    #
+                    #   修法：用 clip **自己返回的** `_gn` 判断「clip 前有非有限」，
+                    #   而不是再去数参数里的 inf（那时已经没有了）。
+                    #   ⚠ 归属仍然准确：`inf × 0 = NaN` 是**原地**写在同一个张量上，
+                    #     所以「哪些张量现在是 NaN」= 「哪些张量原来是 inf」。
+                    _gn_bad = not bool(torch.isfinite(
+                        torch.as_tensor(_grad_norm_last)))
                     scaler.step(optimizer)
                     scaler.update()
                     if use_scaler and scaler.get_scale() < _scale_now:
@@ -4695,7 +4746,14 @@ def main():
                         #   910A 日志里每条都出现两次），而且**看不出**是哪张卡先炸的
                         #   —— 4 份一模一样的文本反而掩盖了「rank0 先炸」这个信息。
                         if is_main:
-                            _locate_overflow(optimizer, logger)
+                            # 把参数名一并给去 —— 组名只是按 LR 比值**猜**的
+                            #（真机日志里三组全被打成 "backbone/policy" 就是
+                            # 这个原因），模块归属才是能直接定位的信息。
+                            _locate_overflow(
+                                optimizer, logger,
+                                phase=('clip 前有 inf（已由总范数确认）'
+                                       if _gn_bad else 'clip 前无 inf，见下'),
+                                named_params=dict(model.named_parameters()))
                             if _scale_now >= _OVERFLOW_WARN_SCALE > scaler.get_scale():
                                 # 分母用 `_n_attempted`（本行上一次自增）而**不是
                                 # `step`：skip 在此处计数，而 `step += 1` 在 47 行
