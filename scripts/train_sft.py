@@ -661,6 +661,14 @@ def v7_batch_features(dataset, idxs, *, boards=None, rules_flags=0):
     """
     from src.data.feature_v7 import spatial_channels_v7, global_features_v7
     idxs = np.asarray(idxs, dtype=np.int64)
+
+    # 🔴 `V7PackedDataset` 已经把 22 通道**预算好**并位打包存了（`spatial_packed`）。
+    #   那条路上 `boards` / `my_hist` 这些字段根本不存在，也**不该**重算 ——
+    #   重算要再做一遍 Benson/seki/劫争，CPU 上比读盘贵一个量级，而且可能与
+    #   转换时用的代码版本漂移（那就成了静默的特征错位）。
+    if hasattr(dataset, 'sample_spatial'):
+        return dataset.sample_spatial(idxs), dataset.sample_global(idxs)
+
     src = dataset.boards if boards is None else boards
     g = _v7_row_gather(dataset, idxs, src)
     my = np.asarray(dataset.my_hist)[idxs]
@@ -1277,6 +1285,104 @@ def evaluate_top1(model, dataset, idxs, bs, device, amp_dtype, max_batches=50,
     return correct / max(total, 1), total
 
 
+def evaluate_metrics_v7(model, dataset, idxs, bs, device, amp_dtype, *,
+                        max_batches=50, action_size=V7_ACTION_SIZE):
+    """V7 路径的验证集综合指标（与 :func:`evaluate_metrics` **返回同构**）。
+
+    为什么必须另写一份
+    ------------------
+    12 通道的 :func:`evaluate_metrics` 建的是 ``sample_batch(n_channels=12)``
+    + ``model(state)`` 二元返回的评估器，对 V7（22 通道 19 维全局 + dict 返回）
+    会直接形状错。与其在这里猜，不如把口径对齐 —— 否则 V7 训��永远看不到
+    top1，`--early-stop` 也跟着形同虚设。
+
+    指标口径（与 12 通道版刻意保持同名同义，便于 early-stop / best-model
+    两处逻辑零改动复用）：
+
+    ``top1`` / ``top5`` / ``top10``
+        policy 的 top-k 命中率。软标签用 ``soft`` 的 argmax 当参考着法。
+    ``kl``
+        ``KL(soft ‖ softmax(logits))``，即 12 通道版同款。
+    ``brier``
+        value 三分类的 Brier score（越小越好），``--early-stop-metric loss``
+        默认就看它。
+    ⚠ policy 通道 1 是 ``π_opp``（引擎语义里叫 optimism），本指标**只看通道 0** ——
+        引擎在 ``policyOptimism=0`` 时也只消费通道 0。
+
+    Returns:
+        与 :func:`evaluate_metrics` 同构的 dict（另加 ``n`` 便于确认覆盖度）。
+    """
+    from src.networks.katago_v7_loss import KataGoV7Loss
+
+    model.eval()
+    n = int(len(idxs))
+    if n == 0:
+        return {'top1': 0.0, 'top5': 0.0, 'top10': 0.0, 'kl': 0.0,
+                'brier': 0.0, 'n': 0, 'batches': 0, 'truncated': False}
+
+    nb = max_batches if max_batches and max_batches > 0 else 10 ** 9
+    rng = np.random.default_rng(0)
+    order = np.arange(n)
+    rng.shuffle(order)                       # 与训练不同序，避免只看高数据量前缀
+
+    hit1 = hit5 = hit10 = 0
+    kl_sum = brier_sum = 0.0
+    seen = 0
+    batches = 0
+    for start in range(0, n, bs):
+        if batches >= nb:
+            break
+        rows = order[start:start + bs]
+        if rows.size == 0:
+            continue
+        batches += 1
+        sp_np, gl_np, moves, lbl = v7_batch_sync(
+            dataset, rows, device, rng=rng, augment=False)
+        sp = v7_to_device(sp_np, device, amp_dtype)
+        gl = v7_to_device(gl_np, device, torch.float32)
+        with torch.no_grad():
+            out = model(sp, gl)
+        pol = out['policy_logits']                      # (B, K, 361+1)
+        pol = pol[:, 0, :action_size].float()           # 只看通道 0（π）
+        logp = F.log_softmax(pol, dim=-1)
+
+        target = torch.as_tensor(lbl['soft'][:, :action_size],
+                                 device=logp.device, dtype=torch.float32)
+        tgt_rank = target.argmax(dim=-1)
+        top = logp.topk(min(10, action_size), dim=-1).indices
+        eq = top.eq(tgt_rank.unsqueeze(1))
+        hit1 += int(eq[:, 0].sum())
+        hit5 += int(eq[:, :5].any(dim=1).sum())
+        hit10 += int(eq.any(dim=1).sum())
+
+        kl_sum += float((target * (torch.log(target.clamp_min(1e-9)) - logp)).sum(-1).sum())
+
+        # ---- value Brier（三分类）----
+        # `outcome` 已是 {0=胜,1=负,2=无结果} 的类别索引（to_play 视角），
+        # 直接 one-hot 即得目标；noresult 行也算进去 —— 引擎同样会预测它。
+        oc = out['outcome_logits'].float()
+        oc_p = F.softmax(oc, dim=-1)
+        oc_t = torch.as_tensor(np.asarray(lbl['outcome']),
+                               device=oc_p.device, dtype=torch.long)
+        oc_t = oc_t.clamp(0, oc_p.shape[1] - 1)
+        oh = F.one_hot(oc_t, oc_p.shape[1]).to(oc_p.dtype)
+        brier_sum += float((oc_p - oh).pow(2).sum(-1).sum())
+
+        seen += int(rows.size)
+
+    model.train()
+    return {
+        'top1': hit1 / max(1, seen),
+        'top5': hit5 / max(1, seen),
+        'top10': hit10 / max(1, seen),
+        'kl': kl_sum / max(1, seen),
+        'brier': brier_sum / max(1, seen),
+        'n': seen,
+        'batches': batches,
+        'truncated': bool(batches >= nb and start + bs < n),
+    }
+
+
 def evaluate_metrics(model, dataset, idxs, bs, device, amp_dtype, max_batches=50,
                      use_channels_last=False, rng=None):
     """验证集综合指标：top-1/5/10 准确率 + policy KL + value Brier score。
@@ -1405,14 +1511,26 @@ def _concat_dicts(dicts):
     return out
 
 
-def load_from_path(path, board_size, max_games_per_tgz=0):
+def load_from_path(path, board_size, max_games_per_tgz=0, v7=False):
     """加载训练数据。
 
-    - 若 path 是文件：按 .npz 加载（兼容原行为）。
-    - 若 path 是目录：递归扫描其下所有 .tgz/.tar.gz（用 build_dataset.build 解析）
-      与 .npz（直接加载），合并成一个 SupervisedDataset。这样可直接喂一个装着
-      多个分片 tgz 的文件夹，无需先手动 build_dataset 成单个 npz。
+    - ``v7=True``：**必须**是 ``stdata_to_npz.py`` 产出的 V7 分片
+      （``spatial_packed`` + 全部 V7 标签），走 `V7PackedDataset`。
+      这条路是 V7 训练**唯一**可行的：``data/sgf_19x19_full.npz`` 那 3420 万行
+      虽然更���，但**没有** ``ownership`` / ``futurepos`` / ``scoring`` /
+      ``seki`` / ``scorebelief`` 标签，而 ``futurepos`` 是段1 四个主目标之一。
+      见 `src/data/v7_dataset.py` 模块 docstring。
+    - 否则：若 path 是文件，按 .npz 加载（兼容原行为）；若是目录，递归扫描
+      其下所有 .tgz/.tar.gz（用 build_dataset.build 解析）与 .npz（直接加载），
+      合并成一个 SupervisedDataset。这样可直接喂一个装着多个分片 tgz 的文件夹，
+      无需先手动 build_dataset 成单个 npz。
     """
+    if v7:
+        from src.data.v7_packed_dataset import load_v7_packed
+
+        ds = load_v7_packed(path)
+        print(f"[data] V7 分片：{ds.describe()}")
+        return ds
     if os.path.isdir(path):
         import glob
         tgzs = (sorted(glob.glob(os.path.join(path, '**', '*.tgz'), recursive=True))
@@ -1658,6 +1776,16 @@ def _v7_labels_and_moves(dataset, idxs, tforms):
     """
     from src.data.dataset import permute_move_vector
     bs = dataset.board_size
+    idxs = np.asarray(idxs, dtype=np.int64)
+    # 🔴 `V7PackedDataset` 每行**自带**该行的目标着法，`_build_labels` 已经把它
+    #   放进 `next_move`（并按同一 tform 重编号过）。若在这里再走 board 级路径的
+    #   `moves[idxs+1]`，会取到**下一行**的答案 —— 监督信号整体错位一行，
+    #   而形状完全合法、不报错。所以本类必须直接用 `next_move`。
+    if hasattr(dataset, 'sample_spatial'):
+        lbl = dataset._build_labels(idxs, tforms, True)
+        moves = np.asarray(lbl['next_move'], dtype=np.int64).copy()
+        return moves, lbl
+
     moves = np.full(len(idxs), bs * bs, dtype=np.int64)
     mv = np.asarray(dataset.moves[np.asarray(idxs, dtype=np.int64)],
                     dtype=np.int64)
@@ -3039,10 +3167,9 @@ def main():
         logger.info("[v7] 已启用 22 通道 V7 路径 | board=%d | 段 1 四目标=%s | "
                     "score 系权重 0（结构保留）",
                     V7_BOARD_SIZE, ' / '.join(V7_STAGE1_TERMS))
-        logger.warning("[v7] ⚠ 验证集评估与 --early-stop 在 V7 下**不生效**"
-                       "（`evaluate_metrics` 是 12 通道路径的评估器：吃 "
-                       "`sample_batch` 的 n_channels 通道、拿 `model(state)` 的"
-                       "二元组返回）。指标曲线请看训练日志里的 `v7/*` 逐项 loss。")
+        logger.info("[v7] 验证集评估：走 `evaluate_metrics_v7`（22 通道 + dict 返回，"
+                        "口径 top1/top5/top10/kl/brier 与 12 通道版同名同义）"
+                        "⇒ `--early-stop` 与 best-model 判据均**生效**。")
         if args.export_onnx == 1:
             logger.warning("[v7] ⚠ --export-onnx 走 `GoAI`，它是 12 通道推理链；"
                            "V7 需要另一条导出路径（本次未接），导出结果不可用。")
@@ -3123,7 +3250,8 @@ def main():
     # 4×6 GB，实测 HBM 94% 而 AICore 0%，紧接着就是 OOM。数据集加载是纯
     # numpy（与 rank 无关），提前无语义影响；反向顺序（dist 初始化后再 fork）
     # 才是 HCCL 的危险方向，提前 fork 是安全的那一侧。
-    dataset = load_from_path(args.data, args.board_size, args.max_games_per_tgz)
+    dataset = load_from_path(args.data, args.board_size,
+                                args.max_games_per_tgz, v7=bool(args.v7))
     # ---- A4 · 软标签挂载：**必须在 fork 之前** -----------------------------
     # 顺序是硬要求：软标签挂在 dataset 对象上，预取器 fork 之后再挂就只有父
     # 进程看得见，worker 会继续造 `soft_mask` 全 0 的批 —— 训练不报任何错，
@@ -3168,11 +3296,19 @@ def main():
     # 在内存里了，为 futurepos 再落一份 12.3 GB 是纯浪费。需要真 mmap 的场景
     # （超大数据集放不进内存）走 `dataset_npz` + `materialized_dir`，那是
     # `_rebind_futurepos_mmap` 的测试覆盖的另一条分支。
+    #
+    # ⚠ `V7PackedDataset` 的 futurepos **就在分片里**（`futurepos` 键，19×19×2），
+    # 不需要再挂载/预热 —— 那是 board 级路径才需要的（那里 futurepos 要跨着法
+    # 往后看，落在另一个 .npy 里）。给它一个「已完成」的状态，让下游日志走同一形状。
     _fp_status = None
     if _v7_on:
-        _fp_status = dataset.attach_futurepos(source=None, mode='live')
-        _fp_status = dataset.warm_futurepos()      # ← warm_futurepos() 调用点
-        logger.info("[v7] futurepos 已启用并 warm | mode=%s offsets=%s resolved=%s "
+        if hasattr(dataset, 'attach_futurepos'):
+            _fp_status = dataset.attach_futurepos(source=None, mode='live')
+            _fp_status = dataset.warm_futurepos()   # 必须在 worker 起来之前 warm
+        else:
+            _fp_status = {'mode': 'packed', 'offsets': None,
+                          'resolved': True, 'source': 'shard:futurepos'}
+        logger.info("[v7] futurepos 数据源 | mode=%s offsets=%s resolved=%s "
                     "source=%s", _fp_status.get('mode'),
                     _fp_status.get('offsets'), _fp_status.get('resolved'),
                     _fp_status.get('source'))
@@ -4437,21 +4573,22 @@ def main():
                 _t_save += time.perf_counter() - _t_save0
 
             # 定期评估：综合指标（所有 rank 都做 eval，避免 barrier 死锁）
-            # ⚠ `--v7` 下**跳过**：`evaluate_metrics` 建的是 12 通道路径的评估器
-            # （`dataset.sample_batch` 的 `n_channels` 通道 + `model(state)` 的
-            # 二元组返回），对 V7 会得到形状错。与其在这里猜，不如明确跳过并
-            # 在启动期就告警 —— 见启动处 `[v7] 验证集评估已跳过` 那一行。
-            # 后果：V7 下 `best_eval_acc` 恒 -1 ⇒ `--early-stop` 也不生效
-            #（它监控的就是 eval 指标）。两件事都在启动日志里说清楚。
-            if (not _v7_on and args.eval_every > 0
-                    and step % args.eval_every == 0 and len(eval_idx) > 0):
+            # V7 走 `evaluate_metrics_v7`（22 通道 + dict 返回），12 通道走原版。
+            # 两版**返回同构**，所以下面的 best-model / early-stop 逻辑零改动。
+            if (args.eval_every > 0 and step % args.eval_every == 0
+                    and len(eval_idx) > 0):
                 if ema is not None:
                     ema.apply_shadow()
                 _t_eval0 = time.perf_counter()
-                metrics = evaluate_metrics(
-                    model, dataset, eval_idx, bs, device, amp_dtype,
-                    max_batches=args.eval_max_batches,
-                    use_channels_last=use_channels_last)
+                if _v7_on:
+                    metrics = evaluate_metrics_v7(
+                        model, dataset, eval_idx, bs, device, amp_dtype,
+                        max_batches=args.eval_max_batches)
+                else:
+                    metrics = evaluate_metrics(
+                        model, dataset, eval_idx, bs, device, amp_dtype,
+                        max_batches=args.eval_max_batches,
+                        use_channels_last=use_channels_last)
                 _t_eval += time.perf_counter() - _t_eval0
                 if ema is not None:
                     ema.restore()
@@ -4579,15 +4716,20 @@ def main():
         logger.info("[train] ONNX 导出完成: %s", onnx_path)
 
     # 最后一步评估：使用 EMA 权重（如果启用）
-    if (not _v7_on) and len(eval_idx) > 0:
+    if len(eval_idx) > 0:
         if is_main:
             logger.info("[train] 开始最终评估...")
         if ema is not None:
             ema.apply_shadow()
-        final_metrics = evaluate_metrics(
-            model, dataset, eval_idx, bs, device, amp_dtype,
-            max_batches=args.eval_max_batches,
-            use_channels_last=use_channels_last)
+        if _v7_on:
+            final_metrics = evaluate_metrics_v7(
+                model, dataset, eval_idx, bs, device, amp_dtype,
+                max_batches=args.eval_max_batches)
+        else:
+            final_metrics = evaluate_metrics(
+                model, dataset, eval_idx, bs, device, amp_dtype,
+                max_batches=args.eval_max_batches,
+                use_channels_last=use_channels_last)
         if ema is not None:
             ema.restore()
         if is_main:

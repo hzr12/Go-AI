@@ -282,11 +282,24 @@ def test_effective_batch_for_throughput_includes_accumulation():
 
 
 def test_eval_timing_wraps_the_dominant_cost():
-    """eval 计时只包住 evaluate_metrics（主导开销），避免大段重排缩进。"""
+    """eval 计时必须**只**包住 eval 调用本身（主导开销）。
+
+    2026-10-04：V7 路径接上 ``evaluate_metrics_v7`` 后，周期 eval 变成
+    「按 ``_v7_on`` 二选一」的两条调用。原正则要求 `_t_eval0` 后面**紧跟**
+    ``metrics = evaluate_metrics(``，会把这条正常分派判成失败。
+
+    放宽的只是「紧跟哪个名字」，**不变量没松**：仍然要求
+    ``_t_eval0 = perf_counter()`` 与 ``_t_eval += … - _t_eval0`` 之间
+    夹着一个真正的 eval 调用，且**不得**夹进别的大段逻辑（否则计时会
+    把重排缩进的开销也算进去 —— 那正是这条测试当初要防的）。
+    """
     m = re.search(
         r'_t_eval0 = time\.perf_counter\(\)\s*\n'
-        r'\s*metrics = evaluate_metrics\(.*?\)\s*\n'
+        r'(?:.*?\n)??'                       # 可选的 if/else 分派
+        r'\s*metrics = (?:\(\s*)?'
+        r'(?:evaluate_metrics_v7|evaluate_metrics)\('
+        r'.*?\)\s*\n'
         r'\s*_t_eval \+= time\.perf_counter\(\) - _t_eval0',
         SRC, re.S,
     )
-    assert m, 'eval 计时未包住 evaluate_metrics'
+    assert m, 'eval 计时未包住 evaluate_metrics / evaluate_metrics_v7'
