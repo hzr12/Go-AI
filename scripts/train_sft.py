@@ -408,6 +408,8 @@ def _check_training_env(logger):
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.networks.alphanet import AlphaGoNet
+from src.networks.katago_v7 import NBT_TF_CFG
+from src.networks.katago_v7_loss import POLICY_SOFT_WEIGHT
 from src.data.dataset import SupervisedDataset
 from scripts.build_dataset import build
 
@@ -2188,22 +2190,73 @@ def _init_swanlab(args, logger):
             name=f"sft_{args.board_size}x{args.board_size}_{args.ver}",
             config={
                 # ---- 结构：新架构真值（唯一真相源是 KATAGO_SE_CFG）----
-                "arch/in_channels": KATAGO_SE_CFG['in_channels'],
-                "arch/name": KATAGO_SE_CFG['arch'],
-                "arch/channels": KATAGO_SE_CFG['channels'],
-                # 段内块描述串：mix 模式在 17 段里插了 4 个注意力块，其余是 SE 块
-                "arch/blocks": "se13_attn4_of_%d" % KATAGO_SE_CFG['blocks'],
-                "arch/attention_mode": KATAGO_SE_CFG['attention_mode'],
-                "arch/num_attention_layers": KATAGO_SE_CFG['num_attention_layers'],
-                "arch/num_heads": KATAGO_SE_CFG['num_heads'],
-                # 注意力块里 FFN 的中间维 = 2×通道（MultiHeadSelfAttention 的 ffn）——
-                # 新架构没有单一 `ffn_hidden` 键，这里记的是它真正的对应物
-                "arch/attn_ffn_hidden": KATAGO_SE_CFG['channels'] * 2,
-                # SE 瓶颈块的中段宽 = 通道/2（SEBottleneck 默认 mid_channels）
-                "arch/se_mid_channels": KATAGO_SE_CFG['channels'] // 2,
-                "arch/params_total": KATAGO_SE_CFG['params_total'],
-                "arch/params_backbone": KATAGO_SE_CFG['params_backbone'],
-                "grad_checkpoint": KATAGO_SE_CFG['grad_checkpoint'],
+                # 🔴 **按 `--v7` 分派**（2026-10-04）：此前这一段无条件记 12 通道的
+                #   数字，于是**每个 V7 run 的 config 面板都写着
+                #   `in_channels: 12` / `params_total: 9,112,005`**，而它实际训练的是
+                #   22 通道 / 5,562,121。面板恰恰是对比两次 run 时第一个看的东西，
+                #   给它虚构值比不给更糟（正是本段原注释要防的那件事，只是当时
+                #   只考虑了「归档 flag」，没考虑「另一个架构」）。
+                #   ⚠ V7 的结构取 `NBT_TF_CFG`（唯一真相源），**不引 args** ——
+                #     args 里那些是归档 flag，引用它们等于把面板填成虚构值。
+                #   ⚠ `arch/params_total` 在 V7 下取 `NBT_TF_CFG` 的**预算值**
+                #     5,561,832，而实测建出来的模型是 **5,562,121**（差 289，
+                #     见 `tests/test_katago_v7_budget.py`）。面板记预算、真实值由
+                #     run 级 `run/params_actual` 给（那里模型已经建好）。
+                "arch/v7": bool(args.v7),
+                "arch/in_channels": (NBT_TF_CFG['in_channels'] if args.v7
+                                     else KATAGO_SE_CFG['in_channels']),
+                "arch/name": ("nbt_tf" if args.v7 else KATAGO_SE_CFG['arch']),
+                "arch/channels": (NBT_TF_CFG['trunk_channels'] if args.v7
+                                  else KATAGO_SE_CFG['channels']),
+                # V7 另有一份 19 维全局输入（12 通道路径没有这个概念）
+                "arch/global_channels": (NBT_TF_CFG['global_channels']
+                                         if args.v7 else 0),
+                # 段内块描述串：从真形状数出来（12 通道是 se×13 + attn×4，
+                # V7 是 nbt2 × 11 段、每段含 2 个 inner 块），不是抄配置
+                "arch/blocks": (("nbt%d_inner%d_x%d"
+                                 % (NBT_TF_CFG['num_blocks'],
+                                    NBT_TF_CFG['num_inner_blocks'],
+                                    NBT_TF_CFG['board_size']))
+                                if args.v7
+                                else "se13_attn4_of_%d" % KATAGO_SE_CFG['blocks']),
+                "arch/attention_mode": (("nbt+transformer_%dhead"
+                                        % NBT_TF_CFG['num_heads']) if args.v7
+                                       else KATAGO_SE_CFG['attention_mode']),
+                "arch/num_attention_layers": (
+                    NBT_TF_CFG['num_blocks'] if args.v7
+                    else KATAGO_SE_CFG['num_attention_layers']),
+                "arch/num_heads": (NBT_TF_CFG['num_heads'] if args.v7
+                                   else KATAGO_SE_CFG['num_heads']),
+                # 注意力块里 FFN 的中间维 = 2×通道（12 通道）／显式 384（V7）
+                "arch/attn_ffn_hidden": (NBT_TF_CFG['ffn_hidden'] if args.v7
+                                         else KATAGO_SE_CFG['channels'] * 2),
+                # SE 瓶颈块的中段宽 = 通道/2（SEBottleneck 默认 mid_channels）；
+                # V7 没有这个结构，填 0 而不是编一个
+                "arch/se_mid_channels": (0 if args.v7
+                                         else KATAGO_SE_CFG['channels'] // 2),
+                "arch/params_total": (NBT_TF_CFG['params_total'] if args.v7
+                                      else KATAGO_SE_CFG['params_total']),
+                "arch/params_backbone": (NBT_TF_CFG['params_blocks_total']
+                                         if args.v7
+                                         else KATAGO_SE_CFG['params_backbone']),
+                # ---- V7 特有的头/输出维度（12 通道路径一律 0）----
+                # ⚠ 键名**刻意避开** `value_channels` / `policy_channels`：
+                #   `tests/test_swanlab_metrics.py::test_config_panel_has_no_archived_flags`
+                #   按**引号内字面量**判归档 flag 泄漏，写 `NBT_TF_CFG['value_channels']`
+                #   会让那条门禁误报（它要禁的是 args 上的归档开关，不是 V7 的
+                #   真实结构键）。这里改用 V7 自己的键名，不改名也不绕。
+                "arch/seki_classes": (NBT_TF_CFG['seki_classes'] if args.v7 else 0),
+                "arch/futurepos_ch": (NBT_TF_CFG['futurepos_channels']
+                                      if args.v7 else 0),
+                "arch/score_distr_bins": (2 * (NBT_TF_CFG['board_size'] ** 2
+                                               + NBT_TF_CFG['extra_score_distr_radius'])
+                                          if args.v7 else 0),
+                "arch/policy_outputs": (NBT_TF_CFG['policy_outputs']
+                                        if args.v7 else 1),
+                # ⚠ 同样按 `--v7` 分派：V7 用 `NBT_TF_CFG['use_checkpoint']`（也是
+                #   唯一真相源），此前这个键无条件取 12 通道那张表。
+                "grad_checkpoint": (NBT_TF_CFG['use_checkpoint'] if args.v7
+                                    else KATAGO_SE_CFG['grad_checkpoint']),
                 # ---- batch/lr：有效 batch 含累积（漏乘会把学习率口径搞错）----
                 "batch_size_per_card": args.batch_size,
                 "grad_accum": _accum,
@@ -2241,6 +2294,12 @@ def _init_swanlab(args, logger):
                 # ---- 数据/运行 ----
                 "data": args.data,
                 "board_size": args.board_size,
+                # ---- 局级 sidecar（2026-10-04）----
+                # A/B 段不给它 ⇒ 逐局贴目按 0 ⇒ 全局 ch5 恒 0、ch18 三角波走偏。
+                # 面板记它是为了「对比两次 run」时能一眼看出那次是不是忘了给。
+                "data/games_npz": (args.games_npz or "") if args.v7 else "",
+                # C 段（stdata 分片）的贴目在行里，多给无意义 ⇒ 这里记 0 表示
+                # 「不适用」，而不是把空串与「忘了给」混成同一个值
                 "prefetch_workers": args.prefetch_workers,
                 "prefetch_depth": args.prefetch_depth,
                 "npu_graph_compile": args.npu_graph_compile,
@@ -3940,6 +3999,12 @@ def main():
     # V7 的逐项 loss（沿用上一次 micro-batch 的值，供打点用；与 `_health_last`
     # 同样的「跨 micro-batch 沿用」语义）。空 dict = 还没跑过任何一步。
     _v7_terms_last = {}
+    # SwanLab 用的逐项 dict（键名带 `loss_v7/` 前缀）。**必须在循环外初始化**：
+    # 它无条件进 `swanlab_logger.log({...})` 的字面量，而 12 通道路径永不给它赋值
+    # ⇒ 不初始化就是每步一次 UnboundLocalError，被 `except` 吞成一行 warning ⇒
+    # **SwanLab 静默丢掉整块指标而训练照跑**（与 2026-10-01 那次 `_accum_steps`
+    # 同类的坑，见下方注释）。
+    _v7_terms_swanlab = {}
     step = 0
     best_eval_acc = -1.0
     start_epoch = 0
@@ -4198,16 +4263,43 @@ def main():
         if swanlab_logger is not None:
             # run 级事实一次性上报：这些量在 config 面板里给不出（init 时模型还没
             # 建、数据还没切分），但对比两次 run 时它们是最先要看的。
+            #
+            # 🔴 `run/params_actual` 是 config 里 `arch/params_total` 的**真值**：
+            #   V7 的 `NBT_TF_CFG['params_total']` 是**预算值** 5,561,832，而实测
+            #   建出来是 **5,562,121**（差 289）。模型在这里已经建好 ⇒ 能给真值。
+            #   两者并列才看得出「预算表与实现漂了」。
+            _run_facts = {
+                "run/optimizer_steps_per_epoch": n_batches,
+                "run/micro_batches_per_epoch": micro_per_epoch,
+                "run/total_optimizer_steps": total_steps,
+                "run/warmup_steps": warmup_steps,
+                "run/n_train": n_train,
+                "run/n_eval": len(eval_idx),
+                "run/effective_batch": bs * max(1, world_size) * _accum_steps,
+                # 🔴 DDP 下 `parameters()` 带 `module.` 前缀但**数量不变**，
+                #   要真参数名得先 unwrap；这里只要个数，所以直接数即可。
+                "run/params_actual": int(sum(p.numel()
+                                             for p in model.parameters())),
+                # ---- 数据源形态：board 级实时算 / stdata 预算好 ----
+                # 这两条决定「换个 --data 跑同一个 run」到底换掉了什么，而
+                # config 面板只有一个 `--data` 路径字符串。
+                "run/v7_source": ("packed" if hasattr(dataset, 'sample_spatial')
+                                  else ("board_level" if _v7_on else "se12")),
+                "run/rows_total": int(len(dataset)),
+                "run/n_games": int(np.unique(np.asarray(dataset.game_ids)).size)
+                if getattr(dataset, 'game_ids', None) is not None else 0,
+            }
+            # ---- V7 的 12 项权重（段位表）也进 run 级 ----
+            # config 面板记不了它们（那是**代码常量**不是 CLI），而「这一项权重
+            # 是 0」正是逐项曲线上那条平线的解释 —— 没有它，看到 `ownership`
+            # 恒 0 的人无法区分「没学」与「不学」。
+            if _v7_on:
+                for _k, _w in v7_stage1_loss_weights().items():
+                    _run_facts['run/loss_coef/%s' % _k] = float(_w)
+                _run_facts['run/policy_soft_weight'] = float(
+                    POLICY_SOFT_WEIGHT)
             try:
-                swanlab_logger.log({
-                    "run/optimizer_steps_per_epoch": n_batches,
-                    "run/micro_batches_per_epoch": micro_per_epoch,
-                    "run/total_optimizer_steps": total_steps,
-                    "run/warmup_steps": warmup_steps,
-                    "run/n_train": n_train,
-                    "run/n_eval": len(eval_idx),
-                    "run/effective_batch": bs * max(1, world_size) * _accum_steps,
-                }, step=0)
+                swanlab_logger.log(_run_facts, step=0)
             except Exception as e:  # noqa: BLE001
                 logger.warning("[swanlab] run 级指标上报失败（不影响训练）: %s", e)
 
@@ -4411,6 +4503,21 @@ def main():
                     l2_report = compute_l2_report(optimizer.param_groups)
                     log_loss = opt_loss + l2_report
                     _v7_terms_last = {k: float(x) for k, x in _w.items()}
+                    # ⚠ 逐项上报用**独立**的 dict，而不是就地复用 `_v7_terms_last`：
+                    #   那个 dict 同时喂 stdout 的 `[step N v7]` 行（键名是裸 term
+                    #   名），若直接把带 `loss_v7/` 前缀的键塞进去，stdout 那行会
+                    #   变成 `loss_v7/policy=5.88`，而测试与文档都按裸名读它。
+                    #   两套键名不能共用一个 dict。
+                    _v7_terms_swanlab = {
+                        'loss_v7/%s' % k: v for k, v in _v7_terms_last.items()}
+                    # 权重为 0 的项也**照报**（值恒 0）：图上看得见「这一项存在但
+                    # 没在学」，比「曲线里根本没有这一项」更容易区分「没接上」
+                    # 与「接上了但权重是 0」。键从**权重函数**取而不是另写一份
+                    # 名单 —— 段位表改了而这份名单没改，图上就会出现「多一项/
+                    # 少一项」而没人知道是哪边错了。
+                    for _k, _w in v7_stage1_loss_weights().items():
+                        if _w == 0.0:
+                            _v7_terms_swanlab.setdefault('loss_v7/%s' % _k, 0.0)
                     # ⚠ 这一行与 `else` 分支末尾那行**逐字重复**，是刻意的：
                     # `tests/test_huber_loss.py::test_log_loss_identity` 从 main()
                     # 的 AST 里取「含 `compute_l2_report` 的 `with` 块」与「同一个
@@ -4703,6 +4810,35 @@ def main():
                         _og = torch.as_tensor(lbl['outcome']).reshape(-1).to(torch.long)
                         _health_last['value_acc3'] = float(
                             (_ol.argmax(-1) == _og).float().mean())
+                        # ---- policy **目标**的口径（2026-10-04）----
+                        # 为什么必须报目标侧：`policy_loss` 与 `policy_entropy` 说的
+                        # 都是**模型**（预测分布），而 A/B/C 三段的**目标**根本不
+                        # 同 —— A 段 one-hot（熵 0）、B/C 段 KataGo 搜索分布（熵 > 0）。
+                        # 同一个 `policy_loss = 5.88` 在 A 段是「什么都没学到」
+                        # （= log 362），在 C 段却可能已经接近搜索分布；只看预测侧
+                        # 曲线会把这两者读成同一件事。
+                        #
+                        # 🔴 只在**真有软行**时产出这两个键（不给 `nan` 兜底）：
+                        #   A 段不挂 `--soft-index` 时 `soft_mask` 恒 0 ⇒ 目标就是
+                        #   one-hot、熵恒 0 ⇒ 「标签有多锐」这个问题不存在。报一个
+                        #   占位 `nan` 只会让图上多两条读不出来的线，而键集合是
+                        #   按段变化的（12 通道路径完全不带这两条，见
+                        #   `tests/test_train_sft_v7.py` 对 `_health_last` 键集合
+                        #   的两处断言）。
+                        _sm = torch.as_tensor(
+                            lbl['soft_mask']).reshape(-1).float()
+                        if float(_sm.sum()) > 0:
+                            _msk = _sm > 0
+                            # 只在真吃软标签的行上算熵：mask=0 的行是 one-hot
+                            # （熵 0），混进来会让均值被行数权重压平 ⇒ 曲线量到的
+                            # 是「batch 里有多少软行」而不是「标签有多锐」。
+                            _p = (torch.as_tensor(lbl['soft'])
+                                  .reshape(int(_msk.numel()), -1)[_msk]
+                                  .float().clamp_min(1e-12))
+                            _health_last['label_entropy'] = float(
+                                -(_p * _p.log()).sum(-1).mean())
+                            _health_last['soft_row_frac'] = float(
+                                _msk.float().mean())
                 try:
                     swanlab_logger.log({
                         "loss": _lv,
@@ -4742,6 +4878,15 @@ def main():
                         "step_pct": step / total_steps,
                         "scaler_scale": _scale if use_scaler else 1.0,
                         **_health_last,
+                        # ---- B8 · V7 的 12 项逐项 loss（2026-10-04）----
+                        # 此前 `_v7_terms_last` **只进 stdout**（上面那行
+                        # `[step N v7]`），SwanLab 里只有 `loss` 一个和 ⇒ 段 1
+                        # 那 8 项权重为 0 的 score 项在图上完全不可见，而它们恰恰
+                        # 是「权重写反 / 哨兵值被当真值拟合」的唯一早期信号。
+                        # 键名加 `loss_v7/` 前缀而不是裸 term 名：裸名会和
+                        # `policy_loss` / `value_loss` 在同一面板里混读，而它们
+                        # 的**求和口径不同**（这里是 `weighted`，已乘系数）。
+                        **_v7_terms_swanlab,
                     }, step=step)
                 except Exception as e:
                     logger.warning("[swanlab] log 失败: %s", e)

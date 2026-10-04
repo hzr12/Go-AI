@@ -138,6 +138,52 @@ python scripts/train_sft.py --data data/stdata_v7 --v7 1 --device cpu \
 # ⚠ `--export-onnx` 对 V7 **无效**（走 `GoAI` 的 12 通道推理链）；V7 导出见第 7/8 步
 # ⚠ 落盘文件名带 `.latest`：`--out models/x.pth` ⇒ 实际存 `models/x.pth.latest`
 
+# ---------- SwanLab 图表：有哪些组、怎么读 ----------
+# ⚠ `--swanlab-every 10` 把**曲线密度**与 stdout 解耦（stdout 仍按 `--log-every 50`）：
+#   A 段一整轮约 4275 个 optimizer step ⇒ 只按 50 打点只有 ~85 个点，曲线看不出
+#   早停拐点；按 10 打有 ~430 个点。stdout 不跟着刷屏。
+#
+# config 面板（对比两次 run 时第一个看的东西）
+#   arch/*            **按 --v7 分派**：V7 run 记 22 通道 / nbt2_11段 / 5,561,832，
+#                     12 通道 run 记 12 / se13_attn4_of_17 / 9,112,005
+#   data/games_npz    A/B 段给了 sidecar 才有值；空串 = 没给（贴目按 0）
+#   soft_* / lr / effective_batch（含 grad_accum，别只看 batch_size）
+#
+# run/ 级（step 0 一次性，config 给不出的真实形态）
+#   run/params_actual     **实测**参数量 5,562,121（config 的 arch/params_total 是
+#                         预算值 5,561,832，差 289 —— 两者并列才看得出预算表漂没漂）
+#   run/v7_source         packed（stdata 预算特征）/ board_level（实时算）/ se12
+#   run/rows_total, run/n_games, run/n_train, run/n_eval
+#   run/loss_coef/*       12 项权重（**代码常量**，config 里没有）⇒ 用来解释
+#                         loss_v7/* 里那些恒 0 的平线是「不学」而不是「没接上」
+#   run/policy_soft_weight
+#
+# 逐 step（预测侧）
+#   loss / policy_loss / value_loss / l2_report / opt_loss / lr / grad_norm
+#   scaler_scale / skipped_steps / skip_rate_pct / memory_gb
+#   speed / speed_inst / speed_per_card / elapsed_min / eta_min
+#   t_data_ms / t_comp_ms / t_save_ms / t_eval_ms / t_data_max_ms
+#   train_top1 / train_top5 / policy_entropy / policy_ce_random / value_acc3
+#
+# 逐 step（V7 专有，13 条 —— 段位表里 9 项权重为 0，图上能看到平线）
+#   loss_v7/policy / policy_opp / value / futurepos        ← 段 A/B/C 主目标
+#   loss_v7/ownership / scorebelief_pdf / scorebelief_cdf / score_stdev
+#   loss_v7/score_mean / lead / var_time_left / scoring / seki  ← 段 A 权重 0
+#   ⚠ **必须有 run/loss_coef/* 一起看**：否则「恒 0」分不清是没学还是权重为 0。
+#
+# 逐 step（目标侧 —— 与上面的预测侧配对读）
+#   label_entropy   policy **目标**的熵 ∈ [0, log 362]：A 段 one-hot ⇒ 不产出；
+#                   B/C 段是 KataGo 搜索分布（实测 0.80，比 log362 锐得多）
+#   soft_row_frac   本批里真吃软标签的行占比（--soft-only-sampling 1 下应恒 1.0）
+#   🔴 读法：`policy_entropy`（模型）远大于 `label_entropy`（目标）= 模型还没跟上；
+#      两者收敛 = 学到了。**只看 policy_loss 分不出这个** —— A 段的 5.88 是
+#      「什么都没学到」，C 段的 5.88 可能已经很接近目标。
+#
+# eval（每 --eval-every 步 + FINAL）
+#   eval_top1/5/10, eval_kl, eval_brier, eval_n, eval_batches, eval_truncated
+#   eval_used_ema, eval_lr, eval_gap_to_best, best_eval_acc
+#   final_* （收尾那一次）
+
 # ⚠ A/B 段**必须加 `--games-npz data/labels/games.npz`**（局级 sidecar，1.2 MB）：
 #   不给 ⇒ `V7Dataset.game_row_for()` 返回 None ⇒ 贴目按 0 ⇒ 全局 **ch5**
 #   （`currentSelfKomi/20`）**恒 0**、ch18 的三角波走偏。实测这 19 维里有 **2 维**
@@ -160,7 +206,7 @@ torchrun --nproc_per_node=1 scripts/train_sft.py \
   --prefetch-workers 24 --prefetch-depth 16 \
   --log-every 50 --eval-every 500 --save-every 250 \
   --early-stop 1 --early-stop-patience 3 \
-  --out models/a_v7_npu1.pth --swanlab 1 --ver a_v7_npu1
+  --out models/a_v7_npu1.pth --swanlab 1 --ver a_v7_npu1 --swanlab-every 10
 
 # --- A-2  4 卡 910A（每卡 1000，accum 2 ⇒ 有效 8000，LR 0.00637）---
 torchrun --nproc_per_node=4 scripts/train_sft.py \
@@ -172,7 +218,7 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
   --prefetch-workers 6 --prefetch-depth 16 \
   --log-every 50 --eval-every 500 --save-every 250 \
   --early-stop 1 --early-stop-patience 3 \
-  --out models/a_v7_npu4.pth --swanlab 1 --ver a_v7_npu4
+  --out models/a_v7_npu4.pth --swanlab 1 --ver a_v7_npu4 --swanlab-every 10
 
 # --- B 段：+ KataGo 软标签（同模型，承接 A-2）--------------------------------
 # ⚠ `--soft-index` 指向 `data/labels/soft_index.npz`（第 3b 步产出，229,848 行）
@@ -189,7 +235,7 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
   --prefetch-workers 6 --prefetch-depth 16 \
   --log-every 50 --eval-every 500 --save-every 250 \
   --early-stop 1 --early-stop-patience 3 \
-  --out models/b_v7_npu4.pth --swanlab 1 --ver b_v7_npu4
+  --out models/b_v7_npu4.pth --swanlab 1 --ver b_v7_npu4 --swanlab-every 10
 
 # --- C 段：+ KataGo 原生数据（同模型，承接 B）--------------------------------
 # 数据：data/stdata_v7 分片（第 3c 步产出）。
@@ -209,7 +255,7 @@ torchrun --nproc_per_node=1 scripts/train_sft.py \
   --prefetch-workers 24 --prefetch-depth 16 \
   --log-every 50 --eval-every 500 --save-every 250 \
   --early-stop 1 --early-stop-patience 3 \
-  --out models/c_v7_npu1.pth --swanlab 1 --ver c_v7_npu1
+  --out models/c_v7_npu1.pth --swanlab 1 --ver c_v7_npu1 --swanlab-every 10
 
 # --- C-2  2 卡 910A（每卡 2800，accum 1 ⇒ 有效 5600，LR 0.00533）---
 torchrun --nproc_per_node=2 scripts/train_sft.py \
@@ -222,7 +268,7 @@ torchrun --nproc_per_node=2 scripts/train_sft.py \
   --prefetch-workers 12 --prefetch-depth 16 \
   --log-every 50 --eval-every 500 --save-every 250 \
   --early-stop 1 --early-stop-patience 3 \
-  --out models/c_v7_npu2.pth --swanlab 1 --ver c_v7_npu2
+  --out models/c_v7_npu2.pth --swanlab 1 --ver c_v7_npu2 --swanlab-every 10
 
 # --- C-3  4 卡 910A（每卡 1000，accum 2 ⇒ 有效 8000，LR 0.00637）---
 torchrun --nproc_per_node=4 scripts/train_sft.py \
@@ -235,7 +281,7 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
   --prefetch-workers 6 --prefetch-depth 16 \
   --log-every 50 --eval-every 500 --save-every 250 \
   --early-stop 1 --early-stop-patience 3 \
-  --out models/c_v7_npu4.pth --swanlab 1 --ver c_v7_npu4
+  --out models/c_v7_npu4.pth --swanlab 1 --ver c_v7_npu4 --swanlab-every 10
 
 # --- 冒烟：整条链在 CPU 上先跑一遍（每段约 50 秒，换数据后先跑这个）---------
 # ① A 段（board 级 → V7 22 通道 + 局级贴目）

@@ -366,7 +366,7 @@ def test_config_expression_actually_evaluates():
     body = SRC[SRC.index('config={'):]
     expr = body[body.index('{') + 1:body.index('},\n')]
     env = {'args': ns, 'KATAGO_SE_CFG': tsf.KATAGO_SE_CFG, 'os': os,
-           '_ws': 2, '_accum': 2}
+           '_ws': 2, '_accum': 2, 'NBT_TF_CFG': tsf.NBT_TF_CFG}
     cfg = eval('{' + expr + '}', env)   # noqa: S307 — 测试内显式求值
 
     assert isinstance(cfg, dict) and len(cfg) >= 25, \
@@ -403,3 +403,188 @@ def test_reported_values_are_floats_not_tensors():
     body = m.group(1)
     assert body.count('float(') >= 6, \
         f'_health_last 的 6 个指标都必须 float()，实得 {body.count("float(")} 处'
+
+
+# --------------------------------------------------------------------------- #
+# 4. V7 段（A/B/C 共用同一个 22 通道模型）的上报面，2026-10-04
+# --------------------------------------------------------------------------- #
+#
+# 这次扩充的动机：V7 训练早已接通，但它的上报面**只覆盖 12 通路的形状** ——
+# config 面板无条件记 12 通道的数字（于是每个 V7 run 的面板都写着
+# `in_channels: 12` / `params_total: 9,112,005`，而它实际训练的是
+# 22 通道 / 5,562,121），逐项 loss 只进 stdout 不进 SwanLab。
+#
+# 两类错误都属于「面板给了虚构值 / 该报的没报」，与本文件开头写的那两类同源。
+@pytest.mark.parametrize('key', [
+    'arch/v7', 'arch/global_channels', 'arch/seki_classes',
+    'arch/futurepos_ch', 'arch/score_distr_bins', 'arch/policy_outputs',
+    'data/games_npz',
+])
+def test_v7_config_keys_are_recorded(key):
+    """V7 特有的结构维度必须进 config 面板（否则面板只剩 12 通道那套）。"""
+    assert _has(INIT, key), f'config 面板缺 V7 键 {key}'
+
+
+def test_config_arch_numbers_follow_the_v7_flag():
+    """🔴 结构数字必须**按 `--v7` 分派**，不得无条件取 12 通道那张表。
+
+    这不是洁癖：一个 V7 run 的面板写着 `in_channels: 12` 时，「对比两次 run」
+    这件最常用的事会得到错误答案 —— 而面板恰恰是第一个看的东西。
+
+    ⚠ 判据跑在 `ast.unparse` 的输出上（`INIT`），那是一行、无换行的形式 ⇒
+      只能按「键名到下一个键名之间」切片，不能按源码的多行排版写正则。
+    """
+    for key in ('arch/in_channels', 'arch/channels', 'arch/params_total',
+                'arch/num_heads', 'grad_checkpoint', 'arch/blocks'):
+        k = "'%s'" % key
+        assert k in INIT, f'config 里找不到 {key}'
+        i = INIT.index(k)
+        nxt = INIT.find("', '", i + len(k))
+        val = INIT[i + len(k):nxt if nxt > 0 else i + 220]
+        assert 'args.v7' in val, \
+            f'{key} 未按 --v7 分派（V7 run 的面板会显示 12 通道的数字）：{val!r}'
+
+
+def test_v7_config_references_nbt_tf_cfg_not_args():
+    """V7 的结构取 `NBT_TF_CFG`（唯一真相源），**不引 args**。
+
+    args 里那些是已归档的结构 flag，引它们等于把面板填成虚构值 ——
+    与本文件 `test_config_arch_facts_come_from_katago_se_cfg` 同一纪律。
+    """
+    cfg = INIT[INIT.index('config={'):]
+    assert "NBT_TF_CFG['in_channels']" in cfg
+    assert "NBT_TF_CFG['trunk_channels']" in cfg
+    assert "NBT_TF_CFG['ffn_hidden']" in cfg
+
+
+def test_v7_config_avoids_the_archived_flag_names():
+    """⚠ V7 的键名必须避开 `value_channels` / `policy_channels` 等归档名。
+
+    `test_config_panel_has_no_archived_flags` 是按**引号内字面量**判泄漏的，
+    所以写 `NBT_TF_CFG['value_channels']` 会让它误报（它要禁的是 args 上的
+    归档开关，不是 V7 的真实结构键）。这条把「改名而不是绕开」钉住。
+    """
+    cfg = INIT[INIT.index('config={'):]
+    for quoted in ("'value_channels'", '"value_channels"',
+                   "'policy_channels'", '"policy_channels"'):
+        assert quoted not in cfg, \
+            f'config 里出现 {quoted} ⇒ 会误触 archived-flag 门禁，且含义与 args 旗同名'
+
+
+def test_v7_loss_terms_are_uploaded_not_only_printed():
+    """🔴 V7 的 12 项逐项 loss 必须进 SwanLab（此前**只**进 stdout）。
+
+    为什么关键：段 1 有 9 项的权重是 0，而 `loss` 只是个总和 ——
+    「四项在学」与「四项都塌了」在 `loss` 这一个数上长得一模一样。
+    逐项曲线是早期唯一能抓住「第 5 项权重写反了」的手段，而它在图上不可见
+    等于这个手段不存在。
+    """
+    assert "'loss_v7/%s' % k" in MAIN, '逐项 loss 未按 loss_v7/ 前缀上报'
+    assert '**_v7_terms_swanlab' in MAIN, '逐项 dict 未进 swanlab.log 的字面量'
+
+
+def test_v7_zero_weight_terms_are_still_uploaded():
+    """⚠ 权重为 0 的项也**照报**（值恒 0）。
+
+    图上看得见「这一项存在但没在学」，比「曲线里根本没有这一项」更容易
+    区分「没接上」与「接上了但权重是 0」。键从**权重函数**取而不是另写一份
+    名单 —— 段位表改了而名单没改，图上就会多一项/少一项而没人知道哪边错了。
+    """
+    assert 'v7_stage1_loss_weights().items()' in MAIN, \
+        '零权重项的键未从权重函数派生（另写名单会与段位表漂移）'
+    assert "_v7_terms_swanlab.setdefault('loss_v7/%s' % _k, 0.0)" in MAIN
+
+
+def test_v7_terms_dict_is_initialised_outside_the_loop():
+    """`_v7_terms_swanlab` 必须在循环外初始化。
+
+    它无条件进 `swanlab.log({...})` 的字面量，而 12 通道路径**永不给它赋值**
+    ⇒ 不初始化就是每步一次 UnboundLocalError，被 `except` 吞成一行 warning ⇒
+    **SwanLab 静默丢掉整块指标而训练照跑**。与 2026-10-01 那次
+    `_accum_steps` 同类，由 `test_run_level_metrics_dict_uses_only_names_defined_earlier`
+    之外的第二道闸守住。
+    """
+    assert '_v7_terms_swanlab = {}' in MAIN, \
+        '_v7_terms_swanlab 必须在循环外初始化为 {}（12 通道路径不赋值它）'
+
+
+def test_terms_prefix_keeps_stdout_reading_bare_names():
+    """⚠ stdout 的 `[step N v7]` 行按**裸 term 名**排版，两者不能共用一个 dict。
+
+    共用会把 stdout 变成 `loss_v7/policy=5.88`，而文档与测试都按裸名读它。
+    """
+    assert "_v7_terms_last = {k: float(x) for k, x in _w.items()}" in MAIN, \
+        'stdout 用的裸名 dict 形状被改动'
+    assert "'%s=%.4f' % (k, v) for k, v in _v7_terms_last.items()" in MAIN
+
+
+@pytest.mark.parametrize('key', [
+    'run/params_actual', 'run/v7_source', 'run/rows_total', 'run/n_games',
+    'run/policy_soft_weight',
+])
+def test_v7_run_level_keys_are_uploaded(key):
+    """模型/数据源的真实形态：config 面板给不出（init 时模型还没建）。"""
+    assert _has(MAIN, key), f'run 级缺 {key}'
+
+
+def test_run_level_reports_actual_params_not_the_budget():
+    """🔴 `run/params_actual` 必须是**实测**参数量。
+
+    V7 的 `NBT_TF_CFG['params_total']` 是**预算值** 5,561,832，而实测建出来
+    是 **5,562,121**（差 289，`tests/test_katago_v7_budget.py` 钉住后者）。
+    只报预算值时，「预算表与实现漂了」这件事在图上完全看不出来。
+    """
+    assert 'run/params_actual' in MAIN and 'numel' in MAIN, \
+        'run/params_actual 必须实测参数量（ast.unparse 会把生成器加括号）'
+
+
+def test_loss_coefficients_are_uploaded_so_flat_lines_are_explicable():
+    """逐项曲线上的平线（值恒 0）需要 `run/loss_coef/*` 才能解释。
+
+    看到 `loss_v7/ownership` 恒 0 的人无法区分「没学」与「不学」——
+    权重表是**代码常量**不是 CLI，config 面板里没有。
+    """
+    assert "run/loss_coef/%s' % _k" in MAIN
+
+
+@pytest.mark.parametrize('key', ['label_entropy', 'soft_row_frac'])
+def test_target_side_metrics_are_uploaded(key):
+    """policy **目标**侧的口径必须上报。
+
+    `policy_loss` / `policy_entropy` 说的都是**模型**（预测分布），而 A/B/C
+    三段的目标根本不同：A 段 one-hot（熵 0）、B/C 段 KataGo 搜索分布（熵 > 0）。
+    同一个 `policy_loss = 5.88` 在 A 段是「什么都没学到」，在 C 段却可能已经
+    接近搜索分布 —— 只看预测侧会把两者读成同一件事。
+    """
+    assert _has(MAIN, key), f'目标侧指标 {key} 未上报'
+
+
+def test_target_metrics_only_appear_when_soft_rows_exist():
+    """⚠ 只在**真有软行**时产出，不给 `nan` 兜底。
+
+    A 段不挂 `--soft-index` 时 `soft_mask` 恒 0 ⇒ 目标就是 one-hot、熵恒 0 ⇒
+    「标签有多锐」这个问题不存在。报占位 `nan` 只会让图上多两条读不出来的线。
+    """
+    blk = SRC[SRC.index('_health_last = {'):]
+    blk = blk[:blk.index("\n                try:")]
+    assert 'if float(_sm.sum()) > 0:' in blk, \
+        '目标侧指标未按「真有软行」设门槛（会在 A 段产出无意义的 nan）'
+
+
+def test_label_entropy_is_computed_on_soft_rows_only():
+    """🔴 熵只能在 `mask=1` 的行上算。
+
+    `mask=0` 的行是 one-hot（熵 0），混进来会让均值被行数权重压平 ⇒
+    曲线量到的是「batch 里有多少软行」而不是「标签有多锐」。
+    """
+    blk = SRC[SRC.index('if float(_sm.sum()) > 0:'):]
+    blk = blk[:blk.index("_health_last['soft_row_frac']")]
+    assert '][_msk]' in blk or '[_msk]' in blk, \
+        '熵的取值未按 soft_mask 过滤行'
+
+
+def test_soft_ce_weight_comes_from_the_loss_module():
+    """`run/policy_soft_weight` 必须取自 `katago_v7_loss` 的常量，不另写一份。"""
+    assert 'from src.networks.katago_v7_loss import POLICY_SOFT_WEIGHT' in SRC
+    assert 'float(\n                    POLICY_SOFT_WEIGHT)' in MAIN or \
+        'POLICY_SOFT_WEIGHT)' in MAIN
