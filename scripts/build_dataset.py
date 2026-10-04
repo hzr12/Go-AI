@@ -48,9 +48,28 @@ def parse_player_rating(player_str):
     return 10 # 默认中等权重
 
 def compute_game_weight(black_rating, white_rating):
-    """根据双方等级计算对局权重（几何平均 + log 压缩）。"""
+    r"""根据双方等级计算对局权重（指数放大，`exp(avg/20)`）。
+
+    **必须夹住指数**（2026-10-04 实测）：`parse_player_rating` 的正则
+    `(\d+)([dkDK])` 会从棋手名里抓到荒谬的大数（如 `KGS:123456` →
+    `20 + 123456*10 = 1234580`）⇒ `exp(61729)` = **inf**。已生成的
+    `data/sgf_19x19_full.npz` 实测 `game_weights` 有 **2,072,682 /
+    34,202,713 = 6.06% 是 inf**，另有 99 分位 1.7e18、最大 1.0e38 的巨值 ——
+    与真实上限（9d = 110、KGS 15d = 170）差着好几个数量级。
+
+    那些 inf 会经 `mean(p × inf)` 进 loss，再在**反向**上以
+    `grad_p = 0 × inf = NaN` 把整个模型的梯度打脏（详见
+    `katago_v7_loss._weighted_mean` 的注释）—— 这是真机「loss 正常、
+    全部 5,562,121 个参数 NaN」的源头。
+
+    指数夹在 10.0（⇒ 权重 ≤ 22026）：覆盖一切合法等级（9d→110、
+    KGS 15d→170、默认 10→1.6487 全在其中，逐位不变），只截掉解析垃圾。
+    """
     avg = (black_rating + white_rating) / 2.0
-    return float(np.exp(avg / 20.0)) # exp(10)≈2.2, exp(20)≈4.9, exp(30)≈10.1
+    x = min(avg / 20.0, 10.0)
+    # 参考：默认 rating=10 → exp(0.5)=1.6487；9d(110) → exp(5.5)=244；
+    #       KGS 15d(170) → exp(8.5)=4915；上限 exp(10)=22026。
+    return float(np.exp(x))
 
 def parse_result_to_value(result_str):
     """解析 RE 字段 -> 黑方视角胜负标签 (+1/-1)。未知返回 None。"""

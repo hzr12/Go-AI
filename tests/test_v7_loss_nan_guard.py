@@ -593,3 +593,80 @@ def test_full_loss_forward_survives_a_nan_in_every_zero_weight_head():
         'policy 项本身没坏，不该被牵连'
     assert 'futurepos' not in r['nonfinite_terms'], \
         'futurepos 系数非 0，没坏就不该被点名'
+
+# --------------------------------------------------------------------------- #
+# ④ 权重本身是 inf —— 真机 NaN 的源头（2026-10-04 定位）
+# --------------------------------------------------------------------------- #
+def test_weighted_mean_strips_an_inf_weight():
+    """无穷权重必须在 `_weighted_mean` 里就被摘掉，否则反向出 NaN。
+
+    机制（真机日志与本机制逐项吻合）：
+
+        v     = mean(p * inf) = inf               # 前向
+        v     <- nan_to_num <- c=0                # 段 1 的 c==0 只净化**前向值**
+        grad_v = 0                                 # c=0 乘出来的
+        grad_p = grad_v * w = 0 * inf = **NaN**    # IEEE-754
+
+    于是 loss 日志显示「加权总 loss 有限（该项系数为 0，已净化）」、
+    `坏在操作数` 还是空的（pred/std 确实都有限），而梯度已经是 NaN。
+    """
+    from src.networks.katago_v7_loss import _weighted_mean
+    w = torch.tensor([1.0, float('inf'), 2.0])
+    probe = {}
+    p = torch.tensor([0.5, 0.7, 0.9], requires_grad=True)
+    out = _weighted_mean(p, w, probe, 'score_stdev')
+    assert torch.isfinite(out), out
+    # 净化必须**留下证据**：不报就成了「悄悄把坏数据吞掉」
+    assert probe.get('score_stdev:w_inf') == 1, probe
+    out.backward()
+    assert torch.isfinite(p.grad).all(), p.grad
+    # 被摘掉的那行梯度恰好 0 —— 是 0 **不是** NaN，这正是本测试的判据
+    assert float(p.grad[1]) == 0.0, p.grad
+
+
+def test_inf_game_weight_leaves_every_parameter_gradient_finite():
+    """真机签名的端到端回归：`game_weight` 里有 inf，全模型梯度仍须有限。
+
+    真机症状是**每个**参数都 NaN（5,562,121 / 5,562,121，连 `stem` 都是）——
+    因为 NaN 从 `score_stdev` 进 value head，再经 trunk 污染全部分支。
+    所以这里数的不是「某个头」，而是 `named_parameters()` 的**全集**。
+    """
+    from train_sft import build_v7_stage1_loss
+    from src.networks.katago_v7 import build_katago_v7_net
+    net = build_katago_v7_net(board_size=19)
+    lf = build_v7_stage1_loss(action_size=A)
+    sp = torch.randn(B, 22, 19, 19)
+    gl = torch.randn(B, 19)
+    out = net(sp, gl)
+    lbl = _lbl()
+    lbl['ownership'] = torch.zeros(B, 1, 19, 19)
+    lbl['seki'] = torch.zeros(B, 1, 19, 19)
+    lbl['futurepos'] = -torch.ones(B, 2, 361)
+    lbl['game_weight'] = torch.tensor([1.0, float('inf'), 2.0, 1.5])
+    r = lf(out, lbl)
+    assert torch.isfinite(r['loss']), '前向应保持有限'
+    # 证据不能因为「已修好」就消失：inf 权重的行数必须报出来
+    assert r['sanitized_rows'].get('score_stdev:w_inf') == 1, r['sanitized_rows']
+    assert r['nonfinite_terms'] == [], r['nonfinite_terms']
+    r['loss'].backward()
+    bad = [n for n, p in net.named_parameters()
+           if p.grad is not None and not bool(torch.isfinite(p.grad).all())]
+    assert not bad, 'game_weight 里的 inf 污染了梯度：%s' % bad[:8]
+
+
+def test_zero_coefficient_guard_still_keeps_the_graph():
+    """① 的净化与 ④ 的权重净化叠加时，图仍必须完整（DDP 不许有 grad=None）。"""
+    from train_sft import build_v7_stage1_loss
+    from src.networks.katago_v7 import build_katago_v7_net
+    net = build_katago_v7_net(board_size=19)
+    lf = build_v7_stage1_loss(action_size=A)
+    out = net(torch.randn(B, 22, 19, 19), torch.randn(B, 19))
+    lbl = _lbl()
+    lbl['ownership'] = torch.zeros(B, 1, 19, 19)
+    lbl['seki'] = torch.zeros(B, 1, 19, 19)
+    lbl['futurepos'] = -torch.ones(B, 2, 361)
+    lbl['game_weight'] = torch.full((B,), float('inf'))
+    lf(out, lbl)['loss'].backward()
+    missing = [n for n, p in net.named_parameters() if p.grad is None]
+    assert not missing, \
+        'DDP 会抛「Expected to have finished reduction」：%s' % missing[:8]

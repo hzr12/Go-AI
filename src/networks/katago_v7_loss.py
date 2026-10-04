@@ -221,7 +221,7 @@ def seki_targets_from_plane(seki):
 
 
 def _weighted_mean(per_sample, weight, probe=None, tag=''):
-    """``mean_b(weight_b · per_sample_b)``（spec §4.5 的装配口径）。
+    r"""``mean_b(weight_b · per_sample_b)``（spec §4.5 的装配口径）。
 
     刻意**不**除以 ``Σw``：除以 Σw 会让「该批全是 w=0 的行」把这一项放大到
     噪声水平（分母趋零）。`samplewise` 的语义是逐样本损失对 batch 取均值，
@@ -233,15 +233,47 @@ def _weighted_mean(per_sample, weight, probe=None, tag=''):
        变成 NaN ⇒ 系数非 0 的主目标也会被一行坏数据带崩。
        典型触发：`game_weight==0` 的行 + 该行的 `per_sample` 溢出。
 
+     **`w` 自己也可能是 `inf`** —— 这是真机 NaN 的**源头**（2026-10-04 定位）：
+
+       实测 ``data/sgf_19x19_full.npz`` 的 ``game_weights`` 有
+       **2,072,682 / 34,202,713 = 6.06% 是 inf**（其余浮点列全干净）。
+       来源是 ``build_dataset.compute_game_weight`` 的 ``np.exp(avg/20)``：
+       ``parse_player_rating`` 的正则 ``(\d+)([dk])`` 会从棋手名里抓到荒谬的
+       大数（如 ``KGS:123456``）⇒ ``exp(61729)`` = inf。
+
+       为什么下面 ``w==0`` 那条防护挡不住它：``inf != 0`` ⇒ ``zero`` 为 False
+       ⇒ 根本不进净化分支。而真正的杀伤在**反向**：
+
+           v   = mean(p * inf) = inf                    # 前向
+           v   ← nan_to_num ← c=0                       # 段 1 的 c==0 净化
+           grad_v   = 0                                  # c=0 乘出来的
+           grad_p   = grad_v * w = 0 * inf = **NaN**     # IEEE-754
+
+       即「**净化了前向、没净化反向**」：日志显示
+       ``加权总 loss 有限（该项系数为 0，已净化）``、``坏在操作数`` 是空的
+       （pred/std 确实都有限），而梯度已经是 NaN。NaN 从 ``score_stdev``
+       进 value head、再经 trunk 污染**全部**参数 —— 真机实测
+       5,562,121 / 5,562,121（连 ``stem`` 都是），与这条链完全吻合。
+
+       ⇒ 无穷权重在任何口径下都没有意义，按 ``w==0`` 同一条语义把它摘掉。
+
     Args:
         probe: 可选的诊断累加器（``{项名: 被净化的行数}``）。**净化是静默的**
             —— 不记下来就成了「这一项坏了但没人知道」，而段 1 有 9 项系数为 0，
             它们坏掉时对总 loss 毫无影响，正因如此更需要把线索报出来。
+            非有限权重记在 ``'{项名}:w_inf'`` 下，与 ``w==0`` 那条分开报。
     """
     if weight is None:
         return per_sample.mean()
     p = per_sample.reshape(-1)
     w = weight.reshape(-1)
+    bad_w = ~torch.isfinite(w)
+    if bool(bad_w.any()):
+        if probe is not None:
+            probe[tag + ':w_inf'] = int(bad_w.sum())
+        # 摘掉后这些行的 w 恒为 0 ⇒ 与 w==0 走同一条路（p 也会被下方的
+        # `where` 净化），于是 `p * w` 与它的反向都落在有限值上。
+        w = w.masked_fill(bad_w, 0.0)
     zero = (w == 0)
     if bool(zero.any()):
         clean = torch.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)

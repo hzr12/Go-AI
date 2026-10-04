@@ -179,7 +179,9 @@ def main():
              res['total_finite']))
     print('  逐项点名      : %s' % (res['nonfinite_terms'] or '（无）'))
     print('  坏在操作数    : %s' % (res['nonfinite_operands'] or '（无）'))
-    print('  按 w=0 净化行 : %s' % (res['sanitized_rows'] or '（无）'))
+    print('  净化行          : %s'
+          '   （`项名`=w==0 上 p 非有限；`项名:w_inf`=权重本身是 inf）'
+          % (res['sanitized_rows'] or '（无）'))
 
     # ---- ④ 反向：谁收到了 inf/nan ----
     # **必须在 clip 之前看**（与 train_sft 同一个坑）：`clip_grad_norm_` 在

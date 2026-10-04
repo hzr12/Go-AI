@@ -4735,8 +4735,11 @@ def main():
                     _san_rows = _v7_res.get('sanitized_rows') or {}
                     # **只报非空的那一半**：`nonfinite_terms` 与 `sanitized_rows`
                     #   是两件不同的事 —— 前者是「这一项最终仍然非有限」，后者是
-                    #   「这一项内部的坏行被按 w=0 净化掉了（所以它现在有限了）」。
-                    #   段 1 有 9 项系数为 0，后一种同样要紧：那一项其实一直在吐
+                    #   「这一项内部的坏行被净化掉了（所以它现在有限了）」。
+                    #   净化分两种，键名不同（见 `_weighted_mean` 的 probe）：
+                    #     `项名`        = w==0 的行上 p 非有限
+                    #     `项名:w_inf`  = **权重本身是 inf** ← 真机 NaN 的源头
+                    #   段 1 有 9 项系数为 0，后两种同样要紧：那一项其实一直在吐
                     #   inf，只是因为不参与优化而没人发现。
                     if _bad_terms or _san_rows:
                         _err_cnt += 1
@@ -4752,7 +4755,7 @@ def main():
                                % (_err_cnt, _head, sorted(_bad_terms) or '（无）',
                                   ('｜坏在操作数 %s' % sorted(_bad_ops))
                                   if _bad_ops else '',
-                                  ('｜按 w=0 净化的坏行 %s' % sorted(_san_rows.items()))
+                                  ('｜被净化的坏行 %s' % sorted(_san_rows.items()))
                                   if _san_rows else ''))
                         # 每种组合只报一次，后续只计次，否则每步刷屏把真信息淹掉
                         _key = (tuple(sorted(_bad_terms)), tuple(sorted(_bad_ops)),
