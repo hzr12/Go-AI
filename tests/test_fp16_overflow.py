@@ -95,6 +95,47 @@ def test_overflow_warning_threshold_exists():
 
 
 # --------------------------------------------------------------------------- #
+# 跳过步的记账：两条被真日志打出来的错误（2026-10-04 云端 910A）
+# --------------------------------------------------------------------------- #
+def test_skip_rate_denominator_cannot_exceed_100():
+    """🔴 「跳过占比」的分母不能是 `step`。
+
+    真日志里打出了 `累计跳过 4 步（占比 133.33%）` —— 分母比分子还小。根因：
+    `_n_skipped += 1` 在 `scaler.step()` 那一行，而 `step += 1` 在 47 行**之后**
+    ⇒ 连续溢出时那一行的 `step` 还没自增。
+
+    修法是引入 `_n_attempted`，与 `_n_skipped` 在**同一处**自增，所以分母恒 ≥ 分子。
+    """
+    assert '_n_attempted' in SRC, '缺少与 _n_skipped 同处自增的计数器'
+    # 两处占比（stdout 告警 + SwanLab）都必须用 _n_attempted
+    assert SRC.count('/ max(1, _n_attempted)') == 2, \
+        '跳过占比的两处上报都要用 _n_attempted'
+    assert '_n_skipped / max(1, step)' not in SRC, \
+        '仍有地方拿 step 当分母（会算出 > 100%）'
+    # 且 _n_attempted 必须在 _n_skipped **之前**自增（同一个 optimizer-step 块内）
+    i_a = SRC.index('_n_attempted += 1')
+    i_s = SRC.index('_n_skipped += 1')
+    assert i_a < i_s, '_n_attempted 必须先自增（否则某次跳过分母可能反而更小）'
+    assert abs(i_a - i_s) < 1200, \
+        '两者必须在同一个 optimizer-step 块内相邻自增，否则「同口径」只是注释里的承诺'
+
+
+def test_overflow_diagnostics_are_rank0_only():
+    """🔴 溢出诊断必须 `is_main` 门控。
+
+    真日志（2 卡）里每条溢出消息都**打印两遍** —— 无条件 `logger.warning` +
+    `_locate_overflow` 的后果。4 卡就是 4 份一模一样的文本，反而掩盖了
+    「rank0 先炸」这个真正有用的信息。
+    """
+    i = SRC.index('if use_scaler and scaler.get_scale() < _scale_now:')
+    blk = SRC[i:i + 1200]
+    assert 'if is_main:' in blk, '溢出诊断未做 rank0 门控'
+    # _locate_overflow 必须在门控之内
+    assert blk.index('if is_main:') < blk.index('_locate_overflow('), \
+        '_locate_overflow 跑在 is_main 门控之外'
+
+
+# --------------------------------------------------------------------------- #
 # 缩放值策略可配：不必每次都从 65536 猜下来，也不必在平衡点附近震荡
 # --------------------------------------------------------------------------- #
 def test_scaler_init_scale_and_growth_are_configurable():

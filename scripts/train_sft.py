@@ -798,8 +798,28 @@ def _dense_move_target(moves, action_size):
     `w['policy_opp'] == 0`。若交给 `F.one_hot(-1)`，PyTorch 的行为不是本仓
     可以依赖的契约（不同版本不同），所以这里**显式**置零 —— 权重本来就是 0，
     全零行既安全又语义正确。
+
+    🔴 **设备无关：不许把设备张量送进 numpy**（2026-10-04 云端 910A 实测崩）
+    ------
+    调用方传的是 `move_t`，而它是 `torch.from_numpy(...).to(device)` 的结果
+    ⇒ 在 NPU 上是 **npu:0 设备张量**，而 `np.asarray()` 对它抛：
+
+        TypeError: can't convert npu:0 device type tensor to numpy.
+        Use Tensor.cpu() to copy the tensor to host memory first.
+
+    CPU 上恰好能跑（numpy 消费 CPU 张量的 `__array__`）⇒ **本机 CPU 冒烟
+    永远发现不了这个 bug**，只有真机 NPU 才会炸。这也是它此前一直没被
+    发现的原因，不是「别人都写对了」。
+
+    修法是**按类型分派**而不是无条件 `.cpu()`：`.cpu()` 能让 numpy 转换成功，
+    但那样 one-hot 目标会被搬回主机、再在 loss 里搬回设备 ⇒ 每步多两次
+    H2D/D2H（`(B, 362)` × 2 项）。直接在设备上 `one_hot` 既修好崩溃，又省掉搬运。
     """
-    mv = torch.as_tensor(np.asarray(moves)).reshape(-1).to(torch.long)
+    if isinstance(moves, torch.Tensor):
+        # `.detach()`：这一项参与 loss 的图，梯度不经过 one-hot（标签是常量）
+        mv = moves.detach().reshape(-1).to(torch.long)
+    else:
+        mv = torch.as_tensor(np.asarray(moves)).reshape(-1).to(torch.long)
     valid = (mv >= 0) & (mv < int(action_size))
     safe = torch.where(valid, mv, torch.zeros_like(mv))
     out = F.one_hot(safe, int(action_size)).to(torch.float32)
@@ -4005,6 +4025,11 @@ def main():
     # **SwanLab 静默丢掉整块指标而训练照跑**（与 2026-10-01 那次 `_accum_steps`
     # 同类的坑，见下方注释）。
     _v7_terms_swanlab = {}
+    # 🔴 「哪一项算坏了」的去重表 + 计数（2026-10-04 云端 910A）。
+    #   同一种坏项组合只 `logger.error` 一次，其余走 debug —— 否则 100% 跳步时
+    #   每步刷一遍同样的文本，把唯一有用的那行信息淹掉。
+    _v7_bad_seen = []
+    _err_cnt = 0
     step = 0
     best_eval_acc = -1.0
     start_epoch = 0
@@ -4283,8 +4308,16 @@ def main():
                 # ---- 数据源形态：board 级实时算 / stdata 预算好 ----
                 # 这两条决定「换个 --data 跑同一个 run」到底换掉了什么，而
                 # config 面板只有一个 `--data` 路径字符串。
-                "run/v7_source": ("packed" if hasattr(dataset, 'sample_spatial')
-                                  else ("board_level" if _v7_on else "se12")),
+                #
+                # 🔴 **必须报数值码，不能报字符串**（2026-10-04 用户实测报出
+                #   `Unsupported scalar string value: 'board_level'`）：swanlab 的
+                #   metric 通道只收 bool/int/float，str 只有 `float()` 成功才收
+                #   （`swanlab/sdk/internal/run/transforms/scalar/__init__.py`：
+                #   `try: float(data) except ValueError: raise TypeError`）。
+                #   人读的名字在 config 面板（那里字符串合法）与 stdout，
+                #   曲线里存码 —— 两边对照见 run.txt 的键位表。
+                "run/v7_source": (2 if hasattr(dataset, 'sample_spatial')
+                                  else (1 if _v7_on else 0)),
                 "run/rows_total": int(len(dataset)),
                 "run/n_games": int(np.unique(np.asarray(dataset.game_ids)).size)
                 if getattr(dataset, 'game_ids', None) is not None else 0,
@@ -4298,6 +4331,13 @@ def main():
                     _run_facts['run/loss_coef/%s' % _k] = float(_w)
                 _run_facts['run/policy_soft_weight'] = float(
                     POLICY_SOFT_WEIGHT)
+            # 人读的名字走 **stdout**（metric 通道只收数值，见上面 `run/v7_source`
+            # 的注释）。config 面板在 init 时建，那时数据集还没加载 ⇒ 那里
+            # 拿不到这个形态，只能靠这一行 + 曲线里的码对照。
+            _src_name = ('packed' if hasattr(dataset, 'sample_spatial')
+                         else ('board_level' if _v7_on else 'se12'))
+            logger.info("[swanlab] run/v7_source=%d（%s）| 0=se12 1=board_level 2=packed",
+                        _run_facts['run/v7_source'], _src_name)
             try:
                 swanlab_logger.log(_run_facts, step=0)
             except Exception as e:  # noqa: BLE001
@@ -4339,6 +4379,10 @@ def main():
         _t_data_max = 0.0
         _n_timed = 0
         _n_skipped = 0
+        # 🔴 `_n_attempted` 与 `_n_skipped` **在同一处**自增（scaler.step 那一行），
+        #   所以「跳过占比」的分母恒 ≥ 分子。此前分母用的是 `step`，而它在 47 行
+        #   之后才自增 ⇒ 连续溢出时会算出 133.33% 这种 > 100% 的荒谬比例。
+        _n_attempted = 0
         # ---- SwanLab 上报用的「跨 micro-batch 沿用」量 ----
         # grad_norm 每个 optimizer.step() 只有一个值（clip_grad_norm_ 的返回值，
         # 在 unscale_ 之后取才是真值），而上报是每 micro-batch 打一次点 ⇒ 必须
@@ -4503,6 +4547,42 @@ def main():
                     l2_report = compute_l2_report(optimizer.param_groups)
                     log_loss = opt_loss + l2_report
                     _v7_terms_last = {k: float(x) for k, x in _w.items()}
+                    # 🔴 哪一项算坏了，**当场点名**（2026-10-04 云端 910A 实跑）。
+                    #   那个 run 的症状是「每步都溢出、loss 全 NaN、缩放值降到 160
+                    #   仍 100% 跳过」，本地 fp32/fp16/bf16 都复现不出来 ⇒ 只有
+                    #   这条日志能指认是哪一项在 NPU 上坏掉。
+                    _bad_terms = _v7_res.get('nonfinite_terms') or []
+                    _bad_ops = _v7_res.get('nonfinite_operands') or []
+                    _san_rows = _v7_res.get('sanitized_rows') or {}
+                    # ⚠ **只报非空的那一半**：`nonfinite_terms` 与 `sanitized_rows`
+                    #   是两件不同的事 —— 前者是「这一项最终仍然非有限」，后者是
+                    #   「这一项内部的坏行被按 w=0 净化掉了（所以它现在有限了）」。
+                    #   段 1 有 9 项系数为 0，后一种同样要紧：那一项其实一直在吐
+                    #   inf，只是因为不参与优化而没人发现。
+                    if _bad_terms or _san_rows:
+                        _err_cnt += 1
+                        # ⚠ **必须区分 total 是否真的非有限**：零系数项会被
+                        #   `nan_to_num` 净化成 0，所以「某项坏」时 total 往往
+                        #   **仍然是有限的** —— 那种情况下这条日志若写成
+                        #   「加权 loss 非有限」就是在**报一件没发生的事**，
+                        #   而看日志的人会以为 loss 已经废了。
+                        _tot_ok = _v7_res.get('total_finite')
+                        _head = ('加权总 loss 仍非有限' if _tot_ok is False
+                                 else '加权总 loss 有限（该项系数为 0，已净化）')
+                        msg = ('[v7] 🔴 第 %d 次：%s，逐项点名 = %s%s%s'
+                               % (_err_cnt, _head, sorted(_bad_terms) or '（无）',
+                                  ('｜坏在操作数 %s' % sorted(_bad_ops))
+                                  if _bad_ops else '',
+                                  ('｜按 w=0 净化的坏行 %s' % sorted(_san_rows.items()))
+                                  if _san_rows else ''))
+                        # 每种组合只报一次，后续只计次，否则每步刷屏把真信息淹掉
+                        _key = (tuple(sorted(_bad_terms)), tuple(sorted(_bad_ops)),
+                                tuple(sorted(_san_rows.items())))
+                        if _key not in _v7_bad_seen:
+                            _v7_bad_seen.append(_key)
+                            logger.error(msg + '（首次出现该组合）')
+                        else:
+                            logger.debug(msg)
                     # ⚠ 逐项上报用**独立**的 dict，而不是就地复用 `_v7_terms_last`：
                     #   那个 dict 同时喂 stdout 的 `[step N v7]` 行（键名是裸 term
                     #   名），若直接把带 `loss_v7/` 前缀的键塞进去，stdout 那行会
@@ -4595,6 +4675,8 @@ def main():
                     # FP16 溢出），不是 loss scaling 的伪影——所以真正的
                     # 修复点在别处，此处只负责让它**可观测**。
                     _scale_now = scaler.get_scale()
+                    # 与 `_n_skipped` 同一处自增 ⇒ 占比口径自洽（见上面注释）
+                    _n_attempted += 1
                     scaler.unscale_(optimizer)
                     # clip_grad_norm_ **返回 clip 前的总范数** —— 之前被丢弃了。它是
                     # fp16 溢出/梯度爆炸唯一的直接信号：这轮 910A 的 inf/nan 与
@@ -4607,13 +4689,27 @@ def main():
                     scaler.update()
                     if use_scaler and scaler.get_scale() < _scale_now:
                         _n_skipped += 1
-                        _locate_overflow(optimizer, logger)
-                        if _scale_now >= _OVERFLOW_WARN_SCALE > scaler.get_scale():
-                            logger.warning("[fp16] 缩放值首次跌破 %d：%.0f -> %.0f。"
-                                           "累计跳过 %d 步（占比 %.2f%%）。",
-                                           int(_OVERFLOW_WARN_SCALE), _scale_now,
-                                           scaler.get_scale(), _n_skipped,
-                                           100.0 * _n_skipped / max(1, step))
+                        # 🔴 溢出诊断必须**只在 rank0 打**（2026-10-04 云端实跑）：
+                        #   这一段原本无条件 `logger.warning` + `_locate_overflow`，
+                        #   于是 4 卡时同一件事打印 4 遍、日志被淹没（用户贴来的
+                        #   910A 日志里每条都出现两次），而且**看不出**是哪张卡先炸的
+                        #   —— 4 份一模一样的文本反而掩盖了「rank0 先炸」这个信息。
+                        if is_main:
+                            _locate_overflow(optimizer, logger)
+                            if _scale_now >= _OVERFLOW_WARN_SCALE > scaler.get_scale():
+                                # 分母用 `_n_attempted`（本行上一次自增）而**不是
+                                # `step`：skip 在此处计数，而 `step += 1` 在 47 行
+                                # 之后 ⇒ 用 `step` 当分母会算出「占比 133.33%」
+                                # 这种 > 100% 的数（4 次缩放 / 当时 step=3）。
+                                # `_n_attempted` 与 `_n_skipped` 在同一处++
+                                # ⇒ 分母恒 ≥ 分子，口径自洽。
+                                logger.warning(
+                                    "[fp16] 缩放值首次跌破 %d：%.0f -> %.0f。"
+                                    "累计跳过 %d 步（占比 %.2f%%）。",
+                                    int(_OVERFLOW_WARN_SCALE), _scale_now,
+                                    scaler.get_scale(), _n_skipped,
+                                    100.0 * _n_skipped
+                                    / max(1, _n_attempted))
                     optimizer.zero_grad(set_to_none=True)
                     if ema is not None:
                         ema.update()
@@ -4862,7 +4958,9 @@ def main():
                                 * (_now - t0) / max(1, step - _step_at_start)
                                 / 60.0) if step > _step_at_start else float('nan'),
                     "skipped_steps": _n_skipped,
-                    "skip_rate_pct": 100.0 * _n_skipped / max(1, step),
+                    # ⚠ 分母用 `_n_attempted`（与 `_n_skipped` 同一处自增）而不是
+                    #   `step` —— 后者在这行之后 47 行才自增，会算出 > 100% 的占比。
+                    "skip_rate_pct": 100.0 * _n_skipped / max(1, _n_attempted),
                     # ⚠ grad_norm 之前被丢弃（clip_grad_norm_ 的返回值）。它是
                     # fp16 溢出/梯度爆炸唯一的直接信号；accum>1 下每 optimizer
                     # step 只有一个值，打点是每 micro-batch ⇒ 沿用上一次的。

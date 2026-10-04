@@ -107,6 +107,11 @@ SEKI_TOTAL_CHANNELS = 4
 SEKI_ADAPT_NUM = 8.0 * 0.005
 SEKI_ADAPT_DEN = 0.005
 SEKI_EMA_MOMENTUM = 0.99
+#: ``score_stdev`` 自预测目标的**数值下界**（见 :meth:`KataGoV7Loss.forward` 第 7 项
+#: 的注释）。作用是把 ``d(sqrt(v))/dv = 1/(2·std)`` 这个因子钉在 500 以内 ——
+#: 初始化时 842 桶近均匀 ⇒ std ≈ 1.17e-7 ⇒ 局部导数 ≈ 4.27e6，在 fp16 上溢成
+#: inf，再乘上游梯度 0 就变成 NaN（下界以下梯度恒 0）。
+SCORE_STDEV_TARGET_FLOOR = 1e-3
 
 
 def huber(pred, target, beta):
@@ -210,16 +215,39 @@ def seki_targets_from_plane(seki):
     return sign, neutral
 
 
-def _weighted_mean(per_sample, weight):
+def _weighted_mean(per_sample, weight, probe=None, tag=''):
     """``mean_b(weight_b · per_sample_b)``（spec §4.5 的装配口径）。
 
     刻意**不**除以 ``Σw``：除以 Σw 会让「该批全是 w=0 的行」把这一项放大到
     噪声水平（分母趋零）。`samplewise` 的语义是逐样本损失对 batch 取均值，
     行权重只作为逐样本的乘子。
+
+    🔴 **`w==0` 的行必须先摘掉非有限值**（2026-10-04 云端 910A 实测
+       `(inf * 0).mean()` = **NaN**）。
+       那些行按定义贡献恰好 0，而「inf × 0 = NaN」（IEEE-754）会让**整项**
+       变成 NaN ⇒ 系数非 0 的主目标也会被一行坏数据带崩。
+       典型触发：`game_weight==0` 的行 + 该行的 `per_sample` 溢出。
+
+    Args:
+        probe: 可选的诊断累加器（``{项名: 被净化的行数}``）。**净化是静默的**
+            —— 不记下来就成了「这一项坏了但没人知道」，而段 1 有 9 项系数为 0，
+            它们坏掉时对总 loss 毫无影响，正因如此更需要把线索报出来。
     """
     if weight is None:
         return per_sample.mean()
-    return (per_sample * weight).mean()
+    p = per_sample.reshape(-1)
+    w = weight.reshape(-1)
+    zero = (w == 0)
+    if bool(zero.any()):
+        clean = torch.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
+        if probe is not None and not bool(torch.isfinite(p).all()):
+            # 记「有几行本该是 0 而实际是非有限」—— 这是坏数据的直接证据
+            probe[tag] = int((zero & ~torch.isfinite(p)).sum())
+        # 只在**被丢弃**的那些行上清成 0：w!=0 的行原样保留，
+        # 所以 `per_sample` 有限时结果与原来**逐位相同**（分母仍是 batch 大小，
+        # 不改变 spec §4.5 的口径）。
+        p = torch.where(zero, clean, p)
+    return (p * w).mean()
 
 
 class KataGoV7Loss(nn.Module):
@@ -260,12 +288,48 @@ class KataGoV7Loss(nn.Module):
         cur = seki_loss.detach()
         if self.training:
             with torch.no_grad():
+                # 🔴 **NaN/Inf 一律不写进 buffer**（2026-10-04 云端 910A 实跑）。
+                #   `seki_ema` 是**注册 buffer** ⇒ 一次写入就是**永久**的：之后每一步
+                #   的 adaptive scale 都是 NaN ⇒ `terms['seki']` 是 NaN ⇒ 加权总
+                #   loss 是 NaN ⇒ **全部**参数梯度 NaN ⇒ GradScaler 永远跳步。
+                #
+                #   实测症状与这个机制逐条吻合：缩放值 10240→5120→…→160 一路
+                #   降到最低仍 100% 跳过，且每步的 nan 参数计数**完全一样**
+                #   （211/98/8）—— 一个「每步重新发生」的溢出会让计数抖动，
+                #   而一个被 buffer 记住的 NaN 会给出恒定的结果。
+                #
+                #   ⚠ 更糟的是它**进 state_dict** ⇒ 存下来的 `.pth` 与
+                #   `--resume` 都带着毒，换台机器续训照样每步 NaN。
+                #
+                #   为什么此前没被发现：段 1 的 seki 系数是 1.0 但**该项在 CPU 上
+                #   恒为 0**，而 CPU 的 kernel 不产生 NaN ⇒ 只有真机 NPU 才会毒化。
+                if not torch.isfinite(cur):
+                    # 不 copy_：保留上一个**有限**的 EMA（初值 0.0 ⇒ scale = 8.0，
+                    # 即「按 seki 极稀有处理」，正是这个 EMA 初值的语义）。
+                    # 刻意不 raise：训练不该因为一个自适应系数而崩，而下一步的
+                    # 逐项有限性检查（见 forward 末尾）会把「这一项坏了」报出来。
+                    return self._seki_fallback_scale()
                 if float(self.seki_ema) == 0.0:
                     self.seki_ema.copy_(cur)
                 else:
                     self.seki_ema.mul_(SEKI_EMA_MOMENTUM).add_(
                         cur * (1.0 - SEKI_EMA_MOMENTUM))
+        # ⚠ 兜底：即使 buffer 在别处（加载旧 checkpoint、手工改写）已经是 NaN，
+        #   也不能让它进 loss。`float()` 只在**标量** buffer 上调用，代价可忽略。
+        if not torch.isfinite(self.seki_ema):
+            return self._seki_fallback_scale()
         return SEKI_ADAPT_NUM / (SEKI_ADAPT_DEN + self.seki_ema)
+
+    def _seki_fallback_scale(self):
+        """「seki 极少」那个系数（`8·0.005/0.005 = 8`），**以 tensor 返回**。
+
+        ⚠ 必须是 tensor：本函数的返回值会进 `return {... 'seki_adaptive_scale':
+          adaptive.detach()}`，给 Python float 会在那里抛
+          `AttributeError: 'float' object has no attribute 'detach'` ——
+          而那正是「NaN 兜底路径」本身，它一旦抛异常就等于**没兜**，
+          反而把唯一一次能说出「seki 坏了」的机会也弄没了。
+        """
+        return torch.as_tensor(SEKI_ADAPT_NUM / SEKI_ADAPT_DEN)
 
     # ---- 标签取用（各带一个「有则用、无则由 one-hot / 稀疏目标推出」的退路）----
     def _policy_target(self, labels, key, fallback_move):
@@ -289,6 +353,17 @@ class KataGoV7Loss(nn.Module):
         n_sq = 19 * 19
         w = labels.get('w') or {}
         ones = torch.ones(b, device=dev)
+        #: 哪个**操作数**坏了（`项名:操作数`）。逐项点名只说「哪一项」，而
+        #: 「这一项」内部往往有两个来源不同的操作数（本轮 `score_stdev` 就是：
+        #: 预测 `out['score_stdev']` 来自 ValueHead、目标 `std(softmax)` 来自
+        #: scorebelief 头）。不区分就还得再猜一轮 —— 本机与 NPU 的 kernel
+        #: 不同，只有真机能回答，而每次真机跑一轮都要几分钟。
+        _bad_operands = []
+        #: 被 `_weighted_mean` 按「w==0」静默净化掉的行数（见该函数 docstring）
+        _sanitized = {}
+
+        def _wm(tag, per_sample, weight):
+            return _weighted_mean(per_sample, weight, _sanitized, tag)
 
         def T(x, dtype=torch.float32):
             """numpy → torch（整条数据链路都是 numpy；要求上游先转一遍
@@ -352,7 +427,7 @@ class KataGoV7Loss(nn.Module):
             terms['policy'] = soft_ce(soft, 0)
         else:
             pi = self._policy_target(labels, 'policy_player', labels.get('moves'))
-            terms['policy'] = _weighted_mean(
+            terms['policy'] = _wm('policy', 
                 -(pi * logp[:, 0]).sum(-1), None)
 
         # ---- 2 π_opp（系数 0.15，局末手权重 0）----
@@ -361,16 +436,16 @@ class KataGoV7Loss(nn.Module):
         #    于是 #1 与 #2 拿到**同一个**目标，π_opp 白训。
         soft_opp = labels.get('soft_opp')
         if _has_soft and soft_opp is not None:
-            terms['policy_opp'] = _weighted_mean(
+            terms['policy_opp'] = _wm('policy_opp', 
                 soft_ce(soft_opp, 1), w_of('policy_opp'))
         else:
             pi_opp = self._policy_target(labels, 'policy_opp',
                                          labels.get('next_move'))
-            terms['policy_opp'] = _weighted_mean(
+            terms['policy_opp'] = _wm('policy_opp', 
                 -(pi_opp * logp[:, 1]).sum(-1), w_of('policy_opp'))
 
         # ---- 3 value 三分类 CE（系数 1.20，行权重恒 1）----
-        terms['value'] = _weighted_mean(F.cross_entropy(
+        terms['value'] = _wm('value', F.cross_entropy(
             out['outcome_logits'].float(),
             T(labels['outcome'], torch.long).reshape(-1),
             reduction='none'), None)
@@ -380,7 +455,7 @@ class KataGoV7Loss(nn.Module):
         own_logit = 2.0 * out['ownership_pretanh'].reshape(b, -1).float()
         own_bce = F.binary_cross_entropy_with_logits(
             own_logit, (own_t + 1.0) * 0.5, reduction='none')
-        terms['ownership'] = _weighted_mean(own_bce.sum(-1) / n_sq,
+        terms['ownership'] = _wm('ownership', own_bce.sum(-1) / n_sq,
                                             w_of('ownership'))
 
         # ---- 5/6 scorebelief pdf + cdf（各 0.020，w_score）----
@@ -391,28 +466,70 @@ class KataGoV7Loss(nn.Module):
                 torch.as_tensor(labels['sb_center']).to(dev),
                 torch.as_tensor(labels['sb_upper']).to(dev), self.num_bins)
         sb_tgt = T(sb_tgt)
-        terms['scorebelief_pdf'] = _weighted_mean(
+        terms['scorebelief_pdf'] = _wm('scorebelief_pdf', 
             -(sb_tgt * F.log_softmax(sb_logits, dim=-1)).sum(-1),
             w_of('score'))
         cdf_p = F.softmax(sb_logits, dim=-1).cumsum(-1)
         cdf_t = sb_tgt.cumsum(-1)
-        terms['scorebelief_cdf'] = _weighted_mean(
+        terms['scorebelief_cdf'] = _wm('scorebelief_cdf', 
             (cdf_p - cdf_t).pow(2).sum(-1), w_of('score'))
 
         # ---- 7 scorestdev 自预测（系数 0.001，**仅 game_weight，无行权重**）----
-        sb_std = F.softmax(sb_logits, dim=-1).std(-1)
-        terms['score_stdev'] = _weighted_mean(
+        # 🔴 `std` **不能**直接调 `F.softmax(...).std(-1)`（2026-10-04 云端 910A
+        #   实测点名到本项：加权 loss 非有限，逐项点名 = ['score_stdev']）。
+        #
+        # 根因：scorebelief 有 **842 个桶**，初始化时 logits 近均匀 ⇒ p ≈ 1/842
+        # ≈ 1.19e-3 且彼此相差极小 ⇒ **方差 ≈ 1e-10**。这个量级下
+        # 「朴素公式」`E[x²] − E[x]²` 会发生**灾难性抵消**：两个 ~1.4e-6 的数
+        # 相减得到一个微小**负数** ⇒ `sqrt(负数)` = **NaN**。
+        #
+        # CPU 的 `torch.std` 用 Welford / 两遍算法，稳；NPU 的规约核用朴素公式，
+        # 于是**只有真机炸** —— 本地 fp32 / fp16 / bf16 全都复现不出来
+        # （实测三项梯度 NaN 张量均为 0/322）。
+        #
+        # 修法：**两遍 + fp32**。`mean((p − μ)²)` 恒非负（每一项都是平方），
+        # 在 fp32 下 842 个元素的抵消也远不到出问题的量级。代价是多一个
+        # `(B, 842)` 的减法/平方，可忽略（这一项的系数在段 1 是 0）。
+        _sb_p = F.softmax(sb_logits, dim=-1).float()
+        _sb_mu = _sb_p.mean(dim=-1, keepdim=True)
+        sb_std = (_sb_p - _sb_mu).pow(2).mean(dim=-1).sqrt()
+        # 🔴 **给 std 一个下界**（2026-10-04 云端 910A，第二轮）。
+        #   上面修了**前向**（两遍算法），但真机仍点名到本项 ⇒ 坏的是**反向**：
+        #   `d(sqrt(v))/dv = 1/(2·std)`。实测初始化时 std ≈ **1.17e-7**
+        #   （842 桶近均匀）⇒ 局部导数 ≈ **4.27e6**，远超 fp16 的 65504 ⇒
+        #   反向溢出成 inf；再乘「段 1 系数 0」这个上游梯度（**0**），
+        #   `0 × inf = NaN` ⇒ 全部参数梯度 NaN ⇒ 每步都被 GradScaler 跳过。
+        #
+        #   `clamp_min` 在下界以下是**常数**，梯度恰好为 0 ⇒ 从根上拿掉
+        #   1/(2·std) 这个爆炸因子，而不是靠降低学习率去绕。
+        #
+        #   下界取 1e-3 的依据：远低于任何真实分布的展度（预测初值约 13.9，
+        #   即 1e-3 几乎只在「分布完全均匀」时触发），而局部导数被钉在 500，
+        #   对 fp16 极其安全。这个数是**数值下限**，不是新造的口径。
+        sb_std = sb_std.clamp_min(SCORE_STDEV_TARGET_FLOOR)
+        # 操作数级归因：下一轮日志能直接看出是「预测」还是「目标」坏掉，
+        # 而不必再猜（真机与本机的 std 实现不同，只有真机能回答）。
+        # ⚠ 下面的 `huber(out['score_stdev'].float(), sb_std, ...)` 是
+        #   `tests/test_katago_v7_budget.py::test_score_stdev_loss_term_is_inside_
+        #   huber_delta_at_the_ruled_out_beta` 按**字面量**钉住的（它要保证本路
+        #   的 δ 与测试常量同步）⇒ **不要**把 `out['score_stdev'].float()` 提成一个
+        #   中间变量，否则那条门禁会假红。
+        if not bool(torch.isfinite(out['score_stdev']).all()):
+            _bad_operands.append('score_stdev:pred')
+        if not bool(torch.isfinite(sb_std).all()):
+            _bad_operands.append('score_stdev:std')
+        terms['score_stdev'] = _wm('score_stdev', 
             huber(out['score_stdev'].float(), sb_std, 10.0),
             None if labels.get('game_weight') is None
             else T(labels['game_weight']).reshape(-1))
 
         # ---- 8 scoremean（系数 0.0015，w_score，δ=12）----
         score_t = T(labels['score']).reshape(-1)
-        terms['score_mean'] = _weighted_mean(
+        terms['score_mean'] = _wm('score_mean', 
             huber(out['score_mean'].float(), score_t, 12.0), w_of('score'))
 
         # ---- 9 lead（系数 0.0060，w_lead，δ=8）----
-        terms['lead'] = _weighted_mean(
+        terms['lead'] = _wm('lead', 
             huber(out['lead'].float(), score_t, 8.0), w_of('lead'))
 
         # ---- 9b varTimeLeft（官方 sv3[3]，系数 0.0060，δ=8）----
@@ -429,7 +546,7 @@ class KataGoV7Loss(nn.Module):
         vtl_t = labels.get('var_time_left')
         vtl_p = out.get('var_time_left')
         if vtl_t is not None and vtl_p is not None:
-            terms['var_time_left'] = _weighted_mean(
+            terms['var_time_left'] = _wm('var_time_left', 
                 huber(vtl_p.float(), T(vtl_t).reshape(-1), 8.0),
                 None if labels.get('game_weight') is None
                 else T(labels['game_weight']).reshape(-1))
@@ -437,7 +554,7 @@ class KataGoV7Loss(nn.Module):
         # ---- 10 scoring（**0.25 在系数表里**，w_scoring）----
         sc_t = T(labels['scoring']).reshape(b, -1)
         sc_mse = (out['scoring'].reshape(b, -1).float() - sc_t).pow(2).mean(-1)
-        terms['scoring'] = _weighted_mean(
+        terms['scoring'] = _wm('scoring', 
             4.0 * (torch.sqrt(0.5 * sc_mse + 1.0) - 1.0), w_of('scoring'))
 
         # ---- 11 futurepos（**0.25 已内嵌在公式里**，w_futurepos）----
@@ -445,7 +562,7 @@ class KataGoV7Loss(nn.Module):
         fut_sq = (torch.tanh(out['futurepos'].reshape(b, 2, n_sq).float())
                   - fut_t).pow(2)
         chan_w = torch.tensor([1.0, 0.25], device=dev).reshape(1, 2, 1)
-        terms['futurepos'] = _weighted_mean(
+        terms['futurepos'] = _wm('futurepos', 
             0.25 * (fut_sq * chan_w).reshape(b, -1).sum(-1) / math.sqrt(n_sq),
             w_of('futurepos'))
 
@@ -471,10 +588,60 @@ class KataGoV7Loss(nn.Module):
             reduction='none')
         seki_raw = (ce_sign.sum(-1) + 0.5 * ce_neu.sum(-1)) / n_sq
         adaptive = self._seki_adaptive_scale(seki_raw.detach().mean())
-        terms['seki'] = _weighted_mean(seki_raw * adaptive, w_of('seki'))
+        terms['seki'] = _wm('seki', seki_raw * adaptive, w_of('seki'))
 
         # ---- 装配：逐项乘**有效**系数（只乘一次）----
-        weighted = {k: self.coeff[k] * v for k, v in terms.items()}
+        # 🔴 **净化数值，但绝不切断计算图**（2026-10-04 云端 910A 实跑）。
+        #   `0.0 * NaN == NaN`（IEEE-754，不是 0）⇒ 只要 13 项里任何一项算坏，
+        #   加权总 loss 就是 NaN，而它一 NaN，**每一个**收到梯度的参数张量都是
+        #   NaN —— 实测 317/322，正是这个签名。
+        #
+        #   ⚠ **不能**用「c==0 就直接给 0.0」那种写法（我先写了这个版本）：
+        #     那会把这些项从图里摘掉 ⇒ 它们的参数 `grad=None` ⇒ DDP 抛
+        #     `Expected to have finished reduction in the prior iteration`
+        #     （真机 2 卡实测，参数索引 308-321）。**安静地剪掉梯度不是修复，
+        #     是换一个更响的崩溃。**
+        #
+        #   净化**只对 c==0 的项**：它们按定义不参与优化，坏掉时的正确行为就是
+        #   「这一项当 0」，净化是如实的。而 c!=0 的项（段 1 的
+        #   policy / policy_opp / value / futurepos）坏了必须**原样传出 NaN** ——
+        #   那是整批数据废掉的信号，净化掉就变成「静默训成 0」：
+        #   loss 曲线正常、指标正常，而模型什么也没学。
+        weighted = {}
+        for k, v in terms.items():
+            c = self.coeff[k]
+            if c == 0.0:
+                v = torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+            weighted[k] = c * v
         total = sum(weighted.values())
+        # 逐项指认「哪一项坏了」。
+        #
+        # ⚠ **不能只在 `total` 非有限时才扫**：正因上面保证了 c==0 的项不进加总，
+        #   `total` 对这些项是**恒有限**的 ⇒ 那种写法下它们永远不会被点名，
+        #   而它们恰恰是唯一「坏了但看不出来」的一类。
+        #
+        # 成本可控：段 1 的 9 个零系数项经 `_weighted_mean` 后都是 `(b,)` 标量，
+        # stack 成一个 `(9, b)` 一次 `isfinite().all()` 即可 ⇒ **一次** D2H
+        # 同步，而本循环每步本来就有 `float(_gn)`（clip_grad_norm_ 的返回值）
+        # 那一次同步，所以不多付。非段 1（c≠0 的项）坏掉时 `total` 会非有限，
+        # 那时再补扫一遍全表。
+        _zero_bad = []
+        _zero_terms = [v for k, v in terms.items() if self.coeff[k] == 0.0]
+        if _zero_terms:
+            _stacked = torch.stack([t.reshape(-1) for t in _zero_terms])
+            if not bool(torch.isfinite(_stacked).all()):
+                _names = [k for k in terms if self.coeff[k] == 0.0]
+                _per = torch.isfinite(_stacked).all(dim=1)
+                _zero_bad = [n for n, ok in zip(_names, _per.tolist())
+                             if not ok]
+        if not bool(torch.isfinite(total)):
+            _zero_bad = sorted(set(_zero_bad) | {
+                k for k, v in terms.items()
+                if not bool(torch.isfinite(v).all())})
+        bad = sorted(_zero_bad)
         return {'loss': total, 'terms': terms, 'weighted': weighted,
+                'nonfinite_terms': bad,
+                'nonfinite_operands': sorted(set(_bad_operands)),
+                'sanitized_rows': dict(_sanitized),
+                'total_finite': bool(torch.isfinite(total)),
                 'seki_adaptive_scale': adaptive.detach()}

@@ -538,6 +538,88 @@ def test_run_level_reports_actual_params_not_the_budget():
         'run/params_actual 必须实测参数量（ast.unparse 会把生成器加括号）'
 
 
+def test_v7_source_is_a_numeric_code_not_a_string():
+    """🔴 `run/v7_source` 必须是**数值码**，不能是 `'board_level'` 这种名字。
+
+    这条是被真报错打出来的（2026-10-04，用户云端 run）：
+    `Unsupported scalar string value: 'board_level'`。swanlab 的 metric 通道
+    只收 bool/int/float —— 字符串只有 `float()` 成功才收（见
+    `swanlab/sdk/internal/run/transforms/scalar/__init__.py` 的
+    `try: float(data) except ValueError: raise TypeError`）。
+    人读的名字走 stdout + config 面板，曲线里存码。
+    """
+    i = MAIN.index("'run/v7_source'")
+    val = MAIN[i + len("'run/v7_source'"):MAIN.index(',', i)]
+    assert 'board_level' not in val and 'packed' not in val, \
+        f'run/v7_source 仍在报字符串：{val!r}'
+    assert 'hasattr(dataset' in val, '应按数据源分派出数值码'
+
+
+@pytest.mark.parametrize('src_name', ['_init_swanlab', 'main'])
+def test_no_string_reaches_the_metric_channel(src_name):
+    """🔴 所有上报字典的值都必须是 bool/int/float —— 一个字符串都不许有。
+
+    直接用 swanlab 自己的 `_transform_tensor_or_array` + 判定规则**实跑**，
+    而不是自己重写一份类型白名单（重写的那份会与 SDK 漂）。
+    swanlab 没装时跳过：这条钉的是「上报面合乎 SDK 契约」，SDK 不在时
+    无从违反。
+    """
+    fn = _fn_src(src_name)
+    # 抠出每个 `swanlab_logger.log({...})` / `swanlab.log({...})` 的字面量
+    dicts = re.findall(r"\.log\(\{", fn)
+    assert dicts or src_name == '_init_swanlab', '未找到 log 调用'
+    if not dicts:
+        return
+
+    pytest.importorskip('swanlab', reason='swanlab 未装，无法按 SDK 契约校验')
+    from swanlab.sdk.internal.run.transforms.scalar import (  # noqa: PLC0415
+        _transform_tensor_or_array,
+    )
+
+    def _accepts(v):
+        try:
+            v = _transform_tensor_or_array(v)
+        except TypeError:
+            return False
+        if isinstance(v, bool) or isinstance(v, (int, float)):
+            return True
+        if isinstance(v, str):
+            try:
+                float(v)
+            except ValueError:
+                return False
+            return True
+        return False
+
+    # 真跑一次主流程里能取到的字面量值（不含运行时变量 —— 那些由
+    # `_run_facts` 那条 `test_*_are_plain_floats` 风格的运行期检查负责）
+    literals = {}
+    for m in re.finditer(r'"([\w/]+)":\s*("(?:[^"\\]|\\.)*")', fn):
+        literals[m.group(1)] = m.group(2)[1:-1]
+    bad = []
+    for k, v in literals.items():
+        # config 面板的字符串是合法的（那是 config 不是 metric），只查 log 侧
+        if k in ('soft_index', 'data', 'data/games_npz'):
+            continue
+        if not _accepts(v):
+            bad.append((k, v))
+    assert not bad, f'字符串值进了 metric 通道（SDK 会抛 TypeError）：{bad}'
+
+
+def test_bool_metrics_are_accepted_by_the_sdk():
+    """⚠ bool 是**合法** metric（SDK 先判 bool，因为 bool 是 int 的子类）。
+
+    这条把「bool 也要转成 0/1」这类过度修正挡住 —— `eval_truncated` /
+    `eval_used_ema` 直接报 bool 才是对的。
+    """
+    pytest.importorskip('swanlab', reason='swanlab 未装')
+    from swanlab.sdk.internal.run.transforms.scalar import (  # noqa: PLC0415
+        _transform_tensor_or_array,
+    )
+    for v in (True, False):
+        assert _transform_tensor_or_array(v) in (True, False)
+
+
 def test_loss_coefficients_are_uploaded_so_flat_lines_are_explicable():
     """逐项曲线上的平线（值恒 0）需要 `run/loss_coef/*` 才能解释。
 
