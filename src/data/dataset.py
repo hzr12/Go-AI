@@ -173,7 +173,10 @@ class SupervisedDataset:
                        ko(int16), moves(int16), values(int8), to_play(int8)
         可选含：game_ids(int32) — 每个样本所属棋局 ID，用于 stratified split。
                winrates(float32) — 连续胜率标签（手数比例软标签 D），优先于 values。
-               game_weights(float32) — 每样本的游戏权重（SGF 元数据加权），用于加权采样。
+               game_weights(float32) — 每样本的游戏权重（来自 SGF 元数据加权）。
+               **不是采样概率**：它一路作为标签传给 loss 的 `game_weight`，
+               由 `katago_v7_loss._weighted_mean` 逐样本加权求和；
+               本仓库没有任何 `.choice(p=...)` 消费它。
         均为 shape=(N, ...) 的 numpy 数组，N 相同。
 
         n_channels: 特征平面通道数，取 12..17 的前缀，**默认 12**。

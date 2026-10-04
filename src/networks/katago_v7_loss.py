@@ -257,8 +257,12 @@ def _weighted_mean(per_sample, weight, probe=None, tag=''):
          ``p * w`` 自己溢出成 ``inf``
 
        来源都是 ``build_dataset.compute_game_weight`` 的 ``np.exp(avg/20)``：
-       ``parse_player_rating`` 的正则 ``(\d+)([dk])`` 会从棋手名里抓到荒谬的
-       大数（如 ``KGS:123456``）⇒ ``exp(61729)`` = inf。
+       ``parse_player_rating`` 当时的正则 ``(\d+)([dk])`` 会从棋手名里抓到
+        荒谬的大数（如 ``KGS:123456``）⇒ ``exp(61729)`` = inf。**解析器已于
+        2026-10-04 修好**（两侧词边界 + ``_RANK_MAX``，见
+        ``tests/test_build_dataset_player_rating.py``），但
+        ``data/sgf_19x19_full.npz`` 是修好之前生成的、按约定**不重建**，所以下面
+        这套兜底仍然必须留着。
 
        为什么下面 ``w==0`` 那条防护挡不住它：``inf != 0`` ⇒ ``zero`` 为 False
        ⇒ 根本不进净化分支。而真正的杀伤在**反向**：

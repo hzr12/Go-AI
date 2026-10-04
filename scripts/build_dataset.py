@@ -26,20 +26,36 @@ def iter_sgf_bytes(src):
         with open(src, 'rb') as f:
             yield os.path.basename(src), f.read()
 
+# 等级数字的真实上界：围棋只有 30k..1k 与 1d..9d，再给 KGS 的 15d 留余量。
+# 超过它的数字一定不是等级 —— 实测是 Leela Zero 名字里的十六进制 commit hash。
+_RANK_MAX = 30
+
 def parse_player_rating(player_str):
-    """从 SGF 的 PB/PW 字段提取等级评分。"""
+    r"""从 SGF 的 PB/PW 字段提取等级评分；认不出来一律回落 10（不猜等级）。
+
+    **两条约束缺一不可**（样本与论证见
+    `tests/test_build_dataset_player_rating.py`）：
+
+    1. 数字的**两侧都不是字母数字** —— 否则 `Leela Zero 0.17 c23d983a` 里的
+       `23d` 会当成"23 段"；rank=23 本身合法，只有词边界拦得住它。
+    2. 数字 **≤ :data:`_RANK_MAX`** —— 否则 `0.17 1234567d` 这种左边是空格、
+       右边是结尾的整串数字会蒙混过关；词边界拦得住它、拦不住别的。
+
+    少任一条，hex hash 就会经 `compute_game_weight` 的 `exp(avg/20)` 溢出成
+    inf，再经 loss 反向 `0 × inf = NaN` 把全部 5,562,121 个参数的梯度打脏。
+    """
     if not player_str:
         return 10
     s = player_str.strip()
-    # KGS 评级: "(KGS:9)" 或 "(KGS:15d)"
+    # KGS 评级: "(KGS:9)" 或 "(KGS:15d)" —— 冒号已隔开左边界，只需校验数字。
     m = re.search(r'[Kk][Gg][Ss]:\s*(\d+)([dkDK]?)', s)
-    if m:
+    if m and int(m.group(1)) <= _RANK_MAX:
         rating = int(m.group(1))
         typ = m.group(2).lower()
         return rating * 2 if not typ else (20 + rating * 10)
-    # 数字 + d/k 后缀: "9d", "3k", "15k"
-    m = re.search(r'(\d+)([dkDK])', s)
-    if m:
+    # 数字 + d/k 后缀: "9d", "3k", "15k" —— 两侧必须是词边界，且必须是真实级/段。
+    m = re.search(r'(?<![A-Za-z0-9])(\d+)([dkDK])(?![A-Za-z0-9])', s)
+    if m and int(m.group(1)) <= _RANK_MAX:
         rating = int(m.group(1))
         typ = m.group(2).lower()
         if typ == 'k':
