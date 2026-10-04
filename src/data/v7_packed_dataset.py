@@ -241,37 +241,56 @@ class V7PackedDataset:
         tf = (np.asarray(tforms, dtype=np.int64) if tforms is not None
               else np.zeros(B, dtype=np.int64))
 
-        rank = self._gather('policy_player_rank', idxs).astype(np.int64, copy=False)
-        prob = self._gather('policy_player_prob', idxs).astype(np.float32, copy=False)
+        # ---- policy：**两路**都要（player 与 opp）----
+        # stdata 的 `policyTargetsNCMove` 是两通道：index 0 = 行棋方（player）、
+        # index 1 = 对手（opp），见 `trainingwrite.cpp:552-568`
+        # （policyTarget0 → rowGlobal[26] w_policy_player，policyTarget1 → [28]）。
+        # ⚠ 旧实现**只做了 player**，而 `v7_loss_labels` 又用 `next_move`（= player
+        #   的 rank[0]）去填 `policy_opp` —— 于是 #1 与 #2 两个 loss 项拿的是
+        #   **同一个**目标，π_opp 白训。这两路必须分开。
+        def soft_from(prefix: str) -> np.ndarray:
+            dense = np.zeros((B, ACTION_SIZE), dtype=np.float32)
+            rk = self._gather(prefix + '_rank', idxs).astype(np.int64, copy=False)
+            pb = self._gather(prefix + '_prob', idxs).astype(np.float32, copy=False)
+            ok = (rk >= 0) & (rk < bs * bs)
+            cnt = np.where(ok, pb, 0.0).astype(np.float64)
+            cnt[cnt < 0] = 0.0
+            den = cnt.sum(axis=1, keepdims=True)
+            # 🔴 `*_prob` 是 KataGo 的**访问计数**（实测一行 853/16/12/4/1/1，和 887），
+            #   必须归一化；全零行退回均匀分布而非 NaN。
+            nrm = np.where(den > 0, cnt / np.where(den > 0, den, 1.0),
+                           np.full_like(cnt, 1.0 / POLICY_TOPK))
+            if not permuted:
+                rows = np.repeat(np.arange(B), POLICY_TOPK).reshape(B, POLICY_TOPK)
+                np.add.at(dense, (rows, np.where(ok, rk, 0)), nrm.astype(np.float32))
+            else:
+                for b in range(B):
+                    moved = _permute_move_scalar(
+                        np.where(ok[b], rk[b], 0), int(tf[b]), bs)
+                    np.add.at(dense[b], np.where(ok[b], moved, 0),
+                              nrm[b].astype(np.float32))
+            return dense
 
-        # ---- policy：top-16 稀疏 → 稠密 362 ----
-        soft = np.zeros((B, ACTION_SIZE), dtype=np.float32)
-        valid = (rank >= 0) & (rank < bs * bs)
-        pv = np.where(valid, prob, 0.0).astype(np.float64)
-        pv[pv < 0] = 0.0
-        denom = pv.sum(axis=1, keepdims=True)
-        # 🔴 `policy_player_prob` 存的是 KataGo 的**访问计数**（实测一行
-        #   853/16/12/4/1/1，和为 887），必须归一化成概率分布。
-        norm = np.where(denom > 0,
-                        pv / np.where(denom > 0, denom, 1.0),
-                        np.full_like(pv, 1.0 / POLICY_TOPK))
-        if not permuted:
-            rows = np.repeat(np.arange(B), POLICY_TOPK).reshape(B, POLICY_TOPK)
-            np.add.at(soft, (rows, np.where(valid, rank, 0)), norm.astype(np.float32))
-        else:
-            for b in range(B):
-                moved = _permute_move_scalar(
-                    np.where(valid[b], rank[b], 0), int(tf[b]), bs)
-                np.add.at(soft[b], np.where(valid[b], moved, 0),
-                          norm[b].astype(np.float32))
+        soft = soft_from('policy_player')
+        soft_opp = soft_from('policy_opp') if self._has('policy_opp_prob') else None
         soft_mask = np.ones(B, dtype=np.float32)
 
+        rank = self._gather('policy_player_rank', idxs).astype(np.int64, copy=False)
+        valid = (rank >= 0) & (rank < bs * bs)
         next_move = np.where(valid[:, 0], rank[:, 0], -1).astype(np.int64)
+        next_move_opp = None
+        if self._has('policy_opp_rank'):
+            ro = self._gather('policy_opp_rank', idxs).astype(np.int64, copy=False)
+            ok_o = (ro >= 0) & (ro < bs * bs)
+            next_move_opp = np.where(ok_o[:, 0], ro[:, 0], -1).astype(np.int64)
         if permuted:
             for b in range(B):
                 if next_move[b] >= 0:
                     next_move[b] = _permute_move_scalar(
                         np.asarray([next_move[b]]), int(tf[b]), bs)[0]
+                if next_move_opp is not None and next_move_opp[b] >= 0:
+                    next_move_opp[b] = _permute_move_scalar(
+                        np.asarray([next_move_opp[b]]), int(tf[b]), bs)[0]
 
         outcome = self._gather('outcome', idxs).astype(np.int64, copy=False)
         to_play = self._gather('global', idxs)[:, 18]   # ch18 = 当前行棋方符号
@@ -325,10 +344,16 @@ class V7PackedDataset:
 
         out = {
             'next_move': next_move,
+            # `next_move_opp`：对手侧的 top-1。`v7_loss_labels` 优先用它填
+            # `policy_opp`；缺席时退回 `next_move`（board 级路径的旧行为）。
+            **({'next_move_opp': next_move_opp}
+               if next_move_opp is not None else {}),
             'outcome': outcome,
             'outcome_black': outcome_black,
             'game_weight': game_weight,
             'soft': soft,
+            # `soft_opp`：对手侧的搜索分布。与 `soft` 同口径（计数归一化）。
+            **({'soft_opp': soft_opp} if soft_opp is not None else {}),
             'soft_mask': soft_mask,
             'w': w,
             'score': score,

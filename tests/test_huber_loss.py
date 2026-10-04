@@ -1491,10 +1491,20 @@ def test_no_new_cli_params():
         #   门禁拆了；把 `--v7` 写进冻结集，则下一个想加 `--v7-lr-mult` 的人
         #   仍然会在这里红一次，并被迫把理由写在这里。
         #   B8 **只加了这一个旗**：V7 的段位权重是代码里的常量表
-        #   （`V7_STAGE1_SCORE_TERMS`）而不是 CLI —— 让「段 1 不训 score」变成
-        #   一个能被人顺手关掉的旋钮是错的，它的依据是数据集事实（81.09% 的
-        #   SGF 是认输），不是调参口味。
+        #   （`V7_STAGE1_SCORE_TERMS`）而不是 CLI —— 让「段 A 不训 score」变成
+        #   一个能被人顺手关掉的旋钮是错的，它的依据是数据集事实（实测 76.49%
+        #   的 SGF 是认输、只有 23.18% 有分差），不是调参口味。
         '--v7',
+        # ---- 2026-10-04 新增的 1 个：局级 sidecar（逐局贴目）----
+        # ⚠ **为什么要显式登记而不是删掉本测试**：D1 的门禁价值不在旗子的个数，
+        #   而在「新增必须是一次**留痕**的改动」。删掉整个测试等于把门禁拆了。
+        #   把 `--games-npz` 写进冻结集，则下一个想加 `--games-komi-scale` 的人
+        #   仍然会在这里红一次，并被迫把理由写在这里。
+        #   语义：`build_games_sidecar.py` 的产物（局级 `g_komi`），接进 V7 的
+        #   全局特征 ch5 / ch18。不给 ⇒ 贴目按 0（**默认关闭时逐位不变**）。
+        #   ⚠ 段位权重仍**不**做成 CLI：V7 的段位表是常量
+        #   （`V7_STAGE1_SCORE_TERMS`），理由同上。
+        '--games-npz',
     }
     got = set(kw)
     assert got == expected, (
@@ -1504,7 +1514,10 @@ def test_no_new_cli_params():
         f'个数 {len(got)} vs {len(expected)}'
         + (f'  仅顺序不同（不算违规）: '
            f'{[k for k in kw if k in expected]}' if got == expected else ''))
-    assert len(expected) == 66, f'冻结的基线本身变了：{len(expected)} != 66（61 + A4 的 4 个 + B8 的 1 个）'
+    # 基线 = 61 原始 + A4 的 4 个软标签 + B8 的 `--v7` + 2026-10-04 的 `--games-npz`
+    assert len(expected) == 67, (
+        f'冻结的基线本身变了：{len(expected)} != 67'
+        f'（61 + A4 的 4 个 + B8 的 1 个 + --games-npz 的 1 个）')
     # 特别地：L2 系数不许有独立参数，label smoothing 也不许有第二个旋钮
     for banned in ('--l2-coef', '--l2-weight', '--weight-decay-l2',
                    '--l2-report', '--label-smoothing-ce'):

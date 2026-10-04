@@ -5,8 +5,11 @@
 四个头（policy / value / ownership / scorebelief），12 项可构造监督目标。
 
 > **当前是「重建管线」阶段，不是「训出强棋」阶段。** 模型、特征、标签三条流都已
-> 落地或有实测结论，但**训练侧还没接到 22 通道**：`scripts/train_sft.py` 至今建的是
-> `KATAGO_SE_CFG`（12 通道、9,112,005 参数）。进度见 [§4](#4-当前进度)。
+> 落地或有实测结论，**训练侧已接到 22 通道**：`scripts/train_sft.py --v7 1` 按数据
+> 布局分派到 `V7Dataset`（board 级语料，训练时实时算 22 平面）或 `V7PackedDataset`
+> （`stdata_v7` 分片，预算好的 22 平面），两者喂给**同一个** `NbtTfNet`
+> （22 通道、5,562,121 参数）⇒ **A→B→C 三段共用一个模型**、权重逐段承接。
+> 进度见 [§4](#4-当前进度)。
 
 ---
 
@@ -87,7 +90,11 @@ ko 规则、计分制度、tax、encore、`passWouldEndPhase`、komi 奇偶三�
 
 ### 2.3 模型层
 
-| | 现行 SFT（`KATAGO_SE_CFG`） | 目标 V7（`NbtTfNet`） |
+**A→B→C 三段共用同一个模型**（`--v7 1` ⇒ `NbtTfNet`，22 通道，5,562,121 参数）。
+`KATAGO_SE_CFG` 那套 12 通道结构（9,112,005 参数）**只在不带 `--v7` 时**才建，
+不再是训练主路。
+
+| | 12 通道（`KATAGO_SE_CFG`，现役默认） | **V7（`NbtTfNet`，A/B/C 共用）** |
 |---|---|---|
 | 输入通道 | 12 | 22 空间 + 19 全局 |
 | 主干 | 240 宽 · 13×SEBottleneck + 4×Attention | `C=256 M=128 H=4 F=384 B=11` nbt2 块 |
@@ -98,12 +105,29 @@ ko 规则、计分制度、tax、encore、`passWouldEndPhase`、komi 奇偶三�
 
 `NbtTfNet` 已实现并通过预算测试（`tests/test_katago_v7_budget.py` 断言精确值
 5,562,121），`src/inference.py:177` 已 `register_in_channels_builder(22, ...)`。
-**已接入 `train_sft.py`**（`--v7 1`，实测 5,562,121 参数）—— 见 [§4](#4-当前进度)。⚠️ 段 1 会**跳过** eval / early-stop / ONNX 导出：`evaluate_metrics` 与 `GoAI` 仍是 12 通道推理链 |
+
+**一份架构、两种数据源**（`load_from_path(--v7 1)` 按**数据布局**分派）：
+
+| 数据 | 数据集类 | 22 平面从哪来 |
+|---|---|---|
+| `data/sgf_19x19_full.npz`（A/B 段） | `V7Dataset` | 训练时实时算（`feature_v7.spatial_channels_v7`） |
+| `data/stdata_v7/`（C 段） | `V7PackedDataset` | 转换时算好并位打包（`spatial_packed`） |
+
+判据是「npz 里有没有 `spatial_packed`」，不是文件名 —— 判错的后果很隐蔽：
+A/B 段会静默退回 12 通道路径，V7 的 22 个平面**根本没参与训练**，
+loss 照降、指标照报，而模型学的是另一个结构。
+`tests/test_v7_single_model.py` 钉住分派结果、22 通道输出、以及
+A→B→C 的 `load_state_dict` 承接（strict 零缺失）。
+
+⚠️ eval / early-stop / best-model 走 `evaluate_metrics_v7`（与 12 通道版同名同义）；
+`--export-onnx` 对 V7 **无效**（走 `GoAI` 的 12 通道推理链），导出见 [§2.5](#25-导出到-kataGo-引擎)。
 
 ### 2.4 训练层
 
-- **段 1 SFT**：`scripts/train_sft.py`（4 卡 910A 入口 `shell/train_sft_npu_4card_katago_se.sh`，
-  DDP + HCCL + fp16/GradScaler）。
+- **段 A/B/C SFT**：`scripts/train_sft.py --v7 1`，三段同一个 22 通道模型、
+  `--model` 逐段承接（DDP + HCCL + fp16/GradScaler）。
+  ⚠️ shell/ 里的 `train_sft_npu_4card_katago_se.sh` 是**不带 `--v7`** 的 12 通道
+  旧入口，别拿它跑 V7 链；`run.txt` 里给的是直连 `torchrun` 命令。
 - **V7 tracer bullet**：`scripts/smoke_train_v7.py` —— 302 行 / batch 8 / 40 步，
   直接吃 stdata，用来回答「12 项 loss 每项到底降不降」。
 
@@ -183,22 +207,31 @@ kernel tiling（`ATTN_BLOCK_Q` 256 vs 128、`CHANNELSTRIDE` 2 vs 1），fp16 累
 |---|---|
 | **软标签流** | `permute_soft` / `soft_cross_entropy`（掩码 `0` 的行贡献恰好 0）/ `labels=True` 的 4 元组 + dict 契约 / `games.npz` sidecar 生成器（ply-20 锚点）|
 | **特征流** | `src/data/feature_v7.py`（气桶 / 历史 5 手 / `calculateArea`）+ `feature_v7_ladders.py`（ch14–17）+ `feature_v7_gather.py`（邻行 gather）**全部完成**，ch0–6/ch8/ch14/ch17 对官方 stdata 逐位 1.000000 |
-| **模型流** | `katago_v7.py` + `katago_v7_loss.py` + 22ch builder 已接线；`train_sft.py` 切 22 通道未做 |
+| **模型流** | `katago_v7.py` + `katago_v7_loss.py` + 22ch builder 已闭环，`train_sft.py --v7 1` 已接：**A/B/C 共用同一个模型**（见 [§2.3](#23-模型层)） |
 
 ### 3.2 三个训练段
 
+**三段共用一个模型**（`--v7 1` ⇒ 22 通道 `NbtTfNet`，5,562,121 参数），
+只换数据、不换架构，权重用 `--model` 逐段承接：
+
 | 段 | 数据 | 量 | policy 目标 | 目的 |
 |---|---|---:|---|---|
-| **1** | 自有 34.2M 语料（SGF 派生标签） | 34,202,713 | 人类着法 one-hot | 通路基线；学会读 22 通道 |
-| **2** | 自有语料的 1%，用 KataGo 标注 | ~342,000 | 访问分布 | 域匹配桥梁（人类局面 + 搜索答案） |
-| **3** | `katago/stdata`（19×19 部分） | ≈3,100,000 | 访问分布 | 棋力主体 |
+| **A** | 自有 34.2M 语料（SGF 派生标签） | 34,202,713 | 人类着法 one-hot | 通路基线；学会读 22 通道 |
+| **B** | 自有语料的 1%，用 KataGo 标注 | ~342,000 | 搜索分布（软 CE） | 域匹配桥梁（人类局面 + 搜索答案） |
+| **C** | `katago/stdata`（19×19 部分） | ≈3,100,000 | 搜索分布 | 棋力主体；**唯一学全 value 的段** |
 
-段 2 与段 3 的 policy 目标同为访问分布 ⇒ **可以合并成一轮跑 ~3.44M**。
-段 2 的价值是**桥梁**：stdata 是自对弈局，自有语料是职业对局。
+B 与 C 的 policy 目标同为搜索分布，但**价值标签不同**：C 段才有真正的
+ownership / scorebelief / varTimeLeft。B 段的软标签要 `--soft-index`；
+**C 段的软标签内建在数据行里**（`policy_player_prob` / `policy_opp_prob`，
+转换时归一化），不需要 `--soft-index`。
 
-### 3.3 段 1 只训 policy 系
+⚠️ B 段必须加 `--soft-only-sampling 1`：软 CE 是**逐行二选一**（mask=0 的行贡献
+恰好 0，不退化成 one-hot）。不加 ⇒ 只有约 1% 的行吃软标签，policy 去折中而不是
+学搜索，且 `--soft-weight 0` **关不掉**这个问题。
 
-段 1 启用：`#1 policy`、`#2 π_opp`、`#3 value` 3 类、`#11 futurepos`。
+### 3.3 段 A 只训 policy 系
+
+段 A 启用：`#1 policy`、`#2 π_opp`、`#3 value` 3 类、`#11 futurepos`。
 
 **不启用**：score 系（`#5/#6` scorebelief、`#8` scoremean、`#9` lead、`#10` scoring）
 与 `#4 ownership`、`#12 seki`。理由见 [§6.2](#62-段-1-为何不训-score)。
@@ -219,8 +252,8 @@ kernel tiling（`ATTN_BLOCK_Q` 256 vs 128、`CHANNELSTRIDE` 2 vs 1），fp16 累
 | 软 CE（`soft_cross_entropy`） | ✅ | 掩码 `mask=0` 的行贡献**恰好 0**（**不是**退化成 one-hot CE）；分母恒为 B ⇒ 不开 `--soft-only-sampling` 就只有 ~1% 的行贡献，policy 项缩小约 100× |
 | `labels=True` 4 元组 + dict 契约 | ✅ | 5 个假 dataset 已补 `labels=False` 形参 |
 | `games.npz` sidecar **生成器** | ✅ | 小规模实测 50/50 匹配；`g_rules`/`g_resign`/`g_resign_side` 4 键 |
-| `games.npz` **产物** | ⚠️ **未生成** | 段 1 的 komi/score/rules 来源；需跑 `build_games_sidecar.py`（几十分钟） |
-| `kata_labels.npz`（段 2 蒸馏） | ✅ **已生成** | 157.5 MB，跑 `label_sgf.py` |
+| `games.npz` **产物** | ⚠️ **未生成** | 段 A 的 komi/score/rules 来源；需跑 `build_games_sidecar.py`（几十分钟） |
+| `kata_labels.npz`（段 B 蒸馏） | ✅ **已生成** | 157.5 MB，跑 `label_sgf.py` |
 | `soft_index.npz` | ✅ **已生成** | 160.5 MB，跑 `build_soft_index.py`；`--soft-index` 已接入训练侧 |
 | `feature_v7.py`（气桶 / 历史 5 手 / `calculateArea`） | ✅ | ch0–6/ch8 对 stdata 逐位 1.000000；**ch18/19 已知对不齐**（官方先提死子，本仓 `score()` 没有） |
 | `feature_v7_ladders.py`（ch14–17） | ✅ | 对官方 stdata **逐位 1.000000**（4,368 行）；梯子占特征耗时 99.8% |
@@ -229,10 +262,12 @@ kernel tiling（`ATTN_BLOCK_Q` 256 vs 128、`CHANNELSTRIDE` 2 vs 1），fp16 累
 | 12 项 loss 装配 | ✅ | `tests/test_katago_v7_loss.py` 24 项 |
 | V7 端到端冒烟 | ✅ 跑过 | 40 步，11/12 项下降；`score_stdev` **−0.0%** |
 | **`train_sft.py` 切 22 通道** | ⬜ **未做** | 现状仍建 `KATAGO_SE_CFG`（12ch / 9.11M） |
-| 软标签 CLI 接线 | ⬜ 未做 | 无 `--soft-labels/--soft-weight/--soft-index/--soft-only-sampling` |
-| 邻行 gather（5 偏移）接线 | ⬜ 未做 | B6，纯 `boards` 索引，几乎免费 |
-| stdata 训练（段 3）整轮 | ⬜ 未做 | 只有 smoke |
-| 段 1 正式训练（新模型） | ⬜ 未做 | 被上一行阻塞 |
+| 软标签 CLI 接线 | ✅ 已做 | `--soft-index/--soft-weight/--soft-every/--soft-only-sampling/--policy-loss soft_ce` |
+| 邻行 gather（5 偏移）接线 | ✅ 已做 | ch14–17 与 futurepos 共用，纯 `boards` 索引 |
+| A/B/C 共用一个 V7 模型 | ✅ 已做 | `load_from_path(v7=1)` 按布局分派 + `--model` 承接，`tests/test_v7_single_model.py` |
+| V7 软 CE（含 π_opp 分离） | ✅ 已做 | `tests/test_v7_soft_ce.py`，逐位对齐 12 通路口径 |
+| C 段（stdata）整轮正式训练 | ⬜ 未做 | 只有 64 行 CPU 冒烟跑通 |
+| A 段 / B 段正式训练 | ⬜ 未做 | 通路已通，待 910A 实跑 |
 | RL（段外） | ✅ 可跑 | 但 MCTS 已归档，采集走 lookahead |
 | 910A 融合注意力探针 | ⬜ 未做 | R1，见 [§7](#7-已知限制) |
 
@@ -300,15 +335,30 @@ soft_cross_entropy(...) = (per_row * mask).mean()   # mask=0 的行贡献 0
 ```
 
 理由：同一个 head 同时收到「搜索分布」与「人类 one-hot」会去**折中**而不是学搜索。
-`mask=0` 的行贡献 0，不是「退化成 one-hot CE」。段 2 用独立采样器**只取软行**。
+`mask=0` 的行贡献 0，不是「退化成 one-hot CE」。段 B 用独立采样器**只取软行**。
+
+🔴 两条容易被忽略的对齐口径（V7 与 12 通道**逐位相同**，由
+`tests/test_v7_soft_ce.py` 钉住）：
+
+- **分母恒为 B**，不是 `Σmask`。若改成 `sum/mask.sum()`，软项量级会随 batch
+  组成漂移，`--soft-weight` 这个旋钮就失去意义。
+- **`soft_mask` 全 0 ⇒ 退回 one-hot**（含义是「本批无软标签」）。否则 policy 拿到
+  **恰好 0** 的梯度：不报错、loss 照降、policy 根本没学。
+  ⚠️ 所以 `--policy-loss soft_ce` 在「无软标签来源」时必须报错；唯一例外是
+  V7 的 stdata 分片，它的 `soft` / `soft_mask` **内建在数据行里**、不需要
+  `--soft-index`。
 
 ### 5.6 `RE` 认输类不能当成分差
 
 `B+R` / `W+Resign` / `B+T` / `W+Forfeit` ⇒ **认输填 `NaN`，不是 0**。
 `g_score` 为 `NaN` 时 `w_score = 0`。
 
-🔴 **真实语料里 81.09% 的 SGF 是认输**（spec 早期抽样写的是 75.2%，
-`build_games_sidecar.py` 在 162,298 局上实测是 **81.09%**），只有约 **18.5%** 有数值分差。
+🔴 **真实语料里约 3/4 的 SGF 是认输**：`games.npz` 全量实测认输率 **76.49%**
+（`g_resign=True`，与 `g_re==RESIGN` 的 124,137 局一致），有数值分差的
+**23.18%**（`g_score` 非 NaN，37,613 局）。
+⚠️ 早期抽样曾写 75.2% / 81.09%，run.txt 曾写 77.51% / 22.20% —— 这几个数
+在 `g_komi` / `g_score` / `g_resign` / `g_re` 四种口径下**都算不出来**，已按实测纠正。
+引用覆盖率时必须写清是哪个字段算的。
 照字面把认输当 0 分会让 scoremean / lead 被系统性地教成「双方刚好一样」。
 
 ### 5.7 ch18/19 无法与官方 stdata 对齐
@@ -377,23 +427,24 @@ ladder 通道的可验证性因此被拆成两半（`katago/` 下无 `cpp/` 源�
 ⇒ **gather 全部行是免费的**（`boards` 常驻内存，就是索引），只有靠近终局的那
 **4%** 行需要真跑一次 area 的 flood fill。
 
-### 6.2 段 1 为何不训 score
+### 6.2 段 A 为何不训 score
 
 三条理由，按重要性：
 
-1. **覆盖率**：81.09% 的局是认输 ⇒ 没有分差 ⇒ `g_score = NaN` ⇒
-   `w_score = 0`。score 系 5 项（`#5/#6` scorebelief、`#8` scoremean、`#9` lead、
-   `#10` scoring）在 **81% 的局上权重为 0**，有监督的只约
-   `18.5% × 162,298 × 210 ≈ 6.3M 行`（34.2M 的 **19%**）。跑一个 19% 覆盖的
-   score 头，不如等段 2/3。
+1. **覆盖率**：约 76.5% 的局是认输（实测 `g_resign` 76.49%，见 [§5.6](#56-re-认输类不能当成分差)）
+   ⇒ 没有分差 ⇒ `g_score = NaN` ⇒ `w_score = 0`。score 系 5 项
+   （`#5/#6` scorebelief、`#8` scoremean、`#9` lead、`#10` scoring）在
+   **约 76% 的局上权重为 0**，有监督的只约
+   `23.18% × 162,298 × 210 ≈ 7.9M 行`（34.2M 的 **23%**）。跑一个 23% 覆盖的
+   score 头，不如等 B/C 段。
 2. **信号质量**：认输局即使重放到终局，`GoBoard.score()` 没有死子判定 ⇒
    从认输棋谱反推的终局归属**不可靠**。`ownership` / `scoring` / `seki` 正是这类。
 3. **有更好的来源**：stdata 的 `valueTargetsNCHW` 直接带 ownership / seki /
    futurepos / scoring（值域 `{−1,0,+1}` 与 `±120`），来自**搜索器自己的评分器**，
    不需要移植任何东西。
 
-⇒ **训练责任从 34.2M 挪到 3.4M**，而那 3.4M 上这些信号质量高得多。
-⇒ ownership / scoring / seki **不在段 1**，交给段 2/3。
+⇒ **训练责任从 34.2M 挪到 ~3.4M**，而那 3.4M 上这些信号质量高得多。
+⇒ ownership / scoring / seki **不在段 A**，交给 B/C 段。
 
 ### 6.3 sidecar 为何只存 4 键
 
@@ -409,10 +460,16 @@ ladder 通道的可验证性因此被拆成两半（`katago/` 下无 `cpp/` 源�
 
 ### 6.4 policy 保持 K=2
 
-段 2/3 的目标同型（访问分布）可合并成一轮；人类 one-hot 已在段 1 学进去，
-段 2/3 覆盖它**正是蒸馏的目的**。K=3 只在「同一部位两个 policy 目标同时训」时才需要，
+B/C 段的目标同型（搜索分布）；人类 one-hot 已在 A 段学进去，
+B/C 段覆盖它**正是蒸馏的目的**。K=3 只在「同一部位两个 policy 目标同时训」时才需要，
 而那会带来权重调参负担且收益未经验证。K=2 恰好对上 stdata 的两路输出
 （`policyTargetsNCMove[0]` 本方 / `[1]` 对手）。
+
+⚠️ 两路目标必须**真的不同**。V7 曾把 `policy_opp` 的目标也填成 player 的
+`rank[0]`（两路同源）⇒ `π_opp` 白训，而 loss 曲线完全看不出异常。
+现在 B 段的 `soft` / `soft_opp`、C 段的 `policy_player_prob` / `policy_opp_prob`
+各自独立，`tests/test_v7_soft_ce.py::test_policy_and_policy_opp_use_different_targets`
+逐位钉住。
 
 ---
 
@@ -429,10 +486,10 @@ ladder 通道的可验证性因此被拆成两半（`katago/` 下无 `cpp/` 源�
 6. **`scorestdev` 的 `beta` 已裁决为 `1.0`** ✅ 原 spec 写 `SoftPlus(x, 0.05)`，
    预测初值高达 277，而 loss #7 的目标量级只有 5~20（Huber δ=10）⇒ 初期梯度被
    常数偏差完全支配（40 步冒烟实测该项 **−0.0%**，即**根本没在学**）。
-   实测改 `beta=1.0` 后 `score_stdev.mean()` **13.8599**、loss #7 **8.83**，
-   **落在 δ=10 附近**；参数量不变（5,562,121），段 1 四目标**逐位不变**
-   （段 1 权重为 0，此改动是为段 2/3 生效的）。
-   常量在 `katago_v7.py::SCORE_STDEV_SOFTPLUS_BETA`，**只改这一行即可**。
+实测改 `beta=1.0` 后 `score_stdev.mean()` **13.8599**、loss #7 **8.83**，
+    **落在 δ=10 附近**；参数量不变（5,562,121），段 A 四目标**逐位不变**
+    （段 A 权重为 0，此改动是为 B/C 段生效的）。
+    常量在 `katago_v7.py::SCORE_STDEV_SOFTPLUS_BETA`，**只改这一行即可**。
 7. **`policy_entropy` 曾报负熵** ✅ 已改成真熵 `H`。原值是 `Σ p·log p = −H`，
    取值 `[−log 362, 0]`、随策略变锐而**上升** ⇒ 与指标名方向相反，读图必反。
    现取值 `[0, log 362]`（均匀 ≈ 5.89，锐化后下降），**换算关系 `新 = −旧`**。

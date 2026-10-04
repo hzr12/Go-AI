@@ -10,6 +10,7 @@
 """
 
 import argparse
+import glob
 import logging
 import math
 import multiprocessing as mp
@@ -610,6 +611,104 @@ def build_katago_v7_net(*, board_size=V7_BOARD_SIZE, use_checkpoint=1,
 
 # ---- V7 的特征装配（纯 numpy，可在预取 worker 里跑）------------------------
 #
+# --------------------------------------------------------------------------- #
+# 局级 sidecar（spec §5.3）→ V7Dataset 的逐局贴目
+# --------------------------------------------------------------------------- #
+def _sidecar_kwargs(dataset, games_npz):
+    """`games.npz` → `V7Dataset(game_komi=..., game_rules_flags=...)` 的 kwargs。
+
+    没给 `--games-npz` ⇒ 返回 ``{}`` ⇒ 构造函数两个参数都留 `None` ⇒
+    `game_row_for()` 返回 `None` ⇒ 贴目按 0（**逐位等于本函数接入之前**，
+    所以这个旗默认关闭时不会动任何已有数值）。
+    """
+    if not games_npz:
+        return {}
+    komi, rules, diag = load_games_sidecar(games_npz, dataset)
+    print('[sidecar] %s' % diag['path'])
+    print('[sidecar] 局数 %d（sidecar）/ %d（数据集）| 有贴目 %d（缺 %d）| '
+          '有分差 %d | 认输 %d'
+          % (diag['sidecar_games'], diag['dataset_games'],
+             diag['has_komi_games'], diag['missing_komi_games'],
+             diag['has_score_games'], diag['resign_games']))
+    if diag['nondefault_rules']:
+        # 如实报「接不进」而不是悄悄按简单局算
+        print('[sidecar] ⚠ %d 局的 g_rules 非默认，但**逐局规则化尚未接进特征**'
+              '（官方 calculateArea 只吃标量 rules_flags）⇒ 这些局的空间特征仍按'
+              '简单局算。这是已知缺口，不是本次接入能解决的。'
+              % diag['nondefault_rules'])
+    return {'game_komi': komi, 'game_rules_flags': rules}
+
+
+def load_games_sidecar(path, dataset):
+    """读 `games.npz`，按 **game_id** 对齐，返回 ``(game_komi, game_rules, 诊断)``。
+
+    口径（spec §5.3）：sidecar 是**局级**表，左索引是 `game_id`，
+    读法 ``sidecar[game_ids[idxs]]`` —— 不是按行号。搞错的后果是**静默取到
+    别局的贴目**：全局 ch5/ch18 跟着错，loss 照降，不报任何错。
+
+    Args:
+        path: ``games.npz`` 路径。
+        dataset: 已建好的 board 级数据集（只用它的 ``game_ids``）。
+
+    Returns:
+        ``(komi_1d, rules_1d, diag)``；``komi_1d`` / ``rules_1d`` 是按 game_id
+        索引的一维数组（可直接交给 ``V7Dataset(game_komi=...)``）。
+
+    Raises:
+        SystemExit: sidecar 短于 game_id 空间、或缺必需键。**这两种都必须
+            当场报错** —— 短了只能靠 ``.get(g, 0.0)`` 补 0，那等于给部分局
+            编了一个「贴目 0」的真值。
+    """
+    need = ('g_komi', 'g_rules', 'g_score', 'g_resign', 'g_re', 'g_resign_side')
+    z = np.load(path, allow_pickle=False)
+    try:
+        missing = [k for k in need if k not in z.files]
+        if missing:
+            raise SystemExit(
+                f'{path} 缺键 {missing}。\n'
+                f'  契约见 scripts/build_games_sidecar.py 的 savez 与 '
+                f'tests/test_games_sidecar_alignment.py::test_sidecar_keys。'
+                f'\n  ⚠ 别「缺哪个补哪个」：键名对不上说明这不是本脚本的产物，'
+                f'硬凑只会得到**逐位错位**的标签。')
+        komi = z['g_komi'].astype(np.float32)
+        rules = z['g_rules'].astype(np.int64)
+        score = z['g_score'].astype(np.float32)
+        resign = np.asarray(z['g_resign'], bool)
+        G = int(komi.shape[0])
+    finally:
+        z.close()
+
+    gid = np.asarray(dataset.game_ids)
+    if gid.size == 0:
+        raise SystemExit(f'{path} 无从对齐：数据集没有 game_ids。')
+    need_n = int(gid.max()) + 1
+    if G < need_n:
+        raise SystemExit(
+            f'sidecar 只有 {G} 局，但数据集的 game_id 最大到 {need_n - 1}'
+            f'（需要 >= {need_n} 局）。\n'
+            f'  ⚠ 短了只能给缺失的局补「贴目 0」，那不是缺失标记而是**一个假真值**'
+            f'（全局 ch5 变 0、ch18 三角波走偏，且不报任何错）。\n'
+            f'  常见原因：sidecar 是旧主 npz 扫的，而数据集已 rebuild —— '
+            f'重跑 scripts/build_games_sidecar.py。')
+
+    # 「有真贴目」的判定用 sidecar 自己的约定：`g_komi == 0` ⇔ 缺失
+    # （sgf_parser.py:218 的 has_komi 标志；不能拿 `komi != 7.5` 当判据）。
+    has_komi = komi[:need_n] != 0.0
+    n_game = int(np.unique(gid).size)
+    diag = {
+        'path': os.path.abspath(path),
+        'sidecar_games': G,
+        'needed_games': need_n,
+        'dataset_games': n_game,
+        'has_komi_games': int(has_komi.sum()),
+        'missing_komi_games': int(need_n - has_komi.sum()),
+        'has_score_games': int(np.isfinite(score[:need_n]).sum()),
+        'resign_games': int(resign[:need_n].sum()),
+        'nondefault_rules': int((rules[:need_n] != 0).sum()),
+    }
+    return komi[:need_n], rules[:need_n], diag
+
+
 # 为什么需要一个**新的**装配函数而不是复用 `dataset.sample_batch_numpy`
 # ----------------------------------------------------------------------
 # `sample_batch_numpy` 返回的是 `feature_planes_batched` 的 12 通道路径
@@ -742,7 +841,12 @@ def v7_loss_labels(labels_dict, moves, *, action_size=V7_ACTION_SIZE):
     """
     lbl = dict(labels_dict)
     lbl['policy_player'] = _dense_move_target(moves, action_size)
-    lbl['policy_opp'] = _dense_move_target(lbl['next_move'], action_size)
+    # 🔴 `policy_opp` 必须用**对手侧**的着法。`V7PackedDataset` 会给
+    #   `next_move_opp`（来自 `policy_opp_rank[:,0]`）；缺席时才退回 `next_move`
+    #   —— 那条退路是 board 级路径的旧行为，而在 stdata 上会让 #1 与 #2 两个
+    #   loss 项拿到**同一个**目标（π_opp 白训）。
+    lbl['policy_opp'] = _dense_move_target(
+        labels_dict.get('next_move_opp', lbl['next_move']), action_size)
     lbl['futurepos'] = lbl['future']
     return lbl
 
@@ -1093,28 +1197,33 @@ def attach_soft_index(dataset, path):
     return diag
 
 
-def resolve_policy_loss_kind(policy_loss, soft_index):
+def resolve_policy_loss_kind(policy_loss, soft_index, v7_packed=False):
     """软标签接入后，**生效**的 policy 损失 kind。
 
-    `soft_ce` 不是又一个旗：它是 `--soft-index` 的**派生**结果。给了 `--soft-index`
+    `soft_ce` 不是又一个旗：它是软标签的**派生**结果。给了 `--soft-index`
     就用软 CE（段 2 的全部意义），没给就原样返回 `--policy-loss`（段 1 的旧路径，
     数值逐位不变）。
 
-    ⚠ 显式 `soft_ce` 却没有 `--soft-index` 必须**报错**：`compute_policy_loss`
+    ⚠ 显式 `soft_ce` 却没有软标签来源必须**报错**：`compute_policy_loss`
       拿不到 `soft`/`soft_mask` 会抛 ValueError，但那是训练跑到第一个 batch
       时的栈 —— 这里提前拒掉，错误信息直指 CLI。
     ⚠ `--policy-loss huber` + `--soft-index` 也报错：huber 分支**完全不看**
       软标签，组合起来等于「以为在蒸馏，其实在回归 one-hot 的概率」。
     """
-    if not soft_index:
+    # V7 的 stdata 分片把 KataGo 的搜索分布**内建**在行里（`V7PackedDataset`
+    # 直接给 `soft` / `soft_opp` / `soft_mask`），不经过 `--soft-index`。
+    # 那条 CLI 守卫在这里对段 3 是**误报**：软项真的在算，只是来源不是索引文件。
+    have_soft = bool(soft_index) or bool(v7_packed)
+    if not have_soft:
         if policy_loss == 'soft_ce':
             raise SystemExit(
-                '--policy-loss soft_ce 需要 --soft-index（否则 soft_mask 全 0，'
-                '软项恒 0 —— 训练照跑但什么也没学到）')
+                '--policy-loss soft_ce 需要软标签来源：要么 --soft-index，'
+                '要么用 V7 的 stdata 分片（--v7 1 + --data data/stdata_v7）。'
+                '否则 soft_mask 全 0，软项恒 0 —— 训练照跑但什么也没学到。')
         return policy_loss
     if policy_loss == 'huber':
         raise SystemExit(
-            '--policy-loss huber 与 --soft-index 互斥：huber 分支不消费软标签，'
+            '--policy-loss huber 与软标签互斥：huber 分支不消费软标签，'
             '组合起来会「以为在蒸馏、其实在回归 one-hot 概率」。段 2 请让 '
             '--soft-index 接管（它把 kind 派生为 soft_ce）。')
     return 'soft_ce'
@@ -1147,8 +1256,24 @@ def narrow_to_soft_rows(train_idx, dataset):
     ⚠ 收窄到 0 行必须**报错**而不是退回全量：静默退回正是本函数要防的那个
     失败模式（用户以为在跑段 2，实际在跑段 1）。
     """
+    # 🔴 先钉成 int64 再用。上游按棋局切分是 `np.array([...])` 的推导式，
+    #   当棋局数太少（`int(局数 * 0.98) == 0`）时它返回**空**数组，而
+    #   `np.array([])` 的 dtype 是 float64 —— 直接拿去索引会抛
+    #   「arrays used as indices must be of integer」，把「这批数据切不出
+    #   训练集」这件清楚的事报成一个 numpy 内部错误。
+    train_idx = np.asarray(train_idx, dtype=np.int64)
+    if train_idx.size == 0:
+        raise SystemExit(
+            '--soft-only-sampling 之前的**训练集就是空的**，所以无法收窄。\n'
+            '  最常见原因：按棋局切分要留 2% 做验证集，而这批数据棋局数太少'
+            '（`int(棋局数 * 0.98) == 0`）⇒ 全被划去验证集了。\n'
+            '  这与软标签无关，别去查软索引。')
     keep = dataset.soft_row_mask()
-    out = np.asarray(train_idx)[keep[np.asarray(train_idx)]]
+    if keep.shape[0] != len(dataset.moves):
+        raise SystemExit(
+            f'软标签掩码长度 {keep.shape[0]} ≠ 数据集行数 '
+            f'{len(dataset.moves)} ⇒ 软索引与数据不是同一份，别硬跑。')
+    out = train_idx[keep[train_idx]]
     if out.size == 0:
         raise SystemExit(
             '--soft-only-sampling 之后训练行为 0：软标签与训练集没有交集'
@@ -1511,7 +1636,8 @@ def _concat_dicts(dicts):
     return out
 
 
-def load_from_path(path, board_size, max_games_per_tgz=0, v7=False):
+def load_from_path(path, board_size, max_games_per_tgz=0, v7=False,
+                   games_npz=None):
     """加载训练数据。
 
     - ``v7=True``：**必须**是 ``stdata_to_npz.py`` 产出的 V7 分片
@@ -1526,13 +1652,41 @@ def load_from_path(path, board_size, max_games_per_tgz=0, v7=False):
       无需先手动 build_dataset 成单个 npz。
     """
     if v7:
-        from src.data.v7_packed_dataset import load_v7_packed
+        # `--v7 1` 下有两种**布局**，都走同一个 22 通道模型（5,562,121 参数）：
+        #
+        #   stdata 分片（含 spatial_packed）→ `V7PackedDataset`
+        #       22 通道已预算好并位打包，每行自带 KataGo 搜索分布（C 段用）
+        #   board 级语料（含 boards/my_hist/moves）→ `V7Dataset`
+        #       22 通道在训练时实时算，policy 目标是人类着法 one-hot（A/B 段用）
+        #
+        # ⚠ 两者不是替代关系，是**同一模型的不同数据源** —— 这样 A→B→C 才能
+        #   用 `load_state_dict` 连续承接（12 通道与 22 通道的 stem 形状不同，
+        #   跨不过去）。
+        #
+        # 判据用「文件里有没有 `spatial_packed`」而不是文件名：目录模式下
+        # 一个目录里可能同时躺着两种分片。
+        import numpy as _np
 
-        ds = load_v7_packed(path)
-        print(f"[data] V7 分片：{ds.describe()}")
-        return ds
+        def _looks_packed(p: str) -> bool:
+            try:
+                with _np.load(p, allow_pickle=False) as z:
+                    return 'spatial_packed' in z.files
+            except Exception:
+                return False
+
+        cands = ([path] if os.path.isfile(path)
+                 else sorted(glob.glob(os.path.join(path, '**', '*.npz'),
+                                      recursive=True)))
+        packed = [p for p in cands if _looks_packed(p)]
+        if packed:
+            from src.data.v7_packed_dataset import load_v7_packed
+
+            ds = load_v7_packed(packed[0] if len(packed) == 1 else path)
+            print(f"[data] V7 分片（预算特征）：{ds.describe()}")
+            return ds
+        # board 级：交给下面的常规路径，但升级成 V7Dataset
+        v7_board_level = True
     if os.path.isdir(path):
-        import glob
         tgzs = (sorted(glob.glob(os.path.join(path, '**', '*.tgz'), recursive=True))
                 + sorted(glob.glob(os.path.join(path, '**', '*.tar.gz'), recursive=True)))
         npzs = sorted(glob.glob(os.path.join(path, '**', '*.npz'), recursive=True))
@@ -1574,7 +1728,22 @@ def load_from_path(path, board_size, max_games_per_tgz=0, v7=False):
         merged = _concat_dicts(dicts)
         print(f"[data] 合并后样本数 {merged['boards'].shape[0]}")
         # 同 load_dataset：平面通道数随 KATAGO_SE_CFG 走（与模型侧同改）
+        if locals().get('v7_board_level'):
+            from src.data.v7_dataset import V7Dataset
+            return V7Dataset(merged, n_channels=KATAGO_SE_CFG['in_channels'],
+                             **_sidecar_kwargs(merged, games_npz))
         return SupervisedDataset(merged, n_channels=KATAGO_SE_CFG['in_channels'])
+    if locals().get('v7_board_level'):
+        from src.data.v7_dataset import V7Dataset
+        # `load_dataset` 返回的是**已构造好的 SupervisedDataset**，不是 dict。
+        # V7Dataset 是它的子类且只多两样东西（重建历史列 + 22 通道装配），
+        # 所以直接搬它已加载好的数组，比重新 np.load 一遍 469 MB 划算得多。
+        base = load_dataset(path)
+        return V7Dataset({k: getattr(base, k) for k in (
+            'boards', 'my_hist', 'op_hist', 'ko', 'moves', 'values', 'to_play',
+            'game_ids', 'game_weights', 'winrates') if hasattr(base, k)},
+            n_channels=KATAGO_SE_CFG['in_channels'],
+            **_sidecar_kwargs(base, games_npz))
     return load_dataset(path)
 
 
@@ -2995,6 +3164,20 @@ def main():
                     help='value head 学习率倍数（相对主干 LR，补偿参数量小的梯度不足）')
     ap.add_argument('--label-smoothing', type=float, default=0.1,
                     help='policy loss label smoothing（0=不平滑，0.1=标准值）')
+    # ---- 局级 sidecar（spec §5.3）：A/B 段的逐局贴目 --------------------------
+    ap.add_argument('--games-npz', default=None,
+                    help='局级 sidecar（scripts/build_games_sidecar.py 的产物，'
+                         '约 1.2 MB）。**只对 board 级数据有意义**（C 段 stdata '
+                         '分片的贴目在行里）。给了就把逐局 `g_komi` 接进 V7 的'
+                         '全局特征：全局 ch5（currentSelfKomi/20）与 ch18 的'
+                         '三角波都要它。不给 ⇒ 贴目按 0 处理（ch5 恒 0）。'
+                         '⚠ sidecar 按 **game_id** 索引，不是按行号；长度必须'
+                         '覆盖 game_ids.max()+1，短了当场报错而不是静默取到别局的贴目。'
+                         '⚠ `g_rules` 目前**接不进特征**（官方 calculateArea 只吃'
+                         '标量 rules_flags，逐局化会触发 "truth value is ambiguous"）——'
+                         '给了会报告有多少局规则与默认不同，那些局的空间特征仍按'
+                         '简单局算。')
+
     # ---- A4 · 软标签（KataGo 访问分布）四参数 --------------------------------
     # spec §3 A 组 / §5.7。这四个旗**只在给了 --soft-index 时有任何作用**；
     # 没给时下面每一条路径都逐位不变（段 1 的通路基线不受影响）。
@@ -3127,7 +3310,8 @@ def main():
     #   `load_from_path` 之前（坏组合不该先吃满内存）。两处顺序都有测试钉。
     _soft_on = bool(args.soft_index)
     _hard_policy_loss = args.policy_loss
-    _eff_kind = resolve_policy_loss_kind(args.policy_loss, args.soft_index)
+    _eff_kind = resolve_policy_loss_kind(args.policy_loss, args.soft_index,
+                                        v7_packed=bool(args.v7))
     if _eff_kind != _hard_policy_loss:
         logger.info("[soft] policy 损失口径 %s → %s（--soft-index 已给定）",
                     _hard_policy_loss, _eff_kind)
@@ -3148,13 +3332,17 @@ def main():
                 f'里的 n_sq={V7_BOARD_SIZE * V7_BOARD_SIZE} 都是钉死的），'
                 f'实得 {args.board_size}。')
         if _soft_on:
-            # 静默互相覆盖是最坏的一种失败：两条都开会让 `policy_player` 到底是
-            # 人类 one-hot 还是搜索分布变成「看实现顺序」，不报错、loss 照降。
-            raise SystemExit(
-                '--v7 与 --soft-index 互斥：V7 的 policy 目标走 `policy_player`'
-                '（人类 one-hot），而软标签是段 2 的口径。段 2 接 V7 软标签时'
-                '需要先决定「policy_player 取 soft 还是取 one-hot」并在这里'
-                '显式分支 —— 不是让两条链自己撞。')
+            # V7 的 policy 目标**按行二选一**（见 `KataGoV7Loss._soft_ce`）：
+            #   soft_mask=1 → 用 `soft` 的分布做软 CE
+            #   soft_mask=0 → 退回 `policy_player` 的 one-hot CE
+            #
+            # 这正是 A→B 能用**同一个模型**连续训练的前提：没命中软标签的行
+            # 照样学人类着法，逐行语义与段 1 完全一致，不存在「两种口径混在
+            # 一个 batch 里互相打架」。
+            logger.warning(
+                "[v7] + --soft-index：policy 目标按行二选一"
+                "（soft CE / one-hot 回退）；加 --soft-only-sampling 1 "
+                "则只采样命中行，软项量级与段 2 一致。")
         if args.value_loss_weight != 1.0:
             logger.warning("[v7] ⚠ --value-loss-weight=%s 在 V7 上**无效**：V7 的"
                            "value 是 `KataGoV7Loss` 内的 3 分类 CE（#3，系数 1.20），"
@@ -3251,7 +3439,23 @@ def main():
     # numpy（与 rank 无关），提前无语义影响；反向顺序（dist 初始化后再 fork）
     # 才是 HCCL 的危险方向，提前 fork 是安全的那一侧。
     dataset = load_from_path(args.data, args.board_size,
-                                args.max_games_per_tgz, v7=bool(args.v7))
+                                args.max_games_per_tgz, v7=bool(args.v7),
+                                games_npz=args.games_npz)
+    # ---- V7 分片的软标签是**内建**的 ⇒ 这里复算一次 policy 口径 -------------
+    # 上面那一次发生在数据集建好之前，只能看见 `--soft-index`；而段 3（stdata
+    # 分片）的 `soft` / `soft_mask` 直接来自行内，不需要索引文件。
+    #
+    # ⚠ 反过来也要把住：board 级 V7（A/B 段，数据来自 full.npz）**没有**内建软
+    #   标签，没挂 `--soft-index` 时的 `soft_mask` 恒为 0 —— 那时必须拒掉，
+    #   否则就是「以为在蒸馏、其实软项恒 0」。
+    if _v7_on:
+        _packed = hasattr(dataset, 'sample_spatial')
+        _eff_kind = resolve_policy_loss_kind(
+            args.policy_loss, args.soft_index, v7_packed=_packed)
+        if _eff_kind != _hard_policy_loss:
+            logger.info("[policy] 生效口径 %s（--policy-loss=%s，软标签来源=%s）",
+                        _eff_kind, _hard_policy_loss,
+                        'stdata 分片内建' if _packed else '--soft-index')
     # ---- A4 · 软标签挂载：**必须在 fork 之前** -----------------------------
     # 顺序是硬要求：软标签挂在 dataset 对象上，预取器 fork 之后再挂就只有父
     # 进程看得见，worker 会继续造 `soft_mask` 全 0 的批 —— 训练不报任何错，

@@ -72,6 +72,14 @@ LOSS_COEFFS = {
 }
 
 #: scorebelief 的桶数与中心（spec §4.4：桶数 = 2*(361+60) = 842，mid = 421）。
+#: 软标签 policy 项的**全局缩放**（对应 12 通路CLI 的 ``--soft-weight``）。
+#:
+#: ⚠ 它**不是** ``LOSS_COEFFS`` 里的一项 —— 那是「有哪些 term」的清单，加进去会
+#:   破坏 ``set(terms) == set(LOSS_COEFFS)`` 这条被测试钉住的不变量。
+#:   它是 policy 项的**量级旋钮**：软 CE 的分母恒为 B（不是 Σmask），所以软项
+#:   的量级随「本批软行占比」线性变化，需要一个固定系数把它标定回来。
+POLICY_SOFT_WEIGHT = 1.0
+
 SCORE_DISTR_BINS = 842
 SCORE_DISTR_MID = 421
 
@@ -304,17 +312,62 @@ class KataGoV7Loss(nn.Module):
 
         terms = {}
         logp = F.log_softmax(out['policy_logits'].float(), dim=-1)
+        w_soft = POLICY_SOFT_WEIGHT
+
+        def soft_ce(target, ch):
+            """某一通道的软 CE，口径与 12 通路 `soft_cross_entropy` 逐位一致。
+
+            ⚠ 逐行**二选一**（`mask=0` 的行贡献恰好 0，**不退化成 one-hot CE**）。
+            ⚠ 分母恒为 B（不是 Σmask）—— 软项量级随「本批软行占比」线性变化，
+              `policy_soft_weight` 就是标定量级的旋钮。
+            ⚠ 一律 fp32、绝不上 fp64（910A 无 fp64 硬件，设备侧 fp64 会挂 AICPU
+              且报错栈指向无关算子）。
+            """
+            tgt = T(target).reshape(-1, self.action_size)
+            per_row = -(tgt * logp[:, ch]).sum(-1)            # (B,)
+            mask = T(soft_mask).reshape(-1).to(per_row.dtype)
+            if mask.shape[0] != per_row.shape[0]:
+                raise ValueError(
+                    f'soft_mask 长度 {mask.shape[0]} 与 batch {per_row.shape[0]} 不符')
+            return w_soft * (per_row * mask).mean()
 
         # ---- 1 policy（系数 1.0，行权重恒 1）----
-        pi = self._policy_target(labels, 'policy_player', labels.get('moves'))
-        terms['policy'] = _weighted_mean(
-            -(pi * logp[:, 0]).sum(-1), None)
+        # 🔴 软标签（2026-10-04）：`labels['soft']` 形状是 **(B, A)**（只管
+        #    **通道 0 = π**），不是 (B,K,A)。stdata 分片里
+        #    `policy_player_prob` 存的就是 KataGo 搜索访问分布（实测一行
+        #    853/16/12/4/1/1，和 887），归一化后即是软标签。
+        #    缺席时退回 one-hot（board 级路径的老行为）。
+        soft = labels.get('soft')
+        soft_mask = labels.get('soft_mask')
+        # ⚠ `soft_mask` 全 0 是 `SupervisedDataset` 约定的「**本批无软标签**」
+        #   （未挂 `--soft-index` 时它就是全 0）。若照字面走软 CE，policy 会拿到
+        #   **恰好 0** 的梯度 —— 不报错、loss 照降、policy 根本没学。
+        #   所以「有没有软标签」以 mask 是否有命中为准，缺席时退回 one-hot。
+        #   `V7PackedDataset` 的 mask 恒为 1（stdata 每行都带 KataGo 搜索分布），
+        #   所以 C 段永远走软 CE；board 级路径没挂索引时永远走 one-hot。
+        #   两者都不会「时有时无」。
+        _has_soft = (soft is not None and soft_mask is not None
+                     and bool(torch.as_tensor(soft_mask).ne(0).any()))
+        if _has_soft:
+            terms['policy'] = soft_ce(soft, 0)
+        else:
+            pi = self._policy_target(labels, 'policy_player', labels.get('moves'))
+            terms['policy'] = _weighted_mean(
+                -(pi * logp[:, 0]).sum(-1), None)
 
         # ---- 2 π_opp（系数 0.15，局末手权重 0）----
-        pi_opp = self._policy_target(labels, 'policy_opp',
-                                     labels.get('next_move'))
-        terms['policy_opp'] = _weighted_mean(
-            -(pi_opp * logp[:, 1]).sum(-1), w_of('policy_opp'))
+        # 🔴 必须用**对手侧**的目标：`labels['soft_opp']`（来自分片的
+        #    `policy_opp_prob`）。旧实现拿 player 的着法去填这一项，
+        #    于是 #1 与 #2 拿到**同一个**目标，π_opp 白训。
+        soft_opp = labels.get('soft_opp')
+        if _has_soft and soft_opp is not None:
+            terms['policy_opp'] = _weighted_mean(
+                soft_ce(soft_opp, 1), w_of('policy_opp'))
+        else:
+            pi_opp = self._policy_target(labels, 'policy_opp',
+                                         labels.get('next_move'))
+            terms['policy_opp'] = _weighted_mean(
+                -(pi_opp * logp[:, 1]).sum(-1), w_of('policy_opp'))
 
         # ---- 3 value 三分类 CE（系数 1.20，行权重恒 1）----
         terms['value'] = _weighted_mean(F.cross_entropy(
