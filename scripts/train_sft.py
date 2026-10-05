@@ -1242,9 +1242,14 @@ def _locate_overflow(optimizer, logger, max_report=3, phase='unscale 后',
         logger.warning("[fp16] 溢出集中在 value head —— 优先下调 --value-loss-weight"
                        "（默认 1.0，无补偿）与 --value-lr-mult（默认 5.0）")
     if any(not b[4] for b in bad):
-        logger.warning("[fp16] 溢出涉及 backbone/policy —— 优先下调 --lr；"
-                       "NPU 上注意力被强制走 math 并物化 logits，"
-                       "可考虑调小 --attn-window 降低 logits 幅度")
+        logger.warning("[fp16] 溢出涉及 backbone/policy —— 优先下调 --lr。"
+                       "**不要**去调 --attn-window：V7 的 MHSA 没有窗口参数"
+                       "（该旗标只对 12 通道路径有意义，而它同样没接进建网，"
+                       "见 main() 里 V7 的 attn-window 提示与 "
+                       "tests/test_no_aicpu_ops_in_startup_check.py）。"
+                       "若报的是 nan（而不是 inf），先怀疑**前向**而非梯度："
+                       "GradScaler 只缩放梯度，NaN 一旦来自前向就不可恢复，"
+                       "降 scale 无用。")
 
 def _grads_nonfinite_local(optimizer):
     """本地：任一参数梯度里有 inf/nan？
@@ -4890,6 +4895,45 @@ def main():
                             logger.error(msg + '（首次出现该组合）')
                         else:
                             logger.debug(msg)
+                        # **被优化的量本身非有限 ⇒ 硬失败，不要继续跑。**
+                        #
+                        # `_tot_ok is False` 就是"加权总 loss 非有限"，而那正是
+                        # 反向要传播的标量。它非有限有两条完全不同的来路，必须分开：
+                        #
+                        #  · **前向就出了 NaN**（权重/激活越界）。这是**不可恢复**的：
+                        #    `GradScaler` 只管梯度，看不到前向；而 NaN 一旦进到权重，
+                        #    后续每步都是 NaN，`scaler.step` 会一直跳步 —— 于是
+                        #    「训练死了但还在跑」，日志上除 `loss=nan` 之外一切正常
+                        #    （速度、显存、耗时都稳），能白烧几小时。
+                        #  · **纯梯度溢出**。这个 GradScaler 管得住：跳步 + 减半，
+                        #    权重不动，下一步往往就干净了。
+                        #
+                        # 实测（2026-10-05 4×910A，lr 9.77e-3 / 4000 每卡）：
+                        # step 400 还好（lr 7.07e-3、scale 81920、skip=0），
+                        # step 430~440 loss=nan、scale 峰值 163840，
+                        # step 450 scale=10、skip=13 —— 减半 14 次**一次也没救回来**，
+                        # 因为病根在前向。梯度侧当时还有巨大余量（163840 都没溢出）。
+                        if _tot_ok is False:
+                            raise RuntimeError(
+                                '[v7] 加权总 loss 非有限（第 %d 次）⇒ 训练已不可恢复，'
+                                '中止以免白烧机时。\n'
+                                '  逐项点名 = %s\n'
+                                '  坏在操作数 = %s\n'
+                                '  被净化的坏行 = %s\n'
+                                '  此刻 scale = %s\n'
+                                ' **这几乎不是梯度溢出**（GradScaler 管得住那个，'
+                                '跳步减半即可）；这里是**前向**出了 NaN，'
+                                '而 GradScaler 只缩放梯度、管不到前向。\n'
+                                ' 判据：step 400 时 lr 7.07e-3、scale 81920、skip=0 '
+                                '仍健康，warmup 结束把 lr 顶上去后 10~20 步内炸 ⇒ '
+                                '峰值 LR 越过了 fp16 激活上限（65504）。\n'
+                                ' 处置：把 --lr 降到峰值的一半以下（实测余量只有 4%%：'
+                                '7.07e-3 健康、7.37e-3 即炸），必要时把 warmup 加长到'
+                                '总步数的 15%%~20%%。'
+                                % (_err_cnt, sorted(_bad_terms) or '（无）',
+                                   sorted(_bad_ops) or '（无）',
+                                   sorted(_san_rows.items()) or '（无）',
+                                   getattr(scaler, 'get_scale', lambda: 'n/a')()))
                     # 逐项上报用**独立**的 dict，而不是就地复用 `_v7_terms_last`：
                     #   那个 dict 同时喂 stdout 的 `[step N v7]` 行（键名是裸 term
                     #   名），若直接把带 `loss_v7/` 前缀的键塞进去，stdout 那行会
