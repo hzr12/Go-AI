@@ -653,58 +653,7 @@ def _sdpa(q, k, v, dropout_p=0.0, use_math=False, scale=None):
             dropout_p=dropout_p, causal=False)
         return out.transpose(1, 2)
     if use_math or not hasattr(F, "scaled_dot_product_attention"):
-        # 手写注意力：math 路径需手动缩放 q
-        if scale is not None:
-            q = q * scale
-        step = _attn_query_chunk
-        nq = q.shape[-2]
-        # query 分块（2026-10-01）：**峰值**显存由「同时活着的最大张量」决定，
-        # 不是总量。整条 (B,Hh,N,N) 分数矩阵在 N=361、4 head、fp16 下是
-        #   1000×4×361×361×2B = 0.97 GiB/份，softmax+dropout 再各留一份 ⇒
-        # 一次调用峰值约 2.9 GiB、反向要重取约 2 份。
-        # 而 softmax 沿 **key 轴**（dim=-1），每行 query 只跟自己那 N 个 key
-        # 有关 ⇒ 按 query 切块在数学上**精确**，峰值变成 ∝ chunk 而不是 ∝ N。
-        # chunk=64 时每份 0.97 → 0.17 GiB（5.6×）。
-        #
-        # 唯一的**行为**变化：`dropout_p > 0`（训练态）时 mask 的随机取样位置
-        # 会变（分布等价、**不逐位相同**）。eval 态 dropout 恒为 0（见
-        # `attn_drop_p`），故评估指标不受影响。
-        if step and nq > step:
-            kt = k.transpose(-2, -1)
-            outs = []
-            # **逐 chunk 梯度检查点**（2026-10-04 新增，为了真正省显存）。
-            #   分块只降**瞬时**峰值，**不降保留量** —— 每块的 softmax 输出
-            #   `(B,Hh,chunk,N)` 都被 autograd 存下来等反向，6 块加起来与
-            #   整条 `(B,Hh,N,N)` **一样多**。实测 V7（22 层注意力、N=361、4 头）
-            #   每样本每层 1.043 MB ⇒ B=3000 时约 68.8 GB。
-            #
-            #   为什么不能只靠 block 级 `torch.utils.checkpoint`：那依赖后端
-            #   autograd 的支持程度，而实测云端 910A 上 64 GB ≈ **无** checkpoint
-            #   的估算值（本地 CPU 上 checkpoint 是有效的：278.5 → 7.0 MB/样本，
-            #   40×）。逐 chunk 检查点把占大头的注意力矩阵从「保留」变成
-            #   「反向时一块一块重算」，**不依赖 block 级那层是否生效**。
-            #
-            # 行为变化只有一处：`dropout_p > 0` 时 mask 的取样位置会变
-            #     （分布等价、不逐位相同）。eval 态 dropout 恒 0，指标不受影响。
-            #     V7 的 `attn_dropout` 默认 0.0 ⇒ 这条对 V7 不适用。
-            use_ckpt = _attn_chunk_checkpoint and torch.is_grad_enabled() \
-                and q.requires_grad
-            for i in range(0, nq, step):
-                if use_ckpt:
-                    outs.append(torch.utils.checkpoint.checkpoint(
-                        _attn_chunk_fn, q[..., i:i + step, :], kt, v,
-                        dropout_p, use_reentrant=False))
-                else:
-                    a = (q[..., i:i + step, :] @ kt).softmax(dim=-1)
-                    if dropout_p > 0.0:
-                        a = torch.nn.functional.dropout(a, p=dropout_p)
-                    outs.append(a @ v)
-            return torch.cat(outs, dim=-2)
-        attn = (q @ k.transpose(-2, -1))
-        attn = attn.softmax(dim=-1)
-        if dropout_p > 0.0:
-            attn = torch.nn.functional.dropout(attn, p=dropout_p)
-        return attn @ v
+        return _sdpa_math(q, k, v, dropout_p=dropout_p, scale=scale)
     # SDPA 路径：SDPA 自带默认缩放 1/sqrt(d)，但 PyTorch>=2.1 支持显式 `scale=`。
     # 必须把调用方传入的 `scale` 透传进去，否则本函数会**无条件**套用 1/sqrt(d)：
     #   - 调用方传 `scale=None`（V7 的 MHSA，旧写法预乘过 q）⇒ 恰好 1/sqrt(d)，巧合正确
@@ -1499,3 +1448,76 @@ class TransformerBlock(nn.Module):
         h = self.fc2(F.gelu(self.fc1(h)))                    # (B, N, C)
         x = x + h.transpose(1, 2).reshape(B, C, H, W)        # 恒等捷径 2
         return x
+
+
+def _sdpa_math(q, k, v, dropout_p=0.0, scale=None):
+    """手写注意力（`_sdpa` 的 math 分支）：分块 + 逐 chunk 梯度检查点。
+
+    ## `dropout_p` 的来源（别把它当闸门看）
+
+    本函数**不**做任何 training 判断，只把形参原样用掉。它之所以受管，是因为
+    它的**所有**调用方传进来的都是 `self.attn_drop_p`
+    （= ``self.attn_drop if self.training else 0.0``）：
+
+    - `_sdpa` 的 math 路径（`use_math=True` / V100 / batch 超限 / 无 SDPA API）；
+    - `_sdpa` 的 SDPA 运行时回退（部分 CANN / 老 torch_npu 有 API 但调用即抛
+      ``RuntimeError``）。
+
+    闸门在**调用方**那一层，不在这里。所以 eval 下这里的 `dropout_p` 恒为 0.0，
+    行为证据见 `tests/test_attn_dropout_eval.py::
+    test_sdpa_runtime_fallback_respects_eval`（把 SDPA 打桩成必抛，验证 eval
+    下输出逐位可复现、train 下确实在丢）。
+    """
+
+    # 手写注意力：math 路径需手动缩放 q
+    if scale is not None:
+        q = q * scale
+    step = _attn_query_chunk
+    nq = q.shape[-2]
+    # query 分块（2026-10-01）：**峰值**显存由「同时活着的最大张量」决定，
+    # 不是总量。整条 (B,Hh,N,N) 分数矩阵在 N=361、4 head、fp16 下是
+    #   1000×4×361×361×2B = 0.97 GiB/份，softmax+dropout 再各留一份 ⇒
+    # 一次调用峰值约 2.9 GiB、反向要重取约 2 份。
+    # 而 softmax 沿 **key 轴**（dim=-1），每行 query 只跟自己那 N 个 key
+    # 有关 ⇒ 按 query 切块在数学上**精确**，峰值变成 ∝ chunk 而不是 ∝ N。
+    # chunk=64 时每份 0.97 → 0.17 GiB（5.6×）。
+    #
+    # 唯一的**行为**变化：`dropout_p > 0`（训练态）时 mask 的随机取样位置
+    # 会变（分布等价、**不逐位相同**）。eval 态 dropout 恒为 0（见
+    # `attn_drop_p`），故评估指标不受影响。
+    if step and nq > step:
+        kt = k.transpose(-2, -1)
+        outs = []
+        # **逐 chunk 梯度检查点**（2026-10-04 新增，为了真正省显存）。
+        #   分块只降**瞬时**峰值，**不降保留量** —— 每块的 softmax 输出
+        #   `(B,Hh,chunk,N)` 都被 autograd 存下来等反向，6 块加起来与
+        #   整条 `(B,Hh,N,N)` **一样多**。实测 V7（22 层注意力、N=361、4 头）
+        #   每样本每层 1.043 MB ⇒ B=3000 时约 68.8 GB。
+        #
+        #   为什么不能只靠 block 级 `torch.utils.checkpoint`：那依赖后端
+        #   autograd 的支持程度，而实测云端 910A 上 64 GB ≈ **无** checkpoint
+        #   的估算值（本地 CPU 上 checkpoint 是有效的：278.5 → 7.0 MB/样本，
+        #   40×）。逐 chunk 检查点把占大头的注意力矩阵从「保留」变成
+        #   「反向时一块一块重算」，**不依赖 block 级那层是否生效**。
+        #
+        # 行为变化只有一处：`dropout_p > 0` 时 mask 的取样位置会变
+        #     （分布等价、不逐位相同）。eval 态 dropout 恒 0，指标不受影响。
+        #     V7 的 `attn_dropout` 默认 0.0 ⇒ 这条对 V7 不适用。
+        use_ckpt = _attn_chunk_checkpoint and torch.is_grad_enabled() \
+            and q.requires_grad
+        for i in range(0, nq, step):
+            if use_ckpt:
+                outs.append(torch.utils.checkpoint.checkpoint(
+                    _attn_chunk_fn, q[..., i:i + step, :], kt, v,
+                    dropout_p, use_reentrant=False))
+            else:
+                a = (q[..., i:i + step, :] @ kt).softmax(dim=-1)
+                if dropout_p > 0.0:
+                    a = torch.nn.functional.dropout(a, p=dropout_p)
+                outs.append(a @ v)
+        return torch.cat(outs, dim=-2)
+    attn = (q @ k.transpose(-2, -1))
+    attn = attn.softmax(dim=-1)
+    if dropout_p > 0.0:
+        attn = torch.nn.functional.dropout(attn, p=dropout_p)
+    return attn @ v

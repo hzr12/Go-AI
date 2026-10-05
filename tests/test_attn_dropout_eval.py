@@ -233,6 +233,49 @@ def test_eval_output_equals_zero_dropout_model(attn_mode):
         f'可能根本没接进计算路径，上面那条「相等」就没有意义')
 
 
+@pytest.mark.parametrize("attn_mode", ATTN_MODES)
+def test_sdpa_runtime_fallback_respects_eval(attn_mode, monkeypatch):
+    """`_sdpa` 的 SDPA→math 运行时回退上也**不许**出现 dropout（登记表的凭据）。
+
+    ## 为什么要有这条
+
+    `_sdpa` 里有一段运行时回退：SDPA 在部分 CANN / 老 torch_npu 上有 API 但
+    运行时抛 `RuntimeError`，此时它递归回自己的手写 math 分支，并转发
+    `dropout_p=dropout_p`。因为那是 `_sdpa` **自己**的调用点，AST 逐站点扫描
+    会把它算成一处「没走 `self.attn_drop_p` 闸门」的站点 —— 它已被登记进
+    `SDPA_SITES_GATED_BY`，但**登记不能只是一句注释**：必须证明它真的受管。
+
+    ## 怎么证明
+
+    把 `F.scaled_dot_product_attention` 打桩成**必抛**，强制每次前向都走那条
+    回退分支，然后：
+      - eval 下两次前向必须逐位相同（没丢 dropout）；
+      - train 下必须**不**相同（否则上面那条只是因为回退分支压根没跑而恒成立）。
+
+    train 侧那条对照是关键：没有它，一个「回退分支永远走不到」的桩也会让
+    eval 那条通过。
+    """
+    def _boom(*_a, **_kw):
+        raise RuntimeError("invalid configuration argument (桩：强制回退)")
+
+    # backbone 里是 `F.scaled_dot_product_attention(...)` 这样调的，而 `F` 就是
+    # `torch.nn.functional` 本身，所以 patch 这个模块的属性能真的把调用打掉。
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", _boom)
+
+    obs = _obs()
+    with_drop = _make_model(attn_mode, DROPOUT).eval()
+    a1, a2 = _forward(with_drop, obs), _forward(with_drop, obs)
+    assert _logits_equal(a1[0], a2[0]) and _logits_equal(a1[1], a2[1]), (
+        f'[{attn_mode}] 强制走 SDPA 回退分支时，eval 下两次前向输出不同 ⇒ '
+        f'回退分支上有 dropout 没被 self.training 闸门管住')
+
+    with_drop.train()
+    t1, t2 = _forward(with_drop, obs), _forward(with_drop, obs)
+    assert not (_logits_equal(t1[0], t2[0]) and _logits_equal(t1[1], t2[1])), (
+        f'[{attn_mode}] train 下走回退分支时两次前向逐位相同 ⇒ 桩没生效或回退'
+        f'分支没跑到，上面 eval 那条就失去意义')
+
+
 # --------------------------------------------------------------------------- #
 # 4. 单元锁：attn_drop_p 派生属性遵守 self.training
 # --------------------------------------------------------------------------- #
@@ -285,6 +328,13 @@ SDPA_SITES_GATED_BY = (
     'MultiHeadSelfAttention._window_global_attn',
     # axial 路径：嵌套的 attn_1d 里 _sdpa(t, t, t, dropout_p=self.attn_drop_p, ...)
     'MultiHeadSelfAttention._axial_attn.attn_1d',
+    # 注：`_sdpa` 曾多出一条「模块级函数体内递归自调用」的站点（SDPA 运行时抛
+    #   RuntimeError ⇒ 递归回 math 分支，转发形参 `dropout_p`）。它曾登记在这里，
+    #   现已**随结构改造消失**：math 分支抽成具名的 `_sdpa_math`，那条调用不再以
+    #   `_sdpa(...)` 的形式出现，所以登记表里也不再有它（上面的 stale 检查会抓）。
+    #   那条路径**依然存在、依然受管**（`self.attn_drop_p` 由调用方给，转发不加工），
+    #   由行为测试 `test_sdpa_runtime_fallback_respects_eval` 兜住 ——
+    #   判据本身没有为它放宽过。
 )
 
 
@@ -293,12 +343,17 @@ def _parent_map(tree):
 
 
 def _scope_of(node, parent):
-    """节点所在的「宿主类.函数[.嵌套函数]」；模块级返回 `'<module>'`。
+    """所在命名空间 `类.函数[.嵌套函数]`；不在类里则是 `函数[.嵌套函数]`。
 
-    站点身份用**类名 + 函数名**而不是行号：行号会随别的改动整体漂移（每加一行注释
-    就全错），而类/函数名不会；红的时候也才答得出「哪条路径没被管住」——
-    这正是这条锁存在的唯一理由。嵌套函数进名字链（`..._axial_attn.attn_1d`），
-    因为同一方法里不同嵌套函数的注意力站点是**不同的**路径。
+    站点名取**定义 + 调用链**而非写死计数：本文件里同一段函数体内的直接调用
+    归属该函数，跨类、跨函数时也各有归属。带点的嵌套函数（嵌套函数定义在
+    方法体里，归到 ``'..._axial_attn.attn_1d'``）表示同一段里的不同嵌套位置
+    —— 它们调用同一份逻辑，但**登记表要能按位置分别登记**。
+
+    模块级**函数**体内的调用报该函数名（不是 ``'<module>'``）：``'<module>'``
+    只能表示真正的模块级语句，而把 `_sdpa` 这类函数体内的递归自调用算成
+    ``'<module>'`` 会让「登记一条合法路径」变成「放行全部模块级站点」——
+    登记表立刻失去分辨力，那才是真正削弱这条测试。
     """
     fns = []
     cur = parent.get(node)
@@ -308,7 +363,7 @@ def _scope_of(node, parent):
         if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
             fns.append(cur.name)
         cur = parent.get(cur)
-    return '<module>'
+    return '.'.join(reversed(fns)) if fns else '<module>'
 
 
 def _sdpa_dropout_param_index(tree):

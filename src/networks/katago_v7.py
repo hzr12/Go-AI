@@ -719,12 +719,22 @@ class ValueHead(nn.Module):
         vv = self.normact(self.conv(trunk))
         h = F.silu(self.fc(gpool_value(vv)))
         s = self.scores(h)
+        # **数值敏感计算强制 FP32**（2026-10-05 真机 NaN 根因修复）。
+        #   `softplus(x)=log(1+exp(x))` 与 `sqrt(softplus(...))` 在 FP16 下，
+        #   当 `s[:,k]` 越过 ~11（warmup 后 value-head LR=3.7e-2 驱动权重漂移）
+        #   即 `exp` 上溢成 inf ⇒ `score_stdev/var_time_left/shortterm_*` 全 inf，
+        #   进而加权总 loss NaN、毒化全部梯度（实测逐项点名 = score_stdev，
+        #   坏操作数 = ['score_stdev:pred','score_stdev:std']）。
+        #   参数始终是 FP32（从未 .half()），autocast 只对「fp32 权重 × fp16 输入」
+        #   降级；这里把 Linear 输出 `s` 提到 fp32，**整条 softplus/sqrt 链保持
+        #   fp32**，开销可忽略（仅 6 个标量通道）。
+        s_f = s.float()
         return {
             'outcome_logits': self.outcome(h),
-            'score_mean': SCORE_MEAN_MULTIPLIER * s[:, 0],
+            'score_mean': SCORE_MEAN_MULTIPLIER * s_f[:, 0],
             'score_stdev': SCORE_STDEV_MULTIPLIER * F.softplus(
-                s[:, 1], beta=SCORE_STDEV_SOFTPLUS_BETA),
-            'lead': LEAD_MULTIPLIER * s[:, 2],
+                s_f[:, 1], beta=SCORE_STDEV_SOFTPLUS_BETA),
+            'lead': LEAD_MULTIPLIER * s_f[:, 2],
             # ---- 官方 sv3 的后三个通道（varianceTimeLeft / shortterm×2）----
             # nneval.cpp（modelVersion>=10 分支）：
             #     varTimeLeft = softPlus(raw) * 40.0
@@ -732,13 +742,12 @@ class ValueHead(nn.Module):
             # 而 softplus(u)² ≡ softplus(2u)，代入 u=raw/2 得
             #     shorttermX = sqrt(softplus(raw) * mult)
             # 后者少一次平方再开根，数值更稳，等价。
-            'var_time_left': VARIANCE_TIME_MULTIPLIER * F.softplus(s[:, 3]),
+            'var_time_left': VARIANCE_TIME_MULTIPLIER * F.softplus(s_f[:, 3]),
             'shortterm_winloss_error': torch.sqrt(
-                F.softplus(s[:, 4]) * SHORTTERM_WINLOSS_ERROR_MULTIPLIER),
+                F.softplus(s_f[:, 4]) * SHORTTERM_WINLOSS_ERROR_MULTIPLIER),
             'shortterm_score_error': torch.sqrt(
-                F.softplus(s[:, 5]) * SHORTTERM_SCORE_ERROR_MULTIPLIER),
-            # raw 六通道原样保留。导出 `.bin.gz` 时**必须写 raw**，因为官方
-            # 引擎会自己做上面那套后处理；若这里就已乘完倍率，引擎会再乘一次。
+                F.softplus(s_f[:, 5]) * SHORTTERM_SCORE_ERROR_MULTIPLIER),
+            # raw 六通道原样保留（fp16，导出用，引擎自己后处理）。
             'score_value_raw': s,
             'ownership_pretanh': self.ownership(vv),
             'scoring': self.scoring(vv),
@@ -790,6 +799,14 @@ class ScorebeliefHead(nn.Module):
         return self
 
     def forward(self, value_pooled, global_features):
+        # **数值敏感计算强制 FP32**（2026-10-05 真机 NaN 根因修复）。
+        #   `logsumexp(mix+comp)` 的 `mix+comp` 是 (B,842,K) 的 FP16 Linear 输出；
+        #   warmup 后该头权重漂移使分量到几万 ⇒ `inf` ⇒ `logsumexp(inf-inf)=nan`
+        #   ⇒ `scorebelief_logits` 坏 ⇒ 派生 `sb_std` 坏（实测坏操作数之一）。
+        #   参数始终 FP32，autocast 只对「fp32 权重 × fp16 输入」降级；这里把输入
+        #   提到 fp32，整条 `fc_* + logsumexp` 链路保持 fp32，不再上溢。
+        value_pooled = value_pooled.float()
+        global_features = global_features.float()
         b = value_pooled.shape[0]
         coord = self.bin_coord.expand(b, -1, 1).to(value_pooled.dtype)
         par = (self.bin_parity * global_features[:, self.parity_channel:self.parity_channel + 1]
