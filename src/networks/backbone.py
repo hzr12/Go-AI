@@ -660,8 +660,21 @@ def _sdpa(q, k, v, dropout_p=0.0, use_math=False, scale=None):
     #   - 调用方传 `scale=self.scale`（本文件里 815/882/1040 三处）⇒ 被**忽略**，
     #     只剩 1/sqrt(d)。当 self.scale != 1/sqrt(head_dim) 时结果就是错的。
     # scale=None 时保持 SDPA 的原生默认（等价 1/sqrt(d)），向后兼容。
-    return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p,
-                                          scale=scale)
+    # 运行时兜底：部分怪 CANN / 老 torch_npu「有 API 但调用即抛 RuntimeError」
+    # （如 invalid configuration argument）。放开 NPU SDPA 后若撞上这类版本会直接
+    # 整训崩溃，故捕获一次并回退手写 math（与 set_sdpa_force_math 的静态判定互补）。
+    try:
+        return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p,
+                                              scale=scale)
+    except RuntimeError as _sdpa_err:
+        if _sdpa_force_math:
+            # 本就强制 math，不该走到这；如实抛出便于定位。
+            raise
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "[_sdpa] F.scaled_dot_product_attention 运行时失败，回退 math: %s",
+            _sdpa_err)
+        return _sdpa_math(q, k, v, dropout_p=dropout_p, scale=scale)
 
 
 # flash-attn 独立库的内核句柄（None=未启用）。由 train_sft.py 启动时按
@@ -737,6 +750,85 @@ def _attn_chunk_fn(qc, kt, v, dropout_p):
     if dropout_p > 0.0:
         a = torch.nn.functional.dropout(a, p=dropout_p)
     return a @ v
+
+
+# ---- online-softmax 注意力（flash 风格，不物化 (Nq,Nk) 注意力矩阵）----
+#: 是否启用 online-softmax 注意力（False ⇒ 回退 `_sdpa_math` 原 materialize
+#: 实现，仅用于数值对照）。由 `set_attn_online` / 训练脚本设置。
+_attn_online = True
+
+
+def set_attn_online(flag):
+    """开关 online-softmax 注意力（False = 回退原 materialize 实现，数值对照用）。"""
+    global _attn_online
+    _attn_online = bool(flag)
+
+
+class _OnlineSoftmaxAttn(torch.autograd.Function):
+    """flash 风格 online-softmax 注意力（纯 math，不物化 (Nq,Nk) 注意力矩阵）。
+
+    forward 在 ``no_grad`` 下沿 **K 维**流式分 tile 累积输出与统计量 ``(m, l)``，
+    注意力权重 ``P`` 不进入 autograd 图；backward 沿 K 重算 ``P`` 并用标准
+    softmax 反向公式累积梯度。``dropout_p`` 必须为 0 —— 训练态带 dropout 时
+    调用方应回退 `_sdpa_math` 的 materialize 路径（保证 dropout mask 行为）。
+
+    数值上 online 的 ``P = exp(s-m)/l`` 与标准 ``softmax(s)`` 等价（fp 下仅细微
+    差异），故 ``dropout=0`` 时与原 materialize 路径**逐位等价**。相比 materialize
+    路径它还带来两个好处：不把 ``(Nq,Nk)`` 矩阵留在 autograd 图里（省反向保留
+    显存），且 online rescaling 在 fp16 下比标准 softmax 更不易溢出。
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, v, scale):
+        # q:(B,Hh,Nq,d) k:(B,Hh,Nk,d) v:(B,Hh,Nk,dv)
+        if scale is None:
+            scale = 1.0
+        scale = float(scale)
+        B, Hh, Nq, d = q.shape
+        Nk = k.shape[-2]
+        dv = v.shape[-1]
+        tile = Nk if Nk <= 512 else 512
+        m = torch.full((B, Hh, Nq, 1), float('-inf'), dtype=q.dtype, device=q.device)
+        l = torch.zeros((B, Hh, Nq, 1), dtype=q.dtype, device=q.device)
+        acc = torch.zeros((B, Hh, Nq, dv), dtype=q.dtype, device=q.device)
+        with torch.no_grad():
+            for j in range(0, Nk, tile):
+                kj = k[..., j:j + tile, :]            # (B,Hh,tile,d)
+                vj = v[..., j:j + tile, :]            # (B,Hh,tile,dv)
+                s = (q @ kj.transpose(-2, -1)) * scale  # (B,Hh,Nq,tile)
+                m_new = torch.maximum(m, s.max(dim=-1, keepdim=True).values)
+                p = torch.exp(s - m_new)
+                l = l * torch.exp(m - m_new) + p.sum(dim=-1, keepdim=True)
+                acc = acc * torch.exp(m - m_new) + (p @ vj)
+                m = m_new
+            out = acc / l
+        ctx.save_for_backward(q, k, v, acc, l, m)
+        ctx.scale = scale
+        return out
+
+    @staticmethod
+    def backward(ctx, d_out):
+        q, k, v, acc, l, m = ctx.saved_tensors
+        scale = ctx.scale
+        Nk = k.shape[-2]
+        tile = Nk if Nk <= 512 else 512
+        dq = torch.zeros_like(q)
+        dk = torch.zeros_like(k)
+        dv = torch.zeros_like(v)
+        O = acc / l
+        D = (d_out * O).sum(dim=-1, keepdim=True)    # (B,Hh,Nq,1)
+        with torch.no_grad():
+            for j in range(0, Nk, tile):
+                kj = k[..., j:j + tile, :]
+                vj = v[..., j:j + tile, :]
+                s = (q @ kj.transpose(-2, -1)) * scale
+                p = torch.exp(s - m) / l              # (B,Hh,Nq,tile) = softmax(s)
+                dP = d_out @ vj.transpose(-2, -1)     # (B,Hh,Nq,tile)
+                dS = p * (dP - D)                     # softmax 反向
+                dq = dq + dS @ kj * scale
+                dk = dk + dS.transpose(-2, -1) @ (q * scale)
+                dv = dv + p.transpose(-2, -1) @ d_out
+        return dq, dk, dv, None
 
 
 def set_attn_query_chunk(n: int) -> None:
@@ -1469,11 +1561,25 @@ def _sdpa_math(q, k, v, dropout_p=0.0, scale=None):
     下输出逐位可复现、train 下确实在丢）。
     """
 
+    step = _attn_query_chunk
+    nq = q.shape[-2]
+
+    # online-softmax 分支（flash 风格）：仅 `dropout_p == 0` 时启用；训练态带
+    # dropout 回退下方 materialize 实现以保证 dropout mask 行为。不物化 (Nq,Nk)
+    # 注意力矩阵 ⇒ 反向不保留该矩阵（省显存），且 online rescaling 在 fp16 下更
+    # 不易溢出。数值上与标准 softmax 注意力逐位等价（dropout=0），见
+    # tests/test_online_softmax_attn.py。
+    use_online = _attn_online and dropout_p == 0.0
+    if use_online:
+        if step and nq > step:
+            outs = [_OnlineSoftmaxAttn.apply(
+                q[..., i:i + step, :], k, v, scale) for i in range(0, nq, step)]
+            return torch.cat(outs, dim=-2)
+        return _OnlineSoftmaxAttn.apply(q, k, v, scale)
+
     # 手写注意力：math 路径需手动缩放 q
     if scale is not None:
         q = q * scale
-    step = _attn_query_chunk
-    nq = q.shape[-2]
     # query 分块（2026-10-01）：**峰值**显存由「同时活着的最大张量」决定，
     # 不是总量。整条 (B,Hh,N,N) 分数矩阵在 N=361、4 head、fp16 下是
     #   1000×4×361×361×2B = 0.97 GiB/份，softmax+dropout 再各留一份 ⇒
