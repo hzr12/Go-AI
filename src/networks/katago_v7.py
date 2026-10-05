@@ -829,6 +829,17 @@ class NbtTfNet(GradCheckpointMixin, nn.Module):
     也能恢复 autocast（`backbone._checkpointed._recompute_ctx`）。
     """
 
+    #: 本模型是**双输入**网络：``forward(spatial, global_features)``，19 维全局
+    #: 特征走独立的 ``global_fc``，不经 stem。
+    #:
+    #: 声明成类属性而不是让调用方去猜（``in_channels == 22``、或者探 ``forward``
+    #: 签名），是因为「要不要第二路输入」是**架构属性**，与空间通道数是两件事：
+    #: 将来若出现另一种 22 通道布局，按通道数判断就会认错网络。
+    #:
+    #: `GoAI.needs_global_features` 与 `MCTS._v7` 都读它 —— 判定链是
+    #: 「网络声明 → GoAI 转述 → MCTS 采用」单源，不在下游各自复述一遍。
+    REQUIRES_GLOBAL_FEATURES = True
+
     GRAD_CHECKPOINT_KINDS = (GC_RES, GC_TRANSFORMER, GC_LEGACY,
                              GC_STEM, GC_HEADS)
     #: 三段默认全开。`GC_LEGACY` 保持 False（V7 没有混合 block 列表）。
