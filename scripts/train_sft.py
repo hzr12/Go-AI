@@ -3935,8 +3935,9 @@ def main():
     #                     V100(sm_70, Volta) -> float16（无 bf16）
     #   - use_scaler:      BF16 下关闭 GradScaler（不下溢）；FP16 下开启
     #   - use_channels_last: A100 卷积走 NHWC 更快；NPU/CPU 收益有限默认关
-    #   - sdpa_force_math: NPU 上 FlashAttention 后端不稳（CANN SDPA 与 CUDA 不同），
-    #                     强制走手写 math 注意力最稳；V100 同样强制 math；A100 走 Flash
+    #   - sdpa_force_math: NPU 默认放开 CANN 融合 SDPA（更省算力、fp32 累加更稳）；
+    #                     仅旧 torch_npu(<2.1)/SDPA API 缺失/GOAI_SDPA=0 才回退手写
+    #                     math。V100 同样强制 math；A100 走 FlashAttn。
     #   - compile_disable_sparse: 所有后端统一禁用——unfold 产生 (B, Hh*d, N, ws²) 巨型
     #                      中间张量，inductor freezing 常量折叠会以 fp32 物化
     #                      (B,N,Hh,ws²,d)（batch512 下单个 4.3GB）直接编译期 OOM；
@@ -3996,22 +3997,40 @@ def main():
         gpu_name = npu_get_device_name(_dev_idx)
         torch.set_num_threads(min(8, os.cpu_count() or 8))
         # 关键：按芯片型号选精度。910B/910Pro 原生 BF16；910A 无 BF16，必须走
-        # FP16 + GradScaler（与 V100 路径一致）。CANN 上 FlashAttention 后端不稳，
-        # 强制手写 math 注意力；channels_last 对 NPU 卷积无明确收益，关闭；
-        # torch.compile(inductor) 在 NPU 不可用，禁用。
+        # FP16 + GradScaler（与 V100 路径一致）。channels_last 对 NPU 卷积无明确收益，
+        # 关闭；torch.compile(inductor) 在 NPU 不可用，禁用。
+        # 注意力内核：CANN 8.0.RC3.20+ 的 F.scaled_dot_product_attention 融合 kernel
+        # （flash/mem-efficient 后端）已稳定，相比手写 math 大幅降注意力开销（c=），
+        # 且内部 fp32 累加、比 fp16 手写 math 更不易溢出（顺带缓解 warmup 后 NaN）。
+        # 默认放开走 SDPA；GOAI_SDPA=0 可强制回退手写 math（兼容旧 CANN/调试）。
+        # 仍受 _sdpa 内部 batch 上限保护（B>60000 自动回退 math）。
         if '910B' in gpu_name or '910Pro' in gpu_name or '910-2' in gpu_name:
             amp_dtype = torch.float16  # NPU autocast 仅支持 FP16
             use_scaler = True  # FP16 需要 GradScaler 防下溢
-            logger.info("[device] %s (NPU/CANN) | 910B 路径: FP16 + GradScaler + 手写 math "
-                        "注意力 + 禁用 torch.compile(inductor)", gpu_name)
+            logger.info("[device] %s (NPU/CANN) | 910B 路径: FP16 + GradScaler + "
+                        "CANN SDPA 融合注意力 + 禁用 torch.compile(inductor)", gpu_name)
         else:
             amp_dtype = torch.float16
             use_scaler = use_amp  # 910A 无 BF16，FP16 必须开 GradScaler
-            logger.info("[device] %s (NPU/CANN) | 910A 路径: FP16 + GradScaler + 手写 math "
-                        "注意力 + 禁用 torch.compile(inductor)", gpu_name)
+            logger.info("[device] %s (NPU/CANN) | 910A 路径: FP16 + GradScaler + "
+                        "CANN SDPA 融合注意力 + 禁用 torch.compile(inductor)", gpu_name)
         use_channels_last = False
-        sdpa_force_math = True
         compile_disable_sparse = True
+        # 注意力后端自动判断（仅 NPU 分支用，但变量供下方日志/backbone 统一取用）：
+        #   - 默认放开 SDPA（CANN 融合，省算力且更稳）；
+        #   - GOAI_SDPA=0 强制 math；
+        #   - SDPA API 缺失或 torch_npu<2.1（老 CANN）时回退 math。
+        _sdpa_wanted = os.environ.get('GOAI_SDPA', '1') != '0'
+        _sdpa_has_api = hasattr(torch.nn.functional, "scaled_dot_product_attention")
+        _sdpa_old_tnpu = False
+        try:
+            import torch_npu as _tnpu
+            _tnpu_ver = tuple(int(x) for x in _tnpu.__version__.split('.')[:2]
+                              if x.isdigit())
+            _sdpa_old_tnpu = _tnpu_ver < (2, 1)
+        except Exception:
+            _sdpa_old_tnpu = False
+        sdpa_force_math = (not _sdpa_wanted) or (not _sdpa_has_api) or _sdpa_old_tnpu
         if args.compile == 1:
             logger.warning("[device] NPU 上 torch.compile(inductor) 不可用，已忽略 --compile；"
                            "如需图编译请改用 --npu-graph-compile 1（TorchAir 后端）。")
@@ -4036,10 +4055,19 @@ def main():
     from src.networks import backbone as _backbone
     _backbone.set_sdpa_force_math(sdpa_force_math)
     _backbone.set_compile_disable_sparse(compile_disable_sparse)
+    # config 面板回填真实注意力后端：swanlab.init 在设备分支之前已上传写死的
+    # `attn_sdpa_force_math: True`，这里用运行时真值覆盖。CANN SDPA 放开后该键应为
+    # False。API 不支持 init 后更新时静默忽略，启动日志才是真相源。
+    if swanlab_logger is not None:
+        try:
+            swanlab_logger.config.update({"attn_sdpa_force_math": bool(sdpa_force_math)})
+        except Exception:
+            pass
     # 注意力 query 分块（2026-10-01）：math 路径下整条 (B,Hh,N,N) 分数矩阵
     # @N=361/4head/fp16 在 B=1000 时 0.97 GiB 一份、softmax+dropout 再各一份。
     # softmax 沿 key 轴 ⇒ 按 query 切块**数学精确**，峰值 ∝ chunk（默认 64 ⇒ 5.6×）。
-    # 只加在 math 分支（NPU 恒走 math），SDPA/flash 路径不受影响。
+    # 只加在 math 分支；SDPA/flash 融合路径自行管理显存，不受影响（NPU 默认已放开
+    # 走 CANN SDPA，故该分块在 NPU 上通常不再生效，见上方日志提示）。
     _attn_chunk = int(os.environ.get('GOAI_ATTN_QUERY_CHUNK', '64') or 0)
     _backbone.set_attn_query_chunk(_attn_chunk)
     # 逐 chunk 梯度检查点（2026-10-04 新增）：分块只降瞬时峰值，**不降保留量** ——
@@ -4067,12 +4095,13 @@ def main():
             logger.info("[env] 注意力内核: 手写 math（GOAI_FLASH=0 已禁用 flash）")
         else:
             logger.info("[env] 注意力内核: %s",
-                        "手写 math（%s 不支持 Flash）" % (_backend.upper(),)
-                        if sdpa_force_math else "内置 SDPA")
+                        ("手写 math（%s 不支持 Flash）" % _backend.upper())
+                        if sdpa_force_math else
+                        ("CANN SDPA 融合内核" if _backend == 'npu' else "内置 SDPA"))
             logger.info("[env] 注意力 query 分块: %s",
-                        "关闭" if _attn_chunk <= 0 else
-                        "%d（峰值 ∝ chunk；eval 逐位不变，训练态 dropout 取样位置变）"
-                        % _attn_chunk)
+                        "关闭（或走 SDPA 路径不生效）" if _attn_chunk <= 0 else
+                        "%d（仅手写 math 路径生效；峰值 ∝ chunk；eval 逐位不变，"
+                        "训练态 dropout 取样位置变）" % _attn_chunk)
 
     logger.info("启动训练 | torch=%s | device=%s | amp_dtype=%s scaler=%s channels_last=%s",
                 torch.__version__, device, amp_dtype, use_scaler, use_channels_last)
