@@ -44,6 +44,19 @@ class MCTSNode:
     expanded: bool = False
     proved: int = 0                 # MCTS-Solver：+1=to_play 必胜, -1=to_play 必败, 0=未知
     prefetch: Optional[tuple] = None  # worker 推测性预评估缓存 (policy_np, value_float)
+    #: 走到本节点那一步**之前**的盘面（`(n,n) int8`），以及再前一步的。
+    #:
+    #: 只有 V7（22 通道）用得上：ch15/ch16 要在**前手盘 / 前二手盘**上重算梯子。
+    #: 12..17 通道的 `feature_planes` 不看这两张盘面，在那边恒为 None。
+    #:
+    #: ⚠ 这两张盘面是**特征的一部分**，不是可选优化：少了它们 `ladder_channels`
+    #: 会回退到「在当前盘上算」，形状照样 22 通道、**不报任何错**，只是 ch15/ch16
+    #: 变成了当前盘的梯子。所以凡是算特征的地方都必须把它们算进缓存 key。
+    #:
+    #: 存**数组**而不是 GoBoard：每步都产生新盘面，持有 board 对象会把它的
+    #: undo 栈一起钉住，内存无界增长。两张 19×19 int8 各 361 字节，可忽略。
+    prev_board: Optional[np.ndarray] = None
+    prev_prev_board: Optional[np.ndarray] = None
 
     def q(self):
         """我方（to_play）视角的平均价值估计。"""
@@ -71,7 +84,8 @@ class MCTS:
                  leaf_ab_uncertain=0.85, priors_leaf=False,
                  dirichlet_alpha=0.0, dirichlet_eps=0.0,
                  dynamic_topk=True, dynamic_virtual_loss=True,
-                 policy_pruning_thresh=0.01, vector_backup=True):
+                  policy_pruning_thresh=0.01, vector_backup=True,
+                  komi=7.5, rules_flags=None):
         """
         Args:
             ai:            GoAI 实例（需支持 predict_batch）
@@ -109,6 +123,28 @@ class MCTS:
         self.ai = ai
         self.bs = board_size
         self.n_actions = board_size * board_size + 1
+        # ---- 局级标量：V7 的 19 维全局输入要用（12..17 通道完全不用）----
+        # 贴目/规则不是盘面状态，是「这局按什么规则下、贴多少目」。它们只喂给
+        # `v7_leaf_features`，与训练口径必须一致 —— 不一致时 ch5（selfKomi/20）
+        # 与 ch18（贴目奇偶波）全错，而**不会报任何错**。
+        self.komi = float(komi)
+        if rules_flags is None:
+            from src.data.feature_v7 import DEFAULT_RULES_FLAGS
+            rules_flags = DEFAULT_RULES_FLAGS
+        self.rules_flags = int(rules_flags)
+        #: 特征是否走 V7 路径（22 通道 + 第二路全局输入）。向模型问，不看通道数。
+        self._v7 = bool(getattr(ai, "needs_global_features", False))
+        if self._v7 and leaf_ab_depth > 0:
+            # leaf α-β 走 `lookahead.forward_level`，那条路用
+            # `feature_planes_batched` + 5 元组，造不出 22 通道、也带不了
+            # 19 维全局输入。接通它要改 `lookahead.py`（与 RL 共用的模块），
+            # 属于另一件事。这里**响亮拒绝**而不是静默按 12 通道跑 ——
+            # 后者会算出看着正常的着法，只是全错。
+            raise ValueError(
+                f"V7（22 通道 + 19 维全局输入）暂不支持 leaf α-β："
+                f"leaf_ab_depth={leaf_ab_depth}。请设 --leaf-ab-depth 0。"
+                f"原因：leaf α-β 经 lookahead.forward_level 造特征，那条路只走"
+                f"feature_planes 的 12..17 通道。")
         self.c_puct = c_puct
         self.virtual_loss = virtual_loss
         self.num_threads = max(1, num_threads)
@@ -237,8 +273,11 @@ class MCTS:
         """
         return self._in_channels()
 
-    def _planes1(self, board, my_hist, op_hist, to_play):
-        """单局面特征（通道数 = 模型 `in_channels`），带 LRU + TTL 缓存。
+    def _feature_inputs(self, board, my_hist, op_hist, to_play,
+                        prev_board=None, prev_prev_board=None):
+        """单局面特征 + （V7）全局特征，带 LRU + TTL 缓存。
+
+        返回 ``(planes, globals)``；12..17 通道下 `globals` 恒为 ``None``。
 
         P4.13b 起通道数由 `_in_channels()` 向所挂模型要，不再钉死 12：
         12 通道 checkpoint 拿 12（逐字节不变，见
@@ -246,11 +285,22 @@ class MCTS:
         通道数（占位构建器可造 17 档，见 `tests/test_mcts_in_channels.py`）。
         通道数与模型对不上的话，`GoAI.predict_batch` 的 F5 守卫会响亮地抛，
         不再靠这里「显式钉 12」去绕开形状错误。
+
+        ---- 缓存 key 必须含前两张盘面（V7）----
+        ch15/ch16 是**前手盘 / 前二手盘**上的梯子，所以同一个 `board.board` 配
+        不同的历史会得到**不同**的特征。key 里漏掉这两张盘面 ⇒ 两个节点撞上同
+        一条缓存 ⇒ 拿到别人的梯子通道，而形状完全正常、不报任何错。这类错比
+        崩溃难查得多，所以 key 的构造与 `MCTSNode` 上那两个字段是同一件事，
+        少改一处就出静默错配。
         """
-        # 缓存 key: 棋盘 hash + to_play（哈希 numpy 数组的 bytes）
+        # 缓存 key: 棋盘 hash + to_play（前手盘面一并纳入，见上）
         h_key = tuple(my_hist) if not my_hist or isinstance(my_hist[0], int) else tuple(tuple(h) for h in my_hist)
         oh_key = tuple(op_hist) if not op_hist or isinstance(op_hist[0], int) else tuple(tuple(h) for h in op_hist)
-        cache_key = (board.board.tobytes(), int(to_play), h_key, oh_key, board.ko_point)
+        pb_key = None if prev_board is None else prev_board.tobytes()
+        ppb_key = None if prev_prev_board is None else prev_prev_board.tobytes()
+        cache_key = (board.board.tobytes(), int(to_play), h_key, oh_key,
+                     board.ko_point, pb_key, ppb_key,
+                     self.komi, self.rules_flags)
         now = time.time()
         # 检查缓存（含 TTL）
         if cache_key in self._plane_cache:
@@ -261,18 +311,37 @@ class MCTS:
             else:
                 self._plane_cache.pop(cache_key, None)
                 self._plane_cache_ts.pop(cache_key, None)
-        planes = board.feature_planes_batched(
-            board.board[None], [list(my_hist)], [list(op_hist)],
-            [to_play], [board.ko_point], n_channels=self._in_channels())[0]
+        if self._v7:
+            from src.search.v7_features import v7_leaf_features
+            planes, gfeat = v7_leaf_features(
+                board, my_hist, op_hist, to_play,
+                prev_board=prev_board, prev_prev_board=prev_prev_board,
+                komi=self.komi, rules_flags=self.rules_flags)
+        else:
+            planes = board.feature_planes_batched(
+                board.board[None], [list(my_hist)], [list(op_hist)],
+                [to_play], [board.ko_point], n_channels=self._in_channels())[0]
+            gfeat = None
+        payload = (planes, gfeat)
         # LRU: 超过上限时淘汰一半
         if len(self._plane_cache) >= self._plane_cache_max:
             keys = list(self._plane_cache.keys())
-            for k in keys[:len(keys) // 2]:
+            for k in keys[:len(self._plane_cache) // 2]:
                 self._plane_cache.pop(k, None)
                 self._plane_cache_ts.pop(k, None)
-        self._plane_cache[cache_key] = planes
+        self._plane_cache[cache_key] = payload
         self._plane_cache_ts[cache_key] = now
-        return planes
+        return payload
+
+    def _planes1(self, board, my_hist, op_hist, to_play,
+                 prev_board=None, prev_prev_board=None):
+        """只要空间 planes 的薄封装（`lookahead` 等旧调用点用）。
+
+        通道数 = 模型 `in_channels`；V7 下走 `v7_leaf_features`。
+        """
+        return self._feature_inputs(board, my_hist, op_hist, to_play,
+                                     prev_board=prev_board,
+                                     prev_prev_board=prev_prev_board)[0]
 
     def _child_states(self, board, moves, my_hist, op_hist, to_play):
         """给定局面与候选着法，返回各子局面的 (GoBoard, my_h, op_h, to_play)。
@@ -374,9 +443,22 @@ class MCTS:
                 lp, leaf_v = leaf.prefetch
                 leaf.prefetch = None
             else:
-                leaf_planes = self._planes1(board, leaf.my_hist, leaf.op_hist, to_play)
-                lp, lv = self.ai.predict_batch(
-                    [(None, list(leaf.my_hist), list(leaf.op_hist), to_play, leaf_planes)])
+                # V7：planes 与 19 维全局输入必须**一起**交给 predict_batch
+                # （7 元组），少给一路就等于拿没见过的输入硬跑。
+                if self._v7:
+                    lsp, lg = self._feature_inputs(
+                        board, leaf.my_hist, leaf.op_hist, to_play,
+                        prev_board=leaf.prev_board,
+                        prev_prev_board=leaf.prev_prev_board)
+                    lp, lv = self.ai.predict_batch(
+                        [(None, list(leaf.my_hist), list(leaf.op_hist), to_play,
+                          lsp, lg)])
+                else:
+                    leaf_planes = self._planes1(board, leaf.my_hist, leaf.op_hist,
+                                                to_play)
+                    lp, lv = self.ai.predict_batch(
+                        [(None, list(leaf.my_hist), list(leaf.op_hist), to_play,
+                          leaf_planes)])
                 leaf_v = float(np.asarray(lv[0]).reshape(-1)[0])
 
             masked = np.zeros(self.n_actions, dtype=np.float64)
@@ -441,6 +523,10 @@ class MCTS:
         """
         child_boards, my_hs, op_hs, to_plays, kos, child_meta = [], [], [], [], [], []
         for mv in moves:
+            # 前一手盘 = **本步之前**的盘面。必须在下子之前快照：apply_action 会
+            # 就地改 board，等改完再存就存成了子局面，ch15/ch16 会静默变成
+            # 「子局面自己的梯子」。
+            prev_snap = board.board.copy() if self._v7 else None
             if not board.apply_action(mv):
                 continue  # 理论不应发生（候选来自合法掩码）
             child_to = -to_play
@@ -456,20 +542,37 @@ class MCTS:
                 # LightPLS 在 play 后、undo 前的子局面推演（内部自带只读拷贝）
                 rv = light_rollout(board, self._fast_policy,
                                    max_steps=self.rollout_steps, rng=self._rng)
-            child_meta.append((mv, child_to, my_h, op_h, rv))
+            child_meta.append((mv, child_to, my_h, op_h, rv, prev_snap))
+            # 必须把这一手撤回：循环下一个候选要在**同一个**父局面上试。
+            # 少了它，board 会带着上一手的落子继续往下走，第 2 个候选之后的
+            # 子局面全部从错误盘面算出来 —— 而 `child_boards` 是每轮单独
+            # snapshot 的，所以连形状都正常，只是内容全错。
             board.undo()
-
         if not child_meta:
             return []
-        # 向量化一次性构造整批子节点特征（通道数 = 所挂模型，见 _in_channels）
-        planes_batch = board.feature_planes_batched(
-            np.stack(child_boards), my_hs, op_hs, to_plays, kos,
-            n_channels=self._in_channels())
-        states = [(None, list(mh), list(oh), ct, planes_batch[i])
-                  for i, (mv, ct, mh, oh, rv) in enumerate(child_meta)]
+        if self._v7:
+            # V7：特征与 19 维全局输入**必须成对**算出来，所以这里逐子调
+            # `v7_leaf_features`（它一次给两份），不走下面那条
+            # `feature_planes_batched` 向量化路 —— 那条造不出 22 通道。
+            from src.search.v7_features import BoardView, v7_leaf_features
+            states = []
+            for i, (mv, child_to, my_h, op_h, _rv, prev_snap) in enumerate(child_meta):
+                view = BoardView(child_boards[i], self.bs, kos[i])
+                pl, gf = v7_leaf_features(
+                    view, list(my_h), list(op_h), child_to,
+                    prev_board=prev_snap, prev_prev_board=leaf.prev_board,
+                    komi=self.komi, rules_flags=self.rules_flags)
+                states.append((None, list(my_h), list(op_h), child_to, pl, gf))
+        else:
+            # 向量化一次性构造整批子节点特征（通道数 = 所挂模型，见 _in_channels）
+            planes_batch = board.feature_planes_batched(
+                np.stack(child_boards), my_hs, op_hs, to_plays, kos,
+                n_channels=self._in_channels())
+            states = [(None, list(mh), list(oh), ct, planes_batch[i])
+                      for i, (mv, ct, mh, oh, rv, _ps) in enumerate(child_meta)]
         policies, values = self.ai.predict_batch(states)
         leaf_view_vals = []
-        for i, (mv, child_to, my_h, op_h, rv) in enumerate(child_meta):
+        for i, (mv, child_to, my_h, op_h, rv, prev_snap) in enumerate(child_meta):
             prior = (priors[mv] if priors is not None
                      else float(np.asarray(policies[i, mv]).reshape(-1)[0]))
             # value 是 child.to_play 视角，取负即叶子（child 对手）视角
@@ -485,6 +588,11 @@ class MCTS:
                 move_int=mv,
                 parent=leaf,
                 prior=prior,
+                # 本节点的前一手盘 = 下这一步之前的盘面；前二手盘 = 叶子的
+                # 前一手盘。V7 的 ch15/ch16 靠这两张算，缺了就静默退化成
+                # 「在当前盘上算梯子」。
+                prev_board=prev_snap,
+                prev_prev_board=leaf.prev_board,
             )
             child.value_sum = net_v
             child.visit = 1
@@ -674,7 +782,21 @@ class MCTS:
 
         返回 ({mv: 根玩家视角价值}, 根 masked policy, 最佳 mv, 最佳价值) ——
         仍是 4 元组（纯函数侧多返回一个 `root_value`，webui 用不到，这里丢掉）。
+
+        ---- V7（22 通道）下**不支持** ----
+        `lookahead_mod.lookahead` 造特征走 `feature_planes_batched` + 5 元组，
+        造不出 22 通道、也带不了 19 维全局输入。接通它要改 `lookahead.py`
+        （与 RL 共用的纯函数模块），那是另一件事。这里响亮拒绝：webui 的
+        hybrid 模式在 V7 上请用 ``--mode mcts``。静默按 12 通道跑会算出看着
+        正常的着法，只是全错 —— 那比报错糟得多。
         """
+        if self._v7:
+            raise RuntimeError(
+                "V7（22 通道 + 19 维全局输入）暂不支持 lookahead 推演"
+                "（webui 的 hybrid 模式 / --mode lookahead）。"
+                "请改用 --mode mcts。原因：lookahead 造特征走 "
+                "feature_planes 的 12..17 通道，给不出 V7 需要的 22 通道与"
+                "全局输入。")
         res = lookahead_mod.lookahead(
             self.ai, board, my_hist, op_hist, to_play,
             n_actions=self.n_actions, n_channels=self._in_channels(),
@@ -855,14 +977,27 @@ class MCTS:
                         for nd in path[1:]:
                             if not pb.apply_action(nd.move_int):
                                 break
-                        planes = pb.feature_planes_batched(
-                            pb.board[None], [list(prefetch_leaf.my_hist)],
-                            [list(prefetch_leaf.op_hist)], [prefetch_leaf.to_play],
-                            [pb.ko_point], n_channels=self._in_channels())[0]
-                        pol, val = self.ai.predict_batch(
-                            [(None, list(prefetch_leaf.my_hist),
-                              list(prefetch_leaf.op_hist),
-                              prefetch_leaf.to_play, planes)])
+                        if self._v7:
+                            from src.search.v7_features import v7_leaf_features
+                            pl, gf = v7_leaf_features(
+                                pb, list(prefetch_leaf.my_hist),
+                                list(prefetch_leaf.op_hist), prefetch_leaf.to_play,
+                                prev_board=prefetch_leaf.prev_board,
+                                prev_prev_board=prefetch_leaf.prev_prev_board,
+                                komi=self.komi, rules_flags=self.rules_flags)
+                            pol, val = self.ai.predict_batch(
+                                [(None, list(prefetch_leaf.my_hist),
+                                  list(prefetch_leaf.op_hist),
+                                  prefetch_leaf.to_play, pl, gf)])
+                        else:
+                            planes = pb.feature_planes_batched(
+                                pb.board[None], [list(prefetch_leaf.my_hist)],
+                                [list(prefetch_leaf.op_hist)], [prefetch_leaf.to_play],
+                                [pb.ko_point], n_channels=self._in_channels())[0]
+                            pol, val = self.ai.predict_batch(
+                                [(None, list(prefetch_leaf.my_hist),
+                                  list(prefetch_leaf.op_hist),
+                                  prefetch_leaf.to_play, planes)])
                         prefetch_leaf.prefetch = (
                             np.asarray(pol[0]).reshape(-1),
                             float(np.asarray(val[0]).reshape(-1)[0]))
@@ -906,15 +1041,26 @@ class MCTS:
                     if leaf.prefetch is None and not leaf.expanded:
                         leaf_batch.append((pth, leaf))
                 if leaf_batch:
-                    # 批量计算 feature planes
+                    # 批量计算 feature planes（V7：planes + 19 维全局输入成对）
                     plane_list = []
                     for pth, leaf in leaf_batch:
                         replay_board = self._replay_path(pth)
                         leaf.board = replay_board
-                        planes = self._planes1(replay_board, leaf.my_hist,
-                                               leaf.op_hist, leaf.to_play)
-                        plane_list.append((None, list(leaf.my_hist),
-                                           list(leaf.op_hist), leaf.to_play, planes))
+                        if self._v7:
+                            lsp, lg = self._feature_inputs(
+                                replay_board, leaf.my_hist, leaf.op_hist,
+                                leaf.to_play,
+                                prev_board=leaf.prev_board,
+                                prev_prev_board=leaf.prev_prev_board)
+                            plane_list.append(
+                                (None, list(leaf.my_hist), list(leaf.op_hist),
+                                 leaf.to_play, lsp, lg))
+                        else:
+                            planes = self._planes1(replay_board, leaf.my_hist,
+                                                   leaf.op_hist, leaf.to_play)
+                            plane_list.append((None, list(leaf.my_hist),
+                                               list(leaf.op_hist), leaf.to_play,
+                                               planes))
                     # 一次 predict_batch 处理所有 leaf
                     all_pols, all_vals = self.ai.predict_batch(plane_list)
                     for i, (pth, leaf) in enumerate(leaf_batch):
