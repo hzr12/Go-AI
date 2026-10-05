@@ -36,6 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from src.inference import GoAI
 from src.search.mcts import MCTS
 from src.game.go_rules import GoBoard
+from src.engine.gtp_client import GTPError, KataGoGTP
 
 PASS = -1
 
@@ -47,8 +48,21 @@ class Session:
                  expand_topk=32, expand_chunk=8, solver_thresh=0.9,
                  spec_prefetch=True, leaf_ab_depth=0, leaf_ab_width=4,
                  priors_leaf=False, hybrid_sims=32, hybrid_blend=0.5,
-                 policy_depth=1, policy_width=4, policy_topk=12):
+                 policy_depth=1, policy_width=4, policy_topk=12,
+                 engine=None):
         self.ai = ai
+        #: 非 None 时 AI 走后端**KataGo 引擎**（GTP），原生 MCTS 不用。
+        #:
+        #: 为什么需要它：V7（22 通道 `NbtTfNet`）**跑不了原生 MCTS** ——
+        #: `go_rules.py::_check_n_channels` 硬性 12..17，而 22 通道里 ch14–17
+        #: 是梯子、ch18 要贴目，`feature_planes` 给不出来。硬放白名单的后果不是
+        #: 报错，而是模型拿到一份它没见过的输入却照样出着法。引擎这条路没有这个
+        #: 缺口（它按 `.bin.gz` 的结构描述自己造全部 22 通道）。
+        #:
+        #: ⚠ 引擎后端**拿不到 visits / 胜率 / 候选着法**（普通 GTP 没有这些，
+        #: `kata-analyze` 才有）。所以那三项一律留 `None` / 空，**不拿默认值冒充**
+        #: —— 编一个 0.5 就是在 UI 上展示看似正常的假数字。
+        self.engine = engine
         self.size = board_size
         self.lock = threading.Lock()
         self.mcts = MCTS(ai, board_size=board_size, num_threads=num_threads,
@@ -377,6 +391,9 @@ class Session:
             if self.board.current_player == self.human_color:
                 return {"error": "当前轮到人类"}
             mode = mode or self.default_mode
+            if self.engine is not None:
+                # 引擎后端**忽略 mode**：搜索在引擎里，webui 只负责同步棋盘与取着法。
+                return self._ai_move_engine()
             if mode == "policy":
                 return self._ai_move_policy()
             if mode == "hybrid":
@@ -435,6 +452,72 @@ class Session:
         self.analysis = self._build_analysis(info, self.candidates)
         self.log.append(info)
         self.wr_hist.append({"mc": self.move_count, "wr": ai_winrate})
+        return self.state()
+
+    def _engine_moves(self):
+        """本局已落子的 `[(color_letter, flat), ...]`，按 GTP 顺序。
+
+        **每次都从 `board.move_history` 全量重放**，不做增量同步：增量要处理
+        悔棋/改判/超时中止各种回退分支，而全量重放的唯一成本是几十条 `play`
+        （本机毫秒级），却不可能与棋盘走偏。
+        """
+        return [('b' if idx % 2 == 0 else 'w', int(mv))
+                for idx, mv in enumerate(self.board.move_history)]
+
+    def _ai_move_engine(self):
+        """AI 走后端 KataGo 引擎（GTP）。
+
+        **拿不到的东西一律留空**：visits / 胜率 / 候选着法。普通 GTP 没有这些
+        （`kata-analyze` 才有），编一个默认值就是在 UI 上放一个看似正常的假数字
+        —— 那正是这个仓一直在消灭的那类静默错误。所以：
+        `visits=None`、`ai_winrate=None`、`candidates=[]`、**不**往 `wr_hist`
+        追加数据点（没有就留空档，而不是画一条 0.5 的平线）。
+        """
+        to_play = self.board.current_player
+        color = 'b' if to_play == 1 else 'w'
+        t0 = time.perf_counter()
+        try:
+            self.engine.set_position(self._engine_moves(), to_move=color)
+            mv_play = self.engine.genmove(color)
+        except GTPError as e:
+            # 引擎起不来/崩了就**响亮**返回，不静默退化成随机走子
+            return {"error": "引擎不可用：%s" % e}
+        elapsed = time.perf_counter() - t0
+
+        if mv_play < 0:
+            self.game_over = True               # resign
+            info = {"move": "resign", "visits": None, "simulations": None,
+                    "ai_winrate": None, "elapsed": round(elapsed, 2),
+                    "sps": None, "mode": "engine", "backend": "katago-gtp"}
+            self.ai_info = info
+            self.analysis = None
+            self.log.append(info)
+            return self.state()
+
+        is_pass = (mv_play == self.size * self.size)
+        # 两套 pass 约定必须在这里翻译：GTP 用扁平下标 81（= N*N）表示 pass，
+        # 而 `_apply_move` 判 pass 的标准是 `mv < 0`。直接把 81 传下去，
+        # `board.play(81)` 会当成越界着点判非法**静默丢弃** —— 于是引擎明明
+        # 叫了 pass，棋盘上却什么都没发生。
+        self._apply_move(-1 if is_pass else mv_play, "ai")
+        mv_str = ("pass" if is_pass
+                  else "%s%s" % (chr(ord('a') + self.last_move[1]),
+                                 chr(ord('a') + self.last_move[0])))
+        info = {
+            "move": mv_str,
+            "visits": None,            # GTP 不提供 —— 见上面 docstring
+            "simulations": None,
+            "ai_winrate": None,        # 同上
+            "elapsed": round(elapsed, 2),
+            "sps": None,
+            "mode": "engine",
+            "backend": "katago-gtp",
+        }
+        self.candidates = []
+        self.ai_info = info
+        self.analysis = None          # 候选为空 ⇒ 没有可展示的分析
+        self.log.append(info)
+        # **不**追加 wr_hist：没有胜率就别画点。留空档比画一条假的平线诚实。
         return self.state()
 
     def _mv_to_str(self, mv):
@@ -1208,6 +1291,16 @@ def build_parser():
                     help="模型版本号 (用于 --model 默认值)")
     ap.add_argument("--board-size", type=int, default=19)
     ap.add_argument("--device", default="auto")
+    # ---- KataGo 引擎后端（V7 走这条；原生 MCTS 只支持 12/17 通道）----
+    ap.add_argument("--engine-gtp", default="",
+                    help="改用 KataGo 引擎当 AI 后端：给 V7 导出的 .bin.gz。"
+                         "留空则用原生 MCTS（仅 12/17 通道模型）。")
+    ap.add_argument("--engine-gtp-exe", default="",
+                    help="katago 可执行文件（默认在 katago/*/katago.exe）")
+    ap.add_argument("--engine-gtp-config", default="",
+                    help="引擎配置（默认 katago/*/default_gtp.cfg）")
+    ap.add_argument("--engine-komi", type=float, default=7.5,
+                    help="引擎后端的贴目；必须与训练口径一致")
     ap.add_argument("--port", type=int, default=7860)
     ap.add_argument("--num-threads", type=int, default=8, help="MCTS 选路径线程数")
     ap.add_argument("--mode", choices=["hybrid", "mcts", "policy"], default="hybrid",
@@ -1261,6 +1354,43 @@ def build_parser():
     return ap
 
 
+def _resolve_engine_paths(args):
+    """定位 katago 可执行文件与 GTP 配置；找不到就**响亮**失败。
+
+    不猜、不回落：悄悄换一个引擎比直接报错糟得多（模型和引擎版本对不上时，
+    你只会看到一堆莫名其妙的着法，没有任何线索指向版本不匹配）。
+    """
+    exe = args.engine_gtp_exe or _find_katago_exe()
+    if not exe:
+        raise SystemExit(
+            "[webui] 找不到 katago 可执行文件。请用 --engine-gtp-exe 指定，"
+            "或确认 katago/ 下有解压好的引擎。")
+    cfg = args.engine_gtp_config or _find_katago_cfg()
+    if not cfg:
+        raise SystemExit("[webui] 找不到 default_gtp.cfg，请用 --engine-gtp-config 指定。")
+    return exe, cfg
+
+
+def _find_katago_exe():
+    root = os.path.join(os.getcwd(), "katago")
+    if os.path.isdir(root):
+        for dirpath, _dirs, files in os.walk(root):
+            for f in files:
+                if f.lower() in ("katago.exe", "katago"):
+                    return os.path.join(dirpath, f)
+    return None
+
+
+def _find_katago_cfg():
+    root = os.path.join(os.getcwd(), "katago")
+    if os.path.isdir(root):
+        for dirpath, _dirs, files in os.walk(root):
+            for f in files:
+                if f == "default_gtp.cfg":
+                    return os.path.join(dirpath, f)
+    return None
+
+
 def main():
     args = build_parser().parse_args()
     # 兼容旧版 --model：未显式指定时按 --ver 推导默认权重路径
@@ -1281,26 +1411,55 @@ def main():
     except Exception as e:  # noqa: BLE001
         print(f"[warn] 线程配置失败（可忽略）: {e}")
 
+    # ---- KataGo 引擎后端 ----
+    # 给了 --engine-gtp 就**完全不建 GoAI**：原生 MCTS 那条路要求
+    # `feature_planes` 能造出模型声明的通道数，而 V7 是 22 通道（ch14–17 梯子、
+    # ch18 贴目），`go_rules.py::_check_n_channels` 只允许 12..17。引擎按
+    # `.bin.gz` 的结构描述自己造全部 22 通道，所以这条路才走得通。
+    engine = None
+    if args.engine_gtp:
+        exe, cfg = _resolve_engine_paths(args)
+        print(f"[webui] AI 后端 = KataGo 引擎\n       exe={exe}\n"
+              f"       model={args.engine_gtp}\n       config={cfg}")
+        engine = KataGoGTP(exe, args.engine_gtp, cfg, board_size=args.board_size,
+                           komi=args.engine_komi, timeout=300.0)
+        try:
+            engine.start()
+        except GTPError as e:
+            raise SystemExit("[webui] 引擎启动失败：%s" % e)
+        print("[webui] 引擎就绪。")
+
     # 量化/ONNX 与 torch.compile 互斥（量化编译后模型无意义）
     use_compile = args.compile and not (args.quantize or args.onnx)
-    ai = GoAI(model_path=model_path, board_size=args.board_size, device=args.device,
-              use_amp=True, attn_mode="window", attn_window=7,
-              compile=use_compile, tf32=args.tf32,
-              channels_last=(args.device.split(":")[0] == "cuda"),
-              policy_layers=args.policy_layers)
-    if args.quantize:
-        ai.quantize_dynamic()
-    # MCTS worker 线程数：必须 >1 才能启用 spec_prefetch 流水线
-    _ncpu = max(1, (os.cpu_count() or 1))
-    _nt = min(args.num_threads, _ncpu) if args.num_threads > 0 else _ncpu
-    if _nt <= 1 and not args.onnx:
-        print(f"[webui] 警告: --num-threads={_nt} 会禁用 spec_prefetch，推理显著变慢。"
-              f"建议 --num-threads {_ncpu}")
-    if args.onnx:
-        # ONNX intra_op 用满物理核（单次大 batch 吞吐最高）
-        _ort_intra = max(2, _ncpu)
-        ai.export_onnx(args.onnx, ort_intra_threads=_ort_intra, quantize_int8=args.onnx_int8)
-    session = Session(ai, board_size=ai.board_size, num_threads=_nt,
+    if engine is not None:
+        # 引擎后端下 `ai` 保持 None：原生 MCTS 用不到它，而建一个 GoAI 只会
+        # 把 22 通道权重硬塞进只支持 12..17 的 `feature_planes` 里报错。
+        # `MCTS(None, ...)` 是安全的 —— `use_rollout=False` 时它只在构造期存下
+        # `ai`，不会去问通道数。
+        ai = None
+        _bs = args.board_size
+        _nt = 1
+    else:
+        ai = GoAI(model_path=model_path, board_size=args.board_size, device=args.device,
+                  use_amp=True, attn_mode="window", attn_window=7,
+                  compile=use_compile, tf32=args.tf32,
+                  channels_last=(args.device.split(":")[0] == "cuda"),
+                  policy_layers=args.policy_layers)
+        if args.quantize:
+            ai.quantize_dynamic()
+        # MCTS worker 线程数：必须 >1 才能启用 spec_prefetch 流水线
+        _ncpu = max(1, (os.cpu_count() or 1))
+        _nt = min(args.num_threads, _ncpu) if args.num_threads > 0 else _ncpu
+        if _nt <= 1 and not args.onnx:
+            print(f"[webui] 警告: --num-threads={_nt} 会禁用 spec_prefetch，推理显著变慢。"
+                  f"建议 --num-threads {_ncpu}")
+        if args.onnx:
+            # ONNX intra_op 用满物理核（单次大 batch 吞吐最高）
+            _ort_intra = max(2, _ncpu)
+            ai.export_onnx(args.onnx, ort_intra_threads=_ort_intra,
+                           quantize_int8=args.onnx_int8)
+    session = Session(ai, board_size=_bs, num_threads=_nt,
+                      engine=engine,
                       default_mode=args.mode, expand_topk=args.expand_topk,
                       expand_chunk=args.expand_chunk,
                       solver_thresh=args.solver_thresh,
@@ -1317,6 +1476,11 @@ def main():
     session.mcts.rollout_lambda = args.rollout_lambda
     session.mcts.rollout_steps = args.rollout_steps
     if args.use_rollout:
+        if engine is not None:
+            # 引擎后端下没有 torch 模型，rollout 没地方拿策略；静默忽略等于
+            # 用户以为开了加速其实没开，所以直接拒绝。
+            raise SystemExit("[webui] --use-rollout 与 --engine-gtp 互斥"
+                             "（引擎搜索在 KataGo 内部，webui 侧不做 rollout）")
         # 通道数向**模型**要，且与搜索侧建特征同一个源：`mcts.n_channels`
         # 直接就是 `_in_channels()`（P4.13b 起「12 通道」在本路径上不再
         # 出现）。这里绝不写默认值：模型问不到通道数就该响亮地报错，而不是
@@ -1332,13 +1496,23 @@ def main():
 
     handler = build_handler(session, html_page)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
-    print(f"WebUI: http://127.0.0.1:{args.port}  (模型={args.model if model_path else '随机权重'}, "
-          f"设备={ai.device}, MCTS线程={_nt}, ONNX内部线程={_ort_intra if args.onnx else 'N/A'})")
+    if engine is not None:
+        _desc = f"AI后端=KataGo引擎({args.engine_gtp})"
+    else:
+        _desc = (f"模型={args.model if model_path else '随机权重'}, "
+                 f"设备={ai.device}, MCTS线程={_nt}, "
+                 f"ONNX内部线程={_ort_intra if args.onnx else 'N/A'}")
+    print(f"WebUI: http://127.0.0.1:{args.port}  ({_desc})")
     print("Ctrl+C 退出")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        # 引擎是常驻子进程：不清掉就会在关窗后留一个占着显存的 katago.exe
+        if engine is not None:
+            engine.close()
+            print("[webui] 引擎已关闭。")
 
 
 if __name__ == "__main__":
