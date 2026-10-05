@@ -57,6 +57,17 @@ _STEM_WEIGHT_KEYS = (
 
 _IN_CHANNEL_BUILDERS = {}
 
+#: `GoAI` 认识的输入通道数集合。
+#:
+#: 12..17 由 `GoBoard.feature_planes_batched` 供给；22 是 V7 的
+#: `fillRowV7` 空间通道数，必须由 `src/search/v7_features.py` 供给（还要额外的
+#: 19 维全局输入）。
+#:
+#: 刻意写成**集合**而不是区间：22 与 12..17 之间是「特征来源不同」的断裂，
+#: 写成 `range(12, 23)` 会把 18~21 也放进来，而那几档没有任何特征路径能供给
+#: —— 那正是「白名单放行、特征给不出」的静默错配。
+_SUPPORTED_IN_CHANNELS = frozenset({12, 13, 14, 15, 16, 17, 22})
+
 
 def _stem_in_channels(tensors):
     """从 state_dict 的张量**形状**读 stem 的 in 维；找不到可识别键返回 None。
@@ -250,7 +261,8 @@ class GoAI:
                  backbone_channels=128, backbone_res_blocks=12, policy_channels=32, value_channels=64,
                  attention_mode="mix", num_attention_layers=4, num_heads=4, attention_dropout=0.0,
                  attn_mode="global", attn_window=7, compile=False, tf32=False,
-                 channels_last=True, policy_layers=2, value_res_blocks=3):
+                 channels_last=True, policy_layers=2, value_res_blocks=3,
+                 komi=7.5, rules_flags=None):
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else (
                 "npu" if _ensure_torch_npu() and torch.npu.is_available() else "cpu")
@@ -266,6 +278,16 @@ class GoAI:
                   "math 注意力，勿开 --compile。若每次启动 warmup 都超过 1 分钟，"
                   "先执行 export ASCEND_CACHE_PATH=~/ascend_cache 持久化算子编译缓存")
         self.board_size = board_size
+        # ---- 局级标量：V7 的 19 维全局输入要用（12 通道路径完全不用）----
+        # 贴目/规则不是盘面状态，是「这局按什么下」。放这里是唯一的：全局特征
+        # 由 `needs_global_features` 那条路造，而那条路只有本类知道这两个值。
+        # 与训练口径必须一致，否则 ch5（selfKomi/20）与 ch18（贴目奇偶波）全错，
+        # 且**不会报任何错**。
+        self.komi = float(komi)
+        if rules_flags is None:
+            from src.data.feature_v7 import DEFAULT_RULES_FLAGS
+            rules_flags = DEFAULT_RULES_FLAGS
+        self.rules_flags = int(rules_flags)
         self._ort = None
         self._ort_dynamic_batch = False
         # 网络侧压：tf32 让 V100/Amp 上的 fp32 matmul 走 TensorFloat-32（约 2-4x 提速，
@@ -523,16 +545,25 @@ class GoAI:
         - 找不到任何可识别的 stem 键 → 返回 None，**调用方必须报错**（P4.8 fix
           轮改的：原为「回退旧默认 12 + 告警」，那条路会拿随机 12ch 模型去装
           一份陌生架构的权重并静默开跑）；
-        - stem 通道数越出 12..17（feature_planes 的白名单）→ ValueError：
+        - stem 通道数不在已支持集合里 → ValueError：
           特征端给不出对应通道，早失败优于前向时的形状错或静默错答案。
+
+        ---- 22 通道（V7）为什么也能过 ----
+        22 **不能**走 `feature_planes`：ch14~17 是梯子、ch18/19 要贴目，
+        `go_rules.py::_check_n_channels` 只允许 12..17。所以放行 22 的**同时**，
+        `_build_state` / `predict_batch` 必须改走
+        `src/search/v7_features.v7_leaf_features`（它还要带 19 维全局输入）。
+        绝不能只把 22 塞进白名单了事 —— 那会造出「模型声明 22 路、实际喂
+        12..17 路 feature_planes」的静默错配，正是本设计要消灭的那一类。
         """
         ic = _stem_in_channels(state)
         if ic is None:
             return None
-        if not (12 <= ic <= 17):
+        if ic not in _SUPPORTED_IN_CHANNELS:
             raise ValueError(
-                f"权重 stem 的 in_channels={ic} 超出支持范围 12..17"
-                f"（feature_planes 通道白名单），无法加载")
+                f"权重 stem 的 in_channels={ic} 不在已支持集合 "
+                f"{sorted(_SUPPORTED_IN_CHANNELS)} 内，无法加载"
+                f"（12..17 走 feature_planes；22 走 V7 特征路径）")
         return ic
 
     def _verify_loaded_state(self, incompatible, state):
@@ -586,17 +617,66 @@ class GoAI:
         """
         return self._in_channels
 
+    @property
+    def needs_global_features(self):
+        """本模型是否需要**第二路输入**（V7 的 19 维全局特征）。
+
+        **向模型问**（读网络自己的 `REQUIRES_GLOBAL_FEATURES` 声明），而不是
+        从 `in_channels == 22` 推：「要不要第二路输入」是架构属性，与空间通道数
+        是两件事；按通道数判断会在将来出现第二种 22 通道布局时认错网络。
+
+        未知（第三方网络没声明）时返回 False —— 单输入是本仓的默认契约，
+        缺声明不该把既有路径全打断；但真需要时会在前向处响亮报错，不会静默。
+        """
+        return bool(getattr(self.model, "REQUIRES_GLOBAL_FEATURES", False))
+
     # ------------------------------------------------------------------ #
     # 特征构造
     # ------------------------------------------------------------------ #
-    def _build_state(self, board, my_hist, op_hist, to_play, planes=None):
-        """用统一的 feature_planes 构造与模型通道数一致的状态张量。
+    def _features_for_state(self, board, my_hist, op_hist, to_play, planes=None,
+                            global_features=None, prev_board=None,
+                            prev_prev_board=None):
+        """特征构造的**唯一入口**：返回 ``(planes, global_features)``。
 
-        planes: 可选，预先算好的 (in_channels,H,W) np.ndarray。传入可避免重复
-        feature_planes 计算（MCTS 增量特征场景）。
-        通道数由 `_infer_in_channels` 从权重形状推断的 `self.in_channels` 驱动
-        （P4.3 临时钉的 `n_channels=12` 已改推断驱动，P4.8/P4.13）。
+        两处调用方（`_build_state` 单图推理、`predict_batch` 批量评估）都走它，
+        这样「22 通道必须换特征来源」这条规则只写一次。之前 `_build_state` 改了
+        而 `predict_batch` 没改，结果就是同一个模型在单图与批量两条路上拿到
+        不同口径的特征 —— 而批量那条是 MCTS 真正在用的那条。
+
+        `planes` 与 `global_features` 可以由调用方预好（搜索侧带缓存就是这么用的）。
+        但对需要第二路输入的模型，**两者必须同时有或同时没有**：只给 planes
+        意味着 19 路全局输入缺失，那两路是「形状对、内容错」，事后无法分辨。
+
+        返回的 `global_features` 在 12..17 通道下恒为 ``None``（那几档没有
+        第二路输入）。
         """
+        if self.needs_global_features:
+            has_planes = planes is not None
+            has_globals = global_features is not None
+            if has_planes != has_globals:
+                raise RuntimeError(
+                    f"模型需要 19 维全局输入（{self.in_channels} 通道 V7），"
+                    f"但 planes 与 global_features 只给了一路"
+                    f"（planes={'有' if has_planes else '无'} / "
+                    f"globals={'有' if has_globals else '无'}）。"
+                    f"两路必须成对：只给空间那一路，模型会拿 0 或缺失的全局"
+                    f"输入硬跑，形状正常、结果全错。")
+            if has_planes:
+                if board is not None and prev_board is not None:
+                    raise RuntimeError(
+                        "V7 特征：要么由调用方预计算（planes + global_features），"
+                        "要么给 board + 前两手盘面让这里算。两条路同时给，"
+                        "无法判断该信哪个。")
+                return planes, global_features
+            from src.search.v7_features import v7_leaf_features
+            return v7_leaf_features(
+                board, list(my_hist), list(op_hist), to_play,
+                prev_board=prev_board, prev_prev_board=prev_prev_board,
+                komi=self.komi, rules_flags=self.rules_flags)
+        if global_features is not None:
+            raise RuntimeError(
+                f"{self.in_channels} 通道模型没有第二路输入，却收到了 "
+                f"global_features —— 调用方大概把 V7 的特征对喂给了非 V7 网络。")
         if planes is None:
             planes = board.feature_planes_batched(
                 board.board[None], [list(my_hist)], [list(op_hist)],
@@ -605,65 +685,111 @@ class GoAI:
             raise RuntimeError(
                 f"预计算特征通道数不匹配：期望 {self.in_channels}"
                 f"（模型 in_channels），实际 {planes.shape[0]}")
+        return planes, None
+
+    def _build_state(self, board, my_hist, op_hist, to_play, planes=None,
+                     global_features=None, prev_board=None, prev_prev_board=None):
+        """构造与模型通道数一致的状态张量（单图推理用）。
+
+        planes: 可选，预先算好的 ``(in_channels,H,W)`` np.ndarray。传入可避免重复
+        特征计算（MCTS 增量特征场景）。
+        通道数由 `_infer_in_channels` 从权重形状推断的 `self.in_channels` 驱动
+        （P4.3 临时钉的 `n_channels=12` 已改推断驱动，P4.8/P4.13）。
+
+        需要第二路输入的模型（V7）返回 ``(x, g)`` 两个张量，否则返回单个 ``x``。
+        """
+        if global_features is not None:
+            planes, _ = self._features_for_state(
+                board, my_hist, op_hist, to_play, planes=planes,
+                prev_board=prev_board, prev_prev_board=prev_prev_board)
+        else:
+            planes, global_features = self._features_for_state(
+                board, my_hist, op_hist, to_play, planes=planes,
+                prev_board=prev_board, prev_prev_board=prev_prev_board)
         x = torch.from_numpy(np.ascontiguousarray(planes)).unsqueeze(0).to(self.device).float()
         if self.channels_last:
             x = x.to(memory_format=torch.channels_last)
-        return x
+        if global_features is None:
+            return x
+        g = (torch.from_numpy(np.ascontiguousarray(global_features))
+             .unsqueeze(0).to(self.device).float())
+        return x, g
 
     # ------------------------------------------------------------------ #
     # 核心：模型前向 + 采样
     # ------------------------------------------------------------------ #
-    def predict(self, board, my_hist, op_hist, to_play):
+    def predict(self, board, my_hist, op_hist, to_play, prev_board=None,
+                prev_prev_board=None):
         """单局面前向。返回 (policy_np, value)。
 
         policy_np: shape=(bs*bs+1,) 概率（已 softmax）
         value    : float, 当前 to_play 视角 [-1,1]
+
+        `prev_board` / `prev_prev_board` 只有需要第二路输入的模型（V7）用得上：
+        ch15/ch16 要在前手盘上重算梯子。12..17 通道忽略它们。
         """
-        x = self._build_state(board, my_hist, op_hist, to_play)
-        policy, value = self._forward_batch(x)
+        built = self._build_state(board, my_hist, op_hist, to_play,
+                                  prev_board=prev_board,
+                                  prev_prev_board=prev_prev_board)
+        x = built[0] if isinstance(built, tuple) else built
+        g = built[1] if isinstance(built, tuple) else None
+        policy, value = self._forward_batch(x, g)
         return policy[0], float(value[0].item())
 
     def predict_batch(self, states):
         """批量前向，MCTS 叶子评估的核心加速点。
 
         Args:
-            states: list[(board, my_hist, op_hist, to_play)] 或
-                    list[(None, my_hist, op_hist, to_play, planes)]（带预计算特征）
-                    长度 B
+            states: 三种形态，长度 B
+              - ``(board, my_hist, op_hist, to_play)``：特征现算。
+                需要第二路输入的模型（V7）此时**没有前两手盘面**，ch15/ch16 会
+                走「在当前盘上算」的回退路径 —— 形状正常、不报错，但语义不是
+                V7 该有的。搜索侧请用 6 元组。
+              - ``(board, my_hist, op_hist, to_play, planes)``：12..17 通道的
+                预计算空间特征（`feature_planes` 口径）。
+              - ``(board, my_hist, op_hist, to_play, planes, globals)``：V7 的
+                预计算**一对**特征。必须成对给：只给 planes 就等于把 22 路空间
+                喂给一个还要 19 路全局的网络，而那两路都是「形状对、内容错」。
         Returns:
             policies: np.ndarray (B, bs*bs+1) 已 softmax
             values : np.ndarray (B,) 当前 to_play 视角 [-1,1]
+
+        特征一律经 `_features_for_state` 造，所以 22 通道模型在这条路上与单图
+        推理（`predict`）拿到**同一口径**的特征 —— 两条路曾各造各的，批量那条
+        恰恰是 MCTS 真正在用的那条。
         """
         if not states:
             return np.zeros((0, self.board_size * self.board_size + 1)), np.zeros(0)
-        planes_list = []
+        planes_list, globals_list = [], []
         for st in states:
-            if len(st) == 5:
+            if len(st) == 6:
+                b, mh, oh, tp, planes, gfeat = st
+            elif len(st) == 5:
                 b, mh, oh, tp, planes = st
+                gfeat = None
             else:
                 b, mh, oh, tp = st
-                planes = None
-            if planes is None:
-                planes = b.feature_planes_batched(
-                    b.board[None], [list(mh)], [list(oh)], [tp], [b.ko_point],
-                    n_channels=self.in_channels)[0]
-            elif planes.shape[0] != self.in_channels:
-                # 失败模式 F5：MCTS 5 元组路径喂进来的预计算特征通道数与模型不符。
-                # 17ch 模型配现行 MCTS（那边还钉着 n_channels=12）就会落在这里。
-                #
-                # `src/search/mcts.py:905` 那个预取 worker 用
-                # `except Exception: prefetch_leaf.prefetch = None` 吞掉本异常
-                # —— **不要**把它「修」成只捕获特定异常或去掉：那层 except 存在的
-                # 理由是预取失败必须退回同步评估（叶子随后会在 evaluate 路径上重新
-                # 算一遍，异常在那里照常逃逸，正确性不漏）。它只是让用户看不到
-                # 这条诊断。真正的修法是把 mcts.py 那几处 `n_channels=12` 换成
-                # `self.ai.in_channels`（GoAI 已把它做成只读属性），而不是放宽这里。
-                raise RuntimeError(
-                    f"预计算特征通道数不匹配：期望 {self.in_channels}"
-                    f"（模型 in_channels），实际 {planes.shape[0]}")
+                planes, gfeat = None, None
+            planes, gfeat = self._features_for_state(b, mh, oh, tp,
+                                                     planes=planes,
+                                                     global_features=gfeat)
             planes_list.append(np.ascontiguousarray(planes, dtype=np.float32))
-        # ONNX 快速路径：全程 numpy，避免 numpy→torch→numpy 往返
+            globals_list.append(None if gfeat is None
+                                else np.ascontiguousarray(gfeat, dtype=np.float32))
+        need_g = self.needs_global_features
+        if need_g and any(g is None for g in globals_list):
+            raise RuntimeError(
+                f"模型需要 19 维全局输入，但有状态没造出全局特征。"
+                f"这通常意味着调用方按 4 元组传状态 —— V7 需要 7 元组"
+                f"(board, my_hist, op_hist, to_play, None, prev, prev_prev)，"
+                f"否则 ch15/ch16 会退化成当前盘的梯子，且不报任何错。")
+        # ONNX 快速路径：全程 numpy，避免 numpy→torch→numpy 往返。
+        # V7 是双输入，ONNX 导出/快速路径在支持它之前一律不走（下面显式拒绝）。
         if self._ort is not None:
+            if need_g:
+                raise RuntimeError(
+                    "ONNX 快速路径尚不支持需要第二路输入的模型（V7 双输入）。"
+                    "请去掉 --onnx 走原生前向。")
             xnp = np.stack(planes_list, axis=0)  # (B,in_channels,H,W)
             policies, values = self._forward_batch_onnx_numpy(xnp)
             return policies, values
@@ -671,7 +797,11 @@ class GoAI:
         x = x.to(self.device, non_blocking=True)
         if self.channels_last:
             x = x.to(memory_format=torch.channels_last)
-        policies, values = self._forward_batch(x)
+        g = None
+        if need_g:
+            g = torch.from_numpy(np.stack(globals_list, axis=0))
+            g = g.to(self.device, non_blocking=True)
+        policies, values = self._forward_batch(x, g)
         return policies, values.squeeze(-1).cpu().numpy().astype(np.float32)
 
     def _forward_batch_onnx_numpy(self, xnp):
@@ -696,14 +826,39 @@ class GoAI:
         pol /= pol.sum(axis=-1, keepdims=True)
         return pol, val.reshape(-1)
 
-    def _forward_batch(self, x):
-        """输入 (B,in_channels,H,W)，输出 (policies_np(B,A), values(B,1))。"""
+    def _forward_batch(self, x, global_features=None):
+        """输入 ``(B,in_channels,H,W)``（+ 可选 ``(B,19)`` 全局），返回
+        ``(policies_np(B,A), values(B,1))``。
+
+        ---- V7 的双输入与两处口径转换 ----
+        V7 的 `forward(spatial, global_features)` 返回一个 **dict**（不是
+        `(policy, value)` 元组），且两处口径必须显式转换，转换错都不报错、
+        只是结果全错：
+
+        - ``policy_logits`` 是 ``(B,2,A)``：``[:,0]`` 是本方策略 ``π``，
+          ``[:,1]`` 是对手策略 ``π_opp``。MCTS 要的是**本方**策略 ⇒ 取 ``[:,0]``。
+          取 ``[:,1]`` 会得到「对手会走哪」当作自己的策略，搜索方向直接反掉。
+        - value 不是标量回归，而是 ``outcome_logits (B,3)``。按 KataGo 官方口径
+          映射成标量：``P(win) - P(loss)``（中间那类是 draw/loss-not-determined，
+          自然被抵消）。这与本仓 12 通道路径的 tanh 标量 value 同一语义域
+          ``[-1,1]``，所以 MCTS 的 PUCT / value_sum / 符号约定都不用改。
+        """
         B = x.shape[0]
         if self.is_npu and B > 1:
             # batch 归桶补零：稳定算子形状，命中 CANN 编译缓存
             bucket = next((b for b in self._NPU_BATCH_BUCKETS if b >= B), None)
             if bucket is not None and bucket > B:
                 x = torch.cat([x, x.new_zeros(bucket - B, *x.shape[1:])], 0)
+                if global_features is not None:
+                    global_features = torch.cat(
+                        [global_features,
+                         global_features.new_zeros(bucket - B,
+                                                   *global_features.shape[1:])], 0)
+        if self.needs_global_features and global_features is None:
+            raise RuntimeError(
+                f"{type(self.model).__name__} 声明了 REQUIRES_GLOBAL_FEATURES，"
+                f"前向必须同时给第二路输入（V7 的 19 维全局特征）。缺它就是"
+                f"「拿一份没见过的输入硬跑」，不报错但结果全错，所以在这里拦。")
         with torch.inference_mode():
             if self.use_amp:
                 if self.is_npu:
@@ -711,17 +866,50 @@ class GoAI:
                     # 回退 torch.npu.amp.autocast()
                     try:
                         with torch.autocast(device_type="npu", dtype=torch.float16):
-                            policy_logits, value = self.model(x)
+                            out = self._model_forward(x, global_features)
                     except (RuntimeError, AttributeError, TypeError):
                         with torch.npu.amp.autocast():
-                            policy_logits, value = self.model(x)
+                            out = self._model_forward(x, global_features)
                 else:
                     with torch.cuda.amp.autocast():
-                        policy_logits, value = self.model(x)
+                        out = self._model_forward(x, global_features)
             else:
-                policy_logits, value = self.model(x)
+                out = self._model_forward(x, global_features)
+        policy_logits, value = self._split_model_output(out)
         policies = torch.softmax(policy_logits[:B], dim=-1).cpu().numpy()
         return policies, value[:B]
+
+    def _model_forward(self, x, global_features):
+        """按模型是否需要第二路输入调用 ``forward``。"""
+        if global_features is not None:
+            return self.model(x, global_features)
+        return self.model(x)
+
+    @staticmethod
+    def _split_model_output(out):
+        """把模型输出归一成 ``(policy_logits (B,A), value (B,1))``。
+
+        两种返回形态都要接：V7 返回 dict（`policy_logits` / `outcome_logits`），
+        12 通道等旧网络返回 ``(policy_logits, value)`` 元组。
+
+        V7 的两处口径转换（`policy_logits[:,0]` 取本方策略、outcome 三类映射成
+        ``P(win)-P(loss)``）都收在这里，别散到调用点 —— 散开的写法一定会有人
+        挑一条去抄。
+        """
+        if isinstance(out, dict):
+            pl = out["policy_logits"]
+            if pl.dim() == 3:
+                # (B,2,A) -> 取 [:,0]（本方 π；[:,1] 是对手 π_opp）
+                pl = pl[:, 0, :]
+            oc = out["outcome_logits"]
+            if oc.shape[-1] != 3:
+                raise RuntimeError(
+                    f"outcome_logits 最后一维是 {oc.shape[-1]}，期望 3。"
+                    f"V7 的标量 value 口径是 P(win)-P(loss)，只对三分类成立。")
+            p = torch.softmax(oc.float(), dim=-1)
+            return pl, (p[:, 0:1] - p[:, 2:3])
+        policy_logits, value = out
+        return policy_logits, value
 
     # ------------------------------------------------------------------ #
     # CPU 推理加速：int8 动态量化 / ONNX Runtime 后端
