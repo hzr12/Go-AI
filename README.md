@@ -139,10 +139,34 @@ A→B→C 的 `load_state_dict` 承接（strict 零缺失）。
 ```bash
 python scripts/export_katago_bin.py export --checkpoint models/ours.pth \
     --out tmp/coding/ours.bin.gz
-# 用引擎验证
+# 用引擎验证。注意仓库里**没有** analysis.cfg —— 现成的是
+#   analysis_batch.cfg / analysis_example.cfg / default_gtp.cfg
+# 且 logDir 是**相对引擎 CWD** 的，父目录不存在时引擎会直接
+#   Uncaught exception: Error creating directory 而退出。
 katago/katago-v1.18.1-opencl-windows-x64/katago.exe analysis \
-    -model tmp/coding/ours.bin.gz -config analysis.cfg
+    -model tmp/coding/ours.bin.gz -config analysis_batch.cfg
 ```
+
+**两条引擎验收已自动化**（2026-10-05 用真实 250 步权重
+`tmp/coding/a_v7_npu4.pth` 复核通过）：
+
+```bash
+python tmp/coding/smoke_katago_analysis.py   # run.txt 的验收口径
+python tmp/coding/smoke_katago_gtp.py        # 完整 GTP 命令序列
+```
+
+`analysis` 实测：`Model version 17` / `nbt transformer, 5545737 params`
+（与期望逐位相符），在**真实 OpenCL 设备**上推理（AMD `gfx90c`），非 CPU 回落。
+
+`GTP` 实测 **19/19 通过**：`protocol_version` / `name` / `version`（模型名往返
+正确）/ `list_commands` / `boardsize` / `clear_board` / `komi` / `showboard`（19×19
+渲染正确）/ `play` / **`genmove` 3/3 全部合法着点** / `undo` / `set_position` /
+`final_score` / `quit`。
+
+⚠ 写 GTP 冒烟脚本时踩过一个**给出全绿假象**的坑：GTP 响应是「若干行 + 空行终止」，
+只读一行会让后续每条命令**错位**（`version` 读到 `list_commands` 的内容），而汇总
+仍打「成功 19 / 失败 0」—— 因为错位拿到的也全是 `=` 开头。**务必读到空行。**
+另外 KataGo **没有** `place_free`，自由落子要用 `set_position`。
 
 导出 **5,545,737** 参数（V7 的 5,562,121 减去四个无对应物的自研头）。已实测：
 引擎报 `Model version 17` / `Model name: goai_v7 (nbt transformer, 5545737 params)`，
@@ -188,7 +212,7 @@ kernel tiling（`ATTN_BLOCK_Q` 256 vs 128、`CHANNELSTRIDE` 2 vs 1），fp16 累
 - **RL**：`scripts/selfplay_train.py`（PPO + lookahead，**MCTS 已在 2026-09-30 归档**，
   采集换成 N 步 minimax 推演）。
 
-### 2.5 推理层
+### 2.6 推理层
 
 `GoAI`（`src/inference.py`）按权重 stem 的形状读 `in_channels`，
 再查构建器注册表：`22 → NbtTfNet`、`12 → AlphaGoNet`。
@@ -236,6 +260,43 @@ ownership / scorebelief / varTimeLeft。B 段的软标签要 `--soft-index`；
 **不启用**：score 系（`#5/#6` scorebelief、`#8` scoremean、`#9` lead、`#10` scoring）
 与 `#4 ownership`、`#12 seki`。理由见 [§6.2](#62-段-1-为何不训-score)。
 
+### 3.4 fp16 下 V7 的 LR 稳定边界（**别用 run.txt 那条 LR 公式**）
+
+2026-10-05 实测（4×910A，段 A，`--batch-size 4000`/卡）：
+
+| step | lr | loss | scale | skip |
+|---:|---:|---|---:|---:|
+| 400 | 7.07e-03 | 12.3146 | 81920 | **0** |
+| 419 | ← warmup 结束（= 10% × 4198），LR 到顶 | | | |
+| 430~440 | ≈7.37e-03 | **nan** | 峰值 163840 | |
+| 450 | 7.37e-03 | nan | **10** | 13 |
+
+**从健康到爆炸，LR 只差 4.2%**（7.07e-3 健康、7.37e-3 即炸）。`7.07e-3` 不是
+「安全值」，只是**爬升段的顶端** —— 离峰值仅 19 步。
+
+**两层 fp16 天花板，只有一层被处理**：
+
+| 层 | 谁在管 | 后果 |
+|---|---|---|
+| 缩放后的**梯度**（65504） | `GradScaler` 跳步 + 减半 | 可恢复，每减半赔一步 |
+| 未缩放的**前向激活**（65504） | **无人管** | NaN，**不可恢复** |
+
+那次 `scale` 从 81920 峰值 163840 一路减到 10（**14 次减半，一次也没救回来**），
+而 `step 400` 时梯度侧还有巨大余量（163840 都没溢出）⇒ **瓶颈在前向**。
+诊断指纹也对得上：`inf=0 nan=全量`（每个参数张量的 nan 数等于它的元素数）。
+若是反向算子溢出则会是 `inf`；NaN 铺到 `stem`/`global_fc` 只可能来自前向。
+
+⚠ **`LR = 0.00356 × 有效batch / 2500` 那条公式对 V7 未标定**，照它算 4000×4=16000
+会得到 **0.0228**，比炸掉的值还高 2.3 倍。用 run.txt 里 4 卡的**实测**值
+**`0.00637`**（≈ 已知健康点的 65%，余量是观测余量的 8 倍）；仍不稳就把 warmup
+加到总步数的 15~20%。
+
+**前向 NaN 现在是硬失败**（`train_sft.py`，判据是 `total_finite is False` ——
+「被优化的那个标量非有限」，而**不是**「某项坏了」，否则段 A 那九项系数为 0、
+恒被净化的项会每步都炸）。抛出前带上逐项点名 / 坏在操作数 / 被净化的坏行 / 当前
+scale。没有这道闸门时，「训练死了但还在跑」—— 除 `loss=nan` 外日志一切正常
+（速度、显存、耗时都稳），能白烧 12 小时。
+
 ---
 
 ## 4. 当前进度
@@ -261,13 +322,15 @@ ownership / scorebelief / varTimeLeft。B 段的软标签要 `--soft-index`；
 | 22ch builder 注册 | ✅ | `src/inference.py:177` |
 | 12 项 loss 装配 | ✅ | `tests/test_katago_v7_loss.py` 24 项 |
 | V7 端到端冒烟 | ✅ 跑过 | 40 步，11/12 项下降；`score_stdev` **−0.0%** |
-| **`train_sft.py` 切 22 通道** | ⬜ **未做** | 现状仍建 `KATAGO_SE_CFG`（12ch / 9.11M） |
+| **`train_sft.py` 切 22 通道** | ✅ **已做** | `--v7 1` 走 `NbtTfNet`；4 卡 910A 实跑（2026-10） |
 | 软标签 CLI 接线 | ✅ 已做 | `--soft-index/--soft-weight/--soft-every/--soft-only-sampling/--policy-loss soft_ce` |
 | 邻行 gather（5 偏移）接线 | ✅ 已做 | ch14–17 与 futurepos 共用，纯 `boards` 索引 |
 | A/B/C 共用一个 V7 模型 | ✅ 已做 | `load_from_path(v7=1)` 按布局分派 + `--model` 承接，`tests/test_v7_single_model.py` |
 | V7 软 CE（含 π_opp 分离） | ✅ 已做 | `tests/test_v7_soft_ce.py`，逐位对齐 12 通路口径 |
+| 段 A 权重 → `.bin.gz` → 引擎 | ✅ **已打通** | 250 步真实权重；analysis `Model version 17` / 5545737 params；**GTP 19/19**、genmove 3/3 |
 | C 段（stdata）整轮正式训练 | ⬜ 未做 | 只有 64 行 CPU 冒烟跑通 |
-| A 段 / B 段正式训练 | ⬜ 未做 | 通路已通，待 910A 实跑 |
+| A 段整轮正式训练 | ⚠ **跑到 step 400 后炸** | `--lr 9.77e-3` 越过 fp16 前向上限；见 [§3.4](#34-fp16-下-v7-的-lr-稳定边界别用-runtxt-那条-lr-公式) |
+| B 段正式训练 | ⬜ 未做 | 通路已通 |
 | RL（段外） | ✅ 可跑 | 但 MCTS 已归档，采集走 lookahead |
 | 910A 融合注意力探针 | ⬜ 未做 | R1，见 [§7](#7-已知限制) |
 
@@ -512,3 +575,20 @@ B/C 段覆盖它**正是蒸馏的目的**。K=3 只在「同一部位两个 poli
     **别照抄 `python run.py sft` 的默认值。**
 12. **显存结论都标着「旧代」。** run.txt 里那张 4 卡 910A 账本是 v21 时代
     （184 通道）量的；V7 是 256 通道，换硬件前必须重新标定并先跑 50 步 smoke。
+    ⚠ **2026-10-05 实测：`v7_batch_memory_advice` 低估约 3.2 倍** —— 它预测
+    batch=1900 约 8.8 GB，实测 **28.28 GB**（64 GiB 卡的 44%；4000/卡时更到
+    91%）。后果是**那道启动前预检没能拦住占满卡的 batch**。在真机复测之前，
+    别把它当成放行依据。
+13. **多卡 fp16 必须自己归约溢出**（`train_sft.py::_scaler_step_global`）。
+    `GradScaler` 的 `found_inf` 是**纯本地**的：某 rank 有 inf 时它跳过、其余 rank
+    照常 `optimizer.step()` ⇒ **各 rank 权重从此永久不同**，之后每次 `all_reduce`
+    都在混合**四个不同模型**的梯度 —— 不是「少训几步」，是**训练从此无效**。
+    以 14% 的边际溢出率算，「四张卡同一步一起溢出」的概率极低 ⇒ 分叉几乎立刻发生。
+    RL 侧（`selfplay_train.py`）目前靠「缩放值有没有下降」判跳步，**只对单卡成立**；
+    将来上多卡 RL 必须换成同一个全局归约。
+14. **溢出诊断必须在 `clip_grad_norm_` 之前。** 它在 `total_norm = inf` 时算出
+    `clip_coef = 0` 并 `grad.mul_(0)` ⇒ `inf × 0 = NaN`，而 `inf ⇒ clip_coef < 1`
+    这个分支**一定会进** ⇒ clip 之后「inf 个数」**结构上恒为 0**，看到的 nan 全是
+    clipper 造的。排在 clip 之后就只能打出「溢出可能发生在已被释放的中间张量里」
+    —— **那是工具的盲区，不是关于计算的结论**，而且它会把排查带偏到反向与 loss
+    （2026-10-05 就被带偏过一次）。

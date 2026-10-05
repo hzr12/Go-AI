@@ -55,6 +55,23 @@ from src.networks.backbone import (
     _sdpa,
 )
 
+# ---- NPU 融合 SwiGLU（可选加速，带运行时回退）----------------------------
+# torch_npu 缺失或 npu_swiglu 不可用时，SwiGLU 退化为标准实现
+# （F.silu(up(x)) * gate(x) 再 down），数值行为完全不变。NPU 机上若 npu_swiglu
+# 因签名/设备异常而调用失败，forward 内 try/except 也会退回标准路径。
+try:
+    import torch_npu  # 仅在 NPU 环境可导入
+    _HAS_NPU_SWIGLU = hasattr(torch_npu, 'npu_swiglu')
+except Exception:
+    torch_npu = None
+    _HAS_NPU_SWIGLU = False
+
+
+def _npu_swiglu(x, w1, w2):
+    """torch_npu.npu_swiglu 薄封装：计算 silu(x@w1.T) * (x@w2.T)。"""
+    return torch_npu.npu_swiglu(x, w1, w2)
+
+
 #: spec §3 的形状常量。结构**只由这张表**决定（与 `train_sft.KATAGO_SE_CFG`
 #: 同一立场：结构不许由调用方零散覆盖）。
 NBT_TF_CFG = {
@@ -357,6 +374,18 @@ class SwiGLU(nn.Module):
         return self
 
     def forward(self, x):
+        # NPU 融合：npu_swiglu 把「up 投影 + SiLU + gate 门控」合成一个 kernel，
+        # 减少 kernel launch / 显存往返。数学上等价于下方标准路径（bias=False 的
+        # _ScaledLinear 的缩放已在 initialize 时 bake 进 weight，无运行时额外缩放）。
+        if x.device.type == 'npu' and _HAS_NPU_SWIGLU:
+            try:
+                return self.down(_npu_swiglu(x, self.up.weight, self.gate.weight))
+            except Exception as _e:
+                # 融合失败（签名/设备异常等）不要静默吞掉：至少告警一次，否则会
+                # 永远退回慢速但正确的标准路径，没人知道融合路径其实是坏的。
+                import logging
+                logging.getLogger(__name__).warning(
+                    "[SwiGLU] NPU 融合失败，退回标准路径: %s", _e)
         return self.down(F.silu(self.up(x)) * self.gate(x))
 
 

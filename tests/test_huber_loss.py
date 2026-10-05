@@ -1511,6 +1511,12 @@ def test_no_new_cli_params():
         # 段位权重仍**不**做成 CLI：V7 的段位表是常量
         #   （`V7_STAGE1_SCORE_TERMS`），理由同上。
         '--games-npz',
+        # ---- online-softmax 注意力开关（预先存在，补登记留痕）----
+        # `--attn-online`（默认 0）开启手写 math 注意力的 online-softmax（flash 风格）
+        # 实现，定义于 scripts/train_sft.py 的 argparse（约 line 3431）。该参数早于
+        # 本测试历次更新加入，当时未在冻结集留痕，导致本测试红；现补登。与 D1 门禁
+        # 哲学一致：登记是把"为什么有这个旗"钉死，后续改名/删除仍会在此报警。
+        '--attn-online',
     }
     got = set(kw)
     assert got == expected, (
@@ -1521,9 +1527,10 @@ def test_no_new_cli_params():
         + (f'  仅顺序不同（不算违规）: '
            f'{[k for k in kw if k in expected]}' if got == expected else ''))
     # 基线 = 61 原始 + A4 的 4 个软标签 + B8 的 `--v7` + 2026-10-04 的 `--games-npz`
-    assert len(expected) == 67, (
-        f'冻结的基线本身变了：{len(expected)} != 67'
-        f'（61 + A4 的 4 个 + B8 的 1 个 + --games-npz 的 1 个）')
+    #        + online-softmax 开关 `--attn-online`（补登）
+    assert len(expected) == 68, (
+        f'冻结的基线本身变了：{len(expected)} != 68'
+        f'（61 + A4 的 4 个 + B8 的 1 个 + --games-npz 的 1 个 + --attn-online 的 1 个）')
     # 特别地：L2 系数不许有独立参数，label smoothing 也不许有第二个旋钮
     for banned in ('--l2-coef', '--l2-weight', '--weight-decay-l2',
                    '--l2-report', '--label-smoothing-ce'):

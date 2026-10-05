@@ -20,11 +20,11 @@
  M scripts/train_sft.py            ← 仅 LF/CRLF 行尾差异，`git diff --ignore-all-space`
                                       为空，内容 == HEAD。无工作丢失（见 §1 末尾）。
  M scripts/webui.py                ← P4.8b
- M src/networks/backbone.py        ← P4.6b 梯度检查点，+421 行
+ M src/networks/backbone.py        ← 梯度检查点重构：删除 block 级 GC（GradCheckpointMixin/run_segment/逐 kind 开关/compile 守卫），改用标准 checkpoint_module 包裹各段
  M src/search/mcts.py              ← P4.8b 加只读属性 `MCTS.n_channels`
  M tests/test_attn_dropout_eval.py ← T2
  M tests/test_swanlab_logging.py   ← T1
-?? tests/test_grad_checkpointing.py     ← P4.6b 新增，1009 行，30 测试全绿
+~~ tests/test_grad_checkpointing.py     ← 已删除（block 级 GC 机制移除，BN guard 机制测试并入 tests/test_se_bottleneck.py）
 ?? tests/test_webui_rollout_channels.py ← P4.8b 新增，7 测试
 ?? .codegraph/                           ← 不要提交
 ```
@@ -33,15 +33,14 @@
 
 已实现内容速览（读代码为准，此处仅导航）：
 
-- **P4.6b** `src/networks/backbone.py`：
-  `GradCheckpointMixin`（`set_grad_checkpointing`）、kinds
-  `res/mamba/transformer/cross_attn_res/legacy`、`V21_GRAD_CHECKPOINT_DEFAULTS`
-  （res/mamba/transformer=True，cross_attn_res=False，legacy=False）、
-  `run_grad_segment(...)` 按「同类型连续块 = 一个段」分组、tap 作为段额外出参以保住
-  主干第 1/5/9 块输出、`_BatchNormStatGuard` + `context_fn` + `use_reentrant=False`
-  解决 BN 统计被重算污染、公开的 `assert_grad_checkpoint_compile_compatible()`
-  保住 P4.7 的 compile/checkpoint 互斥守卫。
-  测试 30 passed（21.2s），覆盖 brief 里点名的四条风险。
+- **P4.6b（已重构）** `src/networks/backbone.py`：
+  原 block 级 GC（`GradCheckpointMixin` + `run_segment` 的逐 kind 状态机、compile 互斥守卫）
+  已**删除**，改用标准 `torch.utils.checkpoint.checkpoint` 直接包裹各段（`checkpoint_module`），
+  保留使混合精度 checkpoint 正确的必要辅助：`_autocast_like`（重算恢复精度）+
+  `_BatchNormStatGuard`/`_collect_batchnorms`（BN 统计还原，determinism 不污染）。
+  开关是模型上的普通 bool 属性 `use_checkpoint`（训练态启用、eval/推理/图编译包裹路径自动关闭）。
+  原 GC 专用测试 `test_grad_checkpointing.py` 已删除，BN guard 机制测试并入
+  `tests/test_se_bottleneck.py`。
 - **P4.8b**：`MCTS.n_channels` property（委托 `_in_channels()`，保留缺失即 raise）；
   `webui.py:1319-1326` 用 `n_channels=session.mcts.n_channels` 重建 `FastPolicy`，
   无 `or 12` 回退；新测试 7 个用 AST/exec 真实 `if args.use_rollout:` 节点验证 17/12 通道。
@@ -74,11 +73,11 @@ FAILED tests/test_search_arch.py::test_calibration_is_self_consistent
 `scripts/search_arch.py` 都**没有被修改**（`git status` 干净），失败是 HEAD 之后的
 工作树改动引入的。667→704 的增量 = 新增 37 个测试（30 grad ckpt + 7 webui），
 所以这 2 个是**新回归**。最大嫌疑是 **P4.6b 给 `backbone.py` 默认开启的梯度检查点
-改变了 `S.measure()` 探测到的 saved-tensor / 显存计数**（`run_grad_segment` 默认对
-res/mamba/transformer 生效），而 `search_arch.py` 的显存计量正是拿实际前向/反向的
+改变了 `S.measure()` 探测到的 saved-tensor / 显存计数**（训练态 `use_checkpoint` 默认开，
+标准 `checkpoint_module` 包裹整段 blocks），而 `search_arch.py` 的显存计量正是拿实际前向/反向的
 saved tensors 做估计 —— 这与「标定因子从 0.83 涨到 1.35」方向一致。
 
-验证方法建议：在探针里临时 `model.set_grad_checkpointing(False)`（或对应构造参数）
+验证方法建议：在探针里临时把主干 `use_checkpoint` 置 False（或对应构造参数）
 后重跑这 2 个测试。若转绿 ⇒ 根因确认，需要决定：让 `search_arch.py` 的计量显式
 关闭检查点（推荐：**计量该反映哪一侧需要业主裁决**），而不是放宽断言区间。
 

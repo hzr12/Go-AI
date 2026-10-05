@@ -146,76 +146,20 @@ def is_valid_move(board: np.ndarray, move: int, current_player: int) -> bool:
     return True
 
 
-def augment_data(state: np.ndarray, policy: np.ndarray, board_size: int = 9):
-    """
-    数据增强（旋转和翻转）
-    
-    Args:
-        state: 状态
-        policy: 策略
-        board_size: 棋盘大小
-        
-    Returns:
-        增强后的数据列表
-    """
-    augmented_states = []
-    augmented_policies = []
-    
-    # 原始数据
-    augmented_states.append(state)
-    augmented_policies.append(policy)
-    
-    # 旋转90度
-    state_90 = np.rot90(state, axes=(1, 2))
-    policy_90 = np.rot90(policy.reshape(board_size, board_size)).flatten()
-    augmented_states.append(state_90)
-    augmented_policies.append(policy_90)
-    
-    # 旋转180度
-    state_180 = np.rot90(state, k=2, axes=(1, 2))
-    policy_180 = np.rot90(policy.reshape(board_size, board_size), k=2).flatten()
-    augmented_states.append(state_180)
-    augmented_policies.append(policy_180)
-    
-    # 旋转270度
-    state_270 = np.rot90(state, k=3, axes=(1, 2))
-    policy_270 = np.rot90(policy.reshape(board_size, board_size), k=3).flatten()
-    augmented_states.append(state_270)
-    augmented_policies.append(policy_270)
-    
-    # 水平翻转
-    state_hflip = np.flip(state, axis=2)
-    policy_hflip = np.flip(policy.reshape(board_size, board_size), axis=1).flatten()
-    augmented_states.append(state_hflip)
-    augmented_policies.append(policy_hflip)
-    
-    # 垂直翻转
-    state_vflip = np.flip(state, axis=1)
-    policy_vflip = np.flip(policy.reshape(board_size, board_size), axis=0).flatten()
-    augmented_states.append(state_vflip)
-    augmented_policies.append(policy_vflip)
-    
-    # 对角线翻转
-    state_diag = np.transpose(state, (0, 2, 1))
-    policy_diag = np.transpose(policy.reshape(board_size, board_size)).flatten()
-    augmented_states.append(state_diag)
-    augmented_policies.append(policy_diag)
-    
-    # 反对角线翻转
-    state_antidiag = np.flip(np.transpose(state, (0, 2, 1)), axis=2)
-    policy_antidiag = np.flip(np.transpose(policy.reshape(board_size, board_size)), axis=1).flatten()
-    augmented_states.append(state_antidiag)
-    augmented_policies.append(policy_antidiag)
-    
-    return augmented_states, augmented_policies
-
-
 def set_seed(seed: int = 42):
-    """设置随机种子"""
+    """设置随机种子（覆盖 numpy / python / torch / CUDA / NPU）。"""
+    import random
+    random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    try:
+        import torch_npu
+        if torch.npu.is_available():
+            torch.npu.manual_seed_all(seed)
+    except Exception:
+        pass
 
 
 def get_device(device_str: str = 'auto') -> torch.device:

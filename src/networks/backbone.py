@@ -14,6 +14,25 @@ import torch.utils.checkpoint  # noqa: F401  （`torch.utils.checkpoint` 的显�
 from src.networks.se_bottleneck import SEBottleneck
 
 
+# ---- NPU 融合 RMSNorm（可选加速，带运行时回退）----------------------------
+# torch_npu 缺失或 npu_rms_norm 不可用时，RMSNorm 退化为下方的标准实现
+# （含 fp16→fp32 硬化），数值行为完全不变。NPU 机上若 npu_rms_norm 因签名/
+# 设备异常而调用失败，forward 内的 try/except 也会退回标准路径，故融合不会
+# 破坏训练（最坏只是退回原速度）。
+try:
+    import torch_npu  # 仅在 NPU 环境可导入
+    _HAS_NPU_RMS_NORM = hasattr(torch_npu, 'npu_rms_norm')
+except Exception:
+    torch_npu = None
+    _HAS_NPU_RMS_NORM = False
+
+
+def _npu_rms_norm(x, weight, eps):
+    """torch_npu.npu_rms_norm 的薄封装，兼容返回 (out, invvar) 或 out 的版本差异。"""
+    out = torch_npu.npu_rms_norm(x, weight, eps)
+    return out[0] if isinstance(out, (tuple, list)) else out
+
+
 class RMSNorm(nn.Module):
     """RMSNorm（兼容 PyTorch 2.1，不依赖 nn.RMSNorm）。
 
@@ -27,24 +46,32 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
-        # fp16 下平方和必须在 fp32 上做。`x²` 在 x 超过约 256 时就撞上 fp16 的
-        # 65504 上限⇒ `mean` 变 inf ⇒ `rsqrt(inf)=0`，前向看着「有限」（全 0），
+        # NPU 融合路径：npu_rms_norm 把「平方+mean+rsqrt+乘权重」合成一个 kernel，
+        # 减少 kernel launch / 显存往返。fp16 仍先 cast 到 fp32 再算（保留下方标准
+        # 的硬化，避免 fp16 平方溢出），融合只改「执行方式」、不改数值。
+        if x.device.type == 'npu' and _HAS_NPU_RMS_NORM:
+            try:
+                if x.dtype == torch.float16:
+                    return _npu_rms_norm(x.float(), self.weight.float(), self.eps).to(x.dtype)
+                return _npu_rms_norm(x, self.weight, self.eps)
+            except Exception as _e:
+                # 融合失败（签名/设备异常等）不要静默吞掉：至少告警一次，否则会
+                # 永远退回慢速但正确的标准路径，没人知道融合路径其实是坏的。
+                import logging
+                logging.getLogger(__name__).warning(
+                    "[RMSNorm] NPU 融合失败，退回标准路径: %s", _e)
+        # RMS 一律在 fp32 中间量上算：`x²` 在 x 超过约 256 时就撞上 fp16 的
+        # 65504 上限 ⇒ `mean` 变 inf ⇒ `rsqrt(inf)=0`，前向看着「有限」（全 0），
         # 但**存下来给反向的是 inf**，梯度就再也回不到有限值 —— 而 GradScaler
         # 对这种与缩放值无关的 inf **无法恢复**（这正是真机「10240 一路降到
-        # 160仍 100% 跳过」那种表现的一种可能来源）。
-        #
-        # 910A 无 bf16、AMP 走 fp16，所以这条路径是现役的；V7 的
-        # `Nbt2TransformerBlock` 有 11 块 × 2 内块 × 2 个 norm = **44 处**走这里。
-        # 空间维那个孪生 `RMSNormMask` 早已因同样的理由硬化成 fp32，这里之前漏了。
-        #
-        # **只对 fp16 改**：bf16 的指数位与 fp32 相同（最大约 3.4e38），
-        # 不存在这个溢出，保持原样以免改变既有 bf16 数值；fp32/fp64 更是无需动。
-        if x.dtype == torch.float16:
-            xf = x.float()
-            rms = (xf.pow(2).mean(dim=-1, keepdim=True) + self.eps).rsqrt()
-            return (xf * rms * self.weight.float()).to(x.dtype)
-        rms = (x.pow(2).mean(dim=-1, keepdim=True) + self.eps).rsqrt()
-        return x * rms * self.weight
+        # 160仍 100% 跳过」那种表现的一种可能来源）。bf16/fp32/fp64 也走 fp32
+        # 中间量，避免任何 dtype 溢出，并保证「输出 dtype == 输入 dtype」：
+        # 此前 bf16 输入下因 `×weight(fp32)` 被提升成 fp32，会静默退化 fp32
+        # （autocast 不会拉回），在 bf16 autocast 设备上整条网络偷偷变 fp32。
+        # 统一到 fp32 中间量再 `.to(x.dtype)`，fp16 行为与此前逐位一致。
+        xf = x.float()
+        rms = (xf.pow(2).mean(dim=-1, keepdim=True) + self.eps).rsqrt()
+        return (xf * rms * self.weight.float()).to(x.dtype)
 
 
 class LayerNorm2d(nn.Module):
@@ -636,6 +663,7 @@ def _sdpa(q, k, v, dropout_p=0.0, use_math=False, scale=None):
         # flash-attn 只接受 fp16/bf16。正常由 autocast 保证 bf16；若上游发生 dtype
         # 泄漏（如 graph-break resume 段的 eager 重算），这里兜底转 bf16，避免
         # "FlashAttention only support fp16 and bf16 data type" 直接崩溃。
+        _flash_orig_dtype = q.dtype
         if q.dtype not in (torch.float16, torch.bfloat16):
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
@@ -651,7 +679,11 @@ def _sdpa(q, k, v, dropout_p=0.0, use_math=False, scale=None):
         out = _flash_attn_func(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
             dropout_p=dropout_p, causal=False)
-        return out.transpose(1, 2)
+        out = out.transpose(1, 2)
+        # 仅在原输入非 fp16/bf16（被兜底转 bf16）时转回，保持与 math/SDPA 路径一致的
+        # dtype；fp16/bf16 输入则维持 flash 原生输出（默认不开 flash，V7 走 force_math）。
+        return out.to(_flash_orig_dtype) if _flash_orig_dtype not in (
+            torch.float16, torch.bfloat16) else out
     if use_math or not hasattr(F, "scaled_dot_product_attention"):
         return _sdpa_math(q, k, v, dropout_p=dropout_p, scale=scale)
     # SDPA 路径：SDPA 自带默认缩放 1/sqrt(d)，但 PyTorch>=2.1 支持显式 `scale=`。
@@ -753,13 +785,30 @@ def _attn_chunk_fn(qc, kt, v, dropout_p):
 
 
 # ---- online-softmax 注意力（flash 风格，不物化 (Nq,Nk) 注意力矩阵）----
-#: 是否启用 online-softmax 注意力（False ⇒ 回退 `_sdpa_math` 原 materialize
-#: 实现，仅用于数值对照）。由 `set_attn_online` / 训练脚本设置。
-_attn_online = True
+#: 是否启用 online-softmax 注意力（False ⇒ 走 `_sdpa_math` 的 materialize 实现）。
+#: 由 `set_attn_online` / 训练脚本（`GOAI_ATTN_ONLINE=1`）设置。
+#:
+#: **默认 False**，虽然它已可用且有测试覆盖。三个理由：
+#:
+#: 1. **它不是逐位等价的** —— online 走 rescale 累加、materialize 走一次
+#:    softmax，算术次序不同，实测 fp32 下 `max|Δ| ≈ 7e-07`。而
+#:    `tests/test_mcts_in_channels.py::test_twelve_channel_path_bit_identical`
+#:    正是靠 12 通道路径**逐位一致**来发现意外的数值变化；默认打开会让那条
+#:    基线失效（实测 `search50_value` 漂到第 8 位有效数字）。
+#: 2. **真机未验证** —— bf16/fp16 内核在 910A 上的实际加速比与数值稳定性都还没有
+#:    数据，而 12 通道的 window/sparse 路径也走这里。
+#: 3. `dropout_p > 0` 时它本来就会回退 materialize（V7 的 `attn_dropout` 默认
+#:    0.0，所以这条不构成日常约束）—— 也就是说它**总是**在关键路径上生效，
+#:    默认开关必须保守。
+_attn_online = False
 
 
 def set_attn_online(flag):
-    """开关 online-softmax 注意力（False = 回退原 materialize 实现，数值对照用）。"""
+    """开关 online-softmax 注意力（False = 走 materialize 实现）。
+
+    打开前请先跑 `tests/test_online_softmax_attn.py`（前向等价 + 梯度 gradcheck），
+    并知道它会让 12 通道的 bit-identical 基线失效。
+    """
     global _attn_online
     _attn_online = bool(flag)
 
@@ -788,46 +837,70 @@ class _OnlineSoftmaxAttn(torch.autograd.Function):
         Nk = k.shape[-2]
         dv = v.shape[-1]
         tile = Nk if Nk <= 512 else 512
-        m = torch.full((B, Hh, Nq, 1), float('-inf'), dtype=q.dtype, device=q.device)
-        l = torch.zeros((B, Hh, Nq, 1), dtype=q.dtype, device=q.device)
-        acc = torch.zeros((B, Hh, Nq, dv), dtype=q.dtype, device=q.device)
+        # ---- 统计量与累加的 dtype：**至少 fp32**，但不降精度 ----
+        # `promote_types(q.dtype, float32)` 而不是写死 `float32`：
+        #  - fp16 / bf16 → fp32：autocast 下 `q @ kj.T` 出 bf16，若 m/l/acc 按
+        #    `q.dtype` 建就是 fp32 减 bf16，直接
+        #    `RuntimeError: expected m1 and m2 to have the same dtype`
+        #    （V7 head 重算那条用例就是这么炸的）；
+        #  - fp32 → fp32；
+        #  - **fp64 → fp64**：写死 fp32 会把 `gradcheck`（用 double）打挂 ——
+        #    `dS @ kj` 变成 fp32 混 fp64。降精度同样是一种静默的错。
+        # 而 **matmul 始终留在计算 dtype**（autocast 的低精度内核照用），不为
+        # 数值稳就把 GEMM 拉回 fp32 那种慢路径。
+        acc_dtype = torch.promote_types(q.dtype, torch.float32)
+        m = torch.full((B, Hh, Nq, 1), float('-inf'), dtype=acc_dtype,
+                       device=q.device)
+        l = torch.zeros((B, Hh, Nq, 1), dtype=acc_dtype, device=q.device)
+        acc = torch.zeros((B, Hh, Nq, dv), dtype=acc_dtype, device=q.device)
         with torch.no_grad():
             for j in range(0, Nk, tile):
                 kj = k[..., j:j + tile, :]            # (B,Hh,tile,d)
                 vj = v[..., j:j + tile, :]            # (B,Hh,tile,dv)
-                s = (q @ kj.transpose(-2, -1)) * scale  # (B,Hh,Nq,tile)
+                # GEMM 走计算 dtype（autocast 内核），随后升到 acc_dtype 做统计
+                s = ((q @ kj.transpose(-2, -1)) * scale).to(acc_dtype)
                 m_new = torch.maximum(m, s.max(dim=-1, keepdim=True).values)
-                p = torch.exp(s - m_new)
-                l = l * torch.exp(m - m_new) + p.sum(dim=-1, keepdim=True)
-                acc = acc * torch.exp(m - m_new) + (p @ vj)
+                p = torch.exp(s - m_new)              # ∈(0,1]
+                corr = torch.exp(m - m_new)           # 首轮为 exp(-inf)=0
+                l = l * corr + p.sum(dim=-1, keepdim=True)
+                # p 回到 vj 的 dtype 再做第二个 GEMM（acc 仍按 acc_dtype 累加）
+                acc = acc * corr + (p.to(vj.dtype) @ vj).to(acc_dtype)
                 m = m_new
             out = acc / l
         ctx.save_for_backward(q, k, v, acc, l, m)
         ctx.scale = scale
-        return out
+        ctx.acc_dtype = acc_dtype
+        # 输出回落到 q.dtype：调用方（MHSA）拿到的必须是它传进来的那个 dtype，
+        # 否则下一层 Linear 在 autocast 下会遇到意外 promotion。
+        return out.to(q.dtype)
 
     @staticmethod
     def backward(ctx, d_out):
         q, k, v, acc, l, m = ctx.saved_tensors
         scale = ctx.scale
+        acc_dtype = ctx.acc_dtype
         Nk = k.shape[-2]
         tile = Nk if Nk <= 512 else 512
         dq = torch.zeros_like(q)
         dk = torch.zeros_like(k)
         dv = torch.zeros_like(v)
         O = acc / l
-        D = (d_out * O).sum(dim=-1, keepdim=True)    # (B,Hh,Nq,1)
+        # d_out 是 q.dtype（可能低精度），D 必须按 acc_dtype 算 —— 与 forward 同口径
+        D = (d_out.to(acc_dtype) * O).sum(dim=-1, keepdim=True)   # (B,Hh,Nq,1)
         with torch.no_grad():
             for j in range(0, Nk, tile):
                 kj = k[..., j:j + tile, :]
                 vj = v[..., j:j + tile, :]
-                s = (q @ kj.transpose(-2, -1)) * scale
-                p = torch.exp(s - m) / l              # (B,Hh,Nq,tile) = softmax(s)
-                dP = d_out @ vj.transpose(-2, -1)     # (B,Hh,Nq,tile)
-                dS = p * (dP - D)                     # softmax 反向
-                dq = dq + dS @ kj * scale
-                dk = dk + dS.transpose(-2, -1) @ (q * scale)
-                dv = dv + p.transpose(-2, -1) @ d_out
+                s = ((q @ kj.transpose(-2, -1)) * scale).to(acc_dtype)
+                p = torch.exp(s - m) / l               # = softmax(s)
+                dP = (d_out @ vj.transpose(-2, -1)).to(acc_dtype)
+                dS = p * (dP - D)                      # softmax 反向
+                # dS 回到 kj 的 dtype 再做 GEMM：梯度按入参 dtype 累加，
+                # 不把 fp32 的中间结果直接加进 fp16 的 dq（那是隐式降精度）。
+                dq = dq + (dS.to(kj.dtype) @ kj) * scale
+                dk = dk + (dS.to(q.dtype).transpose(-2, -1)
+                           @ (q * scale))
+                dv = dv + (p.to(d_out.dtype).transpose(-2, -1) @ d_out)
         return dq, dk, dv, None
 
 
@@ -1567,8 +1640,9 @@ def _sdpa_math(q, k, v, dropout_p=0.0, scale=None):
     # online-softmax 分支（flash 风格）：仅 `dropout_p == 0` 时启用；训练态带
     # dropout 回退下方 materialize 实现以保证 dropout mask 行为。不物化 (Nq,Nk)
     # 注意力矩阵 ⇒ 反向不保留该矩阵（省显存），且 online rescaling 在 fp16 下更
-    # 不易溢出。数值上与标准 softmax 注意力逐位等价（dropout=0），见
-    # tests/test_online_softmax_attn.py。
+    # 不易溢出。**数值等价但非逐位相同**（实测 fp32 `max|Δ| ≈ 7e-07`），
+    # 所以默认关闭、由 `GOAI_ATTN_ONLINE=1` 显式打开；见 `_attn_online` 的理由
+    # 与 `tests/test_online_softmax_attn.py`（前向等价 + 梯度 gradcheck + bf16）。
     use_online = _attn_online and dropout_p == 0.0
     if use_online:
         if step and nq > step:

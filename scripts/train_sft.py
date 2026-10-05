@@ -2590,6 +2590,10 @@ def _init_swanlab(args, logger):
                 "scaler_growth_interval": args.scaler_growth_interval,
                 # ---- 注意力内核（决定显存口径，见 backbone._sdpa）----
                 "attn_sdpa_force_math": True,
+                # online-softmax 注意力开关：登记进来是为了**面板能看到本次到底
+                # 开没开**。静默的开关是排查噩梦 —— 尤其它与 materialize 路径
+                # 非逐位相同，出了问题得先知道它开过。
+                "attn_online": int(args.attn_online),
                 "attn_query_chunk": int(
                     os.environ.get('GOAI_ATTN_QUERY_CHUNK', '64') or 0),
                 # ---- 数据/运行 ----
@@ -3424,6 +3428,14 @@ def main():
                     help='注意力计算模式: global=全配对, window=块状窗口, '
                          'sparse=窗口+全局token, window_global=块状窗口+全局token(手写math)')
     ap.add_argument('--attn-window', type=int, default=7, help='window 模式窗口边长')
+    ap.add_argument('--attn-online', type=int, default=0, choices=[0, 1],
+                    help='手写 math 注意力改用 online-softmax（flash 风格）实现：'
+                         '不物化 (Nq,Nk) 分数矩阵 ⇒ 反向不保留它（省显存），'
+                         '且最大值被归一、低精度下更不易溢出（0=关闭，1=开启）。'
+                         '与 materialize 路径**数值等价但非逐位相同**'
+                         '（实测 fp32 max|Δ|≈7e-07），开启会让 12 通道的 '
+                         'test_twelve_channel_path_bit_identical 基线失效；'
+                         '真机加速比尚未实测，故默认关闭')
     ap.add_argument('--eval-every', type=int, default=5000)
     ap.add_argument('--eval-max-batches', type=int, default=50,
                     help='验证集评估最多跑多少个 batch；<=0 表示不截断（跑满全部验证集）')
@@ -4078,6 +4090,21 @@ def main():
     _chunk_ckpt = os.environ.get('GOAI_ATTN_CHUNK_CKPT', '1') != '0'
     _backbone.set_attn_chunk_checkpoint(int(_chunk_ckpt))
 
+    # online-softmax 注意力（flash 风格）：由 `--attn-online` 控制（默认关）。
+    # 与 materialize 路径**数值等价但非逐位相同**（实测 fp32 max|Δ|≈7e-07），
+    # 而 12 通路的 test_twelve_channel_path_bit_identical 正是靠逐位一致发现
+    # 意外的数值变化 ⇒ 默认关闭，开关走命令行而不是环境变量（`--use-checkpoint`
+    # 当年被「归档」就是因为开关只藏在 config 表里、没有干净入口）。
+    #
+    # 打开前建议先跑 `pytest tests/test_online_softmax_attn.py`（前向等价 + 梯度
+    # gradcheck + bf16/autocast）。`dropout_p > 0` 时它自动回退 materialize
+    # （online 不实现 dropout mask）；V7 的 attn_dropout 默认 0.0 ⇒ 那条不构成
+    # 日常约束，也就是说开关一旦打开就**总是**生效。
+    _backbone.set_attn_online(bool(args.attn_online))
+    if args.attn_online:
+        logger.warning("[model] online-softmax 注意力已开启：与 materialize 路径"
+                       "数值等价但非逐位相同，12 通道 bit-identical 基线会失效")
+
     # flash-attn 独立库启用决策：仅「Ampere+ CUDA 且走非 math 路径」时尝试加载。
     # 加载失败自动回退内置 SDPA，不影响训练启动。
     # 环境变量 GOAI_FLASH=0 可强制禁用（A/B 实测用：稀疏注意力分块 seq 仅 ~30，
@@ -4730,6 +4757,16 @@ def main():
             try:
                 if i % _accum_steps == 0:
                     optimizer.zero_grad(set_to_none=True)
+                # DDP 梯度累积加速：非末步跳过 all-reduce（与 no_sync() 语义等价）。
+                # 数学上 (accum-1) 次本地累加 + 末步一次 all_reduce(SUM) 与「每步都
+                # all_reduce(SUM) 再累加」完全相等，仅省 (accum-1) 次跨卡通信。
+                # 置于 backward 的 with 块之前、测试 AST 切片（tail）之外：test_log_loss_identity
+                # exec 的是「含 compute_l2_report 的 with 块」+「其后到 backward 的切片」，
+                # 本段不在其中，故门禁不受影响。单卡/非 DDP 时 model 无该属性，由
+                # hasattr 跳过（保持原每步同步行为）。
+                _is_last = ((i + 1) % _accum_steps == 0) or ((i + 1) == n_batches)
+                if is_dist and hasattr(model, 'require_backward_grad_sync'):
+                    model.require_backward_grad_sync = _is_last
                 if _prof_at > 0 and step == _prof_at and _prof_ctx is None:
                     try:
                         from torch.profiler import (profile, ProfilerActivity)

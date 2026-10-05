@@ -34,8 +34,11 @@ class LiteValueNetwork(nn.Module):
 
     def forward(self, x):
         x = self.downsample(x)
-        x = self.res(x).squeeze(-1).squeeze(-1)
-        return x
+        # self.res 输出 (B, 1, H, W)：先去掉通道维 1 再展平为 (B, H*W)。
+        # 原 `squeeze(-1).squeeze(-1)` 作用在最后一维（W，非 1）上不生效，
+        # 导致 value 头形状错误（多出一个空间维而非 (B, H*W)）。
+        res = self.res(x)
+        return res.squeeze(1).reshape(res.shape[0], -1)
 
 
 class LitePolicyNetwork(nn.Module):

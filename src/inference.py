@@ -1312,7 +1312,13 @@ class GoAI:
             if inp in ("pass", ""):
                 board.play(-1); continue
             ok, mv = board.parse_move_str(inp, to_play)
-            if not ok or not legal[int(mv)]:
+            if not ok:
+                print("非法，重试。"); continue
+            if mv < 0:
+                # parse_move_str 对 resign/pass 均返回 -1；pass/空串已在上方处理，
+                # 这里只剩 resign ⇒ 认输退出（避免 `legal[-1]` 误判为最后一点哨兵）。
+                break
+            if not legal[mv]:
                 print("非法，重试。"); continue
             board.play(mv)
             hist = my_hist[0] if to_play == 1 else my_hist[1]
