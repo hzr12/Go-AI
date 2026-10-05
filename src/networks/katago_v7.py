@@ -45,7 +45,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
-from src.networks.backbone import RMSNorm, _sdpa
+from src.networks.backbone import (
+    GC_LEGACY,
+    GC_RES,
+    GC_TRANSFORMER,
+    GRAD_CHECKPOINT_DEFAULTS,
+    RMSNorm,
+    GradCheckpointMixin,
+    _sdpa,
+)
 
 #: spec §3 的形状常量。结构**只由这张表**决定（与 `train_sft.KATAGO_SE_CFG`
 #: 同一立场：结构不许由调用方零散覆盖）。
@@ -796,12 +804,51 @@ class ScorebeliefHead(nn.Module):
 # --------------------------------------------------------------------------- #
 # 整网
 # --------------------------------------------------------------------------- #
-class NbtTfNet(nn.Module):
+#: V7 在 `backbone` 那三个 kind 之外**自己**的两个段。`backbone` 的 kind 是按块类
+#: 命名的（res / transformer / legacy），而 V7 的 blocks 用的正是 `GC_RES`；
+#: 剩下两个段是 V7 结构特有的，且都**在 blocks 之外**。
+#:
+#: 为什么要给它们开检查点：`scripts/train_sft.py::v7_batch_memory_advice` 的解析
+#: 模型给 V7 定的预算是 checkpoint 开 ⇒ 8.1 MB/样本，而 910A 实测 batch 3000 用了
+#: 64 GB ≈ 21.3 MB/样本。`V7_RESIDENT_MB_PER_SAMPLE[True]` 的注释写明那 6.9 MB
+#: 是「**只存 block 边界**」—— 差额只可能落在 stem 与三个 head 上，而它们原来走
+#: 裸前向、一次都不重算，中间激活在反向全程驻留。
+GC_STEM = 'stem'
+GC_HEADS = 'heads'
+
+
+class NbtTfNet(GradCheckpointMixin, nn.Module):
     """V7 NBT+Transformer 整网（spec §3 + §4）。
 
     输入 ``(B, 22, H, W)`` 空间 + ``(B, 19)`` 全局，输出 `forward` 里那组张量。
     22 与 19 都由 ``fillRowV7`` 决定，**不从棋局重新推算**。
+
+    梯度检查点覆盖 stem / blocks / 三个 head 三段（见 `GC_STEM` / `GC_HEADS`）。
+    ``use_checkpoint`` 是**总开关**的别名，现在由 `GradCheckpointMixin` 持有 ——
+    形状与语义与改造前逐位相同，只是从"内联 if"变成走 `run_segment`，因此重算期间
+    也能恢复 autocast（`backbone._checkpointed._recompute_ctx`）。
     """
+
+    GRAD_CHECKPOINT_KINDS = (GC_RES, GC_TRANSFORMER, GC_LEGACY,
+                             GC_STEM, GC_HEADS)
+    #: 三段默认全开。`GC_LEGACY` 保持 False（V7 没有混合 block 列表）。
+    #: 粒度（逐块 vs 并段）由 `backbone.GC_PER_BLOCK_DEFAULT[GC_RES]` 决定 = 逐块，
+    #: 与 V18 旧机制一致（`git b65c804`：并段是 4 卡 OOM 的直接成因）。
+    GRAD_CHECKPOINT_DEFAULTS = dict(GRAD_CHECKPOINT_DEFAULTS,
+                                    **{GC_STEM: True, GC_HEADS: True})
+
+    @property
+    def use_checkpoint(self):
+        """总开关的别名。读写都落到 mixin 的 `_gc_enabled`。
+
+        **不动逐 kind 开关**：只翻这一个位不该顺手把 `set_grad_checkpointing(
+        True, heads=False)` 那类逐段覆盖重置回默认值。
+        """
+        return self.grad_checkpointing
+
+    @use_checkpoint.setter
+    def use_checkpoint(self, value):
+        self._gc_enabled = bool(value)
 
     def __init__(self, cfg=None, use_checkpoint=None, attn_dropout=None):
         super().__init__()
@@ -809,6 +856,9 @@ class NbtTfNet(nn.Module):
         if cfg:
             c.update(cfg)
         self.cfg = c
+        # 先起 mixin 的两个属性，再让 `use_checkpoint` 的 setter 有处可落。
+        self._gc_kinds = dict(self.GRAD_CHECKPOINT_DEFAULTS)
+        self._gc_enabled = False
         self.use_checkpoint = (c['use_checkpoint'] if use_checkpoint is None
                                else bool(use_checkpoint))
         self.attn_dropout = (c['attn_dropout'] if attn_dropout is None
@@ -860,28 +910,44 @@ class NbtTfNet(nn.Module):
         self.scorebelief_head.initialize()
         return self
 
+    def _ckpt(self, fn, *args):
+        """按 `GC_HEADS` 这段的开关决定是否走检查点。
+
+        三个 head 是**并联**（都吃 `t`），而 `backbone.run_segment` 走的是
+        `_segment_runner` 的**串联**语义（`out = blk(*cur)`），塞不进去；而包一层
+        `HeadBank` 又会改掉 `state_dict` 的键（A/B/C 三段权重就互相 load 不上了）。
+        所以就地内联，三段各一次 `checkpoint` —— 粒度仍是"每一段一次"，
+        与 blocks 的逐块粒度同一口径。
+        """
+        if self.grad_checkpointing_for(GC_HEADS):
+            return torch.utils.checkpoint.checkpoint(fn, *args,
+                                                     use_reentrant=False)
+        return fn(*args)
+
     def trunk(self, spatial, global_features):
         """stem + 11 个 nbt2 块 + trunk 末端归一化（spec §3.1）。"""
-        x = self.stem(spatial)
+        if self.grad_checkpointing_for(GC_STEM):
+            x = torch.utils.checkpoint.checkpoint(self.stem, spatial,
+                                                   use_reentrant=False)
+        else:
+            x = self.stem(spatial)
         g = self.global_fc(global_features).reshape(-1, self.cfg['trunk_channels'],
                                                     1, 1)
         x = x + g
         pos = _board_pos(x.shape[0], x.shape[2], x.shape[3], x.device)
-        for blk in self.blocks:
-            if self.use_checkpoint and self.training:
-                x = torch.utils.checkpoint.checkpoint(blk, x, pos,
-                                                      use_reentrant=False)
-            else:
-                x = blk(x, pos)
+        # `uncapped_last` 不传（= False）：legacy 路径那个开关存在是为了保住 v18 的
+        # 31.12 GB 显存锚点，V7 没有那个锚点，而我们现在正在打 OOM
+        # （见 `git b65c804` 的裁决）。
+        x, _ = self.run_segment(self.blocks, (x, pos), GC_RES)
         return F.silu(self.norm_trunkfinal(x))
 
     def forward(self, spatial, global_features, board_mask=None):
         t = self.trunk(spatial, global_features)
-        out = {'policy_logits': self.policy_head(t, board_mask=board_mask)}
-        vout = self.value_head(t)
+        out = {'policy_logits': self._ckpt(self.policy_head, t, board_mask)}
+        vout = self._ckpt(self.value_head, t)
         out.update({k: v for k, v in vout.items() if k != 'value_pooled'})
-        out['scorebelief_logits'] = self.scorebelief_head(vout['value_pooled'],
-                                                          global_features)
+        out['scorebelief_logits'] = self._ckpt(
+            self.scorebelief_head, vout['value_pooled'], global_features)
         return out
 
     def ownership(self, out):

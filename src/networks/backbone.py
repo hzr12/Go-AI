@@ -518,6 +518,12 @@ class GradCheckpointMixin:
 
     GRAD_CHECKPOINT_KINDS = (GC_RES, GC_TRANSFORMER, GC_LEGACY)
 
+    #: 逐 kind 的默认开关。**做成类属性**是为了让子类能扩自己的 kind
+    #: （V7 加了 `stem` / `heads`，见 `src/networks/katago_v7.py`）而不用去改
+    #: 这张模块级表——那张表被 `tests/test_grad_checkpointing.py` 逐字钉着。
+    #: 默认仍指向模块级常量，所以 `SharedBackbone` 的行为一个字节都不变。
+    GRAD_CHECKPOINT_DEFAULTS = GRAD_CHECKPOINT_DEFAULTS
+
     def _init_grad_checkpointing(self, enabled=True, **kinds):
         unknown = sorted(set(kinds) - set(self.GRAD_CHECKPOINT_KINDS))
         if unknown:
@@ -525,7 +531,7 @@ class GradCheckpointMixin:
                 '未知的块类型 %s；可用的是 %s'
                 % (unknown, list(self.GRAD_CHECKPOINT_KINDS)))
         self._gc_enabled = bool(enabled)
-        self._gc_kinds = dict(GRAD_CHECKPOINT_DEFAULTS)
+        self._gc_kinds = dict(self.GRAD_CHECKPOINT_DEFAULTS)
         for k, v in kinds.items():
             if v is not None:
                 self._gc_kinds[k] = bool(v)
