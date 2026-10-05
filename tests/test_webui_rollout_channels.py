@@ -97,7 +97,11 @@ def _run_rollout_setup(ai, *, use_rollout=True, board_size=N):
     block = _rollout_setup_block()
     mod = ast.Module(body=[block], type_ignores=[])
     ast.fix_missing_locations(mod)
-    exec(compile(mod, "webui.py::main()", "exec"), {"args": args, "session": session})
+    # `engine` 是 `main()` 里更早装配的局部名（--engine-gtp 那一坨），而本段现在
+    # 会读它做互斥检查。单独 exec 这段时必须把它喂进来 —— 不喂就是 NameError，
+    # 而那不是「webui 坏了」，是这段代码的依赖变了、夹具没跟上。
+    exec(compile(mod, "webui.py::main()", "exec"),
+         {"args": args, "session": session, "engine": None})
     return session
 
 
