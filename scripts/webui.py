@@ -64,6 +64,18 @@ class Session:
         #: —— 编一个 0.5 就是在 UI 上展示看似正常的假数字。
         self.engine = engine
         self.size = board_size
+        # V7（22 通道）+ hybrid 的深度分支 = 构造期就该拦住的组合。
+        # `_ai_move_hybrid` 里 `policy_depth >= 2` 才走 `mcts.lookahead`，
+        # 而那条路在 V7 上会响亮拒绝；默认 `policy_depth=1` 走 `ai.predict`
+        # 则完全正常。也就是说「hybrid 能不能跑」取决于一个深度阈值 ——
+        # 不在启动时说清，用户会玩到一半才撞上错误。静默可用/不可用都不可接受。
+        if getattr(ai, "needs_global_features", False) and policy_depth >= 2:
+            raise ValueError(
+                f"V7（22 通道 + 19 维全局输入）不支持 --policy-depth "
+                f"{policy_depth}：depth≥2 的 hybrid 分支走 mcts.lookahead，"
+                f"而它造特征只用 feature_planes 的 12..17 通道。"
+                f"请用 --policy-depth 1（默认，hybrid 正常工作）或 "
+                f"--mode mcts。")
         self.lock = threading.Lock()
         self.mcts = MCTS(ai, board_size=board_size, num_threads=num_threads,
                          expand_topk=expand_topk, expand_chunk=expand_chunk,
@@ -1431,13 +1443,18 @@ def main():
 
     # 量化/ONNX 与 torch.compile 互斥（量化编译后模型无意义）
     use_compile = args.compile and not (args.quantize or args.onnx)
+    # 棋盘边长两条分支都要用。**必须在 if 之前赋值**：只在一个分支里赋值而
+    # 另一个分支去读，Python 会在运行时抛
+    # `UnboundLocalError: cannot access local variable '_bs'` ——
+    # 而且只在**没走那个分支**时炸，也就是默认的原生 MCTS 路径。
+    # 这类错门禁抓不到（没有测试真把 main() 跑到这一行），只能靠真起一次服务。
+    _bs = args.board_size
     if engine is not None:
         # 引擎后端下 `ai` 保持 None：原生 MCTS 用不到它，而建一个 GoAI 只会
         # 把 22 通道权重硬塞进只支持 12..17 的 `feature_planes` 里报错。
         # `MCTS(None, ...)` 是安全的 —— `use_rollout=False` 时它只在构造期存下
         # `ai`，不会去问通道数。
         ai = None
-        _bs = args.board_size
         _nt = 1
     else:
         ai = GoAI(model_path=model_path, board_size=args.board_size, device=args.device,
