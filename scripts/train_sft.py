@@ -5344,17 +5344,20 @@ def main():
                     # fp16 溢出/梯度爆炸唯一的直接信号；accum>1 下每 optimizer
                     # step 只有一个值，打点是每 micro-batch ⇒ 沿用上一次的。
                     "grad_norm": _grad_norm_last,
-                    "scaler_scale": _scale,
+                    # 缩放值：scaler 关掉时上报 1.0 而不是 _scale，让图上能一眼
+                    # 分辨「这条曲线是真的 scaler 在动」还是「bf16 路径没 scaler」。
+                    # （此前这个键在下面 :5356 又出现了一次 —— dict 字面量里后写的
+                    #   覆盖先写的，于是上面那行是**死代码**：谁改它都不会生效。）
+                    "scaler_scale": _scale if use_scaler else 1.0,
                     "t_data_ms": _dms,
                     "t_comp_ms": _cms,
                     "t_save_ms": _sms,
                     "t_eval_ms": _ems,
-                        # 取数长尾：均值能掩盖「偶尔等 3 秒」的预取抖动
-                        "t_data_max_ms": _dmax,
-                        "epoch": epoch,
-                        "step_pct": step / total_steps,
-                        "scaler_scale": _scale if use_scaler else 1.0,
-                        **_health_last,
+                    # 取数长尾：均值能掩盖「偶尔等 3 秒」的预取抖动
+                    "t_data_max_ms": _dmax,
+                    "epoch": epoch,
+                    "step_pct": step / total_steps,
+                    **_health_last,
                         # ---- B8 · V7 的 12 项逐项 loss（2026-10-04）----
                         # 此前 `_v7_terms_last` **只进 stdout**（上面那行
                         # `[step N v7]`），SwanLab 里只有 `loss` 一个和 ⇒ 段 1

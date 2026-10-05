@@ -1032,6 +1032,10 @@ def train_epochs(ai, buffer, args, device):
     early_stop_any = False
     for epoch in range(args.epochs):
         opt.zero_grad()  # 每轮开始兜底清零（正常路径 step 后已清，防外部残留）
+        # fp16 溢出导致的跳步累计（跨 epoch 累计，不清零）：RL 侧此前**没有任何**
+        # 跳步计数，于是「训练是否有效」在 RL 这段完全不可观测 —— 而 SFT 侧有
+        # skipped_steps / skip_rate_pct。
+        _n_skipped = 0
         # running-KL 逐 PPO epoch 重置：提前中止后下一轮仍有机会在 β 收紧后
         # 跑满整轮（截断是「本轮剩余」，不是整个 train_epochs 调用）
         epoch_kl = 0.0
@@ -1135,20 +1139,47 @@ def train_epochs(ai, buffer, args, device):
                 continue
 
             accum_counter = 0
+            # 跳过的步**不许**推进 LR 计划与 EMA（2026-10-05 补上，与
+            # `scripts/train_sft.py` 的 `_real_step` 门控对齐 —— SFT 路径在
+            # `91c7d53` 修过这个，RL 路径一直没有）。
+            #
+            # 为什么：fp16 溢出时 `GradScaler` **内部跳过** `optimizer.step()`，
+            # 但对调用方是「成功返回」的。权重一动没动，而无条件
+            # `scheduler.step()` 会让 warmup/cosine 在空步上照样前进 ——
+            # 真机 SFT 那轮 558 步的 warmup 被 0 次学习消耗掉，等于训练一开��
+            # 就拿到一个已经退火的 LR。EMA 同理：shadow 被多拉一次且计数 +1，
+            # 而 eval 是在 shadow 上评的 ⇒ 100% 跳步时 shadow 一路收敛到初始权重。
+            #
+            # 判据用**缩放值有没有下降**，而不是去扫梯度：`GradScaler` 只在跳步时
+            # 降 scale（成功时它只等 `growth_interval` 到才 ×2），而扫 5.5M 个参数
+            # 判有限性要在每步的路径上付一次全量 D2H。多卡 RL 当前不用（run.txt
+            # 写明 RL 只跑单卡），所以这里不需要 `train_sft.py` 那套跨 rank 归约。
+            _scale_before = scaler.get_scale() if scaler is not None else None
             if scaler is not None:
                 if args.clip_grad > 0:
                     scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                 scaler.step(opt)
                 scaler.update()
+                _real_step = not (scaler.get_scale() < _scale_before)
             else:
                 if args.clip_grad > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                 opt.step()
+                _real_step = True
+            if not _real_step:
+                # 跳步必须**可观测**，否则 RL 侧的「训练是否有效」无从判断
+                # （SFT 侧有 skipped_steps / skip_rate_pct，RL 侧此前一个数都没有）。
+                _n_skipped += 1
+                if _n_skipped == 1 or _n_skipped % 50 == 0:
+                    print(f'[fp16] PPO 第 {_n_skipped} 次跳步（scale '
+                          f'{_scale_before:.0f} -> {scaler.get_scale():.0f}）；'
+                          f'LR 计划与 EMA 不推进')
             opt.zero_grad()  # 每次 step 后立即清零，防止跨 step 陈旧梯度叠加污染
-            scheduler.step()
-            if ema is not None:
-                ema.update()
+            if _real_step:
+                scheduler.step()
+                if ema is not None:
+                    ema.update()
             losses.append(float(loss_raw.item()))
 
             # ---- P3-C：optimizer step 边界 —— 先 β 自适应，再信任域硬约束 ----

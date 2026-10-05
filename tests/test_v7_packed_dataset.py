@@ -325,11 +325,46 @@ def test_resolve_shards_rejects_empty_dir(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# 真实夹具（存在才跑）
+# 真实夹具
+#
+# 自己造，不要指向 `tmp/` 下的固定文件
+# --------------------------------------------------------
+# 原先读 `tmp/coding/tiny_v7.npz` 并 `skipif(not exists)`。`tmp/` 是**未跟踪的
+# 临时目录**，实测它会在测试**运行途中**被清掉（2026-10-05：门禁日志 8 个只剩 1 个、
+# 这个夹具在收集时存在、运行时消失 ⇒ 那次失败报的是 `V7PackedDataError` 而不是
+# skip）。依赖它的结果是**随机的**：运气好 skip，运气差失败。
+# 现在改成自己造，落在 pytest 的 `tmp_path` 里。
 # --------------------------------------------------------------------------- #
-@pytest.mark.skipif(not os.path.exists(TINY), reason='需要 tmp/coding/tiny_v7.npz')
-def test_real_shard_fixture_loads():
-    ds = load_v7_packed(str(TINY))
+def _make_tiny_packed(path, n_rows=4):
+    """造一个最小可被 `load_v7_packed` 读入的分片。
+
+    必须齐 `_REQUIRED` 的六列，且形状要过 `_check_layout`：
+    `spatial_packed` 是 **(N,22,46)** 的打包布局（不是 (N,22,19,19)）、
+    `global` 宽 19、`policy_player_rank` 宽 `POLICY_TOPK`。
+    """
+    rng = np.random.default_rng(0)
+    # dtype 与既有夹具一致（:132 用 int16）
+    rank = np.zeros((n_rows, POLICY_TOPK), dtype=np.int16)
+    rank[:, 0] = 5                       # 一个合法着点
+    prob = np.zeros((n_rows, POLICY_TOPK), dtype=np.float32)
+    prob[:, 0] = 1.0
+    np.savez(
+        path,
+        spatial_packed=rng.integers(0, 256, size=(n_rows, 22, 46),
+                                        dtype=np.uint8),
+        # `global` 是 Python 关键字，不能写成关键字参数 ⇒ 用 ** 解包。
+        **{'global': rng.random((n_rows, 19)).astype(np.float32)},
+        policy_player_rank=rank,
+        policy_player_prob=prob,
+        outcome=rng.integers(0, 3, size=n_rows).astype(np.int64),
+        game_weight=np.ones(n_rows, dtype=np.float32),
+    )
+
+
+def test_real_shard_fixture_loads(tmp_path):
+    tiny = str(tmp_path / 'tiny_v7.npz')
+    _make_tiny_packed(tiny)
+    ds = load_v7_packed(tiny)
     assert len(ds) > 0
     sp = ds.sample_spatial(np.arange(2, dtype=np.int64))
     assert sp.shape == (2, 22, BS, BS)

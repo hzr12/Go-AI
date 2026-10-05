@@ -728,7 +728,7 @@ def test_single_stone_ko_recapture_rejected_by_psk():
         adopted = b.clone()
         adopted.resync_hash()
         assert adopted._pos_hash_history == [adopted.position_hash()], \
-            f"{n} 路：resync_hash() 必须把历史重建为 {当前局面}"
+            f"{n} 路：resync_hash() 必须把历史重建为 {adopted.position_hash()}"
         assert adopted.ko_point == recapture, f"{n} 路：ko_point 是只读信息位，接管不清它"
         assert adopted._would_repeat(adopted.position_hash_after_move(recapture)) is False
         assert adopted.play(recapture) is True, (

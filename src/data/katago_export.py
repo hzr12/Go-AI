@@ -41,6 +41,7 @@ import sys
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+import torch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -491,7 +492,12 @@ def build_model_desc(state_dict: Dict[str, Any], cfg: Dict[str, Any],
 
 
 def _load_state_dict(path: str) -> Dict[str, Any]:
-    import torch
+    # torch 在模块顶层import（`import torch`）—— 此前只有下面这一处函数内
+    # import，于是 `_t()` 的返回注解 `torch.Tensor` 引用的是一个**模块级不存在**
+    # 的名字（pyflakes F821）。今天不崩，只因为文件头有
+    # `from __future__ import annotations`（注解不求值），而作者也留了
+    # `# type: ignore[name-defined]` —— 但这个前提一旦被拿掉（去掉 future import、
+    # 或者有人调 `typing.get_type_hints()`），就直接 NameError。
     obj = torch.load(path, map_location='cpu', weights_only=False)
     for key in ('state_dict', 'model', 'model_state_dict', 'net'):
         if isinstance(obj, dict) and key in obj and isinstance(obj[key], dict):

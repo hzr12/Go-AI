@@ -1026,7 +1026,9 @@ def judge(env, comps, workers, mem, gather=None):
                 'warm_median': v['warm_ms_per_row']['median']}
             for k, v in gath.items() if 'cold_ms_per_row' in v} if gath else None,
         '3_reproducible_disk_random_read': (
-            (storage or {}).get('random_read_ms_per_row')),
+            # 原写成 `(storage or {})` —— `storage` 从未定义（pyflakes F821），
+            # 走到这里就是 NameError。同文件 :1257 的正确取法是 `storage_probe`。
+            (out.get('storage_probe') or {}).get('random_read_ms_per_row')),
         '3_boards_cache_state': (gath or {}).get('boards_npz_cache_state'),
         '3_materialize_bytes': None,   # 由 run() 在 judge 之后填
         '4_memory': out.get('memory'),
