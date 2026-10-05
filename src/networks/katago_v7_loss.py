@@ -305,7 +305,18 @@ def _weighted_mean(per_sample, weight, probe=None, tag=''):
         w = torch.where(bad_w, torch.full_like(w, W_WEIGHT_DEFAULT), w)
     zero = (w == 0)
     if bool(zero.any()):
-        clean = torch.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
+        # 不能用 `torch.nan_to_num` —— **Ascend 后端没有这个 kernel**。
+        # 2026-10-05 真机 4×910A（A 段 batch=1900/卡）：
+        #   EZ3003: No supported Ops kernel and engine are found for
+        #           [NanToNum266], optype [NanToNum].
+        #   [ERROR] ERR00100 PTA call acl api failed
+        # 建图失败是**异步**的，报错落在下一个同步点（`bool(...)`）上，栈因此指向
+        # 完全无关的一行 —— 日志自己都写了「the stacktrace may be inaccurate」。
+        # `where(isfinite(x), x, 0)` 与 `nan_to_num(x, 0, 0, 0)` **前向与反向都
+        # 逐位等价**（实测前向 [1,0,0,-2]、梯度 [1,0,0,1]），而 `isfinite` 与
+        # `where` 在本文件里已被真机验证可用（见 `_weighted_mean` 的两处）。
+        clean = torch.where(torch.isfinite(p), p,
+                            torch.zeros((), dtype=p.dtype, device=p.device))
         if probe is not None and not bool(torch.isfinite(p).all()):
             # 记「有几行本该是 0 而实际是非有限」—— 这是坏数据的直接证据
             probe[tag] = int((zero & ~torch.isfinite(p)).sum())
@@ -687,7 +698,9 @@ class KataGoV7Loss(nn.Module):
         for k, v in terms.items():
             c = self.coeff[k]
             if c == 0.0:
-                v = torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+                # 同上：不用 `torch.nan_to_num`（Ascend 无此 kernel，EZ3003）。
+                v = torch.where(torch.isfinite(v), v,
+                                torch.zeros((), dtype=v.dtype, device=v.device))
             weighted[k] = c * v
         total = sum(weighted.values())
         # 逐项指认「哪一项坏了」。
