@@ -1422,12 +1422,18 @@ def test_l2_report_precedes_optimizer_step():
                   if isinstance(n, ast.Call)
                   and getattr(n.func, 'id', None) == 'compute_l2_report')
     step_lines = [n.lineno for n in ast.walk(main_fn)
-                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                  and n.func.attr == 'step'
-                  and isinstance(n.func.value, ast.Name)
-                  and n.func.value.id in ('scaler', 'optimizer')]
+                  if isinstance(n, ast.Call) and (
+                      # 2026-10-05 起，optimizer/scaler 的实际步进搬进了
+                      # `_scaler_step_global`（它按**全局**归约决定跳不跳，见
+                      # train_sft 的 `_grads_nonfinite_any_rank`）。本条要盯的
+                      # 性质「l2_report 取的是同一步的 θ」没有变，锚点变了。
+                      (isinstance(n.func, ast.Attribute)
+                       and n.func.attr == 'step'
+                       and isinstance(n.func.value, ast.Name)
+                       and n.func.value.id in ('scaler', 'optimizer'))
+                      or getattr(n.func, 'id', None) == '_scaler_step_global')]
     assert step_lines, \
-        'main() 里既没有 scaler.step(optimizer) 也没有 optimizer.step(...)'
+        'main() 里既没有 optimizer/scaler.step(...)，也没有 _scaler_step_global(...)'
     first_step = min(step_lines)
     assert l2_line < first_step, (
         f'compute_l2_report（第 {l2_line} 行）必须在第一个 optimizer/scaler.step'

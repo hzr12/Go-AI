@@ -43,6 +43,18 @@ def _optimizer_step_block():
                      if not ln.lstrip().startswith('#'))
 
 
+def _code_only(text):
+    """剥掉 docstring 与整行注释，只留可执行代码。
+
+    本文件的断言都是「调用/字面量只许出现 N 次」这类结构判定，而 docstring 里为了
+    讲清事故会**故意引用**那些写法（`bool(`、`scaler.step(optimizer)`…）。带着
+    docstring 数就会自己把自己判红。
+    """
+    text = re.sub(r'(?s)("""|\'\'\').*?\1', '', text)
+    return '\n'.join(ln for ln in text.splitlines()
+                     if not ln.lstrip().startswith('#'))
+
+
 def test_clip_stays_after_unscale():
     """裁剪保持在 unscale_ 之后——挪到前面是错的（见模块 docstring）。
 
@@ -60,19 +72,31 @@ def test_clip_stays_after_unscale():
 
 
 def test_step_and_update_still_called():
+    """步进必须走 `_scaler_step_global`，且裁剪早于它。
+
+    **2026-10-05 起不再直接调 `scaler.step(optimizer)`** —— 它只查**本地**
+    `found_inf`，多卡下各 rank 会做出不同的跳/不跳决定 ⇒ 四份权重永久分叉，
+    之后每次 all_reduce 都在混合四个不同模型的梯度（真机 4×910A：50 步内
+    1024 -> 8、skip=7/50）。改为全局归约后，裁剪仍必须排在步进之前。
+    """
     blk = _optimizer_step_block()
-    assert 'scaler.step(optimizer)' in blk
-    assert 'scaler.update()' in blk
-    assert blk.index('clip_grad_norm_') < blk.index('scaler.step'), \
-        '裁剪必须早于 scaler.step'
+    assert 'scaler.step(optimizer)' not in blk, \
+        '裸的 scaler.step(optimizer) 只查本地 found_inf ⇒ 多卡权重分叉'
+    assert '_scaler_step_global(' in blk, '步进必须走 _scaler_step_global（全局判定）'
+    assert blk.index('clip_grad_norm_') < blk.index('_scaler_step_global('), \
+        '裁剪必须早于步进'
 
 
 def test_skipped_steps_are_counted_and_reported():
     """被跳过的步数必须可观测，否则这是诊断盲区。"""
     blk = _optimizer_step_block()
     assert '_n_skipped += 1' in blk, '未统计跳过的步数'
-    assert 'scaler.get_scale() < _scale_now' in blk, \
-        '未用缩放值下降来判定本步被跳过'
+    # 跳步判据必须来自**全局归约**，不是"本地 scale 有没有下降"——
+    # 后者在多卡下是 per-rank 的，报出来的占比没有意义。
+    assert '_real_step = _scaler_step_global(' in blk, \
+        '跳步必须由全局归约的结果决定（_scaler_step_global 的返回值）'
+    assert 'get_scale() < _scale_now' not in blk, \
+        '不要用"本地 scale 是否下降"判跳步'
     # 日志与 swanlab 都要能看到
     assert 'skip=%d' in SRC, '日志行缺少 skip 计数'
     assert '"skipped_steps": _n_skipped' in SRC, 'swanlab 未上报 skipped_steps'
@@ -139,8 +163,8 @@ def test_scheduler_and_ema_do_not_advance_on_skipped_steps():
     而 eval 是在 EMA shadow 上评的（`eval_used_ema`）⇒ 100% 跳步时 shadow
     会一路收敛到**初始权重**。
     """
-    assert '_real_step = not (use_scaler' in SRC, \
-        '必须由缩放值是否下降判「这一步有没有真的生效」'
+    assert '_real_step = _scaler_step_global(' in SRC, \
+        '跳步必须由全局判定给出（不能再从缩放值反推）'
     assert 'if _real_step:\n                    scheduler.step()' in SRC, \
         'scheduler.step() 必须在 _real_step 门控内'
     assert 'if ema is not None and _real_step:' in SRC, \
@@ -149,16 +173,45 @@ def test_scheduler_and_ema_do_not_advance_on_skipped_steps():
         '跳过的步要单独计数（否则「LR 计划被空跑」这件事不可见）'
 
 
-def test_real_step_is_derived_from_scale_not_from_grads():
-    """ 判据必须是「缩放值是否下降」，不能改成「扫梯度是否有限」。
+def _fn_span(src, name):
+    """从 `def <name>(` 到下一个顶层 `def ` 之间的源码。
 
-    `GradScaler` **只在跳步时**降 scale（成功时它只等 `growth_interval` 到才 ×2），
-    所以缩放值是 O(1) 的可靠信号；而扫 5.5M 个参数判有限性要在打点路径上
-    付一次全量 D2H —— 那正是本文件多处注释在避免的事。
+    用固定字符窗口（例如 2000）会跨进相邻函数，于是「只许出现一次」的计数把
+    邻居的也算进来 —— 那样断言测的就不是被测函数了。
     """
-    seg = SRC[SRC.index('_real_step = not (use_scaler'):][:200]
-    assert 'get_scale() < _scale_now' in seg, seg
-    assert 'isfinite' not in seg, '不应在打点路径上扫梯度有限性'
+    i = src.index('def %s(' % name)
+    j = src.index('\ndef ', i + 1)
+    return src[i:j]
+
+
+def test_real_step_is_derived_from_the_global_verdict_with_one_d2h():
+    """ 跳步判据必须来自**全局归约**，且整条路径只付**一次** D2H。
+
+    这条**替换掉**原 `test_real_step_is_derived_from_scale_not_from_grads`。
+    那条的结论（「不要扫梯度、用缩放值反推就行」）在 2026-10-05 之后是**错的**：
+
+    * 它对「D2H 成本」的担心是对的 —— 写成
+      `bool(torch.isfinite(p.grad).all())` 放进循环里就是**每个参数一次同步**，
+      V7 有 322 个参数张量；
+    * 但它给出的替代方案更糟：`GradScaler` 的 `found_inf` 是**纯本地**的，
+      `scaler.step()` 没有任何 collective ⇒ 多卡下各 rank 跳/不跳的判断不一致
+      ⇒ **四份权重永久分叉**，之后 all_reduce 混合的是四个不同模型的梯度。
+
+    现在的形状是两个都要：`.all()` 逐参数在**设备上**跑、用 `|` 累积成**一个**
+    设备标量，最后只 `bool()` 一次（**一次** D2H），再做一次 `all_reduce(MAX)`
+    把四个 rank 的判定合起来。
+    """
+    i = SRC.index('def _grads_nonfinite_local(')
+    seg = _code_only(_fn_span(SRC, '_grads_nonfinite_local'))
+    assert 'acc = b if acc is None else (acc | b)' in seg, \
+        '有限性必须在设备侧累积成一个标量，而不是逐参数 bool()'
+    _n_bool = seg.count('bool(')
+    assert _n_bool == 1, \
+        '整条本地判定只允许一次 D2H（V7 有 322 个参数张量），实得 %d 处' % _n_bool
+
+    seg2 = _code_only(_fn_span(SRC, '_grads_nonfinite_any_rank'))
+    assert 'dist.all_reduce' in seg2 and 'ReduceOp.MAX' in seg2, \
+        '必须做一次跨 rank 的 MAX 归约 —— 这正是 GradScaler 缺的那一步'
 
 
 def test_terms_float_call_detaches_before_synchronising():
@@ -182,12 +235,14 @@ def test_overflow_diagnostics_are_rank0_only():
     `_locate_overflow` 的后果。4 卡就是 4 份一模一样的文本，反而掩盖了
     「rank0 先炸」这个真正有用的信息。
     """
-    # 判据随实现演进：现在是「算出 _real_step 之后，只在 not _real_step 时诊断」
-    i = SRC.index('_real_step = not (use_scaler')
+    # 判据随实现演进：现在是「全局判定给出 _real_step，跳步时才诊断」。
+    # 诊断本身已挪到 `clip_grad_norm_` **之前**（clip 会把 inf 变成 NaN），
+    # 所以这里从 unscale 处开始找，而不是从 _real_step 处。
+    i = SRC.index('_had_nonfinite = ')
     blk = SRC[i:i + 2000]
-    assert 'if is_main:' in blk, '溢出诊断未做 rank0 门控'
+    assert 'if _had_nonfinite and is_main:' in blk, '溢出诊断未做 rank0 门控'
     # _locate_overflow 必须在门控之内
-    assert blk.index('if is_main:') < blk.index('_locate_overflow('), \
+    assert blk.index('if _had_nonfinite and is_main:') < blk.index('_locate_overflow('), \
         '_locate_overflow 跑在 is_main 门控之外'
 
 

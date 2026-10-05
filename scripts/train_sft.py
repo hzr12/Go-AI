@@ -1246,6 +1246,100 @@ def _locate_overflow(optimizer, logger, max_report=3, phase='unscale 后',
                        "NPU 上注意力被强制走 math 并物化 logits，"
                        "可考虑调小 --attn-window 降低 logits 幅度")
 
+def _grads_nonfinite_local(optimizer):
+    """本地：任一参数梯度里有 inf/nan？
+
+    **必须在 `clip_grad_norm_` 之前问** —— 见 `_locate_overflow` 的 docstring：
+    clip 在 `total_norm = inf` 时算出 `clip_coef = 0` 并 `grad.mul_(0)`，
+    `inf × 0 = NaN`，所以 clip 之后「inf 个数」结构上恒为 0。
+
+    **整条路径只做一次 D2H**：`.all()` 逐参数跑在设备上，用 `|` 累积成**一个**
+    设备标量，最后只 `bool()` 一次。写成 `bool(torch.isfinite(p.grad).all())`
+    放进循环里就是每个参数一次同步 —— V7 有 322 个参数张量，每步 322 次 D2H
+    会把训练拖垮（本文件原先那条
+    `test_real_step_is_derived_from_scale_not_from_grads` 反对的正是这个）。
+    """
+    acc = None
+    for group in optimizer.param_groups:
+        for p in group.get('params', []):
+            if p.grad is None:
+                continue
+            b = torch.isfinite(p.grad).all()
+            acc = b if acc is None else (acc | b)
+    return False if acc is None else (not bool(acc))
+
+
+def _grads_nonfinite_any_rank(optimizer):
+    r"""**任一 rank** 的梯度非有限？—— 这正是 `GradScaler` 缺的那一次归约。
+
+    `GradScaler` 的 `found_inf` 是纯本地状态：`unscale_` 只登记本 rank 检出的非有限，
+    `step` 只看本地标记，全程没有任何 collective。于是在多卡下：
+
+        某 rank 有 inf  ->  它跳过；其余 rank 照常 `optimizer.step()`
+
+    ⇒ **各 rank 的权重从此永久不同**，之后每次 `all_reduce` 都在混合**四个不同
+    模型**的梯度；各 rank 的 scale 也各自独立减半、进一步漂移。这不是"少训几步"
+    的损失，是训练从此无效（2026-10-05 真机 4×910A：50 步内 1024 -> 8、
+    `skip=7/50`，而"四张卡同一步一起溢出"的概率极低 ⇒ 分叉几乎立刻发生）。
+
+    通信域未建（单卡）时退化成只看本地，行为与改动前一致。
+    """
+    local = 1 if _grads_nonfinite_local(optimizer) else 0
+    if not _dist_active():
+        return bool(local)
+    # 设备必须跟着梯度走：HCCL 的 collective 要求张量落在本 rank 的 NPU 上。
+    dev = torch.device('cpu')
+    for group in optimizer.param_groups:
+        for p in group.get('params', []):
+            if p.grad is not None:
+                dev = p.grad.device
+                break
+        else:
+            continue
+        break
+    t = torch.tensor([local], dtype=torch.int32, device=dev)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return bool(int(t.item()) > 0)
+
+
+def _scaler_step_global(scaler, optimizer, *, scale_before, use_scaler,
+                        logger=None):
+    """按**全局**判定决定跳/不跳，返回 True = 这一步真的更新了权重。
+
+    为什么不直接用 `scaler.step(optimizer)`
+    -------------------------------------
+    `scaler.step` 内部只看本地 `found_inf`，多卡下各 rank 会做出**不同**的跳/不跳
+    决定 ⇒ 权重分叉（见 `_grads_nonfinite_any_rank`）。所以这里改成：
+
+    * `use_scaler=False`（bf16 路径）⇒ 直接 `optimizer.step()`，不做任何判定；
+    * 全局有非有限 ⇒ **所有 rank 一起跳**，并把 scale 显式设成
+      `scale_before * backoff_factor`。**显式给值**是关键：`update()` 免参版会读
+      本地 `found_inf`（在没溢出的 rank 上是 0，于是那个 rank 会把 scale 往**上**调）
+      ⇒ 各 rank 的 scale 就此错位，而 `scaler.unscale_` 是在各 rank 上各自除以
+      自己的 scale 的，除数不同 ⇒ all_reduce 混合的是不同尺度的梯度；
+    * 全局干净 ⇒ `optimizer.step()` + `scaler.update()` 免参版（保持
+      `growth_interval` 的增长语义不变；此时每个 rank 本地都没 inf，
+      `update()` 看到的是一致的 0）。
+
+    代价：跳步那条走的是显式 `new_scale`，不会顺手重置 `growth_tracker`。
+    全部 rank 走**同一条**分支，所以 tracker 仍然跨 rank 一致；只是"连续成功"的
+    计数跨过一次跳步而不是被清零 —— `growth_interval` 默认 1e5 量级时可忽略。
+    """
+    if not use_scaler:
+        optimizer.step()
+        return True
+    if _grads_nonfinite_any_rank(optimizer):
+        if logger is not None:
+            logger.debug('[fp16] 全局判定有非有限梯度，全体跳步（scale %.0f -> %.0f）',
+                         scale_before,
+                         scale_before * scaler.get_backoff_factor())
+        scaler.update(scale_before * scaler.get_backoff_factor())
+        return False
+    optimizer.step()
+    scaler.update()
+    return True
+
+
 def _ema_key(name: str) -> str:
     """EMA shadow 的键：去掉 torch.compile 往参数名里插的 '_orig_mod.' 段。
 
@@ -4891,6 +4985,27 @@ def main():
                     # 与 `_n_skipped` 同一处自增 ⇒ 占比口径自洽（见上面注释）
                     _n_attempted += 1
                     scaler.unscale_(optimizer)
+                    # **溢出诊断必须排在 `clip_grad_norm_` 之前**
+                    #   `clip_grad_norm_(max_norm=1.0)` 在 `total_norm = inf` 时算出
+                    #   `clip_coef = 0` 并 `grad.mul_(0)` ⇒ **inf × 0 = NaN**，而
+                    #   `inf ⇒ clip_coef = 0 < 1` 这个分支**一定会进**
+                    #   ⇒ clip 之后统计「inf 个数」**结构上恒为 0**。
+                    #   此前诊断排在 clip 之后，真机 4 卡日志里每一轮打出来的都是
+                    #   「参数上没有 inf/nan —— 溢出可能发生在已被释放的中间张量里」，
+                    #   而那是**工具的盲区**，不是关于计算的结论：它把人引向了
+                    #   「中间张量已释放」这个错误方向。
+                    #   判据改成**直接**问「此刻梯度里真的有 inf/nan 吗」，
+                    #   不再靠 clip 返回的总范数间接推断。
+                    _had_nonfinite = (use_scaler
+                                      and _grads_nonfinite_local(optimizer))
+                    if _had_nonfinite and is_main:
+                        # 把参数名一并给去 —— 组名只是按 LR 比值**猜**的
+                        #（真机日志里三组全被打成 "backbone/policy" 就是
+                        # 这个原因），模块归属才是能直接定位的信息。
+                        _locate_overflow(
+                            optimizer, logger,
+                            phase='clip 前（此刻梯度里真的有 inf/nan）',
+                            named_params=dict(model.named_parameters()))
                     # clip_grad_norm_ **返回 clip 前的总范数** —— 之前被丢弃了。它是
                     # fp16 溢出/梯度爆炸唯一的直接信号：这轮 910A 的 inf/nan 与
                     # 缩放值雪崩，本可以由它提前几分钟看到。
@@ -4915,31 +5030,28 @@ def main():
                     #     所以「哪些张量现在是 NaN」= 「哪些张量原来是 inf」。
                     _gn_bad = not bool(torch.isfinite(
                         torch.as_tensor(_grad_norm_last)))
-                    scaler.step(optimizer)
-                    scaler.update()
-                    # `scaler.step()` 在检出 inf 时**内部跳过**
-                    #   `optimizer.step()`，但对调用方是「成功返回」的 ⇒
-                    #   必须靠缩放值是否下降来判「这一步到底有没有生效」。
-                    #   `GradScaler` 只在**跳步**时降 scale（成功时它只等
-                    #   `growth_interval` 到才 ×2），所以这个判据是可靠的。
-                    _real_step = not (use_scaler
-                                      and scaler.get_scale() < _scale_now)
+                    # **跳/不跳按全局判定**（2026-10-05 真机 4 卡事故的修复）。
+                    # 原来用 `scaler.step(optimizer)`，而它只查**本地** `found_inf`
+                    #   —— 某个 rank 有 inf 时它跳过、其余 rank 照常更新
+                    #   ⇒ 四份权重从此永久不同，之后每次 all_reduce 都在混合四个
+                    #   不同模型的梯度 ⇒ **训练从此无效**。而且各 rank 的 scale 各自
+                    #   独立减半、进一步漂移（报出来的 `skip` 占比也是 per-rank 的）。
+                    # 实测当时：50 ���内 1024 -> 8、skip=7/50，而"四张卡同一步一起
+                    #   溢出"的概率极低 ⇒ 分叉几乎立刻发生。
+                    # 详见 `_grads_nonfinite_any_rank` / `_scaler_step_global`。
+                    _real_step = _scaler_step_global(
+                        scaler, optimizer, scale_before=_scale_now,
+                        use_scaler=use_scaler)
                     if not _real_step:
                         _n_skipped += 1
-                        # 溢出诊断必须**只在 rank0 打**（2026-10-04 云端实跑）：
-                        #   这一段原本无条件 `logger.warning` + `_locate_overflow`，
-                        #   于是 4 卡时同一件事打印 4 遍、日志被淹没（用户贴来的
-                        #   910A 日志里每条都出现两次），而且**看不出**是哪张卡先炸的
-                        #   —— 4 份一模一样的文本反而掩盖了「rank0 先炸」这个信息。
                         if is_main:
-                            # 把参数名一并给去 —— 组名只是按 LR 比值**猜**的
-                            #（真机日志里三组全被打成 "backbone/policy" 就是
-                            # 这个原因），模块归属才是能直接定位的信息。
-                            _locate_overflow(
-                                optimizer, logger,
-                                phase=('clip 前有 inf（已由总范数确认）'
-                                       if _gn_bad else 'clip 前无 inf，见下'),
-                                named_params=dict(model.named_parameters()))
+                            # 本地干净的 rank 不点名：它没有可点的东西。
+                            # 全局非有限但本地干净，说明是别的 rank 炸的。
+                            if not _had_nonfinite:
+                                logger.warning(
+                                    '[fp16] 本步的溢出**不在本 rank**（本地梯度全部'
+                                    '有限）—— 已按全局判定一起跳步。定位请看第一个'
+                                    '报「溢出按模块点名」的 rank。')
                             if _scale_now >= _OVERFLOW_WARN_SCALE > scaler.get_scale():
                                 # 分母用 `_n_attempted`（本行上一次自增）而**不是
                                 # `step`：skip 在此处计数，而 `step += 1` 在 47 行
