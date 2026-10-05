@@ -235,6 +235,67 @@ def test_switching_checkpoint_does_not_change_state_dict():
         assert torch.equal(v, after[k]), k
 
 
+def test_heads_recompute_under_the_same_autocast_as_the_forward():
+    """重算时的精度必须与前向一致 —— 否则 fp16 训练里 head 会退回 fp32。
+
+    ``backbone._checkpointed`` 给每段都挂了 ``context_fn``，其中
+    ``_recompute_ctx`` 会按**段入口张量的 dtype** 恢复 autocast。这不是优化，是
+    正确性：``backbone.py:463-467`` 记着 4 卡 910A 的 OOM 真因就是「重算不在
+    autocast 里 ⇒ 整段退回 fp32、体积翻倍」（`Tried to allocate 1.40 GiB` 恰是
+    ``(1000,4,46,32,64)`` 的 fp32 体积）。
+
+    本条在 CPU 上也抓得住：``autocast(cpu, bfloat16)`` 是真生效的，而
+    ``with`` 块退出后 ``is_autocast_enabled()`` 立刻变回 False —— 所以只要
+    重算没有恢复它，第二次调用就必然被看见。
+    """
+    net = _net(True)
+    seen = []
+    orig = net.value_head.forward
+
+    def spy(*a, **kw):
+        seen.append(bool(torch.is_autocast_enabled('cpu')))
+        return orig(*a, **kw)
+
+    net.value_head.forward = spy
+
+    spatial, gl = _inputs()
+    # **backward 必须在 autocast 块之外** —— 这才是真实训练的形状
+    #（`with autocast: loss = model(x)` 然后块外 `loss.backward()`）。
+    # 把它写在块里会让重算"恰好"看到 autocast 开着，测试就变成永远绿。
+    with torch.autocast(device_type='cpu', dtype=torch.bfloat16):
+        out = net(spatial, gl)
+    sum(v.float().square().sum() for v in out.values()).backward()
+
+    assert len(seen) == 2, 'value_head 应被调 2 次，实得 %d' % len(seen)
+    assert seen[0] is True, '前向那次不在 autocast 里，测试本身失效'
+    assert seen[1] is True, (
+        '重算那次**不在** autocast 里 ⇒ fp16 训练时整个 value 头会退回 fp32，'
+        '体积翻倍（这正是 4 卡 910A OOM 的机制，backbone.py:463-467）')
+
+
+def test_heads_recompute_is_safe_when_a_probe_needs_no_sync():
+    """`GC_HEADS` 段的重算不得引入主机侧同步（BN 守卫为空时开销为 0）。"""
+    net = _net(True)
+    src = _fn_code_of_backbone('_checkpointed')
+    assert 'context_fn' in src, '段级重算必须挂 context_fn（autocast + BN 守卫）'
+    assert 'preserve_rng_state=True' in src
+
+
+def _fn_code_of_backbone(name):
+    import re as _re
+    bp = os.path.join(ROOT, 'src', 'networks', 'backbone.py')
+    with open(bp, encoding='utf-8') as fh:
+        s = fh.read()
+    i = s.index('def %s(' % name)
+    j = s.index('\ndef ', i + 1)
+    out = []
+    for ln in s[i:j].splitlines():
+        if ln.lstrip().startswith('#'):
+            continue
+        out.append(ln)
+    return _re.sub(r'(?s)("""|\'\'\').*?\1', '', '\n'.join(out))
+
+
 # --------------------------------------------------------------------------- #
 # 5. 逐 kind 开关（若 V7 接了 mixin）
 # --------------------------------------------------------------------------- #

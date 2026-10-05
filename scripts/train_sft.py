@@ -317,39 +317,69 @@ def _sync_init_weights_from_rank0(model, logger):
 def _assert_init_weights_identical(model, logger):
     """各 rank 初始权重一致性自检（启动时验证，不等训练途中）。
 
-    本地 checksum = 全部参数 fp64 求和；`all_gather` 出 world_size 个标量后
-    逐位比对。失败即抛，不允许静默继续 —— 与 `_dist_preflight_check` 同一立场：
-    通信域的问题是惰性的，要主动试一发。
+    本地 checksum = 全部参数在**主机侧**以 fp64 求和；`all_gather` 出
+    world_size 个 hi/lo 载荷后**逐位**比对。失败即抛，不允许静默继续 ——
+    与 `_dist_preflight_check` 同一立场：通信域的问题是惰性的，要主动试一发。
+
+    为什么必须在主机侧归约（2026-10-05，4×910A）
+    -------------------------------------------
+    实测 `rank0=8125.2251, rank1=8125.2256, rank2/rank3=8125.2251` ——
+    三个 rank 一致、rank1 差**一个 ulp**。8125.225 落在 `[4096, 8192)`，fp32 在
+    这一档的 ulp = `2**(12-23) = 4.88e-4`，实测差 `5.0e-4`，精确对上；这个量级
+    排除了 NaN（会打成 `nan`）与「广播没生效」（那会差量级而非末位）。
+
+    根因：原先的 `p.detach().sum(dtype=torch.float32)` 是在**设备上**归约，而
+    NPU 的多块 AICore 归约**分块顺序不保证跨 rank 一致**。同样这 300 多个分片和、
+    以不同顺序在 fp32 里累加 ⇒ 末位差 1 ulp；比对用的是精确相等 ⇒ 每次都误报。
+    原注释把「相同归约顺序」当成前提，那在 NPU 上是假的（CPU 上为真，所以
+    `tests/test_init_weight_sync.py::test_checksum_contract_after_losing_fp64`
+    在本地一直是绿的，测不出这个 bug）。
+
+    顺带修掉的第二个缺陷：旧 checksum 是 fp32 跑马和，噪声底 = 总量的 1 ulp
+    ≈ 4.9e-4，而单个 1e-2 量级参数差**一个 fp32 ulp** 只有 ~9.3e-10 —— 低 5 个
+    数量级，**检测不到**。即这个闸门既误报又漏报。
+
+    为什么是主机 fp64、而不是「设备上换个更准的算法」
+    ----------------------------------------------
+    * 主机 fp64 的噪声底 ~1e-12（相对 1e-16），比 fp32 的 4.9e-4 好 11 个数量级，
+      单个 ulp 的真实分歧重新变得可检测；
+    * 求和顺序由 `model.parameters()` 的迭代顺序唯一确定（形状相同 ⇒ 分块相同），
+      且 `run.txt` 已固定 `OMP_NUM_THREADS=1`；
+    * **NPU 上不能用 fp64**：910A 不支持，会派发 AICPU kernel 且故障是**异步**的
+      （2026-10-01 云端实测，见 `tests/test_no_aicpu_ops_in_startup_check.py`）。
+      所以 fp64 只发生在主机，过线一律 fp32。
+
+    为什么载荷要拆成 hi/lo 两个 fp32
+    ------------------------------
+    fp32 只有 24 位尾数，把 fp64 的和直接塞进去会被舍掉 —— 那就等于把噪声底又
+    抬回 1 ulp，正是本次误报的机制。拆成 `hi = fp32(acc)`、`lo = fp32(acc - hi)`
+    之后，两个 fp32 承载 ~48 位尾数，在 8125 那一档的分辨率 ~2.9e-11，仍比要
+    检测的 9.3e-10 低一个数量级 —— 够用。载荷保持 fp32（HCCL 原生支持）。
     """
     if not _dist_active():
         return
-    acc = None
+    acc = 0.0
+    dev = None
     with torch.no_grad():
         for p in model.parameters():
-            # 累加用 **fp32**，不是 fp64：910A **不支持 fp64**。
-            #   实测（2026-10-01 云端）：fp64 checksum 会让 AICPU kernel 挂掉 ——
-            #     Warning: Device do not support double dtype now, dtype cast
-            #               replace with float.
-            #     EXCEPTION TASK: task type=aicpu kernel ... error code=0x2a
-            #     RuntimeError: ACL stream synchronize failed
-            #   且它是**异步**的：故障由 fp64 算子排队，在**后面第一次同步**
-            #   （`all_gather` 后的 `.item()`）才报出来，栈看起来指向 `.item()` /
-            #   `torch.equal`，很容易误判成「比较算子有问题」（我就误判过一次）。
-            #
-            #   为什么 fp32 够用：这里要判的是「各 rank 的权重**逐位相同**」，
-            #   而广播后它们本来就逐位相同 ⇒ 相同输入 + 相同形状 + 相同归约顺序
-            #   ⇒ fp32 的和也逐位相同。我们不需要「累加精度高」，只需要
-            #   「不相等时能看出来」。
-            s = p.detach().sum(dtype=torch.float32)
-            acc = s if acc is None else acc + s
+            # `.to('cpu')` 是位精确的 D2H 拷贝；fp64 只在主机上出现，`sum(dtype=)`
+            # 在归约过程中升精度，不会把整份参数物化成 fp64。
+            acc += float(p.detach().to('cpu').sum(dtype=torch.float64))
+            if dev is None:
+                dev = p.device
+    if dev is None:
+        dev = torch.device('cpu')
+    hi = float(torch.tensor(acc, dtype=torch.float32).item())
+    lo = acc - hi
     # fp32 all_gather：HCCL 原生支持；fp64 会走 AICPU（同上）。
-    buf = acc.reshape(1).to(torch.float32)
+    buf = torch.tensor([hi, lo], dtype=torch.float32, device=dev)
     gathered = [torch.zeros_like(buf) for _ in range(dist.get_world_size())]
     dist.all_gather(gathered, buf)
     # 比对也不走 `torch.equal`（它在 910A 上是 AICPU kernel，见下）。
-    _vals = [float(g.item()) for g in gathered]
+    _vals = [[float(x.item()) for x in g] for g in gathered]
     if any(v != _vals[0] for v in _vals[1:]):
-        vals = ', '.join('rank%d=%.8g' % (i, v) for i, v in enumerate(_vals))
+        vals = ', '.join('rank%d=[%s]' % (i, ', '.join('%.17g' % x for x in v))
+                         for i, v in enumerate(_vals))
         raise RuntimeError(
             '[dist] 初始权重一致性自检失败：各 rank 的参数 checksum 不一致。\n'
             '  各 rank checksum: %s\n'
@@ -359,8 +389,8 @@ def _assert_init_weights_identical(model, logger):
             '    2) 初始权重里有 NaN/Inf —— NaN != NaN，会把这一种误报成前一种\n'
             '       （真因通常是某个 zero-init 假设被破坏）。\n'
             '  环境: %s' % (vals, _dist_env_snapshot()))
-    logger.info("[dist] 初始权重一致性自检通过 | world_size=%d | checksum=%.8g",
-                dist.get_world_size(), _vals[0])
+    logger.info("[dist] 初始权重一致性自检通过 | world_size=%d | checksum=%.17g",
+                dist.get_world_size(), _vals[0][0] + _vals[0][1])
 
 
 def _check_training_env(logger):

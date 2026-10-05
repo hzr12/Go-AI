@@ -28,6 +28,7 @@ fp64，相等判定与 `torch.equal` **逐位等价**。
 import ast
 import os
 import pathlib
+import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -59,6 +60,34 @@ def _fn_src(name):
                      if not ln.lstrip().startswith('#'))
 
 
+def _fn_code(name):
+    """函数源码：剥掉整行注释**与 docstring**，只剩可执行代码。
+
+    结构断言（"不许出现某个调用/某个 dtype"）必须只看代码 —— docstring 里为了
+    讲清事故会引用旧写法（`torch.equal`、`sum(dtype=torch.float64)`），那是应当
+    鼓励的，否则每补一段事故说明就要改一次断言。用 `ast` 定位 docstring 的行区间
+    再删，不用正则（正则会跨函数、也会被字符串里的三引号骗到）。
+    """
+    node = _fn_node(name)
+    drop = set()
+    first = node.body[0] if node.body else None
+    if (first is not None and type(first) is ast.Expr
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)):
+        for i in range(first.lineno, (first.end_lineno or first.lineno) + 1):
+            drop.add(i)
+    # `node.lineno` 是**文件绝对行号**，而 `get_source_segment` 返回的片段是从
+    # `def` 那一行开始的 —— 不减这个偏移就会拿片段的第 k 行去比绝对行号 k，
+    # 于是 docstring 一行都删不掉（表现为"函数里出现了 docstring 里引用的旧写法"）。
+    off = node.lineno - 1
+    out = []
+    for k, ln in enumerate(_fn_raw(name).splitlines(), 1):
+        if (k + off) in drop or ln.lstrip().startswith('#'):
+            continue
+        out.append(ln)
+    return '\n'.join(out)
+
+
 def test_no_torch_equal_anywhere_in_training_path():
     """整个训练脚本不得出现 `torch.equal(` —— 它在 910A 上是 AICPU kernel。
 
@@ -70,18 +99,19 @@ def test_no_torch_equal_anywhere_in_training_path():
 
 
 def test_init_weight_check_compares_on_cpu_via_item():
-    """自检必须用 `.item()` + Python 比较，且把 fp64 值取到主机侧。"""
+    """自检必须用 `.item()` + Python 比较，且把值取到主机侧比较。"""
     src = _fn_src('_assert_init_weights_identical')
     assert 'torch.equal' not in src
     assert '.item()' in src, '应通过 .item()（D2H 拷贝）把 checksum 取到主机侧比较'
-    # 相等判定必须在主机侧的 Python float 上做
-    assert 'float(g.item())' in src
-    assert any(tok in src for tok in ('!= _vals[0]', '!= vals[0]')), \
+    # 相等判定必须在主机侧的 Python float 上做（载荷是 hi/lo 两个 fp32，逐元素比）
+    assert re.search(r'float\(\w+\.item\(\)\)', src), \
+        '应在主机侧 float 上取值（形如 float(x.item())）'
+    assert '!= _vals[0]' in src or '!= vals[0]' in src, \
         '应在主机侧 float 上做不等判定'
 
 
-def test_checksum_stays_fp32_because_npu_has_no_fp64():
-    """checksum 必须在 **fp32** 上累加 —— 910A 不支持 fp64。
+def test_checksum_reduces_on_the_host_but_ships_fp32():
+    """归约在**主机 fp64**、过线一律 **fp32**。
 
     实测事故（2026-10-01 云端，两轮）：
       · 第一轮崩在 `torch.equal(...)`        ⇒ 我误判成「比较算子」的问题
@@ -91,29 +121,48 @@ def test_checksum_stays_fp32_because_npu_has_no_fp64():
             EXCEPTION TASK: task type=aicpu kernel ... error code=0x2a
         AICPU 故障由 fp64 算子排队，在后面第一次同步时才报出来 —— 栈指向哪里，
         错就在**哪里**被误判。
+
+    2026-10-05（4×910A）补的一面：那次把 checksum 改成**设备侧 fp32** 之后，
+    每次启动都误报「各 rank checksum 不一致」—— 差**一个 ulp**
+    （`8125.2251` vs `8125.2256`；该档 ulp = `2**-11` = 4.88e-4）。根因是设备侧
+    多块归约的分块顺序不保证跨 rank 一致。所以正确的形状是**两条都要**：
+    fp64 挪到主机（躲开 AICPU，且噪声底从 1 ulp 降到 ~1e-12），
+    过线仍用 fp32（HCCL 原生支持）。
     """
-    src = _fn_src('_assert_init_weights_identical')
-    assert 'float64' not in src, \
-        'checksum 不得用 fp64（910A 不支持；且 fp64 的 AICPU 故障是异步的，' \
+    src = _fn_code('_assert_init_weights_identical')
+    assert 'dtype=torch.float64, device' not in src, \
+        'fp64 不得作为设备张量的 dtype（910A 不支持；且 fp64 的 AICPU 故障是异步的，' \
         '会在后面某次同步时才报，栈看起来指向无关的算子）'
-    assert 'sum(dtype=torch.float32)' in src, 'checksum 应在 fp32 上累加'
-    assert '.to(torch.float32)' in src, 'all_gather 的 buf 应是 fp32（HCCL 原生支持）'
+    assert '.sum(dtype=torch.float64)' in src, \
+        'checksum 应在**主机侧**以 fp64 累加（先搬到 cpu 再求和）'
+    assert 'sum(dtype=torch.float32)' not in src, \
+        '不得在设备张量上直接 sum fp32 —— 分块顺序跨 rank 不一致，会末位误报'
+    assert 'dtype=torch.float32' in src, 'all_gather 的 buf 应是 fp32（HCCL 原生支持）'
     assert '.double().sum()' not in src and '.double(' not in src, \
-        '不要走 p.double().sum()（整份 fp64 物化，峰值显存 ×8，且 fp64 不可用）'
+        '不要走 p.double().sum()（整份 fp64 物化，峰值显存 ×2）'
 
 
 def test_no_fp64_anywhere_on_the_device_path():
-    """整个训练脚本不得在设备侧用 fp64（`.double()` / `float64` / `torch.float64`）。
+    """训练脚本不得在**设备侧**用 fp64（`.double()` / `torch.float64`）。
 
     910A 没有 fp64 硬件；任何设备侧 fp64 都会走「cast 成 fp32」的兜底，而实测表明
     这条兜底路径会挂 AICPU。主机侧（numpy / Python float）用 fp64 不受限 ——
-    `compute_l2_report` 现在就是走 `float(sq)` 在主机侧算的。
+    `compute_l2_report` 现在就是走 `float(sq)` 在主机侧算的，
+    `_assert_init_weights_identical` 也是（见下面那条测试的 docstring）。
+
+    判据按行匹配，并在**该行先把张量搬回主机**时放行：搬回主机之后 fp64 只存在于
+    CPU，910A 完全看不到它。这不是宽松化 —— 没有主机搬移的 fp64 行照样会被判红
+    （`p.double().sum()`、`sum(dtype=torch.float64)` 直接作用在参数上都会被抓住）。
     """
-    code = CODE
+    host_marks = ('.cpu()', "'cpu'", '"cpu"')
     offenders = []
-    for i, ln in enumerate(code.splitlines(), 1):
-        if '.double()' in ln or 'torch.float64' in ln or 'dtype=torch.float64' in ln:
-            offenders.append((i, ln.strip()[:70]))
+    for i, ln in enumerate(CODE.splitlines(), 1):
+        if '.double()' not in ln and 'torch.float64' not in ln \
+                and 'dtype=torch.float64' not in ln:
+            continue
+        if any(mark in ln for mark in host_marks):
+            continue                      # 已搬回主机，fp64 不经过 910A
+        offenders.append((i, ln.strip()[:70]))
     assert not offenders, \
         '设备路径出现 fp64（910A 不支持，实测会挂 AICPU）：%s' % offenders
 

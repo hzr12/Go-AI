@@ -77,6 +77,7 @@ commit**，不是当前文件。下次改 `train_sft.py` 后右列会变，**左
 import ast
 import importlib.util
 import pathlib
+import re
 import sys
 
 import pytest
@@ -418,10 +419,13 @@ def test_checksum_depends_on_every_parameter():
     #   **fp32 里也是精确整数**，所以下面所有 `==` 判定仍然严格，无需容差。
     assert dtype == torch.float32, (
         'checksum 标量应在 fp32 上累加（fp64 会让 910A 挂 AICPU），实得 %s' % dtype)
-    assert base.numel() == 1, 'all_gather 的载荷应是 1 个标量：%s' % base.shape
-    assert base.item() == 0.0, (
+    assert base.numel() >= 2, (
+        'all_gather 的载荷应至少 2 个 fp32（hi/lo 拆分）才能承载主机侧 fp64 的'
+        'checksum，实得 %s' % (base.shape,))
+    _sum = lambda t: float(t.double().sum())
+    assert _sum(base) == 0.0, (
         '全 0 参数的 checksum 应恰好 0.0（精确，无需容差），实得 %.17g'
-        % base.item())
+        % _sum(base))
 
     # 参数名 -> 只把它 add_(-1.0) 之后 checksum 应**恰好**变成的值（= −元素数）
     expected = {'a': -4.0, 'b': -15.0, 'c': -1.0}
@@ -430,11 +434,11 @@ def test_checksum_depends_on_every_parameter():
         m2 = _ThreeParam()
         getattr(m2, name).data.add_(-1.0)          # 只动一个参数，且取**负**偏移
         _, got = _captured_checksum(mod, m2)
-        assert got.item() == want, (
+        assert _sum(got) == want, (
             '只把 %s（%d 个元素）加 -1.0 时，checksum 应恰好 %.8g，实得 %.17g —— '
             '该参数没进 checksum（漏算 ⇒ 4 卡拼错权重也检测不出来）、权重被折算'
             '（如 *0.5）、或求和不是有符号精确求和（如 .abs()）'
-            % (name, -int(want), want, got.item()))
+            % (name, -int(want), want, _sum(got)))
 
 
 def test_checksum_contract_after_losing_fp64():
@@ -466,7 +470,7 @@ def test_checksum_contract_after_losing_fp64():
         m = torch.nn.Module()
         m.register_parameter('v', torch.nn.Parameter(t.clone()))
         _, got = _captured_checksum(mod, m)
-        return got.item()
+        return float(got.double().sum())
 
     # v21 真实量级：9.07M 参数、典型初值 ~1e-2 ⇒ checksum 量级 ~1e3~1e8。
     torch.manual_seed(0)
@@ -502,9 +506,17 @@ def test_checksum_is_fp32_because_npu_has_no_fp64():
     # 带着注释判会自己把自己判红。
     body = '\n'.join(ln for ln in body.splitlines()
                      if not ln.lstrip().startswith('#'))
-    assert 'float64' not in body, \
-        '_assert_init_weights_identical 里不得出现 fp64（910A 不支持）'
-    assert 'sum(dtype=torch.float32)' in body, 'checksum 应在 fp32 上累加'
+    # 约束的准确形状是「**设备侧**不得有 fp64」，不是「代码里不得出现 fp64」。
+    # 主机侧 fp64 不受限（`compute_l2_report` 早就在用），而把归约搬到主机恰恰是
+    # 2026-10-05 那次 4 卡误报的解药：设备侧 fp32 的噪声底是总量的 1 ulp，
+    # 既误报（设备侧归约的分块顺序跨 rank 不一致）又漏报（微小分歧）。
+    body = re.sub(r'(?s)("""|\'\'\').*?\1', '', body)
+    assert 'dtype=torch.float64, device' not in body, \
+        'fp64 不得作为设备张量的 dtype（910A 不支持，会派发 AICPU kernel）'
+    assert '.sum(dtype=torch.float64)' in body, (
+        'checksum 应在**主机侧**以 fp64 累加（先搬到 cpu 再求和）')
+    assert 'sum(dtype=torch.float32)' not in body, \
+        '不得在设备张量上直接 sum fp32 —— 分块顺序跨 rank 不一致，会末位误报'
     assert 'torch.equal' not in body, \
         'torch.equal 在 910A 上派发到 AICPU kernel，比对要放到主机侧做'
 
