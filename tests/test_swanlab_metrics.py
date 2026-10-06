@@ -485,7 +485,10 @@ def test_v7_loss_terms_are_uploaded_not_only_printed():
     等于这个手段不存在。
     """
     assert "'loss_v7/%s' % k" in MAIN, '逐项 loss 未按 loss_v7/ 前缀上报'
-    assert '**_v7_terms_swanlab' in MAIN, '逐项 dict 未进 swanlab.log 的字面量'
+    # 2026-10-06 D2H 收口：dict 里存的是**设备张量**，float() 转换移到了
+    # swanlab.log 字面量处（打点节奏）——见 `_v7_terms_last` 处注释。
+    assert '**{k: float(v) for k, v in _v7_terms_swanlab.items()}' in MAIN, \
+        '逐项 dict 未进 swanlab.log 的字面量（或 D2H 被提前到每步）'
 
 
 def test_v7_zero_weight_terms_are_still_uploaded():
@@ -519,14 +522,16 @@ def test_terms_prefix_keeps_stdout_reading_bare_names():
     共用会把 stdout 变成 `loss_v7/policy=5.88`，而文档与测试都按裸名读它。
     """
     # 键名仍是**裸 term 名**（不带 `loss_v7/` 前缀）—— stdout 那行按裸名排版。
-    #   `.detach()` 是 2026-10-04 加的：`weighted` 的值带计算图，`float(x)`
-    #   每步触发一次 requires_grad 警告 + 一次多余的 D2H 同步。
-    assert "_v7_terms_last = {k: float(x.detach())" in MAIN, \
-        'stdout 用的裸名 dict 形状被改动'
+    #   `.detach()` 是 2026-10-04 加的：`weighted` 的值带计算图。2026-10-06 起
+    #   **不再就地 float()**：那是 13 次/micro-batch 的 D2H 同步，而 dict 的两个
+    #   消费点都在打点节奏 —— 现在只剥图存设备张量，D2H 推迟到消费处。
+    assert "_v7_terms_last = {k: x.detach() for k, x in _w.items()}" in MAIN, \
+        'stdout 用的裸名 dict 形状被改动（或每步 D2H 被加了回来）'
     # 反向：stdout 那处**不能**带前缀
     _seg = MAIN.split('_v7_terms_last')[1][:200]
     assert 'loss_v7/' not in _seg, 'stdout 的裸名 dict 里混进了上报前缀'
-    assert "'%s=%.4f' % (k, v) for k, v in _v7_terms_last.items()" in MAIN
+    assert "'%s=%.4f' % (k, float(v))" in MAIN, \
+        'stdout 打点行没有在消费处做 float 转换'
 
 
 @pytest.mark.parametrize('key', [

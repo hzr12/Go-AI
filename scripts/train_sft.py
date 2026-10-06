@@ -5168,14 +5168,14 @@ def main():
                     value_loss = _w['value'] + _w['futurepos']
                     l2_report = compute_l2_report(optimizer.param_groups)
                     log_loss = opt_loss + l2_report
-                    # 必须 `.detach()`：`weighted` 的值是**带计算图**的张量，直接
-                    #   `float(x)` 每步都会触发一次
-                    #   `UserWarning: Converting a tensor with requires_grad=True
-                    #   to a scalar`（真机日志里每步刷一次），而且它走的是
-                    #   `Tensor.__float__` 的同步路径 —— 这是**打点路径**，
-                    #   不该为它付一次 D2H。值本身与 detach 无关（同一份数据）。
-                    _v7_terms_last = {k: float(x.detach())
-                                      for k, x in _w.items()}
+                    # **不要**在这里 `float(x)`：那是每项一次 D2H 同步 —— 13 项
+                    #   × 每个 micro-batch，全部是为打点服务的纯浪费（两个消费点
+                    #   `_v7_terms_swanlab` / `[step N v7]` 都只在 `--log-every`
+                    #   节奏读值）。这里只 `.detach()` 剥图（张量带图，直接留着
+                    #   会拖住整段 autograd），**把 D2H 推迟到消费处**：每个打点
+                    #   间隔 13 次同步，而不是每步 13 次。值本身与 detach 无关
+                    #   （同一份数据）；13 个标量张量常驻可忽略。
+                    _v7_terms_last = {k: x.detach() for k, x in _w.items()}
                     # 哪一项算坏了，**当场点名**（2026-10-04 云端 910A 实跑）。
                     #   那个 run 的症状是「每步都溢出、loss 全 NaN、缩放值降到 160
                     #   仍 100% 跳过」，本地 fp32/fp16/bf16 都复现不出来 ⇒ 只有
@@ -5260,6 +5260,8 @@ def main():
                     #   名），若直接把带 `loss_v7/` 前缀的键塞进去，stdout 那行会
                     #   变成 `loss_v7/policy=5.88`，而测试与文档都按裸名读它。
                     #   两套键名不能共用一个 dict。
+                    #   值沿 `_v7_terms_last` 的**张量形态**原样传（D2H 同样推迟
+                    #   到 swanlab log 处），只有权重为 0 的项是字面量 0.0。
                     _v7_terms_swanlab = {
                         'loss_v7/%s' % k: v for k, v in _v7_terms_last.items()}
                     # 权重为 0 的项也**照报**（值恒 0）：图上看得见「这一项存在但
@@ -5565,8 +5567,11 @@ def main():
                 # **长得一模一样**。逐项曲线是训练早期唯一能抓住「第 5 项权重写反了」
                 # 或「futurepos 的 -1 哨兵被当真值拟合」的手段。
                 if _v7_on and _v7_terms_last:
+                    # 值是设备张量（见 `_v7_terms_last` 处注释），float() 就是
+                    # 本行的 D2H —— 每个打点间隔 13 次，而非每步 13 次。
                     logger.info("[step %d v7] " + ' '.join(
-                        '%s=%.4f' % (k, v) for k, v in _v7_terms_last.items()),
+                        '%s=%.4f' % (k, float(v))
+                        for k, v in _v7_terms_last.items()),
                         step)
 
             if _do_swanlab:
@@ -5735,7 +5740,9 @@ def main():
                         # 键名加 `loss_v7/` 前缀而不是裸 term 名：裸名会和
                         # `policy_loss` / `value_loss` 在同一面板里混读，而它们
                         # 的**求和口径不同**（这里是 `weighted`，已乘系数）。
-                        **_v7_terms_swanlab,
+                        # 这里才是 `loss_v7/*` 的**唯一** D2H 点（打点节奏）：
+                        # 上游存的是设备张量，见 `_v7_terms_last` 处注释。
+                        **{k: float(v) for k, v in _v7_terms_swanlab.items()},
                     }
                     # ---- 面板过滤（2026-10-06 瘦身）----
                     #  · `_SWANLAB_DROP_KEYS`：照算不报的键（见常量处注释）；

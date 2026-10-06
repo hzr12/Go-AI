@@ -246,14 +246,29 @@ def test_eval_max_batches_absent_from_run_txt_rl_table():
         'selfplay_train.py 竟然也有 --eval-max-batches —— 那 run.txt 若照抄它就要求它有文档行'
 
     # 原实现是「在 run.txt 的 ③' RL 完整参数表（照抄 selfplay_train.py 的那段）
-    # 里不许出现」，把上面这个源码级检查做了双保险。但 run.txt 已改为一屏简洁版
-    # （7d1d5fd），不再承载逐项参数表，那一节不存在了 ⇒ 断言静默退化成对一个
-    # 不存在的节做 find，检查力归零却不报红 —— 这类「锚点消失」比断言红更危险。
-    # 改为**整篇**不许出现：既不再依赖已退役的小节结构，守卫也比原来更强 ——
-    # train_sft 没有这个选项，那 run.txt 里任何位置都不该教人用它。
-    txt = open(RUN_TXT, encoding='utf-8').read()
-    assert '--eval-max-batches' not in txt, \
-        'run.txt 不得出现 --eval-max-batches（train_sft.py 没有这个 argparse 选项）'
+    # 里不许出现」，后来改成了「run.txt **整篇**都不许出现」。整篇判据是**错的**：
+    #   train_sft.py **确实**定义了这个选项（`--eval-max-batches`，默认 50），
+    #   所以 SFT 那几条命令写它是对的 —— 也正是 b3f10e7 引入 eval 特征预取池、
+    #   消除验证期 NPU 空转之后，调小它的正确做法。
+    #   真正要守的是本测试 docstring 说的那件事：**别把它写进 RL 那条
+    #   selfplay_train 命令**（RL 脚本没有这个选项，照抄过去会让人以为 RL 也在
+    #   按 batch 截断验证集）。所以判据收窄到 RL 命令块 —— 既去掉错误前提，
+    #   又不再依赖已退役的小节结构。
+    _lines = open(RUN_TXT, encoding='utf-8').read().splitlines()
+    _starts = [k for k, l in enumerate(_lines)
+               if 'selfplay_train.py' in l
+               and l.strip().startswith('OMP_NUM_THREADS')]
+    assert _starts, 'run.txt 里找不到 selfplay_train.py 的 RL 命令'
+    for _k in _starts:
+        _blk = []
+        for _l in _lines[_k:]:
+            _blk.append(_l)
+            if not _l.rstrip().endswith('\\'):
+                break
+        _seg = '\n'.join(_blk)
+        assert '--eval-max-batches' not in _seg, (
+            'RL 命令（run.txt 第 %d 行）里出现了 --eval-max-batches，'
+            '但 selfplay_train.py 没有这个 argparse 选项' % (_k + 1))
 
 
 # --------------------------------------------------------------------------- #

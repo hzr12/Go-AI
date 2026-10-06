@@ -122,18 +122,26 @@ def test_broken_zero_weight_term_is_still_named(term, key):
 
 
 def test_seki_broken_is_reported_via_sanitized_rows():
-    """ `seki` 走的是另一条路：它的行权重全为 0 ⇒ 被**净化**成有限。
+    """ seki 头吐 inf **必须留下信号**（段 1 系数 0、坏掉对总 loss 无影响）。
 
-    所以它不会出现在 `nonfinite_terms` 里（那一项确实已经有限了），
-    但必须出现在 `sanitized_rows` 里 —— 否则「seki 头一直在吐 inf」这件事
-    就彻底没人知道了，而它在段 1 系数为 0、坏掉时对总 loss 毫无影响。
+    2026-10-06 门控后信号换通道：零系数项不再走 `_wm` ⇒ 不再有
+    `sanitized_rows`，但廉价替身 `p.sum()` 仍会把 inf/NaN 的头输出带进
+    terms ⇒ `0×inf=NaN` 在装配处净化、且 `nonfinite_terms` 点名。
+    「seki 头一直在吐 inf」依然没人能装看不见。
     """
     lf = _stage1()
     o = _out()
     o['seki_logits'] = torch.full((B, 4, 19, 19), float('inf'))
     r = lf(o, _lbl())
     assert torch.isfinite(r['loss']), '净化后总 loss 应有限'
-    assert r['sanitized_rows'].get('seki'), r['sanitized_rows']
+    assert 'seki' in r['nonfinite_terms'], r['nonfinite_terms']
+    # seki 系数非 0（段 2/3）时才是真正的行净化路径
+    lf2 = KataGoV7Loss(action_size=A)
+    o2 = _out()
+    o2['seki_logits'] = torch.full((B, 4, 19, 19), float('inf'))
+    r2 = lf2(o2, _lbl())
+    assert torch.isfinite(r2['loss']), '净化后总 loss 应有限'
+    assert r2['sanitized_rows'].get('seki'), r2['sanitized_rows']
 
 
 def test_healthy_forward_names_nothing():
@@ -356,13 +364,21 @@ def test_operand_attribution_names_the_broken_side():
     逐项点名只说「哪一项」，而这一项内部有两个来源完全不同的操作数：
     预测来自 ValueHead、目标来自 scorebelief 头。本机与 NPU 的 kernel 不同，
     每次真机跑一轮都要几分钟 ⇒ 归因必须一次到位，不能再猜。
+
+    2026-10-06 门控后操作数探针只在**系数非 0**（段 2/3）时随计算执行
+    ⇒ 本测试改用默认系数（score 系全开）钉归因机制本身；stage 1 下
+    毒信号改由替身经 `nonfinite_terms` 点名（见末尾反向断言）。
     """
-    lf = _stage1()
+    lf = KataGoV7Loss(action_size=A)
     o = _out()
     o['scorebelief_logits'] = torch.full((B, 842), 1e-4)
     o['score_stdev'] = torch.full((B,), float('nan'))
     r = lf(o, _lbl())
     assert 'score_stdev:pred' in r['nonfinite_operands'], r['nonfinite_operands']
+    # stage 1：score_stdev 被门控跳算，操作数探针不跑，但替身仍把毒带进
+    # `nonfinite_terms` —— 坏头不许静默。
+    r1 = _stage1()(o, _lbl())
+    assert 'score_stdev' in r1['nonfinite_terms'], r1['nonfinite_terms']
 
 
 def test_total_finite_flag_distinguishes_sanitised_from_real():
@@ -685,11 +701,15 @@ def test_bad_game_weight_leaves_every_parameter_gradient_finite():
     真机症状是**每个**参数都 NaN（5,562,121 / 5,562,121，连 `stem` 都是）——
     因为 NaN 从 `score_stdev` 进 value head、再经 trunk 污染全部分支。
     所以这里数的不是「某个头」，而是 `named_parameters()` 的**全集**。
+
+    2026-10-06 门控后改用**默认系数**（score 系全开）：`game_weight` 的消费
+    方（score_stdev / var_time_left）在段 1 被跳算，毒通道不存在，端到端
+    回归必须在「消费方活跃」的配置上才有意义。段 1 下替身仍连图
+    （`test_zero_coefficient_guard_still_keeps_the_graph` 钉 DDP 那一半）。
     """
-    from train_sft import build_v7_stage1_loss
     from src.networks.katago_v7 import build_katago_v7_net
     net = build_katago_v7_net(board_size=19)
-    lf = build_v7_stage1_loss(action_size=A)
+    lf = KataGoV7Loss(action_size=A)
     out = net(torch.randn(B, 22, 19, 19), torch.randn(B, 19))
     lbl = _lbl()
     lbl['ownership'] = torch.zeros(B, 1, 19, 19)

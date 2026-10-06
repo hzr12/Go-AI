@@ -708,21 +708,28 @@ def test_gradient_as_bucket_view_implies_set_to_none_false():
 
 
 def test_zero_grad_uses_set_to_none_true():
-    """现状钉住：本文件唯一的 zero_grad 用 `set_to_none=True`。
+    """现状是那唯一的 zero_grad 带 `set_to_none` 参数。
 
-    这条本身也是第 8 条的前提（上面那条依赖「现在确实是 set_to_none=True」才谈
-    得上互斥）。它同时是性能相关的事实：set_to_none 少一次全量写零。
+    别一厢情愿写死 `set_to_none=True`：现在是**条件化**的
+    （`_zero_set_none`），NPU + fused 优化器必须为 `False` ——
+    置 None 会释放要求梯度的张量、破坏其内部引用，并让下一步的
+    `clip_grad_norm_` 直接抛 ValueError。
+
+    这条真正要守的是「**只有一个变量来源**」：满地字面量 `True` 迟早会被
+    某个分支改出第二种行为，而 `gradient_as_bucket_view` 的互斥判定依赖它。
     """
     zero_grads = [n for n in ast.walk(TREE)
                   if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                   and n.func.attr == 'zero_grad']
-    assert zero_grads, '找不到 zero_grad 调用点'
+    assert zero_grads, '找不到 zero_grad 调用'
     for n in zero_grads:
         kw = {k.arg: ast.unparse(k.value) for k in n.keywords}
-        assert kw.get('set_to_none') == 'True', (
-            'L%d 的 zero_grad 应为 set_to_none=True（现状，且是 '
-            'gradient_as_bucket_view 互斥判定的依据），实得 %s'
-            % (n.lineno, kw))
+        assert kw.get('set_to_none') == '_zero_set_none', (
+            'L%d 的 zero_grad 应为 set_to_none=_zero_set_none（唯一变量来源，'
+            'NPU+fused 时求值为 False），实测 %s' % (n.lineno, kw))
+    # 变量本身必须是那个条件表达式，不能被改成别的东西
+    assert '_zero_set_none = not (_opt_mode == ' in SRC, (
+        '_zero_set_none 的定义被改动了 —— 它是 zero_grad 的唯一行为来源')
 
 
 # --------------------------------------------------------------------------- #

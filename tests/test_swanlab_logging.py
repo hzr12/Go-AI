@@ -118,7 +118,7 @@ def _assign_names(stmt):
 
 
 def _call_dict(call):
-    """调用首个位置实参是 dict 字面量时返回 {key: 值源码}；否则 None。"""
+    """解析首个位置实参的 dict 字面量，失败返回 None。"""
     if not call.args:
         return None
     a0 = call.args[0]
@@ -128,18 +128,41 @@ def _call_dict(call):
             if isinstance(k, ast.Constant) and isinstance(k.value, str)}
 
 
-def _train_log_call(tree):
-    """**上报打点标量**的那次 `swanlab_logger.log(` —— 字典里带 loss 三项者。
+def _resolve_payload_dict(call, tree):
+    """同上，但**跟随一层变量间接**：payload 先被攒进 `_sw = {...}` 再上报。
 
-    main() 里有 4 处 `swanlab_logger.log(`：打点 / eval / 早停 / 收尾。只有
-    打点那处传 loss、policy_loss、value_loss，也就是「三个张量各被 .item()
-    取两次」这条不变式真正约束的那一次。按「带哪些 key」指名认领，不按行序取
-    第一个；哪天真的多出第二个带 loss 的上报点，这里会报红要求重新指名，而不会
-    静默改看别处。
+    2026-10-06 起训练步上报写成 `swanlab_logger.log(_sw, step=step)`，
+    键都在 `_sw` 那个赋值里。不跟随这一层的话，所有「键必须出现在上报处」的
+    断言会一起失效 —— 而且是**静默**失效（找不到就报"没有那条上报"，
+    看不出是被重构改了形状）。
+    """
+    d = _call_dict(call)
+    if d is not None:
+        return d
+    if not call.args or not isinstance(call.args[0], ast.Name):
+        return None
+    name = call.args[0].id
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and _assign_names(node) == [name]
+                and isinstance(node.value, ast.Dict) and node.value.keys):
+            return {k.value: ast.unparse(v)
+                    for k, v in zip(node.value.keys, node.value.values)
+                    if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+    return None
+
+
+def _train_log_call(tree):
+    """**训练步上报**：那一处 `swanlab_logger.log(` 携带 loss 三键的上报。
+
+    main() 里有 5 处 `swanlab_logger.log(`（step0 / 训练步 / eval / 早停 /
+    收尾）。训练步是唯一一处同时带 loss、policy_loss、value_loss 的，
+    也只有那一处必须做到「不重新读取张量取标量」—— 用缓存标量上报，
+    否则逐 micro-batch 打点时每点一次 D2H，同步路径会把训练拖垮。
+    以默认步进节奏上报一次为默认情形。
     """
     return _uniques(
         [c for c in _calls_attr(tree, 'swanlab_logger', 'log')
-         if all(k in (_call_dict(c) or {}) for k in _LOSS_KEYS)],
+         if all(k in (_resolve_payload_dict(c, tree) or {}) for k in _LOSS_KEYS)],
         '带 loss/policy_loss/value_loss 的 swanlab_logger.log(',
     )
 
@@ -291,8 +314,9 @@ def test_swanlab_log_uses_cached_scalars():
     # 这是「用缓存的标量」的正向表述。原文只查了「400 字符内没有 .item()」那
     # 一半，于是 `float(log_loss)` 这种不含 .item()、却照样再同步一次设备的
     # 写法能混过去 —— 它破坏的正是本文件要防的「一个打点只同步 3 次」。
-    d = _call_dict(call)
-    assert d is not None, 'swanlab.log 的首个实参不是 dict 字面量，无法核对上报内容'
+    d = _resolve_payload_dict(call, tree)
+    assert d is not None, \
+        'swanlab.log 的首个实参不是 dict 字面量（也不指向一个 dict 赋值），无法核对上报内容'
     got = tuple(d[k] for k in _LOSS_KEYS)
     assert got == ('_lv', '_pv', '_vv'), \
         f'上报的 loss 三项必须复用单同步点的 _lv/_pv/_vv，实得 {got}'

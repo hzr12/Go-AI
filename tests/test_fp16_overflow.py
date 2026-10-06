@@ -32,10 +32,16 @@ def _optimizer_step_block():
 
     必须剥离注释：本块的中文注释里会提到 clip_grad_norm_ / unscale_ 这些
     标识符（解释为何不调换顺序），不剥离会让位置比较读到注释里的名字。
+
+    ⚠ 锚点用的是 `set_to_none=_zero_set_none`（**变量**）而不是 `=True`：
+    NPU + fused 优化器必须 `set_to_none=False`（置 None 会释放要求梯度的张量、
+    破坏其内部引用并让下一步的 `clip_grad_norm_` 抛 ValueError），所以源码里是
+    一个条件表达式。以前这里锚的是字面量 `True`，条件化之后整块就匹配不到了，
+    于是一批断言以「未找到优化器步进块」的形式**一起**假红。
     """
     m = re.search(
         r'if \(i \+ 1\) % _accum_steps == 0 or \(i \+ 1\) == n_batches:\n'
-        r'.*?optimizer\.zero_grad\(set_to_none=True\)',
+        r'.*?optimizer\.zero_grad\(set_to_none=_zero_set_none\)',
         SRC, re.S)
     assert m, '未找到优化器步进块'
     raw = m.group(0)
@@ -99,8 +105,13 @@ def test_skipped_steps_are_counted_and_reported():
         '不要用"本地 scale 是否下降"判跳步'
     # 日志与 swanlab 都要能看到
     assert 'skip=%d' in SRC, '日志行缺少 skip 计数'
-    assert '"skipped_steps": _n_skipped' in SRC, 'swanlab 未上报 skipped_steps'
+    # 2026-10-06 面板瘦身：绝对数 `skipped_steps` 已删，只留 `skip_rate_pct` ——
+    # 两者同源，而跳步**率**才是「溢出严重度」的正确读法（绝对数随 batch /
+    # accum 变，跨 run 不可比）。所以这条守的是「跳步仍可观测」这个意图，
+    # 而不是某个具体键名。
     assert '"skip_rate_pct"' in SRC, 'swanlab 未上报 skip_rate_pct'
+    assert '"skipped_steps": _n_skipped' not in SRC, \
+        'skipped_steps 是可从 skip_rate_pct 推出的派生量，面板瘦身已删除'
     assert '"scaler_scale": _scale' in SRC, 'swanlab 未上报 scaler_scale'
 
 
@@ -215,17 +226,29 @@ def test_real_step_is_derived_from_the_global_verdict_with_one_d2h():
 
 
 def test_terms_float_call_detaches_before_synchronising():
-    """ 逐项 loss 取标量必须 `.detach()`。
+    """ 逐项 loss 取标量必须 `.detach()`，且 **D2H 只能发生在打点节奏上**。
 
-    `weighted` 的值是**带计算图**的张量，`float(x)` 每步触发一次
+    `weighted` 的值是**带计算图**的张量，原地 `float(x)` 每步触发一次
     `UserWarning: Converting a tensor with requires_grad=True to a scalar`
     （真机日志里每步刷一次），而且走的是 `Tensor.__float__` 的同步路径 ——
     这是**打点路径**，不该为它付一次 D2H。
+
+    2026-10-06 起更进一步：`_v7_terms_last` 只 `.detach()` 存**设备张量**，
+    D2H 从「每步 13 次」推迟到「每个打点间隔 13 次」（两个消费点都在
+    `--log-every` 节奏上）。所以下面同时钉住三件事：仍 detach、dict 里
+    **不再就地 float**、消费处确实做了转换。
     """
-    assert '_v7_terms_last = {k: float(x.detach())' in SRC, \
-        '逐项标量必须先 detach 再 float'
+    assert '_v7_terms_last = {k: x.detach() for k, x in _w.items()}' in SRC, \
+        '逐项标量必须先 detach 再取值'
+    assert '_v7_terms_last = {k: float(x.detach())' not in SRC, \
+        '就地 float(x.detach()) 每步一次 D2H —— 应推迟到消费处'
     assert '_v7_terms_last = {k: float(x) for' not in SRC, \
         '未 detach 的 float(x) 每步都会触发 requires_grad 警告'
+    # 两个消费点各自做转换，缺一个就少上报一路
+    assert "'%s=%.4f' % (k, float(v))" in SRC, \
+        'stdout 打点行没有在消费处做 float 转换'
+    assert '**{k: float(v) for k, v in _v7_terms_swanlab.items()}' in SRC, \
+        'swanlab 上报没有在消费处做 float 转换'
 
 
 def test_overflow_diagnostics_are_rank0_only():

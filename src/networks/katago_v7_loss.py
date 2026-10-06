@@ -466,6 +466,38 @@ class KataGoV7Loss(nn.Module):
         logp = F.log_softmax(out['policy_logits'].float(), dim=-1)
         w_soft = POLICY_SOFT_WEIGHT
 
+        # ---- 零系数项的门控（2026-10-06）--------------------------------
+        # 段 A 的权重表把 9 个 score 系项置 0，但 forward 此前**无条件全算**：
+        # 仅 scorebelief 一族每步就是 3 次 (B,842) softmax + 2 次 842 长
+        # cumsum + 逐样本 std 归约，而它们的加权贡献恒为 0。
+        # 门控读 `self.coeff`（段表覆盖后的**有效**权重），段 B/C 打开后自动
+        # 恢复全算 —— 段表怎么改都不用碰这里的代码。
+        _c = self.coeff
+        _on_sb = any(_c[k] != 0.0 for k in
+                     ('scorebelief_pdf', 'scorebelief_cdf', 'score_stdev'))
+
+        def _zero_term(out_key):
+            """零系数项的**廉价替身**：只保「头 → 计算图」的连接，不做 loss 计算。
+
+            为什么不能直接 `terms[k] = 0.0`：这些头（scorebelief / score_stdev /
+            ownership / score_mean / lead / var_time_left / scoring / seki）在
+            段 1 **只**被零系数项消费，替身不连图 ⇒ 参数 grad=None ⇒ DDP 抛
+            `Expected to have finished reduction in the prior iteration`
+            （真机 2 卡实测，见下方装配处的注 —— 静默剪梯度不是修复，是换一个
+            更响的崩溃）。
+            `p.float().sum()` 是一次归约 kernel；经装配处 `c * v`（c=0）回传的
+            梯度恰好是**全零**，与旧实现（真实 loss × c=0，同样精确 0）逐位
+            一致，但省掉整条 softmax/cumsum/std 链。
+            代价与语义的让步（都接受）：零系数项不再产出真实数值 ⇒ ①
+            `nonfinite_terms` / `sanitized_rows` 对它们失效（没算就不可能坏，
+            原本「这一项在吐 inf」的早期信号消失）；② seki 的自适应 EMA 在
+            段 A 停更（权重 0，段 B/C 打开后重新暖机）。
+            """
+            p = out.get(out_key)
+            if p is None:
+                return torch.zeros((), device=dev)
+            return p.float().sum()
+
         def soft_ce(target, ch):
             """某一通道的软 CE，口径与 12 通路 `soft_cross_entropy` 逐位一致。
 
@@ -528,96 +560,119 @@ class KataGoV7Loss(nn.Module):
             reduction='none'), None)
 
         # ---- 4 ownership（系数 1.5，w_ownership）----
-        own_t = T(labels['ownership']).reshape(b, -1)
-        own_logit = 2.0 * out['ownership_pretanh'].reshape(b, -1).float()
-        own_bce = F.binary_cross_entropy_with_logits(
-            own_logit, (own_t + 1.0) * 0.5, reduction='none')
-        terms['ownership'] = _wm('ownership', own_bce.sum(-1) / n_sq,
-                                            w_of('ownership'))
+        if _c['ownership'] != 0.0:
+            own_t = T(labels['ownership']).reshape(b, -1)
+            own_logit = 2.0 * out['ownership_pretanh'].reshape(b, -1).float()
+            own_bce = F.binary_cross_entropy_with_logits(
+                own_logit, (own_t + 1.0) * 0.5, reduction='none')
+            terms['ownership'] = _wm('ownership', own_bce.sum(-1) / n_sq,
+                                                w_of('ownership'))
+        else:
+            terms['ownership'] = _zero_term('ownership_pretanh')
 
         # ---- 5/6 scorebelief pdf + cdf（各 0.020，w_score）----
-        sb_logits = out['scorebelief_logits'].float()
-        sb_tgt = labels.get('score_distr')
-        if sb_tgt is None:
-            sb_tgt = build_score_distr_target(
-                torch.as_tensor(labels['sb_center']).to(dev),
-                torch.as_tensor(labels['sb_upper']).to(dev), self.num_bins)
-        sb_tgt = T(sb_tgt)
-        terms['scorebelief_pdf'] = _wm('scorebelief_pdf', 
-            -(sb_tgt * F.log_softmax(sb_logits, dim=-1)).sum(-1),
-            w_of('score'))
-        cdf_p = F.softmax(sb_logits, dim=-1).cumsum(-1)
-        cdf_t = sb_tgt.cumsum(-1)
-        terms['scorebelief_cdf'] = _wm('scorebelief_cdf', 
-            (cdf_p - cdf_t).pow(2).sum(-1), w_of('score'))
+        # 门控与 #7 共享 `_on_sb`：三者共用 `sb_logits` 的 softmax 链，任一系数
+        # 非 0 就全算（共享计算，没有单独省的余地），全 0 才整链跳过。
+        if _on_sb:
+            sb_logits = out['scorebelief_logits'].float()
+            sb_tgt = labels.get('score_distr')
+            if sb_tgt is None:
+                sb_tgt = build_score_distr_target(
+                    torch.as_tensor(labels['sb_center']).to(dev),
+                    torch.as_tensor(labels['sb_upper']).to(dev), self.num_bins)
+            sb_tgt = T(sb_tgt)
+            terms['scorebelief_pdf'] = _wm('scorebelief_pdf', 
+                -(sb_tgt * F.log_softmax(sb_logits, dim=-1)).sum(-1),
+                w_of('score'))
+            cdf_p = F.softmax(sb_logits, dim=-1).cumsum(-1)
+            cdf_t = sb_tgt.cumsum(-1)
+            terms['scorebelief_cdf'] = _wm('scorebelief_cdf', 
+                (cdf_p - cdf_t).pow(2).sum(-1), w_of('score'))
+        else:
+            terms['scorebelief_pdf'] = _zero_term('scorebelief_logits')
+            terms['scorebelief_cdf'] = _zero_term('scorebelief_logits')
 
         # ---- 7 scorestdev 自预测（系数 0.001，**仅 game_weight，无行权重**）----
-        # `std` **不能**直接调 `F.softmax(...).std(-1)`（2026-10-04 云端 910A
-        #   实测点名到本项：加权 loss 非有限，逐项点名 = ['score_stdev']）。
-        #
-        # 根因：scorebelief 有 **842 个桶**，初始化时 logits 近均匀 ⇒ p ≈ 1/842
-        # ≈ 1.19e-3 且彼此相差极小 ⇒ **方差 ≈ 1e-10**。这个量级下
-        # 「朴素公式」`E[x²] − E[x]²` 会发生**灾难性抵消**：两个 ~1.4e-6 的数
-        # 相减得到一个微小**负数** ⇒ `sqrt(负数)` = **NaN**。
-        #
-        # CPU 的 `torch.std` 用 Welford / 两遍算法，稳；NPU 的规约核用朴素公式，
-        # 于是**只有真机炸** —— 本地 fp32 / fp16 / bf16 全都复现不出来
-        # （实测三项梯度 NaN 张量均为 0/322）。
-        #
-        # 修法：**两遍 + fp32**。`mean((p − μ)²)` 恒非负（每一项都是平方），
-        # 在 fp32 下 842 个元素的抵消也远不到出问题的量级。代价是多一个
-        # `(B, 842)` 的减法/平方，可忽略（这一项的系数在段 1 是 0）。
-        _sb_p = F.softmax(sb_logits, dim=-1).float()
-        _sb_mu = _sb_p.mean(dim=-1, keepdim=True)
-        sb_std = (_sb_p - _sb_mu).pow(2).mean(dim=-1).sqrt()
-        # **目标必须 detach**。
-        #
-        #   `#7 scorestdev` 是 13 项里**唯一**「目标不是标签、而是模型自己输出的
-        #   派生量」的一项：`sb_std = std(softmax(sb_logits))` 来自 `scorebelief_head`。
-        #   其余 12 项的目标都是**标签常量**，autograd 不会往它们回传梯度。
-        #
-        #   detach 的理由是**语义**，不是数值：自预测蒸馏的目标就该是常量。官方
-        #   `losses.cpp` 算 `avgStddev` 时走 `forwardEval` / no-grad —— 它要的是
-        #   「当前预测的分布宽度」这个**读数**。留着梯度等于让 scorebelief 头同时
-        #   被两股方向相反的力撕：CE（#5/#6）要它锐利，这条梯度要它均匀。
-        #
-        #   **不要把它当成 NaN 修复**（2026-10-04 实测推翻的旧说法）：我曾认为
-        #   `d(sqrt v)/dv = 1/(2·std) ≈ 4.27e6`（std≈1.17e-7）会在 fp16 上溢成 inf，
-        #   再乘上游 0 变 NaN。实测不成立：`tmp/coding/measure_stdev_grad.py` 在
-        #   B=3000 / 842 桶 / coeff=0.001 下量得 dL/dstd=3.33e-07、**dL/dv=1.53**
-        #   —— 那个 4.27e6 乘的是 coeff/B 这个极小的上游梯度，不是 0，也不是 1。
-        #   峰值 1.53 离fp16 上限 65504 差四个数量级，无 NaN 无 inf。真正的 NaN
-        #   源头**仍未定位**，见 :data:`_bad_operands` 的操作数级归因。
-        sb_std = sb_std.detach()
-        # 下界是**独立的数值兜底**，与 detach 无关（因此这里不需要梯度注释）：
-        # 它唯一能挡住的极端是 `v` 下溢成**恰好 0**（`sqrt` 的反向 = 1/(2·0) = inf）。
-        # 真实模型里 842 个桶恰好等概率是零测度，所以这层是 belt-and-suspenders，
-        # 不是已观测到的故障。取值 1e-3 远低于任何真实分布展度，不改口径。
-        sb_std = sb_std.clamp_min(SCORE_STDEV_TARGET_FLOOR)
-        # 操作数级归因：下一轮日志能直接看出是「预测」还是「目标」坏掉，
-        # 而不必再猜（真机与本机的 std 实现不同，只有真机能回答）。
-        # 下面的 `huber(out['score_stdev'].float(), sb_std, ...)` 是
-        #   `tests/test_katago_v7_budget.py::test_score_stdev_loss_term_is_inside_
-        #   huber_delta_at_the_ruled_out_beta` 按**字面量**钉住的（它要保证本路
-        #   的 δ 与测试常量同步）⇒ **不要**把 `out['score_stdev'].float()` 提成一个
-        #   中间变量，否则那条门禁会假红。
-        if not bool(torch.isfinite(out['score_stdev']).all()):
-            _bad_operands.append('score_stdev:pred')
-        if not bool(torch.isfinite(sb_std).all()):
-            _bad_operands.append('score_stdev:std')
-        terms['score_stdev'] = _wm('score_stdev', 
-            huber(out['score_stdev'].float(), sb_std, 10.0),
-            None if labels.get('game_weight') is None
-            else T(labels['game_weight']).reshape(-1))
+        # 门控见 #5/6（共享 `_on_sb`）。2026-10-05 真机 NaN 链（前向净化了、
+        # 反向没有：`0 × NaN = NaN`）正是从本项进的 —— 门控跳算后这一整类
+        # 「零权重项污染全参数梯度」的故障从根上消失。
+        if _on_sb:
+            # `std` **不能**直接调 `F.softmax(...).std(-1)`（2026-10-04 云端 910A
+            #   实测点名到本项：加权 loss 非有限，逐项点名 = ['score_stdev']）。
+            #
+            # 根因：scorebelief 有 **842 个桶**，初始化时 logits 近均匀 ⇒ p ≈ 1/842
+            # ≈ 1.19e-3 且彼此相差极小 ⇒ **方差 ≈ 1e-10**。这个量级下
+            # 「朴素公式」`E[x²] − E[x]²` 会发生**灾难性抵消**：两个 ~1.4e-6 的数
+            # 相减得到一个微小**负数** ⇒ `sqrt(负数)` = **NaN**。
+            #
+            # CPU 的 `torch.std` 用 Welford / 两遍算法，稳；NPU 的规约核用朴素公式，
+            # 于是**只有真机炸** —— 本地 fp32 / fp16 / bf16 全都复现不出来
+            # （实测三项梯度 NaN 张量均为 0/322）。
+            #
+            # 修法：**两遍 + fp32**。`mean((p − μ)²)` 恒非负（每一项都是平方），
+            # 在 fp32 下 842 个元素的抵消也远不到出问题的量级。代价是多一个
+            # `(B, 842)` 的减法/平方，可忽略（这一项的系数在段 1 是 0）。
+            _sb_p = F.softmax(sb_logits, dim=-1).float()
+            _sb_mu = _sb_p.mean(dim=-1, keepdim=True)
+            sb_std = (_sb_p - _sb_mu).pow(2).mean(dim=-1).sqrt()
+            # **目标必须 detach**。
+            #
+            #   `#7 scorestdev` 是 13 项里**唯一**「目标不是标签、而是模型自己输出的
+            #   派生量」的一项：`sb_std = std(softmax(sb_logits))` 来自 `scorebelief_head`。
+            #   其余 12 项的目标都是**标签常量**，autograd 不会往它们回传梯度。
+            #
+            #   detach 的理由是**语义**，不是数值：自预测蒸馏的目标就该是常量。官方
+            #   `losses.cpp` 算 `avgStddev` 时走 `forwardEval` / no-grad —— 它要的是
+            #   「当前预测的分布宽度」这个**读数**。留着梯度等于让 scorebelief 头同时
+            #   被两股方向相反的力撕：CE（#5/#6）要它锐利，这条梯度要它均匀。
+            #
+            #   **不要把它当成 NaN 修复**（2026-10-04 实测推翻的旧说法）：我曾认为
+            #   `d(sqrt v)/dv = 1/(2·std) ≈ 4.27e6`（std≈1.17e-7）会在 fp16 上溢成 inf，
+            #   再乘上游 0 变 NaN。实测不成立：`tmp/coding/measure_stdev_grad.py` 在
+            #   B=3000 / 842 桶 / coeff=0.001 下量得 dL/dstd=3.33e-07、**dL/dv=1.53**
+            #   —— 那个 4.27e6 乘的是 coeff/B 这个极小的上游梯度，不是 0，也不是 1。
+            #   峰值 1.53 离fp16 上限 65504 差四个数量级，无 NaN 无 inf。真正的 NaN
+            #   源头**仍未定位**，见 :data:`_bad_operands` 的操作数级归因。
+            sb_std = sb_std.detach()
+            # 下界是**独立的数值兜底**，与 detach 无关（因此这里不需要梯度注释）：
+            # 它唯一能挡住的极端是 `v` 下溢成**恰好 0**（`sqrt` 的反向 = 1/(2·0) = inf）。
+            # 真实模型里 842 个桶恰好等概率是零测度，所以这层是 belt-and-suspenders，
+            # 不是已观测到的故障。取值 1e-3 远低于任何真实分布展度，不改口径。
+            sb_std = sb_std.clamp_min(SCORE_STDEV_TARGET_FLOOR)
+            # 操作数级归因：下一轮日志能直接看出是「预测」还是「目标」坏掉，
+            # 而不必再猜（真机与本机的 std 实现不同，只有真机能回答）。
+            # 下面的 `huber(out['score_stdev'].float(), sb_std, ...)` 是
+            #   `tests/test_katago_v7_budget.py::test_score_stdev_loss_term_is_inside_
+            #   huber_delta_at_the_ruled_out_beta` 按**字面量**钉住的（它要保证本路
+            #   的 δ 与测试常量同步）⇒ **不要**把 `out['score_stdev'].float()` 提成一个
+            #   中间变量，否则那条门禁会假红。
+            if not bool(torch.isfinite(out['score_stdev']).all()):
+                _bad_operands.append('score_stdev:pred')
+            if not bool(torch.isfinite(sb_std).all()):
+                _bad_operands.append('score_stdev:std')
+            terms['score_stdev'] = _wm('score_stdev', 
+                huber(out['score_stdev'].float(), sb_std, 10.0),
+                None if labels.get('game_weight') is None
+                else T(labels['game_weight']).reshape(-1))
+        else:
+            terms['score_stdev'] = _zero_term('score_stdev')
 
         # ---- 8 scoremean（系数 0.0015，w_score，δ=12）----
+        # `score_t` 被 #9 lead 复用，且 lead 的门控可能单独打开 ⇒ 无条件取
+        # （与旧实现一致：`labels['score']` 本就是必给标签）。
         score_t = T(labels['score']).reshape(-1)
-        terms['score_mean'] = _wm('score_mean', 
-            huber(out['score_mean'].float(), score_t, 12.0), w_of('score'))
+        if _c['score_mean'] != 0.0:
+            terms['score_mean'] = _wm('score_mean', 
+                huber(out['score_mean'].float(), score_t, 12.0), w_of('score'))
+        else:
+            terms['score_mean'] = _zero_term('score_mean')
 
         # ---- 9 lead（系数 0.0060，w_lead，δ=8）----
-        terms['lead'] = _wm('lead', 
-            huber(out['lead'].float(), score_t, 8.0), w_of('lead'))
+        if _c['lead'] != 0.0:
+            terms['lead'] = _wm('lead', 
+                huber(out['lead'].float(), score_t, 8.0), w_of('lead'))
+        else:
+            terms['lead'] = _zero_term('lead')
 
         # ---- 9b varTimeLeft（官方 sv3[3]，系数 0.0060，δ=8）----
         # **不能用 `w_of('lead')`**。实测（zzb28c512nfd4 三个成员、12748 行）
@@ -632,17 +687,37 @@ class KataGoV7Loss(nn.Module):
         #   是为了让只构造了部分输出的测试桩也能跑通（真实模型恒有该键）。
         vtl_t = labels.get('var_time_left')
         vtl_p = out.get('var_time_left')
-        if vtl_t is not None and vtl_p is not None:
-            terms['var_time_left'] = _wm('var_time_left', 
-                huber(vtl_p.float(), T(vtl_t).reshape(-1), 8.0),
-                None if labels.get('game_weight') is None
-                else T(labels['game_weight']).reshape(-1))
+        if _c['var_time_left'] != 0.0:
+            if vtl_t is not None and vtl_p is not None:
+                terms['var_time_left'] = _wm('var_time_left', 
+                    huber(vtl_p.float(), T(vtl_t).reshape(-1), 8.0),
+                    None if labels.get('game_weight') is None
+                    else T(labels.get('game_weight')).reshape(-1))
+        elif vtl_t is not None and vtl_p is not None:
+            # 系数为 0 且**标签齐备**：给替身。
+            # ⚠ 判据里必须带 `vtl_t is not None`，不能只看输出头在场：上面
+            #   「标签或输出任一缺失时跳过，而不是喂 0」是本项**单独**的语义
+            #   （喂 0 会把这一路往「方差恒 0」的方向硬拉，比不训练更糟）。
+            #   曾经只判 `vtl_p is not None`，于是「缺标签」也被当成「标签为 0」
+            #   处理、凭空造出一项 —— `test_train_sft_v7.py::
+            #   test_stage1_score_family_contributes_nothing_but_is_still_computed`
+            #   抓到了。
+            #
+            #   DDP 图连通性**不依赖**这一项：`value_head.scores` 的 6 个通道里
+            #   `score_mean`(s[:,0]) 与 `lead`(s[:,2]) 在系数表里非零，它们的
+            #   替身已把 `scores` 连进图（实测：只接这两项时 scores 有梯度）。
+            #   所以这里收紧判据不会重新引入
+            #   `Expected to have finished reduction in the prior iteration`。
+            terms['var_time_left'] = _zero_term('var_time_left')
 
         # ---- 10 scoring（**0.25 在系数表里**，w_scoring）----
-        sc_t = T(labels['scoring']).reshape(b, -1)
-        sc_mse = (out['scoring'].reshape(b, -1).float() - sc_t).pow(2).mean(-1)
-        terms['scoring'] = _wm('scoring', 
-            4.0 * (torch.sqrt(0.5 * sc_mse + 1.0) - 1.0), w_of('scoring'))
+        if _c['scoring'] != 0.0:
+            sc_t = T(labels['scoring']).reshape(b, -1)
+            sc_mse = (out['scoring'].reshape(b, -1).float() - sc_t).pow(2).mean(-1)
+            terms['scoring'] = _wm('scoring', 
+                4.0 * (torch.sqrt(0.5 * sc_mse + 1.0) - 1.0), w_of('scoring'))
+        else:
+            terms['scoring'] = _zero_term('scoring')
 
         # ---- 11 futurepos（**0.25 已内嵌在公式里**，w_futurepos）----
         fut_t = T(labels['futurepos']).reshape(b, 2, n_sq)
@@ -654,28 +729,40 @@ class KataGoV7Loss(nn.Module):
             w_of('futurepos'))
 
         # ---- 12 seki（自适应，w_seki）----
-        if 'seki_sign' in labels and 'seki_neutral' in labels:
-            sign_t = T(labels['seki_sign'], torch.long).reshape(b, n_sq)
-            neu_t = T(labels['seki_neutral']).reshape(b, n_sq)
+        # 门控代价注：跳算时自适应 EMA 停更（段 A 权重 0 本来就不训；段 B/C
+        # 打开后 EMA 从当前值重新暖机，`SEKI_ADAPT_DEN` 量级下几步即收敛）。
+        if _c['seki'] != 0.0:
+            if 'seki_sign' in labels and 'seki_neutral' in labels:
+                sign_t = T(labels['seki_sign'], torch.long).reshape(b, n_sq)
+                neu_t = T(labels['seki_neutral']).reshape(b, n_sq)
+            else:
+                sign_t, neu_t = seki_targets_from_plane(
+                    torch.as_tensor(labels['seki']).reshape(b, 1, n_sq))
+            seki_logits = out['seki_logits'].float()
+            # 逐 (样本, 格) 对 3 个符号类做 CE：把类维放中间 ⇒
+            # cross_entropy(input=(B,3,N), target=(B,N)) → (B,N)。
+            # 误写成 reshape(B*3, N) 会让 cross_entropy 把 361 当类维，
+            # 报「input batch_size 12 vs target 1444」—— 一眼能看出，但更糟的
+            # 写法是 (B,3,N)→(B*N,3) 再转置，形状对而语义错，静默学错。
+            ce_sign = F.cross_entropy(
+                seki_logits[:, :SEKI_SIGN_CHANNELS].reshape(
+                    b, SEKI_SIGN_CHANNELS, n_sq),
+                sign_t.reshape(b, n_sq), reduction='none')
+            ce_neu = F.binary_cross_entropy_with_logits(
+                seki_logits[:, SEKI_SIGN_CHANNELS].reshape(b, n_sq), neu_t,
+                reduction='none')
+            seki_raw = (ce_sign.sum(-1) + 0.5 * ce_neu.sum(-1)) / n_sq
+            adaptive = self._seki_adaptive_scale(seki_raw.detach().mean())
+            terms['seki'] = _wm('seki', seki_raw * adaptive, w_of('seki'))
         else:
-            sign_t, neu_t = seki_targets_from_plane(
-                torch.as_tensor(labels['seki']).reshape(b, 1, n_sq))
-        seki_logits = out['seki_logits'].float()
-        # 逐 (样本, 格) 对 3 个符号类做 CE：把类维放中间 ⇒
-        # cross_entropy(input=(B,3,N), target=(B,N)) → (B,N)。
-        # 误写成 reshape(B*3, N) 会让 cross_entropy 把 361 当类维，
-        # 报「input batch_size 12 vs target 1444」—— 一眼能看出，但更糟的
-        # 写法是 (B,3,N)→(B*N,3) 再转置，形状对而语义错，静默学错。
-        ce_sign = F.cross_entropy(
-            seki_logits[:, :SEKI_SIGN_CHANNELS].reshape(
-                b, SEKI_SIGN_CHANNELS, n_sq),
-            sign_t.reshape(b, n_sq), reduction='none')
-        ce_neu = F.binary_cross_entropy_with_logits(
-            seki_logits[:, SEKI_SIGN_CHANNELS].reshape(b, n_sq), neu_t,
-            reduction='none')
-        seki_raw = (ce_sign.sum(-1) + 0.5 * ce_neu.sum(-1)) / n_sq
-        adaptive = self._seki_adaptive_scale(seki_raw.detach().mean())
-        terms['seki'] = _wm('seki', seki_raw * adaptive, w_of('seki'))
+            terms['seki'] = _zero_term('seki_logits')
+            # 返回键 `seki_adaptive_scale` 必须始终存在（probe 脚本/测试消费）。
+            # 尺度公式只依赖 EMA（见 `_seki_adaptive_scale` 尾行），这里**只读**
+            # 复算同一值 —— 不走该方法本身，避免 train 态下以 cur=0 更新 EMA
+            # （seki 关着却让 EMA 衰减是语义漂移）。
+            adaptive = (self._seki_fallback_scale()
+                        if not torch.isfinite(self.seki_ema)
+                        else SEKI_ADAPT_NUM / (SEKI_ADAPT_DEN + self.seki_ema))
 
         # ---- 装配：逐项乘**有效**系数（只乘一次）----
         # **净化数值，但绝不切断计算图**（2026-10-04 云端 910A 实跑）。

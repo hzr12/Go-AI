@@ -347,3 +347,84 @@ def test_gradient_flows_to_every_term(lossf):
     dead = [k for k, v in out.items()
             if v.grad is None or not torch.isfinite(v.grad).all()]
     assert not dead, f'这些输出没有有限梯度：{dead}'
+
+
+# --------------------------------------------------------------------------- #
+# 4. 零系数门控（2026-10-06）：不算，但必须保持 DDP 图连接
+# --------------------------------------------------------------------------- #
+#: 段 A 权重表置 0 的 9 个 score 系项（train_sft.py `V7_STAGE1_SCORE_TERMS`
+#: 同名单 —— 这里故意**另写一份**：门控测试要的是「给定这组系数」的行为，
+#: 与段表漂移无关；段表自身的正确性由 train_sft 侧的测试钉）。
+_STAGE1_ZERO = {k: 0.0 for k in (
+    'ownership', 'scorebelief_pdf', 'scorebelief_cdf', 'score_stdev',
+    'score_mean', 'lead', 'var_time_left', 'scoring', 'seki')}
+
+
+def test_zero_coeff_terms_stay_in_graph_with_zero_grad():
+    """零系数项：加权值恰 0、替身**连图**、反向拿到精确零梯度。
+
+    三个断言各钉一个契约：
+    1. `weighted[k] == 0.0` —— stdout/swanlab 曲线与旧实现逐位一致；
+    2. `grad_fn is not None` —— 替身若不连图，这些头（段 A 只被零系数项
+       消费）grad=None ⇒ DDP 抛 `Expected to have finished reduction in
+       the prior iteration`（真机实测，装配处注释有记录）；
+    3. 梯度全零 —— 与旧实现（真实 loss × c=0，同样精确 0）逐位一致，
+       证明门控没有改变优化语义，只省了计算。
+    """
+    lossf = KataGoV7Loss(action_size=ACTION_SIZE, coeff=_STAGE1_ZERO)
+    out = _out()
+    lb = _labels()
+    for v in out.values():
+        v.requires_grad_(True)
+    res = lossf(out, lb)
+    for k in _STAGE1_ZERO:
+        # var_time_left 例外：_out() 测试桩没有这个头 ⇒ 与「输入缺失 ⇒ 不设
+        # 项」的既有口径一致（真实模型恒有该头 ⇒ 装配循环必含替身项）。
+        if k == 'var_time_left':
+            continue
+        assert k in res['weighted'], f'{k} 项消失了（装配循环必须全覆盖）'
+        assert float(res['weighted'][k]) == 0.0, f'{k} 的加权值非 0'
+    for k in _STAGE1_ZERO:
+        if k == 'var_time_left':
+            continue
+        assert res['weighted'][k].grad_fn is not None, \
+            f'{k} 的替身没连图（DDP 契约破坏）'
+    res['loss'].backward()
+    for key in ('scorebelief_logits', 'score_stdev', 'ownership_pretanh',
+                'score_mean', 'lead', 'scoring', 'seki_logits'):
+        g = out[key].grad
+        assert g is not None, f'{key} 的头失去梯度（DDP 契约破坏）'
+        assert bool((g == 0).all()), f'{key} 的梯度非零（门控改了优化语义）'
+    # 四个主目标照常回传（门控不能波及它们）
+    assert out['policy_logits'].grad is not None
+    assert not bool((out['policy_logits'].grad == 0).all())
+
+
+def test_zero_coeff_terms_actually_skip_softmax(monkeypatch):
+    """门控必须**真跳过**：零系数下 sb 的 softmax 链不得执行。
+
+    钉的是性能契约 —— 替身若仍走 F.softmax（3 次 (B,842) softmax + 2 次
+    842 长 cumsum 正是本次优化要省的大头），门控就只是改了个写法。
+    """
+    import src.networks.katago_v7_loss as m
+
+    # 数据**先**构造：_labels() 自己会用 F.softmax 造软标签分布，若在打桩后
+    # 构造就把统计污染了。
+    out_a, lb = _out(), _labels()
+    out_b = _out()
+
+    calls = []
+    orig_softmax = m.F.softmax
+
+    def _spy(*a, **kw):
+        calls.append(1)
+        return orig_softmax(*a, **kw)
+
+    monkeypatch.setattr(m.F, 'softmax', _spy)
+    # 段 A 系数：loss 内部一次 softmax 都不该有
+    KataGoV7Loss(action_size=ACTION_SIZE, coeff=_STAGE1_ZERO)(out_a, lb)
+    assert calls == [], f'零系数下仍执行了 {len(calls)} 次 softmax（门控未生效）'
+    # 默认系数：cdf + std 两处照常执行（pdf 走 log_softmax，不在此列）
+    KataGoV7Loss(action_size=ACTION_SIZE)(out_b, lb)
+    assert len(calls) >= 2, '默认系数下 softmax 反而没执行？'
+
