@@ -25,7 +25,11 @@ pip install onnx onnxruntime
 #   fp16+GradScaler 仅 910B 分支保留。NPU 上 inductor 编译无效，别加 --compile。
 
 # ---------- 1. 数据（都已就位，不要重建）----------
-# 1) data/sgf_19x19_full.npz = 34,202,713 行 / 162,298 局，加压 447 MB、解压 12.3 GB
+# 1) data/sgf_19x19_full.npz = 34,264,225 行 / 163,535 局，加压 447 MB、解压 12.3 GB
+# ⚠ 2026-10-06 实测行数（旧文档写 34,202,713/162,298——数据集重建过 +61,512 行）。
+#   🔴 数据集一变，soft_index 的行号全体平移：**必须重建** data/labels/soft_index.npz，
+#   否则 policy 与局面逐行无关（真机事故：B 段 train_top1 崩到 0.2%、policy CE 钉在
+#   均匀上界 5.85）。现在 attach_soft_index 启动时校验行数指纹，不符直接 SystemExit。
 python scripts/build_games_sidecar.py --dataset data/sgf_19x19_full.npz --out data/labels/games.npz
 # 2) KataGo 软标签（B 段用）
 python scripts/label_sgf.py --game-frac 0.015 --move-lo 100 --move-hi 200 --limit 0 --out data/labels/kata_labels.npz
@@ -93,6 +97,18 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 #   （fp32 max|Δ|≈7e-07），开了会让 12 通道 bit-identical 基线失效；真机加速比未实测。
 # ⚠ `--use-checkpoint` 已归档：由 `KATAGO_SE_CFG['grad_checkpoint']` 决定，唯一关闭
 #   路径是 `--compile 1`（而 NPU 上 --compile 无效）。别传它。
+# ✅ eval 特征预取池（2026-10-06）：eval 的梯子特征曾是主进程串行计算，10 万行磨
+#   25-30 分钟（NPU 归零、无日志，两次被当成挂死）。现在与训练预取器同点 fork 一个
+#   2-4 worker 的 eval 池（augment=False，指标逐位不变），墙钟 ÷ worker 数；
+#   启动日志锚点：`[data] eval 预取池已启用`。仍建议配 `--eval-max-batches 5`。
+# ⚠ `--npu-graph-compile 1` 与梯度检查点**互斥**：开图编译会强制关 GC
+#   （日志有 warning），显存/样本从 4.65 MB 涨到 ~278 MB ⇒ batch 上限 200 出头，
+#   batch 1500/5500 必 OOM（2026-10-06 实测）。要试图编译：batch 180 + accum 8。
+#   Linear-only（非整图）由 tests/test_npu_graph_compile.py 钉住。
+# ✅ AdamW：NPU 上优先 `torch_npu.optim.NpuFusedAdamW`（post10 实测可用，日志
+#   `已启用 fused AdamW (backend=npu)`）；不可用自动回退 standard+foreach。
+#   C 段启动若卡在 [device] 之后：先 py-spy dump——大概率是 V7PackedDataset
+#   读 37.6GB 分片的静默加载期（无日志），不是挂死。
 
 # --- A-1  单卡 910A（batch 2800，LR 0.00377）---
 torchrun --nproc_per_node=1 scripts/train_sft.py \
@@ -122,27 +138,36 @@ torchrun --nproc_per_node=2 scripts/train_sft.py \
   --early-stop 1 --early-stop-patience 3 \
   --out models/a_v7_npu2.pth --swanlab 1 --ver a_v7.2_npu2_resume --swanlab-every 5
 
-# --- B 段：+ KataGo 软标签（承接 A-2）---
+# --- B 段：+ KataGo 软标签（承接 A-2，2 卡）---
 # ⚠ `--policy-loss soft_ce` 不写也行：给了 --soft-index 会自动选中。
-torchrun --nproc_per_node=4 scripts/train_sft.py \
+# 🔴 `--epochs 30` 不是笔误：--soft-only-sampling 把训练集从 3426 万行收窄到
+#   225,338 行 ⇒ 2 卡×batch 2000 只有 57 步/epoch。epochs=1 ⇒ 全程 114 步、
+#   cosine 在 step ~100 就退火到 0（2026-10-06 实测：policy 纹丝不动）。
+#   30 epochs ≈ 1710 步，才是有效预算。
+# ⚠ `--eval-max-batches 5`：eval 特征已池化（4 worker），但 50 批×2000=10 万行
+#   仍要 ~6-8 分钟；5 批 ≈ 1 分钟，对 top1/kl 的估计精度足够。
+# 🔴 soft_index.npz **必须对当前数据集/标签构建**（行数变了行号全体平移——
+#   2026-10-06 事故：train_top1 崩到 0.2%、policy CE 钉在均匀上界 5.85）。
+#   启动时 attach_soft_index 会校验行数指纹，不符直接 SystemExit。
+torchrun --nproc_per_node=2 scripts/train_sft.py \
   --data data/sgf_19x19_full.npz --v7 1 --device npu --board-size 19 \
   --games-npz data/labels/games.npz \
-  --model models/a_v7_npu4.pth.latest \
+  --model models/a_v7_npu2.pth.latest \
   --soft-index data/labels/soft_index.npz --soft-only-sampling 1 \
   --soft-weight 1.0 --soft-every 1 --policy-loss soft_ce \
-  --batch-size 1000 --epochs 1 --lr 0.00637 --weight-decay 0.0001 \
-  --gradient-accumulation-steps 2 --use-amp 1 --use-ema 1 \
+  --batch-size 2000 --epochs 30 --lr 0.00537 --weight-decay 0.0001 \
+  --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
   --use-sdpa 1 --attention-dropout 0 \
   --scaler-init-scale 1024 --scaler-growth-interval 100000 \
   --prefetch-workers 6 --prefetch-depth 16 \
-  --log-every 50 --eval-every 500 --save-every 250 \
+  --log-every 25 --eval-every 100 --eval-max-batches 5 --save-every 250 \
   --early-stop 1 --early-stop-patience 3 \
-  --out models/b_v7_npu4.pth --swanlab 1 --ver b_v7_npu4 --swanlab-every 10
+  --out models/b_v7_npu2.pth --swanlab 1 --ver b_v7_npu2 --swanlab-every 5
 
 # --- C-1  单卡 910A（batch 2800，LR 0.00377）---
 torchrun --nproc_per_node=1 scripts/train_sft.py \
   --data data/stdata --v7 1 --device npu --board-size 19 \
-  --model models/b_v7_npu4.pth.latest \
+  --model models/b_v7_npu2.pth.latest \
   --policy-loss soft_ce --soft-weight 1.0 \
   --batch-size 2800 --epochs 1 --lr 0.00377 --weight-decay 0.0001 \
   --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
@@ -156,7 +181,7 @@ torchrun --nproc_per_node=1 scripts/train_sft.py \
 # --- C-2  2 卡 910A（每卡 2800，accum 1 ⇒ 有效 5600，LR 0.00533）---
 torchrun --nproc_per_node=2 scripts/train_sft.py \
   --data data/stdata --v7 1 --device npu --board-size 19 \
-  --model models/b_v7_npu4.pth.latest \
+  --model models/b_v7_npu2.pth.latest \
   --policy-loss soft_ce --soft-weight 1.0 \
   --batch-size 2800 --epochs 1 --lr 0.00533 --weight-decay 0.0001 \
   --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
@@ -170,7 +195,7 @@ torchrun --nproc_per_node=2 scripts/train_sft.py \
 # --- C-3  4 卡 910A（每卡 1000，accum 2 ⇒ 有效 8000，LR 0.00637）---
 torchrun --nproc_per_node=4 scripts/train_sft.py \
   --data data/stdata --v7 1 --device npu --board-size 19 \
-  --model models/b_v7_npu4.pth.latest \
+  --model models/b_v7_npu2.pth.latest \
   --policy-loss soft_ce --soft-weight 1.0 \
   --batch-size 1000 --epochs 1 --lr 0.00637 --weight-decay 0.0001 \
   --gradient-accumulation-steps 2 --use-amp 1 --use-ema 1 \
@@ -323,12 +348,17 @@ python -m pytest tests -q -n0 -p no:randomly --durations=10   # 找最慢 10 个
 # ---------- 7. 已知失败与原因 ----------
 # 权重键名/形状不匹配  ⇐ 12/22 通道混用；GoAI 的 stem 形状错会变 RuntimeError（不静默）
 # 软标签命中 0        ⇐ pos_hash（盘面哈希+to_play+ko 三者）查不到，见 src/data/pos_hash.py
+# soft_index 行数不符  ⇐ 数据集/labels 变过后没重建索引（启动即 SystemExit，按提示重建）
+#                       重建后自检：argmax 落占点比例应 ≈0、top1 vs 人类 ≈0.59
+# fp16 前向 NaN       ⇐ 910A 走 fp16 时 CANN 融合内核处 65504 溢出 ⇒ 用 BF16 路径
+# SwiGLU 融合刷警告   ⇐ 紧急开关 GOAI_NPU_SWIGLU=0 可退标准路径（默认融合）
+# eval 慢/NPU 归零    ⇐ 已池化（eval 预取池）；仍慢就减 --eval-max-batches
 # 全局特征异常 = 32.5  ⇐ foxpro 无 KM[650] 处（100 局里 1.62%），需加 --no-komi-outlier-fix
 # ImportError: scipy   ⇐ requirements.txt 漏了
 # sidecar 匹配率 <100%  ⇐ 未匹配的行权重置 0，训练自动忽略，不会静默丢数据
 
 # ---------- 8. 已知取舍（需要拍板）----------
-# 1. **V7 只能用 9% 的数据**（3,132,287 / 34,202,713 行）。因为 3420 万行那条路没有
+# 1. **V7 只能用 9% 的数据**（3,132,287 / 34,264,225 行）。因为 3420 万行那条路没有
 #    V7 专用标签（ownership/futurepos/scoring/seki/scorebelief），而 futurepos 是
 #    段 1 主目标之一。要提数据量只能：给 full.npz 补 V7 标签（需重解析 SGF，工作量大），
 #    或找更多 stdata 归档。**这直接决定最终棋力上限。**
