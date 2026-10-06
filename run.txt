@@ -152,7 +152,7 @@ torchrun --nproc_per_node=1 scripts/train_sft.py \
 torchrun --nproc_per_node=2 scripts/train_sft.py \
   --data data/sgf_19x19_full.npz --v7 1 --device npu --board-size 19 \
   --games-npz data/labels/games.npz \
-  --batch-size 6000 --epochs 1 --lr 0.00780 --weight-decay 0.0001 \
+  --batch-size 6000 --epochs 1 --lr 0.00780 --weight-decay 0.05 \
   --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
   --use-sdpa 1 --attention-dropout 0 \
   --prefetch-workers 4 --prefetch-depth 8 \

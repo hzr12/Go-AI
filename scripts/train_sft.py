@@ -3588,7 +3588,7 @@ def main():
                     help='NPU 融合注意力 SFA/PFA（torch_npu.npu_fusion_attention，'
                          '优先于内置 SDPA）：带能力探针 + 与 SDPA 的数值自检 + '
                          '运行期回退；dropout>0 时自动不启用（0=关闭，1=开启）')
-    ap.add_argument('--npu-channels-last', type=int, default=0, choices=[0, 1],
+    ap.add_argument('--npu-channels-last', type=int, default=1, choices=[0, 1],
                     help='NPU 上卷积走 NHWC(channels_last) 布局：CANN 卷积 kernel '
                          '偏 NHWC，V7 主干是卷积主导（约 85%% MAC）时可能提速。'
                          '**默认 0**（未实测收益，显存会略涨）；A/B 见 run.txt'
