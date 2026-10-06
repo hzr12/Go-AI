@@ -1476,7 +1476,7 @@ def _at_least_one(text):
 SOFT_INDEX_KEYS = ('idx', 'policy')
 
 
-def attach_soft_index(dataset, path):
+def attach_soft_index(dataset, path, data_npz=None):
     """把软标签索引挂到数据集上（`--soft-index` 的实现）。
 
     产物格式（与 `scripts/build_soft_index.py` / `src/data/kata_label_join.py`
@@ -1488,6 +1488,16 @@ def attach_soft_index(dataset, path):
      必须在**预取器 fork 之前**调用：软标签挂在 dataset 对象上，fork 之后
     再挂就只有父进程看得见，worker 会继续造 `soft_mask` 全 0 的批 —— 而训练
     不报任何错，只是「软标签训了个寂寞」。
+
+    Args:
+        data_npz: 主数据集 npz 路径。给了就做**防陈旧校验**（2026-10-06 事故）：
+            把产物 `cache_meta` 里记录的数据集指纹（行数等）与**当前**数据集
+            现算指纹比对，行数不一致 ⇒ SystemExit。事故形态：数据集重建、
+            labels 续跑/重打之后 `soft_index.npz` 没有重建，训练直接吃旧文件
+            —— 行号全体错位，policy 与局面**逐行无关**（真机实测：
+            train_top1 崩到 0.2%、policy CE 钉在均匀上界 5.85、argmax 30.8%
+            落在已占点上）。本校验只算文件指纹，秒级。
+            不给 `data_npz`（单测/旧调用）则跳过。
     """
     z = np.load(path, allow_pickle=False)
     missing = [k for k in SOFT_INDEX_KEYS if k not in z.files]
@@ -1495,6 +1505,36 @@ def attach_soft_index(dataset, path):
         raise KeyError(
             f'--soft-index {path} 缺字段 {missing}；现有 {sorted(z.files)}。'
             f'请用 scripts/build_soft_index.py 重新生成（它是唯一的产物写者）。')
+    if data_npz is not None:
+        if 'cache_meta' not in z.files:
+            print(f'[soft] ⚠ {path} 没有 cache_meta 指纹（旧版产物），'
+                  f'无法校验新鲜度 —— 建议用 scripts/build_soft_index.py 重建',
+                  flush=True)
+        else:
+            import json as _json  # noqa: PLC0415
+            from src.data.kata_label_join import npz_fingerprint  # noqa: PLC0415
+            meta = _json.loads(str(np.asarray(z['cache_meta']).reshape(-1)[0]))
+            ds_meta = (meta or {}).get('dataset') or {}
+            cur = npz_fingerprint(data_npz, id_key='game_ids')
+            # 行数不符 = 行号全体平移 ⇒ **硬失败**（2026-10-06 真机事故就是它：
+            # 数据集重建 +61,512 行，旧索引的行号指向完全不同的局面）。
+            if ds_meta.get('rows') not in (None, cur['rows']):
+                raise SystemExit(
+                    f'--soft-index {path} 是对**旧版数据集**建的'
+                    f'（索引时 {ds_meta.get("rows")} 行，当前 {cur["rows"]} 行）'
+                    f'⇒ 行号全体错位、policy 与局面逐行无关（2026-10-06 事故）。\n'
+                    f'请重建后再训：\n'
+                    f'  python scripts/build_soft_index.py --data {data_npz} '
+                    f'--labels <kata_labels.npz> --out {path} '
+                    f'--materialized-dir tmp/materialized')
+            # mtime/size/game_id 去重数不符只告警：跨机拷贝会改 mtime，硬失败
+            # 会误伤；但它们值得被看见。
+            drift = [k for k in ('n_distinct', 'mtime_ns', 'size')
+                     if ds_meta.get(k) not in (None, cur.get(k))]
+            if drift:
+                print(f'[soft] ⚠ {path} 相对其构建时的数据集有字段漂移：{drift}'
+                      f'（行数一致 ⇒ 行号仍有效；若换过数据内容请重建索引）',
+                      flush=True)
     idx = np.asarray(z['idx']).ravel()
     pol = np.asarray(z['policy'])
     diag = dataset.attach_soft(idx, pol)
@@ -3897,7 +3937,7 @@ def main():
     # 进程看得见，worker 会继续造 `soft_mask` 全 0 的批 —— 训练不报任何错，
     # 只是「软标签训了个寂寞」。
     if _soft_on:
-        _sd = attach_soft_index(dataset, args.soft_index)
+        _sd = attach_soft_index(dataset, args.soft_index, data_npz=args.data)
         logger.info("[soft] 已挂载软标签 | 索引=%s | 覆盖行=%d/%d (%.3f%%) | "
                     "重复标注行=%d | 软 CE 步间隔=%d",
                     args.soft_index, _sd['n_soft'], _sd['n_rows'],

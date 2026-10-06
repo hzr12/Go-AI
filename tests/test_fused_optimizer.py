@@ -13,12 +13,11 @@ fused AdamW 路径（融合 exp_avg/exp_avg_sq 更新与参数写回的单 kerne
 回退契约（测试 1/3/4 从三个方向钉）：
 * `cpu` → 标准构造，**bit-for-bit 等于 HEAD**（HEAD 的非 CUDA 分支就是
   `torch.optim.AdamW(_opt_groups)`，见 `train_sft.py` A1 锚点）；
-* `npu` → 2026-10-06 曾接入 `torch_npu.optim.NpuFusedAdamW`，但同日真机实测
-  （torch_npu 2.1.0.post10）**构造静默挂死**（双 DDP rank 同停 ~605MB RSS、
-  无异常无日志，卡在 [device] 之后 [model] 之前），故暂时关闭尝试
-  （`_NPU_FUSED_ATTEMPT = False`），一律 standard + foreach（foreach 多张量
-  路径语义不变、拿走大部分 kernel-launch 收益）。代码路径保留，
-  `_NPU_FUSED_ATTEMPT` 改回 True 即可重试；
+* `npu` → 尝试 `torch_npu.optim.NpuFusedAdamW`（torch_npu 随包提供，
+  `_NPU_FUSED_ATTEMPT=True`）。2026-10-06 当天曾因「post10 构造疑似挂死」短暂
+  关闭，随后同日的 B 段 run 用 fused 在 post10 上完整跑了 100+ 步 ⇒ 挂死另有
+  原因（C 段分片加载），门控恢复 True。无 torch_npu 的环境（本地 CPU）
+  import 失败 ⇒ 回退标准构造（+foreach），异常不冒泡；
 * `cuda` 上 fused 构造抛 `TypeError/RuntimeError`（老 torch / 无 kernel）→
   回退标准构造，异常不冒泡。
 
@@ -213,47 +212,62 @@ def test_fused_path_matches_standard_within_tolerance():
 
 
 # --------------------------------------------------------------------------- #
-# 3. NPU：一律 standard（+foreach）——NpuFusedAdamW 构造在 post10 真机挂死，
-#    2026-10-06 起关闭尝试（_NPU_FUSED_ATTEMPT=False），代码路径保留待重试。
+# 3. NPU：torch_npu 在场 ⇒ fused；不在场 ⇒ standard（import 失败回退）。
+#    历史：2026-10-06 曾因「post10 构造疑似挂死」短暂关闭（_NPU_FUSED_ATTEMPT
+#    =False），随后 12:20 的 B 段 run 用 fused 在 post10 上完整跑了 100+ 步
+#    （900 s/s），证明构造可用——那次挂死更可能是 C 段 V7PackedDataset 读
+#    37.6GB 分片的静默加载期。故门控回到 True；若真机再复现构造挂死，用
+#    py-spy 抓栈后把 _NPU_FUSED_ATTEMPT 翻回 False。
 # --------------------------------------------------------------------------- #
-def test_npu_falls_back_to_standard():
-    """`'npu'` / `'npu:0'` 一律 standard：不尝试 fused、不报错。
-
-    2026-10-06 当天曾接入 `NpuFusedAdamW`，同日真机（post10）构造静默挂死
-    （双 DDP rank 同停），故 `_NPU_FUSED_ATTEMPT = False`。本测试钉住：
-    即使 torch_npu 在场（桩），npa 分支也**不得**走 fused。
-    """
+def test_npu_fused_adamw_selected_when_torch_npu_available(monkeypatch):
+    """torch_npu（桩）存在 ⇒ npu 走 fused，且构造吃的是**同一个** param_groups。"""
     import types
 
-    # 造一个「torch_npu 在场且带 NpuFusedAdamW」的环境：若门控被随手改回 True，
-    # 本测试会抓到（构造期挂死在测试里不可重现，但分支选择可钉）。
+    seen = {}
+
     class _FakeNPUFusedAdamW(torch.optim.AdamW):
-        pass
+        def __init__(self, params):
+            super().__init__(params)
+            seen['n_groups'] = len(params)
+            seen['lrs'] = [g['lr'] for g in params]
 
     fake_opt = types.ModuleType('torch_npu.optim')
+    # 真名是小写 npu 前缀（真机 torch_npu 2.1.0.post10 的 dir() 实测：
+    # NpuFusedAdamW；旧文档拼作 NPUFusedAdamW，build_adamw 两种都吃）。
     fake_opt.NpuFusedAdamW = _FakeNPUFusedAdamW
     fake_tnpu = types.ModuleType('torch_npu')
     fake_tnpu.optim = fake_opt
-    monkeypatch_this = {'torch_npu': fake_tnpu, 'torch_npu.optim': fake_opt}
-    saved = {k: sys.modules.get(k) for k in monkeypatch_this}
-    sys.modules.update(monkeypatch_this)
-    try:
-        for dev in ('npu', 'npu:0'):
+    monkeypatch.setitem(sys.modules, 'torch_npu', fake_tnpu)
+    monkeypatch.setitem(sys.modules, 'torch_npu.optim', fake_opt)
+
+    net = _seeded()
+    groups = _build_param_groups(net, _Args())
+    opt, mode = build_adamw(groups, 'npu')
+    assert mode == 'fused', f'torch_npu 在场时 npu 必须走 fused，实得 {mode!r}'
+    assert seen['n_groups'] == len(groups), 'param_groups 没有原样传给 NpuFusedAdamW'
+    # value 头 5x lr 的逐组超参不许被融合构造吞掉
+    assert seen['lrs'] == [g['lr'] for g in groups], '逐组 lr 在融合构造中被改动'
+
+
+def test_npu_without_torch_npu_falls_back_to_standard():
+    """本地无 torch_npu ⇒ `'npu'` / `'npu:0'` import 失败回退 standard、不报错。"""
+    for dev in ('npu', 'npu:0'):
+        saved = sys.modules.pop('torch_npu', None)
+        saved_opt = sys.modules.pop('torch_npu.optim', None)
+        try:
             net = _seeded()
             opt, mode = build_adamw(_build_param_groups(net, _Args()), dev)
-            assert mode == 'standard', \
-                f'{dev} 在 _NPU_FUSED_ATTEMPT=False 下必须 standard，实得 {mode!r}'  # noqa: NKLOC
+            assert mode == 'standard', f'{dev} 必须回退标准构造，实得 {mode!r}'
             assert opt.defaults.get('fused') is None, \
                 f'{dev} 的 defaults[fused] 被置位'
-            # foreach 多张量路径应已启用（见 build_adamw standard 兜底的注释）
+            # standard 兜底在 NPU 上叠加 foreach 多张量路径
             assert opt.defaults.get('foreach') is True, \
                 f'{dev} 的 foreach 路径未启用'
-    finally:
-        for k, v in saved.items():
-            if v is None:
-                sys.modules.pop(k, None)
-            else:
-                sys.modules[k] = v
+        finally:
+            if saved is not None:
+                sys.modules['torch_npu'] = saved
+            if saved_opt is not None:
+                sys.modules['torch_npu.optim'] = saved_opt
 
 
 def test_npu_fused_import_error_falls_back(monkeypatch):

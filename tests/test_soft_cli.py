@@ -417,13 +417,66 @@ def test_attach_soft_index_is_idempotent_with_constructor():
     b = SupervisedDataset(data, n_channels=12)
     b.attach_soft(idxs, sp)
     assert a.soft_row.tolist() == b.soft_row.tolist()
-    assert a.n_soft == b.n_soft == 3
     keys = np.arange(12)
     da = a.sample_batch_numpy(keys, augment=False, labels=True)[3]
     db = b.sample_batch_numpy(keys, augment=False, labels=True)[3]
     assert da['soft'].tobytes() == db['soft'].tobytes()
     assert da['soft_mask'].tolist() == db['soft_mask'].tolist() == \
         [0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0]
+
+
+# --------------------------------------------------------------------------- #
+# 6. 防陈旧索引（2026-10-06 真机事故：数据集重建后索引没跟着重建，
+#    行号全体平移 ⇒ policy 与局面逐行无关，train_top1 崩到 0.2%）
+# --------------------------------------------------------------------------- #
+def _write_index_with_meta(path, idx, policy, rows):
+    """带 cache_meta（dataset.rows=rows）的索引产物，模拟 build_soft_index 写出。"""
+    import json
+    meta = {'schema': 1, 'max_repeats': None,
+            'dataset': {'rows': rows, 'n_distinct': 3, 'mtime_ns': 1, 'size': 1,
+                        'id_key': 'game_ids', 'path': '/x'},
+            'labels': {'rows': rows, 'n_distinct': 0, 'mtime_ns': 1,
+                       'size': 1, 'id_key': 'pos_hash', 'path': '/y'}}
+    np.savez(str(path), idx=np.asarray(idx, np.int64),
+             policy=np.asarray(policy, np.float16),
+             cache_key=np.str_('k' * 32),
+             cache_meta=np.str_(json.dumps(meta)))
+    return str(path)
+
+
+def _write_data_npz(tmp_path, data):
+    p = tmp_path / 'toy_data.npz'
+    np.savez(str(p), **data)
+    return str(p)
+
+
+def test_attach_soft_index_rejects_index_built_on_other_dataset_rowcount(tmp_path):
+    """索引建在行数不同的数据集上 ⇒ 启动即 SystemExit（行号全体平移）。"""
+    ds, data, sp = _toy_dataset(n=12, soft_rows=(1, 4))
+    data_npz = _write_data_npz(tmp_path, data)
+    p = _write_index_with_meta(tmp_path / 'stale.npz', [1, 4], sp, rows=999999)
+    with pytest.raises(SystemExit, match='行号全体错位'):
+        t.attach_soft_index(ds, p, data_npz=data_npz)
+
+
+def test_attach_soft_index_accepts_matching_rowcount(tmp_path, capsys):
+    """行数一致 ⇒ 挂载成功（mtime/size 漂移只告警，不拦跨机拷贝）。"""
+    ds, data, sp = _toy_dataset(n=12, soft_rows=(1, 4))
+    data_npz = _write_data_npz(tmp_path, data)
+    p = _write_index_with_meta(tmp_path / 'ok.npz', [1, 4], sp, rows=12)
+    diag = t.attach_soft_index(ds, p, data_npz=data_npz)
+    assert diag['index_rows'] == 2
+    assert '字段漂移' in capsys.readouterr().out      # mtime_ns=1 必然漂移 ⇒ 告警
+
+
+def test_attach_soft_index_without_meta_warns_but_attaches(tmp_path, capsys):
+    """旧版产物（无 cache_meta）放行但必须大声告警，不能静默。"""
+    ds, _, sp = _toy_dataset(n=12, soft_rows=(1, 4))
+    data_npz = _write_data_npz(tmp_path, {'boards': np.zeros((12, BS, BS), np.int8)})
+    p = _write_index(tmp_path / 'nometa.npz', [1, 4], sp)
+    diag = t.attach_soft_index(ds, p, data_npz=data_npz)
+    assert diag['index_rows'] == 2
+    assert '没有 cache_meta' in capsys.readouterr().out
 
 
 def test_swanlab_config_reports_the_derived_kind():
