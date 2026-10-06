@@ -107,12 +107,13 @@ torchrun --nproc_per_node=1 scripts/train_sft.py \
   --early-stop 1 --early-stop-patience 3 \
   --out models/a_v7_npu1.pth --swanlab 1 --ver a_v7_npu1 --swanlab-every 10
 
-# --- A-2  2 卡 910A（每卡 5500，accum 1 ⇒ 有效 11000，LR 0.00367；BF16 无 scaler，
-#          scaler 两参数为兼容 fp16 分支保留、实际被忽略）---
+# --- A-2  2 卡 910A（每卡 6000，accum 1 ⇒ 有效 12000，LR 0.00780 =
+#          0.00356×√(12000/2500)；BF16 无 scaler，scaler 两参数为兼容 fp16 分支
+#          保留、实际被忽略）---
 torchrun --nproc_per_node=2 scripts/train_sft.py \
   --data data/sgf_19x19_full.npz --v7 1 --device npu --board-size 19 \
   --games-npz data/labels/games.npz \
-  --batch-size 5500 --epochs 1 --lr 0.00367 --weight-decay 0.0001 \
+  --batch-size 6000 --epochs 1 --lr 0.00780 --weight-decay 0.0001 \
   --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
   --use-sdpa 1 --attention-dropout 0 \
   --scaler-init-scale 65536 --scaler-growth-interval 100 \
