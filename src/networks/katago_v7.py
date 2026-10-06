@@ -39,6 +39,7 @@
 """
 
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -56,20 +57,49 @@ from src.networks.backbone import (
 )
 
 # ---- NPU 融合 SwiGLU（可选加速，带运行时回退）----------------------------
-# torch_npu 缺失或 npu_swiglu 不可用时，SwiGLU 退化为标准实现
-# （F.silu(up(x)) * gate(x) 再 down），数值行为完全不变。NPU 机上若 npu_swiglu
-# 因签名/设备异常而调用失败，forward 内 try/except 也会退回标准路径。
+# torch_npu 缺失或 npu_swiglu 不可用/自检不过时，SwiGLU 退化为标准实现
+# （F.silu(up(x)) * gate(x) 再 down），数值行为完全不变。
 try:
     import torch_npu  # 仅在 NPU 环境可导入
-    _HAS_NPU_SWIGLU = hasattr(torch_npu, 'npu_swiglu')
+    # 紧急总闸（调试用）：GOAI_NPU_SWIGLU=0 强制走标准路径。2026-10-06 融合首次
+    # 真跑后真机出现前向 NaN（futurepos 单项），需要能不回滚代码地单独二分它。
+    _HAS_NPU_SWIGLU = (hasattr(torch_npu, 'npu_swiglu')
+                       and os.environ.get('GOAI_NPU_SWIGLU', '1') != '0')
 except Exception:
     torch_npu = None
     _HAS_NPU_SWIGLU = False
 
+#: 融合可用性（运行时会被自检/调用异常降级为 False）。模块级 ⇒ **失败只告警一次**
+#: —— 原实现每个 SwiGLU 每 step 都 warning 一条（V7 主干 6 处 × 每 step），真机日志
+#: 已被 `[SwiGLU] NPU 融合失败` 刷爆（2026-10-06）。
+_npu_swiglu_ok = _HAS_NPU_SWIGLU
+_npu_swiglu_checked = False
 
-def _npu_swiglu(x, w1, w2):
-    """torch_npu.npu_swiglu 薄封装：计算 silu(x@w1.T) * (x@w2.T)。"""
-    return torch_npu.npu_swiglu(x, w1, w2)
+
+def _npu_swiglu(y, dim=-1):
+    """torch_npu.npu_swiglu 薄封装。
+
+    CANN 签名是 ``npu_swiglu(Tensor input, int dim=-1)``：**输入是已沿 dim 拼好
+    的 (…, 2H) 张量**，内部自己分半，返回 ``silu(a) * b``（a=前半过 SiLU，b=后半），
+    与 Megatron-core / MindSpeed 的 chunk 口径一致。它**不吃**两张权重矩阵 ——
+    旧封装 ``npu_swiglu(x, w1, w2)`` 正是因此每次都抛
+    ``expected at most 2 argument(s) but received 3``，整体退回标准路径。
+    """
+    return torch_npu.npu_swiglu(y, dim)
+
+
+def _swiglu_fusion_selfcheck(dev):
+    """分半顺序自检：钉住「silu(前半) * 后半」。
+
+    若某个 CANN 版本的分半语义相反（silu 在后半），融合会给出**错值而非异常** ——
+    forward 的 try/except 抓不住，训练会静默学错。故在首个融合调用处用随机小张量
+    对拍一次；不匹配则调用方永久关闭融合（退标准路径）。
+    """
+    y = torch.randn(16, 64, device=dev, dtype=torch.float16)
+    a, b = y[:, :32], y[:, 32:]
+    fused = torch_npu.npu_swiglu(y, -1).float()
+    ref = (F.silu(a) * b).float()
+    return bool(torch.allclose(fused, ref, atol=1e-2, rtol=1e-2))
 
 
 #: spec §3 的形状常量。结构**只由这张表**决定（与 `train_sft.KATAGO_SE_CFG`
@@ -390,18 +420,32 @@ class SwiGLU(nn.Module):
         return self
 
     def forward(self, x):
-        # NPU 融合：npu_swiglu 把「up 投影 + SiLU + gate 门控」合成一个 kernel，
-        # 减少 kernel launch / 显存往返。数学上等价于下方标准路径（bias=False 的
-        # _ScaledLinear 的缩放已在 initialize 时 bake 进 weight，无运行时额外缩放）。
-        if x.device.type == 'npu' and _HAS_NPU_SWIGLU:
+        global _npu_swiglu_ok, _npu_swiglu_checked
+        # NPU 融合：npu_swiglu 把「SiLU 激活 + 门控相乘」合成一个 kernel（GEMM 仍是
+        # up/gate 两次，融合的是逐元素部分），减少 kernel launch / 显存往返。
+        # 输入须沿末维拼成 (…, 2H)：silu(up(x)) * gate(x) ⟺ npu_swiglu(cat(up, gate))
+        # （前半过 SiLU）。bias=False 的 _ScaledLinear 的缩放已在 initialize 时
+        # bake 进 weight，无运行时额外缩放，数学上与下方标准路径等价。
+        if x.device.type == 'npu' and _npu_swiglu_ok:
             try:
-                return self.down(_npu_swiglu(x, self.up.weight, self.gate.weight))
+                if not _npu_swiglu_checked:
+                    _npu_swiglu_checked = True
+                    if not _swiglu_fusion_selfcheck(x.device):
+                        _npu_swiglu_ok = False
+                        import logging
+                        logging.getLogger(__name__).warning(
+                            "[SwiGLU] npu_swiglu 分半顺序自检不匹配"
+                            "（非 silu(前半)*后半），本进程内永久退回标准路径")
+                        return self.down(F.silu(self.up(x)) * self.gate(x))
+                return self.down(
+                    _npu_swiglu(torch.cat((self.up(x), self.gate(x)), dim=-1)))
             except Exception as _e:
-                # 融合失败（签名/设备异常等）不要静默吞掉：至少告警一次，否则会
-                # 永远退回慢速但正确的标准路径，没人知道融合路径其实是坏的。
+                # 融合失败（签名/设备异常等）不要静默吞掉，但也**不要每 step 都重试
+                # 刷告警**：置 False 永久退回标准路径，只告警一次。
+                _npu_swiglu_ok = False
                 import logging
                 logging.getLogger(__name__).warning(
-                    "[SwiGLU] NPU 融合失败，退回标准路径: %s", _e)
+                    "[SwiGLU] NPU 融合失败，本进程内永久退回标准路径: %s", _e)
         return self.down(F.silu(self.up(x)) * self.gate(x))
 
 

@@ -18,7 +18,11 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 pip install -r requirements.txt
 pip install scipy          # ⚠ requirements.txt 漏了，但 src/data/feature_v7.py 直接 import 它
 pip install onnx onnxruntime
-# 硬件前提：910A **无 BF16** → 必须 fp16 + GradScaler；NPU 上 inductor 编译无效，别加 --compile。
+# 硬件前提（2026-10-06 修订）：实测本批卡 **BF16 autocast 可训**（fp16 在 CANN 融合
+#   内核处前向溢出 65504 ⇒ futurepos 前向 NaN、warmup 内 15 步即炸；bf16 指数位与
+#   fp32 同宽，无此问题）⇒ NPU（非 910B）自动走 BF16、无 GradScaler，
+#   --scaler-init-scale / --scaler-growth-interval 在 BF16 下无效但仍可传（被忽略）。
+#   fp16+GradScaler 仅 910B 分支保留。NPU 上 inductor 编译无效，别加 --compile。
 
 # ---------- 1. 数据（都已就位，不要重建）----------
 # 1) data/sgf_19x19_full.npz = 34,202,713 行 / 162,298 局，加压 447 MB、解压 12.3 GB
@@ -103,18 +107,19 @@ torchrun --nproc_per_node=1 scripts/train_sft.py \
   --early-stop 1 --early-stop-patience 3 \
   --out models/a_v7_npu1.pth --swanlab 1 --ver a_v7_npu1 --swanlab-every 10
 
-# --- A-2  4 卡 910A（每卡 1000，accum 2 ⇒ 有效 8000，LR 0.00637）---
-torchrun --nproc_per_node=4 scripts/train_sft.py \
+# --- A-2  2 卡 910A（每卡 5500，accum 1 ⇒ 有效 11000，LR 0.00367；BF16 无 scaler，
+#          scaler 两参数为兼容 fp16 分支保留、实际被忽略）---
+torchrun --nproc_per_node=2 scripts/train_sft.py \
   --data data/sgf_19x19_full.npz --v7 1 --device npu --board-size 19 \
   --games-npz data/labels/games.npz \
-  --batch-size 1000 --epochs 1 --lr 0.00637 --weight-decay 0.0001 \
-  --gradient-accumulation-steps 2 --use-amp 1 --use-ema 1 \
+  --batch-size 5500 --epochs 1 --lr 0.00367 --weight-decay 0.0001 \
+  --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
   --use-sdpa 1 --attention-dropout 0 \
-  --scaler-init-scale 1024 --scaler-growth-interval 100000 \
-  --prefetch-workers 6 --prefetch-depth 16 \
-  --log-every 50 --eval-every 500 --save-every 250 \
+  --scaler-init-scale 65536 --scaler-growth-interval 100 \
+  --prefetch-workers 4 --prefetch-depth 8 \
+  --log-every 25 --eval-every 100 --save-every 25 \
   --early-stop 1 --early-stop-patience 3 \
-  --out models/a_v7_npu4.pth --swanlab 1 --ver a_v7_npu4 --swanlab-every 10
+  --out models/a_v7_npu2.pth --swanlab 1 --ver a_v7.2_npu2_resume --swanlab-every 5
 
 # --- B 段：+ KataGo 软标签（承接 A-2）---
 # ⚠ `--policy-loss soft_ce` 不写也行：给了 --soft-index 会自动选中。

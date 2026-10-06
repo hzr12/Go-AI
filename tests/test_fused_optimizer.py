@@ -13,7 +13,10 @@ fused AdamW 路径（融合 exp_avg/exp_avg_sq 更新与参数写回的单 kerne
 回退契约（测试 1/3/4 从三个方向钉）：
 * `cpu` → 标准构造，**bit-for-bit 等于 HEAD**（HEAD 的非 CUDA 分支就是
   `torch.optim.AdamW(_opt_groups)`，见 `train_sft.py` A1 锚点）；
-* `npu`（910A 无 fused 支持）→ 直接标准构造，不尝试、不报错；
+* `npu` → 2026-10-06 起改为**先尝试** `torch_npu.optim.NPUFusedAdamW`
+  （torch_npu 随包提供的 NPU 融合 kernel；A1 当年「910A 不支持」指的是
+  torch.optim 的 `fused=True`——那个至今确实 CUDA-only）。无 torch_npu 的
+  环境（本地 CPU）import 失败 ⇒ 回退标准构造，异常不冒泡，行为与旧契约一致；
 * `cuda` 上 fused 构造抛 `TypeError/RuntimeError`（老 torch / 无 kernel）→
   回退标准构造，异常不冒泡。
 
@@ -208,15 +211,71 @@ def test_fused_path_matches_standard_within_tolerance():
 
 
 # --------------------------------------------------------------------------- #
-# 3. NPU（910A 无 fused 支持）→ 直接标准构造
+# 3. NPU：无 torch_npu ⇒ 回退 standard；有（桩）⇒ fused
 # --------------------------------------------------------------------------- #
 def test_npu_falls_back_to_standard():
-    """`'npu'` / `'npu:0'` 一律 standard：不尝试 fused、不报错（A1：910A 不支持）。"""
+    """本地无 torch_npu ⇒ `'npu'` / `'npu:0'` import 失败回退 standard、不报错。
+
+    2026-10-06 起 npu 分支会**尝试** `torch_npu.optim.NPUFusedAdamW`（见
+    `test_npu_fused_adamw_selected_when_torch_npu_available`）；本测试钉的是
+    「torch_npu 缺席时异常不冒泡、行为与旧契约逐位一致」这一半。
+    """
     for dev in ('npu', 'npu:0'):
         net = _seeded()
         opt, mode = build_adamw(_build_param_groups(net, _Args()), dev)
-        assert mode == 'standard', f'{dev} 必须直接走标准构造，实得 {mode!r}'
+        assert mode == 'standard', f'{dev} 必须回退标准构造，实得 {mode!r}'
         assert opt.defaults.get('fused') is None, f'{dev} 的 defaults[fused] 被置位'
+
+
+def test_npu_fused_adamw_selected_when_torch_npu_available(monkeypatch):
+    """torch_npu（桩）存在 ⇒ npu 走 fused，且构造吃的是**同一个** param_groups。
+
+    用注入 `sys.modules` 的假 `torch_npu.optim` 钉分支选择（真 kernel 的数值
+    由 NPU 机的融合等价测试另行把关，本测试只锁「选了 fused、参数组原样传入、
+    逐组 lr 没被吃掉」）。
+    """
+    import types
+
+    seen = {}
+
+    class _FakeNPUFusedAdamW(torch.optim.AdamW):
+        def __init__(self, params):
+            super().__init__(params)
+            seen['n_groups'] = len(params)
+            seen['lrs'] = [g['lr'] for g in params]
+
+    fake_opt = types.ModuleType('torch_npu.optim')
+    # 真名是小写 npu 前缀（真机 torch_npu 2.1.0.post3 的 dir() 实测：
+    # NpuFusedAdamW；旧文档拼作 NPUFusedAdamW，build_adamw 两种都吃）。
+    fake_opt.NpuFusedAdamW = _FakeNPUFusedAdamW
+    fake_tnpu = types.ModuleType('torch_npu')
+    fake_tnpu.optim = fake_opt
+    monkeypatch.setitem(sys.modules, 'torch_npu', fake_tnpu)
+    monkeypatch.setitem(sys.modules, 'torch_npu.optim', fake_opt)
+
+    net = _seeded()
+    groups = _build_param_groups(net, _Args())
+    opt, mode = build_adamw(groups, 'npu')
+    assert mode == 'fused', f'torch_npu 在场时 npu 必须走 fused，实得 {mode!r}'
+    assert seen['n_groups'] == len(groups), 'param_groups 没有原样传给 NPUFusedAdamW'
+    # value 头 5x lr 的逐组超参不许被融合构造吞掉
+    assert seen['lrs'] == [g['lr'] for g in groups], '逐组 lr 在融合构造中被改动'
+
+
+def test_npu_fused_import_error_falls_back(monkeypatch):
+    """torch_npu 在场但 `optim` 里两种拼写的 fused AdamW 都没有 ⇒ 回退 standard。"""
+    import types
+
+    fake_opt = types.ModuleType('torch_npu.optim')
+    fake_tnpu = types.ModuleType('torch_npu')
+    fake_tnpu.optim = fake_opt
+    monkeypatch.setitem(sys.modules, 'torch_npu', fake_tnpu)
+    monkeypatch.setitem(sys.modules, 'torch_npu.optim', fake_opt)
+
+    net = _seeded()
+    opt, mode = build_adamw(_build_param_groups(net, _Args()), 'npu')
+    assert mode == 'standard', f'老 torch_npu 必须回退 standard，实得 {mode!r}'
+    assert opt.defaults.get('fused') is None
 
 
 # --------------------------------------------------------------------------- #

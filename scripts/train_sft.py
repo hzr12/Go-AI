@@ -3193,8 +3193,10 @@ def compute_l2_report(param_groups):
 
 # ---- P4.6：fused AdamW 的设备策略与回退（全模块唯一构造入口）------------------
 # D1：不加 `--fused` 旗标 —— 选择由设备驱动的代码级默认决定，不读环境变量、
-# 不接 CLI。D6/P4.11 MindSpeed 落地后若出现 NPU fused kernel，扩展点是这个常量。
-_FUSED_OK_BACKENDS = frozenset({'cuda'})
+# 不接 CLI。NPU 的 fused kernel 不必等 MindSpeed（D6/P4.11）：torch_npu 自带
+# `torch_npu.optim.NPUFusedAdamW`（apex 风格多张量融合 kernel），2026-10-06 接入；
+# 本地无 torch_npu ⇒ import 失败自动回退标准构造，契约不变。
+_FUSED_OK_BACKENDS = frozenset({'cuda', 'npu'})
 
 
 def build_adamw(param_groups, device, logger=None):
@@ -3210,14 +3212,18 @@ def build_adamw(param_groups, device, logger=None):
     P4.5b 的 opt_loss/log_loss 分离与 `compute_l2_report` 的报告口径）在两种模式
     下逐字相同。**不是** MindSpeed 的融合优化器：那是 D6 / P4.11 的事，本函数不碰。
 
-    **设备策略**（A1 记录：CUDA A100 支持、910A 不支持；本地开发是 CPU）：
+    **设备策略**（A1 记录：CUDA A100 支持；本地开发是 CPU。2026-10-06 起接入
+    torch_npu 自带的 NPU fused kernel）：
 
     * `cuda` → `try: AdamW(param_groups, fused=True)`；构造抛 `TypeError`（老
       torch 无此 kwarg）或 `RuntimeError`（无 fused kernel）→ **回退标准构造，
       异常不冒泡**；
-    * `npu` / `cpu` / 其它 → **直接标准构造**（不尝试、不报错）。D6/P4.11
-      MindSpeed 落地后若拿到 NPU fused kernel，扩展点 = 把后端加进
-      `_FUSED_OK_BACKENDS` 并配能力探针。
+    * `npu` → `try: from torch_npu.optim import NPUFusedAdamW`（torch_npu 随包
+      提供，apex 风格多张量融合 kernel，一趟完成 exp_avg/exp_avg_sq/decoupled
+      decay/参数写回；支持逐组 lr ⇒ value 头 5x lr 分组不受影响）。本地无
+      torch_npu ⇒ `ImportError` → 回退标准构造，异常不冒泡。数值与 standard
+      **容差内一致、非逐位**（同 CUDA fused 的口径）。
+    * `cpu` / 其它 → **直接标准构造**（不尝试、不报错）。
 
     **回退契约（bit-for-bit）**：标准分支就是 `torch.optim.AdamW(param_groups)`
     —— 与 P4.6 之前 main() 非 CUDA 分支**逐字相同、零 kwargs**。同种子、同初始
@@ -3231,18 +3237,42 @@ def build_adamw(param_groups, device, logger=None):
     backend = str(device).split(':')[0]
     if backend in _FUSED_OK_BACKENDS:
         try:
-            optimizer = torch.optim.AdamW(param_groups, fused=True)
+            if backend == 'cuda':
+                optimizer = torch.optim.AdamW(param_groups, fused=True)
+            else:
+                # torch_npu 自带的 NPU 融合 AdamW（见 _FUSED_OK_BACKENDS 注释）。
+                # 类名两代拼写不同：新版 `NpuFusedAdamW`（真机 2.1.0.post3 实测），
+                # 旧文档作 `NPUFusedAdamW` —— 两种都试，都没有按 ImportError 回退。
+                from torch_npu import optim as _npu_optim  # noqa: PLC0415
+                _cls = (getattr(_npu_optim, 'NpuFusedAdamW', None)
+                        or getattr(_npu_optim, 'NPUFusedAdamW', None))
+                if _cls is None:
+                    raise ImportError(
+                        'torch_npu.optim has no fused AdamW '
+                        '(tried NpuFusedAdamW / NPUFusedAdamW)')
+                optimizer = _cls(param_groups)
             if logger is not None:
                 logger.info("[train] 已启用 fused AdamW (backend=%s)", backend)
             return optimizer, 'fused'
-        except (TypeError, RuntimeError) as exc:
+        except (TypeError, RuntimeError, ImportError) as exc:
             if logger is not None:
                 logger.warning(
                     "[train] fused AdamW 在 %s 上不可用（%s: %s），回退标准实现",
                     backend, type(exc).__name__, exc)
-    optimizer = torch.optim.AdamW(param_groups)
+    # 标准实现兜底。NPU 上叠加 foreach 多张量路径：语义与逐参数循环**完全相同**
+    # （只是把数百次 kernel 启动合并成批量调用 —— Ascend 的 ACL 启动开销高，
+    # 收益可观），与 fused 不同，不改变浮点结合顺序。EMA 已在用同一套
+    # `torch._foreach_*`（_HAS_FOREACH 探针），npu 上 foreach kernel 必在。
+    _std_kwargs = {}
+    if backend == 'npu' and _HAS_FOREACH:
+        _std_kwargs['foreach'] = True
+    optimizer = torch.optim.AdamW(param_groups, **_std_kwargs)
     if logger is not None:
-        logger.info("[train] AdamW 标准实现（backend=%s，fused 未启用）", backend)
+        if _std_kwargs:
+            logger.info("[train] AdamW 标准实现（backend=%s，fused 未启用；"
+                        "foreach 多张量路径已启用）", backend)
+        else:
+            logger.info("[train] AdamW 标准实现（backend=%s，fused 未启用）", backend)
     return optimizer, 'standard'
 
 
@@ -4036,11 +4066,14 @@ def main():
             logger.info("[device] %s (NPU/CANN) | 910B 路径: FP16 + GradScaler + "
                         "CANN SDPA 融合注意力 + 禁用 torch.compile(inductor)", gpu_name)
         else:
-            amp_dtype = torch.float16
-            use_scaler = use_amp  # 910A 无 BF16，FP16 必须开 GradScaler
-            logger.info("[device] %s (NPU/CANN) | 910A 路径: FP16 + GradScaler + "
+            # 2026-10-06 实测：本批卡 bf16 autocast 可训。fp16 在融合内核处前向
+            # 溢出 65504（futurepos 单项前向 NaN、LR 无关、15 步内即炸）；bf16 的
+            # 指数位与 fp32 同宽（~3.4e38），无此溢出 ⇒ 不再需要 GradScaler。
+            amp_dtype = torch.bfloat16
+            use_scaler = False
+            logger.info("[device] %s (NPU/CANN) | BF16 路径: 无 GradScaler + "
                         "CANN SDPA 融合注意力 + 禁用 torch.compile(inductor)", gpu_name)
-        use_channels_last = False
+        use_channels_last = True
         compile_disable_sparse = True
         # 注意力后端自动判断（仅 NPU 分支用，但变量供下方日志/backbone 统一取用）：
         #   - 默认放开 SDPA（CANN 融合，省算力且更稳）；
@@ -4095,9 +4128,13 @@ def main():
     # config 面板回填真实注意力后端：swanlab.init 在设备分支之前已上传写死的
     # `attn_sdpa_force_math: True`，这里用运行时真值覆盖。CANN SDPA 放开后该键应为
     # False。API 不支持 init 后更新时静默忽略，启动日志才是真相源。
+    # `amp_dtype` 同理：init 时写死的 'float16' 在 NPU bf16 路径下是错的，回填真值。
     if swanlab_logger is not None:
         try:
-            swanlab_logger.config.update({"attn_sdpa_force_math": bool(sdpa_force_math)})
+            swanlab_logger.config.update({
+                "attn_sdpa_force_math": bool(sdpa_force_math),
+                "amp_dtype": str(amp_dtype).split('.')[-1],
+            })
         except Exception:
             pass
     # 注意力 query 分块（2026-10-01）：math 路径下整条 (B,Hh,N,N) 分数矩阵
@@ -4332,6 +4369,12 @@ def main():
     # 设备策略、构造、回退契约（fused 不可用 ⇒ 标准实现，bit-for-bit 等于旧路径）
     # 集中在唯一入口，全模块不再有第二处 AdamW 构造点。
     optimizer, _opt_mode = build_adamw(_opt_groups, device, logger)
+    # torch_npu fused 优化器的 zero_grad **不支持 set_to_none=True**（融合 kernel
+    # 要求梯度张量常驻，置 None 会破坏其内部引用；实测 ValueError 直崩）。
+    # set_to_none=False 原地清零，训练语义等价（仅多一次写带宽）。其余后端维持
+    # True（省一次 memset，原行为）。
+    _zero_set_none = not (_opt_mode == 'fused'
+                          and str(device).split(':')[0] == 'npu')
     # BF16 后端（A100/NPU）下 use_scaler=False（BF16 不下溢，省去 loss scaling 的额外同步）；
     # V100/FP16 下开启 GradScaler。按设备选择 GradScaler 实现。
     # 缩放值策略可配：从 65536 起步要靠减半向下搜索平衡点，每次溢出都白扔一个
@@ -4783,7 +4826,7 @@ def main():
         for i in range(n_batches):
             try:
                 if i % _accum_steps == 0:
-                    optimizer.zero_grad(set_to_none=True)
+                    optimizer.zero_grad(set_to_none=_zero_set_none)
                 # DDP 梯度累积加速：非末步跳过 all-reduce（与 no_sync() 语义等价）。
                 # 数学上 (accum-1) 次本地累加 + 末步一次 all_reduce(SUM) 与「每步都
                 # all_reduce(SUM) 再累加」完全相等，仅省 (accum-1) 次跨卡通信。
@@ -5203,7 +5246,7 @@ def main():
                                     scaler.get_scale(), _n_skipped,
                                     100.0 * _n_skipped
                                     / max(1, _n_attempted))
-                    optimizer.zero_grad(set_to_none=True)
+                    optimizer.zero_grad(set_to_none=_zero_set_none)
                     # EMA 与 scheduler 同理：**跳过的步权重一动没动**，
                     #   此时 `ema.update()` 会把 shadow 朝当前权重多拉一次
                     #   （step 计数也照样 +1）⇒ EMA 的时间常数被"跳步"稀释，
