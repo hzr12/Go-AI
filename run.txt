@@ -230,16 +230,26 @@ python scripts/train_sft.py --data tmp/coding/c64 --v7 1 --device cpu \
   --attention-dropout 0 --soft-weight 1.0 --batch-size 16 --epochs 1 \
   --prefetch-workers 0 --save-every 1 --out tmp/smoke_c.pth
 
-# ---------- SwanLab 怎么读（只看这几条就够）----------
-# 🔴 `policy_entropy`（模型）远大于 `label_entropy`（目标）= 模型还没跟上；两者收敛
-#   = 学到了。**只看 policy_loss 分不出这个** —— A 段的 5.88 是「什么都没学到」，
-#   C 段的 5.88 可能已经很接近目标。
-# 🔴 `loss_v7/*` 里恒 0 的平线：必须配 `run/loss_coef/*` 一起看，否则分不清
-#   「没学」还是「该项权重为 0」（段 A 有 9 项权重就是 0）。
-#   段 A/B/C 主目标是 loss_v7/{policy, policy_opp, value, futurepos}。
+# ---------- SwanLab 怎么读 ----------
+# 每条曲线「哪边好 + 终点在哪」：
+#   ↓ 好：loss / policy_loss / value_loss / loss_v7/* / eval_kl / eval_brier
+#         —— 但有地板：软 CE 的 policy 项下界是 H(soft)≈0.8，不是 0；
+#            eval_kl 的 0 = 模型分布与目标分布完全一致（B/C 真收敛判据）。
+#   ↑ 好：train_top1（A 段天花板 ~0.30-0.45=人类选择方差；B/C 软 argmax ~0.59
+#         =KataGo-人类一致率）、eval_top1（诚实指标）、value_acc3（随机 1/3）。
+#   过头也是病：policy_entropy ↓ 好但**地板不是 0**——正确终点是逼近
+#         label_entropy(≈0.8)，即模型锐度追平目标分布；压得远低于它 = 过度自信。
+#   看形状不看方向：lr（warmup 升→cosine 降，长得像计划就行）、
+#         label_entropy（目标的属性，B/C 恒 ≈0.8 平线；A 段不产出）、
+#         soft_row_frac（恒 1.0；掉 = 软标签采样坏了）、skip_rate_pct（恒 0）、
+#         grad_norm（平稳即可，尖峰才是信号）、memory_gb（平台稳=健康，
+#         逐 eval 点阶梯爬升=碎片/泄漏）、speed_per_card（台阶下降=数据侧问题）。
+# 🔴 跨段不可比：目标口径 one-hot → 软分布换了，同值含义完全不同
+#   （A 段 policy 5.88=什么都没学到；C 段 5.88 可能已接近目标）。
+# `loss_v7/*` 只上报**权重非 0** 的项（段 A 即 policy/policy_opp/value/futurepos
+#   4 条）；权重表在 config 的 `run/loss_coef/*`，恒 0 平线不再上曲线。
+# 🔴 eval 覆盖度看 `run/eval_max_batches`：只算 5 批的 top1 噪声大，别和跑满的比。
 # `soft_row_frac` 在 --soft-only-sampling 1 下应恒 1.0；不是 1.0 说明软标签没生效。
-# `--swanlab-every 10` 把曲线密度与 stdout 解耦（stdout 仍按 --log-every 50）：
-#   A 段一整轮约 4275 step，按 50 打只有 ~85 个点看不出早停拐点。
 
 # ============================================================================
 # ---------- 3. ★ RL：自对弈（**仅单卡 910A**）----------
