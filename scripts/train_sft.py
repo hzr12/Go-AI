@@ -439,6 +439,7 @@ def _check_training_env(logger):
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.networks.alphanet import AlphaGoNet
 from src.networks.katago_v7 import NBT_TF_CFG
+from src.networks.katago_v7 import _migrate_ema_shadow_qkv
 from src.networks.katago_v7_loss import POLICY_SOFT_WEIGHT
 from src.data.dataset import SupervisedDataset
 from scripts.build_dataset import build
@@ -628,13 +629,12 @@ def build_katago_v7_net(*, board_size=V7_BOARD_SIZE, use_checkpoint=1,
     `build_katago_se_net` 的返回契约一致。
     """
     from src.networks.katago_v7 import build_katago_v7_net as _build
-    from src.networks.katago_v7 import _migrate_ema_shadow_qkv
+    from src.networks.katago_v7 import NBT_TF_CFG
     kw = {}
     if attn_dropout is not None:
         kw['attn_dropout'] = float(attn_dropout)
     model = _build(board_size=int(board_size), use_checkpoint=bool(use_checkpoint),
                    **kw)
-    from src.networks.katago_v7 import NBT_TF_CFG
     cfg = dict(NBT_TF_CFG)
     cfg['use_checkpoint'] = bool(use_checkpoint)
     cfg['attn_dropout'] = float(

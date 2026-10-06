@@ -196,7 +196,14 @@ def test_every_zero_weight_head_still_gets_a_gradient():
     missing = [n for n, p in net.named_parameters() if p.grad is None]
     assert not missing, \
         f'这些参数没收到梯度 ⇒ DDP 会抛「Expected to have finished reduction」：{missing}'
-    assert len(list(net.parameters())) > 300, '网络结构与预期不符'
+    # 「结构没被掏空」要看**参数元素总数**，不能看参数张量个数：MHSA 把 q/k/v
+    # 三个 Linear 合成了一个 qkv（见 tests/test_mhsa_qkv_fusion.py），张量个数
+    # 从 324 降到 278，但元素总数必须仍是 5,562,121 —— 这才是「没被掏空」的证据。
+    # 断言张量个数会把「纯粹的权重重组」误判成结构缺失。
+    from src.networks.katago_v7 import NBT_TF_CFG
+    total = sum(p.numel() for p in net.parameters())
+    assert total == NBT_TF_CFG['params_total'], \
+        '参数元素总数 %d != 预算 %d' % (total, NBT_TF_CFG['params_total'])
 
 
 def build_katago_v7_net_for_test():
