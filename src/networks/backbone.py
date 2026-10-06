@@ -60,18 +60,21 @@ class RMSNorm(nn.Module):
                 import logging
                 logging.getLogger(__name__).warning(
                     "[RMSNorm] NPU 融合失败，退回标准路径: %s", _e)
-        # RMS 一律在 fp32 中间量上算：`x²` 在 x 超过约 256 时就撞上 fp16 的
-        # 65504 上限 ⇒ `mean` 变 inf ⇒ `rsqrt(inf)=0`，前向看着「有限」（全 0），
-        # 但**存下来给反向的是 inf**，梯度就再也回不到有限值 —— 而 GradScaler
-        # 对这种与缩放值无关的 inf **无法恢复**（这正是真机「10240 一路降到
-        # 160仍 100% 跳过」那种表现的一种可能来源）。bf16/fp32/fp64 也走 fp32
-        # 中间量，避免任何 dtype 溢出，并保证「输出 dtype == 输入 dtype」：
-        # 此前 bf16 输入下因 `×weight(fp32)` 被提升成 fp32，会静默退化 fp32
-        # （autocast 不会拉回），在 bf16 autocast 设备上整条网络偷偷变 fp32。
-        # 统一到 fp32 中间量再 `.to(x.dtype)`，fp16 行为与此前逐位一致。
-        xf = x.float()
-        rms = (xf.pow(2).mean(dim=-1, keepdim=True) + self.eps).rsqrt()
-        return (xf * rms * self.weight.float()).to(x.dtype)
+        # 标准路径（CPU / GPU / 非 NPU）：
+        #   - fp16：平方易溢出（910A 走 fp16 AMP，x 超 ~256 撞 65504 上限 ⇒
+        #     `mean=inf` ⇒ `rsqrt=0` ⇒ 前向全 0、存下的却是 inf、梯度永远回不来，
+        #     GradScaler 也救不回）。故**仅 fp16** 先升 fp32 中间量再算、末尾 cast 回。
+        #   - bf16 / fp32 / fp64：**保留输入 dtype、与朴素写法 `x*rms*w` 逐位一致**
+        #     （test_non_fp16_dtypes_are_bitwise_unchanged 的零回归契约）。bf16 的指数
+        #     位与 fp32 同宽、无 fp16 那种平方溢出，刻意不碰它 —— 否则「只修 fp16」
+        #     会悄悄改成 bf16/fp64 数值，违反契约。bf16 输出经 `*weight(fp32)` 自然
+        #     提升为 fp32，与朴素写法一致（autocast 行为不变）。
+        if x.dtype == torch.float16:
+            xf = x.float()
+            rms = (xf.pow(2).mean(dim=-1, keepdim=True) + self.eps).rsqrt()
+            return (xf * rms * self.weight.float()).to(x.dtype)
+        rms = (x.pow(2).mean(dim=-1, keepdim=True) + self.eps).rsqrt()
+        return x * rms * self.weight
 
 
 class LayerNorm2d(nn.Module):

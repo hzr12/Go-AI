@@ -284,17 +284,135 @@ def test_full_search_returns_a_legal_move(v7_ai, mcts):
 
 
 # --------------------------------------------------------------------------- #
-# 6. V7 上明确不支持的两条路（响亮拒绝，不静默走错）
+# 6. V7 上明确不支持的那条路（响亮拒绝，不静默走错）与现已打通的那条
 # --------------------------------------------------------------------------- #
 def test_leaf_alpha_beta_is_rejected_on_v7(v7_ai):
+    """leaf α-β 仍不支持：它走 `lookahead.forward_level` 那条不携带前手盘的路。
+
+    ⚠ 别把它和 `lookahead()` 混为一谈：后者在 2026-10-06 已经接通 V7
+    （`feature_fn` + `v7_batch_features` + `child_states(with_prev=True)`），
+    而 leaf α-β 走的是 `MCTS._batch_leaf_ab`，那里的节点仍是 4 元组、
+    没有前手盘 ⇒ ch15/ch16 会退化成「整批缺失」，那比报错糟得多，所以继续拒。
+    """
     with pytest.raises(ValueError, match="leaf α-β"):
         MCTS(v7_ai, board_size=N, num_threads=1, leaf_ab_depth=1)
 
 
-def test_lookahead_is_rejected_on_v7(mcts):
+def test_lookahead_works_on_v7(mcts):
+    """V7 上 `lookahead()`（= webui 的 hybrid / policy_depth>=2 分支）已打通。
+
+    这条在 2026-10-06 之前是「响亮拒绝」，拒绝理由是 `lookahead.py` 只会
+    `feature_planes_batched` + 5 元组，给不出 22 通道与 19 维全局输入。现在
+    通过 `feature_fn` 参数改走 `v7_batch_features`（批量、逐位等价于单图版），
+    并给子局面带上前两手盘面供 ch15/ch16 的梯子重算。
+    """
     b = GoBoard(N)
-    with pytest.raises(RuntimeError, match="lookahead"):
-        mcts.lookahead(b, [-1, -1, -1], [-1, -1, -1], 1)
+    b.play(4 * N + 4)          # 黑 D5
+    b.play(4 * N + 15)         # 白 D16
+    b.play(15 * N + 4)         # 黑 Q5
+
+    vals, pol, best, best_val = mcts.lookahead(
+        b, [-1, 4 * N + 4, 15 * N + 4], [-1, 4 * N + 15, -1], 1,
+        topk=6, width=3, depth=2)
+
+    assert vals, "候选着法不应为空（V7 上 hybrid 分支必须能出着法）"
+    assert len(pol) == mcts.n_actions
+    # masked policy 是「原始 policy 把非法点清零」，**不重新归一**（lookahead.py:114
+    # 只做 `masked[legal] = p[legal]`），所以只能在 [0,1] 且非零，不能要求 ==1。
+    assert 0.0 < float(pol.sum()) <= 1.0 + 1e-6, "masked policy 越界"
+    assert best in vals, "best_move 必须在候选集合内"
+    assert -1.0 <= float(best_val) <= 1.0
+
+
+def test_lookahead_on_v7_carries_the_prev_boards(mcts):
+    """子局面必须带上前两手盘面 —— 否则 ch15/ch16 静默退化成「整批缺失」。
+
+    `lookahead()` 内部是纯函数、不走搜索树，所以根局面的「前一手盘」只能由
+    `MCTS._prev_board_arrays` 从 `move_history` 重放取；`clone()+undo()` 取不到
+    （`GoBoard.clone()` 不带 undo 栈，实测连撤四次都返回 False）。
+    """
+    b = GoBoard(N)
+    for mv in (4 * N + 4, 4 * N + 15, 15 * N + 4):
+        b.play(mv)
+    prev, prev_prev = mcts._prev_board_arrays(b)
+    assert prev is not None and prev.shape == (N, N), "历史够深却没取到前一手盘"
+    assert prev_prev is not None and prev_prev.shape == (N, N), "历史够深却没取到前二手盘"
+    assert not np.array_equal(prev, prev_prev), "前一手盘与前二手盘不应相同"
+
+
+def test_prev_board_arrays_is_none_when_history_is_short(mcts):
+    """历史不足时返回 None（= 缺失），**不许拿空盘冒充**。
+
+    拿全 0 盘面冒充会让 ch15/ch16 去算一个空盘上的梯子，得到的是训练里从未
+    出现过的输入，而且不报任何错。
+    """
+    b = GoBoard(N)
+    assert mcts._prev_board_arrays(b) == (None, None), "开局不该有前手盘"
+    b.play(4 * N + 4)
+    prev, prev_prev = mcts._prev_board_arrays(b)
+    # 只有一手历史时统一退化成「缺失」：把「一手之前的空盘」当作前一手盘会让
+    # ch15/ch16 进入 history=1 门控，而官方口径是 history=0（ch14==ch15==ch16）——
+    # 那个空盘并不是一个真实存在过的「前一手」。
+    assert prev is None and prev_prev is None, "一手历史应当两格都缺（=整批缺失）"
+
+
+def test_komi_reaches_the_v7_global_features(v7_ai):
+    """贴目必须真的进 V7 全局输入（ch5 / ch18），且随取值变化。
+
+    2026-10-06 之前 webui 的 `Session` 构造 `MCTS(...)` 时**没传 komi**，
+    于是原生 MCTS 路径恒用 MCTS 默认 7.5、且没有任何 CLI 开关（`--engine-komi`
+    只喂 GTP 后端）。V7 的 ch5=`currentSelfKomi/20`、ch18=贴目三角波都由它算，
+    填错就是模型拿到训练里没见过的输入 —— 且**不报任何错**。
+    """
+    b = GoBoard(N)
+    b.play(4 * N + 4)
+    seen = {}
+    for k in (7.5, 0.5):
+        m = MCTS(v7_ai, board_size=N, num_threads=1, komi=k)
+        assert m.komi == k, "komi 没有存进 MCTS"
+        _sp, gl = m._feature_inputs(b, [-1, -1, 4 * N + 4], [-1, -1, -1], 1)
+        seen[k] = (float(gl[5]), float(gl[18]))
+        # 全局特征是 float16（与训练、12 通道 planes 同一 dtype），所以按 fp16
+        # 精度比而不是 float64 —— 0.025 在 fp16 里就是 0.024993896484375。
+        assert abs(seen[k][0] - k / 20.0) < 1e-4, \
+            "ch5 必须是 currentSelfKomi/20，实得 %r" % seen[k][0]
+    assert seen[7.5][1] != seen[0.5][1], \
+        "ch18 贴目三角波应随贴目变化，实得两者都是 %r" % (seen[7.5][1],)
+
+
+def test_search_features_use_the_v7_training_history_order(v7_ai):
+    """搜索侧产出的 ch9..13 必须与 V7 **训练**口径一致（index 0 = 最近一手）。
+
+    推理侧所有对局驱动都用 `hist.pop(0); hist.append(mv)`（最老在前），
+    12 通道也正是这个方向；但 V7 训练数据（`v7_dataset` 换过槽位）是「最近在前」。
+    不对齐的话 ch9..13 与全局 ch0..4 会整体时间倒序 —— 形状全对、不报错、
+    着法看着正常，所以只能靠测试钉住。
+    """
+    b = GoBoard(N)
+    for mv in (4 * N + 4, 4 * N + 15, 15 * N + 4, 15 * N + 15):
+        b.play(mv)
+    to_play = b.current_player
+    # webui 口径：黑 [-1, D5, Q5]、白 [-1, D16, Q16]，即最老在前
+    webui_black = [-1, 4 * N + 4, 15 * N + 4]
+    webui_white = [-1, 4 * N + 15, 15 * N + 15]
+    if to_play == 1:
+        my_h, op_h = webui_black, webui_white
+    else:
+        my_h, op_h = webui_white, webui_black
+
+    m = MCTS(v7_ai, board_size=N, num_threads=1)
+    sp, _gl = m._feature_inputs(b, my_h, op_h, to_play)
+
+    def _pt(ch):
+        idx = np.argwhere(sp[ch] > 0)
+        return (int(idx[0][0]), int(idx[0][1])) if idx.size else None
+
+    # 走完 4 手后，最近一手 = Q16。ch9 = opp 最近手 / ch10 = pla 最近手。
+    # 具体哪一边是「pla」取决于轮到谁，但**两个必须分别是 D5 与 Q16**，
+    # 而不是 (Q5, Q16) 那种被倒序的结果。
+    assert _pt(9) == (15, 15), "ch9 应是对方最近一手 Q16，实得 %r" % (_pt(9),)
+    assert _pt(10) in ((4, 4), (15, 4)), \
+        "ch10 应是我方最近一手 D5 或 Q5，实得 %r" % (_pt(10),)
 
 
 # --------------------------------------------------------------------------- #

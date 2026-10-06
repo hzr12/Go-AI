@@ -234,6 +234,18 @@ def _build_trunk(sd: Dict[str, Any], cfg: Dict[str, Any]) -> TrunkDesc:
     NB = int(cfg['num_blocks'])
     INNER = int(cfg['num_inner_blocks'])
 
+    # GAU 块无法映射到 KataGo 的 `transformer_attention_block`（两者数学定义不同：
+    # GAU 用 relu²(QKᵀ+b) 注意力、value 即 GLU 的 V、注意力与 FFN 融合；KataGo 的
+    # 层 schema 没有对应字段）。强行导出会产出「能加载但棋力错」的文件，比不导出
+    # 更危险。这里显式拒绝，给出清晰指引，而不是抛含糊的「缺少张量」。
+    gau_keys = [k for k in sd if '.gau.' in k]
+    if gau_keys:
+        raise ExportError(
+            f'checkpoint 含 GAU 块（如 {gau_keys[0]!r}），无法导出到 KataGo .bin：'
+            f'KataGo 的层 schema 没有 GAU 类型（relu² 注意力 + 融合 FFN 无法保真'
+            f'映射）。请在纯 nbt 配置（gau_positions=None）下训练/导出，或仅在本'
+            f'仓库 PyTorch 自对弈/推理链路中使用 GAU。')
+
     blocks: List[Block] = []
     for bi in range(NB):
         pb = f'blocks.{bi}'

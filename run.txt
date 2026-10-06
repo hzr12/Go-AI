@@ -97,34 +97,37 @@ python scripts/train_sft.py --data data/stdata --v7 1 --device cpu \
 # ============================================================================
 # 全流程 A / B / C 三阶段 —— **直接调 train_sft.py**（不用 run.py）
 # ============================================================================
-# 🔴 **A/B 与 C 之间有架构边界，权重不能承接**
-#
-#   A/B 段：12 通道（`KATAGO_SE_CFG`，9,112,005 参数）—— 吃 `sgf_19x19_full.npz`
-#           + 可选 `soft_index.npz`。policy 目标 = 人类着法 one-hot（B 段命中行走软 CE）
-#   C 段  ：22 通道（`katago_v7.py`，5,562,121 参数）—— 吃 `data/stdata/` 分片。
-#           policy 目标 = KataGo 搜索分布的**软标签**（分片里 `policy_player_prob`）
-#
-#   两者 stem 形状不同，`load_state_dict` 会直接 RuntimeError（不是静默错位）。
-#   ⇒ C 段是**另起一个模型**，不是 A/B 的续训。
+# ⚠ **本节曾有一段与下一节互相矛盾的描述**（旧文称「A/B 段=12 通道、权重不能承接，
+#   C 段另起一个模型」），已于 2026-10-06 删除 —— 下一节 + 下面六条命令才是现行事实：
+#   三段**都是** `--v7 1`（22 通道），权重用 `--model` 逐段承接，
+#   且由 `tests/test_v7_single_model.py::test_weights_carry_from_board_level_to_packed_stage`
+#   钉住。旧的 12 通道只存在于第 4a/4b 节的**冒烟**测试里，不是 A/B/C 正式链路。
 #
 # ⚠ 结构 flag（--backbone-channels / --res-blocks / --attn-* / --policy-channels …）
-#   已压缩归档，对 V7 无效。下面 C 段的命令里**刻意不带**它们。
+#   已压缩归档，对 V7 无效。下面各段命令里**刻意不带**它们。
 # ⚠ 910A 无 BF16 → 必须 fp16 + GradScaler；`--scaler-init-scale` 给 1024
-#   （正式默认 65536 在大 batch 下会炸）。NPU 上 `--compile` 无效，别加。
+#   （代码默认 0.0 = PyTorch 的 65536，见 train_sft.py:3590 help）。NPU 上 `--compile` 无效。
 # ⚠ 预取 worker 是**每 rank** 的：2 卡 × 12 = 24，4 卡 × 6 = 24（实测 CPU 甜点）
 # ⚠ LR 跟有效 batch 走：LR = 0.00356 × √(有效batch / 2500)
-# ⚠ `--export-onnx` 对 V7 **无效**（走 `GoAI` 的 12 通道推理链）；V7 导出见第 8 步
+# ⚠ `--export-onnx` 对 V7 **无效**（走 `GoAI` 的 12 通道推理链）；V7 导出见第 7 步
 # ============================================================================
 
 # ============================================================================
 # ---------- A → B → C：同一个 22 通道 V7 模型，三段只换数据 ----------
 # ============================================================================
-# 🔴 **三段共用一个模型**（`--v7 1`，22 通道，5,562,121 参数）：
+# 🔴 **三段共用一个模型**（`--v7 1`，22 通道）：
 #   A 段 board 级 `full.npz`（人类着法 one-hot）
 #     → B 段同一份 `full.npz` + `soft_index`（软 CE）
 #       → C 段 `stdata_v7` 分片（KataGo 搜索分布内建）
 #   权重用 `--model` 逐段承接（`load_state_dict` strict 零缺失，已由
 #   `tests/test_v7_single_model.py::test_weights_carry_from_board_level_to_packed_stage` 钉住）。
+#
+#   ⚠ 参数量有**两个**值（2026-10-06 实测 `build_katago_v7_net()`）：
+#     · 5,562,121 = 纯 nbt 参考结构（`gau_positions=None, gau_first_nbt=gau_last_nbt=0`）
+#     · 5,759,497 = **当前 cfg 默认**（中部 6 块的 `inner.1` 换成 GAU）
+#     两者的键集不同（共有 264 个），**互相 load_state_dict 会报错**。
+#     GAU 是 2026-10-06 的在途改动（`katago_v7.py` 尚未提交，预算测试
+#     `tests/test_katago_v7_budget.py` 当时红 7 条），跑前先确认落盘的是哪一种。
 #
 # 为什么 A/B 也能用 V7：`load_from_path(--v7 1)` 按**数据布局**分派 ——
 #   含 `spatial_packed` → `V7PackedDataset`（预算好的 22 平面）
@@ -144,8 +147,102 @@ python scripts/train_sft.py --data data/stdata --v7 1 --device cpu \
 #   （正式默认 65536 在大 batch 下会炸）。NPU 上 `--compile` 无效，别加。
 # ⚠ 预取 worker 是**每 rank** 的：2 卡 × 12 = 24，4 卡 × 6 = 24（实测 CPU 甜点）
 # ⚠ LR 跟有效 batch 走：LR = 0.00356 × √(有效batch / 2500)
-# ⚠ `--export-onnx` 对 V7 **无效**（走 `GoAI` 的 12 通道推理链）；V7 导出见第 7/8 步
+# ⚠ `--export-onnx` 对 V7 **无效**（走 `GoAI` 的 12 通道推理链）；V7 导出见第 7 步
 # ⚠ 落盘文件名带 `.latest`：`--out models/x.pth` ⇒ 实际存 `models/x.pth.latest`
+
+# ============================================================================
+# ---------- 参数核对表（2026-10-06 从 train_sft.py 的 argparse 直接抠出）----------
+# ============================================================================
+# 为什么要有这张表：跑全量 pytest 一次 8 分钟起步，改参数不该靠测试去问
+# 「这个 flag 的默认是多少」。下面每一行都是 `ast` 解析 `add_argument` 的结果，
+#   与「命令里显式给的值」并列。**核对方法**：命令里出现的 flag 必须存在，
+#   且显式值与默认值不同的要能说出理由。
+#
+# flag                       代码默认        本文件命令里给的值   为什么显式给
+# -------------------------  --------------  -------------------  --------------------------
+# --v7                       0               1                    三段都走 22 通道 V7
+# --device                   auto            npu                  正式跑
+# --board-size               19              19                   （冗余，保险）
+# --batch-size               512             1000/2800            见下面「batch 与 LR」
+# --epochs                   4               1                    配 early-stop 自己停
+# --lr                       0.002           按公式算             见公式
+# --weight-decay             0.0001          0.0001               （与默认相同，显式留痕）
+# --gradient-accumulation-   1               1 / 2                与 batch 一起定有效 batch
+#   steps
+# --use-amp                  0               1                    910A 无 BF16 ⇒ fp16 必开
+# --use-ema                  0               1                    eval/save 要 shadow 权重
+# --scaler-init-scale        0.0（=PT 65536） 1024                 65536 大 batch 会炸
+# --scaler-growth-interval   0（=PT 2000）    100000               关掉自动增益，防震荡
+# --prefetch-workers         12              24/12/6              每 rank，按卡数摊到 24
+# --prefetch-depth           8               16                   （比默认深，换数据时别断）
+# --log-every                50              50                   （相同）
+# --eval-every               5000            500                  早停拐点要看得见
+# --save-every               2000            250                  断点粒度
+# --early-stop               0               1                    三段都靠它停
+# --early-stop-patience      3               3                    （相同）
+# --swanlab                  0               1                    对比 run 要曲线
+# --swanlab-every            0               10                   曲线密度与 stdout 解耦
+# --soft-only-sampling       0               1（**仅 B 段**）      不给则 99% 行喂 0
+# --soft-weight              1.0             1.0                  （相同）
+# --soft-every               1               1                    （相同）
+# --policy-loss              ce              soft_ce              B/C 段吃软标签
+# --use-checkpoint           0（已归档）      不给                 由 KATAGO_SE_CFG 决定，
+#                                                                 唯一关闭路径是 --compile 1
+# --attn-online              0               不给                 新开关，见下方 ⚠
+# --use-sdpa                 1               1                    显式留痕：NPU 放开 CANN 融合 SDPA（详见 ⚠）
+# --attention-dropout        0.1             0                    V7 设计意图无 dropout（2026-10-06 拍板，见下 🔴）
+#
+# 🔴 `--attention-dropout` 默认 0.1 会**盖掉 V7 的设计值 0.0**：
+#   `katago_v7.py` 写明「**没有 dropout**」且 `NBT_TF_CFG['attn_dropout']=0.0`，
+#   但 `train_sft.py:4221` 把 `attn_dropout=args.attention_dropout` 传了进去
+#   （0.1 是 12 通道 SE 网的默认，`build_katago_se_net(attention_dropout=0.1)`）。
+#   实测（非测试，直接实例化）：
+#     --attention-dropout 0.1 -> MHSA.attn_dropout = [0.1]   ← 不给该 flag 就是这个
+#     --attention-dropout 0.0 -> MHSA.attn_dropout = [0.0]
+#     attn_dropout=None       -> MHSA.attn_dropout = [0.0]   ← 纯设计意图
+#   ⇒ **V7 每次训练实际都开着 0.1 的注意力 dropout**，与 docstring 相反。
+#     ✅ 已拍板（2026-10-06）：上面六条 A/B/C 命令**显式给 `--attention-dropout 0`**
+#     对齐设计意图（V7 docstring 明确「没有 dropout」，0.1 是 12 通道 SE 网默认串味）。
+#     根修（把 train_sft.py 对 V7 不再透传该 flag，或默认改 0）留给后续改动，
+#     在那之前命令必须带着它。续训承接旧 checkpoint 不受影响（dropout 非权重）。
+#   附带后果：`backbone.py:1646` 是 `use_online = _attn_online and dropout_p == 0.0`，
+#     dropout 归 0 后 `--attn-online 1` 不再静默空转（本文件仍默认不给它，理由见上）。
+#
+# ⚠ `--attn-online {0,1}`（默认 0）：手写 math 注意力改 online-softmax（flash 风格），
+#   不物化 (Nq,Nk) 分数矩阵 ⇒ 反向不保留它、省显存。与 materialize 路径**数值等价但
+#   非逐位相同**（fp32 `max|Δ|≈7e-07`），开了会让
+#   `test_twelve_channel_path_bit_identical` 基线失效 ⇒ 默认关，要开先跑
+#   `pytest tests/test_online_softmax_attn.py`。真机加速比尚未实测。
+#   注意它只在 `--attention-dropout 0` 时才真正生效（见上一条 🔴）。
+#
+# ⚠ `--use-sdpa {0,1}`（默认 1，2026-10-06 从环境变量 GOAI_SDPA 搬成 CLI 参数）：
+#   NPU 注意力内核总开关。1 = 放开 CANN 融合 SDPA（F.scaled_dot_product_attention）：
+#   相比手写 math 大幅降注意力开销，且内部 fp32 累加、比 fp16 手写 math 更不易溢出
+#   （顺带缓解 warmup 后 NaN）。受 `_sdpa` 内部 batch 上限保护（B>60000 自动回退
+#   math）；旧 CANN（<8.0.RC3.20）/ torch_npu<2.1 / SDPA API 缺失时也自动回退。
+#   0 = 强制所有后端回退手写 math（调试数值差异 / 旧 CANN 兼容）。
+#   默认 1 与原 GOAI_SDPA 默认行为一致 ⇒ 下面六条命令**不显式给**（留痕见核对表）。
+#   （flash-attn 独立库只在 CUDA Ampere+ 上参与（A100 优先，--flash-attn 默认 1），
+#     NPU 路径不用它。）
+#
+# batch 与 LR（实测/推导，不是拍的）
+#   LR = 0.00356 × √(有效batch / 2500)，有效batch = batch × 卡数 × accum
+#   六条命令逐一核对（全部与公式一致）：
+#     A-1 / C-1  2800×1×1 = 2800  → 0.00377
+#     C-2        2800×2×1 = 5600  → 0.00533
+#     A-2 / B / C-3  1000×4×2 = 8000 → 0.00637
+#
+# ⚠ 「batch 2000/卡 OOM ⇒ 4 卡定档 1000」（第 204 行附近）与 A-1/C-1 的
+#   **单卡 batch 2800** 并存，两者看不出能同时成立（每卡显存不该随卡数变化）。
+#   按 `v7_batch_memory_advice` 的公式，block 级 checkpoint 开启时
+#   4.65 MB/样本 ⇒ 64 GB × 0.9 预算下 batch 上限过万，1000/2800 都远不到边；
+#   关掉 checkpoint 则 278 MB/样本、batch 上限只有 200 出头 ⇒ 「2000 必 OOM」
+#   那条更像**没有 block checkpoint 时**的实测。而 A-1/C-1 标的「✅ 已用 64 行
+#   切片实测跑通」是**小切片**，不等于全量数据。
+#   ⇒ 这两个数**都别当已验证**：换数据/换卡数前先看启动日志里的
+#     `[mem] V7 试算：… batch=… → 约 … GB`（超预算它会直接 SystemExit 并给出建议值），
+#     云端 NPU 关着，本机复现不了。
+# ============================================================================
 
 # ---------- SwanLab 图表：有哪些组、怎么读 ----------
 # ⚠ `--swanlab-every 10` 把**曲线密度**与 stdout 解耦（stdout 仍按 `--log-every 50`）：
@@ -211,6 +308,7 @@ torchrun --nproc_per_node=1 scripts/train_sft.py \
   --games-npz data/labels/games.npz \
   --batch-size 2800 --epochs 1 --lr 0.00377 --weight-decay 0.0001 \
   --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
+  --use-sdpa 1 --attention-dropout 0 \
   --scaler-init-scale 1024 --scaler-growth-interval 100000 \
   --prefetch-workers 24 --prefetch-depth 16 \
   --log-every 50 --eval-every 500 --save-every 250 \
@@ -223,6 +321,7 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
   --games-npz data/labels/games.npz \
   --batch-size 1000 --epochs 1 --lr 0.00637 --weight-decay 0.0001 \
   --gradient-accumulation-steps 2 --use-amp 1 --use-ema 1 \
+  --use-sdpa 1 --attention-dropout 0 \
   --scaler-init-scale 1024 --scaler-growth-interval 100000 \
   --prefetch-workers 6 --prefetch-depth 16 \
   --log-every 50 --eval-every 500 --save-every 250 \
@@ -240,6 +339,7 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
   --soft-weight 1.0 --soft-every 1 --policy-loss soft_ce \
   --batch-size 1000 --epochs 1 --lr 0.00637 --weight-decay 0.0001 \
   --gradient-accumulation-steps 2 --use-amp 1 --use-ema 1 \
+  --use-sdpa 1 --attention-dropout 0 \
   --scaler-init-scale 1024 --scaler-growth-interval 100000 \
   --prefetch-workers 6 --prefetch-depth 16 \
   --log-every 50 --eval-every 500 --save-every 250 \
@@ -260,6 +360,7 @@ torchrun --nproc_per_node=1 scripts/train_sft.py \
   --policy-loss soft_ce --soft-weight 1.0 \
   --batch-size 2800 --epochs 1 --lr 0.00377 --weight-decay 0.0001 \
   --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
+  --use-sdpa 1 --attention-dropout 0 \
   --scaler-init-scale 1024 --scaler-growth-interval 100000 \
   --prefetch-workers 24 --prefetch-depth 16 \
   --log-every 50 --eval-every 500 --save-every 250 \
@@ -273,6 +374,7 @@ torchrun --nproc_per_node=2 scripts/train_sft.py \
   --policy-loss soft_ce --soft-weight 1.0 \
   --batch-size 2800 --epochs 1 --lr 0.00533 --weight-decay 0.0001 \
   --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
+  --use-sdpa 1 --attention-dropout 0 \
   --scaler-init-scale 1024 --scaler-growth-interval 100000 \
   --prefetch-workers 12 --prefetch-depth 16 \
   --log-every 50 --eval-every 500 --save-every 250 \
@@ -286,6 +388,7 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
   --policy-loss soft_ce --soft-weight 1.0 \
   --batch-size 1000 --epochs 1 --lr 0.00637 --weight-decay 0.0001 \
   --gradient-accumulation-steps 2 --use-amp 1 --use-ema 1 \
+  --use-sdpa 1 --attention-dropout 0 \
   --scaler-init-scale 1024 --scaler-growth-interval 100000 \
   --prefetch-workers 6 --prefetch-depth 16 \
   --log-every 50 --eval-every 500 --save-every 250 \
@@ -346,8 +449,47 @@ python -m pytest tests -q --durations=10   # 找出最慢 10 个
 #   当前实测：1948 passed / 5 skipped（约 3:45）
 
 # ---------- 6. 对弈 / 复盘 ----------
+# ✅ **V7 搜索特征与训练口径的历史顺序错位 —— 2026-10-06 已修**
+#
+# 坑在于：**同一个 `my_hist` 在 12 通道与 V7 上必须反向解释**，而两边训练数据
+# 的槽位顺序恰好是相反的（历史遗留，不是笔误）：
+#
+#   链路            训练侧口径                    推理侧口径              一致？
+#   --------------  ---------------------------  ---------------------  ----
+#   12 通道         `build_dataset.split_hist`   同一份 npz 原样读       ✅ 自洽
+#                  → 最老在前（`[::-1]` 的结果）  （webui 也最老在前）
+#   V7（22 通道）  `v7_dataset` **换过槽位**      `webui` 最老在前        ❌ 曾错位
+#                  → 最近在前（index 0 = 最近一手）
+#
+# 根因（`src/data/v7_dataset.py:19-56` 已写成长注释）：
+#   `scripts/build_dataset.py:93` 的 `return my[::-1], op[::-1]` 把
+#   `reversed(recent)` 已经产出的「新→旧」又翻成了「旧→新」，npz 原始槽位是反的
+#   （实测 `op_hist[i,0] == moves[i-3]` 99.8%，应为 `moves[i-1]`）。
+#   V7 训练绕开该 bug 重建槽位（`op_hist[i,0] = moves[i-1]` = 最近一手），
+#   而 12 通道照旧直读 npz。**12 通道因此一直是自洽的，不要去"统一"它。**
+#
+# 修法：`src/search/v7_features.py` 在 V7 这一侧把「最老在前」翻回「最近在前」
+#   （`HIST_IS_OLDEST_FIRST_DEFAULT = True`，v7_leaf_features / v7_batch_features
+#   都吃这个开关）。**只在 V7 翻** —— 全局翻会把 12 通道弄坏。
+#   钉住它的测试：`test_search_features_use_the_v7_training_history_order`、
+#   `test_adapter_normalises_history_order_to_the_v7_training_convention`。
+#
+# ⚠ 12 通道**不受影响**：`test_mcts_in_channels.py::test_twelve_channel_path_bit_identical`
+#   逐位基线修复前后都是绿的 —— 这也正是判断「只动 V7」的那条判据。
+#
+# ⚠ 另一条静默坑（也已修）：`webui` 构造 `MCTS(...)` 时**没传 komi**，原生 MCTS
+#   恒用默认 7.5 且**无任何 CLI 开关**（`--engine-komi` 只喂 GTP 后端）。
+#   而 V7 的全局 ch5=`currentSelfKomi/20`、ch18=贴目三角波都由贴目算出。
+#   现在新增 `--komi`（默认 7.5）并透传给 MCTS，`--engine-komi` 改为默认跟随它。
+#   钉住它的测试：`test_komi_reaches_the_v7_global_features`。
+#
 # 6a WebUI（人工对局选点）：--simulations 默认 512，--priors-leaf 强制 ≥1
 python scripts/webui.py --model models/sft_19x19_v12.pth --device cpu --port 7860 --mode mcts --expand-topk 8 --num-threads 4
+# 6a' V7 同上（**本地 CPU 跑**，不占 NPU；贴目必须与训练一致，填错不报错但
+#      模型输入是错的 —— 这是 2026-10-06 才补上的开关，此前原生路径恒为 7.5）：
+#      hybrid + --policy-depth 2 在 V7 上现已支持（此前会响亮拒绝），
+#      不需要 KataGo 引擎、不需要 .bin.gz。
+python scripts/webui.py --model models/v7_stage1_npu4.pth --device cpu --port 7860 --mode hybrid --policy-depth 2 --komi 7.5 --num-threads 8
 # 6b 命令行复盘/对局：--human-color black|white。6c RL 自动对局：N 卡 lookahead
 python scripts/cli_play.py --model models/sft_19x19_v12.pth --device cpu --simulations 400 --num-threads 8
 # 6d RL（自对弈）：上面的 `selfplay_train.py` 是直连命令；`run.py --sh` 只是包装，
@@ -359,10 +501,55 @@ python scripts/cli_play.py --model models/sft_19x19_v12.pth --device cpu --simul
 #   （= V7 的 5,562,121 减去 scoring/futurepos/seki/scorebelief 四个自研头，保留 99.71%）
 python scripts/export_katago_bin.py export --checkpoint models/v7_stage1_npu4.pth \
     --out models/v7_stage1.bin.gz
-# 用官方引擎验证（会打印 Model version 17 / 5545737 params，并给出 rootInfo 六通道）
-katago/katago-v1.18.1-opencl-windows-x64/katago.exe analysis \
-    -model models/v7_stage1.bin.gz -config analysis.cfg
+
+# 用官方引擎验证加载 —— **用 gtp，不要用 analysis**：
+#   仓库里**没有 analysis.cfg**（`analysis.cfg` 全仓查无此文件），
+#   照旧文写法跑 `analysis -config analysis.cfg` 会直接失败。
+#   `gtp` 自带 default_gtp.cfg，喂 quit 即可判定加载成功：
+#     echo -e "listgen\nquit" | katago/katago-v1.18.1-opencl-windows-x64/katago.exe \
+#         gtp -model models/v7_stage1.bin.gz
+#   ✅ 成功的判据（2026-10-06 用 tmp/coding/a_v7_npu4.bin.gz 实测）：
+#     `Loaded model tmp\coding\a_v7_npu4.bin.gz`
+#     `Model name: a_v7_npu4_step250`
+#     `GTP ready, beginning main protocol loop`
+#   失败会停在 `Loaded model` 之前，或报 p2Conv.outChannels 之类。
+# 也可 `katago.exe benchmarknn -model X.bin.gz`（**必须给 -model**，否则报
+#   `was not specified` 并去找不存在的 default_model.bin.gz）——它只做前向吞吐。
 # 或 GTP 走子：genmove b/w/b
+
+# 🔴🔴 **2026-10-06 实测：当前两种 V7 结构都导不出去**（问题在我们自己的导出器，
+#     KataGo 引擎侧没问题 —— 引擎加载旧 .bin.gz 完全正常，见上方判据）。
+#   复现（随机初始化新结构，不依赖训练权重）：
+#     python tmp/coding/scratch/rand_init.py    # 造 rand_init_v7.pth
+#     python scripts/export_katago_bin.py export \
+#         --checkpoint tmp/coding/scratch/rand_init_v7.pth \
+#         --out tmp/coding/scratch/rand_init_v7.bin.gz
+#   两半**互相脱钩**，导致 A、B 两种结构各自撞在不同的一半上：
+#     ① 键校验这半：`export_checkpoint` 用 `build_katago_v7_net()` 的键集当 want
+#        （katago_export.py:522-529）—— 那是**当前 cfg（GAU 开）**的 306 个键。
+#          · 纯 nbt 老 checkpoint（324 键，无 gau）→ 报「缺 42 个张量，例如
+#            blocks.3.inner.1.gau.k.weight」→ **导不出**
+#     ② 组装这半：`_build_trunk` 把每个 inner 单元**硬编码**成
+#        `attn(.norm_attn/.attn)` + `ffn(.norm_ffn/.ffn)` 两件套
+#        （katago_export.py:276-301），压根不看模型实际建了什么。
+#          · GAU 开的 checkpoint（306 键，`inner.1` 是 gau 而非 attn）→ 过了键校验，
+#            但卡在 `_t('blocks.3.inner.1.norm_attn.weight')` → **也导不出**
+#   ⇒ 不是「checkpoint 没训好」，是**导出器没跟上 GAU 改动**。修法二选一：
+#        (a) 让 ① 用与 ② 同源的布局来校验（先把 GAU 排除在导出之外），
+#        (b) 给 `_build_trunk` 补上 GAU 的映射 —— 见下一条，官方格式**没有这个原语**。
+#
+# 🔴 官方 modelVersion 17 的 trunk 只有 **5 种块类型**，没有 GAU：
+#     ordinary_block / gpool_block / nested_bottleneck_block /
+#     transformer_attention_block / transformer_ffn_block
+#     （本仓实现见 `src/data/katago_bin.py:1547-1604`，kind 分发全表就这 5 个）
+#   ⇒ GAU（`GatedAttentionBlock`，9 个权重张量/单元）**无法原样进官方格式**，
+#     要导出只能：把 GAU 那 6 个内块降级回 attn+ffn（丢权重），或另立 modelVersion。
+#   这是**结构决策**，不是代码 bug，需要拍板后再动导出器。
+#
+#   当前 .bin.gz 是 GAU 之前导的（`tmp/coding/a_v7_npu4.bin.gz`，20,138 KB，
+#   modelVersion 17 / 22 in / 19 global / 11 块 × 4 内件，引擎可加载）。
+#   ⚠ 它与**当前 cfg 的模型不同构**，拿现在的 `build_katago_v7_net()` 去加载它会报错。
+
 # 🔴 **modelVersion 只能取 17，不能取 16**：16 给 policy head 加了 Q 值通道，
 #    p2Conv.outChannels 被钉成 4，加载时直接失败（p2Conv.outChannels (2) != 4）
 # ⚠ sv3 六通道里**后两路（shorttermWinlossError / shorttermScoreError）未训练**：

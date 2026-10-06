@@ -111,6 +111,8 @@ def test_both_sources_feed_the_identical_architecture():
     # 12 通道的旧结构通道数不同 ⇒ 权重形状不同，承接必然失败
     se = SupervisedDataset.__mro__  # 仅确认父类还在位
     assert SupervisedDataset is not None and len(se) >= 2
+    # 默认纯 nbt（GAU 已关，gau_positions=None），全 11 块 [nbt,nbt]；
+    # 总参 5,562,121（见 `NBT_TF_CFG['params_total']` / `SPEC_TOTAL`）。
     assert n_v7 == 5_562_121, n_v7
 
 

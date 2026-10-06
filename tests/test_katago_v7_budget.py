@@ -11,9 +11,11 @@
 --------------------------
 spec §6.1 里「**块小计 ×11 = 5,479,680**」这一行的**标签是错的**，数字本身
 落在正确的位置：5,479,680 其实是 `stem + global + 11 个块 + trunk 末端` 之和，
-11 个块自身是 **5,423,616**（单块 493,056）。5,479,680 不是 11 的整数倍，
-所以它不可能是「块小计」。spec 的**总数 5,561,832 完全正确**，本测试断言的
-就是它。见 `test_block_subtotal_is_not_the_stem_plus_global_sum`。
+（11 个块自身是 **5,423,616**、单块 493,056）。5,479,680 不是 11 的整数倍，
+所以它不可能是「块小计」。
+spec 的原总数 5,561,832 是全 nbt 时代的值；本测试断言的是**实测实现**的总参
+（当前 **5,562,121**，GAU 已关、全 11 块纯 nbt）。见
+`test_block_subtotal_is_not_the_stem_plus_global_sum`。
 """
 
 import inspect
@@ -38,23 +40,30 @@ from src.networks.katago_v7 import (  # noqa: E402
 
 #: 硬预算（spec §1.2 C1）。超了就是结构改动没同步预算。
 BUDGET_TOTAL = 5_850_000
-#: spec §6.1 的目标值。
+#: spec §6.1 的目标值（**实测**，由 `build_katago_v7_net()` 实例化后数出来）。
 #:
-#: 2026-10-03 从 5,561,832 改为 **5,562,121**（+289），两处结构改动：
-#:   1. `value_head.scores` 由 hidden→3 扩到 hidden→6（官方 `sv3Mul`
-#:      的 `out_channels=6`），+96×3 +3 = **+291**
-#:   2. `policy_head.out` 的 `bias=True` → `False`。官方 `p2Conv` 是**裸 1×1
-#:      conv**，bias 由前面的 `p1BN` 承担，多一个 bias 反而与官方不符，**−2**
+#: 历史：
+#:   - 最初全 nbt：5,561,832（spec §6.1 原值，正确）；
+#:   - 2026-10-03 改 5,562,121（+289：value scores 扩到 6 通道 +291，policy out
+#:     bias 去掉 −2）；
+#:   - 2026-10-06 引入 GAU（gau_hidden=256、gau_positions=[0]）降到 5,021,449；
+#:   - 2026-10-06 再调布局：前 3 / 末 2 块纯 nbt（493,056/块），中部 6 块
+#:     [nbt, gau]（gau_hidden=384、含偏置 b，525,953/块），总参 5,759,503；
+#:   - 2026-10-06 关掉 GAU（gau_positions=None，退回纯 nbt 参考结构）回到
+#:     **5,562,121**（硬预算 5.85M 内，margin 287,879）。GAU 仍是可选 opt-in
+#:     （经 cfg.gau_positions 重开），不在默认/导出路径上。
 SPEC_TOTAL = 5_562_121
 
 #: 各子模块期望值（spec §6.1）。`value_head` 含 spec 未单列的
 #: ownership/scoring/futurepos/seki 四个 1×1 小头（共 384 参数），
-#: 与官方 value 头 26,886 一起构成 27,561。
+#: 与 value 头本体 27,177 一起构成 27,561。
+#:
+#: GAU 已关：11 块全为纯 nbt（每块 [nbt, nbt] = 493,056）。
 EXPECTED = {
     'stem': 50_688,
     'global_fc': 4_864,
-    'blocks_each': 493_056,
-    'blocks_total': 5_423_616,
+    'blocks_each': 493_056,    # 每个 nbt 块：[nbt, nbt]
+    'blocks_total': 5_423_616,  # 11×493_056（全 nbt）
     'trunkfinal': 512,
     'policy_head': 38_832,
     'value_head_with_small': 27_561,   # = 27,177 + 384
@@ -85,13 +94,16 @@ def test_total_is_under_hard_budget(net):
     got = _n(net)
     assert got <= BUDGET_TOTAL, f'超硬预算 {BUDGET_TOTAL:,}：{got:,}'
     margin = BUDGET_TOTAL - got
-    assert margin == 287_879, f'余量应为 287,879（4.9%），实测 {margin:,}'
+    assert margin == 287_879, f'余量应为 287,879（约 4.9%），实测 {margin:,}'
 
 
 def test_submodule_param_counts_match_spec(net):
     assert _n(net.stem) == EXPECTED['stem']
     assert _n(net.global_fc) == EXPECTED['global_fc']
-    assert _n(net.blocks[0]) == EXPECTED['blocks_each']
+    # 全 11 块都是纯 nbt（GAU 已关）
+    for i in range(11):
+        assert _n(net.blocks[i]) == EXPECTED['blocks_each'], \
+            f'块[{i}] 应为 {EXPECTED["blocks_each"]}，实测 {_n(net.blocks[i])}'
     assert _n(net.blocks) == EXPECTED['blocks_total']
     assert _n(net.norm_trunkfinal) == EXPECTED['trunkfinal']
     assert _n(net.policy_head) == EXPECTED['policy_head']
@@ -107,13 +119,19 @@ def test_submodules_sum_to_total(net):
 
 
 def test_block_subtotal_is_not_the_stem_plus_global_sum():
-    """§6.1 那行标签勘误：5,479,680 含 stem/global/trunk-end，不是块小计。"""
+    """§6.1 那行标签勘误：
+
+    `with_prefix = stem + global + blocks + trunkfinal` 含了非块参数，
+    不可能是「块小计」。全 nbt 下块成本一致（每块 493,056 ×11），但
+    `with_prefix` 仍不可被 11 整除（5,479,680 / 11 余 8）。
+    """
     blocks = EXPECTED['blocks_total']
-    assert blocks % 11 == 0 and blocks // 11 == EXPECTED['blocks_each']
+    assert blocks == 11 * EXPECTED['blocks_each']
     with_prefix = (EXPECTED['stem'] + EXPECTED['global_fc'] + blocks
                    + EXPECTED['trunkfinal'])
     assert with_prefix == 5_479_680
-    assert with_prefix != blocks, '5,479,680 不可被 11 整除，不可能是块小计'
+    assert with_prefix != blocks, 'with_prefix 含 stem/global/trunk-end，不可能是块小计'
+    assert with_prefix % 11 != 0, 'with_prefix 不可被 11 整除'
 
 
 # --------------------------------------------------------------------------- #
@@ -136,14 +154,17 @@ def test_head_dim_is_32_and_in_cann_supported_set(net):
     """head_dim = M/H = 32，落在 CANN 融合注意力支持集 {16,32,64}。
 
     这是 spec §3 里唯一**不能事后调**的约束：head_dim 变了，融合注意力直接
-    不可用（spec §6 R1）。
+    不可用（spec §6 R1）。默认布局：边缘块 [nbt, nbt]、中部块 [nbt, gau]；
+    GAU 在 `gau.head_dim`、nbt 在 `attn.head_dim`，两者都应是 32。
     """
-    hd = net.blocks[0].inner[0].attn.head_dim
+    def _hd(inner):
+        return inner.attn.head_dim if hasattr(inner, 'attn') else inner.gau.head_dim
+    hd = _hd(net.blocks[0].inner[0])
     assert hd == 32, f'head_dim={hd}，spec 规定 32'
     assert hd in (16, 32, 64)
     for blk in net.blocks:
         for inner in blk.inner:
-            assert inner.attn.head_dim == hd
+            assert _hd(inner) == hd
 
 
 def test_h_head_count_swap_is_free(net):
@@ -415,12 +436,12 @@ def test_score_stdev_softplus_term_lands_near_huber_delta():
             with _swapped_beta(beta):
                 means[beta] = float(n(sp, gl)['score_stdev'].mean())
 
-    # 裁决值：实测 13.8599，与 δ=10 同量级。判据取「落在 δ 的 3 倍以内」而不是
+    # 裁决值：实测 14.8824，与 δ=10 同量级。判据取「落在 δ 的 3 倍以内」而不是
     # 「等于 δ」—— 初值不必等于目标，只要别差两个数量级。
     assert means[1.0] == pytest.approx(14.8824, abs=0.05), means
     assert means[1.0] <= 3.0 * HUBER_DELTA_SCORE_STDEV, \
         f'beta=1.0 的初值 {means[1.0]} 与 δ={HUBER_DELTA_SCORE_STDEV} 差太远'
-    # spec 字面值：实测 277.2534，是 δ 的 27 倍。这一行是**回归哨兵** ——
+    # spec 字面值：实测 278.2364，是 δ 的 27 倍。这一行是**回归哨兵** ——
     # beta 若被改回 0.05，它会连同上面那条一起变红。
     assert means[0.05] == pytest.approx(278.2364, abs=0.05), means
     assert means[0.05] > 20.0 * HUBER_DELTA_SCORE_STDEV
@@ -434,8 +455,8 @@ def test_score_stdev_loss_term_is_inside_huber_delta_at_the_ruled_out_beta():
     没有被线性段压掉 1/δ —— 那才是「这一项真的有学习信号」的直接判据。
 
     实测（真实 net + 合成标签，段 2 的口径即 `game_weight=1`）：
-      beta=0.05 ⇒ 272.22（δ 的 27 倍）
-      beta=1.0  ⇒   8.83（**δ 以内**）
+      beta=0.05 ⇒ 273.3450（δ 的 27 倍）
+      beta=1.0  ⇒   9.9922（**δ 以内**）
     """
     from src.networks.katago_v7_loss import KataGoV7Loss, huber
 
@@ -462,7 +483,7 @@ def test_score_stdev_loss_term_is_inside_huber_delta_at_the_ruled_out_beta():
     assert got[1.0] == pytest.approx(9.9922, abs=0.05), got
     assert got[1.0] <= HUBER_DELTA_SCORE_STDEV, \
         f'beta=1.0 下 loss #7 的公式值 {got[1.0]} 仍在 δ 之外 ⇒ 仍在线性段'
-    assert got[0.05] == pytest.approx(273.345, abs=0.5), got
+    assert got[0.05] == pytest.approx(273.3450, abs=0.5), got
 
     # 反证：#7 的公式值确实随 beta 变（否则上面全是恒真的断言）。
     assert got[0.05] != got[1.0]

@@ -783,26 +783,79 @@ class MCTS:
         返回 ({mv: 根玩家视角价值}, 根 masked policy, 最佳 mv, 最佳价值) ——
         仍是 4 元组（纯函数侧多返回一个 `root_value`，webui 用不到，这里丢掉）。
 
-        ---- V7（22 通道）下**不支持** ----
-        `lookahead_mod.lookahead` 造特征走 `feature_planes_batched` + 5 元组，
-        造不出 22 通道、也带不了 19 维全局输入。接通它要改 `lookahead.py`
-        （与 RL 共用的纯函数模块），那是另一件事。这里响亮拒绝：webui 的
-        hybrid 模式在 V7 上请用 ``--mode mcts``。静默按 12 通道跑会算出看着
-        正常的着法，只是全错 —— 那比报错糟得多。
+        ---- V7（22 通道 + 19 维全局输入）现已支持 ----
+        2026-10-06：此前「不支持」的原因是 `lookahead_mod.lookahead` 造特征走
+        `feature_planes_batched` + 5 元组，给不出 22 通道、也带不了 19 维全局输入。
+        现已由 `v7_batch_features`（批量装配）+ `child_states(with_prev=True)`
+        （携带前两手盘面）+ `feature_fn` 参数（6 元组入 `predict_batch`）解决。
+        **12 通道不传 `feature_fn`，走原路径一字未改** —— 这是
+        `tests/test_mcts_in_channels.py::test_twelve_channel_path_bit_identical`
+        逐位基线的前提。
+
+        根局面的前两手盘面由 `lookahead()` 自己从 `move_history` 重放取回
+        （`_prev_board_arrays`）：它们不进 MCTS 树（树里只存 prev_board 引用，
+        见 `MCTSNode.prev_board`），所以只有这一层需要补。取不到就退化成
+        「整批缺失」（None），**不拿空盘冒充**。
         """
-        if self._v7:
-            raise RuntimeError(
-                "V7（22 通道 + 19 维全局输入）暂不支持 lookahead 推演"
-                "（webui 的 hybrid 模式 / --mode lookahead）。"
-                "请改用 --mode mcts。原因：lookahead 造特征走 "
-                "feature_planes 的 12..17 通道，给不出 V7 需要的 22 通道与"
-                "全局输入。")
+        prev_b, prev_pb = self._prev_board_arrays(board)
+        feature_fn = (lambda nodes: self._v7_batch_features(nodes, prev_b, prev_pb)
+                      if self._v7 else None)
         res = lookahead_mod.lookahead(
             self.ai, board, my_hist, op_hist, to_play,
             n_actions=self.n_actions, n_channels=self._in_channels(),
             topk=topk, width=width, depth=depth,
-            planes=self._planes1(board, my_hist, op_hist, to_play))
+            planes=self._planes1(board, my_hist, op_hist, to_play),
+            feature_fn=feature_fn)
         return res.values, res.policy, res.best_move, res.best_value
+
+    def _prev_board_arrays(self, board):
+        """当前局面往前 1 手 / 2 手的盘面快照 ``(n,n) int8``，历史不足处为 None。
+
+        为什么需要：V7 的 ch15/ch16 要在**前手盘**上重算梯子。搜索树里只有
+        `MCTSNode.prev_board`（相对根的路径），而 lookahead 是纯函数、不走树，
+        所以根局面这一层的"前手盘"得从 `move_history` 重放取。
+
+        ⚠ **只能用重放，不能用 `clone()+undo()`**：`GoBoard.clone()` **不带 undo
+        栈**（实测 clone 后连着 `undo()` 四次全返回 `False`，盘面纹丝不动）。
+        这里从空盘逐手重放 `move_history` 到倒数第 2 / 第 3 手为止并取快照。
+        历史很长时是 O(手数)，但 lookahead 每局只调一次（展开里每次只多 2 手），
+        相比一次前向可以忽略。
+        """
+        hist = list(getattr(board, "move_history", []) or [])
+        n = len(hist)
+        if n < 2:
+            return None, None            # 连一手历史都没有 ⇒ 两格都缺
+        # 需要的两个目标：倒数第 1 手之后（= 前一手）、倒数第 2 手之后（= 前二手）
+        size = int(board.board_size)
+        try:
+            replay = GoBoard(size)
+            prev = prev_prev = None
+            for idx, mv in enumerate(hist):
+                # 先取快照再落子：idx 时刻的盘面 = 落 hist[idx] 之前的局面
+                if idx == n - 1:
+                    prev = np.asarray(replay.board, dtype=np.int8).copy()
+                elif idx == n - 2:
+                    prev_prev = np.asarray(replay.board, dtype=np.int8).copy()
+                replay.play(int(mv), record=True)
+            return prev, prev_prev
+        except Exception:  # noqa: BLE001 —— 取不到就退化成「整批缺失」，绝不冒充
+            return None, None
+
+    def _v7_batch_features(self, nodes, prev_board=None, prev_prev_board=None):
+        """V7 的批量特征装配（给 `lookahead_mod` 的 `feature_fn` 用）。
+
+        根局面（`nodes` 里唯一不带 prev 的那个）用 `_prev_board_arrays` 补上；
+        其余子局面由 `child_states(with_prev=True)` 自己带着前手盘。
+        """
+        from src.search.v7_features import v7_batch_features
+        # 根节点的 prev：lookahead 传进来的根是 4 元组，统一在这里补
+        nodes2 = list(nodes)
+        if nodes2 and len(nodes2[0]) == 4:
+            b = nodes2[0][0]
+            nodes2[0] = (b, nodes2[0][1], nodes2[0][2], nodes2[0][3],
+                         prev_board, prev_prev_board)
+        return v7_batch_features(nodes2, komi=self.komi,
+                                 rules_flags=self.rules_flags)
 
     def _replay_path(self, path):
         """从根局面沿 path 重放着法，返回 leaf 局面的独立棋盘副本。

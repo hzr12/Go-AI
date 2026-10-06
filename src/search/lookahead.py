@@ -42,38 +42,72 @@ class LookaheadResult(NamedTuple):
     root_value: float             # 根局面的网络估值（根 to_play 视角）
 
 
-def child_states(board, moves, my_hist, op_hist, to_play):
+def child_states(board, moves, my_hist, op_hist, to_play, *, with_prev=False,
+                 prev_board=None, prev_prev_board=None):
     """给定局面与候选着法，返回各子局面的 (GoBoard, my_h, op_h, to_play)。
 
     子节点持有完整棋盘深拷贝，供后续「按层批量前向 / 再展开」复用；
     在传入棋盘上 play/undo（调用方状态不破坏）。
+
+    ``with_prev=True``（**仅 V7**）时改为返回 6 元组，末尾两项是
+    ``(prev_board, prev_prev_board)`` —— 子局面的**前一手 / 前二手盘面**快照
+    ``(n,n) int8``（或 None）。
+
+    为什么 V7 需要它：ch15/ch16 的梯子要在**前手盘**上重算，缺了就退化成
+    「整批缺失」路径，模型拿到的是训练里从未出现过的输入。12 通道不经过这里取
+    前手盘（`feature_planes` 通道 12..17 不含这一路），所以默认关闭。
+
+    ⚠ 存的是 **ndarray 快照而不是 GoBoard**：搜索侧每步都产生新盘面，持有整个
+    board 对象会把 undo 栈一起钉住，内存无界增长（`v7_leaf_features` 同一理由）。
     """
+    # 父局面自己的前一手/前二手，作为子局面的 prev_prev / 更前一手。
+    # None 一律原样传下去（= 历史不足），**不要**拿空盘冒充。
+    parent_prev = None if prev_board is None else np.asarray(prev_board, dtype=np.int8)
+    parent_prev_prev = (None if prev_prev_board is None
+                        else np.asarray(prev_prev_board, dtype=np.int8))
+
     out = []
     for mv in moves:
+        # 快照必须在 apply_action **之前**取：子局面的「前一手」就是下这手之前的盘面
+        cur = np.asarray(board.board, dtype=np.int8).copy() if with_prev else None
         if not board.apply_action(mv):
             continue
         child_to = -to_play
         cmy = list(op_hist)
         cop = list(my_hist)
         cb = board.clone()
-        out.append((cb, cmy, cop, child_to))
+        if with_prev:
+            out.append((cb, cmy, cop, child_to, cur, parent_prev))
+        else:
+            out.append((cb, cmy, cop, child_to))
         board.undo()
     return out
 
 
-def forward_level(ai, nodes, n_channels, n_actions):
+def forward_level(ai, nodes, n_channels, n_actions, feature_fn=None):
     """对一批节点批量前向，返回 (policies(B,A), values(B,))。
 
     一次性组装整批特征（通道数 = 模型 `in_channels`）+ 单次 predict，最大化
     CPU/ONNX 吞吐。`n_channels` 由调用方给（MCTS 侧是 `self._in_channels()`，
     RL 侧是 `ai.in_channels`）—— 不在这里问 ai 是为了保持本模块无状态。
+
+    `feature_fn`：**仅 V7 传**，形如 ``f(nodes) -> (spatial, global_features)``
+    （见 `src/search/v7_features.py::v7_batch_features`）。给了它就走 V7 特征并把
+    `predict_batch` 的输入从 5 元组换成 6 元组（多带 19 维全局输入）；不给则走
+    原来的 `feature_planes_batched` + 5 元组。**两条路都保持"一次前向"，**
+    没有为了兼容 V7 给 12 通道加任何分支开销。
     """
     if not nodes:
         return np.zeros((0, n_actions)), np.zeros(0)
-    arrays = np.stack([n[0].board for n in nodes])
     my_hs = [n[1] for n in nodes]
     op_hs = [n[2] for n in nodes]
     tps = [n[3] for n in nodes]
+    if feature_fn is not None:
+        spatial, gfeat = feature_fn(nodes)
+        states = [(None, my_hs[i], op_hs[i], tps[i], spatial[i], gfeat[i])
+                  for i in range(len(nodes))]
+        return ai.predict_batch(states)
+    arrays = np.stack([n[0].board for n in nodes])
     kos = [n[0].ko_point for n in nodes]
     planes = nodes[0][0].feature_planes_batched(arrays, my_hs, op_hs, tps, kos,
                                                  n_channels=n_channels)
@@ -83,7 +117,8 @@ def forward_level(ai, nodes, n_channels, n_actions):
 
 
 def lookahead(ai, board, my_hist, op_hist, to_play, n_actions, n_channels,
-              topk=12, width=4, depth=2, planes: Optional[np.ndarray] = None
+              topk=12, width=4, depth=2, planes: Optional[np.ndarray] = None,
+              feature_fn=None,
               ) -> LookaheadResult:
     """策略 N 步批量推演（minimax 展开 top-K/width 着法树，价值回传）。
 
@@ -95,6 +130,9 @@ def lookahead(ai, board, my_hist, op_hist, to_play, n_actions, n_channels,
         topk / width / depth: 根候选数 / 每层展开宽度 / 推演层数。
         planes: 根局面**已算好**的特征。RL 侧本来就要把 planes 写进 buffer，
             传进来可以**只算一次**（根前向与 buffer 行共用同一份）。
+        feature_fn: **仅 V7 传**，见 `forward_level`。给了它则根前向与逐层前向都走
+            V7 特征（6 元组），且子局面**携带前两手盘面**供 ch15/ch16 梯子重算；
+            不给则与 12 通道完全同路径（`planes` 会被照旧透传给根前向）。
 
     Returns:
         `LookaheadResult`（见其 docstring；比搬迁前多一个 `root_value`）。
@@ -103,12 +141,22 @@ def lookahead(ai, board, my_hist, op_hist, to_play, n_actions, n_channels,
     legal = [int(m) for m in np.where(board.get_legal_moves())[0]] + [n - 1]
 
     # 根前向取 policy、**根估值**与 top-K 候选
-    if planes is None:
+    if feature_fn is not None:
+        rplanes, rgfeat = feature_fn(
+            [(board, list(my_hist), list(op_hist), int(to_play))])
+        pol, val = ai.predict_batch(
+            [(None, list(my_hist), list(op_hist), int(to_play),
+              rplanes[0], rgfeat[0])])
+    elif planes is None:
         planes = board.feature_planes_batched(
             board.board[None], [list(my_hist)], [list(op_hist)], [to_play],
             [board.ko_point], n_channels=n_channels)[0]
-    pol, val = ai.predict_batch(
-        [(None, list(my_hist), list(op_hist), to_play, planes)])
+        pol, val = ai.predict_batch(
+            [(None, list(my_hist), list(op_hist), to_play, planes)])
+    else:
+        pol, val = ai.predict_batch(
+            [(None, list(my_hist), list(op_hist), to_play, planes)])
+    root_value = float(np.asarray(val).reshape(-1)[0])
     root_value = float(np.asarray(val).reshape(-1)[0])
     p = np.asarray(pol).reshape(-1)
     masked = np.zeros(n)
@@ -129,12 +177,13 @@ def lookahead(ai, board, my_hist, op_hist, to_play, n_actions, n_channels,
         return LookaheadResult({}, masked, n - 1, 0.0, root_value)
 
     # 逐层生成子树（每层节点 = 上层节点按 policy 选出的 top-W 孩子）
-    levels = [child_states(board, kept, my_hist, op_hist, to_play)]
+    levels = [child_states(board, kept, my_hist, op_hist, to_play,
+                           **({'with_prev': True} if feature_fn is not None else {}))]
     if not levels[0]:
         return LookaheadResult({}, masked, n - 1, 0.0, root_value)
     child_ranges = []
     all_pols, all_vals = [], []
-    pol0, val0 = forward_level(ai, levels[0], n_channels, n)
+    pol0, val0 = forward_level(ai, levels[0], n_channels, n, feature_fn)
     all_pols.append(pol0)
     all_vals.append(val0)
     for _ in range(1, depth):
@@ -142,18 +191,23 @@ def lookahead(ai, board, my_hist, op_hist, to_play, n_actions, n_channels,
         pols = all_pols[-1]
         nxt, ranges = [], []
         for i, nd in enumerate(prev):
-            cb, cmy, cop, cto = nd
+            cb, cmy, cop, cto = nd[0], nd[1], nd[2], nd[3]
             pp = np.asarray(pols[i]).reshape(-1)
             lleg = [int(m) for m in np.where(cb.get_legal_moves())[0]] + [n - 1]
             porder = sorted(lleg, key=lambda m: -pp[m])[:max(1, width)]
             s = len(nxt)
-            nxt.extend(child_states(cb, porder, cmy, cop, cto))
+            if feature_fn is not None:
+                nxt.extend(child_states(cb, porder, cmy, cop, cto,
+                                        with_prev=True,
+                                        prev_board=nd[4], prev_prev_board=nd[5]))
+            else:
+                nxt.extend(child_states(cb, porder, cmy, cop, cto))
             ranges.append((s, len(nxt)))
         levels.append(nxt)
         child_ranges.append(ranges)
         if not nxt:
             break
-        pnxt, vnxt = forward_level(ai, nxt, n_channels, n)
+        pnxt, vnxt = forward_level(ai, nxt, n_channels, n, feature_fn)
         all_pols.append(pnxt)
         all_vals.append(vnxt)
 

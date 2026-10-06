@@ -49,39 +49,34 @@ class Session:
                  spec_prefetch=True, leaf_ab_depth=0, leaf_ab_width=4,
                  priors_leaf=False, hybrid_sims=32, hybrid_blend=0.5,
                  policy_depth=1, policy_width=4, policy_topk=12,
-                 engine=None):
+                 engine=None, komi=7.5):
         self.ai = ai
         #: 非 None 时 AI 走后端**KataGo 引擎**（GTP），原生 MCTS 不用。
-        #:
-        #: 为什么需要它：V7（22 通道 `NbtTfNet`）**跑不了原生 MCTS** ——
-        #: `go_rules.py::_check_n_channels` 硬性 12..17，而 22 通道里 ch14–17
-        #: 是梯子、ch18 要贴目，`feature_planes` 给不出来。硬放白名单的后果不是
-        #: 报错，而是模型拿到一份它没见过的输入却照样出着法。引擎这条路没有这个
-        #: 缺口（它按 `.bin.gz` 的结构描述自己造全部 22 通道）。
         #:
         #: ⚠ 引擎后端**拿不到 visits / 胜率 / 候选着法**（普通 GTP 没有这些，
         #: `kata-analyze` 才有）。所以那三项一律留 `None` / 空，**不拿默认值冒充**
         #: —— 编一个 0.5 就是在 UI 上展示看似正常的假数字。
+        #:
+        #: ⚠ **历史注记（2026-10-06 已失效，留着以免重犯）**：本文件原先写着
+        #: 「V7 跑不了原生 MCTS，因为 `go_rules.py::_check_n_channels` 只允许 12..17，
+        #: 22 通道的 ch14–17 梯子与 ch18 贴目给不出来」。那条限制只卡
+        #: `GoBoard.feature_planes` **这一条**造特征的路，而 V7 从 `cb1d2bf` 起走
+        #: `src/search/v7_features.py`（22 平面 + 19 维全局 + 前两手盘面），
+        #: 压根不经过它。原生 MCTS / hybrid / lookahead 现在**全部支持 V7**，
+        #: 引擎后端只是**可选**（它的优势是能报 visits/胜率/候选，且跑在
+        #: `.bin.gz` 上而不是 torch 权重上），不再是 V7 的唯一出路。
         self.engine = engine
         self.size = board_size
-        # V7（22 通道）+ hybrid 的深度分支 = 构造期就该拦住的组合。
-        # `_ai_move_hybrid` 里 `policy_depth >= 2` 才走 `mcts.lookahead`，
-        # 而那条路在 V7 上会响亮拒绝；默认 `policy_depth=1` 走 `ai.predict`
-        # 则完全正常。也就是说「hybrid 能不能跑」取决于一个深度阈值 ——
-        # 不在启动时说清，用户会玩到一半才撞上错误。静默可用/不可用都不可接受。
-        if getattr(ai, "needs_global_features", False) and policy_depth >= 2:
-            raise ValueError(
-                f"V7（22 通道 + 19 维全局输入）不支持 --policy-depth "
-                f"{policy_depth}：depth≥2 的 hybrid 分支走 mcts.lookahead，"
-                f"而它造特征只用 feature_planes 的 12..17 通道。"
-                f"请用 --policy-depth 1（默认，hybrid 正常工作）或 "
-                f"--mode mcts。")
         self.lock = threading.Lock()
+        # komi 必须透传给 MCTS：V7 的全局 ch5（currentSelfKomi/20）与 ch18
+        # （贴目三角波）由它算出。此前这里**没传**，于是原生 MCTS 路径恒用
+        # `MCTS` 的默认 7.5，而 `--engine-komi` 只喂给 GTP —— 换规则下棋时
+        # 模型拿到的是错误输入且不报错。12 通道不受影响（那 12..17 通道无此路）。
         self.mcts = MCTS(ai, board_size=board_size, num_threads=num_threads,
                          expand_topk=expand_topk, expand_chunk=expand_chunk,
                          solver_thresh=solver_thresh, spec_prefetch=spec_prefetch,
                          leaf_ab_depth=leaf_ab_depth, leaf_ab_width=leaf_ab_width,
-                         priors_leaf=priors_leaf)
+                         priors_leaf=priors_leaf, komi=komi)
         self.default_mode = default_mode
         self.hybrid_sims = hybrid_sims
         self.hybrid_blend = hybrid_blend
@@ -1303,16 +1298,25 @@ def build_parser():
                     help="模型版本号 (用于 --model 默认值)")
     ap.add_argument("--board-size", type=int, default=19)
     ap.add_argument("--device", default="auto")
-    # ---- KataGo 引擎后端（V7 走这条；原生 MCTS 只支持 12/17 通道）----
+    # ---- KataGo 引擎后端（**可选**；原生 MCTS 已同时支持 12/17/22 通道）----
     ap.add_argument("--engine-gtp", default="",
-                    help="改用 KataGo 引擎当 AI 后端：给 V7 导出的 .bin.gz。"
-                         "留空则用原生 MCTS（仅 12/17 通道模型）。")
+                    help="改用 KataGo 引擎当 AI 后端：给一个 .bin.gz。"
+                         "留空则用原生 MCTS（12/17 通道与 V7 22 通道都支持）。"
+                         "选引擎的收益是它能报 visits/胜率/候选着法，"
+                         "以及跑在导出的 .bin.gz 上而不是 torch 权重上。")
     ap.add_argument("--engine-gtp-exe", default="",
                     help="katago 可执行文件（默认在 katago/*/katago.exe）")
     ap.add_argument("--engine-gtp-config", default="",
                     help="引擎配置（默认 katago/*/default_gtp.cfg）")
-    ap.add_argument("--engine-komi", type=float, default=7.5,
-                    help="引擎后端的贴目；必须与训练口径一致")
+    ap.add_argument("--komi", type=float, default=7.5,
+                    help="贴目（黑 − 白）。**V7 必须填对**：全局 ch5=currentSelfKomi/20"
+                         "、ch18=贴目三角波都由它算，填错会让模型拿到训练里没见过的"
+                         "输入，而且不报任何错。12 通道不用它（那 12..17 通道里没有这一路）。"
+                         "⚠ 原生 MCTS 路径此前**恒用** MCTS 默认 7.5 且无任何开关，"
+                         "只有 --engine-gtp 路径能改 —— 现在两条路统一走这个参数。")
+    ap.add_argument("--engine-komi", type=float, default=None,
+                    help="引擎后端的贴目（**仅 --engine-gtp 时生效**）；"
+                         "默认跟随 --komi，单独给才覆盖")
     ap.add_argument("--port", type=int, default=7860)
     ap.add_argument("--num-threads", type=int, default=8, help="MCTS 选路径线程数")
     ap.add_argument("--mode", choices=["hybrid", "mcts", "policy"], default="hybrid",
@@ -1424,17 +1428,19 @@ def main():
         print(f"[warn] 线程配置失败（可忽略）: {e}")
 
     # ---- KataGo 引擎后端 ----
-    # 给了 --engine-gtp 就**完全不建 GoAI**：原生 MCTS 那条路要求
-    # `feature_planes` 能造出模型声明的通道数，而 V7 是 22 通道（ch14–17 梯子、
-    # ch18 贴目），`go_rules.py::_check_n_channels` 只允许 12..17。引擎按
-    # `.bin.gz` 的结构描述自己造全部 22 通道，所以这条路才走得通。
+    # 给了 --engine-gtp 就**完全不建 GoAI**：引擎搜索全在 KataGo 内部，
+    # webui 侧不需要 torch 模型（也拿不到策略，所以 `--use-rollout` 与它互斥）。
+    # ⚠ 历史注记（已失效）：此处原注释称原生 MCTS 只支持 12..17 通道、V7 因此
+    # 必须走引擎。那只对 `GoBoard.feature_planes` 成立；V7 自 `cb1d2bf` 起走
+    # `src/search/v7_features.py`，原生 MCTS 与 hybrid 现在都能跑 V7。
     engine = None
     if args.engine_gtp:
         exe, cfg = _resolve_engine_paths(args)
         print(f"[webui] AI 后端 = KataGo 引擎\n       exe={exe}\n"
               f"       model={args.engine_gtp}\n       config={cfg}")
         engine = KataGoGTP(exe, args.engine_gtp, cfg, board_size=args.board_size,
-                           komi=args.engine_komi, timeout=300.0)
+                           komi=(args.engine_komi if args.engine_komi is not None else args.komi),
+                            timeout=300.0)
         try:
             engine.start()
         except GTPError as e:
@@ -1450,10 +1456,9 @@ def main():
     # 这类错门禁抓不到（没有测试真把 main() 跑到这一行），只能靠真起一次服务。
     _bs = args.board_size
     if engine is not None:
-        # 引擎后端下 `ai` 保持 None：原生 MCTS 用不到它，而建一个 GoAI 只会
-        # 把 22 通道权重硬塞进只支持 12..17 的 `feature_planes` 里报错。
-        # `MCTS(None, ...)` 是安全的 —— `use_rollout=False` 时它只在构造期存下
-        # `ai`，不会去问通道数。
+        # 引擎后端下 `ai` 保持 None：原生 MCTS 用不到它（出招全走 GTP），
+        # 建一个 GoAI 纯属白花一次权重加载。`MCTS(None, ...)` 是安全的 ——
+        # `use_rollout=False` 时它只在构造期存下 `ai`，不会去问通道数。
         ai = None
         _nt = 1
     else:
@@ -1488,7 +1493,8 @@ def main():
                       hybrid_blend=args.hybrid_blend,
                       policy_depth=args.policy_depth,
                       policy_width=args.policy_width,
-                      policy_topk=args.policy_topk)
+                      policy_topk=args.policy_topk,
+                      komi=args.komi)
     session.mcts.use_rollout = args.use_rollout
     session.mcts.rollout_lambda = args.rollout_lambda
     session.mcts.rollout_steps = args.rollout_steps

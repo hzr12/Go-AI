@@ -591,7 +591,7 @@ def _script_args(txt):
                      if not l.strip().startswith('#'))
     body = body.replace('\\\n', ' ')
     for m in re.finditer(r'(?:torchrun[^\n]*?|python)\s+(?:scripts/)?'
-                         r'(train_sft|train_sft_ms|selfplay_train)\.py'
+                         r'(train_sft|selfplay_train)\.py'
                          r'([^\n]*)', body):
         toks = [t for t in m.group(2).split() if t and t != '"$@"']
         return m.group(1), toks
@@ -607,7 +607,6 @@ def test_shell_script_args_are_parseable():
     """
     target = {
         'train_sft': os.path.join(ROOT, 'scripts', 'train_sft.py'),
-        'train_sft_ms': os.path.join(ROOT, 'scripts', 'train_sft_ms.py'),
         'selfplay_train': os.path.join(ROOT, 'scripts', 'selfplay_train.py'),
     }
     env = dict(os.environ, PYTHONUTF8='1')

@@ -24,7 +24,8 @@ from src.data.feature_v7 import (  # noqa: E402
     DEFAULT_RULES_FLAGS, GameRow, global_features_v7, spatial_channels_v7)
 from src.game.go_rules import GoBoard  # noqa: E402
 from src.search.v7_features import (  # noqa: E402
-    V7_GLOBAL_CHANNELS, V7_SPATIAL_CHANNELS, is_v7_spatial, v7_leaf_features)
+    V7_GLOBAL_CHANNELS, V7_SPATIAL_CHANNELS, is_v7_spatial, v7_batch_features,
+    v7_leaf_features)
 
 N = 19
 
@@ -176,19 +177,57 @@ def test_rules_flags_reach_the_area_channels():
 # 与 feature_v7 直调必须逐位一致（本层只是转发，不许夹带私货）
 # --------------------------------------------------------------------------- #
 def test_adapter_is_a_faithful_forwarder():
+    """适配器 = `feature_v7` 直调 **+ 一次有意的顺序归一**，不许夹带别的私货。
+
+    ⚠ 这里比的是**同口径**：适配器按「仓库约定 = 最老在前」收下 ``my_hist``，
+    会先反转再交给 `feature_v7`（V7 训练口径是「最近在前」，见
+    `HIST_IS_OLDEST_FIRST_DEFAULT`）。所以参照调用必须传**反转后**的列表，
+    否则这条测试会误报成「适配器夹带了私货」。
+    """
     b, prev, prev_prev, my, op = _state()
     sp, gl = _feats()
+    my_r, op_r = my[::-1], op[::-1]        # 适配器内部就是这么交给 feature_v7 的
     ref_sp = spatial_channels_v7(
-        b.board[None], [b.current_player], [b.ko_point], [my], [op],
+        b.board[None], [b.current_player], [b.ko_point], [my_r], [op_r],
         prev_board=prev[None], prev_prev_board=prev_prev[None],
         rules_flags=DEFAULT_RULES_FLAGS)[0]
     ref_gl = global_features_v7(
-        GameRow(komi=7.5, rules_flags=DEFAULT_RULES_FLAGS), [my], [op],
+        GameRow(komi=7.5, rules_flags=DEFAULT_RULES_FLAGS), [my_r], [op_r],
         prev_board=prev[None], prev_prev_board=prev_prev[None],
         rules_flags=DEFAULT_RULES_FLAGS,
         to_play=[b.current_player], board_area=N * N)[0]
     assert np.array_equal(sp, ref_sp), "适配器与 feature_v7 直调结果不一致"
     assert np.array_equal(gl, ref_gl), "适配器与 feature_v7 直调结果不一致"
+
+
+def test_adapter_normalises_history_order_to_the_v7_training_convention():
+    """适配器把「最老在前」翻成 V7 训练要的「最近在前」；显式说不翻时原样透传。
+
+    这是 2026-10-06 修掉的**静默**错位：推理侧所有对局驱动都用
+    ``hist.pop(0); hist.append(mv)``（最老在前，12 通道也正是这个方向），
+    而 V7 训练口径（`v7_dataset` 换过槽位）是「最近在前」。不对齐的话
+    ch9..13 与全局 ch0..4 全部时间倒序 —— 形状对、不报错、着法看着正常。
+    """
+    b, _prev, _pp, my, op = _state()
+    tp = b.current_player
+
+    def _ref(m, o):
+        return spatial_channels_v7(
+            b.board[None], [tp], [b.ko_point], [m], [o],
+            rules_flags=DEFAULT_RULES_FLAGS)[0]
+
+    # 默认：收下「最老在前」，产出应等于把反转后的列表直接喂 feature_v7
+    sp_default, _ = v7_leaf_features(b, my, op, tp, komi=7.5,
+                                     rules_flags=DEFAULT_RULES_FLAGS)
+    assert np.array_equal(sp_default, _ref(my[::-1], op[::-1]))
+
+    # 显式 hist_is_oldest_first=False：调用方自称「最近在前」⇒ 原样透传
+    sp_passthru, _ = v7_leaf_features(b, my, op, tp, komi=7.5,
+                                      rules_flags=DEFAULT_RULES_FLAGS,
+                                      hist_is_oldest_first=False)
+    assert np.array_equal(sp_passthru, _ref(my, op))
+    assert not np.array_equal(sp_default, sp_passthru), (
+        '夹具前提：my/op 必须非回文，否则正反两种顺序产出相同、这条测不出东西')
 
 
 def test_adapter_does_not_mutate_the_board():
@@ -199,3 +238,78 @@ def test_adapter_does_not_mutate_the_board():
     _feats()
     assert np.array_equal(b.board, before)
     assert b.ko_point == ko_before and b.current_player == tp_before
+
+# --------------------------------------------------------------------------- #
+# 批量装配（`v7_batch_features`）—— lookahed 逐层大 batch 前向的入口
+# --------------------------------------------------------------------------- #
+def test_batch_features_are_bitwise_equal_to_the_single_leaf_path():
+    """批量版必须与单图版**逐位相同**（带/不带 prev 都要）。
+
+    这条是唯一能钉住「批量装配没走样」的锚：批量版是给 lookahead 逐层拼大
+    batch 用的（吃 CPU/ONNX 吞吐），一旦它与单图版有哪怕一个 ULP 的差别，
+    同��个局面在 webui 的 hybrid 模式与 --mode mcts 下就会给出不同着法，
+    而两边都「看着正常」。所以是逐位相等，不是 allclose。
+    """
+    b, prev, prev_prev, my, op = _state()
+    tp = b.current_player
+
+    sp1, gl1 = v7_leaf_features(b, my, op, tp, komi=7.5,
+                                rules_flags=DEFAULT_RULES_FLAGS)
+    sp2, gl2 = v7_batch_features([(b, my, op, tp)], komi=7.5,
+                                 rules_flags=DEFAULT_RULES_FLAGS)
+    assert np.array_equal(sp1, sp2[0]), "不带 prev 时批量版与单图版不一致"
+    assert np.array_equal(gl1, gl2[0]), "不带 prev 时全局输入不一致"
+
+    sp3, gl3 = v7_leaf_features(b, my, op, tp, prev_board=prev,
+                                prev_prev_board=prev_prev, komi=7.5,
+                                rules_flags=DEFAULT_RULES_FLAGS)
+    sp4, gl4 = v7_batch_features([(b, my, op, tp, prev, prev_prev)],
+                                 komi=7.5, rules_flags=DEFAULT_RULES_FLAGS)
+    assert np.array_equal(sp3, sp4[0]), "带 prev 时批量版与单图版不一致"
+    assert np.array_equal(gl3, gl4[0]), "带 prev 时全局输入不一致"
+
+
+def test_batch_features_really_use_the_prev_boards():
+    """给一份不同的前手盘必须**真的改变** ch15/ch16 —— 否则是静默空转。
+
+    `ch14..17` 由 `resolve_ladder_boards` 门控：不传历史时 ch14==ch15==ch16，
+    传一手历史时 ch16 抄 ch15。这正是 `tests/test_v7_assemble.py` 钉的官方口径，
+    这里从**搜索侧的批量入口**再钉一遍 —— 搜索侧和装配侧是两个调用点，
+    只在一个地方钉住不够。
+    """
+    b, _prev, _pp, my, op = _state()
+    tp = b.current_player
+    sp_none, _ = v7_batch_features([(b, my, op, tp)], komi=7.5,
+                                   rules_flags=DEFAULT_RULES_FLAGS)
+    alt = b.board.copy()
+    alt[0, 0] = 1 if alt[0, 0] != 1 else -1
+    sp_prev, _ = v7_batch_features([(b, my, op, tp, alt, alt)], komi=7.5,
+                                   rules_flags=DEFAULT_RULES_FLAGS)
+    assert np.array_equal(sp_none[0][14], sp_none[0][15]), \
+        "整批缺失时 ch14 必须等于 ch15（官方门控）"
+    changed = set(np.where(sp_none[0] != sp_prev[0])[0].tolist())
+    assert changed == {15, 16}, \
+        '换一份前手盘应当只改动 ch15/ch16，实得 %s' % sorted(changed)
+
+
+def test_batch_features_accepts_an_already_batched_prev_board():
+    """prev 若已被调用方批量成 ``(1,n,n)``，不该拼成 ``(B,1,n,n)``。
+
+    不规整的话 `np.stack` 会拼出四维，`resolve_ladder_boards` 抛「形状不符」，
+    而报错信息指不到真正的原因（真正的问题是调用方传了批量形状）。
+    """
+    b, prev, prev_prev, my, op = _state()
+    tp = b.current_player
+    ref, _ = v7_batch_features([(b, my, op, tp, prev, prev_prev)],
+                               komi=7.5, rules_flags=DEFAULT_RULES_FLAGS)
+    got, _ = v7_batch_features(
+        [(b, my, op, tp, prev[None], prev_prev[None])],
+        komi=7.5, rules_flags=DEFAULT_RULES_FLAGS)
+    assert np.array_equal(ref, got)
+
+
+def test_batch_features_handles_an_empty_level():
+    """空层（深度耗尽 / 全是 pass）不能炸，要给出 0 行的合法张量。"""
+    sp, gl = v7_batch_features([], komi=7.5, rules_flags=DEFAULT_RULES_FLAGS)
+    assert sp.shape == (0, V7_SPATIAL_CHANNELS, N, N)
+    assert gl.shape == (0, V7_GLOBAL_CHANNELS)

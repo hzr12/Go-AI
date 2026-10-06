@@ -1517,6 +1517,11 @@ def test_no_new_cli_params():
         # 本测试历次更新加入，当时未在冻结集留痕，导致本测试红；现补登。与 D1 门禁
         # 哲学一致：登记是把"为什么有这个旗"钉死，后续改名/删除仍会在此报警。
         '--attn-online',
+        # ---- 2026-10-06 新增的 1 个：SDPA 融合注意力总开关 ----
+        # `--use-sdpa`（默认 1）把原环境变量 GOAI_SDPA 搬成 CLI 参数：NPU 上放开
+        # CANN 融合 SDPA（更省算力、fp32 累加更稳），0 强制所有后端回退手写 math。
+        # 与 D1 门禁哲学一致：登记是把"为什么有这个旗"钉死，后续改名/删除仍会在此报警。
+        '--use-sdpa',
     }
     got = set(kw)
     assert got == expected, (
@@ -1527,10 +1532,11 @@ def test_no_new_cli_params():
         + (f'  仅顺序不同（不算违规）: '
            f'{[k for k in kw if k in expected]}' if got == expected else ''))
     # 基线 = 61 原始 + A4 的 4 个软标签 + B8 的 `--v7` + 2026-10-04 的 `--games-npz`
-    #        + online-softmax 开关 `--attn-online`（补登）
-    assert len(expected) == 68, (
-        f'冻结的基线本身变了：{len(expected)} != 68'
-        f'（61 + A4 的 4 个 + B8 的 1 个 + --games-npz 的 1 个 + --attn-online 的 1 个）')
+    #        + online-softmax 开关 `--attn-online`（补登）+ 2026-10-06 的 `--use-sdpa`
+    assert len(expected) == 69, (
+        f'冻结的基线本身变了：{len(expected)} != 69'
+        f'（61 + A4 的 4 个 + B8 的 1 个 + --games-npz 的 1 个 + --attn-online 的 1 个'
+        f' + --use-sdpa 的 1 个）')
     # 特别地：L2 系数不许有独立参数，label smoothing 也不许有第二个旋钮
     for banned in ('--l2-coef', '--l2-weight', '--weight-decay-l2',
                    '--l2-report', '--label-smoothing-ce'):

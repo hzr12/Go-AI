@@ -700,11 +700,16 @@ def v7_batch_memory_advice(args, logger, device, *, n_layers, heads, tokens,
     `OutOfMemoryError` 这种**看不出原因**的异常 —— 而原因其实只是一行乘法。
 
      **checkpoint 感知**：开/关 block 级梯度检查点差 **40×**
-       （实测 6.9 vs 277.1 MB/样本）。而实测云端 910A 上 batch 3000 用了
-       **64 GB**（≈ 21.3 MB/样本）—— 远大于「有 checkpoint」该有的量级，
-       强烈提示**那个后端上 block 级 checkpoint 没真正生效**。
-       所以这里把当前**实际配置**对应的每样本字节打出来，让人一眼看出处在
-       哪个区间，而不必靠猜。
+       （驻留 6.9 vs 277.1 MB/样本；fp16 下每样本约 4.65 vs 139.7）。
+       历史实测（2026-10-04，云端 910A，batch 3000 ⇒ 64 GB ≈ 21.3 MB/样本）
+       是**补丁前**的数：当时只有 blocks 被 checkpoint，stem 与三个 head
+       走裸前向、激活全程驻留，故比「全开」估算的 8.1 MB/样本高 2.6×。
+       但 21.3 仍只有「无 checkpoint」基线（≈139.7）的 1/6.6 —— block 级
+       checkpoint 在 910A 上**确已生效**，旧注释「没真正生效」是过时误读。
+       当前代码 stem/heads 也已 checkpoint（并修了重算吃不到 autocast 的
+       910A OOM 真因），全开理论应 ≈ 8.1 MB/样本（batch 3000 ≈ 24 GB），
+       待 910A 真机复测确认。这里仍把**实际配置**对应的每样本字节打出来，
+       让人一眼看出处在哪个区间，而不必靠猜。
 
      只在能查到设备显存时启用。查不到（CPU / 未装 torch_npu）就只打印估算值，
       不拦 —— 本地冒烟不该被这个门控挡住。
@@ -2594,6 +2599,10 @@ def _init_swanlab(args, logger):
                 # 开没开**。静默的开关是排查噩梦 —— 尤其它与 materialize 路径
                 # 非逐位相同，出了问题得先知道它开过。
                 "attn_online": int(args.attn_online),
+                # SDPA（CANN 融合注意力）开关：登记进来同样为了面板可见 ——
+                # 它直接决定注意力走融合内核还是手写 math，是 NPU 上最关键的
+                # 显存/速度/数值口径之一。
+                "use_sdpa": int(args.use_sdpa),
                 "attn_query_chunk": int(
                     os.environ.get('GOAI_ATTN_QUERY_CHUNK', '64') or 0),
                 # ---- 数据/运行 ----
@@ -3436,6 +3445,12 @@ def main():
                          '（实测 fp32 max|Δ|≈7e-07），开启会让 12 通道的 '
                          'test_twelve_channel_path_bit_identical 基线失效；'
                          '真机加速比尚未实测，故默认关闭')
+    ap.add_argument('--use-sdpa', type=int, default=1, choices=[0, 1],
+                    help='NPU 上是否走 CANN 融合 SDPA（F.scaled_dot_product_attention）：'
+                         '1=放开（默认，省算力、fp32 累加更稳，顺带缓解 warmup 后 NaN）；'
+                         '0=强制回退手写 math（兼容旧 CANN <8.0.RC3.20 / torch_npu<2.1，'
+                         '或调试数值差异）。仍受 _sdpa 内部 batch 上限保护（B>60000 自动回退 math）。'
+                         ' 取代原环境变量 GOAI_SDPA（0=math 的语义）')
     ap.add_argument('--eval-every', type=int, default=5000)
     ap.add_argument('--eval-max-batches', type=int, default=50,
                     help='验证集评估最多跑多少个 batch；<=0 表示不截断（跑满全部验证集）')
@@ -3614,8 +3629,11 @@ def main():
                     choices=['default', 'max-autotune', 'reduce-overhead'],
                     help='torch.compile 模式: default=常规融合, max-autotune=A100 上进一步 '
                          '自动调优提速（编译更久）, reduce-overhead=小 batch 低开销')
-    ap.add_argument('--flash-attn', type=int, default=0, choices=[0, 1],
-                    help='启用 flash-attn 独立库（A100 上最快，需 pip install flash-attn）(0=关闭, 1=开启)')
+    ap.add_argument('--flash-attn', type=int, default=1, choices=[0, 1],
+                    help='flash-attn 独立库开关：A100(Ampere+) 上优先于内置 SDPA（最快，需 '
+                         'pip install flash-attn），加载失败自动回退内置 SDPA。'
+                         '1=自动优先（默认：A100 优先 flash-attn，其他后端不用）；'
+                         '0=强制禁用（A100 也走内置 SDPA）。可被环境变量 GOAI_FLASH=0 覆盖禁用')
     ap.add_argument('--arch', default='resnet',
                     choices=['resnet', 'convnext'],
                     help='网络架构风格: resnet=传统 ResBlock (默认，兼容旧权重) | convnext=ConvNeXt 风格 (5x5 深度卷积 + LayerNorm + GELU)')
@@ -3947,9 +3965,11 @@ def main():
     #                     V100(sm_70, Volta) -> float16（无 bf16）
     #   - use_scaler:      BF16 下关闭 GradScaler（不下溢）；FP16 下开启
     #   - use_channels_last: A100 卷积走 NHWC 更快；NPU/CPU 收益有限默认关
-    #   - sdpa_force_math: NPU 默认放开 CANN 融合 SDPA（更省算力、fp32 累加更稳）；
-    #                     仅旧 torch_npu(<2.1)/SDPA API 缺失/GOAI_SDPA=0 才回退手写
-    #                     math。V100 同样强制 math；A100 走 FlashAttn。
+    #   - sdpa_force_math: 各后端天然默认不同——A100 走 SDPA/FlashAttn（False），
+    #                     V100/CPU 强制手写 math（True），NPU 默认放开 CANN 融合 SDPA
+    #                     （除非旧 torch_npu(<2.1)/SDPA API 缺失）。随后统一由
+    #                     --use-sdpa 总开关覆盖：--use-sdpa 0 强制所有后端回退手写
+    #                     math（调试/兼容性），--use-sdpa 1（默认）保留上述天然默认。
     #   - compile_disable_sparse: 所有后端统一禁用——unfold 产生 (B, Hh*d, N, ws²) 巨型
     #                      中间张量，inductor freezing 常量折叠会以 fp32 物化
     #                      (B,N,Hh,ws²,d)（batch512 下单个 4.3GB）直接编译期 OOM；
@@ -3985,16 +4005,10 @@ def main():
             # unfold 巨型中间张量会触发 inductor freezing 以 fp32 物化 (B,N,Hh,ws²,d)
             # 导致编译期 OOM（batch512 下单个 4.3GB），必须排除出编译图
             compile_disable_sparse = True
-            logger.info("[device] %s (sm_%d%d) | 启用 A100 路径: BF16 + FlashAttn + "
+            logger.info("[device] %s (sm_%d%d) | 启用 A100 路径: BF16 + FlashAttn(优先,回退SDPA) + "
                         "channels_last + compile(卷积/线性/FFN)", gpu_name, *compute_cap)
-            # 尝试加载 flash-attn
-            if args.flash_attn == 1:
-                from src.networks import backbone as _backbone
-                fa_ok, fa_msg = _backbone.set_flash_attn(True)
-                if fa_ok:
-                    logger.info("[env] flash-attn %s", fa_msg)
-                else:
-                    logger.warning("[env] flash-attn %s，回退内置 SDPA", fa_msg)
+            # flash-attn 的实际加载/回退统一在下方「flash-attn 独立库启用决策」块处理
+            # （A100 默认优先尝试，--flash-attn 0 / GOAI_FLASH=0 才禁用），此处不再重复。
         else:
             # V100 等老卡：保守路径（与原行为一致）
             amp_dtype = torch.float16
@@ -4014,7 +4028,7 @@ def main():
         # 注意力内核：CANN 8.0.RC3.20+ 的 F.scaled_dot_product_attention 融合 kernel
         # （flash/mem-efficient 后端）已稳定，相比手写 math 大幅降注意力开销（c=），
         # 且内部 fp32 累加、比 fp16 手写 math 更不易溢出（顺带缓解 warmup 后 NaN）。
-        # 默认放开走 SDPA；GOAI_SDPA=0 可强制回退手写 math（兼容旧 CANN/调试）。
+        # 默认放开走 SDPA；--use-sdpa 0 可强制回退手写 math（兼容旧 CANN/调试）。
         # 仍受 _sdpa 内部 batch 上限保护（B>60000 自动回退 math）。
         if '910B' in gpu_name or '910Pro' in gpu_name or '910-2' in gpu_name:
             amp_dtype = torch.float16  # NPU autocast 仅支持 FP16
@@ -4030,9 +4044,9 @@ def main():
         compile_disable_sparse = True
         # 注意力后端自动判断（仅 NPU 分支用，但变量供下方日志/backbone 统一取用）：
         #   - 默认放开 SDPA（CANN 融合，省算力且更稳）；
-        #   - GOAI_SDPA=0 强制 math；
+        #   - --use-sdpa 0 强制 math（取代原环境变量 GOAI_SDPA）；
         #   - SDPA API 缺失或 torch_npu<2.1（老 CANN）时回退 math。
-        _sdpa_wanted = os.environ.get('GOAI_SDPA', '1') != '0'
+        _sdpa_wanted = args.use_sdpa == 1
         _sdpa_has_api = hasattr(torch.nn.functional, "scaled_dot_product_attention")
         _sdpa_old_tnpu = False
         try:
@@ -4062,6 +4076,17 @@ def main():
     if args.npu_graph_compile == 1 and _backend != 'npu':
         logger.warning("[device] --npu-graph-compile 仅对 NPU 生效，当前后端为 %s，"
                        "已忽略。", _backend)
+
+    # 全局 SDPA 总开关（--use-sdpa）：在各后端选定天然默认后做一次统一覆盖，
+    # 让该参数对 CUDA / NPU / CPU 全部后端生效。
+    #   - 默认 1：保留各后端天然选择（A100=SDPA/FlashAttn，V100/CPU=手写 math，
+    #     NPU=CANN 融合 SDPA 或受旧 CANN/torch_npu<2.1 保护回退 math）。
+    #   - 0：强制所有后端回退手写 _sdpa_math（跨后端统一关闭融合注意力，便于
+    #     调试数值差异 / 兼容不支持 SDPA 的环境）。
+    if args.use_sdpa == 0 and not sdpa_force_math:
+        sdpa_force_math = True
+        logger.warning("[device] --use-sdpa 0：强制 %s 后端回退手写 math 注意力"
+                       "（覆盖其天然默认）", _backend)
 
     # 把注意力后端/编译开关透传给 backbone 模块（所有分支统一设置）
     from src.networks import backbone as _backbone
@@ -4105,21 +4130,23 @@ def main():
         logger.warning("[model] online-softmax 注意力已开启：与 materialize 路径"
                        "数值等价但非逐位相同，12 通道 bit-identical 基线会失效")
 
-    # flash-attn 独立库启用决策：仅「Ampere+ CUDA 且走非 math 路径」时尝试加载。
-    # 加载失败自动回退内置 SDPA，不影响训练启动。
-    # 环境变量 GOAI_FLASH=0 可强制禁用（A/B 实测用：稀疏注意力分块 seq 仅 ~30，
-    # flash 小 kernel 密集发射在部分配置下比手写 math 更慢，需实测决定）。
-    _flash_wanted = os.environ.get('GOAI_FLASH', '1') != '0'
-    if _flash_wanted and _backend == 'cuda' and compute_cap >= (8, 0) and not sdpa_force_math:
+    # flash-attn 独立库启用决策（A100 优先）：仅「Ampere+ CUDA 且走非 math 路径」时
+    # 优先尝试加载 flash-attn，加载成功则 _sdpa 优先走 flash-attn 内核，失败回退内置 SDPA。
+    # 控制优先级：--flash-attn 0 显式禁用 > GOAI_FLASH=0 显式禁用 > 默认（A100 优先尝试）。
+    # GOAI_FLASH=0 用于 A/B 实测（稀疏注意力分块 seq 仅 ~30，flash 小 kernel 密集发射在
+    # 部分配置下比手写 math 更慢，需实测决定）。
+    _flash_disabled = (args.flash_attn == 0) or (os.environ.get('GOAI_FLASH', '1') == '0')
+    if (not _flash_disabled) and _backend == 'cuda' and compute_cap >= (8, 0) and not sdpa_force_math:
         fa_ok, fa_msg = _backbone.set_flash_attn(True)
         if fa_ok:
-            logger.info("[env] 注意力内核: flash-attn %s（优先于内置 SDPA）", fa_msg)
+            logger.info("[env] 注意力内核: flash-attn %s（A100 优先，回退 SDPA）", fa_msg)
         else:
             logger.info("[env] 注意力内核: 内置 SDPA（flash-attn %s）", fa_msg)
     else:
         _backbone.set_flash_attn(False)
-        if not _flash_wanted:
-            logger.info("[env] 注意力内核: 手写 math（GOAI_FLASH=0 已禁用 flash）")
+        if _flash_disabled:
+            logger.info("[env] 注意力内核: 内置 SDPA / 手写 math"
+                        "（flash-attn 已被 --flash-attn 0 或 GOAI_FLASH=0 禁用）")
         else:
             logger.info("[env] 注意力内核: %s",
                         ("手写 math（%s 不支持 Flash）" % _backend.upper())

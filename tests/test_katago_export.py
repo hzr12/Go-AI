@@ -393,6 +393,19 @@ def test_matmul_weight_layout_survives_roundtrip(desc, sd, tmp_path):
 # --------------------------------------------------------------------------- #
 # 6. 前置条件不满足时响亮失败
 # --------------------------------------------------------------------------- #
+def test_gau_checkpoint_rejected_with_clear_error():
+    """GAU 块无法保真映射到 KataGo 的层 schema，导出必须**显式**报错，而不是
+    抛含糊的「缺少张量」。这条锁定 `katago_export._build_trunk` 的 GAU 守卫。
+    """
+    from src.networks.katago_v7 import NbtTfNet
+    net = NbtTfNet(cfg={'attn_impl': 'nbt', 'gau_positions': [0],
+                        'gau_first_nbt': 0, 'gau_last_nbt': 0})
+    net.initialize()
+    sd_gau = {k: v.detach().clone() for k, v in net.state_dict().items()}
+    with pytest.raises(kx.ExportError, match='GAU'):
+        kx.build_model_desc(sd_gau, dict(NBT_TF_CFG))
+
+
 def test_missing_tensor_raises_export_error(sd, tmp_path):
     """缺张量必须报错，不许静默填 0。"""
     bad = dict(sd)
