@@ -357,13 +357,52 @@ class RoPE2D(nn.Module):
         return self._rotate(x, ang.cos(), ang.sin())
 
 
+def _migrate_ema_shadow_qkv(shadow):
+    """把旧 ckpt 的 EMA shadow（``...attn.q/k/v.weight``）并成 ``qkv.weight``。
+
+    MHSA 现在内部只存 ``qkv``（见 `MHSA` 类文档），EMA 以
+    ``named_parameters()`` 为键 ⇒ 新 shadow 用 ``qkv``。旧 checkpoint 存的是
+    三个独立键，直接换上去会让 `EMA.update()` 抛 KeyError。三者按 q,k,v 顺序
+    沿 dim0 拼接即可（与 `qkv_to_qkv` 的逆运算，**无损**）。
+
+    返回 ``(新 shadow, 迁移了几处)``。不是 MHSA 的键原样透传。
+    """
+    out, moved = {}, 0
+    i = 0
+    keys = list(shadow.keys())
+    while i < len(keys):
+        k = keys[i]
+        if k.endswith('.q.weight'):
+            # k[:-len('.q.weight')] 会把 q 前的那个点一起吃掉，所以下面补回。
+            base = k[:-len('.q.weight')]
+            trip = [shadow.get(base + '.' + n + '.weight') for n in ('q', 'k', 'v')]
+            if all(t is not None for t in trip):
+                out[base + '.qkv.weight'] = torch.cat(
+                    [t.detach().clone() for t in trip], dim=0)
+                i += 3
+                moved += 1
+                continue
+        out[k] = shadow[k]
+        i += 1
+    return out, moved
+
+
 class MHSA(nn.Module):
     """多头自注意力，``head_dim = nbt_mid / num_heads``（spec §3.2）。
 
-    ``q`` 在调用 ``_sdpa`` **之前**已乘 ``1/√head_dim``（`_sdpa` 的契约，见
+    ``q`` 在调用 ``_sdpa`` **之前**已乘 ``1/√head_dim``（`_sdpa`` 的契约，见
     `backbone.py:584`），这样 flash / mem-efficient 后端与 math 路径拿到的是
     同一份缩放后的输入。
+
+    **q/k/v 合成（训练侧优化）**：内部只存一个 ``qkv`` 权重（一次 GEMM），但
+    ``state_dict()`` 仍以 ``q/k/v`` 三个键对外暴露。因此：
+      - 旧 checkpoint（``attn.q/k/v.weight``）可直接 ``load_state_dict``；
+      - ``katago_export.py`` 读的三个键不变，导出的 .bin.gz 与合成前**逐字节相同**
+        ⇒ KataGo 引擎加载零影响；
+      - EMA（``named_parameters`` 键）只在训练期新起的 shadow 里是 ``qkv``，
+        见 `scripts/train_sft.py` resume 分支的迁移。
     """
+
 
     def __init__(self, dim, num_heads, attn_dropout=0.0):
         super().__init__()
@@ -374,16 +413,29 @@ class MHSA(nn.Module):
         self.num_heads = int(num_heads)
         self.head_dim = self.dim // self.num_heads
         self.scale = 1.0 / math.sqrt(self.head_dim)
-        self.q = _ScaledLinear(self.dim, self.dim, bias=False)
-        self.k = _ScaledLinear(self.dim, self.dim, bias=False)
-        self.v = _ScaledLinear(self.dim, self.dim, bias=False)
+        # q/k/v 三个 Linear(dim,dim) 合成**一个** Linear(dim,3*dim)：22 处
+        # (11 block × 2 inner) 每处省 2 次 ACL 启动。V7 dim=128 时单个 GEMM 是
+        # 128×128×N，M 很小、完全被启动开销支配，合成 384×128 明显更划算。
+        # ⚠ 合成**只发生在训练时的前向组织**：权重张量本身没变（见
+        # `_state_dict_qkv_to_qkv` / `qkv_to_qkv`），所以导出的 .bin.gz 与
+        # 合成前**逐字节相同**，KataGo 引擎加载零影响（实测：两组 ckpt 导出的
+        # SHA256 相同、引擎都 GTP ready）。
+        self.qkv = _ScaledLinear(self.dim, 3 * self.dim, bias=False)
         self.out = _ScaledLinear(self.dim, self.dim, bias=False)
         self.rope = RoPE2D(self.num_heads, self.head_dim)
         self.attn_dropout = float(attn_dropout)
+        self._register_compat_hooks()
 
     def initialize(self, scale=1.0, gain=GAIN_SILU):
-        for lin in (self.q, self.k, self.v, self.out):
-            lin.initialize(scale=scale, gain=gain)
+        # 逐段初始化（而非对 (3dim,dim) 整块 _trunc_normal_）：三段的 std 只跟
+        # in_features 有关、与 out_features 无关，所以整块初始化与分段初始化
+        # **同分布**。分段写是为了让 q/k/v 三段的 RNG 抽样顺序与旧的三个独立
+        # Linear 完全一致 ⇒ 同 seed 下初值与合成前逐位相同，便于回归比对。
+        std = scale * gain / math.sqrt(self.dim)
+        with torch.no_grad():
+            for i, name in enumerate(('q', 'k', 'v')):
+                _trunc_normal_(self.qkv.weight[i * self.dim:(i + 1) * self.dim], std)
+        self.out.initialize(scale=scale, gain=gain)
         self.rope.initialize()
         return self
 
@@ -401,13 +453,63 @@ class MHSA(nn.Module):
         #    旧写法「预乘 q + scale=None」只在 math 路径（V100/910A）正确；
         #    走 SDPA 路径时 SDPA 会再乘一次 1/sqrt(d) ⇒ 注意力 logits 小 32 倍，
         #    softmax 被压平、注意力趋近均值，实测相对误差 82%。
-        q = self._heads(self.q(t))
-        k = self._heads(self.k(t))
-        v = self._heads(self.v(t))
+        # 一次 GEMM 出 q/k/v，按行切成三段（chunk 只是 view，不额外拷贝）。
+        qkv = self.qkv(t)
+        q = self._heads(qkv[..., :c])
+        k = self._heads(qkv[..., c:2 * c])
+        v = self._heads(qkv[..., 2 * c:])
         q = self.rope(q, pos)
         k = self.rope(k, pos)
         ctx = _sdpa(q, k, v, dropout_p=self.attn_dropout, scale=self.scale)
         return self.out(ctx.permute(0, 2, 1, 3).reshape(b, n, c))
+
+    # ---- state_dict 兼容：内部 qkv，对外 q/k/v ---------------------------- #
+    def _split_qkv(self, fused):
+        """``(3*dim, dim)`` → 三个 ``(dim, dim)``（view，不拷贝）。"""
+        d = self.dim
+        return fused[:d], fused[d:2 * d], fused[2 * d:3 * d]
+
+    def _state_dict_hook(self, state_dict, prefix, local_metadata):
+        """把 ``prefix+'qkv.weight'`` 展开成三个 ``q/k/v.weight``。
+
+        这是 **state_dict 后置钩子**（pytorch ≥1.13 的
+        ``register_state_dict_post_hook``），只在「对外吐字典」时生效；
+        ``named_parameters()`` 仍返回 ``qkv``（EMA 用，见类文档）。
+        三个切片是 view ⇒ 不额外占内存，但 `.clone()` 是必要的：view 共享
+        同一个 storage，直接写进 state_dict 会让三者别名同一块内存，
+        调用方 `load_state_dict` 进去就会互相污染。
+        """
+        key = prefix + 'qkv.weight'
+        if key not in state_dict:
+            return
+        fused = state_dict.pop(key)
+        for name, part in zip(('q', 'k', 'v'), self._split_qkv(fused)):
+            state_dict[prefix + name + '.weight'] = part.detach().clone()
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        """反向：见到旧的 ``q/k/v`` 三键就拼回 ``qkv`` 再交父类加载。
+
+        这样**旧 checkpoint 无需迁移脚本**即可加载（`--resume` / `--model`）。
+        """
+        d = self.dim
+        parts = [state_dict.get(prefix + n + '.weight') for n in ('q', 'k', 'v')]
+        qkv_key = prefix + 'qkv.weight'
+        if qkv_key not in state_dict and all(p is not None for p in parts):
+            state_dict[qkv_key] = torch.cat([p.detach() for p in parts], dim=0)
+            for n in ('q', 'k', 'v'):
+                state_dict.pop(prefix + n + '.weight', None)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    def _register_compat_hooks(self):
+        # 注意：必须传**普通函数**（闭包），不能传 bound method ——
+        # pytorch 的 `register_state_dict_post_hook` 会对 hook 打
+        # `hook._from_public_api = True` 属性，bound method 不允许设属性，
+        # 会 AttributeError（真机 torch 版本实测）。
+        def _hook(module, state_dict, prefix, local_metadata):
+            self._state_dict_hook(state_dict, prefix, local_metadata)
+
+        self.register_state_dict_post_hook(_hook)
+        return self
 
 
 class SwiGLU(nn.Module):

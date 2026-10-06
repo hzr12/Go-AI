@@ -84,8 +84,14 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 # batch：V7 的 22 通道特征在训练时**不再实时计算**（分片里已预算并位打包），
 #   iterLadders 那 99.8% 的 CPU 开销在 V7 上不存在 ⇒ batch 可比 12 通道大。
 #   预取 worker 是**每 rank** 的：1 卡×24 / 2 卡×12 / 4 卡×6 = 24（实测 CPU 甜点）。
-# scaler-init-scale：代码默认 0.0（=PyTorch 的 65536），大 batch 下必炸 ⇒ 给 1024；
-#   再配 growth-interval 100000 关掉自动增益，防震荡。
+# ⚠ `--scaler-init-scale` / `--scaler-growth-interval` 已从下面命令里删掉，因为
+#   **910B 自动走 BF16，而 BF16 下 `use_scaler=False` —— GradScaler 根本不会被创建**，
+#   这两个参数是死参数（`run.txt` 第 21-24 行记着 2026-10-06 的实测结论）。
+#   ⚠ **但换 910A 就必须加回来**：910A 走 FP16、`use_scaler=True`，此时不给就是
+#   代码默认 0.0 = PyTorch 的 65536，大 batch 下必炸（fp16 未来点平方溢出 65504）。
+#   910A 上给 `--scaler-init-scale 1024 --scaler-growth-interval 100000`
+#   （growth 调大 = 关掉自动增益，防震荡）。
+#   启动日志里 `[启动] amp_dtype=… scaler=…` 那行会直接告诉你走的是哪条 —— 别靠猜。
 # 🔴 `--attention-dropout 0` **必须显式给**（代码默认 0.1）：
 #   0.1 是 12 通道 SE 网的默认值，会经 `train_sft.py` 透传进 V7，覆盖掉
 #   `NBT_TF_CFG['attn_dropout']=0.0`——而 katago_v7.py 明确写「**没有 dropout**」。
@@ -126,7 +132,6 @@ torchrun --nproc_per_node=1 scripts/train_sft.py \
   --batch-size 2800 --epochs 1 --lr 0.00377 --weight-decay 0.0001 \
   --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
   --use-sdpa 1 --attention-dropout 0 \
-  --scaler-init-scale 1024 --scaler-growth-interval 100000 \
   --prefetch-workers 24 --prefetch-depth 16 \
   --log-every 50 --eval-every 500 --save-every 250 \
   --early-stop 1 --early-stop-patience 3 \
@@ -141,7 +146,6 @@ torchrun --nproc_per_node=2 scripts/train_sft.py \
   --batch-size 6000 --epochs 1 --lr 0.00780 --weight-decay 0.0001 \
   --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
   --use-sdpa 1 --attention-dropout 0 \
-  --scaler-init-scale 65536 --scaler-growth-interval 100 \
   --prefetch-workers 4 --prefetch-depth 8 \
   --log-every 25 --eval-every 100 --save-every 25 \
   --early-stop 1 --early-stop-patience 3 \
@@ -167,7 +171,6 @@ torchrun --nproc_per_node=2 scripts/train_sft.py \
   --batch-size 2000 --epochs 30 --lr 0.00537 --weight-decay 0.0001 \
   --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
   --use-sdpa 1 --attention-dropout 0 \
-  --scaler-init-scale 1024 --scaler-growth-interval 100000 \
   --prefetch-workers 6 --prefetch-depth 16 \
   --log-every 25 --eval-every 100 --eval-max-batches 5 --save-every 250 \
   --early-stop 1 --early-stop-patience 3 \
@@ -181,7 +184,6 @@ torchrun --nproc_per_node=1 scripts/train_sft.py \
   --batch-size 2800 --epochs 1 --lr 0.00377 --weight-decay 0.0001 \
   --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
   --use-sdpa 1 --attention-dropout 0 \
-  --scaler-init-scale 1024 --scaler-growth-interval 100000 \
   --prefetch-workers 24 --prefetch-depth 16 \
   --log-every 50 --eval-every 500 --save-every 250 \
   --early-stop 1 --early-stop-patience 3 \
@@ -195,7 +197,6 @@ torchrun --nproc_per_node=2 scripts/train_sft.py \
   --batch-size 2800 --epochs 1 --lr 0.00533 --weight-decay 0.0001 \
   --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
   --use-sdpa 1 --attention-dropout 0 \
-  --scaler-init-scale 1024 --scaler-growth-interval 100000 \
   --prefetch-workers 12 --prefetch-depth 16 \
   --log-every 50 --eval-every 500 --save-every 250 \
   --early-stop 1 --early-stop-patience 3 \
@@ -209,7 +210,6 @@ torchrun --nproc_per_node=4 scripts/train_sft.py \
   --batch-size 1000 --epochs 1 --lr 0.00637 --weight-decay 0.0001 \
   --gradient-accumulation-steps 2 --use-amp 1 --use-ema 1 \
   --use-sdpa 1 --attention-dropout 0 \
-  --scaler-init-scale 1024 --scaler-growth-interval 100000 \
   --prefetch-workers 6 --prefetch-depth 16 \
   --log-every 50 --eval-every 500 --save-every 250 \
   --early-stop 1 --early-stop-patience 3 \

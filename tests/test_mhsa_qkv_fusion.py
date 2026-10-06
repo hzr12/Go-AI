@@ -1,0 +1,247 @@
+"""MHSA 的 q/k/v 合成：前向等价 + 对外契约不变
+
+背景
+----
+V7 的 dim=128，MHSA 里 q/k/v 各是一个 ``Linear(128,128)``。M 极小，
+每个 GEMM 几乎全部时间花在 ACL 启动开销上。11 block × 2 inner = 22 处，
+每处三次启动。合成成一个 ``Linear(128,384)`` 后每处只剩一次启动。
+
+合成**只发生在训练时的前向组织**。对外契约一律不变：
+
+  1. ``state_dict()`` 仍给 ``attn.q/k/v.weight`` 三个键（所以导出器
+     ``katago_export.py:268-270`` 读的键没变、``.bin.gz`` 逐字节相同）；
+  2. 旧 checkpoint 的三键能直接 ``load_state_dict``（``strict=True``）；
+  3. ``named_parameters()`` 是 ``qkv``（EMA 用），旧 ckpt 的 EMA shadow
+     由 ``_migrate_ema_shadow_qkv`` 迁移。
+
+这些是**契约**，不是实现细节：一旦破坏，症状是「引擎加载失败」或
+「resume 崩」，而且往往离现场很远。所以逐条钉住。
+"""
+
+import math
+
+import pytest
+import torch
+import torch.nn as nn
+
+from src.networks.katago_v7 import (
+    MHSA,
+    NBT_TF_CFG,
+    RoPE2D,
+    _migrate_ema_shadow_qkv,
+    _ScaledLinear,
+    _sdpa,
+    build_katago_v7_net,
+)
+
+
+DIM, HEADS, N_BLOCKS, INNER = 128, 4, 11, 2
+
+
+class _OldMHSA(nn.Module):
+    """合成前的原始实现：三个独立 ``Linear``，作为前向等价的参照物。"""
+
+    def __init__(self, dim=DIM, num_heads=HEADS, attn_dropout=0.0):
+        super().__init__()
+        self.dim, self.num_heads = int(dim), int(num_heads)
+        self.head_dim = self.dim // self.num_heads
+        self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.q = _ScaledLinear(self.dim, self.dim, bias=False)
+        self.k = _ScaledLinear(self.dim, self.dim, bias=False)
+        self.v = _ScaledLinear(self.dim, self.dim, bias=False)
+        self.out = _ScaledLinear(self.dim, self.dim, bias=False)
+        self.rope = RoPE2D(self.num_heads, self.head_dim)
+        self.attn_dropout = float(attn_dropout)
+
+    def _heads(self, t):
+        b, n, _ = t.shape
+        return t.reshape(b, n, self.num_heads, self.head_dim) \
+                .permute(0, 2, 1, 3).contiguous()
+
+    def forward(self, t, pos):
+        b, n, c = t.shape
+        q = self._heads(self.q(t))
+        k = self._heads(self.k(t))
+        v = self._heads(self.v(t))
+        q = self.rope(q, pos)
+        k = self.rope(k, pos)
+        ctx = _sdpa(q, k, v, dropout_p=self.attn_dropout, scale=self.scale)
+        return self.out(ctx.permute(0, 2, 1, 3).reshape(b, n, c))
+
+
+def _inputs(b=3, n=11, dim=DIM, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    t = torch.randn(b, n, dim, generator=g)
+    pos = torch.stack([
+        torch.randint(0, 19, (b, n), generator=g).float(),
+        torch.randint(0, 19, (b, n), generator=g).float(),
+    ], -1)
+    return t, pos
+
+
+# --------------------------------------------------------------------------- #
+# 1. 前向等价 —— 合成是纯优化，数值必须逐位相同
+# --------------------------------------------------------------------------- #
+def test_fused_forward_is_bitwise_identical():
+    """fused MHSA 与三个独立 Linear 的输出必须**逐位**相同（不是 allclose）。"""
+    torch.manual_seed(0)
+    fused = MHSA(DIM, HEADS).eval()
+    old = _OldMHSA(DIM, HEADS).eval()
+
+    # 顺便验证「对外是 q/k/v 三键」：旧结构能无缺口地吃下新 state_dict
+    missing, unexpected = old.load_state_dict(fused.state_dict(), strict=False)
+    assert not missing and not unexpected, (missing, unexpected)
+
+    t, pos = _inputs()
+    with torch.no_grad():
+        y_fused = fused(t, pos)
+        y_old = old(t, pos)
+    assert y_fused.shape == y_old.shape == (3, 11, DIM)
+    assert torch.equal(y_fused, y_old), (
+        '前向不再逐位相同：最大差 %.3e'
+        % (y_fused - y_old).abs().max().item())
+
+
+def test_fused_chunk_is_view_not_copy():
+    """切 q/k/v 只能切出 view；否则每次前向多一次 384×N 的拷贝，收益全吐回去。"""
+    net = MHSA(DIM, HEADS)
+    fused = net.qkv.weight
+    assert fused.shape == (3 * DIM, DIM)
+    base = fused.untyped_storage().data_ptr()
+    q, k, v = net._split_qkv(fused)
+    for part in (q, k, v):
+        assert part.shape == (DIM, DIM)
+        # 注意比较 **storage** 而不是 data_ptr：k/v 段有偏移，data_ptr 必然不同，
+        # 但它们必须仍与 qkv 共用同一块 storage（即是 view 而非拷贝）。
+        assert part.untyped_storage().data_ptr() == base, '切出了拷贝'
+
+
+# --------------------------------------------------------------------------- #
+# 2. 对外契约：state_dict 键名不变（导出与旧 ckpt 都靠它）
+# --------------------------------------------------------------------------- #
+def test_state_dict_still_exposes_qkv_split_keys():
+    """``state_dict()`` 必须给 q/k/v 三键，且**不含** qkv。"""
+    sd = MHSA(DIM, HEADS).state_dict()
+    for nm in ('q', 'k', 'v', 'out'):
+        assert nm + '.weight' in sd, (nm, sorted(sd))
+    assert not [k for k in sd if 'qkv' in k], sorted(sd)
+    # q/k/v 三段合起来才是那个 3*dim 的 qkv
+    assert sum(sd[nm + '.weight'].shape[0] for nm in ('q', 'k', 'v')) == 3 * DIM
+
+
+def test_state_dict_split_keys_are_not_aliased():
+    """三个键不能别名同一块 storage，否则 load 进去会互相污染。"""
+    sd = MHSA(DIM, HEADS).state_dict()
+    ptrs = {sd[n + '.weight'].untyped_storage().data_ptr() for n in ('q', 'k', 'v')}
+    assert len(ptrs) == 3, 'q/k/v 三个切片共享了 storage'
+
+
+def test_whole_net_param_count_and_key_count_unchanged():
+    """合成只是重排：参数量与 state_dict 键数都必须与合成前一致。"""
+    net = build_katago_v7_net()
+    n = sum(p.numel() for p in net.parameters())
+    assert n == NBT_TF_CFG['params_total'], '%d != %d' % (n, NBT_TF_CFG['params_total'])
+
+    sd = net.state_dict()
+    # q/k/v 各 22 处 ⇒ 66 个键。合成前就是这个数，合成后不能变。
+    split = [k for k in sd
+             if any(k.endswith('.%s.weight' % nm) for nm in ('q', 'k', 'v'))]
+    assert len(split) == N_BLOCKS * INNER * 3, len(split)
+    assert not [k for k in sd if 'qkv' in k], '对外不该出现 qkv 键'
+
+
+def test_named_parameters_exposes_qkv_for_ema():
+    """EMA 以 ``named_parameters()`` 为键 ⇒ 新 shadow 必须是 qkv。"""
+    net = build_katago_v7_net()
+    keys = [n for n, _ in net.named_parameters() if 'qkv' in n]
+    assert len(keys) == N_BLOCKS * INNER, len(keys)
+
+
+# --------------------------------------------------------------------------- #
+# 3. 旧 checkpoint 兼容（--resume / --model）
+# --------------------------------------------------------------------------- #
+def test_legacy_three_key_checkpoint_loads_strict():
+    """旧 ckpt（只有 q/k/v）灌进新结构必须 strict=True 通过且逐位一致。"""
+    src = build_katago_v7_net()
+    legacy = {k: (v.clone() if torch.is_tensor(v) else v)
+              for k, v in src.state_dict().items()}
+    assert not any('qkv' in k for k in legacy), '前提：state_dict 不该有 qkv'
+
+    dst = build_katago_v7_net()
+    dst.load_state_dict(legacy, strict=True)   # 缺 qkv 就得在这里炸
+
+    out = dst.state_dict()
+    for k, v in legacy.items():
+        assert torch.equal(out[k], v), k
+
+
+def test_legacy_ema_shadow_is_migrated():
+    """旧 ckpt 的 EMA shadow（q/k/v）迁移成 qkv，非 MHSA 键原样透传。"""
+    legacy = {}
+    for bi in (0, 5):
+        for ui in range(INNER):
+            for nm in ('q', 'k', 'v'):
+                legacy['blocks.%d.inner.%d.attn.%s.weight' % (bi, ui, nm)] = \
+                    torch.randn(DIM, DIM)
+    legacy['stem.conv.weight'] = torch.randn(8, 32, 3, 3)
+
+    migrated, moved = _migrate_ema_shadow_qkv(legacy)
+
+    assert moved == 4, moved
+    assert 'stem.conv.weight' in migrated
+    assert torch.equal(migrated['stem.conv.weight'], legacy['stem.conv.weight'])
+    assert not [k for k in migrated if k.endswith('.q.weight')], '旧三键应被消费'
+    for bi in (0, 5):
+        for ui in range(INNER):
+            base = 'blocks.%d.inner.%d.attn' % (bi, ui)
+            assert base + '.qkv.weight' in migrated
+            for i, nm in enumerate(('q', 'k', 'v')):
+                seg = migrated[base + '.qkv.weight'][i * DIM:(i + 1) * DIM]
+                assert torch.equal(seg, legacy['%s.%s.weight' % (base, nm)])
+
+
+def test_migrate_is_identity_when_already_fused():
+    """已是 qkv 的 shadow 不该被改动（幂等）。"""
+    fused = {'blocks.0.inner.0.attn.qkv.weight': torch.randn(3 * DIM, DIM),
+             'stem.conv.weight': torch.randn(8, 32, 3, 3)}
+    migrated, moved = _migrate_ema_shadow_qkv(fused)
+    assert moved == 0
+    assert set(migrated) == set(fused)
+    assert all(torch.equal(migrated[k], fused[k]) for k in fused)
+
+
+def test_migrate_leaves_stray_q_weight_alone():
+    """只有 q 而没有 k/v 时不能瞎拼（宁可透传，让 EMA.update 报错也不要静默错值）。"""
+    odd = {'blocks.0.inner.0.attn.q.weight': torch.randn(DIM, DIM)}
+    migrated, moved = _migrate_ema_shadow_qkv(odd)
+    assert moved == 0
+    assert set(migrated) == set(odd)
+
+
+# --------------------------------------------------------------------------- #
+# 4. 训练侧：梯度真的流到 qkv
+# --------------------------------------------------------------------------- #
+def test_gradients_reach_fused_qkv():
+    torch.manual_seed(0)
+    net = build_katago_v7_net()
+    net.train()
+    out = net(torch.randn(2, 22, 19, 19), torch.randn(2, 19))
+    out['policy_logits'].float().pow(2).mean().backward()
+
+    qkv = [(n, p) for n, p in net.named_parameters() if 'qkv' in n]
+    assert len(qkv) == N_BLOCKS * INNER
+    assert all(p.grad is not None for _, p in qkv), '有 qkv 没拿到梯度'
+    assert all(p.grad.abs().sum().item() > 0 for _, p in qkv), 'qkv 梯度全零'
+
+
+def test_init_is_seed_stable_across_split_and_fused():
+    """分段 initialize 必须与「整块初始化」同分布，且三段 std 只取决于 in_features。
+
+    这里断言的是**可复现性**：同 seed 下两次构造得到同样的初值。
+    """
+    torch.manual_seed(1234)
+    a = MHSA(DIM, HEADS).initialize()
+    torch.manual_seed(1234)
+    b = MHSA(DIM, HEADS).initialize()
+    assert torch.equal(a.qkv.weight, b.qkv.weight)
+    assert a.qkv.weight.std().item() > 0

@@ -628,6 +628,7 @@ def build_katago_v7_net(*, board_size=V7_BOARD_SIZE, use_checkpoint=1,
     `build_katago_se_net` 的返回契约一致。
     """
     from src.networks.katago_v7 import build_katago_v7_net as _build
+    from src.networks.katago_v7 import _migrate_ema_shadow_qkv
     kw = {}
     if attn_dropout is not None:
         kw['attn_dropout'] = float(attn_dropout)
@@ -4142,9 +4143,18 @@ def main():
     # ---- 多后端自适应路径（CUDA / NPU / CPU）----
     # 各后端能力差异很大，逐后端决定：
     #   - amp_dtype:       A100/A800/H100(sm_80+) -> bfloat16（原生支持）
-    #                     Ascend 910B/910A -> float16（NPU autocast 仅支持 FP16）
+    #                     Ascend **910B** -> bfloat16（2026-10-06 实测后改；此前这行
+    #                     写的是「910B/910A → float16（NPU autocast 仅支持 FP16）」，
+    #                     那是**过期的**——它与本文件 `[env] 混合精度` 那行的
+    #                     「bf16(910B)/fp16(910A) 可用」自相矛盾，会把人引到
+    #                     错误的精度判断上：以为 910B 也只能 fp16，于是照抄
+    #                     --scaler-init-scale，而这些参数在 BF16 下根本不生效）
+    #                     Ascend **910A** -> float16（无 bf16）
     #                     V100(sm_70, Volta) -> float16（无 bf16）
-    #   - use_scaler:      BF16 下关闭 GradScaler（不下溢）；FP16 下开启
+    #   - use_scaler:      BF16 下关闭 GradScaler（不下溢，且 scaler 根本不会被创建
+    #                     ⇒ --scaler-init-scale / --scaler-growth-interval 是死参数）；
+    #                     FP16 下开启，此时这两个参数**仍然要给**（默认 0.0 = PyTorch
+    #                     的 65536，大 batch 下必炸）
     #   - use_channels_last: A100 卷积走 NHWC 更快；NPU/CPU 收益有限默认关
     #   - sdpa_force_math: 各后端天然默认不同——A100 走 SDPA/FlashAttn（False），
     #                     V100/CPU 强制手写 math（True），NPU 默认放开 CANN 融合 SDPA
@@ -4673,7 +4683,15 @@ def main():
                 torch.set_rng_state(tstate['rng'].cpu())
             # 恢复 EMA shadow 状态
             if ema is not None and 'ema_shadow' in tstate:
-                ema.shadow = tstate['ema_shadow']
+                shadow, moved = _migrate_ema_shadow_qkv(tstate['ema_shadow'])
+                if moved:
+                    # 旧 ckpt 的 shadow 是 attn.q/k/v 三键，MHSA 内部已合成
+                    # qkv（见 katago_v7.MHSA）。不迁移会在这里之后第一次
+                    # EMA.update() 时抛 KeyError —— 那种崩法离现场很远，
+                    # 所以显式记一条。
+                    logger.info("[resume] EMA shadow: %d 处 attn.q/k/v 已合并为 qkv",
+                                moved)
+                ema.shadow = shadow
                 logger.info("[resume] 恢复 EMA shadow 状态")
             elif ema is not None:
                 logger.warning("[resume] 未找到 EMA shadow 状态，EMA 从头开始")
