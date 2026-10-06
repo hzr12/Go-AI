@@ -621,12 +621,32 @@ def test_sft_has_no_bce_branch():
 
 
 def test_log_keys_unchanged():
+    # 2026-10-06：面板瘦身把上报改成「先构造 `_sw = {...}` 再过滤后 log」，
+    # 所以首参是**名字**而不是 dict 字面量 —— 这里把两种形态都解析掉（跟随名字
+    # 找到它那个赋值节点的 dict）。判据本身不变：损失相关的键仍是那四个。
+    _main_fn = _fn('main')
+    # 只收「值是 dict 字面量」的赋值：`_sw` 后面还有一次过滤用的推导式赋值，
+    # 无条件收录会把字面量顶掉。
+    _assigned = {t.targets[0].id: t.value for t in ast.walk(_main_fn)
+                 if isinstance(t, ast.Assign) and len(t.targets) == 1
+                 and isinstance(t.targets[0], ast.Name)
+                 and isinstance(t.value, ast.Dict)}
+
+    def _dict_of(node):
+        if isinstance(node, ast.Dict):
+            return node
+        if isinstance(node, ast.Name) and isinstance(_assigned.get(node.id), ast.Dict):
+            return _assigned[node.id]
+        return None
+
     log_dicts = []
-    for call in ast.walk(_fn('main')):
+    for call in ast.walk(_main_fn):
         if (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
-                and call.func.attr == 'log' and call.args
-                and isinstance(call.args[0], ast.Dict)):
-            keys = [k.value for k in call.args[0].keys
+                and call.func.attr == 'log' and call.args):
+            d = _dict_of(call.args[0])
+            if d is None:
+                continue
+            keys = [k.value for k in d.keys
                     if isinstance(k, ast.Constant) and isinstance(k.value, str)]
             if 'policy_loss' in keys:
                 log_dicts.append(keys)
@@ -1522,6 +1542,19 @@ def test_no_new_cli_params():
         # CANN 融合 SDPA（更省算力、fp32 累加更稳），0 强制所有后端回退手写 math。
         # 与 D1 门禁哲学一致：登记是把"为什么有这个旗"钉死，后续改名/删除仍会在此报警。
         '--use-sdpa',
+        # ---- 2026-10-06 新增的 5 个：环境变量 GOAI_* 全部搬成 CLI（D1 的「配置
+        #   级旋钮不许藏在环境变量里」在别处已被 --use-checkpoint 归档过一次）----
+        #   动机：`--use-checkpoint` 当年因「开关只藏在 config 表里、没有干净入口」
+        #   被归档；`GOAI_SDPA`/`GOAI_NPU_SWIGLU`/`GOAI_FLASH`/`GOAI_ATTN_*`/
+        #   `GOAI_CHANNELS_LAST_NPU` 走的是同一个毛病（config 面板与 `--help` 里
+        #   **看不见**，只能靠「记得设过」）。现在全部有 CLI 入口 + 冻结集登记。
+        #   （`GOAI_PROFILE` 刻意留在环境变量：它是诊断开关，语义是「从第 N 步开始
+        #   抓 50 步 kernel 表」，与训练配置无关。）
+        '--npu-swiglu',           # NPU 融合 SwiGLU 总闸（原 GOAI_NPU_SWIGLU）
+        '--npu-sfa',              # NPU 融合注意力 SFA/PFA（原 GOAI_NPU_SFA）
+        '--npu-channels-last',    # NPU 卷积 NHWC 布局（原 GOAI_CHANNELS_LAST_NPU）
+        '--attn-query-chunk',     # math 注意力 query 分块（原 GOAI_ATTN_QUERY_CHUNK）
+        '--attn-chunk-ckpt',      # math 注意力逐 chunk 检查点（原 GOAI_ATTN_CHUNK_CKPT）
     }
     got = set(kw)
     assert got == expected, (
@@ -1533,10 +1566,11 @@ def test_no_new_cli_params():
            f'{[k for k in kw if k in expected]}' if got == expected else ''))
     # 基线 = 61 原始 + A4 的 4 个软标签 + B8 的 `--v7` + 2026-10-04 的 `--games-npz`
     #        + online-softmax 开关 `--attn-online`（补登）+ 2026-10-06 的 `--use-sdpa`
-    assert len(expected) == 69, (
-        f'冻结的基线本身变了：{len(expected)} != 69'
+    #        + 2026-10-06 的 5 个 GOAI_* 环境变量搬家旗
+    assert len(expected) == 74, (
+        f'冻结的基线本身变了：{len(expected)} != 74'
         f'（61 + A4 的 4 个 + B8 的 1 个 + --games-npz 的 1 个 + --attn-online 的 1 个'
-        f' + --use-sdpa 的 1 个）')
+        f' + --use-sdpa 的 1 个 + GOAI_* 搬家的 5 个）')
     # 特别地：L2 系数不许有独立参数，label smoothing 也不许有第二个旋钮
     for banned in ('--l2-coef', '--l2-weight', '--weight-decay-l2',
                    '--l2-report', '--label-smoothing-ce'):

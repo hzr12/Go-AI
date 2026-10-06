@@ -1796,7 +1796,7 @@ _SWANLAB_V7_WEIGHTS = v7_stage1_loss_weights()
 
 def evaluate_metrics_v7(model, dataset, idxs, bs, device, amp_dtype, *,
                         max_batches=50, action_size=V7_ACTION_SIZE,
-                        prefetcher=None):
+                        prefetcher=None, use_channels_last=False):
     """V7 路径的验证集综合指标（与 :func:`evaluate_metrics` **返回同构**）。
 
     为什么必须另写一份
@@ -1868,6 +1868,8 @@ def evaluate_metrics_v7(model, dataset, idxs, bs, device, amp_dtype, *,
     for sp_np, gl_np, moves, lbl in _iter_batches():
         batches += 1
         sp = v7_to_device(sp_np, device, amp_dtype)
+        if use_channels_last:      # 与训练侧同一布局（见训练循环里的同名注释）
+            sp = sp.to(memory_format=torch.channels_last)
         gl = v7_to_device(gl_np, device, torch.float32)
         with torch.no_grad():
             out = model(sp, gl)
@@ -2704,8 +2706,7 @@ def _init_swanlab(args, logger):
                 # 它直接决定注意力走融合内核还是手写 math，是 NPU 上最关键的
                 # 显存/速度/数值口径之一。
                 "use_sdpa": int(args.use_sdpa),
-                "attn_query_chunk": int(
-                    os.environ.get('GOAI_ATTN_QUERY_CHUNK', '64') or 0),
+                "attn_query_chunk": int(args.attn_query_chunk or 0),
                 # ---- 数据/运行 ----
                 "data": args.data,
                 "board_size": args.board_size,
@@ -3575,6 +3576,30 @@ def main():
                     help='注意力计算模式: global=全配对, window=块状窗口, '
                          'sparse=窗口+全局token, window_global=块状窗口+全局token(手写math)')
     ap.add_argument('--attn-window', type=int, default=7, help='window 模式窗口边长')
+    # ---- NPU 融合算子与内存布局（2026-10-06 从环境变量搬成 CLI）----------------
+    # 四个开关都是「出问题时的总闸」：置 0 只慢不坏（数值口径不变），所以默认值
+    # 都是「开」，而**布局类默认关**（要实测收益才开，见 run.txt 的 A/B 段）。
+    ap.add_argument('--npu-swiglu', type=int, default=1, choices=[0, 1],
+                    help='NPU 融合 SwiGLU（torch_npu.npu_swiglu）：0=强制走标准'
+                         '路径（F.silu(up)*gate 再 down，数值不变、只慢不坏）。'
+                         '诊断「融合路径是否坏」的总闸（0=关闭，1=开启，默认开启）')
+    ap.add_argument('--npu-sfa', type=int, default=1, choices=[0, 1],
+                    help='NPU 融合注意力 SFA/PFA（torch_npu.npu_fusion_attention，'
+                         '优先于内置 SDPA）：带能力探针 + 与 SDPA 的数值自检 + '
+                         '运行期回退；dropout>0 时自动不启用（0=关闭，1=开启）')
+    ap.add_argument('--npu-channels-last', type=int, default=0, choices=[0, 1],
+                    help='NPU 上卷积走 NHWC(channels_last) 布局：CANN 卷积 kernel '
+                         '偏 NHWC，V7 主干是卷积主导（约 85%% MAC）时可能提速。'
+                         '**默认 0**（未实测收益，显存会略涨）；A/B 见 run.txt'
+                         '（0=关闭=当前已验证配置，1=开启）')
+    ap.add_argument('--attn-query-chunk', type=int, default=64,
+                    help='手写 math 注意力按 query 分块的长度（0=关闭）：softmax 沿 '
+                         'key 轴 ⇒ 分块数学精确，峰值 ∝ chunk。只影响 math 路径，'
+                         'SDPA/SFA 融合路径自行管理显存（默认 64，0=关闭）')
+    ap.add_argument('--attn-chunk-ckpt', type=int, default=1, choices=[0, 1],
+                    help='math 路径逐 chunk 梯度检查点：把注意力矩阵变成反向时一块块'
+                         '重算（不依赖 block 级 checkpoint 是否生效）。'
+                         '0=关闭，1=开启（默认开启）')
     ap.add_argument('--attn-online', type=int, default=0, choices=[0, 1],
                     help='手写 math 注意力改用 online-softmax（flash 风格）实现：'
                          '不物化 (Nq,Nk) 分数矩阵 ⇒ 反向不保留它（省显存），'
@@ -3771,7 +3796,7 @@ def main():
                     help='flash-attn 独立库开关：A100(Ampere+) 上优先于内置 SDPA（最快，需 '
                          'pip install flash-attn），加载失败自动回退内置 SDPA。'
                          '1=自动优先（默认：A100 优先 flash-attn，其他后端不用）；'
-                         '0=强制禁用（A100 也走内置 SDPA）。可被环境变量 GOAI_FLASH=0 覆盖禁用')
+                         '0=强制禁用（A100 也走内置 SDPA）。原环境变量副本 GOAI_FLASH 已于 2026-10-06 删除')
     ap.add_argument('--arch', default='resnet',
                     choices=['resnet', 'convnext'],
                     help='网络架构风格: resnet=传统 ResBlock (默认，兼容旧权重) | convnext=ConvNeXt 风格 (5x5 深度卷积 + LayerNorm + GELU)')
@@ -4164,7 +4189,7 @@ def main():
             logger.info("[device] %s (sm_%d%d) | 启用 A100 路径: BF16 + FlashAttn(优先,回退SDPA) + "
                         "channels_last + compile(卷积/线性/FFN)", gpu_name, *compute_cap)
             # flash-attn 的实际加载/回退统一在下方「flash-attn 独立库启用决策」块处理
-            # （A100 默认优先尝试，--flash-attn 0 / GOAI_FLASH=0 才禁用），此处不再重复。
+            # （A100 默认优先尝试，--flash-attn 0 才禁用），此处不再重复。
         else:
             # V100 等老卡：保守路径（与原行为一致）
             amp_dtype = torch.float16
@@ -4199,7 +4224,11 @@ def main():
             use_scaler = False
             logger.info("[device] %s (NPU/CANN) | BF16 路径: 无 GradScaler + "
                         "CANN SDPA 融合注意力 + 禁用 torch.compile(inductor)", gpu_name)
-        use_channels_last = True
+        # NPU 的 NHWC 卷积布局：CLI `--npu-channels-last`（默认 0）。此前这里硬编码
+        # True，但 V7 路径压根没有 channels_last 接线（权重转换被 `_backend == 'cuda'`
+        # 门死、V7 输入走 `v7_to_device` 不转格式）⇒ 它对 V7 是 no-op，只是让 12
+        # 通路的输入/权重布局不一致。接线补齐后改成显式 A/B。
+        use_channels_last = (args.npu_channels_last == 1)
         compile_disable_sparse = True
         # 注意力后端自动判断（仅 NPU 分支用，但变量供下方日志/backbone 统一取用）：
         #   - 默认放开 SDPA（CANN 融合，省算力且更稳）；
@@ -4268,15 +4297,19 @@ def main():
     # softmax 沿 key 轴 ⇒ 按 query 切块**数学精确**，峰值 ∝ chunk（默认 64 ⇒ 5.6×）。
     # 只加在 math 分支；SDPA/flash 融合路径自行管理显存，不受影响（NPU 默认已放开
     # 走 CANN SDPA，故该分块在 NPU 上通常不再生效，见上方日志提示）。
-    _attn_chunk = int(os.environ.get('GOAI_ATTN_QUERY_CHUNK', '64') or 0)
+    # （2026-10-06：三个融合/分块开关的环境变量已全部换成 CLI 参数）
+    _attn_chunk = int(args.attn_query_chunk or 0)
     _backbone.set_attn_query_chunk(_attn_chunk)
     # 逐 chunk 梯度检查点（2026-10-04 新增）：分块只降瞬时峰值，**不降保留量** ——
     # 每块的 softmax 输出都被 autograd 存着等反向。逐块 checkpoint 把占大头的
     # 注意力矩阵变成「反向时一块一块重算」，**不依赖 block 级 checkpoint 是否生效**
     # （实测云端 910A 上 64 GB ≈ 无 checkpoint 的估算值）。
-    # 默认开；GOAI_ATTN_CHUNK_CKPT=0 关闭。
-    _chunk_ckpt = os.environ.get('GOAI_ATTN_CHUNK_CKPT', '1') != '0'
-    _backbone.set_attn_chunk_checkpoint(int(_chunk_ckpt))
+    # 默认开；`--attn-chunk-ckpt 0` 关闭。
+    _backbone.set_attn_chunk_checkpoint(int(args.attn_chunk_ckpt))
+    # NPU 融合算子总闸（置 0 只慢不坏，数值口径不变）。
+    _backbone.set_npu_fusion_attention(args.npu_sfa == 1)
+    from src.networks import katago_v7 as _v7mod
+    _v7mod.set_npu_swiglu(args.npu_swiglu == 1)
 
     # online-softmax 注意力（flash 风格）：由 `--attn-online` 控制（默认关）。
     # 与 materialize 路径**数值等价但非逐位相同**（实测 fp32 max|Δ|≈7e-07），
@@ -4295,10 +4328,9 @@ def main():
 
     # flash-attn 独立库启用决策（A100 优先）：仅「Ampere+ CUDA 且走非 math 路径」时
     # 优先尝试加载 flash-attn，加载成功则 _sdpa 优先走 flash-attn 内核，失败回退内置 SDPA。
-    # 控制优先级：--flash-attn 0 显式禁用 > GOAI_FLASH=0 显式禁用 > 默认（A100 优先尝试）。
-    # GOAI_FLASH=0 用于 A/B 实测（稀疏注意力分块 seq 仅 ~30，flash 小 kernel 密集发射在
-    # 部分配置下比手写 math 更慢，需实测决定）。
-    _flash_disabled = (args.flash_attn == 0) or (os.environ.get('GOAI_FLASH', '1') == '0')
+    # 开关就是 `--flash-attn`（1=A100 优先尝试，默认；0=禁用）——2026-10-06 起不再有
+    # 环境变量副本（GOAI_FLASH 已删，CLI 完全覆盖它的语义）。
+    _flash_disabled = (args.flash_attn == 0)
     if (not _flash_disabled) and _backend == 'cuda' and compute_cap >= (8, 0) and not sdpa_force_math:
         fa_ok, fa_msg = _backbone.set_flash_attn(True)
         if fa_ok:
@@ -4309,7 +4341,7 @@ def main():
         _backbone.set_flash_attn(False)
         if _flash_disabled:
             logger.info("[env] 注意力内核: 内置 SDPA / 手写 math"
-                        "（flash-attn 已被 --flash-attn 0 或 GOAI_FLASH=0 禁用）")
+                        "（flash-attn 已被 --flash-attn 0 禁用）")
         else:
             logger.info("[env] 注意力内核: %s",
                         ("手写 math（%s 不支持 Flash）" % _backend.upper())
@@ -4481,11 +4513,14 @@ def main():
     logger.info("[model] GC 逐段开关=%s | 生效还需 training 态+grad enabled"
                 "（eval/推理恒不检查点，零开销）", _gc_kinds or 'n/a')
 
-    # A100 上把卷积型特征（N,C,H,W）转 channels_last(NHWC)，卷积算子走更快内存布局。
-    # 输入 state 也需同步转格式（见训练/评估循环），故这里仅转换模型权重布局。
-    if use_channels_last and _backend == 'cuda':
+    # 把卷积型特征（N,C,H,W）转 channels_last(NHWC)，卷积算子走更快内存布局。
+    # 输入也需同步转格式（见训练/评估循环），故这里仅转换模型权重布局。
+    # 门槛 2026-10-06 放开：NPU 上由 CLI `--npu-channels-last 1` 驱动（V7 的卷积
+    # 权重是 4D，同样可转），此前只有 cuda 能进 ⇒ NPU 上这个 flag 形同虚设。
+    if use_channels_last and _backend in ('cuda', 'npu'):
         model = model.to(memory_format=torch.channels_last)  # type: ignore[call-overload]
-        logger.info("[model] 已启用 channels_last (NHWC) 内存格式（A100 卷积加速）")
+        logger.info("[model] 已启用 channels_last (NHWC) | backend=%s v7=%s",
+                    _backend, _v7_on)
 
     # 参数组：value head 独立 LR（参数量小，需要更高学习率补偿梯度不足）
     # 排除 bias / BatchNorm / LayerNorm 参数的 weight decay（标准做法）
@@ -4968,12 +5003,29 @@ def main():
                     model.require_backward_grad_sync = _is_last
                 if _prof_at > 0 and step == _prof_at and _prof_ctx is None:
                     try:
-                        from torch.profiler import (profile, ProfilerActivity)
-                        _prof_ctx = profile(
-                            activities=[ProfilerActivity.CPU,
-                                        ProfilerActivity.CUDA])
+                        # 活动集**按后端选**（2026-10-06 真机两次修正）：
+                        #   · NPU 上用 `torch.profiler` 的 CUDA 活动会得到
+                        #     「CUDA is not available, disabling CUDA profiling」
+                        #     且**采不到任何 NPU kernel**；
+                        #   · `torch.profiler.ProfilerActivity.NPU` 在
+                        #     torch 2.1 + torch_npu 2.1 上**不存在**
+                        #     （AttributeError: … has no attribute 'NPU'）——
+                        #     NPU 的入口是 **`torch_npu.profiler`**（自带
+                        #     `profile` / `ProfilerActivity.NPU` 与
+                        #     `self_npu_time_total` 计时键）。
+                        if _backend == 'npu':
+                            import torch_npu
+                            import torch_npu.profiler as _tnpu_prof
+                            _acts = [_tnpu_prof.ProfilerActivity.CPU,
+                                     _tnpu_prof.ProfilerActivity.NPU]
+                            _prof_ctx = _tnpu_prof.profile(activities=_acts)
+                        else:
+                            from torch.profiler import (profile, ProfilerActivity)
+                            _acts = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+                            _prof_ctx = profile(activities=_acts)
                         _prof_ctx.__enter__()
-                        logger.info("[profile] 已开始内核剖析（50 steps）...")
+                        logger.info("[profile] 已开始内核剖析（50 steps）| activities=%s",
+                                    [str(a) for a in _acts])
                     except Exception as pe:  # noqa: BLE001
                         logger.warning("[profile] 不可用: %s", pe)
                         _prof_at = 0
@@ -4995,6 +5047,10 @@ def main():
                     _in32 = (amp_dtype == torch.float32)
                     state = v7_to_device(_sp_np, device, amp_dtype,
                                          pin=(_backend == 'cuda'))
+                    # NHWC（2026-10-06）：与模型权重的 channels_last 对齐，否则
+                    # 卷积拿到 channels_last 权重 + NCHW 输入，每次卷积都白搬一次。
+                    if use_channels_last:
+                        state = state.to(memory_format=torch.channels_last)
                     gl = v7_to_device(_gl_np, device, amp_dtype,
                                       pin=(_backend == 'cuda'))
                     move_t = torch.from_numpy(
@@ -5699,10 +5755,20 @@ def main():
                 if _prof_ctx is not None and step >= _prof_at + 50:
                     _prof_ctx.__exit__(None, None, None)
                     try:
-                        table = _prof_ctx.key_averages().table(
-                            sort_by='cuda_time_total', row_limit=18)
-                        logger.info("[profile] 内核耗时 top-18（CUDA 时间排序）:\n%s",
-                                    table)
+                        # 排序键按后端选：NPU 的活动键是 `self_npu_time_total`，
+                        # 用 CUDA 的键会 KeyError 并被下面 except 吞成一行 warning
+                        # ⇒「profile 跑过了但没有表」（2026-10-06 真机）。
+                        _sort_key = ('self_npu_time_total' if _backend == 'npu'
+                                     else 'self_cuda_time_total')
+                        _ka = _prof_ctx.key_averages()
+                        try:
+                            table = _ka.table(sort_by=_sort_key, row_limit=18)
+                        except KeyError:
+                            # 键名随 torch_npu 版本变：退一步用无排序的表，
+                            # 至少能看到有哪些 kernel 与它们的事件数。
+                            table = _ka.table(row_limit=18)
+                        logger.info("[profile] 内核耗时 top-18（按 %s 排序）:\n%s",
+                                    _sort_key, table)
                     except Exception as e:
                         logger.warning("[profile] 打印内核耗时表失败: %s", e)
 
@@ -5735,7 +5801,8 @@ def main():
                 if _v7_on:
                     metrics = evaluate_metrics_v7(
                         model, dataset, eval_idx, bs, device, amp_dtype,
-                        max_batches=args.eval_max_batches, prefetcher=eval_pf)
+                        max_batches=args.eval_max_batches, prefetcher=eval_pf,
+                        use_channels_last=use_channels_last)
                 else:
                     metrics = evaluate_metrics(
                         model, dataset, eval_idx, bs, device, amp_dtype,
@@ -5876,7 +5943,8 @@ def main():
         if _v7_on:
             final_metrics = evaluate_metrics_v7(
                 model, dataset, eval_idx, bs, device, amp_dtype,
-                max_batches=args.eval_max_batches, prefetcher=eval_pf)
+                max_batches=args.eval_max_batches, prefetcher=eval_pf,
+                use_channels_last=use_channels_last)
         else:
             final_metrics = evaluate_metrics(
                 model, dataset, eval_idx, bs, device, amp_dtype,

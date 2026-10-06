@@ -125,9 +125,19 @@ A→B→C 的 `load_state_dict` 承接（strict 零缺失）。
 ### 2.4 训练层
 
 - **段 A/B/C SFT**：`scripts/train_sft.py --v7 1`，三段同一个 22 通道模型、
-  `--model` 逐段承接（DDP + HCCL + fp16/GradScaler）。
+  `--model` 逐段承接（DDP + HCCL + BF16；910B 才走 fp16+GradScaler）。
   ⚠️ shell/ 里的 `train_sft_npu_4card_katago_se.sh` 是**不带 `--v7`** 的 12 通道
   旧入口，别拿它跑 V7 链；`run.txt` 里给的是直连 `torchrun` 命令。
+- **⚙️ 调优开关一律是 CLI 参数，没有环境变量**（2026-08 起陆续登记；`GOAI_PROFILE`
+  是唯一例外——它是诊断开关，语义是「从第 N 步抓 50 步 kernel 表」，与训练配置无关）：
+  - `--use-sdpa 0/1`（默认 1）：NPU 注意力走 CANN 融合 SDPA；0 = 全后端手写 math。
+  - `--npu-sfa 0/1`（默认 1）：NPU 融合注意力 SFA/PFA，**优先于** SDPA；带能力探针
+    + 与 SDPA 的数值自检 + 运行期回退，dropout>0 时自动不启用。
+  - `--npu-swiglu 0/1`（默认 1）：NPU 融合 SwiGLU；0 = 退回 `F.silu(up)*gate`。
+  - `--npu-channels-last 0/1`（**默认 0**）：NPU 卷积走 NHWC；未实测收益，开了要盯显存。
+  - `--attn-query-chunk 0|64`（默认 64）/ `--attn-chunk-ckpt 0/1`（默认 1）：手写
+    math 注意力的分块与逐块检查点（只影响 math 路径，SDPA/SFA 融合路径不生效）。
+  这五个都是**只慢不坏**的总闸（数值口径不变），出问题置 0 即回到已验证配置。
 - **V7 tracer bullet**：`scripts/smoke_train_v7.py` —— 302 行 / batch 8 / 40 步，
   直接吃 stdata，用来回答「12 项 loss 每项到底降不降」。
 

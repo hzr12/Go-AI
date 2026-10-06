@@ -61,13 +61,21 @@ from src.networks.backbone import (
 # （F.silu(up(x)) * gate(x) 再 down），数值行为完全不变。
 try:
     import torch_npu  # 仅在 NPU 环境可导入
-    # 紧急总闸（调试用）：GOAI_NPU_SWIGLU=0 强制走标准路径。2026-10-06 融合首次
-    # 真跑后真机出现前向 NaN（futurepos 单项），需要能不回滚代码地单独二分它。
-    _HAS_NPU_SWIGLU = (hasattr(torch_npu, 'npu_swiglu')
-                       and os.environ.get('GOAI_NPU_SWIGLU', '1') != '0')
+    _HAS_NPU_SWIGLU = hasattr(torch_npu, 'npu_swiglu')
 except Exception:
     torch_npu = None
     _HAS_NPU_SWIGLU = False
+
+
+def set_npu_swiglu(enabled: bool) -> None:
+    """NPU 融合 SwiGLU 开关（对应 CLI ``--npu-swiglu``，2026-10-06 从环境变量搬来）。
+
+    `False` = 强制走标准路径（`F.silu(up(x)) * gate(x)` 再 down），数值不变、
+    只慢不坏。是「融合路径是不是坏的」这个问题的总闸（2026-10-06 融合首次真跑后
+    真机出现过前向 NaN，需要能单独二分它）。
+    """
+    global _HAS_NPU_SWIGLU
+    _HAS_NPU_SWIGLU = bool(enabled) and torch_npu is not None
 
 #: 融合可用性（运行时会被自检/调用异常降级为 False）。模块级 ⇒ **失败只告警一次**
 #: —— 原实现每个 SwiGLU 每 step 都 warning 一条（V7 主干 6 处 × 每 step），真机日志

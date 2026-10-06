@@ -95,6 +95,15 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 #   （B>60000 自动回退 math），旧 CANN / 缺 SDPA API 时也自动回退。0 = 强制全走 math。
 # ⚠ `--attn-online` **默认不给**：online-softmax 注意力数值等价但**非逐位相同**
 #   （fp32 max|Δ|≈7e-07），开了会让 12 通道 bit-identical 基线失效；真机加速比未实测。
+# ⚙️ **调优开关一律是 CLI 参数，没有环境变量**（2026-10-06 全部搬完；`GOAI_PROFILE`
+#   是唯一例外——诊断开关，语义是「从第 N 步抓 50 步 kernel 表」）。五个总闸都是
+#   **只慢不坏**（数值口径不变），出问题置 0 即回到已验证配置：
+#     --use-sdpa 1|0        NPU 注意力走 CANN 融合 SDPA（默认 1）
+#     --npu-sfa 1|0         融合注意力 SFA/PFA，优先于 SDPA（默认 1；探针+自检+回退）
+#     --npu-swiglu 1|0      融合 SwiGLU（默认 1）
+#     --npu-channels-last   NPU 卷积 NHWC（**默认 0**，未实测收益，开了要盯显存）
+#     --attn-query-chunk N  math 注意力 query 分块（默认 64；只影响 math 路径）
+#     --attn-chunk-ckpt 1|0 math 注意力逐块检查点（默认 1）
 # ⚠ `--use-checkpoint` 已归档：由 `KATAGO_SE_CFG['grad_checkpoint']` 决定，唯一关闭
 #   路径是 `--compile 1`（而 NPU 上 --compile 无效）。别传它。
 # ✅ eval 特征预取池（2026-10-06）：eval 的梯子特征曾是主进程串行计算，10 万行磨
@@ -361,7 +370,7 @@ python -m pytest tests -q -n0 -p no:randomly --durations=10   # 找最慢 10 个
 # soft_index 行数不符  ⇐ 数据集/labels 变过后没重建索引（启动即 SystemExit，按提示重建）
 #                       重建后自检：argmax 落占点比例应 ≈0、top1 vs 人类 ≈0.59
 # fp16 前向 NaN       ⇐ 910A 走 fp16 时 CANN 融合内核处 65504 溢出 ⇒ 用 BF16 路径
-# SwiGLU 融合刷警告   ⇐ 紧急开关 GOAI_NPU_SWIGLU=0 可退标准路径（默认融合）
+# SwiGLU 融合刷警告   ⇐ 紧急开关 `--npu-swiglu 0` 退标准路径（默认融合）
 # eval 慢/NPU 归零    ⇐ 已池化（eval 预取池）；仍慢就减 --eval-max-batches
 # 全局特征异常 = 32.5  ⇐ foxpro 无 KM[650] 处（100 局里 1.62%），需加 --no-komi-outlier-fix
 # ImportError: scipy   ⇐ requirements.txt 漏了

@@ -1,5 +1,7 @@
 import contextlib
+import logging as _logging_mod
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -633,6 +635,124 @@ class GradCheckpointMixin:
 # 手写 math——这些分块调用的 seq 仅 ~50（49 窗口 + 全局 token），math 成本可忽略。
 _FLASH_BATCH_LIMIT = 60000  # ws=7, B=4800 -> B*nW=43200 < 60000
 
+# --------------------------------------------------------------------------- #
+# NPU 融合注意力（SFA / PFA）：可选加速，**优先于内置 SDPA**，带三重回退
+# --------------------------------------------------------------------------- #
+# 动机：CANN 的 `npu_fusion_attention`（SFA/PFA）是与 `npu_swiglu` 同源的融合
+# kernel，理论收益在 fp32 累加（数值更稳）与更省 workspace。
+#
+# 为什么必须有探针：**`npu_fusion_attention` 的签名随 torch_npu 版本变**（2.1 的
+# `dim_head` 参数、`return_lse`、还有 v2 版本），写死任何一种都会在另一种上直接
+# TypeError ⇒ 整训崩。所以：能力探针**逐个候选实跑**，选中第一个不抛的；再用
+# 第一次真实调用的 (q,k,v) 与内置 SDPA 做**数值自检**（fp16/bf16 融合 kernel 与
+# SDPA 只允许容差内一致，不要求逐位），自检不过就永久回退内置 SDPA。
+#
+# 三个开关/状态：
+#   `set_npu_fusion_attention(False)` ⇒ 完全不尝试（紧急回退；对应 CLI
+#     `--npu-sfa 0`，2026-10-06 从环境变量 GOAI_NPU_SFA 搬来）
+#   默认 ⇒ 尝试
+#   `_sfa_state` ⇒ 进程内一次性探测/自检的结果（variant/checked/ok/why）
+_SFA_ENV_ON = True
+_sfa_state = {'variant': None, 'checked': False, 'ok': False, 'why': '未探测'}
+
+#: 候选调用形式（按 torch_npu 版本从新到旧）。`scale=None` 时不传该 kw（SDPA 的
+#: 原生默认就是 1/sqrt(d)，与本仓调用方在 scale=None 时的约定一致）。
+_SFA_VARIANTS = ('scale_causal', 'scale', 'basic')
+
+
+def _sfa_call(fn, name, q, k, v, scale):
+    """按候选名调用融合注意力；返回 out 或 None（该形式不可用）。"""
+    if name == 'scale_causal':
+        r = fn(q, k, v, scale=scale, causal=False)
+    elif name == 'scale':
+        r = fn(q, k, v, scale=scale)
+    else:
+        r = fn(q, k, v)
+    if isinstance(r, (tuple, list)):      # (out, lse) / (out, lse, ...)
+        r = r[0]
+    if isinstance(r, dict):               # 少数版本返回 dict
+        r = r.get('out', r.get('output'))
+    return r
+
+
+def _sfa_probe_and_check(q, k, v, scale):
+    """首次调用：能力探针 + 数值自检。返回 (ok, variant, why)。"""
+    if not _HAS_NPU_RMS_NORM or torch_npu is None:      # torch_npu 缺失的等价判据
+        return False, None, 'torch_npu 不可导入'
+    fn = getattr(torch_npu, 'npu_fusion_attention', None)
+    if fn is None:
+        return False, None, 'torch_npu 没有 npu_fusion_attention'
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        return False, None, f'dtype {q.dtype} 不在 SFA 支持集'
+    picked = None
+    errs = []
+    for name in _SFA_VARIANTS:
+        try:
+            with torch.no_grad():
+                out = _sfa_call(fn, name, q, k, v, scale)
+            if out is not None and out.shape == q.shape:
+                picked = name
+                break
+        except Exception as e:  # noqa: BLE001 — 探针要吃下所有版本差异
+            errs.append(f'{name}: {type(e).__name__}')
+    if picked is None:
+        return False, None, '所有候选形式都失败：' + '; '.join(errs)
+    # 数值自检：与内置 SDPA 容差内一致（fp16 融合 kernel 不保证逐位）。
+    try:
+        with torch.no_grad():
+            ref = F.scaled_dot_product_attention(q, k, v, scale=scale)
+            got = _sfa_call(fn, picked, q, k, v, scale)
+        ok = bool(got is not None and torch.allclose(
+            got.float(), ref.float(), atol=2e-2, rtol=2e-2))
+        if not ok:
+            d = (got.float() - ref.float()).abs().max().item() if got is not None else float('inf')
+            return False, None, f'自检不一致（max|Δ|={d:.3e}）'
+    except Exception as e:  # noqa: BLE001
+        return False, None, f'自检抛错：{type(e).__name__}: {e}'
+    return True, picked, 'probe+自检通过'
+
+
+def _sfa_try(q, k, v, scale):
+    """在 NPU 上尝试融合注意力；不可用/自检不过/出错 ⇒ None（回退内置 SDPA）。
+
+    **只在 dropout_p == 0 时启用**：SFA 的调用形式里我们不传 dropout（各版本签名
+    不统一），若调用方的 dropout_p > 0 却被静默忽略，12 通道那 0.1 的注意力
+    dropout 就会「开着但不生效」—— 语义静默改变，不接受。
+    """
+    if not _SFA_ENV_ON or q.device.type != 'npu':
+        return None
+    if not _sfa_state['checked']:
+        _sfa_state['checked'] = True
+        ok, variant, why = _sfa_probe_and_check(q, k, v, scale)
+        _sfa_state['ok'], _sfa_state['variant'], _sfa_state['why'] = ok, variant, why
+        _logging_mod.getLogger(__name__).info(
+            "[_sdpa] NPU 融合注意力(SFA/PFA) 探测：%s | variant=%s",
+            why, variant)
+        if not ok:
+            return None
+    elif not _sfa_state['ok']:
+        return None
+    try:
+        with torch.no_grad():
+            out = _sfa_call(torch_npu.npu_fusion_attention, _sfa_state['variant'],
+                            q, k, v, scale)
+        return out
+    except Exception as e:  # noqa: BLE001 — 运行期失败永久回退，不刷屏
+        _sfa_state['ok'] = False
+        _sfa_state['why'] = f'运行期失败：{type(e).__name__}: {e}'
+        _logging_mod.getLogger(__name__).warning(
+            "[_sdpa] SFA/PFA 运行期失败，本进程内永久回退内置 SDPA: %s", e)
+        return None
+
+
+def set_npu_fusion_attention(enabled: bool) -> None:
+    """训练脚本启动时的显式开关（对应 CLI ``--npu-sfa``）。
+
+    传 False 立刻回到「只用内置 SDPA」的状态（等价于把 SFA 永久判定为不可用）。
+    """
+    global _SFA_ENV_ON
+    _SFA_ENV_ON = bool(enabled)
+
 
 def _sdpa(q, k, v, dropout_p=0.0, use_math=False, scale=None):
     """注意力计算。
@@ -689,6 +809,13 @@ def _sdpa(q, k, v, dropout_p=0.0, use_math=False, scale=None):
             torch.float16, torch.bfloat16) else out
     if use_math or not hasattr(F, "scaled_dot_product_attention"):
         return _sdpa_math(q, k, v, dropout_p=dropout_p, scale=scale)
+    # ---- NPU 融合注意力（SFA/PFA）：优先于内置 SDPA，失败永久回退 ----
+    # dropout_p > 0 时**不启用**（SFA 调用形式里不传 dropout，静默忽略会改变
+    # 12 通道那条 0.1 注意力 dropout 的语义）。
+    if dropout_p == 0.0:
+        _sfa_out = _sfa_try(q, k, v, scale)
+        if _sfa_out is not None:
+            return _sfa_out
     # SDPA 路径：SDPA 自带默认缩放 1/sqrt(d)，但 PyTorch>=2.1 支持显式 `scale=`。
     # 必须把调用方传入的 `scale` 透传进去，否则本函数会**无条件**套用 1/sqrt(d)：
     #   - 调用方传 `scale=None`（V7 的 MHSA，旧写法预乘过 q）⇒ 恰好 1/sqrt(d)，巧合正确
