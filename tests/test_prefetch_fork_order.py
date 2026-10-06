@@ -43,15 +43,17 @@ def _line_of(node):
 
 
 def test_prefetcher_is_forked_before_device_initialization():
-    """`_BatchPrefetcher(` 的调用行号必须早于 set_device / init_process_group。"""
+    """`_BatchPrefetcher(` 的调用行号必须早于 set_device / init_process_group。
+
+    2026-10-06 起构造点为 **2 个**：训练预取器 + eval 特征预取池（V7 eval 的
+    梯子特征串行计算曾让每次 eval 磨 25-30 分钟）。两个池都必须在 fork 前。
+    """
     calls = [n.lineno for n in ast.walk(TREE)
              if isinstance(n, ast.Call)
              and isinstance(n.func, ast.Name)
              and n.func.id == '_BatchPrefetcher']
-    assert len(calls) == 1, (
-        '预取器必须**恰好构造一次**（构造点唯一，才能证明 fork 时机）：'
-        '找到 %d 处 %s' % (len(calls), calls))
-    fork_line = calls[0]
+    assert len(calls) == 2, (
+        '预取器构造点应为 2（训练 + eval 池）：找到 %d 处 %s' % (len(calls), calls))
 
     device_lines = [n.lineno for n in ast.walk(TREE)
                     if isinstance(n, ast.Call)
@@ -59,10 +61,10 @@ def test_prefetcher_is_forked_before_device_initialization():
                     and n.func.attr in ('set_device', 'init_process_group')]
     assert device_lines, '没找到 set_device / init_process_group'
     first_device = min(device_lines)
-    assert fork_line < first_device, (
-        '_BatchPrefetcher 在 L%d 构造，但设备初始化在 L%d —— 晚于它 fork 的 '
+    assert max(calls) < first_device, (
+        '_BatchPrefetcher 在 %s 构造，但设备初始化在 L%d —— 晚于它 fork 的 '
         'worker 会继承 CANN 上下文（4 卡实测每卡凭空多占 ~24 GiB ⇒ OOM）'
-        % (fork_line, first_device))
+        % (calls, first_device))
 
 
 def test_dataset_load_also_precedes_device_init():

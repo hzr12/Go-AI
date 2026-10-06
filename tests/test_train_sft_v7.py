@@ -1190,14 +1190,16 @@ def test_warm_futurepos_is_called_in_main_before_the_prefetcher_fork():
         f'否则「哪一处在 fork 前」这件事就没法用行号钉住')
     fork = [n.lineno for n in ast.walk(main_fn)
             if isinstance(n, ast.Call) and getattr(n.func, 'id', None) == '_BatchPrefetcher']
-    assert len(fork) == 1, f'预取器构造点应唯一，实得 {fork}'
-    assert warm[0] < fork[0], (
-        f'warm_futurepos() 在 L{warm[0]}，预取器构造在 L{fork[0]} —— '
+    # 2026-10-06 起是**两个**构造点：训练预取器 + eval 特征预取池（V7 eval 的
+    # 梯子特征串行计算曾让每次 eval 磨 25-30 分钟）。两个池都必须在 fork 前。
+    assert len(fork) == 2, f'预取器构造点应为 2（训练 + eval 池），实得 {fork}'
+    assert all(warm[0] < f for f in fork), (
+        f'warm_futurepos() 在 L{warm[0]}，预取器构造在 {fork} —— '
         f'惰性解析会发生在每个 worker 里')
     # attach 也必须在 fork 之前（否则 worker 看到的 dataset 上 futurepos 是关的，
     # 症状是「futurepos 项恒 0」且不报任何错）。
     attach = _calls_named(main_fn, 'attach_futurepos')
-    assert len(attach) == 1 and attach[0] < fork[0], (
+    assert len(attach) == 1 and attach[0] < min(fork), (
         f'attach_futurepos 调用在 {attach}，预取器构造在 {fork}')
 
 

@@ -1767,7 +1767,8 @@ _EVAL_BATCH_CAP = 2048
 
 
 def evaluate_metrics_v7(model, dataset, idxs, bs, device, amp_dtype, *,
-                        max_batches=50, action_size=V7_ACTION_SIZE):
+                        max_batches=50, action_size=V7_ACTION_SIZE,
+                        prefetcher=None):
     """V7 路径的验证集综合指标（与 :func:`evaluate_metrics` **返回同构**）。
 
     为什么必须另写一份
@@ -1811,15 +1812,33 @@ def evaluate_metrics_v7(model, dataset, idxs, bs, device, amp_dtype, *,
     kl_sum = brier_sum = 0.0
     seen = 0
     batches = 0
-    for start in range(0, n, bs):
-        if batches >= nb:
-            break
-        rows = order[start:start + bs]
-        if rows.size == 0:
-            continue
+    row_batches = [order[s:s + bs] for s in range(0, n, bs)][:nb]
+    row_batches = [r for r in row_batches if r.size]
+
+    def _iter_batches():
+        """产出 (sp_np, gl_np, moves, lbl)，逐位等于串行 `v7_batch_sync` 路径。
+
+        `prefetcher` 在场时把批投给 eval 特征池（窗口化投递提供背压），墙钟
+        除以 worker 数；不在场时退回串行（行为与改造前逐位一致）。
+        """
+        if prefetcher is None:
+            for rows in row_batches:
+                yield v7_batch_sync(dataset, rows, device,
+                                    rng=rng, augment=False)
+            return
+        win = 0
+        for rows in row_batches:
+            prefetcher.submit(rows)
+            win += 1
+            if win > prefetcher.prefetch:      # 窗口满 ⇒ 先收一个，提供背压
+                win -= 1
+                yield prefetcher.next()
+        while win:
+            win -= 1
+            yield prefetcher.next()
+
+    for sp_np, gl_np, moves, lbl in _iter_batches():
         batches += 1
-        sp_np, gl_np, moves, lbl = v7_batch_sync(
-            dataset, rows, device, rng=rng, augment=False)
         sp = v7_to_device(sp_np, device, amp_dtype)
         gl = v7_to_device(gl_np, device, torch.float32)
         with torch.no_grad():
@@ -1850,7 +1869,7 @@ def evaluate_metrics_v7(model, dataset, idxs, bs, device, amp_dtype, *,
         oh = F.one_hot(oc_t, oc_p.shape[1]).to(oc_p.dtype)
         brier_sum += float((oc_p - oh).pow(2).sum(-1).sum())
 
-        seen += int(rows.size)
+        seen += int(len(lbl['soft']))
 
     model.train()
     return {
@@ -1861,7 +1880,7 @@ def evaluate_metrics_v7(model, dataset, idxs, bs, device, amp_dtype, *,
         'brier': brier_sum / max(1, seen),
         'n': seen,
         'batches': batches,
-        'truncated': bool(batches >= nb and start + bs < n),
+        'truncated': bool(batches >= nb and batches * bs < n),
     }
 
 
@@ -2207,7 +2226,8 @@ def v7_to_device(x, device, amp_dtype, *, pin=False):
     return t.to(device, non_blocking=True)
 
 
-def _prefetch_worker(wi, task_q, res_q, seed, dataset, labels=False, v7=False):
+def _prefetch_worker(wi, task_q, res_q, seed, dataset, labels=False, v7=False,
+                     augment=True):
     """multiprocessing worker：从 task_q 取任务，计算后放 res_q。
 
      **本函数里不许出现任何设备相关调用**（两个后端的运行时入口、跨设备搬运、
@@ -2258,7 +2278,10 @@ def _prefetch_worker(wi, task_q, res_q, seed, dataset, labels=False, v7=False):
         try:
             if v7:
                 b = len(sub_idx)
-                tforms = rng.integers(0, 8, size=b)
+                # augment=False ⇒ 恒等变换（eval 专用：eval 契约是 augment=False，
+                # 且输入/标签必须同源不增强 —— 复用本 worker 而不另写一份的原因）。
+                tforms = (rng.integers(0, 8, size=b) if augment
+                          else np.zeros(b, dtype=np.int64))
                 moves, lbl = _v7_labels_and_moves(dataset, sub_idx, tforms)
                 spatial, gl = v7_batch_features(dataset, sub_idx,
                                                 boards=v7_boards or None)
@@ -2370,7 +2393,7 @@ class _BatchPrefetcher:
     """
 
     def __init__(self, dataset, num_workers=4, prefetch=2, seed=1234,
-                 labels=False, v7=False):
+                 labels=False, v7=False, augment=True):
         # 护栏：**绝不能在设备运行时初始化之后**构造本类（4 卡 910A 的 OOM
         # 直接原因，2026-09-30）。`mp.Process` 默认 fork，子进程会整份继承父
         # 进程的 CANN/CUDA 上下文与已分配显存映射 ⇒ 每卡被旁挂 4 份 ≈ 24 GiB，
@@ -2400,6 +2423,7 @@ class _BatchPrefetcher:
         self._res_q: mp.Queue = mp.Queue(maxsize=cap)
         self.labels = bool(labels)
         self.v7 = bool(v7)
+        self.augment = bool(augment)
         self._step = 0     # 下一个待投递 batch 的编号
         self._expect = 0   # 下一个待取回 batch 的编号
         self._pending: dict = {}  # step -> [(pos, s, m, v, lbl, err)]
@@ -2408,7 +2432,7 @@ class _BatchPrefetcher:
             p = mp.Process(
                 target=_prefetch_worker,
                 args=(wi, self._task_q, self._res_q, seed, dataset,
-                      self.labels, self.v7),
+                      self.labels, self.v7, self.augment),
                 daemon=True,
             )
             p.start()
@@ -4004,6 +4028,24 @@ def main():
     else:
         logger.info("[data] 预取器已关闭（--prefetch-workers=%d ≤ 1）",
                     args.prefetch_workers)
+
+    # ---- eval 特征预取池（V7 专用，2026-10-06）--------------------------------
+    # 事故背景：eval 的 `v7_batch_sync` 在主进程**串行**算 22 通道特征（含
+    # iterLadders 这个 CPU 大头），10 万行要磨 25-30 分钟，期间 NPU 归零、无任何
+    # 日志——真机两次被当成「挂死」。本池与训练预取器同机制（同样在设备初始化
+    # 之前 fork、同一份 `_prefetch_worker`，仅 `augment=False`），eval 批在
+    # worker 间并行 ⇒ 同一批指标逐位不变，只把墙钟除以 worker 数。
+    # 池在整个训练期常驻（eval 之间 idle 阻塞在队列上，无 CPU 开销）。
+    eval_pf = None
+    if _v7_on:
+        _eval_workers = max(2, min(4, args.prefetch_workers or 4))
+        eval_pf = _BatchPrefetcher(
+            dataset, num_workers=_eval_workers,
+            prefetch=max(2, min(args.eval_max_batches if args.eval_max_batches > 0
+                                else 8, 32)),
+            seed=777, labels=_soft_on, v7=True, augment=False)
+        logger.info("[data] eval 预取池已启用（与训练预取器同点 fork）| "
+                    "workers=%d | augment=False", _eval_workers)
 
     # ---- 分布式训练：设备由 LOCAL_RANK 决定，忽略 --device 卡号 ----
     # 后端选择：NPU 走 hccl，CUDA 走 nccl。多卡前必须 init_process_group，
@@ -5648,7 +5690,7 @@ def main():
                 if _v7_on:
                     metrics = evaluate_metrics_v7(
                         model, dataset, eval_idx, bs, device, amp_dtype,
-                        max_batches=args.eval_max_batches)
+                        max_batches=args.eval_max_batches, prefetcher=eval_pf)
                 else:
                     metrics = evaluate_metrics(
                         model, dataset, eval_idx, bs, device, amp_dtype,
@@ -5789,7 +5831,7 @@ def main():
         if _v7_on:
             final_metrics = evaluate_metrics_v7(
                 model, dataset, eval_idx, bs, device, amp_dtype,
-                max_batches=args.eval_max_batches)
+                max_batches=args.eval_max_batches, prefetcher=eval_pf)
         else:
             final_metrics = evaluate_metrics(
                 model, dataset, eval_idx, bs, device, amp_dtype,
