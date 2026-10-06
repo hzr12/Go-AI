@@ -1766,6 +1766,34 @@ def evaluate_top1(model, dataset, idxs, bs, device, amp_dtype, max_batches=50,
 _EVAL_BATCH_CAP = 2048
 
 
+#: SwanLab 面板黑名单（2026-10-06 面板瘦身）：这些量**照算**（stdout 的 [step] 行
+#: 与诊断时都要用），只是不再逐 step 上报曲线 —— 面板只留「出事时第一时间看」
+#: 与「判读必须的基线」两类。删一个键比加一个键容易，先瘦再按需加回。
+#:   · 吞吐三兄弟留 `speed_per_card`/`eta_min`，`speed`/`speed_inst`/`elapsed_min`
+#:     与其重合；
+#:   · 五个分段计时整体退出曲线（stdout 仍有；`t_comp_ms` 只是 CPU 发射时间，
+#:     单独读必然误判）；
+#:   · `l2_report`/`opt_loss`/`scaler_scale`：bf16 无 scaler、L2 走解耦衰减，
+#:     日常恒平；
+#:   · `train_top5`/`policy_ce_random`/`value_rmse(_zero)`：基线与近失信号，
+#:     stdout/诊断保留，曲线与 top1 高度重合；
+#:   · eval 侧只留 top1/kl/brier + `best_eval_acc`，其余（ema/lr/gap/覆盖度）
+#:     进 stdout 的 [eval] 行。
+_SWANLAB_DROP_KEYS = frozenset({
+    'l2_report', 'opt_loss', 'speed', 'speed_inst', 'elapsed_min',
+    'scaler_scale', 't_data_ms', 't_comp_ms', 't_save_ms', 't_eval_ms',
+    't_data_max_ms', 'train_top5', 'policy_ce_random',
+    'value_rmse', 'value_rmse_zero',
+    'eval_top5', 'eval_top10', 'eval_used_ema', 'eval_lr', 'eval_gap_to_best',
+    'eval_n', 'eval_batches', 'eval_truncated',
+    'final_kl', 'final_brier', 'final_batches', 'final_truncated',
+})
+
+#: 段位权重表（逐项 loss 曲线按它过滤：权重为 0 的项是**设计上的平线**，
+#: 13 条里通常只剩 4 条主目标 —— 平线进 `run/loss_coef/*` 的解释，不进曲线）。
+_SWANLAB_V7_WEIGHTS = v7_stage1_loss_weights()
+
+
 def evaluate_metrics_v7(model, dataset, idxs, bs, device, amp_dtype, *,
                         max_batches=50, action_size=V7_ACTION_SIZE,
                         prefetcher=None):
@@ -4842,6 +4870,9 @@ def main():
                 "run/rows_total": int(len(dataset)),
                 "run/n_games": int(np.unique(np.asarray(dataset.game_ids)).size)
                 if getattr(dataset, 'game_ids', None) is not None else 0,
+                # eval 覆盖度（2026-10-06 补）：「这次 eval 只算了 5 批还是 50 批」
+                # 直接决定指标可信度，此前它只活在 config 面板与 stdout。
+                "run/eval_max_batches": int(args.eval_max_batches),
             }
             # ---- V7 的 12 项权重（段位表）也进 run 级 ----
             # config 面板记不了它们（那是**代码常量**不是 CLI），而「这一项权重
@@ -5593,7 +5624,7 @@ def main():
                             _health_last['soft_row_frac'] = float(
                                 _msk.float().mean())
                 try:
-                    swanlab_logger.log({
+                    _sw = {
                         "loss": _lv,
                         "policy_loss": _pv,
                         "value_loss": _vv,
@@ -5614,9 +5645,10 @@ def main():
                     "eta_min": ((total_steps - step)
                                 * (_now - t0) / max(1, step - _step_at_start)
                                 / 60.0) if step > _step_at_start else float('nan'),
-                    "skipped_steps": _n_skipped,
                     # 分母用 `_n_attempted`（与 `_n_skipped` 同一处自增）而不是
                     #   `step` —— 后者在这行之后 47 行才自增，会算出 > 100% 的占比。
+                    # （2026-10-06 面板瘦身：绝对数 `skipped_steps` 删除，只留占比
+                    #   —— 两者同源，跳步率才是「溢出严重度」的正确读法。）
                     "skip_rate_pct": 100.0 * _n_skipped / max(1, _n_attempted),
                     # grad_norm 之前被丢弃（clip_grad_norm_ 的返回值）。它是
                     # fp16 溢出/梯度爆炸唯一的直接信号；accum>1 下每 optimizer
@@ -5628,13 +5660,16 @@ def main():
                     #   覆盖先写的，于是上面那行是**死代码**：谁改它都不会生效。）
                     "scaler_scale": _scale if use_scaler else 1.0,
                     "t_data_ms": _dms,
+                    # ⚠ 口径：`t_comp_ms` 只统计 **CPU 侧发射时间**，不含 NPU 实际
+                    #   执行（刻意不打 synchronize，会打断预取流水）。它**不能**
+                    #   单独读成「算子慢」——判读靠「各段之和 vs elapsed」的差额。
                     "t_comp_ms": _cms,
                     "t_save_ms": _sms,
                     "t_eval_ms": _ems,
                     # 取数长尾：均值能掩盖「偶尔等 3 秒」的预取抖动
                     "t_data_max_ms": _dmax,
-                    "epoch": epoch,
-                    "step_pct": step / total_steps,
+                    # （2026-10-06 面板瘦身：`epoch`/`step_pct` 删除 —— step 本身
+                    #   已上报，两者是它的派生量，曲线不可读性为零。）
                     **_health_last,
                         # ---- B8 · V7 的 12 项逐项 loss（2026-10-04）----
                         # 此前 `_v7_terms_last` **只进 stdout**（上面那行
@@ -5645,7 +5680,17 @@ def main():
                         # `policy_loss` / `value_loss` 在同一面板里混读，而它们
                         # 的**求和口径不同**（这里是 `weighted`，已乘系数）。
                         **_v7_terms_swanlab,
-                    }, step=step)
+                    }
+                    # ---- 面板过滤（2026-10-06 瘦身）----
+                    #  · `_SWANLAB_DROP_KEYS`：照算不报的键（见常量处注释）；
+                    #  · `loss_v7/*` 里**权重为 0** 的项不上曲线 —— 那是设计上的
+                    #    平线，解释走 `run/loss_coef/*`（config 面板），不上图。
+                    #    真机 2026-10-06：13 条里 9 条恒 0 平线把面板糊死。
+                    _sw = {k: v for k, v in _sw.items()
+                           if k not in _SWANLAB_DROP_KEYS
+                           and not (k.startswith('loss_v7/')
+                                    and _SWANLAB_V7_WEIGHTS.get(k[8:], 0) == 0)}
+                    swanlab_logger.log(_sw, step=step)
                 except Exception as e:
                     logger.warning("[swanlab] log 失败: %s", e)
 
@@ -5857,8 +5902,6 @@ def main():
                 try:
                     swanlab_logger.log({
                         "final_top1": final_metrics['top1'],
-                        "final_top5": final_metrics['top5'],
-                        "final_top10": final_metrics['top10'],
                         "final_kl": final_metrics['kl'],
                         "final_brier": final_metrics['brier'],
                         # 覆盖度可见化（P2.1 遗留）：收尾指标同样只覆盖了验证集的一部分，
