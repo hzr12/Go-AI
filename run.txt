@@ -18,11 +18,20 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 pip install -r requirements.txt
 pip install scipy          # ⚠ requirements.txt 漏了，但 src/data/feature_v7.py 直接 import 它
 pip install onnx onnxruntime
-# 硬件前提（2026-10-06 修订）：实测本批卡 **BF16 autocast 可训**（fp16 在 CANN 融合
-#   内核处前向溢出 65504 ⇒ futurepos 前向 NaN、warmup 内 15 步即炸；bf16 指数位与
-#   fp32 同宽，无此问题）⇒ NPU（非 910B）自动走 BF16、无 GradScaler，
-#   --scaler-init-scale / --scaler-growth-interval 在 BF16 下无效但仍可传（被忽略）。
-#   fp16+GradScaler 仅 910B 分支保留。NPU 上 inductor 编译无效，别加 --compile。
+# 硬件前提（2026-10-06 实测；2026-10-07 校正型号）：
+#   本批卡 = **Ascend 910C**（npu-smi 报 `Ascend 910-9392`；平台标注 910C）。
+#   实测 **BF16 autocast 可训**：fp16 在 CANN 融合内核处前向溢出 65504 ⇒
+#   futurepos 前向 NaN、warmup 内 15 步即炸；bf16 指数位与 fp32 同宽，无此问题。
+#
+# ⚠ 型号判据在 `train_sft.py` 的 `_backend == 'npu'` 分支（唯一事实源），现为：
+#     命中 FP16 + GradScaler：名字含 `910B` / `910Pro` / `910-2`
+#     其余（含 **910C**）：BF16、无 GradScaler
+#   `910-9392` 不含 `910-2` 子串 ⇒ 本批卡走 **BF16**，`use_scaler=False`。
+#   ⇒ `--scaler-init-scale` / `--scaler-growth-interval` 在本批卡上是**死参数**
+#     （GradScaler 根本不会被创建），下面所有命令都不给它们。
+#   ⚠ 别把「910B 只能 fp16」套到本批卡上——910C 匹配不上那三个子串。
+#     每次启动看 `[device]` 那行：打印 `BF16 路径` 还是 `910B 路径` 一目了然。
+#   ⚠ NPU 上 inductor 编译无效，别加 --compile（图编译走 --npu-graph-compile）。
 
 # ---------- 1. 数据（都已就位，不要重建）----------
 # 1) data/sgf_19x19_full.npz = 34,264,225 行 / 163,535 局，加压 447 MB、解压 12.3 GB

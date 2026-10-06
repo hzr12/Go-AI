@@ -4143,13 +4143,12 @@ def main():
     # ---- 多后端自适应路径（CUDA / NPU / CPU）----
     # 各后端能力差异很大，逐后端决定：
     #   - amp_dtype:       A100/A800/H100(sm_80+) -> bfloat16（原生支持）
-    #                     Ascend **910B** -> bfloat16（2026-10-06 实测后改；此前这行
-    #                     写的是「910B/910A → float16（NPU autocast 仅支持 FP16）」，
-    #                     那是**过期的**——它与本文件 `[env] 混合精度` 那行的
-    #                     「bf16(910B)/fp16(910A) 可用」自相矛盾，会把人引到
-    #                     错误的精度判断上：以为 910B 也只能 fp16，于是照抄
-    #                     --scaler-init-scale，而这些参数在 BF16 下根本不生效）
-    #                     Ascend **910A** -> float16（无 bf16）
+    #                     Ascend 910B/910Pro -> float16 + GradScaler（**判据见
+    #                     `_backend == 'npu'` 分支的注释，那里是唯一事实源**）
+    #                     Ascend 910A/910C/其它 -> bfloat16、无 GradScaler
+    #                     ⚠ 本批卡 = `Ascend 910-9392`（910C），实测走 BF16。
+    #                       别拿「910B 只能 fp16」去推本批卡——910C 根本不匹配
+    #                       那三个子串，落到 else 的 BF16 分支。
     #                     V100(sm_70, Volta) -> float16（无 bf16）
     #   - use_scaler:      BF16 下关闭 GradScaler（不下溢，且 scaler 根本不会被创建
     #                     ⇒ --scaler-init-scale / --scaler-growth-interval 是死参数）；
@@ -4210,19 +4209,33 @@ def main():
             logger.info("[device] %s (sm_%d%d) | 走保守路径: FP16 + 手写 math 注意力 + "
                         "稀疏注意力禁用编译", gpu_name, *compute_cap)
     elif _backend == 'npu' and npu_is_available():
-        # Ascend 910B / 910A：CANN + torch_npu 后端
+        # Ascend 910B / 910C / 910A：CANN + torch_npu 后端
         gpu_name = npu_get_device_name(_dev_idx)
         torch.set_num_threads(min(8, os.cpu_count() or 8))
-        # 关键：按芯片型号选精度。910B/910Pro 原生 BF16；910A 无 BF16，必须走
-        # FP16 + GradScaler（与 V100 路径一致）。channels_last 对 NPU 卷积无明确收益，
-        # 关闭；torch.compile(inductor) 在 NPU 不可用，禁用。
+        # 关键：按芯片型号选精度。
+        #
+        # ⚠ 这段判据与上面那段总览注释**曾经自相矛盾**（总览写「910B → bfloat16」，
+        #   这里却让 910B 走 float16），两处都得改才不会再次误导人。现以代码为准：
+        #     命中 FP16+GradScaler：910B / 910Pro / '910-2'
+        #     其余（含 910A/910C）：BF16、无 GradScaler
+        #
+        # 依据：2026-10-06 在**本批卡实测**（npu-smi 报 `Ascend 910-9392`，即 910C）
+        #   —— bf16 autocast 可训；fp16 在 CANN 融合内核处前向溢出 65504
+        #   （futurepos 前向 NaN、warmup 内 15 步内即炸）。910C 不含 '910-2'
+        #   子串，故落到 else 的 BF16 分支，正是实测通过的那条路。
+        #
+        # ⚠ `'910-2'` 这个子串判据很脆：任何名字里带 "910-2" 的卡（如未来的
+        #   910-2xxx）都会被拨到 FP16 分支。若新增型号，优先用 `npu_get_device_name`
+        #   的完整串核对，别只凭型号名推断 —— 启动日志那行会直接告诉你走了哪条。
+        #
+        # torch.compile(inductor) 在 NPU 不可用，禁用。
         # 注意力内核：CANN 8.0.RC3.20+ 的 F.scaled_dot_product_attention 融合 kernel
         # （flash/mem-efficient 后端）已稳定，相比手写 math 大幅降注意力开销（c=），
         # 且内部 fp32 累加、比 fp16 手写 math 更不易溢出（顺带缓解 warmup 后 NaN）。
         # 默认放开走 SDPA；--use-sdpa 0 可强制回退手写 math（兼容旧 CANN/调试）。
         # 仍受 _sdpa 内部 batch 上限保护（B>60000 自动回退 math）。
         if '910B' in gpu_name or '910Pro' in gpu_name or '910-2' in gpu_name:
-            amp_dtype = torch.float16  # NPU autocast 仅支持 FP16
+            amp_dtype = torch.float16  # FP16 + GradScaler 分支
             use_scaler = True  # FP16 需要 GradScaler 防下溢
             logger.info("[device] %s (NPU/CANN) | 910B 路径: FP16 + GradScaler + "
                         "CANN SDPA 融合注意力 + 禁用 torch.compile(inductor)", gpu_name)
