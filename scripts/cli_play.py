@@ -33,7 +33,7 @@ PASS = -1
 
 class CliGame:
     def __init__(self, ai, board_size, simulations, num_threads,
-                 use_rollout, rollout_lambda, human_color, topk):
+                 use_rollout, rollout_lambda, human_color, topk, komi=7.5):
         self.ai = ai
         self.size = board_size
         self.sims = simulations
@@ -46,8 +46,13 @@ class CliGame:
         self.move_count = 0
         self.candidates = []
         self.undo_stack = []                        # 悔棋快照
+        # komi 必须透传给 MCTS：V7（22 通道）的全局 ch5=currentSelfKomi/20 与
+        # ch18=贴目三角波都由它算，填错会让模型拿到训练里没见过的输入且**不报错**。
+        # 此前这里没传，恒用 MCTS 默认 7.5 且无任何开关 —— 与 webui 修掉的是同一个坑。
+        # 12 通道（12..17 通道布局）不含这一路，给不给都一样。
         self.mcts = MCTS(ai, board_size=board_size, num_threads=num_threads,
-                         use_rollout=use_rollout, rollout_lambda=rollout_lambda)
+                         use_rollout=use_rollout, rollout_lambda=rollout_lambda,
+                         komi=komi)
 
     # ---- 视图 ---------------------------------------------------------------
 
@@ -171,6 +176,9 @@ def main():
     ap.add_argument("--simulations", type=int, default=400)
     ap.add_argument("--num-threads", type=int, default=8)
     ap.add_argument("--human-color", default="black", choices=["black", "white"])
+    ap.add_argument("--komi", type=float, default=7.5,
+                    help="贴目（黑 − 白）。**V7 必须填对**：全局 ch5/ch18 由它算，"
+                         "填错不报错但模型输入是错的；12 通道不用它。")
     ap.add_argument("--temperature", type=float, default=0.0,
                     help="0=贪心取访问最高；>0 按访问分布采样")
     ap.add_argument("--use-rollout", action="store_true")
@@ -188,7 +196,8 @@ def main():
 
     human_color = 1 if args.human_color == "black" else -1
     game = CliGame(ai, args.board_size, args.simulations, args.num_threads,
-                   args.use_rollout, args.rollout_lambda, human_color, args.topk)
+                   args.use_rollout, args.rollout_lambda, human_color, args.topk,
+                   komi=args.komi)
 
     print(f"Go-AI CLI | 模型={args.model if model_path else '随机权重'} | "
           f"设备={ai.device} | sims={args.simulations} | 你执{'黑(先手)' if human_color == 1 else '白'}")
