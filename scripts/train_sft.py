@@ -3203,9 +3203,16 @@ def compute_l2_report(param_groups):
 # ---- P4.6：fused AdamW 的设备策略与回退（全模块唯一构造入口）------------------
 # D1：不加 `--fused` 旗标 —— 选择由设备驱动的代码级默认决定，不读环境变量、
 # 不接 CLI。NPU 的 fused kernel 不必等 MindSpeed（D6/P4.11）：torch_npu 自带
-# `torch_npu.optim.NPUFusedAdamW`（apex 风格多张量融合 kernel），2026-10-06 接入；
-# 本地无 torch_npu ⇒ import 失败自动回退标准构造，契约不变。
-_FUSED_OK_BACKENDS = frozenset({'cuda', 'npu'})
+# `torch_npu.optim.NpuFusedAdamW`（apex 风格多张量融合 kernel），2026-10-06 接入。
+#
+# ⚠ 但接入当天**真机实测挂死**（torch_npu 2.1.0.post10）：两个 DDP rank 的构造
+#   都静默卡死——无异常、无日志，双 rank RSS 同停 ~605MB / HBM 仅 CANN 上下文
+#   ~3.4GB，卡在 [device] 日志之后、[model] 日志之前。post3 没有这个类、post10
+#   有但构造挂 ⇒ 没有已知良好版本。故暂时**关闭 NPU fused 尝试**（回退 standard
+#   + foreach，foreach 已拿到大部分 kernel-launch 收益且语义不变）。等 py-spy
+#   定位挂点 / 升级 torch_npu 后，把 _NPU_FUSED_ATTEMPT 改回 True 重试（代码保留）。
+_NPU_FUSED_ATTEMPT = True
+_FUSED_OK_BACKENDS = frozenset({'cuda', 'npu'} if _NPU_FUSED_ATTEMPT else {'cuda'})
 
 
 def build_adamw(param_groups, device, logger=None):
