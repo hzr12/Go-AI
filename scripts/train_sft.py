@@ -1718,6 +1718,14 @@ def evaluate_top1(model, dataset, idxs, bs, device, amp_dtype, max_batches=50,
     return correct / max(total, 1), total
 
 
+#: eval 前向批大小封顶。eval 指标只按样本数归一、与批大小无关，但 eval 复用
+#: 训练的 batch（曾为 5500/6000）⇒ 训练把常驻显存顶到 ~89% 后，eval 前向的
+#: 瞬态分配（SDPA workspace / CANN 碎片下的连续大块）直接把峰值顶到 95~96%，
+#: 2026-10-06 真机两次贴线。封到 2048：峰值降一个量级，批数变多但 eval 总时长
+#: 由特征同步计算主导、几乎不变，指标逐位不变（同样本、同顺序、同 augment=False）。
+_EVAL_BATCH_CAP = 2048
+
+
 def evaluate_metrics_v7(model, dataset, idxs, bs, device, amp_dtype, *,
                         max_batches=50, action_size=V7_ACTION_SIZE):
     """V7 路径的验证集综合指标（与 :func:`evaluate_metrics` **返回同构**）。
@@ -1747,6 +1755,7 @@ def evaluate_metrics_v7(model, dataset, idxs, bs, device, amp_dtype, *,
     """
     from src.networks.katago_v7_loss import KataGoV7Loss
 
+    bs = min(int(bs), _EVAL_BATCH_CAP)   # 见 _EVAL_BATCH_CAP 注释
     model.eval()
     n = int(len(idxs))
     if n == 0:
