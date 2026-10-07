@@ -3738,7 +3738,7 @@ def main():
     ap.add_argument('--num-attention-layers', type=int, default=4,
                     help='mix 模式下注意力块数量')
     ap.add_argument('--num-heads', type=int, default=4, help='多头注意力头数')
-    ap.add_argument('--attention-dropout', type=float, default=0.1)
+    ap.add_argument('--attention-dropout', type=float, default=0)
     ap.add_argument('--attn-mode', default='global',
                     choices=['global', 'window', 'axial', 'sparse', 'window_global'],
                     help='注意力计算模式: global=全配对, window=块状窗口, '
@@ -3758,8 +3758,10 @@ def main():
     ap.add_argument('--npu-channels-last', type=int, default=1, choices=[0, 1],
                     help='NPU 上卷积走 NHWC(channels_last) 布局：CANN 卷积 kernel '
                         '偏 NHWC，V7 主干是卷积主导（约 85%% MAC）时可能提速。'
-                        '**默认 0**（未实测收益，显存会略涨）；A/B 见 run.txt'
-                        '（0=关闭=当前已验证配置，1=开启）')
+                        '**默认 1**（2026-10-07 起；走 torch_npu.npu_format_cast，不是 '
+                        'torch.channels_last）。转换失败自动降级回默认布局，'
+                        '训练照常。⚠ 收益**未实测**且显存会略涨，OOM 时置 0；'
+                        'A/B 见 run.txt')
     ap.add_argument('--attn-query-chunk', type=int, default=64,
                     help='手写 math 注意力按 query 分块的长度（0=关闭）：softmax 沿 '
                         'key 轴 ⇒ 分块数学精确，峰值 ∝ chunk。只影响 math 路径，'
@@ -5216,6 +5218,21 @@ def main():
         _t_data = _t_comp = _t_save = _t_eval = 0.0
         _t_data_max = 0.0
         _n_timed = 0
+        # ---- 2026-10-07：backward() 之后的三个区间（g/o/m）--------------
+        # 起因：真机 a_v7.4_npu2 实测 —— 墙钟 **12.0 s/step**，而 `c`（前向+反向）
+        # 只有 2.29 s、`d`（等数据）0.03 s ⇒ **约 81% 的步时落在 `_t_comp`
+        # 结算之后**，旧计时刻画里完全没有这一段。也就是说 `c` vs `d` 只解释
+        # 了 19%，拿它们判断瓶颈会把剩下 81% 当成不存在。
+        #
+        # 三段按「每个 optimizer step」计，故单独用 `_n_opt` 归一：
+        #   g = unscale_ + 溢出探测 + clip_grad_norm_（含全局范数归约的同步）
+        #   o = optimizer.step（含 NpuFusedAdamW）+ zero_grad
+        #   m = EMA update（278 个参数的 foreach_mul_/foreach_add_）
+        # accum>1 时它们每个 optimizer step 才发生一次，**不能**除以
+        # `_n_timed`（那是 micro-batch 数）—— 那样会缩小 accum 倍、
+        # 读成「这几段几乎不耗时」。
+        _t_clip = _t_opt = _t_ema = 0.0
+        _n_opt = 0
         _n_skipped = 0
         # `_n_attempted` 与 `_n_skipped` **在同一处**自增（scaler.step 那一行），
         #   所以「跳过占比」的分母恒 ≥ 分子。此前分母用的是 `step`，而它在 47 行
@@ -5602,6 +5619,9 @@ def main():
                     _scale_now = scaler.get_scale()
                     # 与 `_n_skipped` 同一处自增 ⇒ 占比口径自洽（见上面注释）
                     _n_attempted += 1
+                    # `g` 段起点：unscale_ → clip_grad_norm_ 结束（含溢出
+                    # 探测，它是一次全参数梯度扫描，可能含设备同步）。
+                    _t_clip0 = time.perf_counter()
                     scaler.unscale_(optimizer)
                     # **溢出诊断必须排在 `clip_grad_norm_` 之前**
                     #   `clip_grad_norm_(max_norm=1.0)` 在 `total_norm = inf` 时算出
@@ -5631,6 +5651,9 @@ def main():
                     _gn = torch.nn.utils.clip_grad_norm_(
                         model.parameters(), max_norm=1.0)
                     _grad_norm_last = float(_gn)
+                    # `g` 段结算。`float(_gn)` 本身要等一次设备→主机同步，
+                    # 放在结算之后，不把这次同步算进 `o` 段。
+                    _t_clip += time.perf_counter() - _t_clip0
                     # **溢出诊断的时机（2026-10-04 云端 910A 实测打出来的 bug）**
                     #   `clip_grad_norm_(max_norm=1.0)` 在 `total_norm = inf` 时算出
                     #   `clip_coef = 0` 并 `grad.mul_(0)` ⇒ **inf × 0 = NaN**，
@@ -5657,6 +5680,7 @@ def main():
                     # 实测当时：50 ���内 1024 -> 8、skip=7/50，而"四张卡同一步一起
                     #   溢出"的概率极低 ⇒ 分叉几乎立刻发生。
                     # 详见 `_grads_nonfinite_any_rank` / `_scaler_step_global`。
+                    _t_opt0 = time.perf_counter()
                     _real_step = _scaler_step_global(
                         scaler, optimizer, scale_before=_scale_now,
                         use_scaler=use_scaler)
@@ -5685,13 +5709,19 @@ def main():
                                     100.0 * _n_skipped
                                     / max(1, _n_attempted))
                     optimizer.zero_grad(set_to_none=_zero_set_none)
+                    # `o` 段结算：optimizer.step + zero_grad。
+                    _t_opt += time.perf_counter() - _t_opt0
+                    _n_opt += 1
                     # EMA 与 scheduler 同理：**跳过的步权重一动没动**，
                     #   此时 `ema.update()` 会把 shadow 朝当前权重多拉一次
                     #   （step 计数也照样 +1）⇒ EMA 的时间常数被"跳步"稀释，
                     #   而 eval 又是在 EMA shadow 上评的（`eval_used_ema`）。
                     #   100% 跳步时 shadow 会一路收敛到**初始权重**。
                     if ema is not None and _real_step:
+                        # `m` 段：EMA（278 个参数的 foreach_mul_/foreach_add_）
+                        _t_ema0 = time.perf_counter()
                         ema.update()
+                        _t_ema += time.perf_counter() - _t_ema0
             except Exception as oom_exc:
                 # 同时捕获 CUDA 与 NPU 的 OOM（两后端异常类型不同）
                 _oom_types = [torch.cuda.OutOfMemoryError]
@@ -5788,16 +5818,32 @@ def main():
                 spd_inst = ((step - _last_stdout_step) * _eff_bs
                             / max(1e-6, _now - _last_stdout_t))
                 _nd = max(1, _n_timed)
+                # g/o/m 按 **optimizer step** 归一（`_no`），不是 micro-batch。
+                _no = max(1, _n_opt)
                 _dms = _t_data * 1000.0 / _nd
                 _cms = _t_comp * 1000.0 / _nd
                 _sms = _t_save * 1000.0 / _nd
                 _ems = _t_eval * 1000.0 / _nd
+                _gms = _t_clip * 1000.0 / _no
+                _oms = _t_opt * 1000.0 / _no
+                _mms = _t_ema * 1000.0 / _no
+                # `u` = 未归因 = 墙钟 −(d+c+g+o+m+s+e)。它不是残差噪声，而是
+                # 「**当前已知但尚未分段**」的部分（DDP all-reduce、Python 与
+                # 调度开销、log-every 处的同步）。2026-10-07 真机 a_v7.4_npu2：
+                # 墙钟 12.0 s/step、c=2.29、d=0.03 ⇒ 这 9.7 s 全落进 `u`。
+                # 加 g/o/m 就是为了把它劈开。
+                _wall_ms = ((_now - _last_stdout_t) * 1000.0
+                             / max(1, step - _last_stdout_step))
+                _ums = (_wall_ms - _dms - _cms - _gms - _oms - _mms
+                        - _sms - _ems)
                 _dmax = _t_data_max * 1000.0
                 # 重置放在打点处：某步的 save/eval 发生在其打点之后，
                 # 因此计入下一个区间，与墙钟口径一致
                 _t_data = _t_comp = _t_save = _t_eval = 0.0
+                _t_clip = _t_opt = _t_ema = 0.0
                 _t_data_max = 0.0
                 _n_timed = 0
+                _n_opt = 0
                 _scale = scaler.get_scale()
 
             if _do_stdout:
@@ -5805,11 +5851,13 @@ def main():
                             "scale=%.0f mem=%.2fGB "
                             "spd=%.0f spd_inst=%.0f s/s "
                             "elapsed=%.0fs skip=%d | "
-                            "d=%.0f c=%.0f s=%.0f e=%.0f dmax=%.0f ms",
+                            "d=%.0f c=%.0f g=%.0f o=%.0f m=%.0f s=%.0f e=%.0f "
+                            "u=%.0f dmax=%.0f ms",
                             step, total_steps, _lv, _pv, _vv,
                             lr, _scale, mem,
                             speed, spd_inst, _now - t0, _n_skipped,
-                            _dms, _cms, _sms, _ems, _dmax)
+                            _dms, _cms, _gms, _oms, _mms, _sms, _ems, _ums,
+                            _dmax)
                 _last_stdout_t = time.time()
                 _last_stdout_step = step
                 # ---- B8 · V7：逐项 loss 打到 stdout -----------------------------

@@ -116,7 +116,7 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 #     --use-sdpa 1|0        NPU 注意力走 CANN 融合 SDPA（默认 1）
 #     --npu-sfa 1|0         融合注意力 SFA/PFA，优先于 SDPA（默认 1；探针+自检+回退）
 #     --npu-swiglu 1|0      融合 SwiGLU（默认 1）
-#     --npu-channels-last   NPU 卷积 NHWC（**默认 0**；走 torch_npu.npu_format_cast，
+#     --npu-channels-last   NPU 卷积 NHWC（**默认 1**；走 torch_npu.npu_format_cast，
 #                           非 torch.channels_last，见下方详注；失败自动降级）
 #     --attn-query-chunk N  math 注意力 query 分块（默认 64；只影响 math 路径）
 #     --attn-chunk-ckpt 1|0 math 注意力逐块检查点（默认 1）
