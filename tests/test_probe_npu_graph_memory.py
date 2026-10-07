@@ -321,3 +321,30 @@ def test_batch_ceiling_does_not_report_skipped_as_oom():
     rows = [_mrow('gc-torchair', 4, None, oom='skipped')]
     best, oom, fail = batch_ceiling('gc-torchair', rows)
     assert (best, oom, fail) == (None, [], []), (best, oom, fail)
+
+
+def test_probe_wires_attention_path_to_production_default():
+    """探针必须复刻 train_sft 的注意力口径，且默认值是 `prod`。
+
+    2026-10-07 实测：探针全文没有一处 `set_sdpa_force_math`，于是吃 backbone
+    模块默认 `_sdpa_force_math=True`（`backbone.py:915`）⇒ `_sdpa` 第 821 行
+    置 `use_math`、第 853 行提前 return `_sdpa_math` ⇒ **手写 math**，SFA/SDPA
+    根本到不了。而 train_sft 在 NPU 上按默认参数算出 `force_math=False`
+    （`train_sft.py:4553`）并 `set_npu_fusion_attention(True)`（`:4616`）。
+    两条路的算子图与耗时都不同 —— 探针不复刻就是白测。
+    """
+    src = open(os.path.join(ROOT, 'scripts', 'probe_npu_graph_memory.py'),
+               encoding='utf-8').read()
+    assert "add_argument('--attn', default='prod'" in src, (
+        '默认必须是 prod（复刻生产），否则读报告的人默认拿到的是错口径')
+    assert '_bb.set_sdpa_force_math(False)' in src, 'prod 分支没接 force_math=False'
+    assert '_bb.set_npu_fusion_attention(True)' in src, 'prod 分支没开 SFA'
+    # 手写 math 必须仍可选，否则没法复现早期错口径做对照。
+    assert '_bb.set_sdpa_force_math(True)' in src
+    # SFA 到底有没有真的跑起来，只有第一次前向之后才知道 —— 必须在扫描之后读。
+    # 用**最后一个** print_throughput(rows) 调用（def 那行也会被 str.find 命中）。
+    calls = [i for i in range(len(src))
+             if src.startswith('print_throughput(rows)', i)]
+    assert calls, '找不到 print_throughput 调用，本测试的前提变了'
+    assert src.index('_sfa_state') > calls[-1], (
+        'SFA 状态必须在扫描之后读取，放 [env] 段只会读到「还没探测」')

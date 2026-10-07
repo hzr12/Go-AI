@@ -923,6 +923,15 @@ def main(argv=None):
     ap.add_argument('--stop-at-first-oom', action='store_true',
                     help='某档一 OOM 就跳到下一档（默认继续往小扫）')
     ap.add_argument('--device', default='npu')
+    ap.add_argument('--attn', default='prod', choices=('prod', 'math'),
+                    help='注意力路径（默认 prod = 复刻 train_sft 在 NPU 上的真值）。'
+                         '探针原先**从不**调 set_sdpa_force_math / '
+                         'set_npu_fusion_attention ⇒ 吃 backbone 模块默认 '
+                         '_sdpa_force_math=True ⇒ `_sdpa` 在 821 行置 use_math、'
+                         '853 行提前 return _sdpa_math，SFA/SDPA 根本到不了；'
+                         '而 train_sft 按默认参数算出 force_math=False 并开 SFA。'
+                         '两条路的算子图与耗时都不同，不复刻就是白测。'
+                         'math = 手写 `_sdpa_math`（复现本探针早期的错口径）。')
     args = ap.parse_args(argv)
 
     if args.try_torchair:
@@ -989,6 +998,27 @@ def main(argv=None):
         print('[env] ⇒ torchair 档位（%s）全部跳过；'
               'inductor 档不受影响。'
               % ','.join(t for t in TIERS if TIER_SPEC[t][2] == 'torchair'))
+
+    # ---- 注意力路径（决定「测的是哪张算子图」）----
+    # 复刻 train_sft 在 NPU 上的真值：
+    #   `--use-sdpa` 默认 1、`F.scaled_dot_product_attention` 存在、torch_npu
+    #   2.1 不算老 ⇒ `sdpa_force_math = False`（train_sft.py:4553）；
+    #   `--npu-sfa` 默认 1 ⇒ set_npu_fusion_attention(True)（:4616）。
+    # 探针不复刻就会走 backbone 的模块默认 `_sdpa_force_math=True`
+    # （backbone.py:915）⇒ `_sdpa` 第 821 行置 use_math、第 853 行提前 return
+    # `_sdpa_math` ⇒ **手写 math**，SFA/SDPA 到不了。算子图和耗时都不同。
+    from src.networks import backbone as _bb
+    if args.attn == 'math':
+        _bb.set_sdpa_force_math(True)
+        _bb.set_npu_fusion_attention(False)
+    else:
+        _bb.set_sdpa_force_math(False)
+        _bb.set_npu_fusion_attention(True)
+    print('[env] 注意力路径   = %s | force_math=%s sfa_env=%s'
+          % (args.attn, bool(_bb._sdpa_force_math), bool(_bb._SFA_ENV_ON)))
+    if args.attn == 'prod':
+        print('[env]   = train_sft 的 NPU 默认真值：SFA 融合内核优先，'
+              '探针/自检不过则回退内置 SDPA；dropout>0 时 SFA 自动不启用。')
 
     api = _mem_api()
     total = api['total']
@@ -1382,6 +1412,23 @@ def main(argv=None):
             print('     `train_sft.py` 编译时强制 `_gc = 0` 的分支')
             print('     `src/networks/backbone.py:303` 的守卫')
             print('   ⇒ 改之前必须先看 ② 的数值结论。')
+
+    # 注意力路径到底有没有真的走到 SFA —— 只有第一次前向之后 `_sfa_state`
+    # 才会被填，所以必须在这里（扫描之后）读，不能放 [env] 段。
+    try:
+        st = getattr(_bb, '_sfa_state', None)
+        if isinstance(st, dict) and st.get('checked'):
+            print('\n[env] SFA 真实状态 = ok=%s variant=%s why=%s'
+                  % (st.get('ok'), st.get('variant'), st.get('why')))
+            if not st.get('ok'):
+                print('[env]   ⇒ 本跑没有用 SFA，走的是内置 '
+                      'F.scaled_dot_product_attention（仍非手写 math）。')
+        elif isinstance(st, dict):
+            print('\n[env] SFA 真实状态 = 本次没有触发探测'
+                  '（没走到 _sdpa 的 SFA 分支 —— 注意力被 dropout/batch 上限'
+                  '或 force_math 拦在前面）')
+    except Exception as e:  # noqa: BLE001 — 读状态失败不该弄挂结论段
+        print('\n[env] SFA 真实状态 = 读取失败: %r' % (e,))
 
     print('\n下一步怎么用这些数：')
     print('  · 若 ① 失败在 import/注册阶段 ⇒ 当前栈没有 inductor，结论是「要升级」，')
