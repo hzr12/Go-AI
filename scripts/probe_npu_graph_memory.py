@@ -252,6 +252,13 @@ TIER_SPEC = {
     'whole':      (False, 'whole',  'torchair'),
     'gc-ind':     (True,  'block',  'inductor'),
     'gc-ind-all': (True,  'whole',  'inductor'),
+    # GC + **TorchAir** —— 910C 上唯一真正可用的组合：inductor 缺 triton-ascend
+    # （实测 `ModuleNotFoundError: No module named 'triton'`），而
+    # `torchair.get_npu_backend()` 实测能编译能反向。GC 又是必须的：实测每样本
+    # GC 开 8.3 MB / 关 63.7 MB，关掉 GC 就装不下 A-2 的 batch=6000。
+    # 之前没有这两档 ⇒ 只测了不可用的那条路。
+    'gc-torchair':     (True,  'block', 'torchair'),
+    'gc-torchair-all': (True,  'whole', 'torchair'),
 }
 TIERS = tuple(TIER_SPEC)
 
@@ -260,6 +267,10 @@ INDUCTOR_TIERS = ('gc-ind', 'gc-ind-all')
 #: `--try-inductor` 实际跑的档位：**必须带上 `gc` 基线**，否则第 ② 项的
 #: 梯度/loss 逐位对比没有对照组，跑通了也判不了对错。
 INDUCTOR_SMOKE_TIERS = ('gc',) + INDUCTOR_TIERS
+
+#: 同上，但走 TorchAir 后端 —— 910C 上该跑的就是这组。
+TORCHAIR_TIERS = ('gc-torchair', 'gc-torchair-all')
+TORCHAIR_SMOKE_TIERS = ('gc',) + TORCHAIR_TIERS
 
 
 def _apply_tier(tier, model, backends, ns):
@@ -399,25 +410,61 @@ def _is_oom(exc):
             or 'alloc failed' in s or 'memory not enough' in s)
 
 
-def _err_line(e, limit=120):
-    """异常首行；`str(e)` 可能为空、可能是多行、也可能自己抛 —— 一律兜住。"""
-    try:
-        lines = str(e).splitlines()
-    except Exception:
-        lines = []
-    if not lines:
+def _cause_chain(e, limit=6):
+    """把异常的「外层 → 内层」链拉平：`inner_exception` → `__cause__` → `__context__`。
+
+    为什么必须自己走：`torch._dynamo.exc.BackendCompilerFailed` **不设 `__cause__`**
+    （实测 `__cause__ is None`），它把内层异常存在 `self.inner_exception` 上。
+    只走 `__cause__` 拿不到；只走 `__context__` 也拿不到（Dynamo 自己构造，没有
+    「处理异常时抛出」的语义）。`inner_exception` 优先。
+    """
+    seen, out, cur = set(), [], e
+    while cur is not None and len(out) < limit and id(cur) not in seen:
+        seen.add(id(cur))
+        out.append(cur)
+        nxt = getattr(cur, 'inner_exception', None)
+        if not isinstance(nxt, BaseException):
+            nxt = getattr(cur, '__cause__', None)
+        if not isinstance(nxt, BaseException):
+            nxt = getattr(cur, '__context__', None)
+        cur = nxt if isinstance(nxt, BaseException) else None
+    return out
+
+
+def _err_line(e, limit=200):
+    """异常的**全部**有效行，用 ` / ` 拼成一行；链上更深一层的也一并带上。
+
+    不能只取首行：`BackendCompilerFailed` 的消息是两行 —— 首行是
+    ``backend='inductor' raised:`` 这句**没有任何原因**的话，真正的原因在第二行。
+    2026-10-07 的 910C 实测就是因为这里只取了 `[0]`，报告里只剩
+    ``backend='inductor' raised:``，「为什么挂」一个字都没有。
+    """
+    parts = []
+    for cur in _cause_chain(e):
         try:
-            lines = repr(e).splitlines()
+            body = ' / '.join(l.strip() for l in str(cur).splitlines()
+                              if l.strip())
         except Exception:
-            lines = ['<unprintable exception>']
-    return lines[0][:limit]
+            body = ''
+        if not body:
+            try:
+                body = repr(cur)
+            except Exception:
+                body = '<unprintable exception>'
+        parts.append(body)
+    out = parts[0] if parts else '<no message>'
+    for p in parts[1:]:
+        if p and p not in out:
+            out = '%s | %s' % (out, p)
+    return out[:limit]
 
 
-def _trace_tail(e, limit=200):
-    """异常的**类型 + 首行消息**，等价于 `format_exception_only` 的第一行。
+def _trace_tail(e, limit=240):
+    """`format_exception_only` 的**全部**行（异常类型 + 每一行消息）。
 
-    不能直接取 `format_exc()` 的最后一行 —— torch 在异常消息尾部会追加
-    「Set TORCHDYNAMO_VERBOSE=1 …」这类提示，那行是噪音不是原因。
+    只取第一行会同时丢掉两样东西：内层原因（`BackendCompilerFailed` 的第二行）、
+    以及「类型」在多行消息下的后半段。噪音行（TORCHDYNAMO_VERBOSE 提示、
+    「During handling of the above exception」）仍然过滤掉。
     """
     try:
         txt = ''.join(traceback.format_exception_only(type(e), e))
@@ -427,24 +474,44 @@ def _trace_tail(e, limit=200):
              'During handling', 'The above exception')
     lines = [l.strip() for l in txt.splitlines()
              if l.strip() and not any(n in l for n in noise)]
-    return lines[0][:limit] if lines else ''
+    # 链上更深层若没出现在这些行里，补一条 —— 防某些版本把原因只放 inner_exception。
+    joined = ' '.join(lines)
+    for cur in _cause_chain(e)[1:]:
+        name = type(cur).__name__
+        if name in joined:
+            continue
+        try:
+            body = ' '.join(l.strip() for l in str(cur).splitlines() if l.strip())
+        except Exception:
+            body = ''
+        lines.append('%s: %s' % (name, body) if body else name)
+    return ' '.join(lines)[:limit] if lines else ''
 
 
 def _fail_stage(err, tail):
     """失败发生在哪一层 —— 这决定了还要不要拿到 NPU 上再试一次。
 
-    'dynamo'  : 追踪阶段就挂了。**与设备无关** ⇒ 在 NPU 上同样会挂。
-    'inductor': 已经过了追踪、卡在代码生成/后端。**与设备有关** ⇒ 本机结论
-                不能外推，必须在 NPU 上重测。
+    'dynamo'  : 追踪阶段就挂了。**与设备无关** ⇒ 换设备也一样。
+    'inductor': **已经过了追踪、是 backend 抛的** ⇒ 与设备/后端有关，本机结论
+                不能外推，必须在目标设备上重测。
     'other'   : 其它（OOM、模型构造、数据形状等）。
+
+    `BackendCompilerFailed` 必须**优先于** `torch._dynamo` 关键字判定：它的类型名
+    带 `torch._dynamo` 前缀，但按定义意味着 Dynamo 已经追踪成功、是 **backend**
+    抛的（torch 源码 `BackendCompilerFailed(backend_fn, inner_exception, …)`）。
+    旧实现先匹配 `torch._dynamo` ⇒ 把 backend 阶段的失败误判成 dynamo 阶段 ⇒
+    推出「与设备无关、NPU 也会一样挂」，而当时本机就在 NPU 上，自相矛盾。
     """
     blob = ('%s %s' % (err or '', tail or '')).lower()
-    if any(k in blob for k in ('torch._dynamo', 'dynamo', 'notimplementederror',
-                               'checkpoint not implemented', 'unimplemented')):
-        return 'dynamo'
+    if ('backendcompilerfailed' in blob or "backend='" in blob
+            and ' raised' in blob):
+        return 'inductor'
     if any(k in blob for k in ('torch._inductor', 'inductorerror',
                                'triton', 'codegen', 'compiler:')):
         return 'inductor'
+    if any(k in blob for k in ('torch._dynamo', 'dynamo', 'notimplementederror',
+                               'checkpoint not implemented', 'unimplemented')):
+        return 'dynamo'
     return 'other'
 
 
@@ -584,13 +651,21 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         description=__doc__.split('\n')[0],
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--tiers', default='gc,eager,gc-ind,gc-ind-all',
-                    help='逗号分隔的档位（可选值: %s）' % ','.join(TIERS))
+    ap.add_argument('--tiers', default='gc,eager,gc-torchair,gc-torchair-all',
+                    help='逗号分隔的档位（可选值: %s）。默认走 TorchAir —— '
+                         '910C 实测 inductor 缺 triton-ascend 跑不了，'
+                         'TorchAir 能编译能反向。' % ','.join(TIERS))
     ap.add_argument('--batch-sizes', default='100,200,300,400,600,800',
                     help='逗号分隔的 batch 扫描点；每档从大到小扫，OOM 即止')
     ap.add_argument('--steps', type=int, default=2,
                     help='每个 (档位,batch) 跑几轮 fwd/bwd/step（默认 2，'
                          '第 1 轮吃编译/预热，第 2 轮才是稳态峰值）')
+    ap.add_argument('--try-torchair', action='store_true',
+                    help='只回答「GC + TorchAir 能不能跑、对不对、多快」：'
+                         '档位固定为 %s（含 gc 对照组），batch=4，steps=1。'
+                         'batch 刻意取小 —— 这一档只测**能否追踪/编译 + 数值是否'
+                         '正确**，与显存无关（显存走 --batch-sizes）。'
+                         % ','.join(TORCHAIR_SMOKE_TIERS))
     ap.add_argument('--try-inductor', action='store_true',
                     help='只回答「GC + inductor 能不能跑、对不对、多快」：'
                          '档位固定为 %s（含 gc 对照组），batch=4，steps=1。'
@@ -606,6 +681,10 @@ def main(argv=None):
     ap.add_argument('--device', default='npu')
     args = ap.parse_args(argv)
 
+    if args.try_torchair:
+        args.tiers = ','.join(TORCHAIR_SMOKE_TIERS)
+        args.batch_sizes = '4'
+        args.steps = 1
     if args.try_inductor:
         args.tiers = ','.join(INDUCTOR_SMOKE_TIERS)
         args.batch_sizes = '4'
@@ -659,8 +738,9 @@ def main(argv=None):
     except Exception as e:
         have_torchair = False
         print('[env] import torchair 失败:', repr(e))
-        print('[env] ⇒ torchair 档位（linear/block/whole）全部跳过；'
-              'inductor 档不受影响。')
+        print('[env] ⇒ torchair 档位（%s）全部跳过；'
+              'inductor 档不受影响。'
+              % ','.join(t for t in TIERS if TIER_SPEC[t][2] == 'torchair'))
 
     api = _mem_api()
     total = api['total']
@@ -703,9 +783,18 @@ def main(argv=None):
     need = {TIER_SPEC[t][2] for t in tiers if TIER_SPEC[t][2]}
     backends = {}
 
+    # 后端不可用时被丢掉的档位 —— 结论段要能区分「没请求」和「请求了但被跳过」，
+    # 否则报告会显示「没有跑到任何 … 档位」，读的人分不清是自己没选还是环境问题。
+    skipped = []
+
+    def _drop(kind):
+        gone = [t for t in tiers if TIER_SPEC[t][2] == kind]
+        skipped.extend(gone)
+        return [t for t in tiers if TIER_SPEC[t][2] != kind]
+
     if 'torchair' in need:
         if not have_torchair:
-            tiers = [t for t in tiers if TIER_SPEC[t][2] != 'torchair']
+            tiers = _drop('torchair')
         else:
             try:
                 import torchair
@@ -715,7 +804,7 @@ def main(argv=None):
                 print('[env] torchair backend = 已取得')
             except Exception as e:
                 print('[env] 取 torchair backend 失败:', repr(e))
-                tiers = [t for t in tiers if TIER_SPEC[t][2] != 'torchair']
+                tiers = _drop('torchair')
 
     if 'inductor' in need:
         # 先独立问一次「inductor 在这个栈上存不存在」—— 这是与本探针无关的
@@ -902,13 +991,21 @@ def main(argv=None):
                 why += ('；' if why else '') + '失败: %s' % sorted(fail_)
             print('     %-10s 全部失败：%s' % (tier, why or '无数据'))
 
-    # 4) 本次的正题：GC + inductor
+    # 4) 本次的正题：GC + 编译（inductor 与 TorchAir 都算）
     print('\n' + '=' * 78)
-    print('[verdict] GC + inductor 到底行不行')
+    print('[verdict] GC + 编译到底行不行（inductor / TorchAir）')
     print('=' * 78)
-    ind_rows = [r for r in rows if r['tier'] in INDUCTOR_TIERS]
+    gc_compile_tiers = INDUCTOR_TIERS + TORCHAIR_TIERS
+    ind_rows = [r for r in rows if r['tier'] in gc_compile_tiers]
     if not ind_rows:
-        print('没有跑到任何 inductor 档位。')
+        req = [t for t in gc_compile_tiers if t in skipped]
+        if req:
+            print('请求了 %s，但**一档都没跑** —— 后端不可用被跳过。' % ','.join(req))
+            print('  见上面 [env] 对后端可用性的判断；这不是「跑挂了」，是没跑。')
+        else:
+            print('本次没有请求任何「GC + 编译」档位（可选: %s）。'
+                  % ','.join(gc_compile_tiers))
+            print('  910C 上建议：`--try-torchair`（inductor 缺 triton-ascend 跑不了）。')
     else:
         # 「跑通」= 没抛异常。**不能**要求 peak 非空 —— 内存 API 取不到时
         # （CPU、或 torch_npu 版本差异）peak 是 None，但试验本身是成功的。
@@ -934,7 +1031,7 @@ def main(argv=None):
             stages = {r.get('stage', 'other') for r in fail_rows}
             if 'dynamo' in stages:
                 print('   ⇒ 其中 **追踪阶段（Dynamo）就挂了** —— 这一层**与设备无关**，')
-                print('     换成 NPU 也会原样复现。')
+                print('     不随设备变化（本机是 %s，结论不因换卡而改变）。' % args.device)
                 for r in fail_rows:
                     hint = ctxfn_hint(r.get('err'), r.get('trace_tail'))
                     if hint:
