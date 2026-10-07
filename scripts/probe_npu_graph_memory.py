@@ -394,6 +394,62 @@ def _grad_norm(model):
 # --------------------------------------------------------------------------- #
 # 单次试验
 # --------------------------------------------------------------------------- #
+def _sps(r):
+    """samples/s —— **本项目对外的吞吐口径**。
+
+    不能用「step 耗时」或「多少步跑完」来比档位：关掉 GC 会让 batch 上限从
+    ~929 掉不下去、但也可能迫使你换 batch，而 step 数本身随 batch 变。
+    单位时间处理的样本数与 batch 无关，才是 spd 的定义。
+    """
+    try:
+        return r['batch'] * r['steps'] / r['elapsed']
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def print_throughput(rows):
+    """③ 吞吐段 —— **不能**依赖「编译档是否跑通」。
+
+    曾经整段挂在 `if ok_rows:` 里：编译档全挂的那一轮（目前的常态）就**整个
+    打不出 samples/s**，而「GC 关 vs 开 谁快」恰恰是编译挂了也必须回答的问题
+    （spd 的口径就是 samples/s）。所以这里只吃 `rows`，谁跑出了 elapsed 谁上。
+    """
+    sp_rows = [x for x in rows
+               if x.get('elapsed') and not x.get('oom')
+               and not x.get('err') and x.get('losses')]
+    if not sp_rows:
+        return
+    print('③ **快吗 / 省吗** —— 吞吐按 samples/s（与 batch 无关的口径）：')
+    # 基线档（gc / eager）也要列出来，否则「× vs gc」永远算不出来 ——
+    # 它们不在 `ok_rows`（那只是被测的编译档），但在 `rows` 里。
+    # 同 batch 才能算比值：samples/s 自身也随 batch 变，跨 batch 直接比
+    # 会把「batch 效应」算进「档位效应」。
+    sps_by = {}
+    for x in sp_rows:
+        sps_by.setdefault(x['batch'], {})[x['tier']] = _sps(x)
+    for r in sorted(sp_rows, key=lambda x: (x['tier'], x['batch'])):
+        sps = _sps(r)
+        base = sps_by.get(r['batch'], {}).get('gc')
+        rel = ('  ×%s vs gc' % ('%.2f' % (sps / base))
+               if (base and sps and r['tier'] != 'gc') else '')
+        print('     %-10s bs=%-5d  %7.2fs  %8.0f samples/s%s  '
+              'loss=%s   |grad|=%s'
+              % (r['tier'], r['batch'], r['elapsed'], sps or 0.0, rel,
+                 _fmt_losses(r['losses']),
+                 _fmt_losses(r.get('grad_norms') or [], n=1)))
+    best = {}
+    for r in sp_rows:
+        sps = _sps(r)
+        if sps and (r['tier'] not in best or sps > best[r['tier']][0]):
+            best[r['tier']] = (sps, r['batch'])
+    if len(best) > 1:
+        print('     每档最优吞吐：' + '   '.join(
+            '%s=%.0f (bs=%d)' % (t, v[0], v[1])
+            for t, v in sorted(best.items())))
+        print('     ⇒ 各档在**各自能装下的最大 batch**下比 —— samples/s '
+              '本来就不该用同 batch 绑死；跨 batch 直接比这一列即可。')
+
+
 def _is_oom(exc):
     """是不是 OOM。
 
@@ -958,9 +1014,9 @@ def main(argv=None):
                           steps=args.steps, backends=backends, ns=ts, api=api)
                 rows.append(r)
                 print('  %s OK     peak=%6.2f GB  base=%5.2f GB  '
-                      'compiled=%-3d  %.2fs  loss=%s%s%s'
+                      'compiled=%-3d  %.2fs  %8.0f samples/s  loss=%s%s%s'
                       % (label, _gb(r['peak']), _gb(r['base']),
-                         r['n_compiled'], r['elapsed'],
+                         r['n_compiled'], r['elapsed'], _sps(r) or 0.0,
                          _fmt_losses(r['losses']),
                          '  ⚠NaN' if r['bad_loss'] else '',
                          '  ⚠守卫会拦' if r.get('guard') else ''))
@@ -1113,6 +1169,7 @@ def main(argv=None):
             print('本次没有请求任何「GC + 编译」档位（可选: %s）。'
                   % ','.join(gc_compile_tiers))
             print('  910C 上建议：`--try-torchair`（inductor 缺 triton-ascend 跑不了）。')
+        print_throughput(rows)
     else:
         # 「跑通」= 没抛异常。**不能**要求 peak 非空 —— 内存 API 取不到时
         # （CPU、或 torch_npu 版本差异）peak 是 None，但试验本身是成功的。
@@ -1222,13 +1279,6 @@ def main(argv=None):
                 print('② **对吗**：跑通且 loss/梯度均有限，但**没有 gc 对照组**，'
                       '判不了对错 —— 加上 `--tiers gc,...` 再跑一次。')
 
-            print('③ **快吗 / 省吗**：')
-            for r in sorted(ok_rows, key=lambda x: (x['tier'], x['batch'])):
-                print('     %-10s bs=%-5d  %.2fs   loss=%s   |grad|=%s'
-                      % (r['tier'], r['batch'], r['elapsed'],
-                         _fmt_losses(r['losses']),
-                         _fmt_losses(r.get('grad_norms') or [], n=1)))
-
             gc_ref = next((x for x in rows if x['tier'] == 'gc'
                            and not x.get('oom') and not x.get('err')
                            and x.get('peak') is not None), None)
@@ -1238,6 +1288,9 @@ def main(argv=None):
                     d = r['peak'] - gc_ref['peak']
                     print('     %-10s 相对纯 GC 基线：workspace = %+6.2f GB'
                           % (r['tier'], _gb(d)))
+
+        # 3) 吞吐 —— 定义在外面，两个分支共用一份实现。
+        print_throughput(rows)
 
         # 4) 落地障碍：守卫
         blocked = [r for r in ok_rows if r.get('guard')]

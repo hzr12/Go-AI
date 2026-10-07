@@ -21,7 +21,9 @@
    ``'inductor'``。归成 ``'dynamo'`` 会推出「与设备无关 ⇒ NPU 也一样挂」，
    而本机恰恰就是 NPU —— 自相矛盾，还会掩盖「triton 没装」这类真因。
 """
+import contextlib
 import inspect
+import io
 import os
 import sys
 
@@ -34,6 +36,7 @@ from scripts.probe_npu_graph_memory import (  # noqa: E402
     _err_line,
     _fail_stage,
     _trace_tail,
+    print_throughput,
 )
 
 INNER = "No module named 'triton'"
@@ -152,3 +155,51 @@ def test_cann_error_is_a_backend_stage_not_other():
     assert _fail_stage(_err_line(e), _trace_tail(e), e) == 'torchair'
     # 不传 e 也要能靠消息本身归档 —— 结论段可能只拿到已经截好的字符串。
     assert _fail_stage(_err_line(e), _trace_tail(e)) == 'torchair'
+
+
+# --------------------------------------------------------------------------- #
+# ③ 吞吐段
+# --------------------------------------------------------------------------- #
+def _row(tier, batch, elapsed, steps=2, **extra):
+    r = {'tier': tier, 'batch': batch, 'steps': steps, 'elapsed': elapsed,
+         'losses': [1.0, 2.0], 'grad_norms': [123.0]}
+    r.update(extra)
+    return r
+
+
+def _throughput(*rows):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        print_throughput(list(rows))
+    return out.getvalue()
+
+
+def test_throughput_does_not_depend_on_compile_tiers():
+    """**回归**：编译档一档没跑时，③ 也必须打印。
+
+    这段原先整块挂在 `if ok_rows:` 里 —— 而目前每一轮 `gc-torchair` 都在
+    backend 阶段抛异常，`ok_rows` 恒空 ⇒ ③ **静默消失**，于是
+    「GC 关 vs 开 谁快（samples/s）」这个 spd 本义的问题，在最需要它的那一轮
+    反而没有数据。基线档的吞吐跟编译能不能跑通无关。
+    """
+    text = _throughput(_row('gc', 800, 40.0), _row('eager', 800, 33.0))
+    assert '③' in text, '编译档全挂 ⇒ ③ 整段没打印：%r' % text
+    assert 'samples/s' in text, text
+    # 同 batch 的比值：800*2/33 ÷ 800*2/40 = 1.21
+    assert '×1.21 vs gc' in text, text
+
+
+def test_throughput_skips_rows_that_threw():
+    """失败/中断的行没有可比的 elapsed，混进来会把「档位效应」算成噪声。"""
+    text = _throughput(_row('gc', 800, 40.0),
+                       _row('gc-torchair', 800, 1.0, err='boom'),
+                       _row('eager', 800, 1.0, oom=True))
+    assert 'gc-torchair' not in text, text
+    # 只剩基线 ⇒ 不该出现「每档最优吞吐」（单档比不出档位差异）
+    assert '每档最优吞吐' not in text, text
+    assert 'eager' not in text, text
+
+
+def test_throughput_silent_when_nothing_measured():
+    out = _throughput()
+    assert out == '', out
