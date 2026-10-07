@@ -1,0 +1,997 @@
+"""探测「块级 / 整模型 TorchAir 图编译」在这台 64 GB 卡上装不装得下（只读，不训练）。
+
+⚠ 本文件是 **spike（一次性探针）**：它的产出是**结论**，不是要长期维护的代码。
+结论拿回来之后，真实改动（若要做块级编译）应该写进 `scripts/train_sft.py`
+并由 `tests/test_npu_graph_compile.py` 重新钉住。届时本文件可直接删除。
+
+为什么需要它
+------------
+`train_sft.py:3653` 与 `:4059` 记着「整模型 torch.compile 把 26.7~31.1GB 顶到
+OOM 边缘」。**这条记录是无效证据**：
+
+  · `--compile` / `--npu-graph-compile` 强制 `_gc = 0`（`train_sft.py:4726`），
+    且 `backbone.assert_grad_checkpoint_compile_compatible` 直接禁止 GC 与
+    compile 共存 —— 所以那次实验里 GC 一定是关的；
+  · 那次实验的 batch 是 A-2 的 6000，而 GC 关掉后每样本按**任一**口径都超预算：
+    按 `:727` 的公式 12.67 MB ⇒ 6000×12.67 MB ≈ **76 GB**（> 64 GB）；
+    按 `:737` 的 277 MB ⇒ 1662 GB。**无论图缓冲多大都必 OOM**。
+
+  换句话说它测的是「GC 关了放不下」，不是「图缓冲放不下」。
+  **图 workspace 的真实大小，全仓库零测量。**
+
+而且「每样本多少 MB」这件事，仓库里同时存在**三个互不相容**的数：
+
+  位置                          每样本      它到底是什么
+  ---------------------------  ---------   ------------------------------------------
+  `:721` GC 开  `[mem]` 行        4.65     6.9÷2 + 1.2（驻留÷2 + 瞬时）
+  `:727` GC 关  `[mem]` 行       12.67     **只算注意力**：11×4×361²×2/1e6 + 1.2
+  `:737` GC 关  warning         277.00     实测的 fp32 **驻留**字典值（含一切）
+  `:704` docstring              139.7      277÷2 + 1.2 —— 想调和上面两个，但
+                                            **与 `:727` 实际打出来的 12.67 不符**
+  `run.txt:133`                "4.65 → ~278"  把两个不同单位混写    ✗
+  `run.txt:134`                "batch 上限 200 出头"  按 277 算的   ✗
+
+12.67 与 277 差 **21.9×**，而这个差距直接决定成败：
+
+    batch=200，GC 关：按 12.67 ⇒ 占 2.5 GB（图 workspace 随便放）
+                     按 277  ⇒ 占 55.4 GB（64 GB 只剩 8.6 GB）
+
+两个口径给出的答案**完全相反**。所以「装不装得下」必须实测，不能推算。
+
+本探针一次性回答三件事
+----------------------
+1. **真实每样本显存**是多少？对照 12.67（`:727` 公式）与 277（`:737` 驻留值）。
+2. 各编译粒度的 **workspace 要几 GB**？
+   = 同一 batch、**同一 GC 状态**下，编译档减基线档。
+3. 各粒度的 **batch 上限**在哪（扫到第一个 OOM 为止）。
+
+档位（阶梯，逐级更激进；`TIER_SPEC` 是唯一权威表）：
+
+  tier          GC    编译范围                   backend     对应开关 / 意图
+  ------------  ----  -------------------------  ----------  -------------------------
+  gc            开    无（eager）                          现网生产配置（锚点）
+  eager         关    无                                   隔离「关 GC」的代价
+  linear        关    每个 nn.Linear 一张图       torchair   `--npu-graph-compile 1`
+  ind-linear    关    每个 nn.Linear 一张图       inductor   与 linear 同粒度，只换后端
+  ind-all       关    整个 model 一张图           inductor   融合上限（GC 关）
+  block         关    每个 `model.blocks[i]`      torchair   （提案，未实现）
+  whole         关    整个 model 一张图           torchair   `:3653` 那条记录的形态
+  gc-ind        开    每个 `model.blocks[i]`      inductor   ★ GC + inductor，块粒度
+  gc-ind-all    开    整个 model 一张图           inductor   ★ GC + inductor，最大融合
+
+`gc` 档与 GC 关的档位**不可比**（编译与 GC 互斥是当前策略），它只用来锚定现网基线。
+
+★ 为什么要试 GC + inductor
+--------------------------
+这两件事**各解决一半问题，且互不冲突**：
+
+  · **GC** → 每样本 4.65 MB 而非 12.67/277 MB ⇒ batch 6000 照跑，显存不破 64 GB；
+  · **inductor** → 融掉 96% 的 elementwise 碎核（`Mul` 1131 / `Add` 987 /
+    `Select` 986 / `Mul_StridedSlice` 1232 / `InplaceCopy_ViewCopy` 247），
+    而 TorchAir Linear-only 只碰 `aclnnMatmul` 343 核 = **3.5%**。
+
+而仓库**主动禁止**这个组合（`train_sft.py:4726` 强制 `_gc = 0` +
+`backbone.assert_grad_checkpoint_compile_compatible` 抛 RuntimeError），理由写在
+守卫 docstring 里：`torch.utils.checkpoint` 靠 `saved_tensors_hooks`、compile 靠
+Dynamo 图捕获，两者边界会让检查点段退化成 graph break 或 eager。
+
+**那个理由是推理，不是实测。** 本探针绕过守卫直接试，并单独报告「守卫会不会拦」——
+把「策略上禁止」和「技术上不行」拆成两个问题分别回答。
+
+为什么 inductor 本身也值得一试
+-----------------------------
+`train_sft.py:4555` 那条「NPU 上 torch.compile(inductor) 不可用」来自提交
+`24a3ab1`，代码是**无条件 warn + 直接 `args.compile = False`**，从没真正试过 ——
+它是 2023 年的假设，不是实测（`run.txt:34`、`:4514` 只是转述同一句，不算独立证据）。
+
+外部证据指向「**当前版本没有，新版有**」：
+
+  · 昇腾上的 inductor = `triton-ascend` + `torch_npu._inductor`；
+  · **triton-ascend 捆绑的 TorchNPU 是 2.7.1.post8**，本机是 **2.1.0.post10**；
+  · 官方「Inductor 编译后端」章节出现在 **TorchNPU 26.1.0** 文档，要求
+    **Triton Ascend v3.2.2**，用法 `torch.compile(backend="inductor")`。
+
+所以别猜，跑一次拿一手结论 —— 不可用也会把**确切报错**打出来。
+
+用法（在 NPU 机器上）
+--------------------
+    # 最快：只回答「GC + inductor 到底能不能跑、对不对、多快」
+    python scripts/probe_npu_graph_memory.py --try-inductor
+
+    python scripts/probe_npu_graph_memory.py            # 默认含 gc-ind / gc-ind-all
+    python scripts/probe_npu_graph_memory.py --tiers gc,eager,gc-ind,gc-ind-all
+    python scripts/probe_npu_graph_memory.py --batch-sizes 200,400,600 \
+            --stop-at-first-oom
+
+
+**不读数据集、不建 DataLoader、不落 checkpoint** —— 只建网 + 随机张量 +
+几个 fwd/bwd/step，通常几十秒到几分钟（编译档要等编译）。
+"""
+
+import argparse
+import ast
+import math
+import pathlib
+import sys
+import time
+import traceback
+
+# 把仓库根放进 sys.path：以 `python scripts/probe_npu_graph_memory.py` 运行时
+# sys.path[0] 只有 `scripts/`，`from src.networks...` 会 ImportError。
+# 与 train_sft.py 的做法一致。
+_REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+# --------------------------------------------------------------------------- #
+# 内存 API 探测（torch_npu 各版本名字不统一，宁可逐个试也不要抛）
+# --------------------------------------------------------------------------- #
+def _mem_api():
+    """返回一组已解析好的显存函数；取不到的项为 None。"""
+    api = {k: None for k in (
+        'total', 'alloc', 'peak_alloc', 'reset_peak', 'empty_cache')}
+    try:
+        import torch
+        import torch_npu  # noqa: F401
+    except Exception:
+        return api
+
+    def pick(*cands):
+        for obj, name in cands:
+            fn = getattr(obj, name, None)
+            if callable(fn):
+                return fn
+        return None
+
+    dev = torch.npu if hasattr(torch, 'npu') else None
+    if dev is None:
+        return api
+    cuda = torch.cuda
+    api['alloc'] = pick((dev, 'memory_allocated'), (cuda, 'memory_allocated'))
+    api['peak_alloc'] = pick((dev, 'max_memory_allocated'),
+                             (cuda, 'max_memory_allocated'))
+    api['reset_peak'] = pick((dev, 'reset_peak_memory_stats'),
+                             (dev, 'reset_max_memory_allocated'),
+                             (cuda, 'reset_peak_memory_stats'))
+    api['empty_cache'] = pick((dev, 'empty_cache'), (cuda, 'empty_cache'))
+    try:
+        api['total'] = int(torch.npu.get_device_properties(
+            torch.npu.current_device()).total_memory)
+    except Exception:
+        api['total'] = None
+    return api
+
+
+def _gb(n):
+    return 0.0 if not n else n / 1e9
+
+
+def _mb(n):
+    return 0.0 if not n else n / 1e6
+
+
+def _fmt_losses(losses, n=3):
+    """把逐 step loss 压成一行短文本；NaN/Inf 直接写出来，不参与四舍五入。"""
+    if not losses:
+        return '-'
+    parts = []
+    for x in losses[:n]:
+        if not math.isfinite(x):
+            parts.append('nan' if math.isnan(x) else 'inf')
+        else:
+            parts.append('%.4f' % x)
+    if len(losses) > n:
+        parts.append('…')
+    return ' '.join(parts)
+
+
+def _max_rel(a, b):
+    """逐位相对差的最大值；任一为空返回 None，遇到非有限值直接返回 inf。"""
+    if not a or not b:
+        return None
+    n = min(len(a), len(b))
+    diffs = []
+    for x, y in zip(a[:n], b[:n]):
+        if not (math.isfinite(x) and math.isfinite(y)):
+            return float('inf')
+        diffs.append(abs(x - y) / max(abs(y), 1e-12))
+    return max(diffs) if diffs else None
+
+
+def _fmt_rel(v):
+    if v is None:
+        return 'n/a'
+    return '%.3e' % v if math.isfinite(v) else 'inf'
+
+
+# --------------------------------------------------------------------------- #
+# 从 train_sft.py 抽出「现网那份」代码，保证口径一致
+# --------------------------------------------------------------------------- #
+def _train_sft_path():
+    here = pathlib.Path(__file__).resolve()
+    return here.parent / 'train_sft.py'
+
+
+def _extract_funcs(names):
+    """用 AST 从 train_sft.py 顶层抽出指定函数定义，`exec` 成真实函数对象。
+
+    **不 import train_sft**：那个模块在模块级就跑 `args = ap.parse_args()`
+    （`:4119`），import 会直接吃掉本脚本的命令行并 SystemExit。
+    """
+    src = _train_sft_path().read_text(encoding='utf-8')
+    tree = ast.parse(src)
+    found = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in names:
+            found[node.name] = ast.get_source_segment(src, node)
+    missing = [n for n in names if n not in found]
+    if missing:
+        raise RuntimeError(
+            'train_sft.py 里找不到这些函数（改名了？）: %s' % ', '.join(missing))
+    ns = {'__name__': 'probe_extracted'}
+    import torch
+    ns['torch'] = torch
+    for name in names:
+        exec(compile(found[name], str(_train_sft_path()), 'exec'), ns)
+    return ns
+
+
+# --------------------------------------------------------------------------- #
+# 档位定义
+# --------------------------------------------------------------------------- #
+# tier -> (grad_ckpt, compile_scope, backend_kind)
+#   compile_scope : 'none' | 'linear' | 'block' | 'whole'
+#   backend_kind  : None | 'torchair' | 'inductor'
+TIER_SPEC = {
+    'gc':         (True,  'none',   None),
+    'eager':      (False, 'none',   None),
+    'linear':     (False, 'linear', 'torchair'),
+    'ind-linear': (False, 'linear', 'inductor'),
+    'ind-all':    (False, 'whole',  'inductor'),
+    'block':      (False, 'block',  'torchair'),
+    'whole':      (False, 'whole',  'torchair'),
+    'gc-ind':     (True,  'block',  'inductor'),
+    'gc-ind-all': (True,  'whole',  'inductor'),
+}
+TIERS = tuple(TIER_SPEC)
+
+#: 本次要回答的问题（GC + inductor）；`--try-inductor` 的被测档位。
+INDUCTOR_TIERS = ('gc-ind', 'gc-ind-all')
+#: `--try-inductor` 实际跑的档位：**必须带上 `gc` 基线**，否则第 ② 项的
+#: 梯度/loss 逐位对比没有对照组，跑通了也判不了对错。
+INDUCTOR_SMOKE_TIERS = ('gc',) + INDUCTOR_TIERS
+
+
+def _apply_tier(tier, model, backends, ns):
+    """按档位给 model 上编译；返回 ``(编译过的子模块个数, 实际要用的 model)``。
+
+    **必须接住返回的 model**：`torch.compile(model)` 不改原对象，而是返回一个新的
+    `OptimizedModule` 包装。原实现丢掉了这个返回值 —— 于是「整模型」档实际上
+    编译了个没人用的包装，跑的还是 eager（本地用 stub backend 抓到的）。
+    `linear` / `block` 两档是就地改子模块，model 本体不变，返回原引用即可。
+    """
+    import torch
+    _, scope, kind = TIER_SPEC[tier]
+    if scope == 'none':
+        return 0, model
+    backend = backends.get(kind) if kind else None
+    if backend is None:
+        raise RuntimeError(
+            '档位 %s 需要 %s 后端，但没取到' % (tier, kind))
+    if scope == 'linear':
+        # 现网那份（train_sft._compile_linear_submodules），原样抽取复用。
+        ns['_compile_linear_submodules'](model, backend)
+        return sum(1 for _, m in model.named_modules()
+                   if hasattr(m, '_orig_mod')), model
+    if scope == 'block':
+        # 块粒度：每个 nbt2 外块一张图（含其 `.inner` 的 GAU/nbt 子块）。
+        n = 0
+        for i, blk in enumerate(model.blocks):
+            model.blocks[i] = torch.compile(blk, backend=backend,
+                                            dynamic=False)
+            n += 1
+        return n, model
+    if scope == 'whole':
+        # `:3653` 说的形态。整模型被包成 OptimizedModule ⇒ 顶层出现 `_orig_mod`。
+        return 1, torch.compile(model, backend=backend, dynamic=False)
+    raise ValueError('未知 compile_scope: %r' % scope)
+
+
+def _guard_verdict(model):
+    """绕过守卫做实验，但**如实报告**落地时守卫会不会拦。
+
+    返回 `(would_block, message)`。直接复用守卫**自己的判据**
+    `backbone.compiled_module_paths`（守卫的实现就是 `bad = compiled_module_paths(m);
+    if bad: raise`），这样即使运行时已经把守卫换成了 no-op，判定仍然成立。
+    守卫是策略（「检测到 `_orig_mod` 就抛」），它不区分 backend —— 所以
+    GC + inductor 一定也会被拦；把这件事显式打出来，是为了避免「probe 跑通了
+    ⇒ 以为能直接上线」的误判。
+    """
+    try:
+        from src.networks.backbone import compiled_module_paths
+    except Exception as e:
+        return None, '守卫导入失败: %r' % (e,)
+    bad = compiled_module_paths(model)
+    if not bad:
+        return False, '守卫放行'
+    return True, ('梯度检查点与 torch.compile 互斥：以下子模块已被 torch.compile '
+                  '包成 OptimizedModule（带 _orig_mod）：%s'
+                  % ', '.join(bad[:8]))
+
+
+def _bypass_inforward_guard(tiers):
+    """GC+编译同开时，把 `backbone` 里那道**前向中途**的守卫换成 no-op。
+
+    关键事实：`assert_grad_checkpoint_compile_compatible` 不只在启动期检查 ——
+    `backbone.run_grad_segment` 在 `active and guard_root` 时**每次前向都调它**
+    （`src/networks/backbone.py:421-423`）。所以不做这个实验是跑不起来的：
+    第一次 fwd 就抛，连数据都吃不到。
+
+    只在确实要跑 GC+编译档位时才动手；动了手要**显式打出来**。
+    返回 True 表示已改动模块级行为。
+    """
+    if not any(TIER_SPEC[t][0] and TIER_SPEC[t][1] != 'none' for t in tiers):
+        return False
+    try:
+        import src.networks.backbone as bb
+    except Exception as e:
+        print('[guard] 无法 import backbone 放行守卫: %r' % (e,))
+        return False
+    bb.assert_grad_checkpoint_compile_compatible = _noop_guard
+    return True
+
+
+def _noop_guard(module, where=''):
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# 模型
+# --------------------------------------------------------------------------- #
+def _build(device, dtype, use_checkpoint):
+    from src.networks.katago_v7 import build_katago_v7_net
+    model = build_katago_v7_net(use_checkpoint=bool(use_checkpoint))
+    model.set_grad_checkpointing(bool(use_checkpoint))
+    return model.to(device=device, dtype=dtype)
+
+
+def _loss_of(out):
+    import torch
+    terms = [v.float().pow(2).mean()
+             for v in out.values()
+             if torch.is_tensor(v) and v.is_floating_point()]
+    return sum(terms) if terms else None
+
+
+def _grad_norm(model):
+    """全参数梯度的 L2 范数（fp64 在主机累加，避开 NPU 归约的不确定顺序）。
+
+    与 `train_sft._assert_init_weights_identical` 同样的理由：NPU 上的分块归约
+    不保证跨运行顺序一致，会把「梯度真的不一样」和「归约顺序抖动」混在一起。
+    这里只要一个可跨档比较的标量，所以宁可慢一点也要稳定。
+    """
+    total = 0.0
+    for p in model.parameters():
+        if p.grad is None:
+            continue
+        g = p.grad.detach()
+        total += float(g.float().pow(2).sum().to('cpu').double())
+    return total ** 0.5
+
+
+# --------------------------------------------------------------------------- #
+# 单次试验
+# --------------------------------------------------------------------------- #
+def _is_oom(exc):
+    """是不是 OOM。
+
+    ⚠ 原实现是 `'%s: %s' % (type(exc).__name__, exc).lower()` —— 属性引用的优先级
+    高于 `%`，于是 `.lower()` 打在了**那个元组**上，任何异常都会先抛
+    `AttributeError: 'tuple' object has no attribute 'lower'`。而它又是在
+    `except` 块里被调的 ⇒ 异常处理自己炸了 ⇒ 整个探针崩掉、一个 FAIL 都没记下。
+    括号必须把格式化结果整个包住。
+    """
+    try:
+        s = ('%s: %s' % (type(exc).__name__, exc)).lower()
+    except Exception:
+        s = type(exc).__name__.lower()
+    return ('out of memory' in s or 'oom' in s
+            or 'alloc failed' in s or 'memory not enough' in s)
+
+
+def _err_line(e, limit=120):
+    """异常首行；`str(e)` 可能为空、可能是多行、也可能自己抛 —— 一律兜住。"""
+    try:
+        lines = str(e).splitlines()
+    except Exception:
+        lines = []
+    if not lines:
+        try:
+            lines = repr(e).splitlines()
+        except Exception:
+            lines = ['<unprintable exception>']
+    return lines[0][:limit]
+
+
+def _trace_tail(e, limit=200):
+    """异常的**类型 + 首行消息**，等价于 `format_exception_only` 的第一行。
+
+    不能直接取 `format_exc()` 的最后一行 —— torch 在异常消息尾部会追加
+    「Set TORCHDYNAMO_VERBOSE=1 …」这类提示，那行是噪音不是原因。
+    """
+    try:
+        txt = ''.join(traceback.format_exception_only(type(e), e))
+    except Exception:
+        return ''
+    noise = ('TORCHDYNAMO_VERBOSE', 'TORCH_LOGS', 'developer context',
+             'During handling', 'The above exception')
+    lines = [l.strip() for l in txt.splitlines()
+             if l.strip() and not any(n in l for n in noise)]
+    return lines[0][:limit] if lines else ''
+
+
+def _fail_stage(err, tail):
+    """失败发生在哪一层 —— 这决定了还要不要拿到 NPU 上再试一次。
+
+    'dynamo'  : 追踪阶段就挂了。**与设备无关** ⇒ 在 NPU 上同样会挂。
+    'inductor': 已经过了追踪、卡在代码生成/后端。**与设备有关** ⇒ 本机结论
+                不能外推，必须在 NPU 上重测。
+    'other'   : 其它（OOM、模型构造、数据形状等）。
+    """
+    blob = ('%s %s' % (err or '', tail or '')).lower()
+    if any(k in blob for k in ('torch._dynamo', 'dynamo', 'notimplementederror',
+                               'checkpoint not implemented', 'unimplemented')):
+        return 'dynamo'
+    if any(k in blob for k in ('torch._inductor', 'inductorerror',
+                               'triton', 'codegen', 'compiler:')):
+        return 'inductor'
+    return 'other'
+
+
+def trial(tier, batch, *, device, dtype, use_checkpoint, amp_dtype, steps,
+          backends, ns, api, board=19, seed=1234):
+    """建一个全新模型 + 优化器，跑 `steps` 轮 fwd/bwd/step，返回峰值统计。
+
+    **每次都重建**：跨试验复用模型会让分配器保留池串味，峰值不再可比。
+
+    **固定随机种子**（两次：建网前 + 生成数据前）：这样不同档位拿到**完全相同的
+    初始权重和完全相同的输入**，跨档的 loss 才能逐位对比。只 seed 一次是不够的
+    —— 中间的 `torch.compile` 可能消耗 RNG，会让数据错位，对比就失效了。
+
+    额外回答两件显存之外的事：
+      · `guard`      —— 落地时 `assert_grad_checkpoint_compile_compatible` 会不会拦；
+      · `losses` / `grad_norms` —— 逐 step 的 loss 与全参数梯度 L2 范数。
+
+    **梯度范数是这里最重要的一个数**：检查点重算 + Dynamo 图断开的经典症状是
+    **静默算错梯度** —— loss 看着完全正常，梯度却已经不对，模型慢慢学偏。
+    只看 loss 会漏掉。种子固定（见上）⇒ 不同档位拿到相同权重和相同输入，
+    梯度范数才可跨档逐位对比。
+    """
+    import torch
+    import torch.optim as optim
+
+    if api['empty_cache']:
+        api['empty_cache']()
+    if api['reset_peak']:
+        try:
+            api['reset_peak']()
+        except TypeError:
+            api['reset_peak']()
+
+    torch.manual_seed(seed)
+    model = _build(device, dtype, use_checkpoint)
+    n_compiled, model = _apply_tier(tier, model, backends, ns)
+    guard_block, guard_msg = _guard_verdict(model)
+    opt = optim.AdamW(model.parameters(), lr=1e-3)
+
+    base = api['alloc']() if api['alloc'] else None
+
+    torch.manual_seed(seed)          # 重新播种，抵消编译阶段可能消耗的 RNG
+    spatial = torch.randn(batch, 22, board, board, device=device, dtype=dtype)
+    gf = torch.randn(batch, 19, device=device, dtype=dtype)
+
+    losses = []
+    grad_norms = []
+    t0 = time.perf_counter()
+    for _ in range(max(1, int(steps))):
+        model.train()
+        opt.zero_grad(set_to_none=True)
+        with torch.autocast(device_type=device.type, dtype=amp_dtype,
+                            enabled=amp_dtype is not None):
+            out = model(spatial, gf)
+        loss = _loss_of(out)
+        if loss is None:
+            raise RuntimeError('前向没有任何浮点输出，无法反传')
+        # `float()` 会同步一次，把 D2H 塞进计时里 —— 故意的：每个档位都付同样的
+        # 代价，横向比较才成立（本模型太小，这点开销可忽略）。
+        losses.append(float(loss.detach()))
+        loss.backward()
+        grad_norms.append(_grad_norm(model))
+        opt.step()
+    if device.type == 'npu':
+        torch.npu.synchronize()
+    elapsed = time.perf_counter() - t0
+
+    peak = api['peak_alloc']() if api['peak_alloc'] else None
+    now = api['alloc']() if api['alloc'] else None
+    total = api['total']
+
+    n_params = sum(p.numel() for p in model.parameters())
+    return {
+        'tier': tier, 'batch': batch, 'oom': False,
+        'n_compiled': n_compiled, 'n_params': n_params,
+        'base': base, 'peak': peak, 'now': now, 'total': total,
+        'elapsed': elapsed, 'steps': max(1, int(steps)),
+        'guard': guard_block, 'guard_msg': guard_msg,
+        'losses': losses, 'grad_norms': grad_norms,
+        # NaN 和 Inf 都算坏：inf 说明溢出，nan 说明除零/inf-inf，
+        # 两者都是「能跑但学错」—— 融合路径真机出过前向 NaN，必须单独判。
+        'bad_loss': any(not math.isfinite(x) for x in losses + grad_norms),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 主流程
+# --------------------------------------------------------------------------- #
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description=__doc__.split('\n')[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--tiers', default='gc,eager,gc-ind,gc-ind-all',
+                    help='逗号分隔的档位（可选值: %s）' % ','.join(TIERS))
+    ap.add_argument('--batch-sizes', default='100,200,300,400,600,800',
+                    help='逗号分隔的 batch 扫描点；每档从大到小扫，OOM 即止')
+    ap.add_argument('--steps', type=int, default=2,
+                    help='每个 (档位,batch) 跑几轮 fwd/bwd/step（默认 2，'
+                         '第 1 轮吃编译/预热，第 2 轮才是稳态峰值）')
+    ap.add_argument('--try-inductor', action='store_true',
+                    help='只回答「GC + inductor 能不能跑、对不对、多快」：'
+                         '档位固定为 %s（含 gc 对照组），batch=64，steps=1'
+                         % ','.join(INDUCTOR_SMOKE_TIERS))
+    ap.add_argument('--no-checkpoint', dest='ckpt', action='store_false',
+                    default=True,
+                    help='连 gc / gc-ind 档也关掉梯度检查点（默认开）')
+    ap.add_argument('--stop-at-first-oom', action='store_true',
+                    help='某档一 OOM 就跳到下一档（默认继续往小扫）')
+    ap.add_argument('--device', default='npu')
+    args = ap.parse_args(argv)
+
+    if args.try_inductor:
+        args.tiers = ','.join(INDUCTOR_SMOKE_TIERS)
+        args.batch_sizes = '64'
+        args.steps = 1
+
+    tiers = [t.strip() for t in args.tiers.split(',') if t.strip()]
+    bad = [t for t in tiers if t not in TIERS]
+    if bad:
+        print('未知档位 %s（可选: %s）' % (bad, ','.join(TIERS)), file=sys.stderr)
+        return 2
+    batches = sorted({int(b) for b in args.batch_sizes.split(',') if b.strip()},
+                     reverse=True)
+
+    # ---- 放行前向守卫（GC+编译档位才需要）----
+    if _bypass_inforward_guard(tiers):
+        print('\n[guard] ⚠ 已把 src.networks.backbone 的'
+              ' assert_grad_checkpoint_compile_compatible 换成 no-op。')
+        print('[guard]   那道守卫在 run_grad_segment 里**每次前向都调'
+              '（backbone.py:421-423）**，不放行则 GC+编译第一次 fwd 就抛。')
+        print('[guard]   本探针**只报告**它会不会拦，不改仓库代码 —— '
+              '结论落地时必须自己决定是否动这两处：')
+        print('[guard]     scripts/train_sft.py 编译时强制 _gc=0 的分支')
+        print('[guard]     src/networks/backbone.py:303 的守卫')
+
+    # ---- 环境 ----
+    print('=' * 78)
+    print('[env] probe_npu_graph_memory —— 图编译显存可行性探针（spike，只读）')
+    print('=' * 78)
+    try:
+        import torch
+    except Exception as e:
+        print('import torch 失败:', repr(e))
+        return 1
+    print('[env] torch        = %s' % torch.__version__)
+
+    try:
+        import torch_npu
+        print('[env] torch_npu    = %s' % getattr(torch_npu, '__version__', '?'))
+    except Exception as e:
+        print('[env] import torch_npu 失败:', repr(e))
+        if str(args.device).startswith('npu'):
+            print('[env] 这不是 NPU 环境，探针无法工作。')
+            return 2
+        print('[env] ⚠ 用 --device %s 继续 —— **只能验证探针本身**，'
+              '显存/耗时结论一概不适用于 NPU。' % args.device)
+
+    have_torchair = True
+    try:
+        import torchair
+        print('[env] torchair     = %s' % getattr(torchair, '__version__', '?'))
+    except Exception as e:
+        have_torchair = False
+        print('[env] import torchair 失败:', repr(e))
+        print('[env] ⇒ torchair 档位（linear/block/whole）全部跳过；'
+              'inductor 档不受影响。')
+
+    api = _mem_api()
+    total = api['total']
+    print('[env] 显存总量     = %s' % (
+        '%.1f GB' % _gb(total) if total else '查不到'))
+    if args.device == 'npu':
+        try:
+            print('[env] 设备型号     = %s' % torch.npu.get_device_name())
+        except Exception:
+            pass
+
+    # ---- 口径对照（静态预测，不占显存）----
+    ts = _extract_funcs(['_compile_linear_submodules',
+                         '_rollback_linear_submodules'])
+    import src.networks.katago_v7 as v7
+    cfg = dict(v7.NBT_TF_CFG)
+    n_layers = int(cfg.get('num_blocks', 11))
+    heads = int(cfg['num_heads'])
+    tokens = 19 * 19
+    resident = {True: 6.9, False: 277.0}   # 同 train_sft.V7_RESIDENT_MB_PER_SAMPLE
+    transient = 1.2                         # 同 V7_TRANSIENT_MB_PER_SAMPLE_FP16
+    pred_fp16_ckpt = resident[True] / 2.0 + transient
+    attn_mb_fp16 = (n_layers * heads * tokens * tokens * 2) / 1e6
+    pred_fp16_nockpt = attn_mb_fp16 + transient
+
+    print('\n[口径] 静态预测每样本显存（不实测，只列出两个互相矛盾的数）：')
+    print('       GC 开  fp16  : %6.2f MB/样本   ← train_sft.py:721 用这个'
+          % pred_fp16_ckpt)
+    print('       GC 关  fp16  : %6.2f MB/样本   ← train_sft.py:727 用这个'
+          % pred_fp16_nockpt)
+    print('       GC 关  fp32  : %6.2f MB/样本   ← train_sft.py:737 warning 用这个'
+          % resident[False])
+    print('       （模型 %d 层 × %d 头 × %d² token；两种口径差 %.1f×，'
+          % (n_layers, heads, tokens, resident[False] / pred_fp16_nockpt))
+    print('        batch=200 时分别占 %.1f GB / %.1f GB ⇒ 结论完全相反）'
+          % (_gb(pred_fp16_nockpt * 1e6 * 200),
+             _gb(resident[False] * 1e6 * 200)))
+
+    # ---- 后端 ----
+    need = {TIER_SPEC[t][2] for t in tiers if TIER_SPEC[t][2]}
+    backends = {}
+
+    if 'torchair' in need:
+        if not have_torchair:
+            tiers = [t for t in tiers if TIER_SPEC[t][2] != 'torchair']
+        else:
+            try:
+                import torchair
+                _cfg = torchair.CompilerConfig()
+                backends['torchair'] = torchair.get_npu_backend(
+                    compiler_config=_cfg)
+                print('[env] torchair backend = 已取得')
+            except Exception as e:
+                print('[env] 取 torchair backend 失败:', repr(e))
+                tiers = [t for t in tiers if TIER_SPEC[t][2] != 'torchair']
+
+    if 'inductor' in need:
+        # 先独立问一次「inductor 在这个栈上存不存在」—— 这是与本探针无关的
+        # 环境事实，即使后面试验失败也已经拿到一手证据，不必再靠
+        # `train_sft.py:4555` 那条 2023 年的、从未真正试过的假设。
+        try:
+            from torch._inductor import config as _ind_cfg  # noqa: F401
+            print('[env] inductor      = torch._inductor 可导入')
+        except Exception as e:
+            print('[env] inductor      = torch._inductor 导入失败: %r' % (e,))
+        try:
+            import triton
+            print('[env] triton        = %s'
+                  % getattr(triton, '__version__', '?'))
+        except Exception as e:
+            print('[env] triton        = 未安装（昇腾 inductor 需要 triton-ascend）: %r'
+                  % (e,))
+        # backend 名就是字符串 'inductor'；真正的失败发生在首次 torch.compile，
+        # 由 trial() 捕获并原样打印报错 —— 那正是我们要的证据。
+        backends['inductor'] = 'inductor'
+
+    device = torch.device(args.device)
+    dtype = torch.float32
+    # NPU 走 BF16（run.txt:28，910C 全程 BF16）。CPU 上**刻意不**开 autocast：
+    # 本机实测 CPU 的 bf16 autocast 让单步从 5.0s 变 76.8s（15×，bf16 走的是
+    # 慢速模拟路径），会把本地验证拖到没法用。CPU 跑只用于验证探针本身。
+    amp_dtype = torch.bfloat16 if device.type == 'npu' else None
+
+    # ---- 扫描 ----
+    rows = []
+    if not tiers:
+        print('\n[scan] 没有可用档位（后端全部不可用）', file=sys.stderr)
+        return 2
+    print('\n[scan] 档位 × batch：每档从大到小扫，OOM 即标记并（可选）止损')
+    print('-' * 78)
+    for tier in tiers:
+        # GC 只按 TIER_SPEC 开 —— 与「编译」不再由代码硬性互斥，
+        # 互斥是**策略**（backbone 的守卫），probe 要测的正是这个策略值不值得。
+        ckpt = bool(args.ckpt) and TIER_SPEC[tier][0]
+        oomed = False
+        for bs in batches:
+            if oomed and args.stop_at_first_oom:
+                rows.append({'tier': tier, 'batch': bs, 'oom': 'skipped'})
+                continue
+            label = '%-10s bs=%-5d' % (tier, bs)
+            try:
+                r = trial(tier, bs, device=device, dtype=dtype,
+                          use_checkpoint=ckpt, amp_dtype=amp_dtype,
+                          steps=args.steps, backends=backends, ns=ts, api=api)
+                rows.append(r)
+                print('  %s OK     peak=%6.2f GB  base=%5.2f GB  '
+                      'compiled=%-3d  %.2fs  loss=%s%s%s'
+                      % (label, _gb(r['peak']), _gb(r['base']),
+                         r['n_compiled'], r['elapsed'],
+                         _fmt_losses(r['losses']),
+                         '  ⚠NaN' if r['bad_loss'] else '',
+                         '  ⚠守卫会拦' if r.get('guard') else ''))
+            except Exception as e:
+                # 首行往往只是包装层（inductor 会包好几层），**真正的原因另有一行**，
+                # 所以两者都留：首行进表格，`stage` 决定要不要拿到 NPU 上重测。
+                first = _err_line(e)
+                tail = _trace_tail(e)
+                stage = _fail_stage(first, tail)
+                if _is_oom(e):
+                    oomed = True
+                    rows.append({'tier': tier, 'batch': bs, 'oom': True,
+                                 'err': first, 'trace_tail': tail,
+                                 'stage': stage})
+                    print('  %s OOM    %s' % (label, first))
+                else:
+                    rows.append({'tier': tier, 'batch': bs, 'oom': False,
+                                 'err': first, 'trace_tail': tail,
+                                 'stage': stage,
+                                 'trace': traceback.format_exc()})
+                    print('  %s FAIL   %s  [%s]' % (label, first, stage))
+                    if tail and tail != first:
+                        print('  %s        ↳ %s' % (' ' * len(label), tail))
+            finally:
+                if api['empty_cache']:
+                    try:
+                        api['empty_cache']()
+                    except Exception:
+                        pass
+
+    # ---- 汇总表 ----
+    print('\n' + '=' * 78)
+    print('[result] 峰值显存汇总（GB）')
+    print('=' * 78)
+    hdr = '%-11s' % 'tier' + ''.join('%9d' % b for b in sorted(batches))
+    print(hdr)
+    print('-' * len(hdr))
+    for tier in tiers:
+        line = '%-11s' % tier
+        for bs in sorted(batches):
+            r = next((x for x in rows
+                      if x['tier'] == tier and x['batch'] == bs), None)
+            if r is None:
+                line += '%9s' % '-'
+            elif r.get('oom') == 'skipped':
+                line += '%9s' % 'skip'
+            elif r.get('oom'):
+                line += '%9s' % 'OOM'
+            elif r.get('peak') is None:
+                line += '%9s' % 'n/a'
+            else:
+                line += '%9.2f' % _gb(r['peak'])
+        print(line)
+    if total:
+        print('%-11s %s' % ('total', '%.1f GB（横线以上任何数接近它就危险）'
+                            % _gb(total)))
+
+    # ---- 结论 ----
+    print('\n' + '=' * 78)
+    print('[verdict] 直接回答三个问题')
+    print('=' * 78)
+
+    # 1) 真实每样本
+    ref = next((r for r in rows if r['tier'] == 'eager' and not r.get('oom')
+                and r.get('peak') is not None), None)
+    if ref and ref['base'] is not None:
+        act = (ref['peak'] or 0) - (ref['base'] or 0)
+        real = act / float(ref['batch'])
+        print('1) GC 关掉后，实测每样本 = %.1f MB'
+              % (_mb(real) if act > 0 else 0.0))
+        print('     对照 fp16 预测 %6.1f MB  → 实测/预测 = %.2f'
+              % (pred_fp16_nockpt, (real / 1e6) / pred_fp16_nockpt))
+        print('     对照 fp32 字典  %6.1f MB  → 实测/预测 = %.2f'
+              % (resident[False], (real / 1e6) / resident[False]))
+        print('   ⇒ run.txt:134「batch 上限 200 出头」若按 277 算，是错的：')
+        if total:
+            print('     按实测推 batch 上限 ≈ %.0f（预算 %.1f GB ÷ 实测每样本）'
+                  % ((total * 0.9) / (real if real > 0 else 1),
+                     _gb(total * 0.9)))
+    else:
+        print('1) 拿不到 eager 档的干净峰值 ⇒ 无法判定每样本，见上面的 FAIL。')
+
+    # 2) workspace —— **按 GC 开/关配对**：GC-off 的档减 eager，
+    #    GC-on 的档减 gc。拿 GC-on 减 GC-off 会把「关 GC 省下的 12.67 MB×batch」
+    #    全算到 workspace 头上，结论直接错一个数量级。
+    print('\n2) 各档相对**同 GC 状态**基线的额外占用（= 图 workspace + 图缓冲）：')
+    got = False
+    for tier in tiers:
+        if TIER_SPEC[tier][2] is None:
+            continue
+        base_tier = 'gc' if TIER_SPEC[tier][0] else 'eager'
+        for bs in sorted(batches):
+            a = next((x for x in rows if x['tier'] == tier
+                      and x['batch'] == bs and not x.get('oom')
+                      and not x.get('err') and x.get('peak') is not None), None)
+            e = next((x for x in rows if x['tier'] == base_tier
+                      and x['batch'] == bs and not x.get('oom')
+                      and not x.get('err') and x.get('peak') is not None), None)
+            if a and e and a['peak'] is not None and e['peak'] is not None:
+                d = a['peak'] - e['peak']
+                print('     %-10s bs=%-5d  workspace = %+6.2f GB'
+                      '   （vs %-5s，编译了 %s 个子模块）'
+                      % (tier, bs, _gb(d), base_tier, a.get('n_compiled')))
+                got = True
+                break
+    if not got:
+        print('     没有可相减的 (tier, 基线) 配对 ⇒ 见上面的 FAIL/OOM。')
+
+    # 3) batch 上限 —— 判据是**有没有 OOM**，与拿不拿得到峰值无关；
+    #    用 peak 非空当判据会让「跑成功但内存 API 查不到」被误报成失败。
+    print('\n3) 各档在 %.1f GB 卡上的 batch 上限（最后一个没 OOM 的点）：'
+          % _gb(total) if total else '\n3) 各档 batch 上限：')
+    for tier in tiers:
+        ok = [r['batch'] for r in rows if r['tier'] == tier
+              and not r.get('oom') and not r.get('err')]
+        bad_ = [r['batch'] for r in rows if r['tier'] == tier
+                and r.get('oom') is True]
+        fail_ = [r['batch'] for r in rows if r['tier'] == tier
+                 and r.get('err') and not r.get('oom')]
+        if ok:
+            extra = ''
+            if bad_:
+                extra = '（更小的点 OOM: %s）' % sorted(bad_)
+            if fail_:
+                extra += '（失败: %s）' % sorted(fail_)
+            print('     %-10s ≥ %d%s' % (tier, min(ok), extra))
+        else:
+            why = 'OOM: %s' % sorted(bad_) if bad_ else ''
+            if fail_:
+                why += ('；' if why else '') + '失败: %s' % sorted(fail_)
+            print('     %-10s 全部失败：%s' % (tier, why or '无数据'))
+
+    # 4) 本次的正题：GC + inductor
+    print('\n' + '=' * 78)
+    print('[verdict] GC + inductor 到底行不行')
+    print('=' * 78)
+    ind_rows = [r for r in rows if r['tier'] in INDUCTOR_TIERS]
+    if not ind_rows:
+        print('没有跑到任何 inductor 档位。')
+    else:
+        # 「跑通」= 没抛异常。**不能**要求 peak 非空 —— 内存 API 取不到时
+        # （CPU、或 torch_npu 版本差异）peak 是 None，但试验本身是成功的。
+        ok_rows = [r for r in ind_rows
+                   if not r.get('oom') and not r.get('err')
+                   and r.get('losses')]
+        fail_rows = [r for r in ind_rows if r.get('err') and not r.get('oom')]
+
+        if fail_rows:
+            print('① **能用吗**：不能 —— 首次 torch.compile 就抛：')
+            seen = set()
+            for r in fail_rows:
+                key = (r['tier'], r['err'])
+                if key in seen:
+                    continue
+                seen.add(key)
+                print('     [%s] %s' % (r['tier'], r['err']))
+                if r.get('trace_tail') and r['trace_tail'] != r['err']:
+                    print('     %s↳ %s' % (' ' * (len(r['tier']) + 2),
+                                           r['trace_tail']))
+
+            # 关键分层：**哪一层**挂的，决定本机结论能不能外推到 NPU。
+            stages = {r.get('stage', 'other') for r in fail_rows}
+            if 'dynamo' in stages:
+                print('   ⇒ 其中 **追踪阶段（Dynamo）就挂了** —— 这一层**与设备无关**，')
+                print('     换成 NPU 也一样会挂。**这不是环境问题，是硬限制。**')
+            if 'inductor' in stages:
+                print('   ⇒ 其中已过追踪、卡在代码生成/后端 —— 这一层**与设备有关**，')
+                print('     本机结论不能外推，**必须在 NPU 上重测**才算数。')
+            if stages == {'other'}:
+                print('   ⇒ 报错不在这两层，见上面的首行。')
+
+            blob = ' '.join((r.get('err') or '') + ' ' + (r.get('trace_tail') or '')
+                            for r in fail_rows).lower()
+            version_issue = any(k in blob for k in (
+                'triton', 'not registered', 'unknown backend',
+                'npu backend', 'torch_npu', 'ascend'))
+            if version_issue:
+                print('   ⇒ 这是**一手证据**，不是 2023 年那条没试过的假设。')
+                print('     报错指向后端本身不存在 ⇒ 要走这条路必须先升级 torch_npu')
+                print('     （triton-ascend 捆绑 2.7.1.post8，本机 2.1.0.post10；')
+                print('     官方 inductor 章节在 26.1.0）。')
+            else:
+                print('   ⇒ 这是**一手证据**，不是 2023 年那条没试过的假设。')
+                print('     报错**不是**「后端不存在」，不要直接归因于版本。')
+        elif ok_rows:
+            print('① **能用吗**：能 —— %d 个 GC+inductor 试验跑通。' % len(ok_rows))
+
+        nan_rows = [r for r in ok_rows if r.get('bad_loss')]
+        if ok_rows:
+            if nan_rows:
+                print('② **对吗**：✗ 出现 NaN/Inf（loss 或梯度范数）—— %s'
+                      % ', '.join('%s@bs=%d' % (r['tier'], r['batch'])
+                                  for r in nan_rows))
+                print('   ⇒ 组合可用但**数值不正确**，不能上。')
+
+            # 与同 batch 的纯 GC 基线逐位对比（种子固定 ⇒ 权重与输入相同）。
+            # 梯度范数是**决定性**的那一项：checkpoint 重算 + Dynamo 图断开的经典
+            # 症状是 loss 完全正常、梯度却已经错了，只看 loss 会漏掉。
+            printed_hdr = False
+            for r in sorted(ok_rows, key=lambda x: (x['tier'], x['batch'])):
+                ref = next((x for x in rows if x['tier'] == 'gc'
+                            and x['batch'] == r['batch']
+                            and not x.get('oom') and not x.get('err')
+                            and x.get('losses')), None)
+                if not ref or not ref.get('losses'):
+                    continue
+                if not printed_hdr:
+                    print('     与纯 GC 基线逐位对比（同权重同输入）：')
+                    printed_hdr = True
+                ldiff = _max_rel(r['losses'], ref['losses'])
+                gdiff = _max_rel(r.get('grad_norms') or [],
+                                 ref.get('grad_norms') or [])
+                lflag = '✓' if (ldiff is not None and ldiff < 1e-3) else '✗'
+                gflag = '✓' if (gdiff is not None and gdiff < 1e-3) else '✗'
+                print('       %-10s bs=%-5d  loss rel err = %-10s %s | '
+                      'grad rel err = %-10s %s'
+                      % (r['tier'], r['batch'],
+                         _fmt_rel(ldiff), lflag, _fmt_rel(gdiff), gflag))
+            if printed_hdr:
+                print('     （阈值 1e-3；超出即判定该档位算错了）')
+            elif ok_rows and not nan_rows:
+                print('② **对吗**：跑通且 loss/梯度均有限，但**没有 gc 对照组**，'
+                      '判不了对错 —— 加上 `--tiers gc,...` 再跑一次。')
+
+            print('③ **快吗 / 省吗**：')
+            for r in sorted(ok_rows, key=lambda x: (x['tier'], x['batch'])):
+                print('     %-10s bs=%-5d  %.2fs   loss=%s   |grad|=%s'
+                      % (r['tier'], r['batch'], r['elapsed'],
+                         _fmt_losses(r['losses']),
+                         _fmt_losses(r.get('grad_norms') or [], n=1)))
+
+            gc_ref = next((x for x in rows if x['tier'] == 'gc'
+                           and not x.get('oom') and not x.get('err')
+                           and x.get('peak') is not None), None)
+            for r in ok_rows:
+                if (gc_ref and gc_ref['batch'] == r['batch']
+                        and r.get('peak') is not None):
+                    d = r['peak'] - gc_ref['peak']
+                    print('     %-10s 相对纯 GC 基线：workspace = %+6.2f GB'
+                          % (r['tier'], _gb(d)))
+
+        # 4) 落地障碍：守卫
+        blocked = [r for r in ok_rows if r.get('guard')]
+        if blocked:
+            print('④ **能直接上吗**：不能 —— 仓库守卫会拦：')
+            print('     %s' % blocked[0].get('guard_msg', ''))
+            print('   ⇒ 即使技术上跑通，落地还要改两处策略：')
+            print('     `train_sft.py` 编译时强制 `_gc = 0` 的分支')
+            print('     `src/networks/backbone.py:303` 的守卫')
+            print('   ⇒ 改之前必须先看 ② 的数值结论。')
+
+    print('\n下一步怎么用这些数：')
+    print('  · 若 ① 失败在 import/注册阶段 ⇒ 当前栈没有 inductor，结论是「要升级」，')
+    print('    并把确切报错贴进 run.txt 替换 `:4555` 那条 2023 年的假设。')
+    print('  · 若 ① 失败但报错是环境缺件（编译器/triton 没装）⇒ 还判不了 inductor')
+    print('    本身，先补环境再跑一次，不要直接下结论。')
+    print('  · 若 ① 成功、② 有 NaN ⇒ GC+inductor 数值不可用，回到 TorchAir 路线，')
+    print('    改去调 CompilerConfig 的融合参数。')
+    print('  · 若 ①② 都过、④ 拦住 ⇒ 技术可行、策略要改；此时先比 ③ 的耗时，')
+    print('    确认真的比现网快，再去动 train_sft.py 的 _gc=0 分支和 backbone 守卫。')
+    print('  · 若实测每样本接近 %.1f（fp16 预测）⇒ 两个口径里 fp16 那个对，'
+          % pred_fp16_nockpt)
+    print('    run.txt:134 按 277 算的「200 出头」是错的，可回填 train_sft.py:727/:737。')
+    print('  · 若实测接近 %.1f（fp32 字典值）⇒ GC 关掉后 batch 要按 277 算，'
+          % resident[False])
+    print('    此时 GC-off 的块级编译没余量。')
+    print('  · 若 workspace（第 2 项）只有几百 MB ⇒ `:3653` 的 OOM 记录确系')
+    print('    GC 互斥所致，可重新评估整模型/块级编译。')
+    print('\n⚠ 本文件是 spike：结论拿到后请删除，真实改动写进 train_sft.py 并')
+    print('   让 tests/test_npu_graph_compile.py 重新钉住。')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
