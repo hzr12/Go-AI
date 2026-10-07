@@ -1,4 +1,5 @@
 import contextlib
+import functools
 import logging as _logging_mod
 import math
 import os
@@ -485,28 +486,69 @@ def _autocast_like(t):
         return contextlib.nullcontext()
 
 
-def _checkpointed(runner, args, bns):
-    guard = _BatchNormStatGuard(bns)
-    _ac = _autocast_like(next((a for a in args
-                               if isinstance(a, torch.Tensor)), None))
+def _recompute_context_fn(ac, guard):
+    """`torch.utils.checkpoint(context_fn=…)` 的工厂 —— **必须定义在模块级**。
 
+    为什么不能在 `_checkpointed` 里就地 `def context_fn()`
+    ----------------------------------------------------
+    Dynamo 对 `context_fn` 只认两种形态（torch 源码
+    `torch/_dynamo/variables/higher_order_ops.py:3849-3861`）::
+
+        ctx = kwargs.pop("context_fn")
+        if isinstance(ctx, UserFunctionVariable):        # 模块级 def
+            ...
+        elif isinstance(ctx, FunctoolsPartialVariable):  # functools.partial
+            ...
+        else:
+            raise NotImplementedError(
+                f"checkpoint not implemented for {type(ctx)} context_fn")
+
+    函数体内就地定义的 `context_fn` 得到的是 `NestedUserFunctionVariable`，其 MRO 是
+    `BaseUserFunctionVariable → VariableTracker`，**不是** `UserFunctionVariable`
+    的子类 ⇒ isinstance 必然落空。于是 GC 一旦与 `torch.compile` 同用（块级/整模型
+    编译），前向第一帧就抛上面那条 `NotImplementedError`。注意行尾的
+    ``" context_fn"`` 是**消息里的字面量**，``type(ctx)`` 指的才是实参类型 ——
+    这条报错说的不是被 checkpoint 的那个函数。
+
+    闭包里的 `ac` / `guard` 改由参数传入，调用方用 `functools.partial` 绑定
+    （对应上面第二个分支）。
+
+    实测：`tmp/coding/repro_context_fn.py` 的 3×4 矩阵证明**把被 checkpoint 的
+    函数改写成纯模块级函数治不了这个错**（那样仍然 FAIL），改 `context_fn` 才行；
+    `tmp/coding/repro_ctxfn_real_guard.py` 用**真的** `_BatchNormStatGuard` 复验 ——
+    过 Dynamo、输出与梯度与原写法逐位相等、`num_batches_tracked` 仍为 1，
+    而「不传 context_fn」则会挂在 `modified by an inplace operation`（即守卫必需）。
+    """
     @contextlib.contextmanager
-    def _recompute_ctx():
+    def recompute_ctx():
         # 重算期间依次做两件事，**两者都不能省**：
         #   1. 恢复前向的精度（fp16/bf16）—— 否则整段退回 fp32，体积翻倍，
         #      这是 4 卡 910A OOM 的直接原因（`Tried to allocate 1.40 GiB`
         #      恰是 (1000,4,46,32,64) 的 fp32 体积）；
         #   2. BN guard 把统计还回去 —— P4.5b 为 `determinism_check` 装的
         #      （前向与重算保存的张量数必须一致，否则 CheckpointError）。
-        with _ac:
+        with ac:
             with guard:
                 yield
 
-    def context_fn():
-        # 第二个 context 只在**重算期间**进入（实测进入 1 次），第一个包原前向。
-        # 传的是 `_recompute_ctx()` —— **实例**不是工厂：checkpoint 拿到的
-        #   是「已构造好的上下文管理器」，直接 `with` 它。
-        return contextlib.nullcontext(), _recompute_ctx()
+    # 第二个 context 只在**重算期间**进入（实测进入 1 次），第一个包原前向。
+    # 传的是 `recompute_ctx()` —— **实例**不是工厂：checkpoint 拿到的
+    #   是「已构造好的上下文管理器」，直接 `with` 它。
+    return contextlib.nullcontext(), recompute_ctx()
+
+
+def _checkpointed(runner, args, bns):
+    guard = _BatchNormStatGuard(bns)
+    _ac = _autocast_like(next((a for a in args
+                               if isinstance(a, torch.Tensor)), None))
+    # `context_fn` 走 functools.partial（Dynamo 认 FunctoolsPartialVariable）。
+    # **不要**改回就地 `def context_fn()` —— 那会变成 NestedUserFunctionVariable，
+    # 与 torch.compile 同用时前向直接抛 NotImplementedError。缘由见
+    # `_recompute_context_fn` 的文档；`tests/test_katago_v7_grad_checkpointing.py`
+    # 的 `test_heads_recompute_under_the_same_autocast_as_the_forward` 盯重算精度，
+    # `test_heads_recompute_is_safe_when_a_probe_needs_no_sync` 盯本函数源码里
+    # 必须保留 `context_fn` 与 `preserve_rng_state=True` 两处字面量。
+    context_fn = functools.partial(_recompute_context_fn, _ac, guard)
 
     return torch.utils.checkpoint.checkpoint(
         runner, *tuple(args),

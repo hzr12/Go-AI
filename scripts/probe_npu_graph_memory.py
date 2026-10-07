@@ -448,6 +448,53 @@ def _fail_stage(err, tail):
     return 'other'
 
 
+#: 已在本机用 3×4 矩阵实测过的 Dynamo 限制（`tmp/coding/repro_context_fn.py`）。
+#: torch 源码：`torch/_dynamo/variables/higher_order_ops.py:3849-3861`
+#:
+#:     if "context_fn" in kwargs and kwargs["context_fn"] is not noop_context_fn:
+#:         ctx = kwargs.pop("context_fn")
+#:         if isinstance(ctx, UserFunctionVariable): ...
+#:         elif isinstance(ctx, FunctoolsPartialVariable): ...
+#:         else: raise NotImplementedError(
+#:             f"checkpoint not implemented for {type(ctx)} context_fn")
+#:
+#: **`type(ctx)` 是 `context_fn` 这个实参的类型，行尾 `" context_fn"` 是消息里的
+#: 固定字面量** —— 所以报错指的是 `context_fn`，**不是**被 checkpoint 的函数。
+#: `NestedUserFunctionVariable` 的 MRO 是 `BaseUserFunctionVariable → VariableTracker`，
+#: 不是 `UserFunctionVariable` 的子类 ⇒ isinstance 必然落空。
+_CTXFN_KEYWORD = 'checkpoint not implemented'
+
+
+def ctxfn_hint(err, tail):
+    """命中已知的 `context_fn` 限制时，返回诊断；否则 None。"""
+    blob = ('%s %s' % (err or '', tail or '')).lower()
+    if _CTXFN_KEYWORD not in blob:
+        return None
+    return [
+        '  ⇒ **这条报错指的是 `context_fn`，不是被 checkpoint 的函数。**',
+        '    报错源：torch/_dynamo/variables/higher_order_ops.py:3849-3861，',
+        '    `type(ctx)` 是 **context_fn 实参**的 Dynamo 变量类型；行尾的',
+        '    `" context_fn"` 是消息里的固定字面量，不是变量名。',
+        '    （NestedUserFunctionVariable 不是 UserFunctionVariable 的子类 ⇒ isinstance 落空）',
+        '',
+        '  已在本机用 3×4 矩阵实测（tmp/coding/repro_context_fn.py，backend=eager，',
+        '  只测 Dynamo 追踪 ⇒ 与设备无关，NPU 上会原样复现）：',
+        '      被 ckpt 的函数      context_fn      结果',
+        '      嵌套闭包            嵌套            FAIL   ← 现状',
+        '      纯模块级函数        嵌套            FAIL   ← 改写 checkpoint 治不了',
+        '      自 bound method     嵌套            FAIL',
+        '      嵌套闭包            模块级 def      PASS',
+        '      嵌套闭包            functools.partial PASS',
+        '      嵌套闭包            不传            PASS',
+        '',
+        '  ⇒ **修法是把 `context_fn` 提到模块级（或改用 functools.partial 传闭包里的',
+        '    ac/guard），把 checkpoint 目标改写成纯函数是无效的** —— 上表第 2 行已反证。',
+        '    落地点：src/networks/backbone.py:505 的 `def context_fn()`（嵌套）。',
+        '    注意 `tests/test_katago_v7_grad_checkpointing.py:279` 断言 `_checkpointed`',
+        '    源码里含 `context_fn` —— 修法必须保留该 kwarg，否则那条测试会红。',
+    ]
+
+
 def trial(tier, batch, *, device, dtype, use_checkpoint, amp_dtype, steps,
           backends, ns, api, board=19, seed=1234):
     """建一个全新模型 + 优化器，跑 `steps` 轮 fwd/bwd/step，返回峰值统计。
@@ -546,7 +593,10 @@ def main(argv=None):
                          '第 1 轮吃编译/预热，第 2 轮才是稳态峰值）')
     ap.add_argument('--try-inductor', action='store_true',
                     help='只回答「GC + inductor 能不能跑、对不对、多快」：'
-                         '档位固定为 %s（含 gc 对照组），batch=64，steps=1'
+                         '档位固定为 %s（含 gc 对照组），batch=4，steps=1。'
+                         'batch 刻意取小 —— 这一档只测**能否追踪/编译 + 数值是否'
+                         '正确**，与显存无关（显存走 --batch-sizes）；CPU 上 bs=64 '
+                         '要 45s 且占内存，拖慢定位循环。'
                          % ','.join(INDUCTOR_SMOKE_TIERS))
     ap.add_argument('--no-checkpoint', dest='ckpt', action='store_false',
                     default=True,
@@ -558,7 +608,7 @@ def main(argv=None):
 
     if args.try_inductor:
         args.tiers = ','.join(INDUCTOR_SMOKE_TIERS)
-        args.batch_sizes = '64'
+        args.batch_sizes = '4'
         args.steps = 1
 
     tiers = [t.strip() for t in args.tiers.split(',') if t.strip()]
@@ -884,12 +934,30 @@ def main(argv=None):
             stages = {r.get('stage', 'other') for r in fail_rows}
             if 'dynamo' in stages:
                 print('   ⇒ 其中 **追踪阶段（Dynamo）就挂了** —— 这一层**与设备无关**，')
-                print('     换成 NPU 也一样会挂。**这不是环境问题，是硬限制。**')
+                print('     换成 NPU 也会原样复现。')
+                for r in fail_rows:
+                    hint = ctxfn_hint(r.get('err'), r.get('trace_tail'))
+                    if hint:
+                        print('')
+                        for ln in hint:
+                            print(ln)
+                        break
+                else:
+                    print('     （不是已知的 context_fn 限制，见首行原文。）')
             if 'inductor' in stages:
                 print('   ⇒ 其中已过追踪、卡在代码生成/后端 —— 这一层**与设备有关**，')
                 print('     本机结论不能外推，**必须在 NPU 上重测**才算数。')
             if stages == {'other'}:
                 print('   ⇒ 报错不在这两层，见上面的首行。')
+
+            # inductor 档 != TorchAir 档，别把 Windows 的 cl 缺失当成 TorchAir 结论。
+            if 'inductor' in stages:
+                print()
+                print('   ⚠ 注意档位口径：`gc-ind` / `gc-ind-all` 走的是 **torch.compile 的')
+                print('     inductor 后端**，不是 TorchAir。TorchAir 档是 linear/block/whole')
+                print('     （TIER_SPEC 里 kind==`torchair`）。')
+                print('     `Compiler: cl is not found` 是**本机 Windows 缺 C++ 编译器**，')
+                print('     与 TorchAir 能否跑通**无关**，不要据此给 TorchAir 下结论。')
 
             blob = ' '.join((r.get('err') or '') + ' ' + (r.get('trace_tail') or '')
                             for r in fail_rows).lower()
