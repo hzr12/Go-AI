@@ -510,12 +510,54 @@ def _backend_tag(e):
     return name if len(name) <= 32 else None
 
 
-def _full_trace(e, limit_lines=90):
+def _project_frames(e, limit=40):
+    """异常链里**落在本仓库**的帧（`文件:行 in 函数`），走栈 + 走消息两遍。
+
+    为什么要单独捞：FakeTensor / CANN 这类报错的栈极长，`--full-trace` 也难免
+    截断，而**最先被删掉的中间段恰恰是模型自己的帧**。模型帧丢了就只能猜
+    「哪一行造出了那个真张量」，而 910C 上一轮往返十几分钟。
+    消息里也扫一遍：Dynamo 常把用户源码位置写进 message 而不放进 `__traceback__`。
+    """
+    root = str(_REPO_ROOT)
+    seen, hits = set(), []
+
+    def add(rel, line, fn):
+        key = (rel, line)
+        if key not in seen:
+            seen.add(key)
+            hits.append('%s:%s in %s' % (rel, line, fn))
+
+    for cur in _cause_chain(e):
+        tb = cur.__traceback__
+        while tb is not None:
+            path = tb.tb_frame.f_code.co_filename
+            if path.startswith(root):
+                add(path[len(root):].lstrip('/\\'), tb.tb_lineno,
+                    tb.tb_frame.f_code.co_name)
+            tb = tb.tb_next
+    try:
+        text = ''.join(traceback.format_exception(
+            type(e), e, e.__traceback__))
+    except Exception:  # noqa: BLE001
+        text = str(e)
+    for m in re.finditer(r'([\w./\\-]+\.py):(\d+)', text):
+        rel, line = m.group(1), m.group(2)
+        if re.search(r'(^|/|\\)(src|scripts)(/|\\)', rel) and (
+                rel, line) not in seen:
+            add(rel, line, '?')
+    return hits[:limit]
+
+
+def _full_trace(e, limit_lines=0):
     """整条异常链的完整栈 —— 失败诊断专用，不进表格。
 
     表格那行只能放一句话；`Please convert all Tensors to FakeTensors…` 这种报错
     的**真正线索在栈里**（哪个算子、哪一行代码造出了那个真张量）。没有栈就只能靠
     猜，而 910C 上一轮往返要十几分钟。
+
+    `limit_lines=0`（默认）= **不截断**。原先默认 90 行（head 30 + tail 60），
+    而被删掉的正是**中间** —— innermost 那条栈里 `aten.clone` 从哪来就在中间。
+    日志走 tee 落文件，几百行不构成问题。
     """
     out = []
     for cur in _cause_chain(e):
@@ -525,7 +567,7 @@ def _full_trace(e, limit_lines=90):
         except Exception:  # noqa: BLE001
             out.append('%s: %r' % (type(cur).__name__, cur))
     lines = '\n'.join(out).splitlines()
-    if len(lines) > limit_lines:
+    if limit_lines and len(lines) > limit_lines:
         head = lines[:limit_lines // 3]
         tail = lines[-(limit_lines - len(head)):]
         lines = head + ['...（中间省略 %d 行）...'
@@ -1041,9 +1083,15 @@ def main(argv=None):
                     if tail and tail != first:
                         print('  %s        ↳ %s' % (' ' * len(label), tail))
                     if args.full_trace:
+                        pf = _project_frames(e)
+                        if pf:
+                            print('  %s        ---- 本仓库的帧（截断也丢不了）----'
+                                  % (' ' * len(label)))
+                            for ln in pf:
+                                print('  %s        %s' % (' ' * len(label), ln))
                         print('  %s        ---- 完整异常 ----'
                               % (' ' * len(label)))
-                        for ln in _full_trace(e, limit_lines=90).splitlines():
+                        for ln in _full_trace(e).splitlines():
                             print('  %s        %s' % (' ' * len(label), ln))
             finally:
                 if api['empty_cache']:

@@ -26,6 +26,7 @@ import inspect
 import io
 import os
 import sys
+import traceback
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -35,6 +36,8 @@ from scripts.probe_npu_graph_memory import (  # noqa: E402
     _backend_tag,
     _err_line,
     _fail_stage,
+    _full_trace,
+    _project_frames,
     _trace_tail,
     print_throughput,
 )
@@ -203,3 +206,57 @@ def test_throughput_skips_rows_that_threw():
 def test_throughput_silent_when_nothing_measured():
     out = _throughput()
     assert out == '', out
+
+
+# --------------------------------------------------------------------------- #
+# `--full-trace`
+# --------------------------------------------------------------------------- #
+def _deep(depth):
+    """递归帧**故意两两交替**：Python 的 traceback 会把连续同
+    `(file, line, name)` 的帧折叠成 ``[Previous line repeated N more times]``
+    （实测 `_deep` 单函数 80 层只打出 8 行），那样就测不到「默认不截断」。
+    """
+    if depth:
+        return _deep_alt(depth - 1)
+    raise ValueError('boom')
+
+
+def _deep_alt(depth):
+    if depth:
+        return _deep(depth - 1)
+    raise AssertionError('unreachable')
+
+
+def _raises(depth):
+    try:
+        _deep(depth)
+    except ValueError as e:
+        return e
+    raise AssertionError('unreachable')
+
+
+def test_full_trace_is_not_truncated_by_default():
+    """默认必须**全打**。
+
+    原先默认 `limit_lines=90` ⇒ head 30 + tail 60，**中间被删**。而 FakeTensor
+    那条报错「哪个算子从哪来」就在 innermost 栈的中段 —— 砍掉就只能再跑一轮
+    （910C 上十几分钟）。日志走 tee，几百行不构成问题。
+    """
+    e = _raises(40)
+    want = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
+    t = _full_trace(e)
+    assert '省略' not in t, '默认仍被截断：%r' % t[:400]
+    assert t == want.rstrip(), '默认应当原样输出整条异常链'
+
+
+def test_full_trace_still_honors_an_explicit_limit():
+    t = _full_trace(_raises(40), limit_lines=30)
+    assert '中间省略' in t, t[:300]
+
+
+def test_project_frames_find_repo_frames():
+    """本仓库的帧要单独捞出来 —— 它们是最先被截断删掉的那段。"""
+    fr = _project_frames(_raises(40))
+    # 只比文件名：Windows 上 `path[len(root):].lstrip('/\\')` 给出的是反斜杠。
+    assert any('test_probe_npu_graph_memory.py' in x for x in fr), fr
+    assert any('in _deep' in x for x in fr), fr
