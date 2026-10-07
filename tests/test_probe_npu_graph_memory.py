@@ -314,3 +314,10 @@ def test_batch_ceiling_reports_the_largest_success():
 
     best, oom, fail = batch_ceiling('whole', rows)
     assert best is None and oom == [1600], (best, oom)
+
+
+def test_batch_ceiling_does_not_report_skipped_as_oom():
+    """被跳过的档位记的是 `oom='skipped'` —— 打成「OOM」就是把没跑说成跑挂。"""
+    rows = [_mrow('gc-torchair', 4, None, oom='skipped')]
+    best, oom, fail = batch_ceiling('gc-torchair', rows)
+    assert (best, oom, fail) == (None, [], []), (best, oom, fail)

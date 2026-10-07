@@ -486,7 +486,9 @@ def batch_ceiling(tier, rows):
     """
     ok = [r['batch'] for r in rows if r['tier'] == tier
           and not r.get('oom') and not r.get('err')]
-    oom = [r['batch'] for r in rows if r['tier'] == tier and r.get('oom')]
+    # `is True`：被跳过的档位记的是 `oom='skipped'`（见 trial 那行），拿 truthy
+    # 判会把「后端不可用没跑」打成「OOM」。
+    oom = [r['batch'] for r in rows if r['tier'] == tier and r.get('oom') is True]
     fail = [r['batch'] for r in rows if r['tier'] == tier
             and r.get('err') and not r.get('oom')]
     return (max(ok) if ok else None), oom, fail
@@ -937,6 +939,10 @@ def main(argv=None):
     if bad:
         print('未知档位 %s（可选: %s）' % (bad, ','.join(TIERS)), file=sys.stderr)
         return 2
+    # **用户点名要的档位**：后面 `_drop(kind)` 会把后端不可用的档位从 `tiers`
+    # 里删掉，结论段若拿 `tiers` 判断「请求了什么」，会把「请求了但被跳过」
+    # 误报成「本次没有请求」—— 2026-10-07 实测就是这么错的。
+    requested_tiers = tuple(tiers)
     batches = sorted({int(b) for b in args.batch_sizes.split(',') if b.strip()},
                      reverse=True)
 
@@ -1198,7 +1204,7 @@ def main(argv=None):
     #    GC-on 的档减 gc。拿 GC-on 减 GC-off 会把「关 GC 省下的 12.67 MB×batch」
     #    全算到 workspace 头上，结论直接错一个数量级。
     print('\n2) 各档相对**同 GC 状态**基线的额外占用（= 图 workspace + 图缓冲）：')
-    pairs = workspace_pairs(rows, tiers, batches)
+    pairs = workspace_pairs(rows, requested_tiers, batches)
     for tier, bs, d, base_tier, n_compiled in pairs:
         print('     %-10s bs=%-5d  workspace = %+6.2f GB'
               '   （vs %-5s，编译了 %s 个子模块）'
@@ -1210,7 +1216,7 @@ def main(argv=None):
     #    用 peak 非空当判据会让「跑成功但内存 API 查不到」被误报成失败。
     print('\n3) 各档在 %.1f GB 卡上的 batch 上限（最后一个没 OOM 的点）：'
           % _gb(total) if total else '\n3) 各档 batch 上限：')
-    for tier in tiers:
+    for tier in requested_tiers:
         best, bad_, fail_ = batch_ceiling(tier, rows)
         if best is not None:
             extra = ''
@@ -1219,6 +1225,10 @@ def main(argv=None):
             if fail_:
                 extra += '（失败: %s）' % sorted(fail_)
             print('     %-10s ≥ %d%s' % (tier, best, extra))
+        elif tier in skipped:
+            # `_drop(kind)` 把后端不可用的档位从 `tiers` 里删了 ⇒ 一格数据都没有。
+            # 不单独标出来会打成「全部失败：无数据」，把「没跑」说成「跑挂了」。
+            print('     %-10s 未跑：后端不可用被跳过（见 [env]）' % tier)
         else:
             why = 'OOM: %s' % sorted(bad_) if bad_ else ''
             if fail_:
@@ -1233,7 +1243,7 @@ def main(argv=None):
     # 于是 `linear / block / whole`（TorchAir 但 **GC 关**）**永远进不了这一段**：
     # 2026-10-07 实测 block/whole 双 batch 全挂 E19999，而 ①②④ 一个字不提，
     # 只在第 3 项留下一句「全部失败」—— 真因（反向图 CANN PreRun）反而没进结论。
-    gc_compile_tiers = tuple(t for t in tiers if TIER_SPEC[t][2])
+    gc_compile_tiers = tuple(t for t in requested_tiers if TIER_SPEC[t][2])
     ind_rows = [r for r in rows if r['tier'] in gc_compile_tiers]
     if not ind_rows:
         req = [t for t in gc_compile_tiers if t in skipped]
