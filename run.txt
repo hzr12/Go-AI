@@ -116,7 +116,8 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 #     --use-sdpa 1|0        NPU 注意力走 CANN 融合 SDPA（默认 1）
 #     --npu-sfa 1|0         融合注意力 SFA/PFA，优先于 SDPA（默认 1；探针+自检+回退）
 #     --npu-swiglu 1|0      融合 SwiGLU（默认 1）
-#     --npu-channels-last   NPU 卷积 NHWC（**默认 0**，未实测收益，开了要盯显存）
+#     --npu-channels-last   NPU 卷积 NHWC（**默认 0**；走 torch_npu.npu_format_cast，
+#                           非 torch.channels_last，见下方详注；失败自动降级）
 #     --attn-query-chunk N  math 注意力 query 分块（默认 64；只影响 math 路径）
 #     --attn-chunk-ckpt 1|0 math 注意力逐块检查点（默认 1）
 # ⚠ `--use-checkpoint` 已归档：由 `KATAGO_SE_CFG['grad_checkpoint']` 决定，唯一关闭
@@ -129,6 +130,22 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 #   （日志有 warning），显存/样本从 4.65 MB 涨到 ~278 MB ⇒ batch 上限 200 出头，
 #   batch 1500/5500 必 OOM（2026-10-06 实测）。要试图编译：batch 180 + accum 8。
 #   Linear-only（非整图）由 tests/test_npu_graph_compile.py 钉住。
+# ⚠ `--npu-channels-last 1`：**不是** `torch.channels_last`（2026-10-07 探针定论）：
+#   本机 torch 2.1.0 + torch_npu 2.1.0.post10 上，`torch.channels_last` 整条路不通 ——
+#     · `model.to(memory_format=…)` → `Only contiguous_format or preserve_format is supported.`
+#     · 逐参数 `.contiguous(memory_format=…)` → `NPU contiguous operator only supportted
+#       contiguous memory format` (ERR01007 OPS feature not supported)
+#   但**布局控制本身是有的**：`scripts/probe_npu_layout.py` 实测 ⇒
+#     · `torch_npu.npu_format_cast` 存在，**只能用整数 aclFormat 调用**（枚举
+#       `torch_npu.Format` 在该版本上不存在，引用它会 AttributeError）
+#     · `npu_format_cast(x, 1)` 之后 `get_npu_format(x)` 由 0 → **1（NHWC）**
+#   故代码走整数 aclFormat（NHWC=1），并在转完后**读回校验** format 真的是 1 ——
+#   转换「声称」成功不算数（静默不生效时日志照样说「已启用」，而布局没变）。
+#   转换失败自动降级回默认布局 + warning，训练照常（只少这项优化），不会崩。
+#   启动日志锚点：`[model] channels_last 逐参数转换: N 个 4D 权重 | … | 入口=…`
+#   ⚠ **收益仍未实测**：转成了不等于更快。要用 `speed_per_card` 与
+#   `--npu-channels-last 0` 同配置对比，别只看这行日志就下结论。
+#   换机器/换版本后先跑 `python scripts/probe_npu_layout.py` 确认入口还在。
 # ✅ AdamW：NPU 上优先 `torch_npu.optim.NpuFusedAdamW`（post10 实测可用，日志
 #   `已启用 fused AdamW (backend=npu)`）；不可用自动回退 standard+foreach。
 #   C 段启动若卡在 [device] 之后：先 py-spy dump——大概率是 V7PackedDataset
@@ -147,18 +164,25 @@ torchrun --nproc_per_node=1 scripts/train_sft.py \
   --out models/a_v7_npu1.pth --swanlab 1 --ver a_v7_npu1 --swanlab-every 10
 
 # --- A-2  2 卡 910A（每卡 6000，accum 1 ⇒ 有效 12000，LR 0.00780 =
-#          0.00356×√(12000/2500)；BF16 无 scaler，scaler 两参数为兼容 fp16 分支
-#          保留、实际被忽略）---
+#          0.00356×√(12000/2500)）---
+# ⚠ weight-decay 必须是 **0.0001**。2026-10-07 修正：本行原先误写 0.05（代码默认
+#   与其余全部段都是 1e-4），是它的 **500 倍**，后果有两个且都很难一眼看出：
+#     1) 日志里的 `loss` 是**报告口径** `log_loss = 真实加权损失 + l2_report`，
+#        其中 `l2_report = c·‖θ‖²`、**c 就是 --weight-decay**。V7 初值 ‖θ‖²≈77835，
+#        wd=0.05 ⇒ l2_report≈3892，而四项真实加权和只有约 7.8。实测日志
+#        `loss=3541` **几乎全是那一项**，于是总 loss 平得看不出任何训练进展。
+#     2) 优化器里是**真的**按 0.05 衰减：每步衰减 lr·wd，Σlr≈11 ⇒ 全程权重缩到
+#        exp(-0.55)≈58%，value head 因独立高 LR 衰减得更狠。
 torchrun --nproc_per_node=2 scripts/train_sft.py \
   --data data/sgf_19x19_full.npz --v7 1 --device npu --board-size 19 \
   --games-npz data/labels/games.npz \
-  --batch-size 6000 --epochs 1 --lr 0.00780 --weight-decay 0.05 \
+  --batch-size 6000 --epochs 1 --lr 0.00780 --weight-decay 0.0001 \
   --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
   --use-sdpa 1 --attention-dropout 0 \
-  --prefetch-workers 4 --prefetch-depth 8 \
-  --log-every 25 --eval-every 100 --save-every 25 \
+  --prefetch-workers 4 --prefetch-depth 16 \
+  --log-every 5 --eval-every 25 --save-every 10 \
   --early-stop 1 --early-stop-patience 3 \
-  --out models/a_v7_npu2.pth --swanlab 1 --ver a_v7.2_npu2_resume --swanlab-every 5
+  --out models/a_v7_npu2.pth --swanlab 1 --ver a_v7.3_npu2 --swanlab-every 5
 
 # --- B 段：+ KataGo 软标签（承接 A-2，2 卡）---
 # ⚠ `--policy-loss soft_ce` 不写也行：给了 --soft-index 会自动选中。

@@ -210,6 +210,56 @@ def test_migrate_is_identity_when_already_fused():
     assert all(torch.equal(migrated[k], fused[k]) for k in fused)
 
 
+def test_works_without_torch22_state_dict_post_hook():
+    """⚠ 必须能在**没有** `register_state_dict_post_hook` 的 torch 上建网。
+
+    事故：实现最初用 `register_state_dict_post_hook` 展开 q/k/v，本地 torch
+    2.12 有这个 API ⇒ 12 条测试全绿；但训练环境是 **torch 2.1.0**（Linux），
+    那个 API 不存在 ⇒ `MHSA.__init__` 直接 AttributeError，**整个模型建不起来**，
+    一行训练代码都跑不到。
+
+    这条把 2.2+ 的 API 从 `nn.Module` 上摘掉再重建网，把「只能在 2.2+ 上跑」
+    这类依赖钉死在测试里，而不是留给真机去发现。
+    """
+    import torch.nn as _nn
+    saved = getattr(_nn.Module, 'register_state_dict_post_hook', None)
+    if saved is not None:
+        delattr(_nn.Module, 'register_state_dict_post_hook')
+    try:
+        assert not hasattr(_nn.Module, 'register_state_dict_post_hook')
+        m = MHSA(DIM, HEADS)                      # 曾经的崩溃点
+        assert 'qkv.weight' not in m.state_dict()
+        net = build_katago_v7_net(board_size=19)  # 全网也要能建
+        sd = net.state_dict()
+        assert not [k for k in sd if 'qkv' in k]
+        assert sum(p.numel() for p in net.parameters()) == NBT_TF_CFG['params_total']
+    finally:
+        if saved is not None:
+            _nn.Module.register_state_dict_post_hook = saved
+
+
+def test_state_dict_expansion_works_when_nested_in_parent():
+    """父模块递归时带着 `destination=`/`prefix=` 下来，展开仍必须生效。
+
+    只测 `MHSA(...).state_dict()` 会漏掉这个：独立调用时 prefix 为空，
+    而嵌在 `NbtTfNet` 里前缀是 `blocks.N.inner.M.attn.`。之前正是这里静默
+    失效（全网还残留 22 个 qkv 键）。
+    """
+    net = build_katago_v7_net(board_size=19)
+    sd = net.state_dict()
+    assert not [k for k in sd if 'qkv' in k], '嵌套下 qkv 键没被展开'
+    q = [k for k in sd if k.endswith('.attn.q.weight')]
+    assert len(q) == N_BLOCKS * INNER, len(q)
+    # ⚠ 不能拿全网的 q 键拼 —— 12 通路的 stem 之类也有 `.q.weight` 同名键
+    # （`cat` 会得到 2816 行）。按 MHSA 的真实前缀精确定位一个 block。
+    # 用 MHSA 自己的 dim（不要写死 DIM：真实配置由 NBT_TF_CFG 决定）
+    dim = net.blocks[0].inner[0].attn.dim
+    fused = torch.cat([sd['blocks.0.inner.0.attn.%s.weight' % n] for n in ('q', 'k', 'v')],
+                      dim=0)
+    assert fused.shape == (3 * dim, dim), fused.shape
+    assert torch.equal(fused, net.blocks[0].inner[0].attn.qkv.weight.detach())
+
+
 def test_migrate_leaves_stray_q_weight_alone():
     """只有 q 而没有 k/v 时不能瞎拼（宁可透传，让 EMA.update 报错也不要静默错值）。"""
     odd = {'blocks.0.inner.0.attn.q.weight': torch.randn(DIM, DIM)}

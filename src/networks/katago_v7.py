@@ -424,7 +424,6 @@ class MHSA(nn.Module):
         self.out = _ScaledLinear(self.dim, self.dim, bias=False)
         self.rope = RoPE2D(self.num_heads, self.head_dim)
         self.attn_dropout = float(attn_dropout)
-        self._register_compat_hooks()
 
     def initialize(self, scale=1.0, gain=GAIN_SILU):
         # 逐段初始化（而非对 (3dim,dim) 整块 _trunc_normal_）：三段的 std 只跟
@@ -469,22 +468,40 @@ class MHSA(nn.Module):
         d = self.dim
         return fused[:d], fused[d:2 * d], fused[2 * d:3 * d]
 
-    def _state_dict_hook(self, state_dict, prefix, local_metadata):
-        """把 ``prefix+'qkv.weight'`` 展开成三个 ``q/k/v.weight``。
+    def state_dict(self, *args, **kwargs):
+        """对外吐字典时把 ``qkv.weight`` 展开成三个 ``q/k/v.weight``。
 
-        这是 **state_dict 后置钩子**（pytorch ≥1.13 的
-        ``register_state_dict_post_hook``），只在「对外吐字典」时生效；
-        ``named_parameters()`` 仍返回 ``qkv``（EMA 用，见类文档）。
-        三个切片是 view ⇒ 不额外占内存，但 `.clone()` 是必要的：view 共享
-        同一个 storage，直接写进 state_dict 会让三者别名同一块内存，
-        调用方 `load_state_dict` 进去就会互相污染。
+        ⚠ 两个坑，都是真机 Linux / torch 2.1.0 上踩出来的：
+
+        1. **不能用** ``register_state_dict_post_hook``：那是 **torch ≥2.2**
+           才有的 API，在 2.1.0 上 AttributeError，整个模型在
+           ``MHSA.__init__`` 就建不起来（本地 torch 2.12 有这个 API，
+           所以本地测试全绿也照样漏）。
+        2. **也不能只覆写** ``_save_to_state_dict``：``nn.Module.state_dict``
+           的调用顺序是「先父模块 ``_save_to_state_dict``、**再**递归子模块、
+           最后跑 post-hook」。子模块的 ``qkv.weight`` 是在父模块那步**之后**
+           才写进去的 ⇒ 那一刻去 ``pop`` 找不到键，展开静默失效。
+
+        ⇒ 只能在 ``state_dict()`` 这一层整体收口：递归结束后
+        ``prefix+'qkv.weight'`` 已经存在，这时再展开。``state_dict`` 与
+        ``_load_from_state_dict`` 从 torch 1.x 到 2.x 签名都稳定。
         """
+        # 本层既可能是最外层调用（无 destination），也可能是父模块带着
+        # destination= 递归下来。两种都要处理：本模块的 prefix 在两种情况下
+        # 分别来自 kwargs['prefix'] 或位置参数 args[1]。
+        destination = super().state_dict(*args, **kwargs)
+        prefix = kwargs.get('prefix')
+        if prefix is None:
+            prefix = args[1] if len(args) > 1 else ''
         key = prefix + 'qkv.weight'
-        if key not in state_dict:
-            return
-        fused = state_dict.pop(key)
+        if key not in destination:
+            return destination
+        fused = destination.pop(key)
         for name, part in zip(('q', 'k', 'v'), self._split_qkv(fused)):
-            state_dict[prefix + name + '.weight'] = part.detach().clone()
+            # `.clone()` 必要：三个切片共享同一 storage，不拷就会别名同一块
+            # 内存，调用方 load_state_dict 进去三者互相污染。
+            destination[prefix + name + '.weight'] = part.detach().clone()
+        return destination
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         """反向：见到旧的 ``q/k/v`` 三键就拼回 ``qkv`` 再交父类加载。
@@ -499,17 +516,6 @@ class MHSA(nn.Module):
             for n in ('q', 'k', 'v'):
                 state_dict.pop(prefix + n + '.weight', None)
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
-
-    def _register_compat_hooks(self):
-        # 注意：必须传**普通函数**（闭包），不能传 bound method ——
-        # pytorch 的 `register_state_dict_post_hook` 会对 hook 打
-        # `hook._from_public_api = True` 属性，bound method 不允许设属性，
-        # 会 AttributeError（真机 torch 版本实测）。
-        def _hook(module, state_dict, prefix, local_metadata):
-            self._state_dict_hook(state_dict, prefix, local_metadata)
-
-        self.register_state_dict_post_hook(_hook)
-        return self
 
 
 class SwiGLU(nn.Module):

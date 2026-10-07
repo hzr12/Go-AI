@@ -1,13 +1,13 @@
 """
-19x19 监督训练脚本（AlphaGoZero 风格策略+价值网络）。
+    19x19 监督训练脚本（AlphaGoZero 风格策略+价值网络）。
 
-依赖 scripts/build_dataset.py 产出的紧凑 npz 数据集。监督学习不涉及
-自我对弈，因此绕开了 H1/H2/H4/H5/L1 等自我对弈性能问题。
+    依赖 scripts/build_dataset.py 产出的紧凑 npz 数据集。监督学习不涉及
+    自我对弈，因此绕开了 H1/H2/H4/H5/L1 等自我对弈性能问题。
 
-用法:
-    python scripts/train_sft.py --data data/sft_dataset.npz --device cuda --use-amp \
-        --batch-size 512 --epochs 5 --save-every 2000 --out models/sft.pt
-"""
+    用法:
+        python scripts/train_sft.py --data data/sft_dataset.npz --device cuda --use-amp \
+            --batch-size 512 --epochs 5 --save-every 2000 --out models/sft.pt
+    """
 
 import argparse
 import glob
@@ -78,9 +78,9 @@ def _auto_select_device():
     """自动选择最优训练设备。
 
     策略（按优先级）：
-      1. 探测 CUDA 与 NPU 各卡的空闲显存，挑空闲显存最大的那张卡。
-      2. 若两后端都可用，选「空闲显存更大」的后端（A100 通常 > 910B，但按实测）。
-      3. 都不可用则回退 CPU。
+    1. 探测 CUDA 与 NPU 各卡的空闲显存，挑空闲显存最大的那张卡。
+    2. 若两后端都可用，选「空闲显存更大」的后端（A100 通常 > 910B，但按实测）。
+    3. 都不可用则回退 CPU。
     返回形如 'cuda:0' / 'npu:1' / 'cpu' 的具体设备串。
     """
     def _cuda_free(idx):
@@ -137,7 +137,7 @@ def _downgrade_npu_dist_debug(logger):
     `docs/source/distributed.md` 的 `TORCH_DISTRIBUTED_DEBUG` 一节就是这么写的
     （"consistency and synchronization checks **on every collective call** …
     creating a **wrapper process group** … include a `monitored_barrier`"）。
-     关键点：这层 wrapper 是 **`init_process_group` 建域时按 debug level 挂上去的**，
+    关键点：这层 wrapper 是 **`init_process_group` 建域时按 debug level 挂上去的**，
     **与用哪种包裹层无关**（FSDP1 / DDP 都一样）。而本仓库从未在 NPU 上验证过
     它的开销（910A + HCCL 下 DETAIL 的实测数据缺失）⇒ 在 910A 上仍降为 OFF。
 
@@ -147,13 +147,13 @@ def _downgrade_npu_dist_debug(logger):
     跨 rank 比对参数句柄，在 HCCL 上是纯负担。那套包裹层在 2026-10-01 被 DDP
     取代，该理由随之失效；「保持 OFF」的决定不变。）
 
-     换轨时（2026-10-01）曾经把上面那条历史理由换成「DDP 下 DETAIL 只加 reducer
+    换轨时（2026-10-01）曾经把上面那条历史理由换成「DDP 下 DETAIL 只加 reducer
     bookkeeping、不额外发 collective」—— **那是错的**：额外 collective 来自上面
     那层 PG wrapper（每次 collective 一发 `monitored_barrier`），与 DDP 无关。
     当前这版表述才是有据的，而且比原理由更强：原理由只覆盖「FSDP1 这一种包裹层」，
     现在覆盖**所有**包裹层。
 
-     **实测更正**：曾怀疑 DETAIL 是 4 卡 HCCL 报错的元凶（后来查到的真因是
+    **实测更正**：曾怀疑 DETAIL 是 4 卡 HCCL 报错的元凶（后来查到的真因是
     上一次崩掉的进程留下 HCCP 状态，`EJ0001 ... Maybe the last training process
     is running`）。降级仍然保留，理由只剩「DETAIL 的 PG wrapper 代价与包裹层无关
     且在 NPU 上未验证、保持 OFF」，但**它不是修那个错的原因**，别再拿它当根因。
@@ -198,7 +198,7 @@ def _dist_env_snapshot():
     bits.append('WORLD_SIZE={}'.format(dist.get_world_size()))
     bits.append('LOCAL_RANK={}'.format(os.environ.get('LOCAL_RANK')))
     bits.append('MASTER_ADDR={}:{}'.format(os.environ.get('MASTER_ADDR'),
-                                           os.environ.get('MASTER_PORT')))
+                                        os.environ.get('MASTER_PORT')))
     return ' | '.join(bits)
 
 
@@ -342,12 +342,12 @@ def _assert_init_weights_identical(model, logger):
     为什么是主机 fp64、而不是「设备上换个更准的算法」
     ----------------------------------------------
     * 主机 fp64 的噪声底 ~1e-12（相对 1e-16），比 fp32 的 4.9e-4 好 11 个数量级，
-      单个 ulp 的真实分歧重新变得可检测；
+    单个 ulp 的真实分歧重新变得可检测；
     * 求和顺序由 `model.parameters()` 的迭代顺序唯一确定（形状相同 ⇒ 分块相同），
-      且 `run.txt` 已固定 `OMP_NUM_THREADS=1`；
+    且 `run.txt` 已固定 `OMP_NUM_THREADS=1`；
     * **NPU 上不能用 fp64**：910A 不支持，会派发 AICPU kernel 且故障是**异步**的
-      （2026-10-01 云端实测，见 `tests/test_no_aicpu_ops_in_startup_check.py`）。
-      所以 fp64 只发生在主机，过线一律 fp32。
+    （2026-10-01 云端实测，见 `tests/test_no_aicpu_ops_in_startup_check.py`）。
+    所以 fp64 只发生在主机，过线一律 fp32。
 
     为什么载荷要拆成 hi/lo 两个 fp32
     ------------------------------
@@ -379,7 +379,7 @@ def _assert_init_weights_identical(model, logger):
     _vals = [[float(x.item()) for x in g] for g in gathered]
     if any(v != _vals[0] for v in _vals[1:]):
         vals = ', '.join('rank%d=[%s]' % (i, ', '.join('%.17g' % x for x in v))
-                         for i, v in enumerate(_vals))
+                        for i, v in enumerate(_vals))
         raise RuntimeError(
             '[dist] 初始权重一致性自检失败：各 rank 的参数 checksum 不一致。\n'
             '  各 rank checksum: %s\n'
@@ -406,7 +406,7 @@ def _check_training_env(logger):
         fa_status = "已安装 v%s" % getattr(flash_attn, "__version__", "?")
     except Exception:
         fa_status = ("未安装（可选；Ampere+ CUDA 上比内置 SDPA 再快 20-30%%，"
-                     "安装: pip install flash-attn --no-build-isolation）")
+                    "安装: pip install flash-attn --no-build-isolation）")
     # 2) torch.compile（inductor 后端）
     if hasattr(torch, 'compile'):
         try:
@@ -478,7 +478,7 @@ from scripts.build_dataset import build
 KATAGO_SE_CFG = {
     # ---- 形状（结构，全部对应 AlphaGoNet.__init__ 的参数名）----
     'in_channels': 12,            # 与 AlphaGoNet 默认 / 数据集默认 / GoAI 注册的
-                                  # 12 通道构建器一致
+                                # 12 通道构建器一致
     'arch': 'se_bottleneck',      # KataGo v4+ bottleneck + SE
     'channels': 240,              # backbone_channels
     'blocks': 17,                 # backbone_res_blocks（段内块数）
@@ -604,11 +604,11 @@ def v7_stage1_loss_weights():
 def build_v7_stage1_loss(action_size=V7_ACTION_SIZE, num_bins=None):
     """段 1 的 12 项 loss 装配：score 系权重 0，四主目标正常。
 
-     **12 项一个不少地照常计算**：被关掉的那 8 项仍然会出现在返回值的 `terms`
+    **12 项一个不少地照常计算**：被关掉的那 8 项仍然会出现在返回值的 `terms`
     / `weighted` 两个 dict 里（值恒 0）。这是刻意的 —— 段 2/3 只改系数就能开回来，
     而「结构上保留」在测试里是**逐项可断言**的（见 `tests/test_train_sft_v7.py`）。
 
-     `seki` 的自适应因子（`8·0.005/(0.005+EMA)`）在段 1 仍会随 step 更新
+    `seki` 的自适应因子（`8·0.005/(0.005+EMA)`）在段 1 仍会随 step 更新
     `seki_ema` buffer。它不影响任何数字（系数 0 ⇒ 贡献 0），但**会**让
     checkpoint 里那个 buffer 在段 1 期间跟着占位标签的噪声动。段 2 打开时
     自适应因子从「被占位标签污染过的 EMA」起步，会比从 0 起步保守 —— 这是
@@ -634,7 +634,7 @@ def build_katago_v7_net(*, board_size=V7_BOARD_SIZE, use_checkpoint=1,
     if attn_dropout is not None:
         kw['attn_dropout'] = float(attn_dropout)
     model = _build(board_size=int(board_size), use_checkpoint=bool(use_checkpoint),
-                   **kw)
+                **kw)
     cfg = dict(NBT_TF_CFG)
     cfg['use_checkpoint'] = bool(use_checkpoint)
     cfg['attn_dropout'] = float(
@@ -669,9 +669,9 @@ def v7_peak_activation_bytes(batch, *, n_layers, heads, tokens, elem_size=2):
 
     这是**无 checkpoint** 口径：每样本每层 ``heads × T × T × elem_size``。
 
-     假设**完整注意力**（V7 的 `MHSA` 确实如此）：若将来给它加了窗口，
-       这个估算会**高估**，届时必须改成 ``T_window``。高估的方向是安全的
-       （宁可少报 batch 也不要 OOM 一次）。
+    假设**完整注意力**（V7 的 `MHSA` 确实如此）：若将来给它加了窗口，
+    这个估算会**高估**，届时必须改成 ``T_window``。高估的方向是安全的
+    （宁可少报 batch 也不要 OOM 一次）。
     """
     return int(batch) * int(n_layers) * int(heads) * int(tokens) ** 2 * int(elem_size)
 
@@ -693,41 +693,41 @@ def _device_total_bytes(device):
 
 
 def v7_batch_memory_advice(args, logger, device, *, n_layers, heads, tokens,
-                           use_checkpoint=True):
+                        use_checkpoint=True):
     """按 `--max-gpu-memory` 检查 V7 的 batch；明显超了就**启动前**报错。
 
     为什么不等到 OOM：真机上 OOM 发生在第一个 batch 反向之后，那时已经白跑了
     数据加载、模型构建、CANN 初始化（实测几分钟），而且 OOM 报的是
     `OutOfMemoryError` 这种**看不出原因**的异常 —— 而原因其实只是一行乘法。
 
-     **checkpoint 感知**：开/关 block 级梯度检查点差 **40×**
-       （驻留 6.9 vs 277.1 MB/样本；fp16 下每样本约 4.65 vs 139.7）。
-       历史实测（2026-10-04，云端 910A，batch 3000 ⇒ 64 GB ≈ 21.3 MB/样本）
-       是**补丁前**的数：当时只有 blocks 被 checkpoint，stem 与三个 head
-       走裸前向、激活全程驻留，故比「全开」估算的 8.1 MB/样本高 2.6×。
-       但 21.3 仍只有「无 checkpoint」基线（≈139.7）的 1/6.6 —— block 级
-       checkpoint 在 910A 上**确已生效**，旧注释「没真正生效」是过时误读。
-       当前代码 stem/heads 也已 checkpoint（并修了重算吃不到 autocast 的
-       910A OOM 真因），全开理论应 ≈ 8.1 MB/样本（batch 3000 ≈ 24 GB），
-       待 910A 真机复测确认。这里仍把**实际配置**对应的每样本字节打出来，
-       让人一眼看出处在哪个区间，而不必靠猜。
+    **checkpoint 感知**：开/关 block 级梯度检查点差 **40×**
+    （驻留 6.9 vs 277.1 MB/样本；fp16 下每样本约 4.65 vs 139.7）。
+    历史实测（2026-10-04，云端 910A，batch 3000 ⇒ 64 GB ≈ 21.3 MB/样本）
+    是**补丁前**的数：当时只有 blocks 被 checkpoint，stem 与三个 head
+    走裸前向、激活全程驻留，故比「全开」估算的 8.1 MB/样本高 2.6×。
+    但 21.3 仍只有「无 checkpoint」基线（≈139.7）的 1/6.6 —— block 级
+    checkpoint 在 910A 上**确已生效**，旧注释「没真正生效」是过时误读。
+    当前代码 stem/heads 也已 checkpoint（并修了重算吃不到 autocast 的
+    910A OOM 真因），全开理论应 ≈ 8.1 MB/样本（batch 3000 ≈ 24 GB），
+    待 910A 真机复测确认。这里仍把**实际配置**对应的每样本字节打出来，
+    让人一眼看出处在哪个区间，而不必靠猜。
 
-     只在能查到设备显存时启用。查不到（CPU / 未装 torch_npu）就只打印估算值，
-      不拦 —— 本地冒烟不该被这个门控挡住。
+    只在能查到设备显存时启用。查不到（CPU / 未装 torch_npu）就只打印估算值，
+    不拦 —— 本地冒烟不该被这个门控挡住。
     """
     ckpt = bool(use_checkpoint)
     if ckpt:
         # 驻留（fp16）+ 重算瞬时
         per_sample = (V7_RESIDENT_MB_PER_SAMPLE[True] / 2.0
-                      + V7_TRANSIENT_MB_PER_SAMPLE_FP16)
+                    + V7_TRANSIENT_MB_PER_SAMPLE_FP16)
         basis = ('block 级 checkpoint 开：驻留 %.1f + 瞬时 %.1f = %.1f MB/样本'
-                 % (V7_RESIDENT_MB_PER_SAMPLE[True] / 2.0,
+                % (V7_RESIDENT_MB_PER_SAMPLE[True] / 2.0,
                     V7_TRANSIENT_MB_PER_SAMPLE_FP16, per_sample))
     else:
         attn_mb = (n_layers * heads * tokens * tokens * 2) / 1e6
         per_sample = attn_mb + V7_TRANSIENT_MB_PER_SAMPLE_FP16
         basis = ('block 级 checkpoint **关**：注意力 %d 层 × %.3f MB = %.1f MB/样本'
-                 % (n_layers, attn_mb, attn_mb))
+                % (n_layers, attn_mb, attn_mb))
     attn = per_sample * args.batch_size * 1e6
     total = _device_total_bytes(device)
     logger.info("[mem] V7 显存：%d 层 × %d 头 × %d² token | %s"
@@ -735,8 +735,8 @@ def v7_batch_memory_advice(args, logger, device, *, n_layers, heads, tokens,
                 n_layers, heads, tokens, basis, args.batch_size, attn / 1e9)
     if not ckpt:
         logger.warning("[mem] block 级 checkpoint 没开 —— 这是 40× 的差距"
-                       "（277 vs 6.9 MB/样本）。它由 KATAGO_SE_CFG['grad_checkpoint']"
-                       "决定，且与 --compile / --npu-graph-compile 互斥。")
+                    "（277 vs 6.9 MB/样本）。它由 KATAGO_SE_CFG['grad_checkpoint']"
+                    "决定，且与 --compile / --npu-graph-compile 互斥。")
     if total is None:
         logger.info("[mem] 查不到设备显存总量 ⇒ 跳过 batch 预检"
                     "（--max-gpu-memory 本次不生效）")
@@ -758,13 +758,13 @@ def v7_batch_memory_advice(args, logger, device, *, n_layers, heads, tokens,
             "  ⇒ 要更大的有效 batch，用 --gradient-accumulation-steps 配合"
             "更小的 --batch-size。"
             % (attn / 1e9, args.batch_size, basis,
-               budget / 1e9, total / 1e9, frac, safe))
+            budget / 1e9, total / 1e9, frac, safe))
     if ratio > 0.8:
         logger.warning("[mem] batch=%d 的估算已达预算的 %.0f%%"
-                       "（%.1f / %.1f GB）—— 非注意力部分与碎片可能让它 OOM，"
-                       "建议 --batch-size %d 以下",
-                       args.batch_size, 100 * ratio, attn / 1e9, budget / 1e9,
-                       max(1, int(args.batch_size / ratio)))
+                    "（%.1f / %.1f GB）—— 非注意力部分与碎片可能让它 OOM，"
+                    "建议 --batch-size %d 以下",
+                    args.batch_size, 100 * ratio, attn / 1e9, budget / 1e9,
+                    max(1, int(args.batch_size / ratio)))
 
 
 # --------------------------------------------------------------------------- #
@@ -782,16 +782,16 @@ def _sidecar_kwargs(dataset, games_npz):
     komi, rules, diag = load_games_sidecar(games_npz, dataset)
     print('[sidecar] %s' % diag['path'])
     print('[sidecar] 局数 %d（sidecar）/ %d（数据集）| 有贴目 %d（缺 %d）| '
-          '有分差 %d | 认输 %d'
-          % (diag['sidecar_games'], diag['dataset_games'],
-             diag['has_komi_games'], diag['missing_komi_games'],
-             diag['has_score_games'], diag['resign_games']))
+        '有分差 %d | 认输 %d'
+        % (diag['sidecar_games'], diag['dataset_games'],
+            diag['has_komi_games'], diag['missing_komi_games'],
+            diag['has_score_games'], diag['resign_games']))
     if diag['nondefault_rules']:
         # 如实报「接不进」而不是悄悄按简单局算
         print('[sidecar] %d 局的 g_rules 非默认，但**逐局规则化尚未接进特征**'
-              '（官方 calculateArea 只吃标量 rules_flags）⇒ 这些局的空间特征仍按'
-              '简单局算。这是已知缺口，不是本次接入能解决的。'
-              % diag['nondefault_rules'])
+            '（官方 calculateArea 只吃标量 rules_flags）⇒ 这些局的空间特征仍按'
+            '简单局算。这是已知缺口，不是本次接入能解决的。'
+            % diag['nondefault_rules'])
     return {'game_komi': komi, 'game_rules_flags': rules}
 
 
@@ -885,7 +885,7 @@ def load_games_sidecar(path, dataset):
 def _v7_row_gather(dataset, idxs, boards):
     """一次 gather 取回 ``i-2`` / ``i-1`` 两组邻行（纯 numpy）。
 
-     **不把 offset 0 一起 gather**：`gather_neighbors` 明确拒绝 0（「邻行
+    **不把 offset 0 一起 gather**：`gather_neighbors` 明确拒绝 0（「邻行
     gather 存在的意义就是取**别的**行」），当前盘面直接从 `boards[idxs]` 取。
     两条路取的是**同一个**数组对象上的 fancy-index，所以口径一致。
     """
@@ -903,16 +903,16 @@ def v7_batch_features(dataset, idxs, *, boards=None, rules_flags=0):
         dtype 与 `GoBoard.feature_planes_batched` / `feature_v7.py` 一致（fp16），
         AMP 下不必再升精度。
 
-     **对称增强不在这里做**：8 路 dihedral 变换由调用方（预取 worker 或
+    **对称增强不在这里做**：8 路 dihedral 变换由调用方（预取 worker 或
     `v7_batch_sync`）施加，且**必须与标签用的同一份 `tforms`**（标签侧的
     `next_move` / `future` 会被那一份同步重映射；输入与标签不同源是「loss 照降、
     棋力不涨」的经典静默错）。19 维全局量在棋盘翻转下不变（与 `_build_labels`
     docstring 的口径一致），故只有 22 通道空间量要变换。
 
-     `game_row=None` ⇒ 贴目按 0 处理（`feature_v7._komi_of` 的 NaN 分支口径）：
-      主数据集 npz **没有**贴目列，SGF 的 `KM` 在 D0 sidecar（B 组）里。
-      后果是全局 ch5（`selfKomi/20`）恒 0、全局 ch18 的 parity 相位按 0 算 ——
-      这两维在段 1 拿不到真值，是已知缺口，不在这里假装它有。
+    `game_row=None` ⇒ 贴目按 0 处理（`feature_v7._komi_of` 的 NaN 分支口径）：
+    主数据集 npz **没有**贴目列，SGF 的 `KM` 在 D0 sidecar（B 组）里。
+    后果是全局 ch5（`selfKomi/20`）恒 0、全局 ch18 的 parity 相位按 0 算 ——
+    这两维在段 1 拿不到真值，是已知缺口，不在这里假装它有。
     """
     from src.data.feature_v7 import spatial_channels_v7, global_features_v7
     idxs = np.asarray(idxs, dtype=np.int64)
@@ -947,13 +947,13 @@ def v7_batch_features(dataset, idxs, *, boards=None, rules_flags=0):
 def _dense_move_target(moves, action_size):
     """``(B,)`` 行号 → ``(B, action_size)`` 稠密 one-hot；**-1 ⇒ 全零行**。
 
-     `-1` 不是「随便哪个类」：dataset 的 `next_move` 用 -1 表示「局末手 /
+    `-1` 不是「随便哪个类」：dataset 的 `next_move` 用 -1 表示「局末手 /
     下一行不是同一局 / 下一手是 pass」，语义是**没有下一手**，对应
     `w['policy_opp'] == 0`。若交给 `F.one_hot(-1)`，PyTorch 的行为不是本仓
     可以依赖的契约（不同版本不同），所以这里**显式**置零 —— 权重本来就是 0，
     全零行既安全又语义正确。
 
-     **设备无关：不许把设备张量送进 numpy**（2026-10-04 云端 910A 实测崩）
+    **设备无关：不许把设备张量送进 numpy**（2026-10-04 云端 910A 实测崩）
     ------
     调用方传的是 `move_t`，而它是 `torch.from_numpy(...).to(device)` 的结果
     ⇒ 在 NPU 上是 **npu:0 设备张量**，而 `np.asarray()` 对它抛：
@@ -1004,7 +1004,7 @@ def v7_loss_labels(labels_dict, moves, *, action_size=V7_ACTION_SIZE):
                                 dataset 叫 `future`；值域与 -1 哨兵完全一致）
     ==========================  ==============================================
 
-     **`w['futurepos']` 绝不能改成 OR**（这是承重语义，不是风格）：
+    **`w['futurepos']` 绝不能改成 OR**（这是承重语义，不是风格）：
     loss 的 #11 把 `future` reshape 成 `(b,2,bs²)` 之后**塌成逐样本标量**、
     再乘**一个**权重，而 `_weighted_mean` 是 `(per_sample*weight).mean()`
     （**刻意不除 Σw**）⇒ 权重的最小作用单位是「整块 2×bs²」。
@@ -1012,7 +1012,7 @@ def v7_loss_labels(labels_dict, moves, *, action_size=V7_ACTION_SIZE):
     恒 −0.76 的假平面。dataset 给的**与**语义（`w_h0 & w_h1`）是唯一正确的
     口径，本函数**原样透传**，不改。
 
-     **`outcome_black` 不能由 `outcome * to_play` 推出**：`0 * -1 == 0`，
+    **`outcome_black` 不能由 `outcome * to_play` 推出**：`0 * -1 == 0`，
     于是「白胜」会被报成「黑胜」。直接用 dataset 给的键。
     """
     lbl = dict(labels_dict)
@@ -1046,18 +1046,18 @@ def _rebind_futurepos_mmap(dataset):
     ------------------------------
     重开后每个 worker 各持一个独立的按需分页映射，页缓存由 OS 在进程间共享，
     内存占用是「被点到的页」而不是「12.3 GB」。
-     `dataset._futurepos_boards` 末尾那句 `np.asarray(boards)` 会把 memmap 降级成
+    `dataset._futurepos_boards` 末尾那句 `np.asarray(boards)` 会把 memmap 降级成
     `ndarray` **视图**（共享同一块映射、不复制），所以判「是否还挂着映射」要看
     base 链上有没有 memmap，**不能**判 `isinstance(x, np.memmap)`。
 
-     **绝不在 worker 里走会落盘的那条分支**
+    **绝不在 worker 里走会落盘的那条分支**
     那会把 12.3 GB × worker 数真正写出来（还可能几个进程同时写同一个路径互相
     踩坏）。本函数只把**父进程已经落好的 `.npy` 路径**重新 `np.load` 一次 ——
     那个路径由 `attach_futurepos(source=<.npy>)` 直接给出，或从
     `fp['materialized_paths']` 取回（那只是几个**字符串**的字典，穿过 pickle
     的代价可忽略）。见 `_futurepos_mmap_path`。
 
-     **它依赖父进程已经 warm 过**：只有 warm 过，`materialized_paths` 才被填上，
+    **它依赖父进程已经 warm 过**：只有 warm 过，`materialized_paths` 才被填上，
     worker 才知道该重开哪个文件。`main()` 里 `warm_futurepos()` 因此排在
     `_BatchPrefetcher(...)` **之前**（顺序有测试钉）。
 
@@ -1083,9 +1083,9 @@ def _futurepos_mmap_path(dataset):
     """从（已被 pickl 过来的）futurepos 配置里取「可以直接 ``np.load`` 的 .npy」。
 
     两条命中路径：
-      1. `fp['materialized_paths']['boards']` —— 父进程跑过 `materialize_dataset`
-         留下的产物路径（只有字符串 ⇒ 能安全穿过 spawn 的 pickle）；
-      2. `fp['source']` 是路径 —— `attach_futurepos(source=<.npy>)` 的直接形态。
+    1. `fp['materialized_paths']['boards']` —— 父进程跑过 `materialize_dataset`
+        留下的产物路径（只有字符串 ⇒ 能安全穿过 spawn 的 pickle）；
+    2. `fp['source']` 是路径 —— `attach_futurepos(source=<.npy>)` 的直接形态。
 
     返回 `None` 的两种情况：futurepos 没启用（`fp is None` / `mode != 'live'`）、
     或来源是**数组**（那已经在 pickle 里整份传过来了，再开一次没有意义）。
@@ -1106,14 +1106,14 @@ def save_model(model, path):
     """保存模型权重，并剥离 DDP 包裹产生的 'module.' 前缀与 torch.compile 产生的
     '_orig_mod.' 段，保证存档无论是否经 DDP/compile 都能被后续普通加载/resume 使用。
 
-     DDP 下**直接** `model.state_dict()` 就是完整权重，不需要任何汇聚 helper：
+    DDP 下**直接** `model.state_dict()` 就是完整权重，不需要任何汇聚 helper：
     DDP 每 rank 各持一份完整模型、只同步梯度，`state_dict()` 本身**不是
     collective**（没有 all-gather）。所以调用方把它放在 `is_main` 分支里既安全
     也没有额外开销 —— 键名形如 'module.backbone.…'，剥掉 'module.' 之后与包裹前
     完全同形，`src/inference.py` / `scripts/evaluate.py` / `webui.py` /
     `_load_model_state` 一行都不用改，旧 checkpoint 继续可读。
 
-     '_orig_mod.' 出现在**路径任意层级**，不只在开头。两种 compile 形态落点不同：
+    '_orig_mod.' 出现在**路径任意层级**，不只在开头。两种 compile 形态落点不同：
     整模型 compile（CUDA `--compile 1`）把**顶层**包成 OptimizedModule
     （'_orig_mod.backbone.xxx.weight'），而 Linear-only compile（D2，
     `--npu-graph-compile 1`，见 `_compile_linear_submodules`）顶层仍是原模型、
@@ -1171,22 +1171,22 @@ _OVERFLOW_WARN_SCALE = 1024.0
 
 
 def _locate_overflow(optimizer, logger, max_report=3, phase='unscale 后',
-                     named_params=None):
+                    named_params=None):
     """定位参数组里的 inf/nan 梯度来源，只报不修（修是别处的责任）。
 
-     **必须在 `clip_grad_norm_` 之前调用**（2026-10-04 云端 910A 实测打出来的）。
-       `clip_grad_norm_(max_norm=1.0)` 的实现是
+    **必须在 `clip_grad_norm_` 之前调用**（2026-10-04 云端 910A 实测打出来的）。
+    `clip_grad_norm_(max_norm=1.0)` 的实现是
 
-           total_norm = ‖所有梯度‖                   # 有 inf ⇒ total_norm = inf
-           clip_coef  = max_norm/(total_norm + 1e-6)  # = 0
-           p.grad.mul_(clip_coef)                    # inf × 0 = NaN
+        total_norm = ‖所有梯度‖                   # 有 inf ⇒ total_norm = inf
+        clip_coef  = max_norm/(total_norm + 1e-6)  # = 0
+        p.grad.mul_(clip_coef)                    # inf × 0 = NaN
 
-       `total_norm = inf ⇒ clip_coef = 0 < 1` ⇒ 这个分支**一定会进**。所以在
-       clip 之后统计，「inf 个数」**结构上恒为 0**，看到的 nan 全是 clipper 造的。
+    `total_norm = inf ⇒ clip_coef = 0 < 1` ⇒ 这个分支**一定会进**。所以在
+    clip 之后统计，「inf 个数」**结构上恒为 0**，看到的 nan 全是 clipper 造的。
 
-       后果不是「报告不好看」，而是**方向性误导**：真机上那行
-       `有 0 个 inf / 211 个 nan 参数` 被读成「反向算出了 NaN」，排查方向偏向
-       loss 与前向；而实际上**前向与 loss 都有限**，真凶是**反向算出了 inf**。
+    后果不是「报告不好看」，而是**方向性误导**：真机上那行
+    `有 0 个 inf / 211 个 nan 参数` 被读成「反向算出了 NaN」，排查方向偏向
+    loss 与前向；而实际上**前向与 loss 都有限**，真凶是**反向算出了 inf**。
 
     Args:
         named_params: ``{参数名: 参数}``，用于按模块点名。缺省则跳过该段
@@ -1210,13 +1210,13 @@ def _locate_overflow(optimizer, logger, max_report=3, phase='unscale 后',
             bad.append((gi, lrs[gi], n_inf, n_nan, is_value))
     if not bad:
         logger.warning("[fp16] GradScaler 报告溢出，但此刻（%s）参数上没有 "
-                       "inf/nan —— 溢出可能发生在已被释放的中间张量里。", phase)
+                    "inf/nan —— 溢出可能发生在已被释放的中间张量里。", phase)
         return
     for gi, lr, n_inf, n_nan, is_value in bad[:max_report]:
         logger.warning("[fp16] 梯度溢出（%s）：参数组 %d（%s, lr=%.2e）"
-                       "有 %d 个 inf / %d 个 nan 参数",
-                       phase, gi, 'value head' if is_value else 'backbone/policy',
-                       lr, n_inf, n_nan)
+                    "有 %d 个 inf / %d 个 nan 参数",
+                    phase, gi, 'value head' if is_value else 'backbone/policy',
+                    lr, n_inf, n_nan)
     # **按模块点名**：组名只是按 LR 比值**猜**的（`--value-lr-mult` 一改 guess
     #   就失效 —— 真机日志里三组全被打成 "backbone/policy" 就是这个原因），
     #   而「哪个模块的梯度爆了」才是能直接定位的信息。
@@ -1238,24 +1238,24 @@ def _locate_overflow(optimizer, logger, max_report=3, phase='unscale 后',
         if mods:
             top = sorted(mods.items(), key=lambda kv: -(kv[1][0] + kv[1][1]))[:8]
             logger.warning("[fp16] 溢出按模块点名：%s",
-                           ', '.join('%s[inf=%d nan=%d]' % (n, i, j)
-                                     for n, (i, j) in top))
+                        ', '.join('%s[inf=%d nan=%d]' % (n, i, j)
+                                    for n, (i, j) in top))
             logger.warning("[fp16] 下一个 %s 里这些 inf 会变成 NaN"
-                           "（clip_grad_norm_ 算出的 clip_coef=0，inf×0=NaN），"
-                           "所以**之后**再统计就看不到 inf 了。",
-                           'clip_grad_norm_')
+                        "（clip_grad_norm_ 算出的 clip_coef=0，inf×0=NaN），"
+                        "所以**之后**再统计就看不到 inf 了。",
+                        'clip_grad_norm_')
     if any(b[4] for b in bad):
         logger.warning("[fp16] 溢出集中在 value head —— 优先下调 --value-loss-weight"
-                       "（默认 1.0，无补偿）与 --value-lr-mult（默认 5.0）")
+                    "（默认 1.0，无补偿）与 --value-lr-mult（默认 5.0）")
     if any(not b[4] for b in bad):
         logger.warning("[fp16] 溢出涉及 backbone/policy —— 优先下调 --lr。"
-                       "**不要**去调 --attn-window：V7 的 MHSA 没有窗口参数"
-                       "（该旗标只对 12 通道路径有意义，而它同样没接进建网，"
-                       "见 main() 里 V7 的 attn-window 提示与 "
-                       "tests/test_no_aicpu_ops_in_startup_check.py）。"
-                       "若报的是 nan（而不是 inf），先怀疑**前向**而非梯度："
-                       "GradScaler 只缩放梯度，NaN 一旦来自前向就不可恢复，"
-                       "降 scale 无用。")
+                    "**不要**去调 --attn-window：V7 的 MHSA 没有窗口参数"
+                    "（该旗标只对 12 通道路径有意义，而它同样没接进建网，"
+                    "见 main() 里 V7 的 attn-window 提示与 "
+                    "tests/test_no_aicpu_ops_in_startup_check.py）。"
+                    "若报的是 nan（而不是 inf），先怀疑**前向**而非梯度："
+                    "GradScaler 只缩放梯度，NaN 一旦来自前向就不可恢复，"
+                    "降 scale 无用。")
 
 def _grads_nonfinite_local(optimizer):
     """本地：任一参数梯度里有 inf/nan？
@@ -1324,13 +1324,13 @@ def _scaler_step_global(scaler, optimizer, *, scale_before, use_scaler,
 
     * `use_scaler=False`（bf16 路径）⇒ 直接 `optimizer.step()`，不做任何判定；
     * 全局有非有限 ⇒ **所有 rank 一起跳**，并把 scale 显式设成
-      `scale_before * backoff_factor`。**显式给值**是关键：`update()` 免参版会读
-      本地 `found_inf`（在没溢出的 rank 上是 0，于是那个 rank 会把 scale 往**上**调）
-      ⇒ 各 rank 的 scale 就此错位，而 `scaler.unscale_` 是在各 rank 上各自除以
-      自己的 scale 的，除数不同 ⇒ all_reduce 混合的是不同尺度的梯度；
+    `scale_before * backoff_factor`。**显式给值**是关键：`update()` 免参版会读
+    本地 `found_inf`（在没溢出的 rank 上是 0，于是那个 rank 会把 scale 往**上**调）
+    ⇒ 各 rank 的 scale 就此错位，而 `scaler.unscale_` 是在各 rank 上各自除以
+    自己的 scale 的，除数不同 ⇒ all_reduce 混合的是不同尺度的梯度；
     * 全局干净 ⇒ `optimizer.step()` + `scaler.update()` 免参版（保持
-      `growth_interval` 的增长语义不变；此时每个 rank 本地都没 inf，
-      `update()` 看到的是一致的 0）。
+    `growth_interval` 的增长语义不变；此时每个 rank 本地都没 inf，
+    `update()` 看到的是一致的 0）。
 
     代价：跳步那条走的是显式 `new_scale`，不会顺手重置 `growth_tracker`。
     全部 rank 走**同一条**分支，所以 tracker 仍然跨 rank 一致；只是"连续成功"的
@@ -1342,8 +1342,8 @@ def _scaler_step_global(scaler, optimizer, *, scale_before, use_scaler,
     if _grads_nonfinite_any_rank(optimizer):
         if logger is not None:
             logger.debug('[fp16] 全局判定有非有限梯度，全体跳步（scale %.0f -> %.0f）',
-                         scale_before,
-                         scale_before * scaler.get_backoff_factor())
+                        scale_before,
+                        scale_before * scaler.get_backoff_factor())
         scaler.update(scale_before * scaler.get_backoff_factor())
         return False
     optimizer.step()
@@ -1354,7 +1354,7 @@ def _scaler_step_global(scaler, optimizer, *, scale_before, use_scaler,
 def _ema_key(name: str) -> str:
     """EMA shadow 的键：去掉 torch.compile 往参数名里插的 '_orig_mod.' 段。
 
-     必须去，否则编译一开就 KeyError：EMA 在**编译之前**按当时的
+    必须去，否则编译一开就 KeyError：EMA 在**编译之前**按当时的
     `named_parameters()` 名字建 shadow，而 update / apply_shadow / restore 是按
     **运行时**的名字取键的。torch.compile 无论哪种形态都会改名字（整模型 compile
     插在开头，Linear-only compile 插在路径中段），键空间一变就再也对不上。
@@ -1378,7 +1378,7 @@ class EMA:
         self.model = model
         self.decay = decay
         self.shadow = {_ema_key(name): param.clone().detach()
-                       for name, param in model.named_parameters()}
+                    for name, param in model.named_parameters()}
 
     @torch.no_grad()
     def update(self):
@@ -1405,7 +1405,7 @@ class EMA:
 
     def apply_shadow(self):
         self.backup = {_ema_key(name): param.clone()
-                       for name, param in self.model.named_parameters()}
+                    for name, param in self.model.named_parameters()}
         for name, param in self.model.named_parameters():
             param.data = self.shadow[_ema_key(name)].data
 
@@ -1486,7 +1486,7 @@ def attach_soft_index(dataset, path, data_npz=None):
         idx     int64  (M,)      数据集行号
         policy  float16(M, 362)  对应的 KataGo 访问分布（行和 ≈ 1）
 
-     必须在**预取器 fork 之前**调用：软标签挂在 dataset 对象上，fork 之后
+    必须在**预取器 fork 之前**调用：软标签挂在 dataset 对象上，fork 之后
     再挂就只有父进程看得见，worker 会继续造 `soft_mask` 全 0 的批 —— 而训练
     不报任何错，只是「软标签训了个寂寞」。
 
@@ -1509,8 +1509,8 @@ def attach_soft_index(dataset, path, data_npz=None):
     if data_npz is not None:
         if 'cache_meta' not in z.files:
             print(f'[soft] ⚠ {path} 没有 cache_meta 指纹（旧版产物），'
-                  f'无法校验新鲜度 —— 建议用 scripts/build_soft_index.py 重建',
-                  flush=True)
+                f'无法校验新鲜度 —— 建议用 scripts/build_soft_index.py 重建',
+                flush=True)
         else:
             import json as _json  # noqa: PLC0415
             from src.data.kata_label_join import npz_fingerprint  # noqa: PLC0415
@@ -1531,18 +1531,18 @@ def attach_soft_index(dataset, path, data_npz=None):
             # mtime/size/game_id 去重数不符只告警：跨机拷贝会改 mtime，硬失败
             # 会误伤；但它们值得被看见。
             drift = [k for k in ('n_distinct', 'mtime_ns', 'size')
-                     if ds_meta.get(k) not in (None, cur.get(k))]
+                    if ds_meta.get(k) not in (None, cur.get(k))]
             if drift:
                 print(f'[soft] ⚠ {path} 相对其构建时的数据集有字段漂移：{drift}'
-                      f'（行数一致 ⇒ 行号仍有效；若换过数据内容请重建索引）',
-                      flush=True)
+                    f'（行数一致 ⇒ 行号仍有效；若换过数据内容请重建索引）',
+                    flush=True)
     idx = np.asarray(z['idx']).ravel()
     pol = np.asarray(z['policy'])
     diag = dataset.attach_soft(idx, pol)
     diag.update({'path': os.path.abspath(path),
-                 'index_rows': int(idx.size),
-                 'policy_shape': tuple(int(x) for x in pol.shape),
-                 'hit_rate': (int(idx.size) / max(len(dataset), 1))})
+                'index_rows': int(idx.size),
+                'policy_shape': tuple(int(x) for x in pol.shape),
+                'hit_rate': (int(idx.size) / max(len(dataset), 1))})
     return diag
 
 
@@ -1553,11 +1553,11 @@ def resolve_policy_loss_kind(policy_loss, soft_index, v7_packed=False):
     就用软 CE（段 2 的全部意义），没给就原样返回 `--policy-loss`（段 1 的旧路径，
     数值逐位不变）。
 
-     显式 `soft_ce` 却没有软标签来源必须**报错**：`compute_policy_loss`
-      拿不到 `soft`/`soft_mask` 会抛 ValueError，但那是训练跑到第一个 batch
-      时的栈 —— 这里提前拒掉，错误信息直指 CLI。
-     `--policy-loss huber` + `--soft-index` 也报错：huber 分支**完全不看**
-      软标签，组合起来等于「以为在蒸馏，其实在回归 one-hot 的概率」。
+    显式 `soft_ce` 却没有软标签来源必须**报错**：`compute_policy_loss`
+    拿不到 `soft`/`soft_mask` 会抛 ValueError，但那是训练跑到第一个 batch
+    时的栈 —— 这里提前拒掉，错误信息直指 CLI。
+    `--policy-loss huber` + `--soft-index` 也报错：huber 分支**完全不看**
+    软标签，组合起来等于「以为在蒸馏，其实在回归 one-hot 的概率」。
     """
     # V7 的 stdata 分片把 KataGo 的搜索分布**内建**在行里（`V7PackedDataset`
     # 直接给 `soft` / `soft_opp` / `soft_mask`），不经过 `--soft-index`。
@@ -1584,7 +1584,7 @@ def _soft_kind_for_step(hard_kind, step, soft_every):
     `soft_every == 1`（默认）⇒ 每步都走软 CE。`> 1` ⇒ 只有 `step % N == 0` 的
     那些步走软 CE，其余步回退到 `--policy-loss` 的硬目标口径。
 
-     非软步里的软行会按 **one-hot** 训（软项被完全跳过）。这正是 spec §5
+    非软步里的软行会按 **one-hot** 训（软项被完全跳过）。这正是 spec §5
     退路表点名的「混合训练 ⇒ index 0 向两种语义折中」，所以默认值是 1，
     且 `>1` 时 main() 会打 warning。
     """
@@ -1602,7 +1602,7 @@ def narrow_to_soft_rows(train_idx, dataset):
     `--soft-weight 0` 关不掉（那是「开了软标签但 99% 样本仍在教 one-hot」的
     静默半吊子）。与 Phase 4 item 3 的滑动窗口**正交**，两者可叠加。
 
-     收窄到 0 行必须**报错**而不是退回全量：静默退回正是本函数要防的那个
+    收窄到 0 行必须**报错**而不是退回全量：静默退回正是本函数要防的那个
     失败模式（用户以为在跑段 2，实际在跑段 1）。
     """
     # 先钉成 int64 再用。上游按棋局切分是 `np.array([...])` 的推导式，
@@ -1638,7 +1638,7 @@ def load_dataset(path):
     # SupervisedDataset 的默认 12 是它自己的默认（dataset.py C7），这里不显式传
     # 就等于赌「模型侧也是 12」—— 两者一旦分叉，第一个 batch 就形状错。
     return SupervisedDataset({k: d[k] for k in d.files},
-                             n_channels=KATAGO_SE_CFG['in_channels'])
+                            n_channels=KATAGO_SE_CFG['in_channels'])
 
 
 # ---- eval 的确定性：固定采样源 + 与训练 RNG 流隔离 + 关闭数据增强 ----
@@ -1713,8 +1713,175 @@ def _eval_batch_budget(n_samples, bs, max_batches):
     return min(total, max_batches), total > max_batches
 
 
+#: 昇腾 aclnn 的 ``aclFormat`` 取值。`torch_npu.Format` 枚举在 2.1.0 上不存在，
+#: 只能用字面量；取值来自 CANN 文档的格式表，实测（2026-10-07，torch_npu
+#: 2.1.0.post10）`npu_format_cast(x, 1)` 之后 `get_npu_format(x)` 确实变成 1。
+ACL_FORMAT_NHWC = 1
+ACL_FORMAT_NCHW = 0
+
+
+def _npu_nhwc_formats():
+    """探测 torch_npu 上「把张量转成 NHWC」的所有可用入口，返回 [(名字, 转换器)]。
+
+    为什么要探测而不是写死一个 API
+    ------------------------------
+    昇腾的布局 API 在版本间变动很大，而本仓库的训练环境是
+    **torch 2.1.0 + torch_npu 2.1.0**（2023-10，对应 CANN 7.0.RC1），
+    比官方文档里那个 `npu_format_cast`（标注 beta、随 CANN 8.x 提供）**老得多**。
+    已经踩过的坑，按时间顺序：
+
+    1. `model.to(memory_format=torch.channels_last)`
+        → `Only contiguous_format or preserve_format is supported.`
+    2. `param.data.contiguous(memory_format=torch.channels_last)`
+        → `NPU contiguous operator only supportted contiguous memory format.`
+        (ERR01007 OPS feature not supported)
+3. `torch_npu.npu_format_cast(t, torch_npu.Format.NHWC)`
+        → `AttributeError: module 'torch_npu' has no attribute 'Format'`
+        （`getattr(torch_npu, 'Format', None)` 也是 None ⇒ 枚举确实没有）
+
+    ⇒ 探针结果（2026-10-07，`scripts/probe_npu_layout.py`，torch 2.1.0 +
+    torch_npu **2.1.0.post10**）：**`npu_format_cast` 存在且能用整数调用**，
+    转换后 `get_npu_format` 确实变成 1（NHWC）。也就是说 `channels_last`
+    在这台机器上**是可用的**，只是必须走整数 aclFormat、不能引用那个
+    不存在的枚举。
+
+    ⇒ 于是这里仍然保留运行时探测而非写死：换一台机器 / 换个 torch_npu 版本时，
+    探测会自动落到能用的那个入口，并把入口名回灌到日志（[model] 那行末尾有
+    `入口=...`）。一个都没有时返回空列表，由调用方降级（「只慢不坏」契约）。
+
+    注意探测必须用 `getattr(mod, 'Name', None)`：**不能**写
+    `getattr(mod, 'Format', 1)`，因为那会先取 `mod.Format` 再在它上面取属性，
+    属性不存在时抛的是 `AttributeError` 而不是返回默认值 —— 第 3 个坑就栽在这。
+    """
+    try:
+        import torch_npu
+    except Exception:                                  # 没装 torch_npu
+        return []
+    out = []
+
+    fn = getattr(torch_npu, 'npu_format_cast', None)
+    fmt_enum = getattr(torch_npu, 'Format', None)
+    # 入口 1：枚举与函数同时存在（较新 torch_npu）
+    if callable(fn) and fmt_enum is not None:
+        nhwc = getattr(fmt_enum, 'NHWC', None)
+        if nhwc is not None:
+            out.append(('npu_format_cast(t, Format.NHWC)',
+                        lambda t, _fn=fn, _f=nhwc: _fn(t, _f)))
+    # 入口 2：**本仓库真机走的就是这条** —— 函数在、枚举不在，按 CANN 文档的
+    # 整数值传（NHWC=1）。已实测：`get_npu_format` 转换前 0、转换后 1。
+    if callable(fn) and not any(n.startswith('npu_format_cast') for n, _ in out):
+        out.append(('npu_format_cast(t, %d)  # 枚举缺失，用文档整数值'
+                    % ACL_FORMAT_NHWC,
+                    lambda t, _fn=fn: _fn(t, ACL_FORMAT_NHWC)))
+    return out
+
+
+def _cast_nhwc_npu(t, verify=True):
+    """用**第一个可用**的昇腾入口把 4D 张量转成 NHWC。
+
+    一个都不可用时抛 ``NotImplementedError``，由调用方降级 —— 这里绝不静默
+    返回原张量：静默返回会让权重保持 NCHW 而日志说「已启用」，是假成功。
+
+    ``verify=True`` 时会用 ``torch_npu.get_npu_format`` **读回**实际格式并断言
+    它真的是 NHWC。为什么要多这一步：``npu_format_cast`` 返回新张量、不改原张量，
+    万一某些版本/形状上它静默不生效（返回的仍是 NCHW），没有校验的话日志会照样
+    打「已启用」，而真实布局没变 ⇒ 权重与输入都白搬，等于白开。转换**声称**成功
+    不算数，读回来是 1 才算数。
+    """
+    fmts = _npu_nhwc_formats()
+    if not fmts:
+        raise NotImplementedError(
+            'torch_npu 上没有任何可用的 NHWC 转换入口（该版本不支持用户侧布局控制）')
+    name, fn = fmts[0]
+    out = fn(t)
+    if not verify:
+        return out
+    try:
+        import torch_npu
+        getter = getattr(torch_npu, 'get_npu_format', None)
+        if getter is not None:
+            got = getter(out)
+            if int(got) != ACL_FORMAT_NHWC:
+                raise RuntimeError(
+                    'npu_format_cast 未生效：读回 format=%r（期望 %d=NHWC），'
+                    '入口=%s' % (got, ACL_FORMAT_NHWC, name))
+    except ImportError:
+        pass          # 没装 torch_npu（本地 CPU 测试），无法校验，跳过
+    return out
+
+
+def _apply_channels_last_(model, backend='npu'):
+    """就地把所有 **4D** 权重（Conv2d.kernel）转成 NHWC，返回转换个数。
+
+    失败的**每一条路**都会抛出去，由调用方降级 —— helper 内部不吞异常
+    （吞掉的话调用方会以为转换成功、继续把输入也转成 NHWC ⇒ 权重 NCHW +
+    输入 NHWC 错配）。调用方拿到异常就把 ``use_channels_last`` 置回 False。
+
+    为什么不能用 ``model.to(memory_format=torch.channels_last)``
+    --------------------------------------------------------------
+    ``torch_npu`` 覆写了 ``Module.to``（``torch_npu/utils/_module.py``），
+    只接受 ``contiguous_format`` / ``preserve_format``，传 channels_last 直接
+    ``RuntimeError: Only contiguous_format or preserve_format is supported.``
+    （真机 torch 2.1.0 实测）。
+
+    torch 2.1.0 上连**张量级** ``.contiguous(memory_format=channels_last)`` 也不行
+    —— ``torch_npu`` 的 contiguous 算子只认 contiguous 布局：
+
+        RuntimeError: NPU contiguous operator only supportted contiguous
+        memory format.  [ERROR] ERR01007 OPS feature not supported
+
+    ⇒ NPU 上必须走**昇腾自己的** format cast API：
+    ``torch_npu.npu_format_cast(t, torch_npu.Format.NHWC)``。
+    它作用在 aclnn 的 ``aclFormat`` 上（NHWC=1），是 CANN 卷积核真正认的布局；
+    ``torch.channels_last`` 只是 stride 的排列，在 NPU 这条路上根本走不通。
+    该 API 返回**新张量**（不改原张量），且标注为 beta，所以要探测存在性。
+    非 NPU 后端仍走 ``.contiguous(memory_format=...)``（CUDA/CPU 有效）。
+
+    ``param.data = ...`` 就地换张量而非新建 Parameter，是为了保住 optimizer
+    已经持有的引用 —— 否则这个 flag 一开，优化器就管不到卷积核了（会静默变成
+    「卷积核不更新」，比崩溃更难查）。
+    """
+    n = 0
+    if backend == 'npu':
+        for mod in model.modules():
+            for name, param in list(mod.named_parameters(recurse=False)):
+                if param.dim() == 4 and param.numel() > 0:
+                    param.data = _cast_nhwc_npu(param.data)
+                    n += 1
+        return n
+    for mod in model.modules():
+        for name, param in list(mod.named_parameters(recurse=False)):
+            if param.dim() == 4 and param.numel() > 0:
+                param.data = param.data.contiguous(memory_format=torch.channels_last)
+                n += 1
+    return n
+
+
+def _to_nhwc(t):
+    """把 4D 输入张量转成 NHWC（**按张量所在设备**自动选后端），非 4D 原样返回。
+
+    后端由 ``t.device.type`` 判定，不靠调用方传 —— 调用点在训练/评估热循环里
+    （5 处），多传一个 backend 参数等于给每处都留一个传错的机会，而「权重用
+    A 转换、输入用 B 转换」正是这次要根治的错。
+
+    与 `_apply_channels_last_` 用同一套后端判据：NPU 走
+    ``torch_npu.npu_format_cast``（``.to(memory_format=channels_last)`` 在
+    torch 2.1.0 + torch_npu 上会 ERR01007），其余走 PyTorch 原生转换。
+
+    ⚠ 输入与权重必须用同一套转换：权重转了、输入没转（或反过来）会让每次
+    卷积白搬一次布局 —— 那等于 flag 没开。调用方只在权重转换**成功**后才置
+    ``use_channels_last=True``（见 main），所以这里抛异常必须冒到训练层，
+    不能静默跳过（静默跳过 = 权重 NHWC + 输入 NCHW，正是最坏组合）。
+    """
+    if t.dim() != 4:
+        return t
+    if getattr(t.device, 'type', None) == 'npu':
+        return _cast_nhwc_npu(t)
+    return t.to(memory_format=torch.channels_last)
+
+
 def evaluate_top1(model, dataset, idxs, bs, device, amp_dtype, max_batches=50,
-                  use_channels_last=False, rng=None):
+                use_channels_last=False, rng=None):
     """验证集 top-1 着法准确率。返回 (accuracy, num_samples)。
 
     返回形状按历史契约保持二元组（本函数在 train_sft.py 内当前没有调用点，
@@ -1743,7 +1910,7 @@ def evaluate_top1(model, dataset, idxs, bs, device, amp_dtype, max_batches=50,
             states_np, moves_np, _ = dataset.sample_batch_numpy(sel, rng=eval_rng, augment=False)
             state = torch.from_numpy(states_np).to(device)
             if use_channels_last:
-                state = state.to(memory_format=torch.channels_last)
+                state = _to_nhwc(state)
             move_t = torch.from_numpy(moves_np).to(device)
             with maybe_autocast(device, amp_dtype):
                 policy_logits, _ = model(state)
@@ -1817,7 +1984,7 @@ def evaluate_metrics_v7(model, dataset, idxs, bs, device, amp_dtype, *,
     ``brier``
         value 三分类的 Brier score（越小越好），``--early-stop-metric loss``
         默认就看它。
-     policy 通道 1 是 ``π_opp``（引擎语义里叫 optimism），本指标**只看通道 0** ——
+    policy 通道 1 是 ``π_opp``（引擎语义里叫 optimism），本指标**只看通道 0** ——
         引擎在 ``policyOptimism=0`` 时也只消费通道 0。
 
     Returns:
@@ -1870,7 +2037,7 @@ def evaluate_metrics_v7(model, dataset, idxs, bs, device, amp_dtype, *,
         batches += 1
         sp = v7_to_device(sp_np, device, amp_dtype)
         if use_channels_last:      # 与训练侧同一布局（见训练循环里的同名注释）
-            sp = sp.to(memory_format=torch.channels_last)
+            sp = _to_nhwc(sp)
         gl = v7_to_device(gl_np, device, torch.float32)
         with torch.no_grad():
             out = model(sp, gl)
@@ -1879,7 +2046,7 @@ def evaluate_metrics_v7(model, dataset, idxs, bs, device, amp_dtype, *,
         logp = F.log_softmax(pol, dim=-1)
 
         target = torch.as_tensor(lbl['soft'][:, :action_size],
-                                 device=logp.device, dtype=torch.float32)
+                                device=logp.device, dtype=torch.float32)
         tgt_rank = target.argmax(dim=-1)
         top = logp.topk(min(10, action_size), dim=-1).indices
         eq = top.eq(tgt_rank.unsqueeze(1))
@@ -1895,7 +2062,7 @@ def evaluate_metrics_v7(model, dataset, idxs, bs, device, amp_dtype, *,
         oc = out['outcome_logits'].float()
         oc_p = F.softmax(oc, dim=-1)
         oc_t = torch.as_tensor(np.asarray(lbl['outcome']),
-                               device=oc_p.device, dtype=torch.long)
+                            device=oc_p.device, dtype=torch.long)
         oc_t = oc_t.clamp(0, oc_p.shape[1] - 1)
         oh = F.one_hot(oc_t, oc_p.shape[1]).to(oc_p.dtype)
         brier_sum += float((oc_p - oh).pow(2).sum(-1).sum())
@@ -1916,7 +2083,7 @@ def evaluate_metrics_v7(model, dataset, idxs, bs, device, amp_dtype, *,
 
 
 def evaluate_metrics(model, dataset, idxs, bs, device, amp_dtype, max_batches=50,
-                     use_channels_last=False, rng=None):
+                    use_channels_last=False, rng=None):
     """验证集综合指标：top-1/5/10 准确率 + policy KL + value Brier score。
 
     返回 dict:
@@ -1925,8 +2092,8 @@ def evaluate_metrics(model, dataset, idxs, bs, device, amp_dtype, max_batches=50
         brier             : value 预测 vs 实际胜负的 Brier score（越小越好）
         n                 : 样本数
         batches           : 本次**实际**跑掉的批数。防御性计数：批数预算已把尾部残批算作
-                             整一批、循环里的 break 在非空 idxs 下不会触发，故当前恒等于
-                             计划批数；仍按实际计数只为将来循环若提前退出时日志报真值
+                            整一批、循环里的 break 在非空 idxs 下不会触发，故当前恒等于
+                            计划批数；仍按实际计数只为将来循环若提前退出时日志报真值
         truncated         : 是否因 --eval-max-batches 上限少跑了批（评估覆盖度不足）
 
     后两个键只增信息、不改计算：`max_batches` 为 None 或 <= 0 时跑满验证集。
@@ -1967,7 +2134,7 @@ def evaluate_metrics(model, dataset, idxs, bs, device, amp_dtype, max_batches=50
                 state = state.float()
             state = state.to(device)
             if use_channels_last:
-                state = state.to(memory_format=torch.channels_last)
+                state = _to_nhwc(state)
             move_t = torch.from_numpy(moves_np).to(device)
             value_t = torch.from_numpy(values_np).to(device)  # (B,1) in {-1,+1}
             with maybe_autocast(device, amp_dtype):
@@ -1999,7 +2166,7 @@ def evaluate_metrics(model, dataset, idxs, bs, device, amp_dtype, max_batches=50
             A = log_p.shape[1]
             p = F.softmax(policy_logits, dim=-1)
             kl_per_sample = (torch.log(torch.tensor(A, dtype=p.dtype))
-                             + (p * log_p).sum(dim=-1))  # (B,)
+                            + (p * log_p).sum(dim=-1))  # (B,)
             kl_sum += float(kl_per_sample.sum())
 
             # --- value Brier score ---
@@ -2044,19 +2211,19 @@ def _concat_dicts(dicts):
 
 
 def load_from_path(path, board_size, max_games_per_tgz=0, v7=False,
-                   games_npz=None):
+                games_npz=None):
     """加载训练数据。
 
     - ``v7=True``：**必须**是 ``stdata_to_npz.py`` 产出的 V7 分片
-      （``spatial_packed`` + 全部 V7 标签），走 `V7PackedDataset`。
-      这条路是 V7 训练**唯一**可行的：``data/sgf_19x19_full.npz`` 那 3420 万行
-      虽然更���，但**没有** ``ownership`` / ``futurepos`` / ``scoring`` /
-      ``seki`` / ``scorebelief`` 标签，而 ``futurepos`` 是段1 四个主目标之一。
-      见 `src/data/v7_dataset.py` 模块 docstring。
+    （``spatial_packed`` + 全部 V7 标签），走 `V7PackedDataset`。
+    这条路是 V7 训练**唯一**可行的：``data/sgf_19x19_full.npz`` 那 3420 万行
+    虽然更���，但**没有** ``ownership`` / ``futurepos`` / ``scoring`` /
+    ``seki`` / ``scorebelief`` 标签，而 ``futurepos`` 是段1 四个主目标之一。
+    见 `src/data/v7_dataset.py` 模块 docstring。
     - 否则：若 path 是文件，按 .npz 加载（兼容原行为）；若是目录，递归扫描
-      其下所有 .tgz/.tar.gz（用 build_dataset.build 解析）与 .npz（直接加载），
-      合并成一个 SupervisedDataset。这样可直接喂一个装着多个分片 tgz 的文件夹，
-      无需先手动 build_dataset 成单个 npz。
+    其下所有 .tgz/.tar.gz（用 build_dataset.build 解析）与 .npz（直接加载），
+    合并成一个 SupervisedDataset。这样可直接喂一个装着多个分片 tgz 的文件夹，
+    无需先手动 build_dataset 成单个 npz。
     """
     if v7:
         # `--v7 1` 下有两种**布局**，都走同一个 22 通道模型（5,562,121 参数）：
@@ -2082,8 +2249,8 @@ def load_from_path(path, board_size, max_games_per_tgz=0, v7=False,
                 return False
 
         cands = ([path] if os.path.isfile(path)
-                 else sorted(glob.glob(os.path.join(path, '**', '*.npz'),
-                                      recursive=True)))
+                else sorted(glob.glob(os.path.join(path, '**', '*.npz'),
+                                    recursive=True)))
         packed = [p for p in cands if _looks_packed(p)]
         if packed:
             from src.data.v7_packed_dataset import load_v7_packed
@@ -2100,7 +2267,7 @@ def load_from_path(path, board_size, max_games_per_tgz=0, v7=False,
         # 直接子目录也作为数据源（build 支持递归解析目录内的 .sgf，
         # 例如 data/games/ 这种已解压的棋谱目录）
         subdirs = sorted(d for d in glob.glob(os.path.join(path, '*'))
-                         if os.path.isdir(d) and d not in npzs)
+                        if os.path.isdir(d) and d not in npzs)
         dicts = []
         n_games_total = 0
         n_skip_total = 0
@@ -2115,7 +2282,7 @@ def load_from_path(path, board_size, max_games_per_tgz=0, v7=False,
                 return None, 0, 0
             if n_games == 0:
                 _log.warning("[data] 跳过分片 %s：0 有效局（与 --board-size %d 不匹配或空）",
-                               src, board_size)
+                            src, board_size)
                 return None, 0, 0
             return d, n_games, skip
 
@@ -2138,7 +2305,7 @@ def load_from_path(path, board_size, max_games_per_tgz=0, v7=False,
         if locals().get('v7_board_level'):
             from src.data.v7_dataset import V7Dataset
             return V7Dataset(merged, n_channels=KATAGO_SE_CFG['in_channels'],
-                             **_sidecar_kwargs(merged, games_npz))
+                            **_sidecar_kwargs(merged, games_npz))
         return SupervisedDataset(merged, n_channels=KATAGO_SE_CFG['in_channels'])
     if locals().get('v7_board_level'):
         from src.data.v7_dataset import V7Dataset
@@ -2178,7 +2345,7 @@ def _prefetch_worker_init(dataset):
 def _concat_label_dicts(dicts):
     """把各子块的 `labels_dict` 沿 **batch 轴**拼成整批（顶层入口）。
 
-     `w` 是**嵌套 dict** ⇒ 拼接必须递归（见 `_concat_tree`）。键集合必须
+    `w` 是**嵌套 dict** ⇒ 拼接必须递归（见 `_concat_tree`）。键集合必须
     一致：同一份 dataset 造出来的 dict 形状恒定（`SupervisedDataset.
     _build_labels`），所以这里做**严格**校验而不是取交集 —— 少一个键就是
     「某个子块用了旧契约」，宁可炸。
@@ -2236,7 +2403,7 @@ def v7_batch_sync(dataset, idxs, device=None, *, rng=None, augment=True):
     if rng is None:
         rng = np.random.default_rng()
     tforms = (rng.integers(0, 8, size=idxs.size) if augment
-              else np.zeros(idxs.size, dtype=np.int64))
+            else np.zeros(idxs.size, dtype=np.int64))
     moves, lbl = _v7_labels_and_moves(dataset, idxs, tforms)
     sp, gl = v7_batch_features(dataset, idxs)
     return _dihedral_batch(sp, tforms), gl, moves, lbl
@@ -2246,7 +2413,7 @@ def v7_to_device(x, device, amp_dtype, *, pin=False):
     """V7 输入的 H2D：AMP 下保持 planes 的 **fp16**，全精度才升 fp32。
 
     与主循环里 12 通道那段**同口径**（同一条「不白带一倍 H2D 字节数」的判据）。
-     V7 走的是默认 contiguous 布局、**没有** channels_last 那一摊，所以不需要
+    V7 走的是默认 contiguous 布局、**没有** channels_last 那一摊，所以不需要
     numpy 端转置；`pin` 只在 CUDA 上开（NPU/CPU 的 pin_memory 语义不同，
     12 通道那条路也是只在 `_backend == 'cuda'` 时 pin）。
     """
@@ -2258,10 +2425,10 @@ def v7_to_device(x, device, amp_dtype, *, pin=False):
 
 
 def _prefetch_worker(wi, task_q, res_q, seed, dataset, labels=False, v7=False,
-                     augment=True):
+                    augment=True):
     """multiprocessing worker：从 task_q 取任务，计算后放 res_q。
 
-     **本函数里不许出现任何设备相关调用**（两个后端的运行时入口、跨设备搬运、
+    **本函数里不许出现任何设备相关调用**（两个后端的运行时入口、跨设备搬运、
     低精度上下文管理器）—— 见 `tests/test_prefetch_fork_order.py::
     test_prefetch_workers_do_not_touch_cuda_or_npu`，它对本段源码做**字面**
     扫描（注释也算，所以这句描述刻意避开被禁的字面量）。理由是 worker 只做纯
@@ -2279,7 +2446,7 @@ def _prefetch_worker(wi, task_q, res_q, seed, dataset, labels=False, v7=False,
     payload 变成 ``(step, pos, spatial, gl, moves, lbl, None)``（第 3/4 项是
     22 通道与 19 维的 V7 输入，取代旧路径的第 2/3 项 `states`/`values`）。
 
-     **开头那次 `_rebind_futurepos_mmap` 就是本函数存在的理由之一**：Windows
+    **开头那次 `_rebind_futurepos_mmap` 就是本函数存在的理由之一**：Windows
     上 `mp.Process` 是 **spawn** 而不是 fork，spawn **不继承内存** —— 父进程里
     `warm_futurepos()` 解析好的映射句柄到不了子进程（pickle 要么报错，要么把
     12.3 GB 当 ndarray 整份搬过去）。所以 worker 里**重新 open 一次**，而不是
@@ -2287,14 +2454,14 @@ def _prefetch_worker(wi, task_q, res_q, seed, dataset, labels=False, v7=False,
     理由与被禁止的字面量清单见 `_rebind_futurepos_mmap` 的 docstring，以及
     `tests/test_train_sft_v7.py::test_worker_reopens_mmap_instead_of_inheriting`
     / `::test_worker_does_not_rewrite_the_boards_file`）。
-     这段 docstring 刻意避开若干字面量：`tests/test_prefetch_labels.py::
+    这段 docstring 刻意避开若干字面量：`tests/test_prefetch_labels.py::
     test_worker_source_never_reopens_the_dataset` 对**同一个切片**做字面扫描
     （连注释一起扫），列出的那些词一个都不许出现在 worker 段里。
 
-     **`augment` 的对称增强与标签必须同源**：本函数抽一份 `tforms`，然后把它
+    **`augment` 的对称增强与标签必须同源**：本函数抽一份 `tforms`，然后把它
     **原样**同时交给 22 通道空间量与 `_build_labels`，后者会同步重映射
     `next_move` / `soft` / `future` ⇒ 输入与标签永远出自同一份变换。
-     这里**不能**改用 `dataset.sample_batch_numpy(..., labels=True)` 来拿标签：
+    这里**不能**改用 `dataset.sample_batch_numpy(..., labels=True)` 来拿标签：
     那份 `tforms` 是它内部抽的、本函数拿不到；而「自己再抽一份」是静默错标签
     （输入翻了、标签没翻 ⇒ loss 照降、棋力不涨）。见 `_v7_labels_and_moves`。
     """
@@ -2312,12 +2479,12 @@ def _prefetch_worker(wi, task_q, res_q, seed, dataset, labels=False, v7=False,
                 # augment=False ⇒ 恒等变换（eval 专用：eval 契约是 augment=False，
                 # 且输入/标签必须同源不增强 —— 复用本 worker 而不另写一份的原因）。
                 tforms = (rng.integers(0, 8, size=b) if augment
-                          else np.zeros(b, dtype=np.int64))
+                        else np.zeros(b, dtype=np.int64))
                 moves, lbl = _v7_labels_and_moves(dataset, sub_idx, tforms)
                 spatial, gl = v7_batch_features(dataset, sub_idx,
                                                 boards=v7_boards or None)
                 res_q.put((step, pos, _dihedral_batch(spatial, tforms), gl,
-                           moves, lbl, None))
+                        moves, lbl, None))
             else:
                 out = dataset.sample_batch_numpy(sub_idx, rng=rng, labels=labels)
                 if labels:
@@ -2424,7 +2591,7 @@ class _BatchPrefetcher:
     """
 
     def __init__(self, dataset, num_workers=4, prefetch=2, seed=1234,
-                 labels=False, v7=False, augment=True):
+                labels=False, v7=False, augment=True):
         # 护栏：**绝不能在设备运行时初始化之后**构造本类（4 卡 910A 的 OOM
         # 直接原因，2026-09-30）。`mp.Process` 默认 fork，子进程会整份继承父
         # 进程的 CANN/CUDA 上下文与已分配显存映射 ⇒ 每卡被旁挂 4 份 ≈ 24 GiB，
@@ -2463,7 +2630,7 @@ class _BatchPrefetcher:
             p = mp.Process(
                 target=_prefetch_worker,
                 args=(wi, self._task_q, self._res_q, seed, dataset,
-                      self.labels, self.v7, self.augment),
+                    self.labels, self.v7, self.augment),
                 daemon=True,
             )
             p.start()
@@ -2519,7 +2686,7 @@ class _BatchPrefetcher:
                 raise err
         # 按 pos 排序并拼接
         parts = [(pos, s, m, v, lbl) for pos, s, m, v, lbl, _ in parts
-                 if s is not None]
+                if s is not None]
         parts.sort(key=lambda x: x[0])
         if not parts:
             raise RuntimeError(f"step {step}: 所有子块为空")
@@ -2579,7 +2746,7 @@ def _init_swanlab(args, logger):
                 _spec = None
             if _spec is None:
                 logger.warning("[swanlab] 未安装，已跳过跟踪（指标请看 stdout 日志）。"
-                               "请在启动训练前安装: pip install swanlab")
+                            "请在启动训练前安装: pip install swanlab")
                 return None
         import swanlab
         # 登录：优先用 --swanlab-api-key，其次环境变量，最后交互式
@@ -2614,41 +2781,41 @@ def _init_swanlab(args, logger):
                 #     run 级 `run/params_actual` 给（那里模型已经建好）。
                 "arch/v7": bool(args.v7),
                 "arch/in_channels": (NBT_TF_CFG['in_channels'] if args.v7
-                                     else KATAGO_SE_CFG['in_channels']),
+                                    else KATAGO_SE_CFG['in_channels']),
                 "arch/name": ("nbt_tf" if args.v7 else KATAGO_SE_CFG['arch']),
                 "arch/channels": (NBT_TF_CFG['trunk_channels'] if args.v7
-                                  else KATAGO_SE_CFG['channels']),
+                                else KATAGO_SE_CFG['channels']),
                 # V7 另有一份 19 维全局输入（12 通道路径没有这个概念）
                 "arch/global_channels": (NBT_TF_CFG['global_channels']
-                                         if args.v7 else 0),
+                                        if args.v7 else 0),
                 # 段内块描述串：从真形状数出来（12 通道是 se×13 + attn×4，
                 # V7 是 nbt2 × 11 段、每段含 2 个 inner 块），不是抄配置
                 "arch/blocks": (("nbt%d_inner%d_x%d"
-                                 % (NBT_TF_CFG['num_blocks'],
+                                % (NBT_TF_CFG['num_blocks'],
                                     NBT_TF_CFG['num_inner_blocks'],
                                     NBT_TF_CFG['board_size']))
                                 if args.v7
                                 else "se13_attn4_of_%d" % KATAGO_SE_CFG['blocks']),
                 "arch/attention_mode": (("nbt+transformer_%dhead"
                                         % NBT_TF_CFG['num_heads']) if args.v7
-                                       else KATAGO_SE_CFG['attention_mode']),
+                                    else KATAGO_SE_CFG['attention_mode']),
                 "arch/num_attention_layers": (
                     NBT_TF_CFG['num_blocks'] if args.v7
                     else KATAGO_SE_CFG['num_attention_layers']),
                 "arch/num_heads": (NBT_TF_CFG['num_heads'] if args.v7
-                                   else KATAGO_SE_CFG['num_heads']),
+                                else KATAGO_SE_CFG['num_heads']),
                 # 注意力块里 FFN 的中间维 = 2×通道（12 通道）／显式 384（V7）
                 "arch/attn_ffn_hidden": (NBT_TF_CFG['ffn_hidden'] if args.v7
-                                         else KATAGO_SE_CFG['channels'] * 2),
+                                        else KATAGO_SE_CFG['channels'] * 2),
                 # SE 瓶颈块的中段宽 = 通道/2（SEBottleneck 默认 mid_channels）；
                 # V7 没有这个结构，填 0 而不是编一个
                 "arch/se_mid_channels": (0 if args.v7
-                                         else KATAGO_SE_CFG['channels'] // 2),
+                                        else KATAGO_SE_CFG['channels'] // 2),
                 "arch/params_total": (NBT_TF_CFG['params_total'] if args.v7
-                                      else KATAGO_SE_CFG['params_total']),
+                                    else KATAGO_SE_CFG['params_total']),
                 "arch/params_backbone": (NBT_TF_CFG['params_blocks_total']
-                                         if args.v7
-                                         else KATAGO_SE_CFG['params_backbone']),
+                                        if args.v7
+                                        else KATAGO_SE_CFG['params_backbone']),
                 # ---- V7 特有的头/输出维度（12 通道路径一律 0）----
                 # 键名**刻意避开** `value_channels` / `policy_channels`：
                 #   `tests/test_swanlab_metrics.py::test_config_panel_has_no_archived_flags`
@@ -2657,10 +2824,10 @@ def _init_swanlab(args, logger):
                 #   真实结构键）。这里改用 V7 自己的键名，不改名也不绕。
                 "arch/seki_classes": (NBT_TF_CFG['seki_classes'] if args.v7 else 0),
                 "arch/futurepos_ch": (NBT_TF_CFG['futurepos_channels']
-                                      if args.v7 else 0),
+                                    if args.v7 else 0),
                 "arch/score_distr_bins": (2 * (NBT_TF_CFG['board_size'] ** 2
-                                               + NBT_TF_CFG['extra_score_distr_radius'])
-                                          if args.v7 else 0),
+                                            + NBT_TF_CFG['extra_score_distr_radius'])
+                                        if args.v7 else 0),
                 "arch/policy_outputs": (NBT_TF_CFG['policy_outputs']
                                         if args.v7 else 1),
                 # 同样按 `--v7` 分派：V7 用 `NBT_TF_CFG['use_checkpoint']`（也是
@@ -2729,9 +2896,9 @@ def _init_swanlab(args, logger):
         _emsg = str(e)
         if 'pydantic' in _emsg or 'TypeAdapter' in _emsg:
             logger.warning("[swanlab] 疑似 pydantic 版本冲突：swanlab 需要 pydantic>=2，"
-                           "而 MindSpore / torch_npu 常钉 pydantic<2。"
-                           "请在启动训练前解决版本冲突（如在独立环境装 swanlab），"
-                           "不要依赖训练进程内自动安装。")
+                        "而 MindSpore / torch_npu 常钉 pydantic<2。"
+                        "请在启动训练前解决版本冲突（如在独立环境装 swanlab），"
+                        "不要依赖训练进程内自动安装。")
         return None
 
 
@@ -2758,7 +2925,7 @@ def _read_log_scalars(loss, policy_loss, value_loss):
     同步，其中 3 次完全重复。这里只取一次并返回给两处复用——数值逐位不变，
     同步次数减半。
 
-     第一个参数传的是 **`log_loss`（报告口径）**，不是被 backward 的
+    第一个参数传的是 **`log_loss`（报告口径）**，不是被 backward 的
     `opt_loss`。两者相差一个 `l2_report = c‖θ‖²`（P4.5b §3.1），故意不相等；
     形参名沿用 `loss` 是为了不打乱本仓既有的调用/断言写法，含义以上行为准。
     """
@@ -2799,11 +2966,11 @@ def huber_loss(pred, target, beta=0.5, reduction='mean'):
     数学式（逐元素误差 d = pred − target，N = 元素数）::
 
         h(d) = 0.5 * d² / beta    若 |d| <  beta      （二次段，∂h/∂d = d/beta）
-             = |d| − 0.5 * beta    若 |d| ≥ beta      （线性段，∂h/∂d = sign(d)）
+            = |d| − 0.5 * beta    若 |d| ≥ beta      （线性段，∂h/∂d = sign(d)）
         reduction='mean'  →  (1/N) · Σ h(d)     ← 默认，value 侧用它
         reduction='none'  →  h(d) 逐元素        ← policy 侧自己聚合（见下）
 
-     **「线性段梯度 = ±1」只在 N=1 时成立**（P4.5-fix 更正）。mean 归约把每个
+    **「线性段梯度 = ±1」只在 N=1 时成立**（P4.5-fix 更正）。mean 归约把每个
     元素的梯度也除以 N，实测（beta=0.5, d=1）：N=1 → ±1.000000、N=8 → ±0.125000、
     N=2888（B=8 × A=361）→ ±0.000346。上一版 docstring 拿「±1 vs ±0.5」当
     smooth_l1 与 huber_loss 的选型依据，是 `test_huber_limits` 用**单元素张量**
@@ -2813,32 +2980,32 @@ def huber_loss(pred, target, beta=0.5, reduction='mean'):
     实现选择（三问三答，改动前先读完）：
 
     1. **用 `F.smooth_l1_loss(..., beta=)`，不用 `F.huber_loss(..., delta=)`。**
-       D4 简报「两者在 beta ≤ 1 时完全等价」的断言在本仓实测的 torch 2.12.0+cpu
-       上**不成立**，torch 自己的 docstring 也这么写（"In general, Huber loss
-       differs from SmoothL1Loss by a factor of delta"）。实测（float64、
-       d ∈ linspace(-3,3,20001)、逐位比较）：
+    D4 简报「两者在 beta ≤ 1 时完全等价」的断言在本仓实测的 torch 2.12.0+cpu
+    上**不成立**，torch 自己的 docstring 也这么写（"In general, Huber loss
+    differs from SmoothL1Loss by a factor of delta"）。实测（float64、
+    d ∈ linspace(-3,3,20001)、逐位比较）：
 
-           F.huber_loss(delta=b) == b · F.smooth_l1_loss(beta=b)     恒等，仅 b=1 时两者相等
+        F.huber_loss(delta=b) == b · F.smooth_l1_loss(beta=b)     恒等，仅 b=1 时两者相等
 
-       选 smooth_l1 的理由因此**不是**梯度 ±1（那是被 N=1 掩盖的假象），而是
-       **量纲约定**：smooth_l1 就是教科书 Huber(delta=b) 本身
-       （实测 `smooth_l1(beta=b) ≡ Huber(delta=b)` 逐位相等，拐点确实在 |d|=b），
-       而 `F.huber_loss` 是它的 b 倍缩放 —— 用 smooth_l1 时 `--huber-beta`
-       的语义与 Huber 的 delta 直觉一致，改 beta 只改拐点、不改整体量纲。
+    选 smooth_l1 的理由因此**不是**梯度 ±1（那是被 N=1 掩盖的假象），而是
+    **量纲约定**：smooth_l1 就是教科书 Huber(delta=b) 本身
+    （实测 `smooth_l1(beta=b) ≡ Huber(delta=b)` 逐位相等，拐点确实在 |d|=b），
+    而 `F.huber_loss` 是它的 b 倍缩放 —— 用 smooth_l1 时 `--huber-beta`
+    的语义与 Huber 的 delta 直觉一致，改 beta 只改拐点、不改整体量纲。
         顺带证伪 fix 简报里的另一句：它把 smooth_l1 说成「delta 取 1.0 的
-       Huber 再整体除以 b」，并据此断言拐点固定在 1.0、与 beta 无关 ——
-       **同样是错的**：b=0.5 时两者最大差 2.25（线性段不等），仅 b=1 巧合
-       相等。拐点就在 |d|=b。逐位 oracle 见
-       tests/test_huber_loss.py::test_huber_matches_torch_reference。
+    Huber 再整体除以 b」，并据此断言拐点固定在 1.0、与 beta 无关 ——
+    **同样是错的**：b=0.5 时两者最大差 2.25（线性段不等），仅 b=1 巧合
+    相等。拐点就在 |d|=b。逐位 oracle 见
+    tests/test_huber_loss.py::test_huber_matches_torch_reference。
     2. **reduction 显式写出**：默认 `'mean'` 与被替换的旧 value 口径
-       （`F.mse_loss` 默认 mean）对齐；`'none'` 是 P4.5-fix 给 policy 侧用的
-       逃生口 —— policy 必须**逐样本**聚合（类内 sum 后对 batch 取 mean），
-       原因见 compute_policy_loss docstring 的 1/A 稀释分析。
+    （`F.mse_loss` 默认 mean）对齐；`'none'` 是 P4.5-fix 给 policy 侧用的
+    逃生口 —— policy 必须**逐样本**聚合（类内 sum 后对 batch 取 mean），
+    原因见 compute_policy_loss docstring 的 1/A 稀释分析。
     3. **数值稳定性**：|d| ≥ beta 段梯度有界（∝ sign(d)/N，不随误差放大），
-       SFT 早期 value 误差可能很大（目标 ±1、初值 ~0 → |d| ~ 1），此时 log
-       不会被一次离群样本炸出天文数字（MSE 会：其梯度 ∝ 2|d|）。代价是大误差
-       处损失只按 |d| 线性增长 —— 日志上 value_loss 早期是一条**斜率恒定**的
-       下降线，收敛末段（|d|<beta）才转成二次的平滑收口。
+    SFT 早期 value 误差可能很大（目标 ±1、初值 ~0 → |d| ~ 1），此时 log
+    不会被一次离群样本炸出天文数字（MSE 会：其梯度 ∝ 2|d|）。代价是大误差
+    处损失只按 |d| 线性增长 —— 日志上 value_loss 早期是一条**斜率恒定**的
+    下降线，收敛末段（|d|<beta）才转成二次的平滑收口。
     """
     return F.smooth_l1_loss(pred, target, beta=beta, reduction=reduction)
 
@@ -2853,18 +3020,18 @@ def soft_cross_entropy(policy_logits, soft, soft_mask, soft_weight=1.0):
     soft_mask     : (B,)  —— 1 = 该行走软 CE，0 = 该行**不参与**软项
     soft_weight   : float —— 软项的全局缩放（`--soft-weight` 的函数侧形参；默认 1.0）
 
-     **掩码是逐行二选一，不是混合。** `mask=0` 的行贡献**恰好 0**，**不退化
+    **掩码是逐行二选一，不是混合。** `mask=0` 的行贡献**恰好 0**，**不退化
     成 one-hot CE**、也不与软项按比例插值。理由（spec §5.7）：同一个 head 同时
     收到「搜索分布」与「人类 one-hot」会去折中而不是学搜索。段 2/3 用独立采样器
     **只取软行**（`--soft-only-sampling`）来喂蒸馏，不靠混合权重。
 
-     **分母恒为 B（不是 mask 的和）。** 这是上面那条「二选一」的直接推论：
+    **分母恒为 B（不是 mask 的和）。** 这是上面那条「二选一」的直接推论：
     掩掉的行既不进分子也不进分母 ⇒ 软项的量级随「本批软行占比」线性变化。
     段 2 的采样器把占比拉到 1，所以正常训练里 B == Σmask；要在这里改成
     `sum / mask.sum()`（占比无关的平均）会让软项的量级与 1.0 权重的含义
     随 batch 组成漂移。`soft_weight` 就是给这个全局量级用的旋钮。
 
-     精度：**升到 float32，但绝不上 float64**。autocast 下 logits 可能是
+    精度：**升到 float32，但绝不上 float64**。autocast 下 logits 可能是
     fp16/bf16，而软 target 在低精度下会被舍入掉可观的相对误差（bf16 只有 8 位
     尾数，0.001 量级的概率直接被抹平），所以要 `.to(torch.float32)`。
     但 910A **没有 fp64 硬件**，任何设备侧 fp64 都走「cast 成 fp32」的兜底，
@@ -2879,7 +3046,7 @@ def soft_cross_entropy(policy_logits, soft, soft_mask, soft_weight=1.0):
             " 现状二者都是 None —— 软标签的接线在 A3/A4（预取器透传 dict + CLI）")
     if tuple(soft.shape) != tuple(policy_logits.shape):
         raise ValueError(f"soft {tuple(soft.shape)} 与 logits "
-                         f"{tuple(policy_logits.shape)} 形状不符")
+                        f"{tuple(policy_logits.shape)} 形状不符")
     # 一律 fp32：见 docstring 的 910A/fp64 段。`soft` 是 fp16（.npz 里就是
     # float16），直接乘会把 0.001 量级的概率舍掉，必须先升到 fp32。
     calc_dtype = torch.float32
@@ -2908,10 +3075,10 @@ def compute_policy_loss(policy_logits, move_t, kind,
         0.1 也照旧生效），数值行为不得改变。目标 = **人类/自对弈的 one-hot**。
     kind='huber' —— 对 policy **目标**（label-smoothed one-hot 分布）做 Huber：
         · 目标 y = (1−eps)·onehot(move_t) + eps/A（eps = label_smoothing，
-          A = 动作数）—— 与 `F.cross_entropy(label_smoothing=eps)` 用的是
-          **同一构造**，故 `--label-smoothing` 对两条路径语义一致；
+        A = 动作数）—— 与 `F.cross_entropy(label_smoothing=eps)` 用的是
+        **同一构造**，故 `--label-smoothing` 对两条路径语义一致；
         · 预测侧 = `softmax(policy_logits)`（模型输出是 logits，目标是概率
-          分布，必须先归一化到同一值域 [0,1] 才能逐元素回归）；
+        分布，必须先归一化到同一值域 [0,1] 才能逐元素回归）；
         · 归约 = **类内 sum over A，再对 batch 取 mean**（P4.5-fix 修，见下）。
     kind='soft_ce' —— **软标签**交叉熵（蒸馏，spec §5.7）。目标不是 one-hot 而是
         KataGo 的**访问分布** `soft` (B,A)（361 落点 + pass），由
@@ -2921,13 +3088,13 @@ def compute_policy_loss(policy_logits, move_t, kind,
         1 = 该行只算软 CE，0 = 该行对软项贡献恰好 0（**不退化成 one-hot CE**、
         不做插值）—— 理由与分母约定见 `soft_cross_entropy` 的 docstring。
 
-     `kind='soft_ce'` 走的是**新参数** `soft` / `soft_mask` / `soft_weight`；
+    `kind='soft_ce'` 走的是**新参数** `soft` / `soft_mask` / `soft_weight`；
     `huber` / `ce` 两条既有路径**完全不看这三个形参**，数值逐位不变（有测试钉着）。
     CLI 侧的 `--policy-loss` choices 仍冻结在 `['huber','ce']`
     （tests/test_huber_loss.py::test_no_new_cli_params，D1 零新增），
     `--soft-weight` 的 CLI 入口属 A4；本函数已带好同名形参（默认 1.0）。
 
-     **P4.5-fix：归约口径是修过的实现 bug，不是设计选择。**
+    **P4.5-fix：归约口径是修过的实现 bug，不是设计选择。**
     D4 首版用 `huber_loss(..., reduction='mean')`，对 **B×A 个元素**求均值；
     而被它替换掉的 `F.cross_entropy` 是**逐样本**（类内 softmax 已归一）再对
     batch 求均值。两者差一个 **1/A 的稀释**（A=361 → 361×）。实测（B=8, A=361,
@@ -2957,7 +3124,7 @@ def compute_policy_loss(policy_logits, move_t, kind,
     值，且 (0.9−0.25)/361 精确算是 **1.80e-03** 不是 1.5e-3），而 CE 起步
     ≈ ln(A) ≈ 5.89。`loss` 与 `policy_loss` 的数值与旧 run **不可直接比**。
 
-     **P4.5b：默认值已由 `huber` 改成 `ce`。`huber` 分支保留（可复现实验），
+    **P4.5b：默认值已由 `huber` 改成 `ce`。`huber` 分支保留（可复现实验），
     但它**不是**默认 —— 下面这段是留给下一个想把它改回去的人的：**
 
     **定义在概率上的损失，其梯度尺度必然依赖动作空间 A。** 机制：CE 打在
@@ -2991,7 +3158,7 @@ def compute_policy_loss(policy_logits, move_t, kind,
     """
     if kind == 'ce':
         return F.cross_entropy(policy_logits, move_t,
-                               label_smoothing=label_smoothing)
+                            label_smoothing=label_smoothing)
     if kind == 'huber':
         A = policy_logits.shape[-1]
         eps = float(label_smoothing)
@@ -3004,10 +3171,10 @@ def compute_policy_loss(policy_logits, move_t, kind,
         # 「batch 维求均值」口径；reduction='none' + 手工聚合是唯一能同时
         # 保住逐元素 Huber 与逐样本归约的写法）
         return huber_loss(pred, target, beta=huber_beta,
-                          reduction='none').sum(dim=-1).mean()
+                        reduction='none').sum(dim=-1).mean()
     if kind == 'soft_ce':
         return soft_cross_entropy(policy_logits, soft, soft_mask,
-                                  soft_weight=soft_weight)
+                                soft_weight=soft_weight)
     raise ValueError(f"--policy-loss 只接受 huber|ce|soft_ce，收到 {kind!r}")
 
 
@@ -3034,7 +3201,7 @@ def compute_value_loss(value_pred, value_target, kind, huber_beta=0.5):
     value 侧**不涉及** P4.5-fix 修的那个 1/A 稀释：被替换的 `F.mse_loss` 本身
     就是 mean over B，与这里的归约逐位同口径。
 
-     **为什么 value 侧留 Huber、而 policy 侧在 P4.5b 改回 CE**（简报 §2 的裁决）：
+    **为什么 value 侧留 Huber、而 policy 侧在 P4.5b 改回 CE**（简报 §2 的裁决）：
     value 头是**单标量输出、没有 softmax**，链式法则里就不存在 policy 侧那个
     「再乘一层 `∂p_k/∂logit_j = p_k(δ_kj−p_j)`」的雅可比因子，也就没有
     「梯度尺度随动作空间 A 变」这个结构性缺陷（它的 A 相关差异只来自
@@ -3157,17 +3324,17 @@ def _build_param_groups(model, args) -> list[dict]:
     # （AdamW 会照单全收，梯度被更新两遍）。对象条件对 AlphaGoNet 是**空操作**
     # （没有跨模块共享的参数），所以默认路径逐位不变。
     other_decay = [p for n, p in model.named_parameters()
-                   if not n.startswith('value.') and p not in value_params
-                   and p not in no_decay_params]
+                if not n.startswith('value.') and p not in value_params
+                and p not in no_decay_params]
     other_no_decay = [p for n, p in model.named_parameters()
-                      if not n.startswith('value.') and p not in value_params
-                      and p in no_decay_params]
+                    if not n.startswith('value.') and p not in value_params
+                    and p in no_decay_params]
     return [
         {'params': other_decay, 'lr': args.lr,
-         'weight_decay': args.weight_decay},
+        'weight_decay': args.weight_decay},
         {'params': other_no_decay, 'lr': args.lr, 'weight_decay': 0.0},
         {'params': value_decay, 'lr': args.lr * args.value_lr_mult,
-         'weight_decay': args.weight_decay},
+        'weight_decay': args.weight_decay},
         {'params': value_no_decay, 'lr': args.lr * args.value_lr_mult, 'weight_decay': 0.0},
     ]
 
@@ -3176,22 +3343,22 @@ def compose_losses(policy_loss, value_loss, value_loss_weight, l2_report):
     """总损失的两个口径，返回 `(opt_loss, log_loss)` —— **它们故意不相等**。
 
     · `opt_loss = policy_loss + w·value_loss`：**被 backward** 的量。它**不含**
-      `c‖θ‖²`，因为正则走 AdamW 的**解耦** weight decay（`θ ← θ − lr·wd·θ`，在
-      参数更新里、按构造不进梯度）。
+    `c‖θ‖²`，因为正则走 AdamW 的**解耦** weight decay（`θ ← θ − lr·wd·θ`，在
+    参数更新里、按构造不进梯度）。
     · `log_loss = opt_loss + l2_report`：写进日志 `loss` 键的量。多了
-      `c‖θ‖²`，是为了让用户裁决的恒等式 `L = L_policy + L_value + c‖θ‖²` 在日志
-      上字面成立（`l2_report` 由 `compute_l2_report` 给，纯 python float ⇒
-      **不进计算图**，所以即便对 log_loss 反向，L2 项也贡献不出任何梯度）。
+    `c‖θ‖²`，是为了让用户裁决的恒等式 `L = L_policy + L_value + c‖θ‖²` 在日志
+    上字面成立（`l2_report` 由 `compute_l2_report` 给，纯 python float ⇒
+    **不进计算图**，所以即便对 log_loss 反向，L2 项也贡献不出任何梯度）。
 
     为什么写成函数而不是在 main() 里手写两行：这两个量必须能被测试**按行为**
-      区分开（`tests/test_huber_loss.py::test_log_loss_identity` 断言
-      「log_loss.backward() 与 opt_loss.backward() 给出逐位相同的参数梯度」，
-      即 L2 项确实是纯报告）。只写在 main() 里就只能做源码子串检查 —— 而 P4.5
-      的教训正是「文案对了行为没对」。
+    区分开（`tests/test_huber_loss.py::test_log_loss_identity` 断言
+    「log_loss.backward() 与 opt_loss.backward() 给出逐位相同的参数梯度」，
+    即 L2 项确实是纯报告）。只写在 main() 里就只能做源码子串检查 —— 而 P4.5
+    的教训正是「文案对了行为没对」。
 
-     `value_loss_weight` 出现在**两项**里：报告口径必须与优化口径同权重，否则
-      `loss` 与被优化的目标在 `--value-loss-weight != 1` 时会差两项而不是一项。
-      默认 w=1.0 时它就是用户裁决里的 `L_policy + L_value`。
+    `value_loss_weight` 出现在**两项**里：报告口径必须与优化口径同权重，否则
+    `loss` 与被优化的目标在 `--value-loss-weight != 1` 时会差两项而不是一项。
+    默认 w=1.0 时它就是用户裁决里的 `L_policy + L_value`。
     """
     opt_loss = policy_loss + value_loss_weight * value_loss
     log_loss = opt_loss + l2_report
@@ -3209,7 +3376,7 @@ def compute_l2_report(param_groups):
     （`θ ← θ − lr·wd·θ`，在参数更新里、不进梯度）；本函数既不参与 backward
     也不改优化器。
 
-     **只对 `weight_decay != 0` 的组求和**（`_build_param_groups` 的两组
+    **只对 `weight_decay != 0` 的组求和**（`_build_param_groups` 的两组
     decay + 两组 no_decay）。no_decay 组（`param.ndim == 1`，即 norm 权重与
     bias）在优化器里 `weight_decay=0.0`，**没有**被正则；若图省事对
     `model.parameters()` 全量求和，日志就会报告一个仓库根本没有施加的正则
@@ -3230,7 +3397,7 @@ def compute_l2_report(param_groups):
     broadcast 给所有 rank、每步再 all_reduce 梯度（`find_unused_parameters`
     =False、无 `no_sync`），故各 rank 的 θ 恒一致，本项在各 rank 上是同一个数
     —— 同一个日志键不会在不同 rank 上打架，也就没有引入新的同步点/挂死风险。
-     例外：`GradScaler.step` 只在**本地**查 `found_inf`、不做 all_reduce，
+    例外：`GradScaler.step` 只在**本地**查 `found_inf`、不做 all_reduce，
     所以一次 inf/nan 触发的 step 跳过是**单 rank** 的 —— 那一步各 rank 的 θ
     会分叉，本项在那一行就会跨 rank 不一致。稳态（无跳过）下不影响。
 
@@ -3326,13 +3493,13 @@ def build_adamw(param_groups, device, logger=None):
     torch_npu 自带的 NPU fused kernel）：
 
     * `cuda` → `try: AdamW(param_groups, fused=True)`；构造抛 `TypeError`（老
-      torch 无此 kwarg）或 `RuntimeError`（无 fused kernel）→ **回退标准构造，
-      异常不冒泡**；
+    torch 无此 kwarg）或 `RuntimeError`（无 fused kernel）→ **回退标准构造，
+    异常不冒泡**；
     * `npu` → `try: from torch_npu.optim import NPUFusedAdamW`（torch_npu 随包
-      提供，apex 风格多张量融合 kernel，一趟完成 exp_avg/exp_avg_sq/decoupled
-      decay/参数写回；支持逐组 lr ⇒ value 头 5x lr 分组不受影响）。本地无
-      torch_npu ⇒ `ImportError` → 回退标准构造，异常不冒泡。数值与 standard
-      **容差内一致、非逐位**（同 CUDA fused 的口径）。
+    提供，apex 风格多张量融合 kernel，一趟完成 exp_avg/exp_avg_sq/decoupled
+    decay/参数写回；支持逐组 lr ⇒ value 头 5x lr 分组不受影响）。本地无
+    torch_npu ⇒ `ImportError` → 回退标准构造，异常不冒泡。数值与 standard
+    **容差内一致、非逐位**（同 CUDA fused 的口径）。
     * `cpu` / 其它 → **直接标准构造**（不尝试、不报错）。
 
     **回退契约（bit-for-bit）**：标准分支就是 `torch.optim.AdamW(param_groups)`
@@ -3561,8 +3728,8 @@ def main():
     # 注意力相关
     ap.add_argument('--backbone-channels', type=int, default=128,
                     help='主干卷积通道数。容量主开关，实测（19路, mix/window'
-                         ' 注意力, 4 层注意力头）：128×12≈4.06M，192×17≈12.41M，'
-                         '224×12≈12.36M，256×12≈16.13M')
+                        ' 注意力, 4 层注意力头）：128×12≈4.06M，192×17≈12.41M，'
+                        '224×12≈12.36M，256×12≈16.13M')
     ap.add_argument('--backbone-res-blocks', type=int, default=12,
                     help='主干残差块数量（与 --backbone-channels 共同决定容量）')
     ap.add_argument('--attention-mode', default='mix',
@@ -3575,46 +3742,46 @@ def main():
     ap.add_argument('--attn-mode', default='global',
                     choices=['global', 'window', 'axial', 'sparse', 'window_global'],
                     help='注意力计算模式: global=全配对, window=块状窗口, '
-                         'sparse=窗口+全局token, window_global=块状窗口+全局token(手写math)')
+                        'sparse=窗口+全局token, window_global=块状窗口+全局token(手写math)')
     ap.add_argument('--attn-window', type=int, default=7, help='window 模式窗口边长')
     # ---- NPU 融合算子与内存布局（2026-10-06 从环境变量搬成 CLI）----------------
     # 四个开关都是「出问题时的总闸」：置 0 只慢不坏（数值口径不变），所以默认值
     # 都是「开」，而**布局类默认关**（要实测收益才开，见 run.txt 的 A/B 段）。
     ap.add_argument('--npu-swiglu', type=int, default=1, choices=[0, 1],
                     help='NPU 融合 SwiGLU（torch_npu.npu_swiglu）：0=强制走标准'
-                         '路径（F.silu(up)*gate 再 down，数值不变、只慢不坏）。'
-                         '诊断「融合路径是否坏」的总闸（0=关闭，1=开启，默认开启）')
+                        '路径（F.silu(up)*gate 再 down，数值不变、只慢不坏）。'
+                        '诊断「融合路径是否坏」的总闸（0=关闭，1=开启，默认开启）')
     ap.add_argument('--npu-sfa', type=int, default=1, choices=[0, 1],
                     help='NPU 融合注意力 SFA/PFA（torch_npu.npu_fusion_attention，'
-                         '优先于内置 SDPA）：带能力探针 + 与 SDPA 的数值自检 + '
-                         '运行期回退；dropout>0 时自动不启用（0=关闭，1=开启）')
+                        '优先于内置 SDPA）：带能力探针 + 与 SDPA 的数值自检 + '
+                        '运行期回退；dropout>0 时自动不启用（0=关闭，1=开启）')
     ap.add_argument('--npu-channels-last', type=int, default=1, choices=[0, 1],
                     help='NPU 上卷积走 NHWC(channels_last) 布局：CANN 卷积 kernel '
-                         '偏 NHWC，V7 主干是卷积主导（约 85%% MAC）时可能提速。'
-                         '**默认 0**（未实测收益，显存会略涨）；A/B 见 run.txt'
-                         '（0=关闭=当前已验证配置，1=开启）')
+                        '偏 NHWC，V7 主干是卷积主导（约 85%% MAC）时可能提速。'
+                        '**默认 0**（未实测收益，显存会略涨）；A/B 见 run.txt'
+                        '（0=关闭=当前已验证配置，1=开启）')
     ap.add_argument('--attn-query-chunk', type=int, default=64,
                     help='手写 math 注意力按 query 分块的长度（0=关闭）：softmax 沿 '
-                         'key 轴 ⇒ 分块数学精确，峰值 ∝ chunk。只影响 math 路径，'
-                         'SDPA/SFA 融合路径自行管理显存（默认 64，0=关闭）')
+                        'key 轴 ⇒ 分块数学精确，峰值 ∝ chunk。只影响 math 路径，'
+                        'SDPA/SFA 融合路径自行管理显存（默认 64，0=关闭）')
     ap.add_argument('--attn-chunk-ckpt', type=int, default=1, choices=[0, 1],
                     help='math 路径逐 chunk 梯度检查点：把注意力矩阵变成反向时一块块'
-                         '重算（不依赖 block 级 checkpoint 是否生效）。'
-                         '0=关闭，1=开启（默认开启）')
+                        '重算（不依赖 block 级 checkpoint 是否生效）。'
+                        '0=关闭，1=开启（默认开启）')
     ap.add_argument('--attn-online', type=int, default=0, choices=[0, 1],
                     help='手写 math 注意力改用 online-softmax（flash 风格）实现：'
-                         '不物化 (Nq,Nk) 分数矩阵 ⇒ 反向不保留它（省显存），'
-                         '且最大值被归一、低精度下更不易溢出（0=关闭，1=开启）。'
-                         '与 materialize 路径**数值等价但非逐位相同**'
-                         '（实测 fp32 max|Δ|≈7e-07），开启会让 12 通道的 '
-                         'test_twelve_channel_path_bit_identical 基线失效；'
-                         '真机加速比尚未实测，故默认关闭')
+                        '不物化 (Nq,Nk) 分数矩阵 ⇒ 反向不保留它（省显存），'
+                        '且最大值被归一、低精度下更不易溢出（0=关闭，1=开启）。'
+                        '与 materialize 路径**数值等价但非逐位相同**'
+                        '（实测 fp32 max|Δ|≈7e-07），开启会让 12 通道的 '
+                        'test_twelve_channel_path_bit_identical 基线失效；'
+                        '真机加速比尚未实测，故默认关闭')
     ap.add_argument('--use-sdpa', type=int, default=1, choices=[0, 1],
                     help='NPU 上是否走 CANN 融合 SDPA（F.scaled_dot_product_attention）：'
-                         '1=放开（默认，省算力、fp32 累加更稳，顺带缓解 warmup 后 NaN）；'
-                         '0=强制回退手写 math（兼容旧 CANN <8.0.RC3.20 / torch_npu<2.1，'
-                         '或调试数值差异）。仍受 _sdpa 内部 batch 上限保护（B>60000 自动回退 math）。'
-                         ' 取代原环境变量 GOAI_SDPA（0=math 的语义）')
+                        '1=放开（默认，省算力、fp32 累加更稳，顺带缓解 warmup 后 NaN）；'
+                        '0=强制回退手写 math（兼容旧 CANN <8.0.RC3.20 / torch_npu<2.1，'
+                        '或调试数值差异）。仍受 _sdpa 内部 batch 上限保护（B>60000 自动回退 math）。'
+                        ' 取代原环境变量 GOAI_SDPA（0=math 的语义）')
     ap.add_argument('--eval-every', type=int, default=5000)
     ap.add_argument('--eval-max-batches', type=int, default=50,
                     help='验证集评估最多跑多少个 batch；<=0 表示不截断（跑满全部验证集）')
@@ -3639,78 +3806,78 @@ def main():
                     help='Policy head 层数（2=原始 1x1->1x1，3=1x1->3x3->1x1）')
     ap.add_argument('--prefetch-workers', type=int, default=12,
                     help='数据预取进程数：每个 batch 切块并行造特征并与 GPU 计算重叠；'
-                         '<=1 关闭预取（回退同步取样）。'
-                         ' 默认 12 来自 C0 基准实测：16 核上 8 worker 的边际效率已'
-                         '降到 0.701（饱和），云端 24 核 ⇒ 12 是同一饱和点上的下一步。'
-                         ' 这是从 16 核**外推**到 24 核的，仓库里没有 24 核实测'
-                         '支撑（spec 已标为外推）。**batch 不要为迁就特征侧而设**：'
-                         '特征侧对 batch 几乎不敏感（32→311.4 / 128→309.7 / '
-                         '1024→307.1 行/s，离散度 1.7%%），成本在 iterLadders 逐行 DFS '
-                         '而不是 batch 固定开销 ⇒ batch 按显存选即可。'
-                         ' fork 之前**必须 warm**（--v7 路径的 boards mmap）：'
-                         '冷 IO 8 worker 273 vs warm 1161 行/s（差 4.3×），'
-                         'gather 冷读 10.4–24.7 ms/行 vs 热读 0.005–0.008（1500×）。')
+                        '<=1 关闭预取（回退同步取样）。'
+                        ' 默认 12 来自 C0 基准实测：16 核上 8 worker 的边际效率已'
+                        '降到 0.701（饱和），云端 24 核 ⇒ 12 是同一饱和点上的下一步。'
+                        ' 这是从 16 核**外推**到 24 核的，仓库里没有 24 核实测'
+                        '支撑（spec 已标为外推）。**batch 不要为迁就特征侧而设**：'
+                        '特征侧对 batch 几乎不敏感（32→311.4 / 128→309.7 / '
+                        '1024→307.1 行/s，离散度 1.7%%），成本在 iterLadders 逐行 DFS '
+                        '而不是 batch 固定开销 ⇒ batch 按显存选即可。'
+                        ' fork 之前**必须 warm**（--v7 路径的 boards mmap）：'
+                        '冷 IO 8 worker 273 vs warm 1161 行/s（差 4.3×），'
+                        'gather 冷读 10.4–24.7 ms/行 vs 热读 0.005–0.008（1500×）。')
     ap.add_argument('--prefetch-depth', type=int, default=8,
                     help='预取流水深度（提前多少个 batch 造好数据，控制内存/吞吐平衡）')
     ap.add_argument('--resume', default='',
                     help='断点续训：指定已保存的 .pth 模型路径，会从该权重 + 同目录 '
-                         '.train_state.pt 恢复 optimizer/scheduler/step 计数继续训练')
+                        '.train_state.pt 恢复 optimizer/scheduler/step 计数继续训练')
     ap.add_argument('--model', default='',
                     help='加载预训练权重（仅权重，optimizer/scheduler/step 从头开始）。'
-                         '用于迁移学习或微调，不加载优化器状态')
+                        '用于迁移学习或微调，不加载优化器状态')
     ap.add_argument('--value-loss-weight', type=float, default=1.0,
                     help='value loss 权重。默认 1.0 = 无补偿（P4.5-fix 按用户裁决'
-                         '删掉了 BCE 时代为平衡 policy/value 梯度而加的 5.0 倍'
-                         '补偿）。 换 --value-loss 后 policy/value 的梯度量级'
-                         '关系已变，见 report `## Fix 增补`：policy 默认走 huber，'
-                         '其梯度天然比 value 弱 ~A 倍，修掉归约 bug 后实测仍差 '
-                         '约 250~360:1，此参数不足以单独补平。')
+                        '删掉了 BCE 时代为平衡 policy/value 梯度而加的 5.0 倍'
+                        '补偿）。 换 --value-loss 后 policy/value 的梯度量级'
+                        '关系已变，见 report `## Fix 增补`：policy 默认走 huber，'
+                        '其梯度天然比 value 弱 ~A 倍，修掉归约 bug 后实测仍差 '
+                        '约 250~360:1，此参数不足以单独补平。')
     # ---- D4（SFT 侧）：损失口径三参数 ------------------------------------
     # 只加这三个（结构参数不新增任何 CLI）。RL 侧的对应拆分在 P3-C/P3-D，
     # scripts/selfplay_train.py 不在本任务范围。
     ap.add_argument('--policy-loss', default='ce',
                     choices=['huber', 'ce', 'soft_ce'],
                     help='policy 损失：ce=原交叉熵口径（数值行为与 D4 之前逐位一致）'
-                         '，**默认**；huber=对 label-smoothed one-hot 目标做 Huber'
-                         '(smooth L1, beta=--huber-beta，归约=类内 sum over A + '
-                         'batch mean)，保留仅供复现实验；soft_ce=**软标签**交叉熵'
-                         '（KataGo 访问分布蒸馏，spec §5.7），掩码逐行二选一 —— '
-                         'soft_mask=1 的行走软 CE、0 的行贡献恰好 0（不是插值）。'
-                         ' soft_ce 只在给了 --soft-index 时才会被自动选中；'
-                         '显式写 --policy-loss soft_ce 而没有 --soft-index 会在'
-                         '启动时报错（否则软项恒 0，是静默半吊子）。'
-                         ' 默认**不是** huber（P4.5b 用户裁决）：定义在概率上的损失，'
-                         '梯度尺度必然依赖动作空间 A —— softmax 雅可比贡献 p≈1/A，'
-                         'mean over A 给 1/A²、sum over A 给 A，没有任何归约能消掉它；'
-                         '本仓支持 9/13/19 路（A=82/170/362），选 sum 等于让同一学习率'
-                         '在 9 路与 19 路之间差 4.4 倍。CE 定义在 log-prob 上，'
-                         'd(CE)/d(logit)=p−y 每坐标有界且与 A 无关（实测 A=82 vs 362 '
-                         '的 policy 梯度比 1.005，Huber 同条件 0.223=1/A）。'
-                         '详见 compute_policy_loss docstring')
+                        '，**默认**；huber=对 label-smoothed one-hot 目标做 Huber'
+                        '(smooth L1, beta=--huber-beta，归约=类内 sum over A + '
+                        'batch mean)，保留仅供复现实验；soft_ce=**软标签**交叉熵'
+                        '（KataGo 访问分布蒸馏，spec §5.7），掩码逐行二选一 —— '
+                        'soft_mask=1 的行走软 CE、0 的行贡献恰好 0（不是插值）。'
+                        ' soft_ce 只在给了 --soft-index 时才会被自动选中；'
+                        '显式写 --policy-loss soft_ce 而没有 --soft-index 会在'
+                        '启动时报错（否则软项恒 0，是静默半吊子）。'
+                        ' 默认**不是** huber（P4.5b 用户裁决）：定义在概率上的损失，'
+                        '梯度尺度必然依赖动作空间 A —— softmax 雅可比贡献 p≈1/A，'
+                        'mean over A 给 1/A²、sum over A 给 A，没有任何归约能消掉它；'
+                        '本仓支持 9/13/19 路（A=82/170/362），选 sum 等于让同一学习率'
+                        '在 9 路与 19 路之间差 4.4 倍。CE 定义在 log-prob 上，'
+                        'd(CE)/d(logit)=p−y 每坐标有界且与 A 无关（实测 A=82 vs 362 '
+                        '的 policy 梯度比 1.005，Huber 同条件 0.223=1/A）。'
+                        '详见 compute_policy_loss docstring')
     ap.add_argument('--value-loss', default='huber',
                     choices=['huber', 'mse'],
                     help='value 损失：huber=对 value_t∈[-1,1] 直接 Huber'
-                         '(smooth L1, beta=--huber-beta)；mse=原均方误差口径'
-                         '（数值行为与 D4 之前逐位一致）。默认 huber（D4/C8，'
-                         'BCE 分支已删）。 value 侧留 Huber 正是为了与 policy 侧'
-                         '相反：value 头是**单标量输出、无 softmax**，链式法则里'
-                         '没有 softmax 雅可比那层（p≈1/A），所以 policy 侧那个'
-                         '「梯度尺度随动作空间 A 变」的结构性缺陷在这里不存在；'
-                         '（value 侧仍有 A 相关的差异，但只来自 GAP 在 H·W 个位置上'
-                         '求平均，是结构性的、与损失选择无关。）且 |d|≥beta 段梯度'
-                         '有界、SFT 早期大误差不会把 log 炸飞')
+                        '(smooth L1, beta=--huber-beta)；mse=原均方误差口径'
+                        '（数值行为与 D4 之前逐位一致）。默认 huber（D4/C8，'
+                        'BCE 分支已删）。 value 侧留 Huber 正是为了与 policy 侧'
+                        '相反：value 头是**单标量输出、无 softmax**，链式法则里'
+                        '没有 softmax 雅可比那层（p≈1/A），所以 policy 侧那个'
+                        '「梯度尺度随动作空间 A 变」的结构性缺陷在这里不存在；'
+                        '（value 侧仍有 A 相关的差异，但只来自 GAP 在 H·W 个位置上'
+                        '求平均，是结构性的、与损失选择无关。）且 |d|≥beta 段梯度'
+                        '有界、SFT 早期大误差不会把 log 炸飞')
     ap.add_argument('--huber-beta', default=0.5,
                     type=_positive_beta,
                     help='Huber(smooth L1) 的 beta，同时就是拐点位置 delta：'
-                         '|误差|<beta 走二次段、>=beta 走线性段（线性段的逐元素'
-                         '梯度是 sign(d)，但 mean 归约会再除以元素数 N —— '
-                         'N=2888 时只有 ±0.00035，不是 ±1）。'
-                         '实现用 F.smooth_l1_loss(beta=)，它就是教科书 '
-                         'Huber(delta=beta) 本身；torch 的 F.huber_loss(delta=) '
-                         '则是它的 beta 倍缩放（仅 beta=1 时两者相等），故不用。'
-                         '同时作用于 --policy-loss=huber 与 --value-loss=huber，'
-                         '必须 >0（0 会静默退化成 L1，负值在训练中途才炸），'
-                         '默认 0.5')
+                        '|误差|<beta 走二次段、>=beta 走线性段（线性段的逐元素'
+                        '梯度是 sign(d)，但 mean 归约会再除以元素数 N —— '
+                        'N=2888 时只有 ±0.00035，不是 ±1）。'
+                        '实现用 F.smooth_l1_loss(beta=)，它就是教科书 '
+                        'Huber(delta=beta) 本身；torch 的 F.huber_loss(delta=) '
+                        '则是它的 beta 倍缩放（仅 beta=1 时两者相等），故不用。'
+                        '同时作用于 --policy-loss=huber 与 --value-loss=huber，'
+                        '必须 >0（0 会静默退化成 L1，负值在训练中途才炸），'
+                        '默认 0.5')
     ap.add_argument('--value-lr-mult', type=float, default=5.0,
                     help='value head 学习率倍数（相对主干 LR，补偿参数量小的梯度不足）')
     ap.add_argument('--label-smoothing', type=float, default=0.1,
@@ -3718,48 +3885,48 @@ def main():
     # ---- 局级 sidecar（spec §5.3）：A/B 段的逐局贴目 --------------------------
     ap.add_argument('--games-npz', default=None,
                     help='局级 sidecar（scripts/build_games_sidecar.py 的产物，'
-                         '约 1.2 MB）。**只对 board 级数据有意义**（C 段 stdata '
-                         '分片的贴目在行里）。给了就把逐局 `g_komi` 接进 V7 的'
-                         '全局特征：全局 ch5（currentSelfKomi/20）与 ch18 的'
-                         '三角波都要它。不给 ⇒ 贴目按 0 处理（ch5 恒 0）。'
-                         ' sidecar 按 **game_id** 索引，不是按行号；长度必须'
-                         '覆盖 game_ids.max()+1，短了当场报错而不是静默取到别局的贴目。'
-                         ' `g_rules` 目前**接不进特征**（官方 calculateArea 只吃'
-                         '标量 rules_flags，逐局化会触发 "truth value is ambiguous"）——'
-                         '给了会报告有多少局规则与默认不同，那些局的空间特征仍按'
-                         '简单局算。')
+                        '约 1.2 MB）。**只对 board 级数据有意义**（C 段 stdata '
+                        '分片的贴目在行里）。给了就把逐局 `g_komi` 接进 V7 的'
+                        '全局特征：全局 ch5（currentSelfKomi/20）与 ch18 的'
+                        '三角波都要它。不给 ⇒ 贴目按 0 处理（ch5 恒 0）。'
+                        ' sidecar 按 **game_id** 索引，不是按行号；长度必须'
+                        '覆盖 game_ids.max()+1，短了当场报错而不是静默取到别局的贴目。'
+                        ' `g_rules` 目前**接不进特征**（官方 calculateArea 只吃'
+                        '标量 rules_flags，逐局化会触发 "truth value is ambiguous"）——'
+                        '给了会报告有多少局规则与默认不同，那些局的空间特征仍按'
+                        '简单局算。')
 
     # ---- A4 · 软标签（KataGo 访问分布）四参数 --------------------------------
     # spec §3 A 组 / §5.7。这四个旗**只在给了 --soft-index 时有任何作用**；
     # 没给时下面每一条路径都逐位不变（段 1 的通路基线不受影响）。
     ap.add_argument('--soft-index', default=None,
                     help='软标签索引 npz（scripts/build_soft_index.py 的产物，'
-                         '含 idx (M,) 与 policy (M,362)）。给了就把它挂到数据集'
-                         '行上并把 policy 损失切到 soft_ce；**不给 = 完全走段 1 '
-                         '旧路径**（labels=False、policy_loss=ce，数值逐位不变）。'
-                         ' 该索引必须来自当前主 npz：build_soft_index 的缓存 key '
-                         '含主 npz 指纹与散列口径版本，索引陈旧时它会告警并重建 —— '
-                         '静默挂错标签的症状只是「命中率 0」，别把它当成「这批局面'
-                         '真的没标签」')
+                        '含 idx (M,) 与 policy (M,362)）。给了就把它挂到数据集'
+                        '行上并把 policy 损失切到 soft_ce；**不给 = 完全走段 1 '
+                        '旧路径**（labels=False、policy_loss=ce，数值逐位不变）。'
+                        ' 该索引必须来自当前主 npz：build_soft_index 的缓存 key '
+                        '含主 npz 指纹与散列口径版本，索引陈旧时它会告警并重建 —— '
+                        '静默挂错标签的症状只是「命中率 0」，别把它当成「这批局面'
+                        '真的没标签」')
     ap.add_argument('--soft-weight', type=float, default=1.0,
                     help='软项的全局缩放（soft_ce 的乘子，默认 1.0 = 不缩放）。'
-                         ' soft_ce 的分母恒为 batch 大小 B 而不是 Σmask ⇒ 软项'
-                         '量级随「批里软行占比」线性变化；--soft-only-sampling 让'
-                         '占比≈1 时本参数才有可解释的量级，否则调它是在调软行占比')
+                        ' soft_ce 的分母恒为 batch 大小 B 而不是 Σmask ⇒ 软项'
+                        '量级随「批里软行占比」线性变化；--soft-only-sampling 让'
+                        '占比≈1 时本参数才有可解释的量级，否则调它是在调软行占比')
     ap.add_argument('--soft-only-sampling', type=int, default=0, choices=[0, 1],
                     help='训练行索引空间收窄到「有软标签的行」（soft_row >= 0）'
-                         '(0=关闭=全量混训，1=开启)。段 2 用它：**只训软行**是'
-                         'spec §1.2 的决定 —— 同一个 head 同时收到搜索分布与人类 '
-                         'one-hot 会去折中而不是学搜索；--soft-weight 0 关不掉'
-                         '这个问题（那是「开了软标签但 99%% 样本仍在教 one-hot」的'
-                         '静默半吊子）。与 Phase 4 item 3 的滑动窗口**正交**，'
-                         '两者可叠加。 必须同时给 --soft-index，否则启动时报错')
+                        '(0=关闭=全量混训，1=开启)。段 2 用它：**只训软行**是'
+                        'spec §1.2 的决定 —— 同一个 head 同时收到搜索分布与人类 '
+                        'one-hot 会去折中而不是学搜索；--soft-weight 0 关不掉'
+                        '这个问题（那是「开了软标签但 99%% 样本仍在教 one-hot」的'
+                        '静默半吊子）。与 Phase 4 item 3 的滑动窗口**正交**，'
+                        '两者可叠加。 必须同时给 --soft-index，否则启动时报错')
     ap.add_argument('--soft-every', type=_at_least_one, default=1,
                     help='每 N 个 micro-batch 里有 1 个走软 CE（默认 1 = 每步都走）。'
-                         'N>1 时其余步骤回退到 --policy-loss 的硬目标口径，'
-                         '那几步里的软行会按 one-hot 训 —— 这正是 spec §5 退路表'
-                         '点名的「混合训练 ⇒ index 0 向两种语义折中」，只在'
-                         '明确知道后果时才用。必须 >= 1')
+                        'N>1 时其余步骤回退到 --policy-loss 的硬目标口径，'
+                        '那几步里的软行会按 one-hot 训 —— 这正是 spec §5 退路表'
+                        '点名的「混合训练 ⇒ index 0 向两种语义折中」，只在'
+                        '明确知道后果时才用。必须 >= 1')
     ap.add_argument('--use-checkpoint', type=int, default=0, choices=[0, 1],
                     help='用 gradient checkpointing 减少显存占用（约省 50%%，训练慢 ~30%%）(0=关闭, 1=开启)')
     ap.add_argument('--use-ema', type=int, default=0, choices=[0, 1],
@@ -3768,36 +3935,36 @@ def main():
                     help='梯度累积步数（模拟更大 batch size，效果等同于 batch_size * N）')
     ap.add_argument('--scaler-init-scale', type=float, default=0.0,
                     help='GradScaler 初始缩放值（0=用 PyTorch 默认 65536）。'
-                         '默认 65536 需要靠减半向下搜索平衡点，每次溢出白扔一个 '
-                         'batch；实测本模型在 4 卡 910A 上平衡于 512~2048，'
-                         '故建议直接给 1024 起步。设 --scaler-growth-interval 0 '
-                         '可关闭自动回涨，避免震荡反复偷步')
+                        '默认 65536 需要靠减半向下搜索平衡点，每次溢出白扔一个 '
+                        'batch；实测本模型在 4 卡 910A 上平衡于 512~2048，'
+                        '故建议直接给 1024 起步。设 --scaler-growth-interval 0 '
+                        '可关闭自动回涨，避免震荡反复偷步')
     ap.add_argument('--scaler-growth-interval', type=int, default=0,
                     help='连续多少个无溢出 step 后把缩放值翻倍'
-                         '（0=用 PyTorch 默认 2000；设一个大值如 100000 即'
-                         '相当于关闭回涨，让缩放值稳定在 init-scale 附近）')
+                        '（0=用 PyTorch 默认 2000；设一个大值如 100000 即'
+                        '相当于关闭回涨，让缩放值稳定在 init-scale 附近）')
     ap.add_argument('--npu-graph-compile', type=int, default=0, choices=[0, 1],
                     help='NPU 上用 TorchAir 图编译替代 eager（受控实验，D2 Linear-only：'
-                         '只递归编译各 nn.Linear 子模块，其余仍 eager，不包整张网络）。'
-                         'NPU 上 inductor 不可用，必须显式传 torchair backend；'
-                         'torch_npu 须先于 torchair 导入，否则图模式会静默降级为'
-                         'eager 而不报错。失败自动整表回滚并回退 eager。'
-                         ' 显存风险：本项目 4 卡 910A 常驻已达 26.7~31.1GB/32GB，'
-                         '图模式的 workspace 与图缓冲可能再炸；且实测环境为 '
-                         'torch 2.1.0 / torch_npu 2.1.0.post3 / CANN 8.0.RC1，'
-                         '属 2023 年代组合，功能成熟度存疑。故默认关闭，'
-                         '建议先短跑验证(0=关闭, 1=开启)')
+                        '只递归编译各 nn.Linear 子模块，其余仍 eager，不包整张网络）。'
+                        'NPU 上 inductor 不可用，必须显式传 torchair backend；'
+                        'torch_npu 须先于 torchair 导入，否则图模式会静默降级为'
+                        'eager 而不报错。失败自动整表回滚并回退 eager。'
+                        ' 显存风险：本项目 4 卡 910A 常驻已达 26.7~31.1GB/32GB，'
+                        '图模式的 workspace 与图缓冲可能再炸；且实测环境为 '
+                        'torch 2.1.0 / torch_npu 2.1.0.post3 / CANN 8.0.RC1，'
+                        '属 2023 年代组合，功能成熟度存疑。故默认关闭，'
+                        '建议先短跑验证(0=关闭, 1=开启)')
     ap.add_argument('--compile', type=int, default=0, choices=[0, 1],
                     help='用 torch.compile 融合算子（GPU 上约 20-40%% 提速，首次迭代较慢）(0=关闭, 1=开启)')
     ap.add_argument('--compile-mode', default='default',
                     choices=['default', 'max-autotune', 'reduce-overhead'],
                     help='torch.compile 模式: default=常规融合, max-autotune=A100 上进一步 '
-                         '自动调优提速（编译更久）, reduce-overhead=小 batch 低开销')
+                        '自动调优提速（编译更久）, reduce-overhead=小 batch 低开销')
     ap.add_argument('--flash-attn', type=int, default=1, choices=[0, 1],
                     help='flash-attn 独立库开关：A100(Ampere+) 上优先于内置 SDPA（最快，需 '
-                         'pip install flash-attn），加载失败自动回退内置 SDPA。'
-                         '1=自动优先（默认：A100 优先 flash-attn，其他后端不用）；'
-                         '0=强制禁用（A100 也走内置 SDPA）。原环境变量副本 GOAI_FLASH 已于 2026-10-06 删除')
+                        'pip install flash-attn），加载失败自动回退内置 SDPA。'
+                        '1=自动优先（默认：A100 优先 flash-attn，其他后端不用）；'
+                        '0=强制禁用（A100 也走内置 SDPA）。原环境变量副本 GOAI_FLASH 已于 2026-10-06 删除')
     ap.add_argument('--arch', default='resnet',
                     choices=['resnet', 'convnext'],
                     help='网络架构风格: resnet=传统 ResBlock (默认，兼容旧权重) | convnext=ConvNeXt 风格 (5x5 深度卷积 + LayerNorm + GELU)')
@@ -3811,8 +3978,8 @@ def main():
                     help='SwanLab API key（可选，未设置则读取 SWANLAB_API_KEY 环境变量）')
     ap.add_argument('--swanlab-every', type=int, default=0,
                     help='SwanLab 上报频率（每 N 步上报一次）。0=跟随 --log-every（默认，'
-                         '与旧行为一致）；曲线太稀时设 5~10，例：--log-every 50 '
-                         '--swanlab-every 10 可让曲线密度提升 5 倍而 stdout 不刷屏')
+                        '与旧行为一致）；曲线太稀时设 5~10，例：--log-every 50 '
+                        '--swanlab-every 10 可让曲线密度提升 5 倍而 stdout 不刷屏')
     ap.add_argument('--early-stop', type=int, default=0, choices=[0, 1],
                     help='启用早停机制：当验证集指标连续 N 次无改善时自动停止训练 (0=关闭, 1=开启)')
     ap.add_argument('--early-stop-patience', type=int, default=3,
@@ -3831,17 +3998,17 @@ def main():
     #   判据的依据是数据集事实（81.09% 的 SGF 是认输），不是调参口味。
     ap.add_argument('--v7', type=int, default=0, choices=[0, 1],
                     help='启用 V7 的 22 通道 NBT+Transformer 路径'
-                         '（NbtTfNet + 12 项 KataGoV7Loss，0=关闭=12 通道旧路径，'
-                         '**默认**；1=开启）。开启时：特征改由 feature_v7 的 '
-                         'spatial_channels_v7/global_features_v7 在预取 worker 里造，'
-                         'futurepos 自动 enable 并在**父进程 fork 前 warm**，'
-                         '段 1 的四个目标 = policy / π_opp / value / futurepos，'
-                         'score 系权重 0 但结构保留。'
-                         ' 强制 --board-size 19（V7 通道数与 loss 里的 n_sq=19*19 '
-                         '都是钉死的）。'
-                         ' 与 --soft-index 互斥：V7 的 policy 目标走 '
-                         '`policy_player`（人类 one-hot），软标签是段 2 的口径，'
-                         '两条都开会静默互相覆盖 —— 给了就报错。')
+                        '（NbtTfNet + 12 项 KataGoV7Loss，0=关闭=12 通道旧路径，'
+                        '**默认**；1=开启）。开启时：特征改由 feature_v7 的 '
+                        'spatial_channels_v7/global_features_v7 在预取 worker 里造，'
+                        'futurepos 自动 enable 并在**父进程 fork 前 warm**，'
+                        '段 1 的四个目标 = policy / π_opp / value / futurepos，'
+                        'score 系权重 0 但结构保留。'
+                        ' 强制 --board-size 19（V7 通道数与 loss 里的 n_sq=19*19 '
+                        '都是钉死的）。'
+                        ' 与 --soft-index 互斥：V7 的 policy 目标走 '
+                        '`policy_player`（人类 one-hot），软标签是段 2 的口径，'
+                        '两条都开会静默互相覆盖 —— 给了就报错。')
     args = ap.parse_args()
 
     # ---- 分布式训练环境变量（由 torchrun / mp.spawn 注入）----
@@ -3864,8 +4031,17 @@ def main():
     #   `load_from_path` 之前（坏组合不该先吃满内存）。两处顺序都有测试钉。
     _soft_on = bool(args.soft_index)
     _hard_policy_loss = args.policy_loss
+    # ⚠ 这里**不能**用 `v7_packed=bool(args.v7)`：`--v7 1` 只说明「走 22 通道
+    #   路径」，**不等于**「数据是 stdata 分片」。board 级语料（full.npz，A/B 段）
+    #   同样打 `--v7 1`，却**没有**内建软标签。传 `bool(args.v7)` 会让
+    #   `resolve_policy_loss_kind` 误判成「有软标签来源」⇒ 提前把 kind 派生成
+    #   `soft_ce`，于是在 board 级数据上打出一句**假的**「--soft-index 已给定」
+    #   （2026-10-07 真机日志里就出现过），而 `soft_mask` 其实恒 0。
+    #   V7 的真实分片判据要等 dataset 建好后用 `hasattr(dataset, 'sample_spatial')`
+    #   （见本文件后面 `if _v7_on:` 那一次重新解析），那里才是唯一正确的口径。
+    #   此处只做「加载数据集之前拒掉坏组合」这一件事，V7 的最终口径留给后面。
     _eff_kind = resolve_policy_loss_kind(args.policy_loss, args.soft_index,
-                                        v7_packed=bool(args.v7))
+                                        v7_packed=False)
     if _eff_kind != _hard_policy_loss:
         logger.info("[soft] policy 损失口径 %s → %s（--soft-index 已给定）",
                     _hard_policy_loss, _eff_kind)
@@ -3899,9 +4075,9 @@ def main():
                 "则只采样命中行，软项量级与段 2 一致。")
         if args.value_loss_weight != 1.0:
             logger.warning("[v7] --value-loss-weight=%s 在 V7 上**无效**：V7 的"
-                           "value 是 `KataGoV7Loss` 内的 3 分类 CE（#3，系数 1.20），"
-                           "不经 `compute_value_loss`。该参数只作用于 12 通道路径。",
-                           args.value_loss_weight)
+                        "value 是 `KataGoV7Loss` 内的 3 分类 CE（#3，系数 1.20），"
+                        "不经 `compute_value_loss`。该参数只作用于 12 通道路径。",
+                        args.value_loss_weight)
         args.value_loss_weight = 1.0
         args.label_smoothing = 0.0
         args.policy_loss = 'ce'
@@ -3914,7 +4090,7 @@ def main():
                         "⇒ `--early-stop` 与 best-model 判据均**生效**。")
         if args.export_onnx == 1:
             logger.warning("[v7] --export-onnx 走 `GoAI`，它是 12 通道推理链；"
-                           "V7 需要另一条导出路径（本次未接），导出结果不可用。")
+                        "V7 需要另一条导出路径（本次未接），导出结果不可用。")
 
     # ---- C2NET 支持（OpenI 启智平台）----
     # 关于 rank 守卫：prepare() 与 --data 覆盖**必须**在所有 rank 上执行——
@@ -3940,7 +4116,7 @@ def main():
                     if os.path.isdir(args.data):
                         import glob
                         _n_npz = len(glob.glob(os.path.join(args.data, '**', '*.npz'),
-                                               recursive=True))
+                                            recursive=True))
                         logger.info("[c2net] 使用数据集目录（合并全部分片）: %s"
                                     "（npz 分片 %d 个）", args.data, _n_npz)
                     else:
@@ -3977,7 +4153,7 @@ def main():
         swanlab_logger = _init_swanlab(args, logger)
         if swanlab_logger is None:
             logger.warning("[swanlab] 已降级为关闭；指标请看 stdout 日志"
-                           "（每 --log-every 步一行：loss / p / v / lr / mem / spd）")
+                        "（每 --log-every 步一行：loss / p / v / lr / mem / spd）")
     if is_main:
         _se_eff = args.swanlab_every if args.swanlab_every > 0 else args.log_every
         logger.info("SwanLab: 启用=%s 已初始化=%s 上报频率=每 %d 步（--swanlab-every=%d，"
@@ -4022,17 +4198,17 @@ def main():
                     100.0 * _sd['hit_rate'], _sd['n_soft_dup'], _soft_every)
         if _sd['n_soft'] == 0:
             logger.error("[soft] 软标签命中 0 行。先确认索引与当前主 npz 匹配"
-                         "（build_soft_index 会对陈旧缓存告警并重建），"
-                         "**不要**把「索引陈旧」当成「这批局面真的没标签」—— "
-                         "后者根本不会命中缓存。")
+                        "（build_soft_index 会对陈旧缓存告警并重建），"
+                        "**不要**把「索引陈旧」当成「这批局面真的没标签」—— "
+                        "后者根本不会命中缓存。")
         if _soft_every > 1:
             logger.warning("[soft] --soft-every=%d：只有 1/%d 的 micro-batch 走软 "
-                           "CE，其余步骤的软行按 one-hot 训 —— spec §5 退路表点名"
-                           "这是「index 0 向两种语义折中」的场景，请确认这是有意的。",
-                           _soft_every, _soft_every)
+                        "CE，其余步骤的软行按 one-hot 训 —— spec §5 退路表点名"
+                        "这是「index 0 向两种语义折中」的场景，请确认这是有意的。",
+                        _soft_every, _soft_every)
     elif _soft_every > 1:
         logger.warning("[soft] --soft-every=%d 但没有 --soft-index：该参数无作用",
-                       _soft_every)
+                    _soft_every)
 
     # ---- B8 · futurepos 挂载 + warm：**必须在 fork 之前** --------------------
     # `warm_futurepos()` 是本次接线里唯一一处「顺序错了不报错」的调用，必须
@@ -4065,7 +4241,7 @@ def main():
             _fp_status = dataset.warm_futurepos()   # 必须在 worker 起来之前 warm
         else:
             _fp_status = {'mode': 'packed', 'offsets': None,
-                          'resolved': True, 'source': 'shard:futurepos'}
+                        'resolved': True, 'source': 'shard:futurepos'}
         logger.info("[v7] futurepos 数据源 | mode=%s offsets=%s resolved=%s "
                     "source=%s", _fp_status.get('mode'),
                     _fp_status.get('offsets'), _fp_status.get('resolved'),
@@ -4074,8 +4250,8 @@ def main():
     pf = None
     if args.prefetch_workers > 1:
         pf = _BatchPrefetcher(dataset, num_workers=args.prefetch_workers,
-                              prefetch=args.prefetch_depth, labels=_soft_on,
-                              v7=_v7_on)
+                            prefetch=args.prefetch_depth, labels=_soft_on,
+                            v7=_v7_on)
         logger.info("[data] 预取器已启用（在设备初始化之前 fork）| workers=%d depth=%d"
                     " | labels=%s | v7=%s", args.prefetch_workers, args.prefetch_depth,
                     _soft_on, _v7_on)
@@ -4106,8 +4282,8 @@ def main():
     # 否则后续 .to(device) / DDP 包裹会失败或各卡不互通。
     if is_dist:
         _dist_backend = (args.device.split(':')[0]
-                         if args.device not in ('auto', '') else
-                         ('npu' if npu_is_available() else 'cuda'))
+                        if args.device not in ('auto', '') else
+                        ('npu' if npu_is_available() else 'cuda'))
         # 必须在 init_process_group **之前**：DETAIL 是在建域那一刻给每个 PG 套
         # 一层一致性检查 wrapper（每次 collective 前一发 monitored_barrier），NPU
         # 上未验证过其开销 ⇒ 降为 OFF（该代价与用哪种包裹层无关，换轨后依旧存在）。
@@ -4263,14 +4439,14 @@ def main():
         try:
             import torch_npu as _tnpu
             _tnpu_ver = tuple(int(x) for x in _tnpu.__version__.split('.')[:2]
-                              if x.isdigit())
+                            if x.isdigit())
             _sdpa_old_tnpu = _tnpu_ver < (2, 1)
         except Exception:
             _sdpa_old_tnpu = False
         sdpa_force_math = (not _sdpa_wanted) or (not _sdpa_has_api) or _sdpa_old_tnpu
         if args.compile == 1:
             logger.warning("[device] NPU 上 torch.compile(inductor) 不可用，已忽略 --compile；"
-                           "如需图编译请改用 --npu-graph-compile 1（TorchAir 后端）。")
+                        "如需图编译请改用 --npu-graph-compile 1（TorchAir 后端）。")
             args.compile = False
     else:
         # CPU 或其他：纯 FP32，无 AMP、无 channels_last
@@ -4286,7 +4462,7 @@ def main():
     _npu_graph = (args.npu_graph_compile == 1 and _backend == 'npu')
     if args.npu_graph_compile == 1 and _backend != 'npu':
         logger.warning("[device] --npu-graph-compile 仅对 NPU 生效，当前后端为 %s，"
-                       "已忽略。", _backend)
+                    "已忽略。", _backend)
 
     # 全局 SDPA 总开关（--use-sdpa）：在各后端选定天然默认后做一次统一覆盖，
     # 让该参数对 CUDA / NPU / CPU 全部后端生效。
@@ -4297,7 +4473,7 @@ def main():
     if args.use_sdpa == 0 and not sdpa_force_math:
         sdpa_force_math = True
         logger.warning("[device] --use-sdpa 0：强制 %s 后端回退手写 math 注意力"
-                       "（覆盖其天然默认）", _backend)
+                    "（覆盖其天然默认）", _backend)
 
     # 把注意力后端/编译开关透传给 backbone 模块（所有分支统一设置）
     from src.networks import backbone as _backbone
@@ -4347,7 +4523,7 @@ def main():
     _backbone.set_attn_online(bool(args.attn_online))
     if args.attn_online:
         logger.warning("[model] online-softmax 注意力已开启：与 materialize 路径"
-                       "数值等价但非逐位相同，12 通道 bit-identical 基线会失效")
+                    "数值等价但非逐位相同，12 通道 bit-identical 基线会失效")
 
     # flash-attn 独立库启用决策（A100 优先）：仅「Ampere+ CUDA 且走非 math 路径」时
     # 优先尝试加载 flash-attn，加载成功则 _sdpa 优先走 flash-attn 内核，失败回退内置 SDPA。
@@ -4504,7 +4680,7 @@ def main():
         # `_eff_cfg` 里也有一份）。对不上说明表被改过而锚没更新 —— 直接在这里响，
         # 别等到几天后拿一个「莫名涨了 2M 参数」的 run 去比 loss。
         if (n_params, _n_backbone) != (_eff_cfg['params_total'],
-                                       _eff_cfg['params_backbone']):
+                                    _eff_cfg['params_backbone']):
             logger.warning(
                 "[model] 参数量与 KATAGO_SE_CFG 的预算锚不符：实测 %d / %d"
                 "（全网 / 主干），锚 %d / %d。改了结构表就要重数这两个数。",
@@ -4541,9 +4717,53 @@ def main():
     # 门槛 2026-10-06 放开：NPU 上由 CLI `--npu-channels-last 1` 驱动（V7 的卷积
     # 权重是 4D，同样可转），此前只有 cuda 能进 ⇒ NPU 上这个 flag 形同虚设。
     if use_channels_last and _backend in ('cuda', 'npu'):
-        model = model.to(memory_format=torch.channels_last)  # type: ignore[call-overload]
-        logger.info("[model] 已启用 channels_last (NHWC) | backend=%s v7=%s",
-                    _backend, _v7_on)
+        # ⚠ NPU 上 `torch.channels_last` 这条路**整条都不通**（真机 torch 2.1.0
+        #   + torch_npu 两次实测，两个不同的错）：
+        #     1) `model.to(memory_format=channels_last)`
+        #        → `Only contiguous_format or preserve_format is supported.`
+        #          （torch_npu 覆写了 `Module.to`，`torch_npu/utils/_module.py`）
+        #     2) 逐参数 `param.data.contiguous(memory_format=channels_last)`
+        #        → `NPU contiguous operator only supportted contiguous memory
+        #           format.` [ERROR] ERR01007 OPS feature not supported
+        #          （torch_npu 的 contiguous 算子只认 contiguous 布局）
+        #   ⇒ 昇腾的布局控制走 `npu_format_cast` / `Format` 这一套（改的是 aclnn 的
+        #     aclFormat，NHWC=1，那才是 CANN 卷积核认的布局）。但它是 CANN 8.x
+        #     才有的 beta API，**本仓库的 torch_npu 2.1.0 上连 `Format` 都没有**
+        #     （2026-10-07 实测 AttributeError），所以可用入口由
+        #     `_npu_nhwc_formats()` 探测决定，不是写死的。
+        #     细节见那三个连续踩过的坑与 `_cast_nhwc_npu`。
+        if _backend == 'cuda':
+            model = model.to(memory_format=torch.channels_last)
+            logger.info("[model] 已启用 channels_last (NHWC) | backend=%s v7=%s",
+                        _backend, _v7_on)
+        else:
+            # NPU：逐参数转，且**失败必须降级而不是崩**——run.txt 把这批开关的
+            # 契约定为「只慢不坏」：布局转换是纯优化，任何后端/版本不支持都只该
+            # 少一个优化，不该让训练起不来。崩在这里会让人误以为模型坏了。
+            _n_cl, _cl_err = 0, None
+            try:
+                _n_cl = _apply_channels_last_(model, backend=_backend)
+            except Exception as _e:      # noqa: BLE001 - 故意兜住，降级优先
+                _cl_err = repr(_e)
+            if _cl_err is not None:
+                use_channels_last = False   # 关键：权重没转 ⇒ 输入也不能转
+                _have = [n for n, _ in _npu_nhwc_formats()]
+                logger.warning(
+                    "[model] ⚠ channels_last 不可用，已回退默认布局"
+                    "（训练照常继续，仅少这项优化）。"
+                    "原因=%s | 本机 torch_npu 可用入口=%s | "
+                    "如需确认可跑 scripts/probe_npu_layout.py",
+                    _cl_err, _have if _have else '无（该版本不支持用户侧布局控制）')
+            elif _n_cl == 0:
+                # 一个 4D 卷积权重都没转成 ⇒ 这个 flag 对当前模型是 no-op。
+                use_channels_last = False
+                logger.warning("[model] ⚠ 没找到任何 4D 权重可转 channels_last，"
+                            "--npu-channels-last 对本模型无效，已回退默认布局。")
+            else:
+                logger.info("[model] channels_last 逐参数转换: %d 个 4D 权重 | "
+                            "backend=%s v7=%s | 入口=%s",
+                            _n_cl, _backend, _v7_on,
+                            _npu_nhwc_formats()[0][0])
 
     # 参数组：value head 独立 LR（参数量小，需要更高学习率补偿梯度不足）
     # 排除 bias / BatchNorm / LayerNorm 参数的 weight decay（标准做法）
@@ -4558,7 +4778,7 @@ def main():
     # set_to_none=False 原地清零，训练语义等价（仅多一次写带宽）。其余后端维持
     # True（省一次 memset，原行为）。
     _zero_set_none = not (_opt_mode == 'fused'
-                          and str(device).split(':')[0] == 'npu')
+                        and str(device).split(':')[0] == 'npu')
     # BF16 后端（A100/NPU）下 use_scaler=False（BF16 不下溢，省去 loss scaling 的额外同步）；
     # V100/FP16 下开启 GradScaler。按设备选择 GradScaler 实现。
     # 缩放值策略可配：从 65536 起步要靠减半向下搜索平衡点，每次溢出都白扔一个
@@ -4712,7 +4932,7 @@ def main():
                         step, best_eval_acc, start_epoch)
         else:
             logger.warning("[resume] 未找到 %s（仅恢复模型权重，optimizer/scheduler 从头开始）",
-                           state_path)
+                        state_path)
 
     # ---- 仅加载模型权重（不加载 optimizer/scheduler/step）----
     if args.model:
@@ -4770,12 +4990,12 @@ def main():
                 # 发生在这个 autocast 块里」）。抽走之后那条测试会误报。
                 if _v7_on:
                     model(torch.zeros(1, V7_SPATIAL_CHANNELS, args.board_size,
-                                      args.board_size, device=device),
-                          torch.zeros(1, V7_GLOBAL_CHANNELS, device=device))
+                                    args.board_size, device=device),
+                        torch.zeros(1, V7_GLOBAL_CHANNELS, device=device))
                 else:
                     model(torch.zeros(1, KATAGO_SE_CFG['in_channels'],
-                                      args.board_size, args.board_size,
-                                      device=device))
+                                    args.board_size, args.board_size,
+                                    device=device))
             logger.info("[train] NPU TorchAir Linear-only 图编译已启用（已编译 %d 个 "
                         "nn.Linear，其余子模块仍 eager）", len(_npu_rollback))
         except Exception as e:  # noqa: BLE001
@@ -4783,11 +5003,11 @@ def main():
             # 「替换中途失败」（helper 内部已还原过一次）与「预热失败」都适用。
             _restored = _rollback_linear_submodules(_npu_rollback)
             logger.warning("[train] NPU TorchAir 图编译失败，已还原 %d 个 nn.Linear 子模块，"
-                           "回退 eager: %s", _restored, e)
+                        "回退 eager: %s", _restored, e)
             if isinstance(e, ImportError):
                 logger.warning("[train] 常见原因：torchair 随 torch_npu 附带，"
-                               "不可单独 pip install；同时需确认 CANN 的 ATC/ACL "
-                               "路径可见（镜像内通常已 source set_env.sh）")
+                            "不可单独 pip install；同时需确认 CANN 的 ATC/ACL "
+                            "路径可见（镜像内通常已 source set_env.sh）")
     elif args.compile == 1:
         if hasattr(torch, 'compile'):
             try:
@@ -4812,12 +5032,12 @@ def main():
                     # （同上，就地写而不是抽 helper）。
                     if _v7_on:
                         model(torch.zeros(1, V7_SPATIAL_CHANNELS, args.board_size,
-                                          args.board_size, device=device),
-                              torch.zeros(1, V7_GLOBAL_CHANNELS, device=device))
+                                        args.board_size, device=device),
+                            torch.zeros(1, V7_GLOBAL_CHANNELS, device=device))
                     else:
                         model(torch.zeros(1, KATAGO_SE_CFG['in_channels'],
-                                          args.board_size, args.board_size,
-                                          device=device))
+                                        args.board_size, args.board_size,
+                                        device=device))
                 logger.info("[train] 已启用 torch.compile 算子融合")
             except Exception as e:  # noqa: BLE001
                 # 真正回退 eager：剥离 OptimizedModule 包装，恢复原始模块引用
@@ -4919,7 +5139,7 @@ def main():
                 # DDP 下 `parameters()` 带 `module.` 前缀但**数量不变**，
                 #   要真参数名得先 unwrap；这里只要个数，所以直接数即可。
                 "run/params_actual": int(sum(p.numel()
-                                             for p in model.parameters())),
+                                            for p in model.parameters())),
                 # ---- 数据源形态：board 级实时算 / stdata 预算好 ----
                 # 这两条决定「换个 --data 跑同一个 run」到底换掉了什么，而
                 # config 面板只有一个 `--data` 路径字符串。
@@ -4932,7 +5152,7 @@ def main():
                 #   人读的名字在 config 面板（那里字符串合法）与 stdout，
                 #   曲线里存码 —— 两边对照见 run.txt 的键位表。
                 "run/v7_source": (2 if hasattr(dataset, 'sample_spatial')
-                                  else (1 if _v7_on else 0)),
+                                else (1 if _v7_on else 0)),
                 "run/rows_total": int(len(dataset)),
                 "run/n_games": int(np.unique(np.asarray(dataset.game_ids)).size)
                 if getattr(dataset, 'game_ids', None) is not None else 0,
@@ -4953,7 +5173,7 @@ def main():
             # 的注释）。config 面板在 init 时建，那时数据集还没加载 ⇒ 那里
             # 拿不到这个形态，只能靠这一行 + 曲线里的码对照。
             _src_name = ('packed' if hasattr(dataset, 'sample_spatial')
-                         else ('board_level' if _v7_on else 'se12'))
+                        else ('board_level' if _v7_on else 'se12'))
             logger.info("[swanlab] run/v7_source=%d（%s）| 0=se12 1=board_level 2=packed",
                         _run_facts['run/v7_source'], _src_name)
             try:
@@ -5048,7 +5268,7 @@ def main():
                             import torch_npu
                             import torch_npu.profiler as _tnpu_prof
                             _acts = [_tnpu_prof.ProfilerActivity.CPU,
-                                     _tnpu_prof.ProfilerActivity.NPU]
+                                    _tnpu_prof.ProfilerActivity.NPU]
                             _prof_ctx = _tnpu_prof.profile(activities=_acts)
                         else:
                             from torch.profiler import (profile, ProfilerActivity)
@@ -5077,13 +5297,13 @@ def main():
                             dataset, sel, device)
                     _in32 = (amp_dtype == torch.float32)
                     state = v7_to_device(_sp_np, device, amp_dtype,
-                                         pin=(_backend == 'cuda'))
+                                        pin=(_backend == 'cuda'))
                     # NHWC（2026-10-06）：与模型权重的 channels_last 对齐，否则
                     # 卷积拿到 channels_last 权重 + NCHW 输入，每次卷积都白搬一次。
                     if use_channels_last:
-                        state = state.to(memory_format=torch.channels_last)
+                        state = _to_nhwc(state)
                     gl = v7_to_device(_gl_np, device, amp_dtype,
-                                      pin=(_backend == 'cuda'))
+                                    pin=(_backend == 'cuda'))
                     move_t = torch.from_numpy(
                         np.ascontiguousarray(_mv_np)).long().to(
                             device, non_blocking=True)
@@ -5145,7 +5365,7 @@ def main():
                         lbl = None
                     # A100 上转 NHWC 以匹配模型 channels_last 布局，卷积更快
                     if use_channels_last:
-                        state = state.to(memory_format=torch.channels_last)
+                        state = _to_nhwc(state)
                 # ---- A4：软批节奏 + 软项 kwarg -----------------------------
                 # kind 走 `args.policy_loss` 这个**既有**通道：`compute_policy_loss`
                 # 的第 3 个位置实参被 tests/test_huber_loss.py::
@@ -5159,7 +5379,7 @@ def main():
                 # 相同（段 1 的热路径不多搬一个字节、也不多算一个张量）。
                 soft_kwargs = ({'soft': lbl['soft'], 'soft_mask': lbl['soft_mask'],
                                 'soft_weight': args.soft_weight}
-                               if lbl is not None else {})
+                            if lbl is not None else {})
                 _dt = time.perf_counter() - _t_data0
                 _t_data += _dt
                 if _dt > _t_data_max:
@@ -5232,13 +5452,13 @@ def main():
                         #   而看日志的人会以为 loss 已经废了。
                         _tot_ok = _v7_res.get('total_finite')
                         _head = ('加权总 loss 仍非有限' if _tot_ok is False
-                                 else '加权总 loss 有限（该项系数为 0，已净化）')
+                                else '加权总 loss 有限（该项系数为 0，已净化）')
                         msg = ('[v7] 第 %d 次：%s，逐项点名 = %s%s%s'
-                               % (_err_cnt, _head, sorted(_bad_terms) or '（无）',
-                                  ('｜坏在操作数 %s' % sorted(_bad_ops))
-                                  if _bad_ops else '',
-                                  ('｜被净化的坏行 %s' % sorted(_san_rows.items()))
-                                  if _san_rows else ''))
+                            % (_err_cnt, _head, sorted(_bad_terms) or '（无）',
+                                ('｜坏在操作数 %s' % sorted(_bad_ops))
+                                if _bad_ops else '',
+                                ('｜被净化的坏行 %s' % sorted(_san_rows.items()))
+                                if _san_rows else ''))
                         # 每种组合只报一次，后续只计次，否则每步刷屏把真信息淹掉
                         _key = (tuple(sorted(_bad_terms)), tuple(sorted(_bad_ops)),
                                 tuple(sorted(_san_rows.items())))
@@ -5283,9 +5503,9 @@ def main():
                                 '7.07e-3 健康、7.37e-3 即炸），必要时把 warmup 加长到'
                                 '总步数的 15%%~20%%。'
                                 % (_err_cnt, sorted(_bad_terms) or '（无）',
-                                   sorted(_bad_ops) or '（无）',
-                                   sorted(_san_rows.items()) or '（无）',
-                                   getattr(scaler, 'get_scale', lambda: 'n/a')()))
+                                sorted(_bad_ops) or '（无）',
+                                sorted(_san_rows.items()) or '（无）',
+                                getattr(scaler, 'get_scale', lambda: 'n/a')()))
                     # 逐项上报用**独立**的 dict，而不是就地复用 `_v7_terms_last`：
                     #   那个 dict 同时喂 stdout 的 `[step N v7]` 行（键名是裸 term
                     #   名），若直接把带 `loss_v7/` 前缀的键塞进去，stdout 那行会
@@ -5395,7 +5615,7 @@ def main():
                     #   判据改成**直接**问「此刻梯度里真的有 inf/nan 吗」，
                     #   不再靠 clip 返回的总范数间接推断。
                     _had_nonfinite = (use_scaler
-                                      and _grads_nonfinite_local(optimizer))
+                                    and _grads_nonfinite_local(optimizer))
                     if _had_nonfinite and is_main:
                         # 把参数名一并给去 —— 组名只是按 LR 比值**猜**的
                         #（真机日志里三组全被打成 "backbone/policy" 就是
@@ -5498,7 +5718,7 @@ def main():
                     }, args.out + '.latest.train_state')
                 logger.error("=" * 60)
                 logger.error("%s 显存不足 (OOM)！当前 --batch-size=%d 过大。",
-                             device.upper(), bs)
+                            device.upper(), bs)
                 logger.error("window 注意力在 19x19 上把 batch 展开为 B*361，显存增长很快。")
                 logger.error(
                     "建议减小 --batch-size。%s",
@@ -5508,7 +5728,7 @@ def main():
                     if _v7_on else
                     "12 通道可考虑同时调小 --attn-window。")
                 logger.error("已保存进度至 %s.latest(.train_state)，可用 --resume 续训。",
-                             args.out)
+                            args.out)
                 logger.error("已清理显存并退出，请调整参数后重跑。")
                 logger.error("=" * 60)
                 sys.exit(1)
@@ -5677,7 +5897,7 @@ def main():
                         # 会报：它是个合法的局部变量，只是那条路没赋值）。
                         'value_rmse': float('nan') if _v7_on else float(torch.sqrt(
                             (value_logit.detach().float().reshape(-1)
-                             - value_t.reshape(-1).float()).pow(2).mean())),
+                            - value_t.reshape(-1).float()).pow(2).mean())),
                         'value_rmse_zero': float('nan') if _v7_on else float(
                             torch.sqrt(value_t.reshape(-1).float().pow(2).mean())),
                     }
@@ -5709,8 +5929,8 @@ def main():
                             # （熵 0），混进来会让均值被行数权重压平 ⇒ 曲线量到的
                             # 是「batch 里有多少软行」而不是「标签有多锐」。
                             _p = (torch.as_tensor(lbl['soft'])
-                                  .reshape(int(_msk.numel()), -1)[_msk]
-                                  .float().clamp_min(1e-12))
+                                .reshape(int(_msk.numel()), -1)[_msk]
+                                .float().clamp_min(1e-12))
                             _health_last['label_entropy'] = float(
                                 -(_p * _p.log()).sum(-1).mean())
                             _health_last['soft_row_frac'] = float(
@@ -5781,8 +6001,8 @@ def main():
                     #    平线，解释走 `run/loss_coef/*`（config 面板），不上图。
                     #    真机 2026-10-06：13 条里 9 条恒 0 平线把面板糊死。
                     _sw = {k: v for k, v in _sw.items()
-                           if k not in _SWANLAB_DROP_KEYS
-                           and not (k.startswith('loss_v7/')
+                        if k not in _SWANLAB_DROP_KEYS
+                        and not (k.startswith('loss_v7/')
                                     and _SWANLAB_V7_WEIGHTS.get(k[8:], 0) == 0)}
                     swanlab_logger.log(_sw, step=step)
                 except Exception as e:
@@ -5797,7 +6017,7 @@ def main():
                         # 用 CUDA 的键会 KeyError 并被下面 except 吞成一行 warning
                         # ⇒「profile 跑过了但没有表」（2026-10-06 真机）。
                         _sort_key = ('self_npu_time_total' if _backend == 'npu'
-                                     else 'self_cuda_time_total')
+                                    else 'self_cuda_time_total')
                         _ka = _prof_ctx.key_averages()
                         try:
                             table = _ka.table(sort_by=_sort_key, row_limit=18)
