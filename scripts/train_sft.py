@@ -5231,7 +5231,17 @@ def main():
         # accum>1 时它们每个 optimizer step 才发生一次，**不能**除以
         # `_n_timed`（那是 micro-batch 数）—— 那样会缩小 accum 倍、
         # 读成「这几段几乎不耗时」。
+        #
+        # `g` 再劈三段（2026-10-07 真机 a_v7.3_npu2：13.09 s/step 里 `g` 独占
+        #   79.9%，必须先分清是 clip 自己有病还是整个待执行队列在这里 drain）：
+        #     g1 = unscale_ + 溢出探测（BF16 下两者都应 ≈0）
+        #     g2 = clip_grad_norm_ 调用本身（返回 device 张量 ⇒ 纯发射）
+        #     g3 = float(_gn) 的设备→主机同步 = 队列 drain（真正干活的地方）
+        # 判读：g2 ≫ g3 ⇒ clip 在同步，改 foreach；g3 ≫ g2 ⇒ clip 无辜，
+        #       瓶颈在 graph-compile / channels-last A/B。
+        # 三段与 `_t_clip` 同为「每个 optimizer step」归一，故同样走 `_no`。
         _t_clip = _t_opt = _t_ema = 0.0
+        _t_g1 = _t_g2 = _t_g3 = 0.0
         _n_opt = 0
         _n_skipped = 0
         # `_n_attempted` 与 `_n_skipped` **在同一处**自增（scaler.step 那一行），
@@ -5619,9 +5629,10 @@ def main():
                     _scale_now = scaler.get_scale()
                     # 与 `_n_skipped` 同一处自增 ⇒ 占比口径自洽（见上面注释）
                     _n_attempted += 1
-                    # `g` 段起点：unscale_ → clip_grad_norm_ 结束（含溢出
-                    # 探测，它是一次全参数梯度扫描，可能含设备同步）。
+                    # `g` 段起点：unscale_ → float(_gn) 结束（含溢出探测，
+                    # 它是一次全参数梯度扫描，可能含设备同步）。
                     _t_clip0 = time.perf_counter()
+                    _t_g1_0 = _t_clip0
                     scaler.unscale_(optimizer)
                     # **溢出诊断必须排在 `clip_grad_norm_` 之前**
                     #   `clip_grad_norm_(max_norm=1.0)` 在 `total_norm = inf` 时算出
@@ -5644,15 +5655,26 @@ def main():
                             optimizer, logger,
                             phase='clip 前（此刻梯度里真的有 inf/nan）',
                             named_params=dict(model.named_parameters()))
+                    # g1 结算（unscale_ + 溢出探测）/ g2 起点。
+                    _t_g1 += time.perf_counter() - _t_g1_0
+                    _t_g2_0 = time.perf_counter()
                     # clip_grad_norm_ **返回 clip 前的总范数** —— 之前被丢弃了。它是
                     # fp16 溢出/梯度爆炸唯一的直接信号：这轮 910A 的 inf/nan 与
                     # 缩放值雪崩，本可以由它提前几分钟看到。
                     # 必须在 unscale_ 之后取（unscale 前是按 scale 放大的假值）。
                     _gn = torch.nn.utils.clip_grad_norm_(
                         model.parameters(), max_norm=1.0)
+                    # g2 结算 / g3 起点。
+                    _t_g2 += time.perf_counter() - _t_g2_0
+                    _t_g3_0 = time.perf_counter()
                     _grad_norm_last = float(_gn)
-                    # `g` 段结算。`float(_gn)` 本身要等一次设备→主机同步，
-                    # 放在结算之后，不把这次同步算进 `o` 段。
+                    # g3 结算。`float(_gn)` 本身要等一次设备→主机同步，而它是
+                    # backward 之后**第一次**同步 ⇒ 整个待执行队列（前向/反向的
+                    # 实际执行、DDP all-reduce、clip kernel）都在这里 drain。
+                    # 真机 2026-10-07：这 10.45 s 占 79.9%，是本段存在的理由。
+                    _t_g3 += time.perf_counter() - _t_g3_0
+                    # `g` 段结算 = g1+g2+g3（三段首尾相接无缝，故恒等）。放在
+                    # `float(_gn)` 之后，不把这次同步算进 `o` 段。
                     _t_clip += time.perf_counter() - _t_clip0
                     # **溢出诊断的时机（2026-10-04 云端 910A 实测打出来的 bug）**
                     #   `clip_grad_norm_(max_norm=1.0)` 在 `total_norm = inf` 时算出
@@ -5825,6 +5847,9 @@ def main():
                 _sms = _t_save * 1000.0 / _nd
                 _ems = _t_eval * 1000.0 / _nd
                 _gms = _t_clip * 1000.0 / _no
+                _g1ms = _t_g1 * 1000.0 / _no
+                _g2ms = _t_g2 * 1000.0 / _no
+                _g3ms = _t_g3 * 1000.0 / _no
                 _oms = _t_opt * 1000.0 / _no
                 _mms = _t_ema * 1000.0 / _no
                 # `u` = 未归因 = 墙钟 −(d+c+g+o+m+s+e)。它不是残差噪声，而是
@@ -5841,6 +5866,7 @@ def main():
                 # 因此计入下一个区间，与墙钟口径一致
                 _t_data = _t_comp = _t_save = _t_eval = 0.0
                 _t_clip = _t_opt = _t_ema = 0.0
+                _t_g1 = _t_g2 = _t_g3 = 0.0
                 _t_data_max = 0.0
                 _n_timed = 0
                 _n_opt = 0
@@ -5851,12 +5877,16 @@ def main():
                             "scale=%.0f mem=%.2fGB "
                             "spd=%.0f spd_inst=%.0f s/s "
                             "elapsed=%.0fs skip=%d | "
-                            "d=%.0f c=%.0f g=%.0f o=%.0f m=%.0f s=%.0f e=%.0f "
+                            "d=%.0f c=%.0f g=%.0f "
+                            "g1=%.0f g2=%.0f g3=%.0f "
+                            "o=%.0f m=%.0f s=%.0f e=%.0f "
                             "u=%.0f dmax=%.0f ms",
                             step, total_steps, _lv, _pv, _vv,
                             lr, _scale, mem,
                             speed, spd_inst, _now - t0, _n_skipped,
-                            _dms, _cms, _gms, _oms, _mms, _sms, _ems, _ums,
+                            _dms, _cms, _gms,
+                            _g1ms, _g2ms, _g3ms,
+                            _oms, _mms, _sms, _ems, _ums,
                             _dmax)
                 _last_stdout_t = time.time()
                 _last_stdout_step = step

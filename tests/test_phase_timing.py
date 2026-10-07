@@ -16,7 +16,9 @@
 3. save/eval 发生在其打点之后，因此计入下一区间（墙钟口径正确）；
 4. g/o/m（backward 之后的 clip / optimizer.step / EMA）按 **optimizer step**
    归一，不能除以 micro-batch 数 `_n_timed` —— accum>1 时会缩小 accum 倍，
-   把要找的瓶颈读成「几乎不耗时」。
+   把要找的瓶颈读成「几乎不耗时」；
+5. g 还要拆成 g1（unscale_）/ g2（clip 调用）/ g3（float(_gn) 的 D2H 同步）
+   —— 不拆就分不清「clip 自己在同步」与「设备执行慢」，两者的药方相反。
 """
 import ast
 import os
@@ -180,11 +182,13 @@ def test_accumulators_reset_together_at_logging():
         f'打点块内应有且仅有一处累加器重置，实得 {len(chains)} 处'
     reset = chains[0]
     j = metrics.body.index(reset)
-    # 「齐全」= 紧跟其后必须依次是 g/o/m 那组、_t_data_max、_n_timed、_n_opt。
-    # 2026-10-07 加 g/o/m 之后重置点从 3 行变 5 行；这里按**语句**判定而非
-    # 正则，注释与空行不会插进来，也不会因「有人多加了一个计时器」而静默放行。
+    # 「齐全」= 紧跟其后必须依次是 g/o/m 那组、g1/g2/g3、_t_data_max、_n_timed、_n_opt。
+    # 2026-10-07 加 g/o/m 后重置点从 3 行变 5 行，再拆 g1/g2/g3 变 6 行；这里按
+    # **语句**判定而非正则，注释与空行不会插进来，也不会因「有人多加了一个计时器」
+    # 而静默放行。
     _expect_after = [
         (['_t_clip', '_t_opt', '_t_ema'], '0.0'),
+        (['_t_g1', '_t_g2', '_t_g3'], '0.0'),
         (['_t_data_max'], '0.0'),
         (['_n_timed'], '0'),
         (['_n_opt'], '0'),
@@ -243,9 +247,14 @@ def test_segments_logged_and_uploaded():
     # 2026-10-07：日志行从 `d c s e dmax` 扩成 `d c g o m s e u dmax`。
     # g/o/m 是 backward() 之后的三段、u 是未归因余量 —— 真机 a_v7.4_npu2 上
     # 墙钟 12.0 s/step 而 c 只有 2.29 s，那 81% 正是靠这一行才第一次可见。
-    # 格式串在源码里被拆成两行字面量，故分开断言。
-    assert re.search(r'd=%.0f c=%.0f g=%.0f o=%.0f m=%.0f s=%.0f e=%.0f', SRC), \
-        '日志行缺少分段耗时字段（含 g/o/m）'
+    # 同日再把 `g` 拆成 g1/g2/g3（13.09 s/step 里 g 独占 79.9%，但分不清是
+    # clip 有病还是队列 drain）。格式串在源码里被拆成多行字面量，故分段断言。
+    assert re.search(r'd=%.0f c=%.0f g=%.0f ', SRC), \
+        '日志行缺少 d/c/g 字段'
+    assert re.search(r'g1=%.0f g2=%.0f g3=%.0f', SRC), \
+        '日志行缺少 g 的三段拆分（g1/g2/g3）'
+    assert re.search(r'o=%.0f m=%.0f s=%.0f e=%.0f', SRC), \
+        '日志行缺少 o/m/s/e 字段'
     assert re.search(r'u=%.0f dmax=%.0f ms', SRC), \
         '日志行缺少未归因 u 与 dmax'
     for key in ('"t_data_ms": _dms', '"t_comp_ms": _cms',
@@ -269,18 +278,65 @@ def test_backward_tail_segments_are_measured():
     for acc in ('_t_clip', '_t_opt', '_t_ema'):
         assert re.search(re.escape(acc) + r' \+= time\.perf_counter\(\) - ', SRC), \
             f'{acc} 未被累加'
-    # 入口初始化
+    # 入口初始化（g1/g2/g3 紧跟在 g 后面、`_n_opt` 之前）
     assert re.search(
-        r'_t_clip = _t_opt = _t_ema = 0\.0\s*\n\s*_n_opt = 0', SRC), \
-        '循环入口未初始化 g/o/m 计数'
+        r'_t_clip = _t_opt = _t_ema = 0\.0\s*\n'
+        r'\s*_t_g1 = _t_g2 = _t_g3 = 0\.0\s*\n\s*_n_opt = 0', SRC), \
+        '循环入口未初始化 g/o/m 与 g1/g2/g3 计数'
     # 归一必须走 `_n_opt`，不能走 `_n_timed`
-    for acc, var in (('_t_clip', '_gms'), ('_t_opt', '_oms'), ('_t_ema', '_mms')):
+    for acc, var in (('_t_clip', '_gms'), ('_t_opt', '_oms'), ('_t_ema', '_mms'),
+                     ('_t_g1', '_g1ms'), ('_t_g2', '_g2ms'), ('_t_g3', '_g3ms')):
         assert re.search(
             re.escape(var) + r'\s*=\s*' + re.escape(acc)
             + r' \* 1000\.0 / _no', SRC), \
             f'{acc} 的归一未走 optimizer-step 口径（应为 … / _no，不是 / _nd）'
     # `u` = 墙钟 −(d+c+g+o+m+s+e)：未归因余量必须真的被算出来
     assert re.search(r'_ums = \(_wall_ms', SRC), '缺少未归因 u 的计算'
+
+
+def test_g_is_split_into_three_contiguous_subsegments():
+    """`g` 必须拆成 g1/g2/g3，且首尾相接、顺序固定（和恒等于 g）。
+
+    动机（2026-10-07 真机 a_v7.3_npu2）：13.09 s/step 里 `g` 独占 10.45 s
+    （79.9%），而 `u`=1 ms、`c`=2.48 s。但 `g` 内部混着三件性质完全不同的事：
+
+      g1 = `unscale_` + 溢出探测 —— BF16 下 `use_scaler=False`，两者都应 ≈0；
+           它 ≫0 就说明本以为跳过的路径其实没跳过。
+      g2 = `clip_grad_norm_` 调用本身 —— 返回 device 张量 ⇒ 理论上纯发射；
+      g3 = `float(_gn)` 的设备→主机同步 —— backward 之后**第一次**同步，整个
+           待执行队列（前/反向实际执行、DDP all-reduce、clip kernel）在此 drain。
+
+    不拆就分不清「clip 自己在同步」和「设备执行慢」，而这两种病的药方相反：
+    `g2≫g3` ⇒ 改 `foreach=True`；`g3≫g2` ⇒ clip 无辜，去打 graph-compile
+    与 channels-last 的 A/B。所以三段必须**紧邻无缝**——中间被塞进别的代码
+    时 `g ≠ g1+g2+g3`，「g 独占 79.9%」就再也对不上账。
+    """
+    # g1 的起点刻意**就是** g 的起点（`_t_g1_0 = _t_clip0`），两段之间零缝隙；
+    # g2/g3 才各自新取一次 perf_counter。
+    for tag in ('_t_g2_0', '_t_g3_0'):
+        assert f'{tag} = time.perf_counter()' in SRC, f'缺少 {tag} 起点'
+    assert '_t_g1_0 = _t_clip0' in SRC, \
+        'g1 起点必须与 g 起点同一时刻（否则 g ≠ g1+g2+g3）'
+    for acc in ('_t_g1', '_t_g2', '_t_g3'):
+        assert re.search(re.escape(acc) + r' \+= time\.perf_counter\(\) - ', SRC), \
+            f'{acc} 未被累加'
+    # 起点与结算必须严格交错排列。走 AST 而不是 SRC.index：注释里引用一次
+    # `_t_g2_0 = ...` 就能让索引测试错位（本文件顶部那段教训的同类问题）。
+    want = ['_t_clip0', '_t_g1_0', '_t_g1', '_t_g2_0',
+            '_t_g2', '_t_g3_0', '_t_g3', '_t_clip']
+    got = []
+    for n in ast.walk(_tree()):
+        if isinstance(n, ast.Assign) and len(n.targets) == 1 \
+                and isinstance(n.targets[0], ast.Name) \
+                and n.targets[0].id in want:
+            got.append((n.lineno, n.targets[0].id))
+        elif isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name) \
+                and n.target.id in ('_t_g1', '_t_g2', '_t_g3', '_t_clip'):
+            got.append((n.lineno, n.target.id))
+    got.sort()
+    assert [x[1] for x in got] == want, \
+        'g 的起止必须按 clip0 → g1_0 → g1 → g2_0 → g2 → g3_0 → g3 → clip 排列，' \
+        f'实际 {["%d:%s" % (ln, nm) for ln, nm in got]}'
 
 
 def test_memory_line_reports_reserved_only():

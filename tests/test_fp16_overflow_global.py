@@ -257,15 +257,21 @@ def _main_src():
 def _optimizer_step_window():
     """从 `scaler.unscale_(optimizer)` 起、往后 4 KB 的**代码**（剥掉注释）。
 
+    必须**先剥注释、再切片**：反过来（先切 4 KB 源码、再剥注释）时，注释体积
+    会挤占窗口 —— 2026-10-07 给 `g` 补 g1/g2/g3 判读说明多写了十几行注释，
+    就把 `_scaler_step_global(` 挤出了窗口，`test_training_loop_does_not_call_
+    scaler_step_directly` 因此误红。那条断言查的是**代码**，不该被「注释写了
+    多少」影响；先剥注释，窗口才是稳定的「4 KB 代码」而非「4 KB 源码」。
+
     限定窗口是为了让断言精确：`clip_grad_norm_` 这个词在文件前部的注释里也大量
     出现，直接全文件 `index()` 会命中注释里的那一处，断言就变成永远绿。
     """
     src = _main_src()
+    src = '\n'.join(ln for ln in src.splitlines()
+                    if not ln.lstrip().startswith('#'))
     i = src.index('scaler.unscale_(optimizer)')
     win = src[i:i + 4000]
     win = re.sub(r'(?s)("""|\'\'\').*?\1', '', win)
-    win = '\n'.join(ln for ln in win.splitlines()
-                    if not ln.lstrip().startswith('#'))
     return win
 
 
