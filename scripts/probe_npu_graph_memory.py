@@ -450,6 +450,48 @@ def print_throughput(rows):
               '本来就不该用同 batch 绑死；跨 batch 直接比这一列即可。')
 
 
+def workspace_pairs(rows, tiers, batches):
+    """第 2 项的数据：每个编译档相对**同 GC 状态**基线的峰值差。
+
+    返回 ``[(tier, batch, delta_bytes, base_tier, n_compiled), ...]``。
+
+    **每个 batch 都要报**：原实现在内层循环里打完一个就 `break`，而
+    `sorted(batches)` 是升序 ⇒ 永远只报最小那个 batch，bs=800 被整条吞掉
+    （2026-10-07 实测：只打出 `linear bs=400 +0.02 GB`，bs=800 的 +0.00 不见了）。
+    """
+    out = []
+    for tier in tiers:
+        if TIER_SPEC[tier][2] is None:
+            continue
+        base_tier = 'gc' if TIER_SPEC[tier][0] else 'eager'
+        for bs in sorted(batches):
+            a = next((x for x in rows if x['tier'] == tier
+                      and x['batch'] == bs and not x.get('oom')
+                      and not x.get('err') and x.get('peak') is not None), None)
+            e = next((x for x in rows if x['tier'] == base_tier
+                      and x['batch'] == bs and not x.get('oom')
+                      and not x.get('err') and x.get('peak') is not None), None)
+            if a and e:
+                out.append((tier, bs, a['peak'] - e['peak'], base_tier,
+                            a.get('n_compiled')))
+    return out
+
+
+def batch_ceiling(tier, rows):
+    """第 3 项的数据：`(实测成功过的最大 batch, OOM 的 batch, 失败的 batch)`。
+
+    返回 **max 不是 min** —— 这是「batch 上限」。原实现取 `min(ok)`：测了
+    800 和 400 都过，却打印「≥ 400」，把实测到的上限**低估一半**
+    （2026-10-07 实测 gc/eager/linear 三档明明 800 都过）。
+    """
+    ok = [r['batch'] for r in rows if r['tier'] == tier
+          and not r.get('oom') and not r.get('err')]
+    oom = [r['batch'] for r in rows if r['tier'] == tier and r.get('oom')]
+    fail = [r['batch'] for r in rows if r['tier'] == tier
+            and r.get('err') and not r.get('oom')]
+    return (max(ok) if ok else None), oom, fail
+
+
 def _is_oom(exc):
     """是不是 OOM。
 
@@ -1156,26 +1198,12 @@ def main(argv=None):
     #    GC-on 的档减 gc。拿 GC-on 减 GC-off 会把「关 GC 省下的 12.67 MB×batch」
     #    全算到 workspace 头上，结论直接错一个数量级。
     print('\n2) 各档相对**同 GC 状态**基线的额外占用（= 图 workspace + 图缓冲）：')
-    got = False
-    for tier in tiers:
-        if TIER_SPEC[tier][2] is None:
-            continue
-        base_tier = 'gc' if TIER_SPEC[tier][0] else 'eager'
-        for bs in sorted(batches):
-            a = next((x for x in rows if x['tier'] == tier
-                      and x['batch'] == bs and not x.get('oom')
-                      and not x.get('err') and x.get('peak') is not None), None)
-            e = next((x for x in rows if x['tier'] == base_tier
-                      and x['batch'] == bs and not x.get('oom')
-                      and not x.get('err') and x.get('peak') is not None), None)
-            if a and e and a['peak'] is not None and e['peak'] is not None:
-                d = a['peak'] - e['peak']
-                print('     %-10s bs=%-5d  workspace = %+6.2f GB'
-                      '   （vs %-5s，编译了 %s 个子模块）'
-                      % (tier, bs, _gb(d), base_tier, a.get('n_compiled')))
-                got = True
-                break
-    if not got:
+    pairs = workspace_pairs(rows, tiers, batches)
+    for tier, bs, d, base_tier, n_compiled in pairs:
+        print('     %-10s bs=%-5d  workspace = %+6.2f GB'
+              '   （vs %-5s，编译了 %s 个子模块）'
+              % (tier, bs, _gb(d), base_tier, n_compiled))
+    if not pairs:
         print('     没有可相减的 (tier, 基线) 配对 ⇒ 见上面的 FAIL/OOM。')
 
     # 3) batch 上限 —— 判据是**有没有 OOM**，与拿不拿得到峰值无关；
@@ -1183,30 +1211,29 @@ def main(argv=None):
     print('\n3) 各档在 %.1f GB 卡上的 batch 上限（最后一个没 OOM 的点）：'
           % _gb(total) if total else '\n3) 各档 batch 上限：')
     for tier in tiers:
-        ok = [r['batch'] for r in rows if r['tier'] == tier
-              and not r.get('oom') and not r.get('err')]
-        bad_ = [r['batch'] for r in rows if r['tier'] == tier
-                and r.get('oom') is True]
-        fail_ = [r['batch'] for r in rows if r['tier'] == tier
-                 and r.get('err') and not r.get('oom')]
-        if ok:
+        best, bad_, fail_ = batch_ceiling(tier, rows)
+        if best is not None:
             extra = ''
             if bad_:
                 extra = '（更小的点 OOM: %s）' % sorted(bad_)
             if fail_:
                 extra += '（失败: %s）' % sorted(fail_)
-            print('     %-10s ≥ %d%s' % (tier, min(ok), extra))
+            print('     %-10s ≥ %d%s' % (tier, best, extra))
         else:
             why = 'OOM: %s' % sorted(bad_) if bad_ else ''
             if fail_:
                 why += ('；' if why else '') + '失败: %s' % sorted(fail_)
             print('     %-10s 全部失败：%s' % (tier, why or '无数据'))
 
-    # 4) 本次的正题：GC + 编译（inductor 与 TorchAir 都算）
+    # 4) 本次的正题：编译档（inductor 与 TorchAir 都算）
     print('\n' + '=' * 78)
-    print('[verdict] GC + 编译到底行不行（inductor / TorchAir）')
+    print('[verdict] 编译档到底行不行（inductor / TorchAir）')
     print('=' * 78)
-    gc_compile_tiers = INDUCTOR_TIERS + TORCHAIR_TIERS
+    # 「编译档」= 任何后端非空的档位。原来写死成 INDUCTOR_TIERS + TORCHAIR_TIERS，
+    # 于是 `linear / block / whole`（TorchAir 但 **GC 关**）**永远进不了这一段**：
+    # 2026-10-07 实测 block/whole 双 batch 全挂 E19999，而 ①②④ 一个字不提，
+    # 只在第 3 项留下一句「全部失败」—— 真因（反向图 CANN PreRun）反而没进结论。
+    gc_compile_tiers = tuple(t for t in tiers if TIER_SPEC[t][2])
     ind_rows = [r for r in rows if r['tier'] in gc_compile_tiers]
     if not ind_rows:
         req = [t for t in gc_compile_tiers if t in skipped]
@@ -1214,8 +1241,8 @@ def main(argv=None):
             print('请求了 %s，但**一档都没跑** —— 后端不可用被跳过。' % ','.join(req))
             print('  见上面 [env] 对后端可用性的判断；这不是「跑挂了」，是没跑。')
         else:
-            print('本次没有请求任何「GC + 编译」档位（可选: %s）。'
-                  % ','.join(gc_compile_tiers))
+            print('本次没有请求任何「编译」档位（可选: %s）。'
+                  % ','.join(t for t in TIERS if TIER_SPEC[t][2]))
             print('  910C 上建议：`--try-torchair`（inductor 缺 triton-ascend 跑不了）。')
         print_throughput(rows)
     else:
@@ -1298,19 +1325,25 @@ def main(argv=None):
                                   for r in nan_rows))
                 print('   ⇒ 组合可用但**数值不正确**，不能上。')
 
-            # 与同 batch 的纯 GC 基线逐位对比（种子固定 ⇒ 权重与输入相同）。
+            # 与同 batch 的**同 GC 状态**基线逐位对比（种子固定 ⇒ 权重与输入相同）。
             # 梯度范数是**决定性**的那一项：checkpoint 重算 + Dynamo 图断开的经典
             # 症状是 loss 完全正常、梯度却已经错了，只看 loss 会漏掉。
             printed_hdr = False
             for r in sorted(ok_rows, key=lambda x: (x['tier'], x['batch'])):
-                ref = next((x for x in rows if x['tier'] == 'gc'
+                # GC-off 的档必须拿 `eager` 当基线：拿 `gc` 比会把「重算省下的
+                # 显存/时间」与「图编译的数值差异」混成一个数，方向都可能反。
+                base = 'gc' if TIER_SPEC[r['tier']][0] else 'eager'
+                ref = next((x for x in rows if x['tier'] == base
                             and x['batch'] == r['batch']
                             and not x.get('oom') and not x.get('err')
                             and x.get('losses')), None)
                 if not ref or not ref.get('losses'):
                     continue
                 if not printed_hdr:
-                    print('     与纯 GC 基线逐位对比（同权重同输入）：')
+                    print('     与同 GC 状态基线（%s）逐位对比（同权重同输入）：'
+                          % '/'.join(sorted({('gc' if TIER_SPEC[x['tier']][0]
+                                              else 'eager')
+                                             for x in ok_rows})))
                     printed_hdr = True
                 ldiff = _max_rel(r['losses'], ref['losses'])
                 gdiff = _max_rel(r.get('grad_norms') or [],
@@ -1324,18 +1357,8 @@ def main(argv=None):
             if printed_hdr:
                 print('     （阈值 1e-3；超出即判定该档位算错了）')
             elif ok_rows and not nan_rows:
-                print('② **对吗**：跑通且 loss/梯度均有限，但**没有 gc 对照组**，'
+                print('② **对吗**：跑通且 loss/梯度均有限，但**没有对照组**，'
                       '判不了对错 —— 加上 `--tiers gc,...` 再跑一次。')
-
-            gc_ref = next((x for x in rows if x['tier'] == 'gc'
-                           and not x.get('oom') and not x.get('err')
-                           and x.get('peak') is not None), None)
-            for r in ok_rows:
-                if (gc_ref and gc_ref['batch'] == r['batch']
-                        and r.get('peak') is not None):
-                    d = r['peak'] - gc_ref['peak']
-                    print('     %-10s 相对纯 GC 基线：workspace = %+6.2f GB'
-                          % (r['tier'], _gb(d)))
 
         # 3) 吞吐 —— 定义在外面，两个分支共用一份实现。
         print_throughput(rows)

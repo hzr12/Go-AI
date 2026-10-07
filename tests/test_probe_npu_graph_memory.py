@@ -39,7 +39,9 @@ from scripts.probe_npu_graph_memory import (  # noqa: E402
     _full_trace,
     _project_frames,
     _trace_tail,
+    batch_ceiling,
     print_throughput,
+    workspace_pairs,
 )
 
 INNER = "No module named 'triton'"
@@ -260,3 +262,55 @@ def test_project_frames_find_repo_frames():
     # 只比文件名：Windows 上 `path[len(root):].lstrip('/\\')` 给出的是反斜杠。
     assert any('test_probe_npu_graph_memory.py' in x for x in fr), fr
     assert any('in _deep' in x for x in fr), fr
+
+
+# --------------------------------------------------------------------------- #
+# 第 2/3 项
+# --------------------------------------------------------------------------- #
+def _mrow(tier, batch, peak, n_compiled=1, oom=False, err=None):
+    return {'tier': tier, 'batch': batch, 'peak': peak,
+            'n_compiled': n_compiled, 'oom': oom, 'err': err}
+
+
+def test_workspace_reports_every_batch_not_just_the_first():
+    """**回归**：原实现在内层循环打完一个就 `break`。
+
+    `sorted(batches)` 升序 ⇒ 永远只报最小那个，bs=800 被整条吞掉
+    （2026-10-07 实测只打出 `linear bs=400 +0.02 GB`，bs=800 的 +0.00 不见了）。
+    """
+    rows = [_mrow('eager', 400, 25.64e9), _mrow('eager', 800, 51.02e9),
+            _mrow('linear', 400, 25.66e9), _mrow('linear', 800, 51.02e9)]
+    pairs = workspace_pairs(rows, ['eager', 'linear'], [800, 400])
+    assert [(p[0], p[1]) for p in pairs] == [('linear', 400), ('linear', 800)], pairs
+    assert pairs[1][2] == 0.0, pairs[1]
+
+
+def test_workspace_pairs_with_the_same_gc_state_baseline():
+    """GC-off 减 `eager`、GC-on 减 `gc` —— 拿错基线会把省下的显存算成 workspace。"""
+    rows = [_mrow('gc', 800, 6.64e9), _mrow('gc-torchair', 800, 6.70e9)]
+    pairs = workspace_pairs(rows, ['gc-torchair'], [800])
+    assert len(pairs) == 1, pairs
+    tier, bs, delta, base, _n = pairs[0]
+    assert (tier, bs, base) == ('gc-torchair', 800, 'gc'), pairs[0]
+    assert abs(delta - 0.06e9) < 1e3, delta
+
+
+def test_workspace_skips_tiers_that_do_not_compile():
+    assert workspace_pairs([_mrow('eager', 800, 1.0)], ['eager'], [800]) == []
+
+
+def test_batch_ceiling_reports_the_largest_success():
+    """**回归**：原来取 `min(ok)` ⇒ 测了 800/400 都过却打「≥ 400」，低估一半。"""
+    rows = [_mrow('gc', 800, 1.0), _mrow('gc', 400, 1.0),
+            _mrow('block', 800, None, err='E19999'),
+            _mrow('block', 400, None, err='E19999'),
+            _mrow('whole', 1600, None, oom=True)]
+    best, oom, fail = batch_ceiling('gc', rows)
+    assert best == 800, best
+    assert oom == [] and fail == []
+
+    best, oom, fail = batch_ceiling('block', rows)
+    assert best is None and fail == [800, 400], (best, fail)
+
+    best, oom, fail = batch_ceiling('whole', rows)
+    assert best is None and oom == [1600], (best, oom)
