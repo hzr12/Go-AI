@@ -129,7 +129,9 @@ A→B→C 的 `load_state_dict` 承接（strict 零缺失）。
   ⚠️ shell/ 里的 `train_sft_npu_4card_katago_se.sh` 是**不带 `--v7`** 的 12 通道
   旧入口，别拿它跑 V7 链；`run.txt` 里给的是直连 `torchrun` 命令。
 - **⚙️ 调优开关一律是 CLI 参数，没有环境变量**（2026-08 起陆续登记；`GOAI_PROFILE`
-  是唯一例外——它是诊断开关，语义是「从第 N 步抓 50 步 kernel 表」，与训练配置无关）：
+  与 `GOAI_PROFILE_STEPS` 是仅有的例外——两个都是诊断开关，与训练配置无关，语义是
+  「从第 N 步抓 M 步 kernel 表」，M 默认 50，`M=0` = 起点即终点、在起点后的第一个
+  打点步出表）：
   - `--use-sdpa 0/1`（默认 1）：NPU 注意力走 CANN 融合 SDPA；0 = 全后端手写 math。
   - `--npu-sfa 0/1`（默认 1）：NPU 融合注意力 SFA/PFA，**优先于** SDPA；带能力探针
     + 与 SDPA 的数值自检 + 运行期回退，dropout>0 时自动不启用。

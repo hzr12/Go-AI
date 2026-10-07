@@ -37,7 +37,7 @@ if str(ROOT) not in sys.path:
 from scripts.train_sft import (  # noqa: E402
     V7_GLOBAL_CHANNELS, V7_SPATIAL_CHANNELS, V7_STAGE1_SCORE_TERMS,
     V7_STAGE1_TERMS, _dihedral_batch, _v7_labels_and_moves, build_katago_v7_net,
-    build_v7_stage1_loss, v7_batch_features,
+    build_v7_stage1_loss, evaluate_metrics_v7, v7_batch_features,
     v7_batch_sync, v7_loss_labels, v7_stage1_loss_weights,
 )
 from src.data.dataset import SupervisedDataset  # noqa: E402
@@ -1446,3 +1446,107 @@ def test_soft_only_sampling_without_soft_index_is_refused(tmp_path):
                                '--device', 'cpu'])
     assert rc != 0
     assert 'soft-index' in out or 'soft' in out.lower(), out[-800:]
+
+
+# --------------------------------------------------------------------------- #
+# eval 的参考着法：软标签缺席时必须退回真实着法
+# --------------------------------------------------------------------------- #
+class _AlwaysPredict:
+    """固定预测同一个着法的假模型（eval 里只当打分器用，不需要真网络）。"""
+
+    def __init__(self, move, action_size=ACTION):
+        self.move = int(move)
+        self.A = int(action_size)
+
+    def eval(self):
+        return self
+
+    def train(self):
+        return self
+
+    def __call__(self, sp, gl):
+        b = sp.shape[0]
+        lg = torch.full((b, 1, self.A), -50.0, dtype=torch.float32)
+        lg[:, 0, self.move] = 50.0
+        return {'policy_logits': lg,
+                'outcome_logits': torch.zeros(b, 3, dtype=torch.float32)}
+
+
+class _InjectSoft:
+    """把一份软标签注入 `_build_labels` 返回值的薄壳，其余属性全部转发。"""
+
+    def __init__(self, base, soft):
+        self.__dict__['_base'] = base
+        self.__dict__['_soft'] = np.asarray(soft, dtype=np.float32)
+
+    def __getattr__(self, name):
+        base = self.__dict__.get('_base')
+        if base is None:
+            raise AttributeError(name)
+        return getattr(base, name)
+
+    def _build_labels(self, idxs, tforms=None, augment=False):
+        lbl = self._base._build_labels(idxs, tforms, augment)
+        idxs = np.asarray(idxs, dtype=np.int64)
+        lbl['soft'] = self._soft[idxs].copy()
+        lbl['soft_mask'] = np.ones(len(idxs), dtype=np.float32)
+        return lbl
+
+
+def _eval_top1(ds, predict_move):
+    """跑一次 CPU eval，返回指标 dict。"""
+    return evaluate_metrics_v7(_AlwaysPredict(predict_move), ds,
+                               np.arange(len(ds.moves)), 8,
+                               torch.device('cpu'), torch.float32,
+                               max_batches=0, prefetcher=None)
+
+
+def test_eval_reference_falls_back_to_real_move_when_soft_absent():
+    """无软标签时（full.npz + 不给 `--soft-index`），eval 参考必须是**真实着法**。
+
+    线上配置正是这一条：`SupervisedDataset.soft_row` 从未挂载 ⇒
+    `src/data/dataset.py:_build_labels` 返回**全 0** 的 `soft`（`soft_mask` 同样
+    全 0）。`evaluate_metrics_v7` 此前无条件拿 `lbl['soft']` 当参考 ⇒
+    `argmax(全0) = 0` ⇒ top1/5/10 退化成「模型是否预测 index 0」、KL 恒 0。
+
+    真机 2026-10-07 实测：top1 0.0006 → 0.0002 一路走低，而随机基线
+    top10 = 10/362 ≈ 2.76%、实测 0.49%（**低于随机 5.6 倍**）—— 只有「参考恒为
+    index 0 且模型越来越自信」能同时解释「越训越差」与「KL 打印 0.0000」。
+    brier 不受影响（它读 `lbl['outcome']`），与真机「brier 在正常改善」一致。
+    """
+    ds = make_dataset()
+    ds.moves[:] = 100                      # 全部行的真实着法 = 100（≠0，便于分辨）
+    assert not hasattr(ds, 'sample_spatial'), '本例要走 board 级那条路径'
+    _, lbl = _v7_labels_and_moves(ds, np.arange(8), np.zeros(8, np.int64))
+    assert float(np.abs(lbl['soft']).max()) == 0.0, \
+        '前置条件不成立：本例要求「无软标签」'
+    assert float(lbl['soft_mask'].sum()) == 0.0, \
+        '前置条件不成立：本例要求 soft_mask 全 0'
+
+    m = _eval_top1(ds, 100)                # 模型逐行都预测真实着法
+    assert m['n'] > 0, '没评估到任何样本'
+    assert m['top1'] == 1.0, \
+        f'模型逐行都预测真实着法 100，top1 应为 1.0，实得 {m["top1"]}'
+    assert m['top5'] == 1.0 and m['top10'] == 1.0, m
+
+
+def test_eval_reference_still_uses_soft_argmax_when_soft_present():
+    """有软标签时参考仍是 `argmax(soft)` —— 退回真实着法不许盖掉软路径。
+
+    与上一条配成对：这里刻意让 `argmax(soft)`（=7）与真实着法（=100）**不同**，
+    两条路径才会给出相反的答案，否则两条断言等价、测不出区别。
+    """
+    base = make_dataset()
+    base.moves[:] = 100
+    n = len(base.moves)
+    soft = np.full((n, ACTION), 0.001, dtype=np.float32)
+    soft[:, 7] = 1.0                        # argmax 恒为 7，与 moves=100 不同
+    soft /= soft.sum(axis=1, keepdims=True)
+    ds = _InjectSoft(base, soft)
+
+    m_soft = _eval_top1(ds, 7)              # 押 argmax(soft) ⇒ 应全中
+    assert m_soft['top1'] == 1.0, \
+        f'有软标签时参考应为 argmax(soft)=7，实得 top1={m_soft["top1"]}'
+    m_hard = _eval_top1(ds, 100)            # 押真实着法 ⇒ 应全不中
+    assert m_hard['top1'] == 0.0, \
+        f'有软标签时不该以真实着法为参考，实得 top1={m_hard["top1"]}'

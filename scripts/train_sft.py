@@ -1962,6 +1962,37 @@ _SWANLAB_DROP_KEYS = frozenset({
 _SWANLAB_V7_WEIGHTS = v7_stage1_loss_weights()
 
 
+def _eval_ref_target(lbl, moves, action_size, *, device, dtype):
+    """eval 的参考分布：**有软标签用软标签，没有就退回真实着法的 one-hot**。
+
+    `soft_mask` 的语义（`src/data/dataset.py:_build_labels` 与
+    `src/data/v7_packed_dataset.py` 都是这个约定）就是「本行有没有软标签」，
+    全 0 表示一行都没有。本仓对「board 级 V7 没有内建软标签」这件事**已有**注释
+    与训练侧守卫（见 `resolve_policy_loss_kind` 上方、以及 `_soft_on` 那段）：
+    `data/*full.npz` + 不给 `--soft-index` ⇒ `soft_row` 从未挂载 ⇒
+    `_build_labels` 返回**全 0** 的 `soft`/`soft_mask`。
+
+    但 eval 侧此前无条件读 `lbl['soft']`，守卫不覆盖它 ⇒
+    `argmax(全0) = 0` ⇒ top1/5/10 退化成「模型是否预测 index 0」、KL 恒 0。
+    真机 2026-10-07 实测就是这个形状：top1 0.0006 → 0.0002 越训越低，而随机基线
+    top10 ≈ 2.76%、实测 0.49%；brier 却在正常改善（它读 `lbl['outcome']`）。
+    影响面不止指标 —— `--early-stop-metric` 默认就是 top1，`best_eval_acc` 也读它。
+
+    12 通道版 `evaluate_metrics` 一直以真实着法 `move_t` 为参考（见它的 top-k 段），
+    所以这里不是引入新语义，而是让 V7 版在软标签缺席时**回到**那条既有语义；
+    有软标签时行为逐字不变。
+    """
+    soft = torch.as_tensor(np.asarray(lbl['soft'])[:, :int(action_size)],
+                           device=device, dtype=dtype)
+    hard = _dense_move_target(moves, action_size).to(device=device, dtype=dtype)
+    mask = lbl.get('soft_mask')
+    if mask is None:
+        return hard
+    m = torch.as_tensor(np.asarray(mask), device=device,
+                        dtype=dtype).reshape(-1, 1)
+    return soft * m + hard * (1.0 - m)
+
+
 def evaluate_metrics_v7(model, dataset, idxs, bs, device, amp_dtype, *,
                         max_batches=50, action_size=V7_ACTION_SIZE,
                         prefetcher=None, use_channels_last=False):
@@ -1978,12 +2009,18 @@ def evaluate_metrics_v7(model, dataset, idxs, bs, device, amp_dtype, *,
     两处逻辑零改动复用）：
 
     ``top1`` / ``top5`` / ``top10``
-        policy 的 top-k 命中率。软标签用 ``soft`` 的 argmax 当参考着法。
+        policy 的 top-k 命中率。参考着法 = ``argmax(soft)``。
     ``kl``
         ``KL(soft ‖ softmax(logits))``，即 12 通道版同款。
     ``brier``
-        value 三分类的 Brier score（越小越好），``--early-stop-metric loss``
-        默认就看它。
+        value 三分类的 Brier score（越小越好）；``--early-stop-metric loss``
+        看的是它（**默认**的判据是 top1，见该参数）。
+
+    **参考着法的回退**（见 :func:`_eval_ref_target`）：`soft_mask` 全 0 时 ——
+    board 级 V7 + 不给 `--soft-index`，此时 `soft` 本身也是全 0 —— 上面两项一律
+    改以**真实着法的 one-hot** 为参考，与 12 通道版同一语义。不回退的话
+    `argmax(全0) = 0`，top1/5/10 会变成「模型是否预测 index 0」而 KL 恒 0，
+    并且因为 top1 同时是 early-stop 与 best-model 的判据，早停会盯着噪声走。
     policy 通道 1 是 ``π_opp``（引擎语义里叫 optimism），本指标**只看通道 0** ——
         引擎在 ``policyOptimism=0`` 时也只消费通道 0。
 
@@ -2045,8 +2082,8 @@ def evaluate_metrics_v7(model, dataset, idxs, bs, device, amp_dtype, *,
         pol = pol[:, 0, :action_size].float()           # 只看通道 0（π）
         logp = F.log_softmax(pol, dim=-1)
 
-        target = torch.as_tensor(lbl['soft'][:, :action_size],
-                                device=logp.device, dtype=torch.float32)
+        target = _eval_ref_target(lbl, moves, action_size,
+                                  device=logp.device, dtype=torch.float32)
         tgt_rank = target.argmax(dim=-1)
         top = logp.topk(min(10, action_size), dim=-1).indices
         eq = top.eq(tgt_rank.unsqueeze(1))
@@ -3707,6 +3744,74 @@ def _load_model_state(model, ckpt, logger) -> None:
     target.load_state_dict(aligned)
 
 
+def _prof_parse_trace(trace, *, row_limit=18):
+    """chrome trace JSON →（top-k 内核表, cat 总耗时摘要）。
+
+    **纯函数**：只吃已经 ``json.load`` 出来的对象，不碰 profiler 实例 ⇒ 不装
+    torch_npu 也能测。这是 `key_averages()` 那条路走不通时的唯一出口。
+
+    为什么必须有它：``torch_npu 2.1.0.post10`` 的 ``torch_npu.profiler.profile``
+    是**独立类**，实例方法只有 ``add_metadata / add_metadata_json /
+    export_chrome_trace / export_memory_timeline / export_stacks / start /
+    step / stop`` 共 8 个，**没有** ``key_averages / events / profiler_result``
+    （``scripts/probe_npu_profiler.py`` 实测）。于是打表那段在真机上必
+    AttributeError，被外层 ``except`` 吞成一行 warning ⇒「窗口跑完了、表没有」。
+
+    聚合口径：按 ``(cat, name)`` 求和时长。只收 ``dur > 0`` 的事件 —— trace 里
+    还有大量瞬时（``ph=i``）、计数器、flow、metadata 事件，它们没有时长，
+    混进来会把「按耗时排序」变成「按事件条数排序」。
+    """
+    events = trace.get('traceEvents', trace) if isinstance(trace, dict) else trace
+    agg = {}   # (cat, name) -> [total_us, count]
+    cats = {}  # cat       -> total_us
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        dur = ev.get('dur') or 0
+        if dur <= 0:
+            continue
+        cat = str(ev.get('cat') or '?')
+        name = str(ev.get('name') or '?')
+        row = agg.setdefault((cat, name), [0.0, 0])
+        row[0] += float(dur)
+        row[1] += 1
+        cats[cat] = cats.get(cat, 0.0) + float(dur)
+    if not agg:
+        return ('(trace 里没有带时长的事件 —— 采到 0 条，窗口可能是 0 步)',
+                '(空)')
+    lines = ['%7s %12s  cat / name' % ('cnt', 'total_us')]
+    top = sorted(agg.items(), key=lambda kv: -kv[1][0])[:row_limit]
+    for (cat, name), (tot, cnt) in top:
+        lines.append('%7d %12d  %s / %s'
+                     % (cnt, int(round(tot)), cat, name))
+    cat_line = ', '.join('%s=%.2fs' % (c, t / 1e6)
+                         for c, t in sorted(cats.items(), key=lambda kv: -kv[1])[:14])
+    return ('\n'.join(lines), cat_line)
+
+
+def _prof_trace_table(prof, *, row_limit=18):
+    """``key_averages()`` 缺失时的退路：导出 chrome trace → 解析 → 表 + cat 摘要。
+
+    ``export_chrome_trace(path)`` 是 torch_npu **确实提供**的 8 个方法之一，所以
+    这条路在真机上是走得通的。trace 落到临时文件、读完即删（一次窗口几百 MB，
+    留在 /tmp 里没人收）。
+    """
+    import json
+    import tempfile
+    fd, path = tempfile.mkstemp(prefix='goai_prof_', suffix='.json')
+    os.close(fd)
+    try:
+        prof.export_chrome_trace(path)
+        with open(path, 'r', encoding='utf-8') as fh:
+            trace = json.load(fh)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return _prof_parse_trace(trace, row_limit=row_limit)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--data', required=True,
@@ -5203,9 +5308,16 @@ def main():
         if pf is not None:
             for _j in range(min(args.prefetch_depth, n_batches)):
                 pf.submit(perm[_j * bs:(_j + 1) * bs])
-        # 内核级剖析（诊断用）：GOAI_PROFILE=<step> 从该 step 起 profiling 50 个
-        # step，结束打印 top CUDA kernel 耗时表，用于定位 740ms/step 的去向。
+        # 内核级剖析（诊断用）：GOAI_PROFILE=<step> 从该 step 起 profiling
+        # GOAI_PROFILE_STEPS 个 step（默认 50），结束打印 top kernel 耗时表，
+        # 用于定位 740ms/step 的去向。
         _prof_at = int(os.environ.get('GOAI_PROFILE', '0') or 0)
+        # 窗口长度，步数。`0` = 起点即终点：起点之后**第一个** `_do_stdout` 步就停表
+        # ⇒ 配 `--log-every 5` + `GOAI_PROFILE=5 GOAI_PROFILE_STEPS=0` 即「第 5 步出表」，
+        # 而不是等满 50 步（2026-10-07 真机一次诊断要等 ~11 分钟才拿到表）。
+        # 钳到 >=0：负数没有意义，且会让 `step >= _prof_at + _prof_span` 恒真 ⇒ 起点步
+        # 之前就停表、一个内核都没采到。
+        _prof_span = max(0, int(os.environ.get('GOAI_PROFILE_STEPS', '50') or 50))
         _prof_ctx = None
         # ---- 分段计时（纯 CPU 侧观测）----
         # 动机：4 卡 910A 实测 4.25 s/step，扣除 eval（实测仅 0.2%）后
@@ -5302,8 +5414,8 @@ def main():
                             _acts = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
                             _prof_ctx = profile(activities=_acts)
                         _prof_ctx.__enter__()
-                        logger.info("[profile] 已开始内核剖析（50 steps）| activities=%s",
-                                    [str(a) for a in _acts])
+                        logger.info("[profile] 已开始内核剖析（%d steps）| activities=%s",
+                                    _prof_span, [str(a) for a in _acts])
                     except Exception as pe:  # noqa: BLE001
                         logger.warning("[profile] 不可用: %s", pe)
                         _prof_at = 0
@@ -6087,24 +6199,49 @@ def main():
                     logger.warning("[swanlab] log 失败: %s", e)
 
             if _do_stdout:
-                # 内核剖析结束：打印 top CUDA kernel 耗时表
-                if _prof_ctx is not None and step >= _prof_at + 50:
-                    _prof_ctx.__exit__(None, None, None)
+                # 内核剖析结束：打印 top kernel 耗时表
+                if _prof_ctx is not None and step >= _prof_at + _prof_span:
+                    _prof = _prof_ctx
+                    # **先摘掉再收尾**。原实现把 `__exit__` 放在 try **外面**、且收尾
+                    # 后仍留着 `_prof_ctx` ⇒ 窗口一过，之后每个 stdout 步都会再
+                    # `__exit__` 一次、再失败一次（2026-10-07 真机：每 2 步刷一行
+                    # "'profile' object has no attribute 'key_averages'"），而 `__exit__`
+                    # 一旦抛异常还会直接打穿训练循环。置 None 保证「无论成败只收一次尾」。
+                    _prof_ctx = None
                     try:
-                        # 排序键按后端选：NPU 的活动键是 `self_npu_time_total`，
-                        # 用 CUDA 的键会 KeyError 并被下面 except 吞成一行 warning
-                        # ⇒「profile 跑过了但没有表」（2026-10-06 真机）。
-                        _sort_key = ('self_npu_time_total' if _backend == 'npu'
-                                    else 'self_cuda_time_total')
-                        _ka = _prof_ctx.key_averages()
+                        _prof.__exit__(None, None, None)
+                        # **先试**在位的 `key_averages()`（torch.profiler 有）。
+                        # torch_npu 2.1.0.post10 的 `profile` 是**独立类**，实例
+                        # 方法只有 add_metadata / export_chrome_trace /
+                        # export_memory_timeline / export_stacks / start / step /
+                        # stop 共 8 个，**没有** `key_averages` ⇒ 真机必
+                        # AttributeError。2026-10-07 真机实测：窗口一过，之后每个
+                        # stdout 步都刷一行 `'profile' object has no attribute
+                        # 'key_averages'` —— 表永远拿不到。取不到就走下面的
+                        # chrome trace 退路（scripts/probe_npu_profiler.py 就是
+                        # 为探明这件事写的探针）。
                         try:
-                            table = _ka.table(sort_by=_sort_key, row_limit=18)
-                        except KeyError:
-                            # 键名随 torch_npu 版本变：退一步用无排序的表，
-                            # 至少能看到有哪些 kernel 与它们的事件数。
-                            table = _ka.table(row_limit=18)
-                        logger.info("[profile] 内核耗时 top-18（按 %s 排序）:\n%s",
-                                    _sort_key, table)
+                            _ka = _prof.key_averages()
+                            # 排序键按后端选：NPU 的活动键是 `self_npu_time_total`，
+                            # 用 CUDA 的键会 KeyError ⇒「跑了但没有表」（2026-10-06 真机）。
+                            _sort_key = ('self_npu_time_total' if _backend == 'npu'
+                                        else 'self_cuda_time_total')
+                            try:
+                                table = _ka.table(sort_by=_sort_key, row_limit=18)
+                            except KeyError:
+                                # 键名随 torch_npu 版本变：退一步用无排序的表，
+                                # 至少能看到有哪些 kernel 与它们的事件数。
+                                table = _ka.table(row_limit=18)
+                            logger.info("[profile] 内核耗时 top-18（按 %s 排序）:\n%s",
+                                        _sort_key, table)
+                        except (AttributeError, NotImplementedError):
+                            _table, _cats = _prof_trace_table(_prof, row_limit=18)
+                            logger.info("[profile] 内核耗时 top-18（chrome trace 解析）:\n%s",
+                                        _table)
+                            # cat 摘要是**探针**：分组口径只能先按通用 schema 猜，
+                            # 真机第一次回来先看这一行有没有把 kernel 单列出来，
+                            # 没有就据此改 `_prof_parse_trace` 的聚合键。
+                            logger.info("[profile] trace cat 总耗时: %s", _cats)
                     except Exception as e:
                         logger.warning("[profile] 打印内核耗时表失败: %s", e)
 
