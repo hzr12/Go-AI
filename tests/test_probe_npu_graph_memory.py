@@ -30,6 +30,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from scripts.probe_npu_graph_memory import (  # noqa: E402
+    _backend_tag,
     _err_line,
     _fail_stage,
     _trace_tail,
@@ -91,3 +92,63 @@ def test_unwrapped_inductor_error_still_classified_as_inductor():
     err = 'RuntimeError: Compiler: cl is not found.'
     stage = _fail_stage(err, 'torch._inductor.exc.InductorError: ' + err)
     assert stage == 'inductor', stage
+
+
+# ---------------------------------------------------------------- TorchAir / CANN
+
+# 2026-10-07 910C 实测：TorchAir 后端的名字是整段 functools.partial 的 repr，
+# 300+ 字节，恒排在 `backend=… raised:` 与真原因**之间**。
+TORCHAIR_BACKEND_NAME = (
+    "functools.partial(<function _npu_backend at 0x7f9e1c0d2f80>, "
+    "compiler_config=<torchair.configs.options.Proto2IROptions>, "
+    "decompositions={})")
+
+
+def test_torchair_backend_repr_does_not_shove_out_the_real_cause():
+    """TorchAir 的后端 repr 极长 —— 不能把它当成 `_err_line` 的全部内容。"""
+    e = _backend_failed(RuntimeError('AHGraphCompileError: unsupported op'))
+    # torch 2.1 的 `BackendCompilerFailed` 用 backend_fn 的 repr 当 backend_name
+    # （functools.partial 没有 __name__），于是消息里夹着这段 300+ 字节的 repr。
+    e.backend_name = TORCHAIR_BACKEND_NAME
+    e.args = ('backend=%r raised:\nRuntimeError: AHGraphCompileError: '
+              'unsupported op' % TORCHAIR_BACKEND_NAME,)
+
+    line = _err_line(e)
+    assert 'unsupported op' in line, (
+        '真原因被那段 300+ 字节的 partial repr 挤没了：\n  %s' % line)
+    assert len(line) <= 1200, len(line)
+    assert _backend_tag(e) == 'torchair', _backend_tag(e)
+    assert _fail_stage(line, _trace_tail(e), e) == 'torchair'
+    assert 'inductor' not in line, 'TorchAir 的失败不能被显示成 inductor：%s' % line
+
+
+CANN_MSG = '\n'.join([
+    'E19999: Inner Error!',
+    'E19999: [PID: 62] 2026-10-07-20:48:26.590.568 [Call][PreRun] Failed, '
+    'graph_id:151, session_id:0.[FUNC: CompileGraph][FILE: graph_manager.cc]'
+    '[LINE: 4512]',
+    'TraceBack (most recent call last):',
+    '[Compile][Graph] Compile graph failed. Unsupported operator: _masked_fill',
+])
+
+
+def test_cann_error_shows_the_last_line_not_the_empty_first_one():
+    """CANN 的根因在**最后一行**，首行 `E19999: Inner Error!` 零信息量。
+
+    2026-10-07 `block bs=800` 实测只打印了前 200 字节，看不到图编不过什么。
+    """
+    line = _err_line(RuntimeError(CANN_MSG))
+    assert '_masked_fill' in line, (
+        '只留首行 ⇒ 报告里只剩 `E19999: Inner Error!`，看不出哪张图编不过：\n  %s' % line)
+    assert 'graph_manager.cc' in line, line
+
+
+def test_cann_error_is_a_backend_stage_not_other():
+    """`E19999` 是 CANN 图编译失败 ⇒ 已过追踪、属后端阶段。
+
+    归成 `'other'` 会让结论段漏掉「必须在目标环境重测」这句。
+    """
+    e = RuntimeError(CANN_MSG)
+    assert _fail_stage(_err_line(e), _trace_tail(e), e) == 'torchair'
+    # 不传 e 也要能靠消息本身归档 —— 结论段可能只拿到已经截好的字符串。
+    assert _fail_stage(_err_line(e), _trace_tail(e)) == 'torchair'

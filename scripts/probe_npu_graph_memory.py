@@ -112,6 +112,7 @@ import argparse
 import ast
 import math
 import pathlib
+import re
 import sys
 import time
 import traceback
@@ -431,70 +432,144 @@ def _cause_chain(e, limit=6):
     return out
 
 
-def _err_line(e, limit=200):
-    """异常的**全部**有效行，用 ` / ` 拼成一行；链上更深一层的也一并带上。
+def _backend_tag(e):
+    """从 `BackendCompilerFailed` 的消息里读出**后端名**，归一成 `inductor` / `torchair`。
 
-    不能只取首行：`BackendCompilerFailed` 的消息是两行 —— 首行是
-    ``backend='inductor' raised:`` 这句**没有任何原因**的话，真正的原因在第二行。
-    2026-10-07 的 910C 实测就是因为这里只取了 `[0]`，报告里只剩
-    ``backend='inductor' raised:``，「为什么挂」一个字都没有。
+    消息形如 ``backend=<backend_name!r> raised:``。inductor 的名字就是
+    ``'inductor'``；TorchAir 的名字是整段 ``functools.partial(<function _npu_backend
+    …, compiler_config=…, decompositions={…})`` 的 repr —— 几百字节，不能原样进表格，
+    所以按 `_npu_backend` / `compiler_config` 归类成 `torchair`。
     """
-    parts = []
+    try:
+        raw = str(e)
+    except Exception:
+        return None
+    m = re.search(r"backend=(['\"])(.*?)\1\s*raised", raw, re.S)
+    if not m:
+        return None
+    name = m.group(2)
+    if ('_npu_backend' in name or 'torchair' in name
+            or 'compiler_config' in name):
+        return 'torchair'
+    return name if len(name) <= 32 else None
+
+
+def _full_trace(e, limit_lines=90):
+    """整条异常链的完整栈 —— 失败诊断专用，不进表格。
+
+    表格那行只能放一句话；`Please convert all Tensors to FakeTensors…` 这种报错
+    的**真正线索在栈里**（哪个算子、哪一行代码造出了那个真张量）。没有栈就只能靠
+    猜，而 910C 上一轮往返要十几分钟。
+    """
+    out = []
     for cur in _cause_chain(e):
         try:
-            body = ' / '.join(l.strip() for l in str(cur).splitlines()
-                              if l.strip())
+            out.append(''.join(traceback.format_exception(
+                type(cur), cur, cur.__traceback__)).rstrip())
+        except Exception:  # noqa: BLE001
+            out.append('%s: %r' % (type(cur).__name__, cur))
+    lines = '\n'.join(out).splitlines()
+    if len(lines) > limit_lines:
+        head = lines[:limit_lines // 3]
+        tail = lines[-(limit_lines - len(head)):]
+        lines = head + ['...（中间省略 %d 行）...'
+                        % (len(lines) - len(head) - len(tail))] + tail
+    return '\n'.join(lines)
+
+
+def _err_line(e, limit=1200):
+    """**最深一层**的原因打头，外层只留类型（可带后端标签）；多行消息**首尾都留**。
+
+    两条历史教训，都来自 910C 实测：
+
+    1. 不能按顺序拼 —— `BackendCompilerFailed` 的首行是
+       ``backend=<后端 repr> raised:``，TorchAir 后端那截 repr 就 300+ 字节，
+       合理 limit 下真原因恒被截掉。真原因在链尾。
+    2. 也不能只留首行 —— CANN 的图编译失败是 ``E19999: Inner Error!`` +
+       一串 ``[FUNC:…][FILE:…]`` + ``TraceBack`` 帧，**根因在最后一行**，
+       首行 `E19999: Inner Error!` 本身零信息量。所以**先整条拼起来**，
+       只有超过 limit 才退回「首行 + 末行」。limit=1200：2026-10-07 实测
+       FakeTensor 那条报错本身就有 400+ 字节，320 会把后半截砍掉。
+       更长的线索（栈）走 `--full-trace`，不进这一行。
+    """
+    chain = _cause_chain(e)
+    inner = chain[-1]
+    try:
+        lines = [l.strip() for l in str(inner).splitlines() if l.strip()]
+    except Exception:
+        lines = []
+    if not lines:
+        try:
+            body = repr(inner)
         except Exception:
-            body = ''
-        if not body:
-            try:
-                body = repr(cur)
-            except Exception:
-                body = '<unprintable exception>'
-        parts.append(body)
-    out = parts[0] if parts else '<no message>'
-    for p in parts[1:]:
-        if p and p not in out:
-            out = '%s | %s' % (out, p)
-    return out[:limit]
+            body = '<unprintable exception>'
+        lines = [body]
+    body = ' / '.join(lines)
+    if len(body) > limit:
+        # 超长才退回「首 + 末」：CANN 的 `E19999` 根因在最后一行，
+        # 首行 `E19999: Inner Error!` 本身零信息量，只留首行等于什么都没说。
+        first, last = lines[0], lines[-1]
+        room = limit - len(first) - 5
+        body = ('%s ... %s' % (first, last[:room])
+                if room > 40 else last[:limit])
+    if inner is e:
+        return body[:limit]
+    head = type(e).__name__
+    tag = _backend_tag(e)
+    if tag:
+        head = '%s[%s]' % (head, tag)
+    return ('%s: %s' % (head, body))[:limit]
 
 
 def _trace_tail(e, limit=240):
-    """`format_exception_only` 的**全部**行（异常类型 + 每一行消息）。
+    """`↳` 那行：**类型链**；单层异常才带上消息。
 
-    只取第一行会同时丢掉两样东西：内层原因（`BackendCompilerFailed` 的第二行）、
-    以及「类型」在多行消息下的后半段。噪音行（TORCHDYNAMO_VERBOSE 提示、
-    「During handling of the above exception」）仍然过滤掉。
+    链长 >1 时外层消息几乎总是一大段 backend repr（`BackendCompilerFailed`），
+    与 `_err_line` 里的原因重复且更长，只会把输出挤爆 —— 这种情况只留类型名。
     """
-    try:
-        txt = ''.join(traceback.format_exception_only(type(e), e))
-    except Exception:
-        return ''
+    chain = _cause_chain(e)
     noise = ('TORCHDYNAMO_VERBOSE', 'TORCH_LOGS', 'developer context',
              'During handling', 'The above exception')
-    lines = [l.strip() for l in txt.splitlines()
-             if l.strip() and not any(n in l for n in noise)]
-    # 链上更深层若没出现在这些行里，补一条 —— 防某些版本把原因只放 inner_exception。
-    joined = ' '.join(lines)
-    for cur in _cause_chain(e)[1:]:
-        name = type(cur).__name__
-        if name in joined:
-            continue
+
+    def _clean(txt):
+        return [l.strip() for l in txt.splitlines()
+                if l.strip() and not any(n in l for n in noise)]
+
+    if len(chain) == 1:
         try:
-            body = ' '.join(l.strip() for l in str(cur).splitlines() if l.strip())
+            txt = ''.join(traceback.format_exception_only(type(e), e))
         except Exception:
-            body = ''
-        lines.append('%s: %s' % (name, body) if body else name)
-    return ' '.join(lines)[:limit] if lines else ''
+            return ''
+        ls = _clean(txt)
+        if len(ls) > 2:
+            # 同 `_err_line`：CANN 的根因在末行，首行往往只是 `E19999: Inner Error!`。
+            room = limit - len(ls[0]) - 5
+            return ('%s ... %s' % (ls[0], ls[-1][:room]) if room > 40
+                    else ' '.join(ls))[:limit]
+        return ' '.join(ls)[:limit]
+
+    names = list(dict.fromkeys(type(c).__name__ for c in chain))
+    tail = ': '.join(names) if names else type(e).__name__
+    inner = chain[-1]
+    try:
+        body = ' '.join(_clean(str(inner)))
+    except Exception:
+        body = ''
+    if body and inner is not e:
+        tail = '%s -> %s' % (tail, body)
+    return tail[:limit]
 
 
-def _fail_stage(err, tail):
-    """失败发生在哪一层 —— 这决定了还要不要拿到 NPU 上再试一次。
+def _fail_stage(err, tail, e=None):
+    """失败发生在哪一层 —— 这决定了还要不要拿到目标设备上再试一次。
 
-    'dynamo'  : 追踪阶段就挂了。**与设备无关** ⇒ 换设备也一样。
-    'inductor': **已经过了追踪、是 backend 抛的** ⇒ 与设备/后端有关，本机结论
-                不能外推，必须在目标设备上重测。
-    'other'   : 其它（OOM、模型构造、数据形状等）。
+    'dynamo'   : 追踪阶段就挂了。**与设备无关** ⇒ 换设备也一样。
+    'inductor' : **已经过了追踪、是 inductor 后端抛的** ⇒ 与后端/设备有关，
+                 本机结论不能外推，必须在目标设备上重测。
+    'torchair' : 同上，但后端是 TorchAir。单独一档是因为两者的补救办法不同：
+                 inductor 缺件要装 triton-ascend，TorchAir 要查 CompilerConfig。
+                 合并成一个 'inductor' 会让 TorchAir 的失败被误判成「装 triton」。
+    'other'    : 其它（OOM、模型构造、数据形状等）。
 
     `BackendCompilerFailed` 必须**优先于** `torch._dynamo` 关键字判定：它的类型名
     带 `torch._dynamo` 前缀，但按定义意味着 Dynamo 已经追踪成功、是 **backend**
@@ -503,9 +578,30 @@ def _fail_stage(err, tail):
     推出「与设备无关、NPU 也会一样挂」，而当时本机就在 NPU 上，自相矛盾。
     """
     blob = ('%s %s' % (err or '', tail or '')).lower()
-    if ('backendcompilerfailed' in blob or "backend='" in blob
-            and ' raised' in blob):
+    if e is not None:
+        # 后端名要从**未截断**的 `str(e)` 里读 —— tail 被 limit 截过，
+        # TorchAir 的 functools.partial repr 截断后可能已经看不到 `_npu_backend`。
+        try:
+            blob = '%s %s' % (blob, str(e).lower())
+        except Exception:
+            pass
+        tag = _backend_tag(e)
+        if tag in ('inductor', 'torchair'):
+            return tag
+    if ('backendcompilerfailed' in blob
+            or ("backend='" in blob and ' raised' in blob)
+            or ('backend="' in blob and ' raised' in blob)):
+        if ('npu_backend' in blob or 'torchair' in blob
+                or 'compiler_config' in blob):
+            return 'torchair'
         return 'inductor'
+    # CANN 图编译失败：TorchAir 把图交给 CANN 的 graph manager 编译，报
+    # `E19999: Inner Error!` + `[Call][PreRun] Failed ... [FUNC: CompileGraph]
+    # [FILE: graph_manager.cc]`。这同样是**后端阶段**（追踪已过），归 'other'
+    # 会让结论段以为「报错不在这两层」，从而漏掉「必须在目标设备上重测」这句。
+    if any(k in blob for k in ('e19999', 'e19998', 'graph_manager.cc',
+                               'compilegraph', 'call][prerun')):
+        return 'torchair'
     if any(k in blob for k in ('torch._inductor', 'inductorerror',
                                'triton', 'codegen', 'compiler:')):
         return 'inductor'
@@ -672,7 +768,13 @@ def main(argv=None):
                          'batch 刻意取小 —— 这一档只测**能否追踪/编译 + 数值是否'
                          '正确**，与显存无关（显存走 --batch-sizes）；CPU 上 bs=64 '
                          '要 45s 且占内存，拖慢定位循环。'
-                         % ','.join(INDUCTOR_SMOKE_TIERS))
+                          % ','.join(INDUCTOR_SMOKE_TIERS))
+    ap.add_argument('--full-trace', action='store_true',
+                    help='FAIL 时把**完整异常链的完整栈**打出来（默认关）。'
+                         '报错行只能放一句话，`Please convert all Tensors to '
+                         'FakeTensors…` 这种的线索在栈里 —— 没有栈就只能猜，'
+                         '而 910C 上一轮往返十几分钟。')
+
     ap.add_argument('--no-checkpoint', dest='ckpt', action='store_false',
                     default=True,
                     help='连 gc / gc-ind 档也关掉梯度检查点（默认开）')
@@ -863,11 +965,11 @@ def main(argv=None):
                          '  ⚠NaN' if r['bad_loss'] else '',
                          '  ⚠守卫会拦' if r.get('guard') else ''))
             except Exception as e:
-                # 首行往往只是包装层（inductor 会包好几层），**真正的原因另有一行**，
-                # 所以两者都留：首行进表格，`stage` 决定要不要拿到 NPU 上重测。
+                # 首行 = 根因（`_err_line` 已经保证多行取首尾、真因在链尾），
+                # `tail` = 类型链，`stage` 决定这条结论能不能外推。
                 first = _err_line(e)
                 tail = _trace_tail(e)
-                stage = _fail_stage(first, tail)
+                stage = _fail_stage(first, tail, e)
                 if _is_oom(e):
                     oomed = True
                     rows.append({'tier': tier, 'batch': bs, 'oom': True,
@@ -882,6 +984,11 @@ def main(argv=None):
                     print('  %s FAIL   %s  [%s]' % (label, first, stage))
                     if tail and tail != first:
                         print('  %s        ↳ %s' % (' ' * len(label), tail))
+                    if args.full_trace:
+                        print('  %s        ---- 完整异常 ----'
+                              % (' ' * len(label)))
+                        for ln in _full_trace(e, limit_lines=90).splitlines():
+                            print('  %s        %s' % (' ' * len(label), ln))
             finally:
                 if api['empty_cache']:
                     try:
@@ -1041,20 +1148,26 @@ def main(argv=None):
                         break
                 else:
                     print('     （不是已知的 context_fn 限制，见首行原文。）')
-            if 'inductor' in stages:
-                print('   ⇒ 其中已过追踪、卡在代码生成/后端 —— 这一层**与设备有关**，')
-                print('     本机结论不能外推，**必须在 NPU 上重测**才算数。')
-            if stages == {'other'}:
-                print('   ⇒ 报错不在这两层，见上面的首行。')
+            backend_stages = stages & {'inductor', 'torchair'}
+            if backend_stages:
+                print('   ⇒ 其中后端阶段失败（%s）—— **追踪已过**，卡在代码生成/'
+                      '图编译；这一层与后端和设备都有关，' % '+'.join(sorted(backend_stages)))
+                print('     本机结论不能外推到别的环境，**必须在目标环境重测**才算数。')
+            if 'dynamo' not in stages and not backend_stages and stages:
+                print('   ⇒ 报错既不在追踪层也不在后端层，见上面的首行。')
 
-            # inductor 档 != TorchAir 档，别把 Windows 的 cl 缺失当成 TorchAir 结论。
+            # inductor 档 != TorchAir 档，别把一侧的缺件当成另一侧的结论。
             if 'inductor' in stages:
                 print()
                 print('   ⚠ 注意档位口径：`gc-ind` / `gc-ind-all` 走的是 **torch.compile 的')
                 print('     inductor 后端**，不是 TorchAir。TorchAir 档是 linear/block/whole')
-                print('     （TIER_SPEC 里 kind==`torchair`）。')
+                print('     / gc-torchair / gc-torchair-all（TIER_SPEC 里 kind==`torchair`）。')
                 print('     `Compiler: cl is not found` 是**本机 Windows 缺 C++ 编译器**，')
                 print('     与 TorchAir 能否跑通**无关**，不要据此给 TorchAir 下结论。')
+            if 'torchair' in stages:
+                print()
+                print('   ⚠ 这是 TorchAir / CANN 侧的失败，**与 inductor 是否安装无关**。')
+                print('     不要据此得出「要升级 torch_npu / 装 triton-ascend」的结论。')
 
             blob = ' '.join((r.get('err') or '') + ' ' + (r.get('trace_tail') or '')
                             for r in fail_rows).lower()
