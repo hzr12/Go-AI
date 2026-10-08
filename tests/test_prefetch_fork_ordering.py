@@ -40,6 +40,8 @@ import os
 import re
 import sys
 
+import pytest
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -76,26 +78,35 @@ def test_no_context_creating_cuda_call_before_the_prefetcher():
 def test_the_nvml_helper_does_not_touch_torch_cuda():
     """`_cuda_name_and_capability` 存在的全部意义就是不建 context。
 
-    所以它内部**不许**出现任何 `torch.cuda.*` 调用 —— 一旦有人「顺手改回」
-    `get_device_properties`，这条就红。
+    所以它**可执行代码**里不许出现任何 `torch.cuda.*` 调用 —— 一旦有人
+    「顺手改回」`get_device_properties`，这条就红。
+
+    只看可执行代码、不看 docstring：docstring 里**必须**点名那个被禁的调用
+    （说明为什么禁），否则这条测试等于要求把原因也删掉。
     """
-    src = _main_src()
-    start = src.index('def _cuda_name_and_capability(')
-    body = src[start:src.index('\ndef ', start + 1)]
-    assert not re.search(r'torch\.cuda\.', body), (
-        '_cuda_name_and_capability 里出现了 torch.cuda.* 调用 —— '
-        '那会重新引入 CUDA context 初始化')
-    assert 'nvidia-smi' in body, '实现应走 nvidia-smi（NVML）'
+    tree = ast.parse(open(_SRC_PATH, encoding='utf-8').read())
+    fn = next(n for n in tree.body
+              if isinstance(n, ast.FunctionDef)
+              and n.name == '_cuda_name_and_capability')
+    # 先在**未处理**的代码上确认它真的调 nvidia-smi（下面要把字符串常量抹掉，
+    # 那会把 'nvidia-smi' 这个字面量一起抹掉，顺序不能反）
+    assert any(isinstance(n, ast.Constant) and n.value == 'nvidia-smi'
+               for n in ast.walk(fn)), '实现应走 nvidia-smi（NVML）'
+    # 去掉所有字符串常量（docstring / 命令名）后再扫 torch.cuda
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            node.value = ''
+    code = ast.unparse(fn)
+    assert not re.search(r'torch\.cuda\.', code), (
+        '_cuda_name_and_capability 的可执行代码里出现了 torch.cuda.* 调用 —— '
+        '那会重新引入 CUDA context 初始化：\n%s' % code)
 
 
 def test_the_helper_parses_capability_and_survives_na():
     """`compute_cap` 在老驱动上返回 `[N/A]`；解析必须扛住，且不抛。"""
     import scripts.train_sft as t
 
-    real_run = t.subprocess.run if hasattr(t, 'subprocess') else None
-    assert real_run is not None or True  # subprocess 是函数内 import，见下
-
-    # 函数内部是 `import subprocess`，所以直接用 monkeypatch 打在 subprocess 上
+    # 函数内部是 `import subprocess`，所以打在 subprocess 模块的 run 上
     import subprocess as sp
 
     class _R:
@@ -122,6 +133,5 @@ def test_prefetcher_guard_still_refuses_after_device_init():
 
     if not hasattr(torch, 'npu') and not torch.cuda.is_available():
         pytest.skip('本机既无 NPU 也无 CUDA，护栏分支不可达')
-    import pytest
     with pytest.raises(RuntimeError, match='初始化之后构造'):
         _BatchPrefetcher(object(), num_workers=2)

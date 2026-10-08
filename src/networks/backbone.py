@@ -537,10 +537,30 @@ def _recompute_context_fn(ac, guard):
     return contextlib.nullcontext(), recompute_ctx()
 
 
+def _first_tensor(args):
+    """`args` 里第一个 `torch.Tensor`，没有则 None。
+
+    为什么不用 `next((a for a in args if isinstance(a, torch.Tensor)), None)`：
+    **那个写法会让每个检查点段各断一次图。** `next(genexpr, default)` 是**两个**
+    位置参数，Dynamo 的 builtin 处理器只认有限几种 arity，落到
+    `torch/_dynamo/variables/builtin.py` 的 `call_next` 分支上就报
+    `incorrect arg count ... too many positional arguments and no constant
+    handler` 并**放弃整段**。而本函数在 `_checkpointed` 里、被 Dynamo 追踪，
+    于是 A100 上开 `--compile` + `--gc-with-compile 1` 时，每个 block 边界
+    都断一次 —— 融合收益被吃光，而日志里只是一行 WARNING。
+
+    改写成显式循环：对**静态 tuple** 的 `for` + `isinstance` 是 Dynamo 的
+    基本功（直接展开），不会断图。语义与原来逐位相同。
+    """
+    for a in args:
+        if isinstance(a, torch.Tensor):
+            return a
+    return None
+
+
 def _checkpointed(runner, args, bns):
     guard = _BatchNormStatGuard(bns)
-    _ac = _autocast_like(next((a for a in args
-                               if isinstance(a, torch.Tensor)), None))
+    _ac = _autocast_like(_first_tensor(args))
     # `context_fn` 走 functools.partial（Dynamo 认 FunctoolsPartialVariable）。
     # **不要**改回就地 `def context_fn()` —— 那会变成 NestedUserFunctionVariable，
     # 与 torch.compile 同用时前向直接抛 NotImplementedError。缘由见
