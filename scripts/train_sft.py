@@ -84,11 +84,22 @@ def _auto_select_device():
     返回形如 'cuda:0' / 'npu:1' / 'cpu' 的具体设备串。
     """
     def _cuda_free(idx):
+        # 同样**不能**用 `torch.cuda.memory_allocated` / `get_device_properties`：
+        # 它们会 `_lazy_init()` 建 CUDA context，而本函数在 `--device auto` 时
+        # 跑在 `_BatchPrefetcher` fork **之前** ⇒ 预取 worker 继承设备上下文
+        # （4 卡 NPU 实测每卡凭空多占 ~24 GiB），护栏会直接拒绝构造。
+        # 改走 NVML：同样的「空闲显存」语义、**不建 context**。
         try:
-            torch.cuda.synchronize(idx)
-            total = torch.cuda.get_device_properties(idx).total_memory
-            alloc = torch.cuda.memory_allocated(idx)
-            return max(0, total - alloc)
+            import subprocess
+            out = subprocess.run(
+                ['nvidia-smi', '--query-gpu=memory.used,memory.total',
+                 '--format=csv,noheader,nounits', '--id=%d' % int(idx)],
+                capture_output=True, text=True, timeout=20)
+            if out.returncode != 0:
+                return 0
+            used, total = (int(x.strip()) for x in
+                           out.stdout.strip().splitlines()[0].split(',')[:2])
+            return max(0, total - used)
         except Exception:
             return 0
 
@@ -393,6 +404,42 @@ def _assert_init_weights_identical(model, logger):
                 dist.get_world_size(), _vals[0][0] + _vals[0][1])
 
 
+def _cuda_name_and_capability(idx=0):
+    """读第 `idx` 块卡的型号与算力，**返回 `(name, (major, minor))`**。
+
+    刻意**不**用 `torch.cuda.get_device_properties`：那个调用会 `_lazy_init()`
+    建 CUDA primary context。本函数服务于「设备初始化之前」的启动诊断，而后面
+    `_BatchPrefetcher` 要 fork 预取 worker，fork 会整份继承父进程的设备上下文
+    与显存映射（4 卡 NPU 实测每卡凭空多占 ~24 GiB），它自己有一条硬护栏拒绝在
+    设备已初始化后构造。
+
+    走 `nvidia-smi`（NVML）：同样的信息、**不建 context**、也不额外占显存。
+    拿不到就返回 `(None, None)` —— 这是纯诊断信息，读不到不该拦住训练。
+
+    `nvidia-smi --query-gpu` 的 `compute_cap` 在驱动不支持时返回 `[N/A]`，解析
+    要能扛住这种情况（此时只保留型号，算力给 None）。
+    """
+    try:
+        import subprocess
+        out = subprocess.run(
+            ['nvidia-smi', '--query-gpu=name,compute_cap',
+             '--format=csv,noheader,nounits', '--id=%d' % int(idx)],
+            capture_output=True, text=True, timeout=20)
+        line = (out.stdout or '').strip().splitlines()
+        if out.returncode != 0 or not line:
+            return None, None
+        parts = [p.strip() for p in line[0].split(',')]
+        name = parts[0] if parts else None
+        cap = None
+        if len(parts) > 1 and parts[1] and not parts[1].startswith('['):
+            bits = parts[1].split('.')
+            if len(bits) == 2 and all(b.isdigit() for b in bits):
+                cap = (int(bits[0]), int(bits[1]))
+        return name, cap
+    except Exception:  # noqa: BLE001 — 纯诊断，失败就放弃
+        return None, None
+
+
 def _check_training_env(logger):
     """启动时检查三大加速能力并打印诊断：flash-attn 库 / torch.compile / 混合精度。
 
@@ -422,12 +469,25 @@ def _check_training_env(logger):
     except Exception:
         pass
     if torch.cuda.is_available():
-        p = torch.cuda.get_device_properties(0)
-        cap = (p.major, p.minor)
-        if cap >= (8, 0):
-            amp_status = "bf16+fp16 可用（%s, sm_%d%d）" % (p.name, cap[0], cap[1])
+        # ⚠ **不能用 `torch.cuda.get_device_properties`**：它会 `_lazy_init()`
+        #   建 CUDA primary context。本函数在 main() 里跑在 `_BatchPrefetcher`
+        #   构造**之前**（预取 worker 是 fork 出来的，会整份继承父进程的设备
+        #   上下文与显存映射），而 `_BatchPrefetcher.__init__` 有一条硬护栏：
+        #   设备已初始化就 RuntimeError。
+        #   这条在 **NPU 机上从不触发**（`torch.cuda.is_available()` 为 False，
+        #   整个分支跳过），所以它是潜伏的 **CUDA-only** 缺陷 —— 直到迁到
+        #   A100 才第一次炸，且报错信息（"请把它挪到 init_process_group 之前"）
+        #   指向的地方并不是真正的原因。
+        #   改走 NVML（`nvidia-smi`）：拿同样的型号与算力，**不建 context**。
+        #   `device_count()` 走的是 NVML 路径、也不建 context，所以上面的
+        #   `is_available()` 判断同样是安全的。
+        name, cap = _cuda_name_and_capability()
+        if cap is None:
+            amp_status = "CUDA 可用（型号/算力读取失败，不影响训练）"
+        elif cap >= (8, 0):
+            amp_status = "bf16+fp16 可用（%s, sm_%d%d）" % (name, cap[0], cap[1])
         else:
-            amp_status = "仅 fp16（%s, sm_%d%d，Volta/Turing 无 bf16）" % (p.name, cap[0], cap[1])
+            amp_status = "仅 fp16（%s, sm_%d%d，Volta/Turing 无 bf16）" % (name, cap[0], cap[1])
     elif npu_is_available():
         amp_status = "bf16(910B)/fp16(910A) 可用（Ascend NPU，运行时按型号选择）"
     else:

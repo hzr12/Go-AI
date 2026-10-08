@@ -64,21 +64,21 @@ _POLICY = [
 ]
 
 
-@pytest.mark.parametrize('flags,exp_gc,exp_reason', _POLICY,
+@pytest.mark.parametrize('flags,exp_gc,exp_reason', [c[1:] for c in _POLICY],
                          ids=[c[0] for c in _POLICY])
 def test_policy_table(flags, exp_gc, exp_reason):
-    assert resolve_grad_checkpoint(1, compile_on=False, npu_linear_compile=False,
-                                   gc_with_compile=False, **flags) == (
-                                       exp_gc, exp_reason)
+    kw = dict(compile_on=False, npu_linear_compile=False, gc_with_compile=False)
+    kw.update(flags)
+    assert resolve_grad_checkpoint(1, **kw) == (exp_gc, exp_reason)
 
 
 def test_configured_zero_is_respected():
     """配置本身是 0 时不要被「无图编译」这条路径抬成 1。"""
-    assert resolve_grad_checkpoint(
-        0, compile_on=False, npu_linear_compile=False,
-        gc_with_compile=False) == (0, None)
-    assert resolve_grad_checkpoint(
-        0, compile_on=True, gc_with_compile=True) == (0, GC_REASON_GC_WITH_COMPILE)
+    off = dict(compile_on=False, npu_linear_compile=False, gc_with_compile=False)
+    assert resolve_grad_checkpoint(0, **off) == (0, None)
+    assert resolve_grad_checkpoint(0, **dict(off, compile_on=True,
+                                              gc_with_compile=True)) == (
+                                                  0, GC_REASON_GC_WITH_COMPILE)
 
 
 def test_new_flags_default_to_the_historical_behaviour():

@@ -18,20 +18,46 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 pip install -r requirements.txt
 pip install scipy          # ⚠ requirements.txt 漏了，但 src/data/feature_v7.py 直接 import 它
 pip install onnx onnxruntime
-# 硬件前提（2026-10-06 实测；2026-10-07 校正型号）：
-#   本批卡 = **Ascend 910C**（npu-smi 报 `Ascend 910-9392`；平台标注 910C）。
-#   实测 **BF16 autocast 可训**：fp16 在 CANN 融合内核处前向溢出 65504 ⇒
-#   futurepos 前向 NaN、warmup 内 15 步即炸；bf16 指数位与 fp32 同宽，无此问题。
+# 硬件前提 —— **两条链路，别混**（2026-10-08 起）：
 #
-# ⚠ 型号判据在 `train_sft.py` 的 `_backend == 'npu'` 分支（唯一事实源），现为：
+#   | 链路 | 入口            | 硬件          | 精度              |
+#   |------|-----------------|---------------|-------------------|
+#   | SFT  | train_sft.py    | **A100 40G 单卡** | BF16，无 GradScaler |
+#   | RL   | selfplay_train.py | Ascend NPU   | **FP16 + GradScaler** |
+#
+# ---- SFT：A100 40G 单卡（本节 A/B/C 全部命令）----
+#   `train_sft.py` 的 `_backend == 'cuda' and compute_cap >= (8,0)` 分支（唯一事实源）
+#   自动给：BF16 + `use_scaler=False` + `channels_last=True` + `sdpa_force_math=False`
+#   （⇒ FlashAttn 优先，回退内置 SDPA）+ TF32（`set_float32_matmul_precision('high')`）
+#   + fused AdamW + `--compile` 按设备自动开 1。
+#   ⇒ **`--scaler-init-scale` / `--scaler-growth-interval` 在 SFT 上是死参数**
+#     （GradScaler 根本不会被创建），下面所有 SFT 命令都不给它们。
+#     与 NPU 的 910B 路径不同：A100 是 Ampere+，BF16 原生支持，不需要 scaler。
+#   ⇒ `--compile` **不给即可**（自动开）。要关就显式 `--compile 0`。
+#     启动日志看两行：`[device] --compile 未指定 ⇒ 按设备自动取 1` 与 `[train] 已启用 torch.compile 算子融合`。
+#   ⚠ `--compile` 与梯度检查点默认**二选一**（开 compile 就强制 `_gc = 0`）。
+#     40G 卡上那等于「要融合就得把 batch 调小到吃不满算力」，而 batch 缩小吃掉的
+#     吞吐通常远大于融合省下的 ⇒ **SFT 命令一律加 `--gc-with-compile 1`**（两者共存）。
+#     前提已就位：检查点走 `use_reentrant=False`（`backbone._checkpointed`），
+#     与整模型 `torch.compile` 兼容；且 V7 的 head 原来返回 dict、穿不过 checkpoint
+#     的问题已修（`katago_v7._ckpt`，回归测试
+#     `tests/test_katago_v7_grad_checkpointing.py::test_grad_checkpoint_survives_aot_autograd`）。
+#     ⚠ 这条**不适用于** `--npu-graph-compile`（逐 Linear 编译的产物落在检查点段内部，
+#       真的互斥，`--gc-with-compile` 对它无效；判据见 `train_sft.resolve_grad_checkpoint`）。
+#   ⚠ `--compile-mode max-autotune` 与 `reduce-overhead` 都**带 CUDA Graphs**，
+#     私有内存池不归还 ⇒ 40G 卡上长跑容易吃满显存。要自动调优就用
+#     `--compile-mode max-autotune-no-cudagraphs`（新选项）。
+#   ⚠ flash-attn 需 `pip install flash-attn`；加载失败**自动回退内置 SDPA**，
+#     只少速度不会崩。`--flash-attn 0` 可强制禁用。启动日志看 `[env]` 那行。
+#
+# ---- RL：仍在 NPU，且是 FP16（见第 3 节）----
+#   型号判据在 `train_sft.py` 的 `_backend == 'npu'` 分支：
 #     命中 FP16 + GradScaler：名字含 `910B` / `910Pro` / `910-2`
-#     其余（含 **910C**）：BF16、无 GradScaler
-#   `910-9392` 不含 `910-2` 子串 ⇒ 本批卡走 **BF16**，`use_scaler=False`。
-#   ⇒ `--scaler-init-scale` / `--scaler-growth-interval` 在本批卡上是**死参数**
-#     （GradScaler 根本不会被创建），下面所有命令都不给它们。
-#   ⚠ 别把「910B 只能 fp16」套到本批卡上——910C 匹配不上那三个子串。
-#     每次启动看 `[device]` 那行：打印 `BF16 路径` 还是 `910B 路径` 一目了然。
-#   ⚠ NPU 上 inductor 编译无效，别加 --compile（图编译走 --npu-graph-compile）。
+#     其余（含 910C）：BF16、无 GradScaler
+#   ⚠ RL 走的是 `selfplay_train.py`，它**自己**用 `torch.npu.amp.GradScaler`（:958）
+#     且 `maybe_autocast` 默认 float16 ⇒ RL 侧恒为 FP16 + GradScaler，与 SFT 那套
+#     BF16 口径**不同**，两条链路的 `--scaler-*` 语义不要互相套用。
+#   ⚠ NPU 上 inductor 无效：`--compile` 在 NPU 被忽略（图编译走 `--npu-graph-compile`）。
 
 # ---------- 1. 数据（都已就位，不要重建）----------
 # 1) data/sgf_19x19_full.npz = 34,264,225 行 / 163,535 局，加压 447 MB、解压 12.3 GB
@@ -88,52 +114,65 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 # ⚠ 落盘带 `.latest`：`--out models/x.pth` ⇒ 实际是 `models/x.pth.latest`。
 #
 # ---- 参数为什么是这些值 ----
-# LR = 0.00356 × √(有效batch / 2500)，有效batch = batch × 卡数 × accum
-#   2800×1×1 = 2800 → 0.00377 ｜ 2800×2×1 = 5600 → 0.00533 ｜ 1000×4×2 = 8000 → 0.00637
+# LR = 0.00356 × √(有效batch / 2500)，有效batch = batch × 卡数 × accum。
+#   SFT 现在是**单卡 A100** ⇒ 卡数 = 1，于是 LR 只跟 batch 走：
+#     1400 → 0.00267 ｜ 2000 → 0.00320 ｜ 2800 → 0.00377 ｜ 5600 → 0.00533
+#   ⚠ **改 batch 必须按这条公式重算 LR**，别沿用上一段的旧值。
 # batch：V7 的 22 通道特征在训练时**不再实时计算**（分片里已预算并位打包），
 #   iterLadders 那 99.8% 的 CPU 开销在 V7 上不存在 ⇒ batch 可比 12 通道大。
-#   预取 worker 是**每 rank** 的：1 卡×24 / 2 卡×12 / 4 卡×6 = 24（实测 CPU 甜点）。
-# ⚠ `--scaler-init-scale` / `--scaler-growth-interval` 已从下面命令里删掉，因为
-#   **910B 自动走 BF16，而 BF16 下 `use_scaler=False` —— GradScaler 根本不会被创建**，
-#   这两个参数是死参数（`run.txt` 第 21-24 行记着 2026-10-06 的实测结论）。
-#   ⚠ **但换 910A 就必须加回来**：910A 走 FP16、`use_scaler=True`，此时不给就是
-#   代码默认 0.0 = PyTorch 的 65536，大 batch 下必炸（fp16 未来点平方溢出 65504）。
-#   910A 上给 `--scaler-init-scale 1024 --scaler-growth-interval 100000`
-#   （growth 调大 = 关掉自动增益，防震荡）。
+#   预取 worker 是**每 rank** 的：单卡 ⇒ 给 24（旧实测的 CPU 甜点，总量不变）。
+# ⚠ `--scaler-init-scale` / `--scaler-growth-interval` 在 **SFT（A100）上是死参数**：
+#   A100 是 Ampere+，走 BF16、`use_scaler=False`，GradScaler 根本不会被创建。
+#   ⚠ **RL（NPU）不同**：RL 走 `selfplay_train.py`，恒为 FP16 + GradScaler，
+#     scaler 参数在那条链路上是真参数；旧记录里「910A 走 FP16 时不给就是代码默认
+#     0.0 = PyTorch 的 65536，大 batch 下必炸（fp16 未来点平方溢出 65504）」，
+#     需要时给 `--scaler-init-scale 1024 --scaler-growth-interval 100000`
+#     （growth 调大 = 关掉自动增益，防震荡）。
 #   启动日志里 `[启动] amp_dtype=… scaler=…` 那行会直接告诉你走的是哪条 —— 别靠猜。
 # 🔴 `--attention-dropout 0` **必须显式给**（代码默认 0.1）：
 #   0.1 是 12 通道 SE 网的默认值，会经 `train_sft.py` 透传进 V7，覆盖掉
 #   `NBT_TF_CFG['attn_dropout']=0.0`——而 katago_v7.py 明确写「**没有 dropout**」。
 #   实测：不给该 flag 时 MHSA.attn_dropout=0.1（与设计相反）。
-# ⚠ `--use-sdpa 1`（默认 1，显式留痕）：放开 CANN 融合 SDPA，相比手写 math 大幅降
-#   注意力开销，且内部 fp32 累加比 fp16 手写 math 更不易溢出。受 batch 上限保护
-#   （B>60000 自动回退 math），旧 CANN / 缺 SDPA API 时也自动回退。0 = 强制全走 math。
+# ⚠ `--use-sdpa 1`（默认 1）：`0` 强制回退手写 math 注意力。**A100 上默认就已经
+#   走融合路径**（CUDA 分支直接 `sdpa_force_math=False` ⇒ FlashAttn 优先、回退内置
+#   SDPA），所以这条在 SFT 上基本不用给；给 0 是「关掉融合注意力做数值对拍」用的。
 # ⚠ `--attn-online` **默认不给**：online-softmax 注意力数值等价但**非逐位相同**
 #   （fp32 max|Δ|≈7e-07），开了会让 12 通道 bit-identical 基线失效；真机加速比未实测。
+#   且它只作用于**手写 math 路径** —— A100 上注意力走融合内核，给了也不生效。
 # ⚙️ **调优开关一律是 CLI 参数，没有环境变量**（2026-10-06 全部搬完；`GOAI_PROFILE`
 #   与 `GOAI_PROFILE_STEPS` 是仅有的例外——两个都是诊断开关、与训练配置无关，语义是
 #   「从第 N 步抓 M 步 kernel 表」，M 默认 50；`M=0` = 起点即终点，在起点后的**第一个**
 #   打点步就出表 ⇒ 配 `--log-every 5` 用 `GOAI_PROFILE=5 GOAI_PROFILE_STEPS=0`
-#   即「第 5 步出表」，不必等满 50 步）。五个总闸都是
-#   **只慢不坏**（数值口径不变），出问题置 0 即回到已验证配置：
-#     --use-sdpa 1|0        NPU 注意力走 CANN 融合 SDPA（默认 1）
+#   即「第 5 步出表」，不必等满 50 步）。总闸都是
+#   **只慢不坏**（数值口径不变），出问题置 0 即回到已验证配置。
+#   **A100/SFT 上有意义的是下面这组**，其后是 NPU 专用、在 CUDA 上是死参数：
+#     --flash-attn 1|0      融合注意力独立库（默认 1=自动优先；加载失败回退内置 SDPA）
+#     --compile 1|0         inductor 算子融合（**不给=按设备自动**，A100 上自动 1）
+#     --compile-mode ...    见第 0 节；A100 上别用带 CUDA Graphs 的两个值
+#     --gc-with-compile 1|0 compile 与梯度检查点共存（默认 0；**SFT 建议给 1**）
+#     --use-sdpa 1|0        0 = 强制回退手写 math（默认 1）
+#     --use-checkpoint      **已归档**，别传（见下）
+#   以下四个**只对 NPU/RL 有意义**，SFT 命令里给了不起作用：
 #     --npu-sfa 1|0         融合注意力 SFA/PFA，优先于 SDPA（默认 1；探针+自检+回退）
 #     --npu-swiglu 1|0      融合 SwiGLU（默认 1）
 #     --npu-channels-last   NPU 卷积 NHWC（**默认 1**；走 torch_npu.npu_format_cast，
 #                           非 torch.channels_last，见下方详注；失败自动降级）
 #     --attn-query-chunk N  math 注意力 query 分块（默认 64；只影响 math 路径）
 #     --attn-chunk-ckpt 1|0 math 注意力逐块检查点（默认 1）
-# ⚠ `--use-checkpoint` 已归档：由 `KATAGO_SE_CFG['grad_checkpoint']` 决定，唯一关闭
-#   路径是 `--compile 1`（而 NPU 上 --compile 无效）。别传它。
+# ⚠ `--use-checkpoint` 已归档：由 `KATAGO_SE_CFG['grad_checkpoint']` 决定。唯一让
+#   它让位的路径是 `--compile 1`（且不给 `--gc-with-compile 1`）。别传它。
 # ✅ eval 特征预取池（2026-10-06）：eval 的梯子特征曾是主进程串行计算，10 万行磨
-#   25-30 分钟（NPU 归零、无日志，两次被当成挂死）。现在与训练预取器同点 fork 一个
+#   25-30 分钟（GPU 归零、无日志，两次被当成挂死）。现在与训练预取器同点 fork 一个
 #   2-4 worker 的 eval 池（augment=False，指标逐位不变），墙钟 ÷ worker 数；
 #   启动日志锚点：`[data] eval 预取池已启用`。仍建议配 `--eval-max-batches 5`。
-# ⚠ `--npu-graph-compile 1` 与梯度检查点**互斥**：开图编译会强制关 GC
-#   （日志有 warning），显存/样本从 4.65 MB 涨到 ~278 MB ⇒ batch 上限 200 出头，
-#   batch 1500/5500 必 OOM（2026-10-06 实测）。要试图编译：batch 180 + accum 8。
-#   Linear-only（非整图）由 tests/test_npu_graph_compile.py 钉住。
-# ⚠ `--npu-channels-last 1`：**不是** `torch.channels_last`（2026-10-07 探针定论）：
+# ⚠ `--npu-graph-compile 1`（**仅 NPU/RL**）与梯度检查点**互斥**：逐 Linear 编译的
+#   产物落在检查点段内部，开图编译会强制关 GC（日志有 warning），且 `--gc-with-compile`
+#   对它**无效**。Linear-only（非整图）由 tests/test_npu_graph_compile.py 钉住。
+#   ⚠ 旧记录里「显存/样本从 4.65 MB 涨到 ~278 MB ⇒ batch 上限 200 出头」是 **NPU
+#     口径**且三个数互相矛盾（12.67 / 4.65 / 277），**对 A100 一律不适用**。
+#   SFT 侧要走图编译就用 `--compile`（整模型），它与 GC 可以共存。
+# ⚠ `--npu-channels-last 1`（**仅 NPU**）**不是** `torch.channels_last`
+#   （2026-10-07 探针定论）：
 #   本机 torch 2.1.0 + torch_npu 2.1.0.post10 上，`torch.channels_last` 整条路不通 ——
 #     · `model.to(memory_format=…)` → `Only contiguous_format or preserve_format is supported.`
 #     · 逐参数 `.contiguous(memory_format=…)` → `NPU contiguous operator only supportted
@@ -149,115 +188,100 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 #   ⚠ **收益仍未实测**：转成了不等于更快。要用 `speed_per_card` 与
 #   `--npu-channels-last 0` 同配置对比，别只看这行日志就下结论。
 #   换机器/换版本后先跑 `python scripts/probe_npu_layout.py` 确认入口还在。
-# ✅ AdamW：NPU 上优先 `torch_npu.optim.NpuFusedAdamW`（post10 实测可用，日志
-#   `已启用 fused AdamW (backend=npu)`）；不可用自动回退 standard+foreach。
+#   📌 A100 上**不需要**这一摊：CUDA 分支自动 `use_channels_last=True` 并用标准
+#   `torch.channels_last` 转换（`model.to(memory_format=…)` 在 CUDA 上是正常路径）。
+# ✅ AdamW：CUDA 上用 `torch.optim.AdamW(..., fused=True)`（日志
+#   `已启用 fused AdamW (backend=cuda)`）；NPU 上优先 `torch_npu.optim.NpuFusedAdamW`，
+#   不可用自动回退 standard+foreach。
 #   C 段启动若卡在 [device] 之后：先 py-spy dump——大概率是 V7PackedDataset
 #   读 37.6GB 分片的静默加载期（无日志），不是挂死。
 
-# --- A-1  单卡 910A（batch 2800，LR 0.00377）---
-torchrun --nproc_per_node=1 scripts/train_sft.py \
-  --data data/sgf_19x19_full.npz --v7 1 --device npu --board-size 19 \
+# --- A 段：board 级 full.npz（人类着法 one-hot），单卡 A100 40G ---
+# ⚠ **batch 未定档，由你现场调**（2026-10-08：A100 40G 上还没测过上限）。
+#   仓库里 `v7_batch_memory_advice` 的每样本 MB 三个数（4.65 / 12.67 / 277）全是
+#   **910A/NPU 口径**，对 A100 不可信 —— 照它算出来的 batch 建议值会系统性偏。
+#   调法：从 2800 起步（= 旧单卡 910A 的定档，作为同 LR 口径的锚），OOM 就减半；
+#   稳定且 `memory_gb` 平台还有余量就往上加。**定档后把下面 B/C 的 `--batch-size`
+#   与 LR 一起改掉**（LR 必须跟着 batch 走，见上面的公式）。
+# ⚠ LR = 0.00356 × √(有效batch / 2500)，有效batch = batch × 卡数 × accum。
+#   单卡 ⇒ 卡数 = 1。batch 2800 → 0.00377；batch 1400 → 0.00267；
+#   batch 5600 → 0.00533。**换了 batch 一定要按公式重算 LR**，别沿用旧值。
+# ⚠ `--gc-with-compile 1` 必给（见第 0 节）：否则开 compile 就强制关 GC，
+#   40G 卡上 batch 被迫调小到吃不满算力。
+# ⚠ `--compile-mode` 保持默认 `default`。想再要一档自动调效用
+#   `max-autotune-no-cudagraphs`；**别用** `max-autotune` / `reduce-overhead`
+#   （带 CUDA Graphs，私有内存池不归还，长跑吃显存）。
+python scripts/train_sft.py \
+  --data data/sgf_19x19_full.npz --v7 1 --device cuda --board-size 19 \
   --games-npz data/labels/games.npz \
   --batch-size 2800 --epochs 1 --lr 0.00377 --weight-decay 0.0001 \
   --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
-  --use-sdpa 1 --attention-dropout 0 \
-  --prefetch-workers 24 --prefetch-depth 16 \
+  --gc-with-compile 1 --flash-attn 1 --attention-dropout 0 \
+  --prefetch-workers 16 --prefetch-depth 4 \
   --log-every 50 --eval-every 500 --save-every 250 \
   --early-stop 1 --early-stop-patience 3 \
-  --out models/a_v7_npu1.pth --swanlab 1 --ver a_v7_npu1 --swanlab-every 10
+  --out models/a_v7_a100.pth --swanlab 1 --ver a_v7_a100 --swanlab-every 2
 
-# --- A-2  2 卡 910A（每卡 6000，accum 1 ⇒ 有效 12000，LR 0.00780 =
-#          0.00356×√(12000/2500)）---
-# ⚠ weight-decay 必须是 **0.0001**。2026-10-07 修正：本行原先误写 0.05（代码默认
-#   与其余全部段都是 1e-4），是它的 **500 倍**，后果有两个且都很难一眼看出：
-#     1) 日志里的 `loss` 是**报告口径** `log_loss = 真实加权损失 + l2_report`，
-#        其中 `l2_report = c·‖θ‖²`、**c 就是 --weight-decay**。V7 初值 ‖θ‖²≈77835，
-#        wd=0.05 ⇒ l2_report≈3892，而四项真实加权和只有约 7.8。实测日志
-#        `loss=3541` **几乎全是那一项**，于是总 loss 平得看不出任何训练进展。
-#     2) 优化器里是**真的**按 0.05 衰减：每步衰减 lr·wd，Σlr≈11 ⇒ 全程权重缩到
-#        exp(-0.55)≈58%，value head 因独立高 LR 衰减得更狠。
-torchrun --nproc_per_node=2 scripts/train_sft.py \
-  --data data/sgf_19x19_full.npz --v7 1 --device npu --board-size 19 \
-  --games-npz data/labels/games.npz \
-  --batch-size 6000 --epochs 1 --lr 0.00780 --weight-decay 0.0001 \
-  --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
-  --use-sdpa 1 --attention-dropout 0 \
-  --prefetch-workers 4 --prefetch-depth 16 \
-  --log-every 5 --eval-every 25 --save-every 10 \
-  --early-stop 1 --early-stop-patience 3 \
-  --out models/a_v7_npu2.pth --swanlab 1 --ver a_v7.3_npu2 --swanlab-every 5
-
-# --- B 段：+ KataGo 软标签（承接 A-2，2 卡）---
+# --- B 段：+ KataGo 软标签（承接 A 段，单卡 A100）---
 # ⚠ `--policy-loss soft_ce` 不写也行：给了 --soft-index 会自动选中。
 # 🔴 `--epochs 30` 不是笔误：--soft-only-sampling 把训练集从 3426 万行收窄到
-#   225,338 行 ⇒ 2 卡×batch 2000 只有 57 步/epoch。epochs=1 ⇒ 全程 114 步、
-#   cosine 在 step ~100 就退火到 0（2026-10-06 实测：policy 纹丝不动）。
-#   30 epochs ≈ 1710 步，才是有效预算。
-# ⚠ `--eval-max-batches 5`：eval 特征已池化（4 worker），但 50 批×2000=10 万行
-#   仍要 ~6-8 分钟；5 批 ≈ 1 分钟，对 top1/kl 的估计精度足够。
+#   225,338 行 ⇒ 单卡 batch 2000 只有约 113 步/epoch。epochs=1 ⇒ cosine 在
+#   step ~100 就退火到 0（2026-10-06 实测：policy 纹丝不动）。
+#   30 epochs ≈ 3400 步，才是有效预算。**batch 一改，这里的 epochs 要重算**：
+#   目标总步数 ≈ 3400。
+# ⚠ `--eval-max-batches 5`：eval 特征已池化（多 worker），但跑满仍要数分钟；
+#   5 批对 top1/kl 的估计精度足够。
 # 🔴 soft_index.npz **必须对当前数据集/标签构建**（行数变了行号全体平移——
 #   2026-10-06 事故：train_top1 崩到 0.2%、policy CE 钉在均匀上界 5.85）。
 #   启动时 attach_soft_index 会校验行数指纹，不符直接 SystemExit。
-torchrun --nproc_per_node=2 scripts/train_sft.py \
-  --data data/sgf_19x19_full.npz --v7 1 --device npu --board-size 19 \
+# ⚠ weight-decay 必须是 **0.0001**。日志里的 `loss` 是**报告口径**
+#   `log_loss = 真实加权损失 + l2_report`，其中 `l2_report = c·‖θ‖²`、**c 就是
+#   --weight-decay**。V7 初值 ‖θ‖²≈77835，wd=0.05 ⇒ l2_report≈3892，而四项真实
+#   加权和只有约 7.8 ⇒ 日志 `loss` 几乎全是那一项，总 loss 平得看不出任何进展；
+#   优化器里也真的按 0.05 衰减（Σlr≈11 ⇒ 全程权重缩到 exp(-0.55)≈58%）。
+torchrun --nproc_per_node=1 scripts/train_sft.py \
+  --data data/sgf_19x19_full.npz --v7 1 --device cuda --board-size 19 \
   --games-npz data/labels/games.npz \
-  --model models/a_v7_npu2.pth.latest \
+  --model models/a_v7_a100.pth.latest \
   --soft-index data/labels/soft_index.npz --soft-only-sampling 1 \
   --soft-weight 1.0 --soft-every 1 --policy-loss soft_ce \
-  --batch-size 2000 --epochs 30 --lr 0.00537 --weight-decay 0.0001 \
+  --batch-size 2000 --epochs 30 --lr 0.00320 --weight-decay 0.0001 \
   --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
-  --use-sdpa 1 --attention-dropout 0 \
-  --prefetch-workers 6 --prefetch-depth 16 \
+  --gc-with-compile 1 --flash-attn 1 --attention-dropout 0 \
+  --prefetch-workers 4 --prefetch-depth 8 \
   --log-every 25 --eval-every 100 --eval-max-batches 5 --save-every 250 \
   --early-stop 1 --early-stop-patience 3 \
-  --out models/b_v7_npu2.pth --swanlab 1 --ver b_v7_npu2 --swanlab-every 5
+  --out models/b_v7_a100.pth --swanlab 1 --ver b_v7_a100 --swanlab-every 5
 
-# --- C-1  单卡 910A（batch 2800，LR 0.00377）---
+# --- C 段：stdata 分片（搜索分布内建），单卡 A100 ---
+# ⚠ C 段**不要** `--games-npz`（贴目已在行里）、也**不需要** `--soft-index`
+#   （stdata 每行自带 policy_player_prob/policy_opp_prob，归一化即软标签）。
+# ⚠ batch 与 LR 同 A 段：未定档，现场调，改了按公式重算 LR。
 torchrun --nproc_per_node=1 scripts/train_sft.py \
-  --data data/stdata --v7 1 --device npu --board-size 19 \
-  --model models/b_v7_npu2.pth.latest \
+  --data data/stdata --v7 1 --device cuda --board-size 19 \
+  --model models/b_v7_a100.pth.latest \
   --policy-loss soft_ce --soft-weight 1.0 \
   --batch-size 2800 --epochs 1 --lr 0.00377 --weight-decay 0.0001 \
   --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
-  --use-sdpa 1 --attention-dropout 0 \
-  --prefetch-workers 24 --prefetch-depth 16 \
+  --gc-with-compile 1 --flash-attn 1 --attention-dropout 0 \
+  --prefetch-workers 4 --prefetch-depth 8 \
   --log-every 50 --eval-every 500 --save-every 250 \
   --early-stop 1 --early-stop-patience 3 \
-  --out models/c_v7_npu1.pth --swanlab 1 --ver c_v7_npu1 --swanlab-every 10
+  --out models/c_v7_a100.pth --swanlab 1 --ver c_v7_a100 --swanlab-every 10
 
-# --- C-2  2 卡 910A（每卡 2800，accum 1 ⇒ 有效 5600，LR 0.00533）---
-torchrun --nproc_per_node=2 scripts/train_sft.py \
-  --data data/stdata --v7 1 --device npu --board-size 19 \
-  --model models/b_v7_npu2.pth.latest \
-  --policy-loss soft_ce --soft-weight 1.0 \
-  --batch-size 2800 --epochs 1 --lr 0.00533 --weight-decay 0.0001 \
-  --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
-  --use-sdpa 1 --attention-dropout 0 \
-  --prefetch-workers 12 --prefetch-depth 16 \
-  --log-every 50 --eval-every 500 --save-every 250 \
-  --early-stop 1 --early-stop-patience 3 \
-  --out models/c_v7_npu2.pth --swanlab 1 --ver c_v7_npu2 --swanlab-every 10
+# ⚠ **batch 数字都别当已验证**（2026-10-08）。旧文档里那套 910A 的多卡定档
+#   （A-1 单卡 2800 / A-2 每卡 6000 / C-2 每卡 2800 / C-3 每卡 1000）**全部作废**：
+#   硬件换成 A100 40G 单卡，且 `v7_batch_memory_advice` 的每样本 MB 三个数
+#   （4.65 / 12.67 / 277）是 NPU 口径、对 A100 不可信。
+#   调 batch 的正确顺序：
+#     1) 先看启动日志那行 `[mem] V7 试算：… batch=… → 约 … GB`（超预算会
+#        SystemExit 并给建议值）—— **但它是 NPU 公式算的，只当量级参考**；
+#     2) 以实测 `memory_gb` / `speed_per_card` 为准：`memory_gb` 平台稳 = 健康，
+#        逐 eval 点阶梯爬升 = 碎片/泄漏；OOM 就把 batch 减半；
+#     3) 定档后按 `LR = 0.00356×√(有效batch/2500)` 重算 LR，并同步改 B/C 段。
+#   ⚠ `flash-attn` 与 `channels_last` 都会改显存口径，任何 batch 定档都必须
+#     **连同这两个开关一起**记录，否则换回去复现不了。
 
-# --- C-3  4 卡 910A（每卡 1000，accum 2 ⇒ 有效 8000，LR 0.00637）---
-torchrun --nproc_per_node=4 scripts/train_sft.py \
-  --data data/stdata --v7 1 --device npu --board-size 19 \
-  --model models/b_v7_npu2.pth.latest \
-  --policy-loss soft_ce --soft-weight 1.0 \
-  --batch-size 1000 --epochs 1 --lr 0.00637 --weight-decay 0.0001 \
-  --gradient-accumulation-steps 2 --use-amp 1 --use-ema 1 \
-  --use-sdpa 1 --attention-dropout 0 \
-  --prefetch-workers 6 --prefetch-depth 16 \
-  --log-every 50 --eval-every 500 --save-every 250 \
-  --early-stop 1 --early-stop-patience 3 \
-  --out models/c_v7_npu4.pth --swanlab 1 --ver c_v7_npu4 --swanlab-every 10
-
-# ⚠ **batch 数字都别当已验证**。「batch 2000/卡 OOM ⇒ 4 卡定档 1000」那条实测与
-#   A-1/C-1 的单卡 2800 看不出能同时成立（每卡显存不该随卡数变化）。按
-#   `v7_batch_memory_advice`：block 级 checkpoint 开启时 4.65 MB/样本 ⇒ 64 GB×0.9
-#   预算下上限过万；关掉则 278 MB/样本、上限只有 200 出头 ⇒ 那条 OOM 更像是
-#   **没有 block checkpoint 时**的实测。而 A-1/C-1 标的「✅ 64 行切片跑通」是
-#   小切片，不等于全量。**换数据/换卡数前先看启动日志的**
-#   `[mem] V7 试算：… batch=… → 约 … GB`（超预算它会 SystemExit 并给建议值）。
 
 # --- CPU 冒烟：换数据后先跑这三条（各约 50 秒）---
 python scripts/train_sft.py --data tmp/coding/bmini/board8.npz --v7 1 \
@@ -297,18 +321,25 @@ python scripts/train_sft.py --data tmp/coding/c64 --v7 1 --device cpu \
 # `soft_row_frac` 在 --soft-only-sampling 1 下应恒 1.0；不是 1.0 说明软标签没生效。
 
 # ============================================================================
-# ---------- 3. ★ RL：自对弈（**仅单卡 910A**）----------
+# ---------- 3. ★ RL：自对弈（**仍在 NPU，FP16 + GradScaler**）----------
+# 📌 SFT 已迁到 A100 40G 单卡（BF16），**RL 没有迁**、仍在 NPU 且是 FP16。
+#    下面的命令按原样保留 `--device npu`，别跟着 SFT 改成 cuda。
 # ============================================================================
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python scripts/selfplay_train.py \
   --device npu --board-size 19 \
-  --model models/c_v7_npu4.pth.latest --out models/az_v7 \
+  --model models/c_v7_a100.pth.latest --out models/az_v7 \
   --iters 20 --sims 48 --parallel-games 8 --mcts-threads 3 \
   --batch-cap 64 --expand-topk 16 --buffer-size 500 \
   --td 1 --td-steps 3 --use-rollout 1 --leaf-ab-depth 2 --rollout-lambda 0.25 \
   --grad-accum-steps 1 --mcts-vector-backup 1 --lr 1e-3 --swanlab 1
 
 # ⚠ **没有多卡 RL**。shell/ 里只有 train_rl_npu_1card.sh；selfplay_train 的
-#   `--ddp 1` 默认 0，多卡未验证。SFT 用 2/4 卡而 RL 只用 1 卡 ⇒ **不能负载同时**。
+#   `--ddp 1` 默认 0，多卡未验证。
+# 📌 **SFT 已迁到 A100 40G 单卡，RL 仍在 NPU**（见第 0 节的两条链路表）。
+#   ⇒ 两条链路用的**不是同一块卡**，可以同时跑；但 RL 的 `--model` 要指
+#     **A100 上 C 段的产物**（`models/c_v7_a100.pth.latest`），不是 NPU 产物。
+#   ⇒ RL 是 FP16 + GradScaler，SFT 是 BF16 无 scaler，两边的 `--scaler-*` 语义
+#     不要互相套用（详见第 0 节与上面「参数为什么是这些值」）。
 # ⚠ **RL 是 CPU 瓶颈**：CPU 预算 = parallel_games × mcts_threads，24 是实测甜点
 #   （上面 8×3=24 起步）。
 # ⚠ `--sims 48` 是强烈建议：默认 400 在 19 路卡上近似白跑，必须显式给并调小
@@ -329,16 +360,16 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python scripts/selfplay_train.py \
 #    或想跑在导出的 .bin.gz 上时才用。
 
 # --- 4a V7 + hybrid（--policy-depth>=2 已支持，此前会响亮拒绝）---
-python scripts/webui.py --model models/c_v7_npu4.pth.latest --device cpu \
+python scripts/webui.py --model models/c_v7_a100.pth.latest --device cpu \
   --port 7860 --mode hybrid --policy-depth 2 --komi 7.5 --num-threads 8
 # --- 4b V7 + 纯 MCTS ---
-python scripts/webui.py --model models/c_v7_npu4.pth.latest --device cpu \
+python scripts/webui.py --model models/c_v7_a100.pth.latest --device cpu \
   --port 7860 --mode mcts --komi 7.5 --num-threads 8
 # --- 4c 12 通道（旧模型）---
 python scripts/webui.py --model models/sft_19x19_v12.pth --device cpu --port 7860 \
   --mode mcts --expand-topk 8 --num-threads 4
 # --- 4d 命令行复盘/对局（--human-color black|white）---
-python scripts/cli_play.py --model models/c_v7_npu4.pth.latest --device cpu \
+python scripts/cli_play.py --model models/c_v7_a100.pth.latest --device cpu \
   --komi 7.5 --simulations 400 --num-threads 8
 
 # ⚠🔴 **`--komi` 必须与训练口径一致**（webui 与 cli_play 都一样）。V7 的全局
@@ -364,7 +395,7 @@ python scripts/cli_play.py --model models/c_v7_npu4.pth.latest --device cpu \
 #   **只在 V7 这一侧**翻。12 通道逐位基线修复前后都是绿的 —— 那正是判据。
 
 # ---------- 5. 导出到 KataGo 引擎（.bin.gz，modelVersion 17）----------
-python scripts/export_katago_bin.py export --checkpoint models/c_v7_npu4.pth.latest \
+python scripts/export_katago_bin.py export --checkpoint models/c_v7_a100.pth.latest \
     --out models/c_v7.bin.gz
 # 验证加载 —— **用 gtp，不要用 analysis**：仓库里**没有 analysis.cfg**（全仓查无此文件）。
 echo -e "listgen\nquit" | katago/katago-v1.18.1-opencl-windows-x64/katago.exe \
@@ -405,9 +436,10 @@ python -m pytest tests -q -n0 -p no:randomly --durations=10   # 找最慢 10 个
 # 软标签命中 0        ⇐ pos_hash（盘面哈希+to_play+ko 三者）查不到，见 src/data/pos_hash.py
 # soft_index 行数不符  ⇐ 数据集/labels 变过后没重建索引（启动即 SystemExit，按提示重建）
 #                       重建后自检：argmax 落占点比例应 ≈0、top1 vs 人类 ≈0.59
-# fp16 前向 NaN       ⇐ 910A 走 fp16 时 CANN 融合内核处 65504 溢出 ⇒ 用 BF16 路径
-# SwiGLU 融合刷警告   ⇐ 紧急开关 `--npu-swiglu 0` 退标准路径（默认融合）
-# eval 慢/NPU 归零    ⇐ 已池化（eval 预取池）；仍慢就减 --eval-max-batches
+# fp16 前向 NaN       ⇐ **NPU/RL 侧**走 fp16 时 CANN 融合内核处 65504 溢出。
+#                       SFT 已在 A100 上用 BF16，不适用；RL 恒 fp16，注意溢出
+# SwiGLU 融合刷警告   ⇐ NPU 专用，紧急开关 `--npu-swiglu 0` 退标准路径（默认融合）
+# eval 慢/GPU 归零    ⇐ 已池化（eval 预取池）；仍慢就减 --eval-max-batches
 # 全局特征异常 = 32.5  ⇐ foxpro 无 KM[650] 处（100 局里 1.62%），需加 --no-komi-outlier-fix
 # ImportError: scipy   ⇐ requirements.txt 漏了
 # sidecar 匹配率 <100%  ⇐ 未匹配的行权重置 0，训练自动忽略，不会静默丢数据
