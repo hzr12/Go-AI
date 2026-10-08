@@ -409,7 +409,10 @@ def test_grad_checkpoint_survives_aot_autograd():
     用 `backend='aot_eager'` 而不是 inductor：aot 的 higher-order-op 输出检查
     （"HigherOrderOperator body's output must consist of tensors only"）就发生
     在这一层，而 inductor 的 .codegen 还需要一个 C++ 编译器，在开发机上没有。
-    本条只断言「能跑通 + 数值与关 GC 一致」，不声称能编出内核。
+    本条只断言「能跑通 + 数值与纯 eager 一致」，不声称能编出内核。
+
+    参照系取**纯 eager（同样开 GC）**而不是「编译但关 GC」：两种选择都能验数值，
+    但前者只需要编译**一次**（aot 编译是这个测试里最贵的一步），后者要两次。
 
     这条测试就是 `ValueHead` 返回 dict 那个 bug 的回归守卫：dict 穿不过
     checkpoint，torch 2.1 上必然在前向第一帧抛 NotImplementedError。
@@ -421,11 +424,12 @@ def test_grad_checkpoint_survives_aot_autograd():
     spatial = torch.randn(2, 22, SMALL['board_size'], SMALL['board_size'])
     gf = torch.randn(2, 19)
 
-    def run(use_ckpt):
+    def run(backend):
         torch.manual_seed(0)
-        net = build_katago_v7_net(use_checkpoint=use_ckpt)
+        net = build_katago_v7_net(use_checkpoint=True)
         net.train()
-        m = torch.compile(net, dynamic=False, backend='aot_eager')
+        m = net if backend is None else torch.compile(
+            net, dynamic=False, backend=backend)
         out = m(spatial, gf)
         loss = sum(v.float().sum() for v in out.values())
         loss.backward()
@@ -433,12 +437,12 @@ def test_grad_checkpoint_survives_aot_autograd():
                                for p in net.parameters() if p.grad is not None))
         return float(loss.detach()), float(gnorm.detach())
 
+    l_eager, g_eager = run(None)
     try:
-        l_ck, g_ck = run(True)
+        l_aot, g_aot = run('aot_eager')
     except Exception as e:  # noqa: BLE001
         pytest.fail('aot_eager + 梯度检查点 跑不通（GC 与 compile 不兼容？）: '
                     '%s: %s' % (type(e).__name__, str(e).splitlines()[0][:200]))
-    l_no, g_no = run(False)
-    assert l_ck == l_no and g_ck == g_no, (
-        'aot_eager 下开/关 GC 的数值不一致: %.6f/%.6f vs %.6f/%.6f'
-        % (l_ck, g_ck, l_no, g_no))
+    assert l_aot == l_eager and g_aot == g_eager, (
+        'aot_eager 下与纯 eager 的数值不一致: %.6f/%.6f vs %.6f/%.6f'
+        % (l_aot, g_aot, l_eager, g_eager))
