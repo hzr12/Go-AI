@@ -1269,6 +1269,51 @@ class ScorebeliefHead(nn.Module):
 GC_STEM = 'stem'
 GC_HEADS = 'heads'
 
+#: **只有 `ValueHead.forward` 返回 dict**（其余两个 head 返回张量），
+#: `NbtTfNet._ckpt` 需要在调用 `torch.utils.checkpoint` 之前知道键序，才能把 dict
+#: 摊成 tuple 穿过去、出来再装回 dict（缘由见 `_ckpt` 的 docstring）。
+#:
+#: 键用**子模块对象**而不是字符串：`self.value_head` 走 `nn.Module.__getattr__`
+#: 命中 `self._modules`，返回的是**存着的那个模块对象本身**（不是每次新建的
+#: bound method），所以同一个实例上反复取身份恒等、可以直接当 dict 键。
+#: 登记表由 `build_katago_v7_net` 在返回模型前填一次（`_register_ckpt_dict_keys`）；
+#: 查不到就退回原样返回，行为与改动前完全一致。
+_CKPT_DICT_KEYS = {}
+
+#: `ValueHead.forward` 的键序，**必须与 `:1168-1193` 的字面量逐字一致**。
+#: 键序错了不会报错、只会让 `out` 的插入序变了 —— 而 `export_katago_bin.py` 与
+#: `_dense_move_target` 都按名字取值，插序本身无害；真正的约束是「集合相同」。
+_VALUE_HEAD_KEYS = (
+    'outcome_logits',
+    'score_mean',
+    'score_stdev',
+    'lead',
+    'var_time_left',
+    'shortterm_winloss_error',
+    'shortterm_score_error',
+    'score_value_raw',
+    'ownership_pretanh',
+    'scoring',
+    'futurepos',
+    'seki_logits',
+    'value_pooled',
+)
+
+
+def _register_ckpt_dict_keys(model):
+    """把 `model` 里**返回 dict 的 head** 登记进 `_CKPT_DICT_KEYS`（幂等）。
+
+    必须**晚于** head 的构造：键是子模块对象本身，而对象是在 `NbtTfNet.__init__`
+    里创建的。登记挂在 `build_katago_v7_net` 返回之前，保证第一次前向时表已就位。
+
+    只有 `ValueHead` 在册 —— `PolicyHead` / `ScorebeliefHead` 返回的是张量，
+    张量本来就能直接穿过 `checkpoint`（aot 的 higher-order-op 检查要的正是
+    「纯张量」）。**别把返回张量的 head 也登记进来**：那会让 `_ckpt` 去对张量
+    做 `[k]` 下标，直接 `IndexError`。
+    """
+    _CKPT_DICT_KEYS[model.value_head] = _VALUE_HEAD_KEYS
+    return model
+
 
 class NbtTfNet(GradCheckpointMixin, nn.Module):
     """V7 NBT+Transformer 整网（spec §3 + §4）。
@@ -1394,8 +1439,33 @@ class NbtTfNet(GradCheckpointMixin, nn.Module):
         `HeadBank` 又会改掉 `state_dict` 的键（A/B/C 三段权重就互相 load 不上了）。
         所以就地内联，三段各一次 `checkpoint` —— 粒度仍是"每一段一次"，
         与 blocks 的逐块粒度同一口径。
+
+        dict 返回值为什么要在**检查点内部**摊成 tuple
+        ------------------------------------------------
+        `torch.utils.checkpoint` 在 Dynamo 下被当作 higher-order operator 处理，
+        而 aot 的检查只认**纯张量**输出（torch 2.1
+        `torch/_functorch/aot_autograd.py` / `torch/_dynamo/variables/higher_order_ops.py`）::
+
+            if not are_tensors(outs):
+                raise ...("HigherOrderOperator body's output must consist of "
+                          "tensors only")
+
+        `ValueHead.forward` 返回的是 12 键的 dict（`:1168-1193`），于是
+        **「开检查点 + 开 torch.compile」必然在前向第一帧抛**——与 batch、与设备、
+        与数值都无关。torch 2.12 已经放宽了这条检查，所以这个坑在本地复现不出来，
+        修它属于「按源码证据修」而不是「按复现修」。
+
+        做法：被 checkpoint 的函数返回 tuple，**在 `checkpoint` 调用之外**再组装成
+        原来的 dict（`_AS_DICT` 给出键顺序）。组装发生在 checkpoint 之外 ⇒ 不参与
+        重算、也不进 higher-order op 的输出；两个分支返回的 dict 键序与值逐位相同。
         """
         if self.grad_checkpointing_for(GC_HEADS):
+            if fn in _CKPT_DICT_KEYS:
+                keys = _CKPT_DICT_KEYS[fn]
+                packed = torch.utils.checkpoint.checkpoint(
+                    lambda *a: tuple(fn(*a)[k] for k in keys), *args,
+                    use_reentrant=False)
+                return dict(zip(keys, packed))
             return torch.utils.checkpoint.checkpoint(fn, *args,
                                                      use_reentrant=False)
         return fn(*args)
@@ -1443,4 +1513,6 @@ def build_katago_v7_net(*, board_size=19, use_checkpoint=None,
     c.setdefault('board_size', int(board_size))
     net = NbtTfNet(cfg=c, use_checkpoint=use_checkpoint,
                    attn_dropout=attn_dropout)
-    return net.initialize()
+    # 必须在第一次前向之前登记：`_ckpt` 要靠它把 head 的 dict 返回值摊成 tuple
+    # 穿过 `torch.utils.checkpoint`（见 `_ckpt` / `_register_ckpt_dict_keys`）。
+    return _register_ckpt_dict_keys(net.initialize())

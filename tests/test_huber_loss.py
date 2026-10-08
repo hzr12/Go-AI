@@ -1555,6 +1555,16 @@ def test_no_new_cli_params():
         '--npu-channels-last',    # NPU 卷积 NHWC 布局（原 GOAI_CHANNELS_LAST_NPU）
         '--attn-query-chunk',     # math 注意力 query 分块（原 GOAI_ATTN_QUERY_CHUNK）
         '--attn-chunk-ckpt',      # math 注意力逐 chunk 检查点（原 GOAI_ATTN_CHUNK_CKPT）
+        # ---- 2026-10-08 新增的 1 个：图编译与梯度检查点共存（A100 40G 迁移）----
+        # `--gc-with-compile`（默认 0）让 `--compile` 与 gradient checkpointing
+        # **同时**开启。默认 0 = 保持历史行为，所以既有命令行逐位不变。
+        # 为什么要留这个口：40GB 卡上「开 compile 就强制 `_gc = 0`」等于
+        # 「要融合就得把 batch 调小到吃不满算力」，而 batch 缩小吃掉的吞吐通常
+        # 远大于融合省下的。技术上成立是因为检查点走 `use_reentrant=False`
+        # （`backbone._checkpointed` 已经是），与整模型 `torch.compile` 兼容。
+        # **不适用**于 `--npu-graph-compile`（逐 Linear 编译的产物落在检查点段
+        # 内部，真的互斥）—— 判据见 `train_sft.resolve_grad_checkpoint`。
+        '--gc-with-compile',
     }
     got = set(kw)
     assert got == expected, (
@@ -1567,10 +1577,11 @@ def test_no_new_cli_params():
     # 基线 = 61 原始 + A4 的 4 个软标签 + B8 的 `--v7` + 2026-10-04 的 `--games-npz`
     #        + online-softmax 开关 `--attn-online`（补登）+ 2026-10-06 的 `--use-sdpa`
     #        + 2026-10-06 的 5 个 GOAI_* 环境变量搬家旗
-    assert len(expected) == 74, (
-        f'冻结的基线本身变了：{len(expected)} != 74'
+    #        + 2026-10-08 的 `--gc-with-compile`（A100 40G：compile 与 GC 共存）
+    assert len(expected) == 75, (
+        f'冻结的基线本身变了：{len(expected)} != 75'
         f'（61 + A4 的 4 个 + B8 的 1 个 + --games-npz 的 1 个 + --attn-online 的 1 个'
-        f' + --use-sdpa 的 1 个 + GOAI_* 搬家的 5 个）')
+        f' + --use-sdpa 的 1 个 + GOAI_* 搬家的 5 个 + --gc-with-compile 的 1 个）')
     # 特别地：L2 系数不许有独立参数，label smoothing 也不许有第二个旋钮
     for banned in ('--l2-coef', '--l2-weight', '--weight-decay-l2',
                    '--l2-report', '--label-smoothing-ce'):

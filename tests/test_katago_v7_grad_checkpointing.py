@@ -342,3 +342,103 @@ def test_compile_guard_rejects_compiled_submodule():
     net.blocks[0] = torch.compile(net.blocks[0])
     with pytest.raises(RuntimeError, match='互斥'):
         assert_grad_checkpoint_compile_compatible(net)
+
+
+# --------------------------------------------------------------------------- #
+# head 的 dict 返回值穿过 checkpoint（aot higher-order op 只收纯张量）
+# --------------------------------------------------------------------------- #
+def test_value_head_dict_keys_are_pinned_to_the_real_return():
+    """`_VALUE_HEAD_KEYS` 必须与 `ValueHead.forward` 的真实键**逐字一致**（含顺序）。
+
+    `_ckpt` 靠这张表把 dict 摊成 tuple 穿过 `torch.utils.checkpoint`。写错一个
+    键的后果非常安静：要么 `KeyError`（键名打错），要么**悄悄少一个输出** ——
+    后者不会报错，只会让 `out` 少一个键，直到下游按名取值才炸。所以必须用
+    真实的 `ValueHead` 输出做集合 + 顺序双重比对，而不是对着源码字面量抄一遍。
+    """
+    from src.networks.katago_v7 import _VALUE_HEAD_KEYS, build_katago_v7_net
+
+    net = build_katago_v7_net(use_checkpoint=False)
+    trunk = net.trunk(torch.randn(2, 22, SMALL['board_size'],
+                                  SMALL['board_size']),
+                      torch.randn(2, 19))
+    real = list(net.value_head(trunk).keys())
+    assert real == list(_VALUE_HEAD_KEYS), (
+        '键表与 ValueHead 真实返回不一致\n  真实: %s\n  表里: %s'
+        % (real, list(_VALUE_HEAD_KEYS)))
+
+
+def test_ckpt_tuple_bridge_is_bitwise_identical_to_the_dict_path():
+    """开/关 GC 的输出与梯度必须 `torch.equal` 为真（含 dict 的键序）。
+
+    这条比「误差很小」强得多：V7 全网无 BatchNorm，重算没有任何有状态的算子，
+    同输入重跑必须逐位相同。键序也要比 —— 下游 `export_katago_bin.py` 与
+    `_dense_move_target` 都按名取值，但插入序变了会让日志/存档的列序漂移。
+    """
+    from src.networks.katago_v7 import build_katago_v7_net
+
+    torch.manual_seed(0)
+    spatial = torch.randn(2, 22, SMALL['board_size'], SMALL['board_size'])
+    gf = torch.randn(2, 19)
+
+    def run(use_ckpt):
+        torch.manual_seed(0)
+        net = build_katago_v7_net(use_checkpoint=use_ckpt)
+        net.train()
+        out = net(spatial, gf)
+        loss = sum(v.float().sum() for v in out.values())
+        loss.backward()
+        gnorm = torch.sqrt(sum((p.grad.float() ** 2).sum()
+                               for p in net.parameters() if p.grad is not None))
+        return list(out.keys()), {k: v.detach() for k, v in out.items()}, \
+            float(loss.detach()), float(gnorm.detach())
+
+    k_off, o_off, l_off, g_off = run(False)
+    k_on, o_on, l_on, g_on = run(True)
+    assert k_off == k_on, 'dict 键序在开关 GC 后变了：%s vs %s' % (k_off, k_on)
+    for k in k_off:
+        assert torch.equal(o_off[k], o_on[k]), \
+            '开 GC 后 %s 的输出不逐位相同（max|Δ|=%.3e）' % (
+                k, float((o_off[k].float() - o_on[k].float()).abs().max()))
+    assert l_off == l_on and g_off == g_on, \
+        'loss/gnorm 不逐位相同: %.6f/%.6f vs %.6f/%.6f' % (l_off, g_off, l_on, g_on)
+
+
+def test_grad_checkpoint_survives_aot_autograd():
+    """GC 段必须能整段穿过 aot_autograd —— 这是「GC + torch.compile」的前提。
+
+    用 `backend='aot_eager'` 而不是 inductor：aot 的 higher-order-op 输出检查
+    （"HigherOrderOperator body's output must consist of tensors only"）就发生
+    在这一层，而 inductor 的 .codegen 还需要一个 C++ 编译器，在开发机上没有。
+    本条只断言「能跑通 + 数值与关 GC 一致」，不声称能编出内核。
+
+    这条测试就是 `ValueHead` 返回 dict 那个 bug 的回归守卫：dict 穿不过
+    checkpoint，torch 2.1 上必然在前向第一帧抛 NotImplementedError。
+    """
+    from src.networks.katago_v7 import build_katago_v7_net
+
+    torch._dynamo.config.cache_size_limit = 256
+    torch.manual_seed(0)
+    spatial = torch.randn(2, 22, SMALL['board_size'], SMALL['board_size'])
+    gf = torch.randn(2, 19)
+
+    def run(use_ckpt):
+        torch.manual_seed(0)
+        net = build_katago_v7_net(use_checkpoint=use_ckpt)
+        net.train()
+        m = torch.compile(net, dynamic=False, backend='aot_eager')
+        out = m(spatial, gf)
+        loss = sum(v.float().sum() for v in out.values())
+        loss.backward()
+        gnorm = torch.sqrt(sum((p.grad.float() ** 2).sum()
+                               for p in net.parameters() if p.grad is not None))
+        return float(loss.detach()), float(gnorm.detach())
+
+    try:
+        l_ck, g_ck = run(True)
+    except Exception as e:  # noqa: BLE001
+        pytest.fail('aot_eager + 梯度检查点 跑不通（GC 与 compile 不兼容？）: '
+                    '%s: %s' % (type(e).__name__, str(e).splitlines()[0][:200]))
+    l_no, g_no = run(False)
+    assert l_ck == l_no and g_ck == g_no, (
+        'aot_eager 下开/关 GC 的数值不一致: %.6f/%.6f vs %.6f/%.6f'
+        % (l_ck, g_ck, l_no, g_no))

@@ -181,8 +181,16 @@ def _epoch_for():
 
 
 def _stop_flag_breaks(scope):
+    """`if <含 stop_flag 读取>: break ...` 的 If 节点。
+
+    判据是「test 里**出现** `stop_flag.item()`」而不是「test 恰好等于
+    `stop_flag.item()`」：step 循环内那一处后来加了 `args.early_stop == 1 and`
+    的前缀 —— 早停没开时 `stop_flag` 恒为 0（唯一写入点被 `args.early_stop == 1`
+    门控），那次 `.item()` 是纯浪费的同步点。锁的仍然是「两处 break 都在」这个
+    wiring 不变量，多余的与门只是让它在早停关闭时不白付同步。
+    """
     return [n for n in ast.walk(scope)
-            if isinstance(n, ast.If) and ast.unparse(n.test) == 'stop_flag.item()'
+            if isinstance(n, ast.If) and 'stop_flag.item()' in ast.unparse(n.test)
             and any(isinstance(s, ast.Break) for s in n.body)]
 
 
@@ -231,6 +239,32 @@ def test_two_breaks_one_per_loop():
     assert len(inside) == 1, 'step 循环内必须 break（否则继续训完本 epoch 剩下的 step）'
     assert len(outside) == 1, \
         'epoch 循环内、step 循环外必须再 break 一次（缺它 = 早停只跳 batch，训练照跑完）'
+
+
+def test_step_loop_read_is_gated_on_early_stop():
+    """step 循环内那处 `.item()` 必须被 `args.early_stop == 1` 门控。
+
+    `.item()` 是**同步点**（D2H + 阻塞等队列排空），而它每个 step 都执行一次。
+    `stop_flag` 的唯一写入点是 `if args.early_stop == 1 and is_main:` 里的
+    `fill_(1)` ⇒ 早停没开时它恒为 0，那次同步每次都白付：host 被拉回等 GPU，
+    下一个 step 的 kernel 发射排不上去。
+
+    所以这里锁的是「**为什么**那个 `and` 前缀必须在」—— 免得后来有人看到
+    「条件越少越快」把它删掉，删掉后测试仍然全绿（`_stop_flag_breaks` 用的是
+    「test 里出现 `stop_flag.item()`」，`and` 前缀在不在都算命中）。
+    """
+    epoch_for = _epoch_for()
+    step_fors = [n for n in ast.walk(epoch_for)
+                 if isinstance(n, ast.For) and ast.unparse(n.target) == 'i']
+    assert len(step_fors) == 1
+    step_ids = {id(n) for n in ast.walk(step_fors[0])}
+
+    inside = [n for n in _stop_flag_breaks(epoch_for) if id(n) in step_ids]
+    assert len(inside) == 1
+    test_src = ast.unparse(inside[0].test)
+    assert 'args.early_stop' in test_src, (
+        f'step 循环内的 stop_flag 读取没有早停门控（test={test_src!r}）—— '
+        '早停关闭时它每个 step 白付一次同步')
 
 
 # --------------------------------------------------------------------------- #

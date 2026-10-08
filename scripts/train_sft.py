@@ -3304,6 +3304,46 @@ def _sync_stop_flag(stop_flag, is_dist, early_stop_enabled):
     dist.broadcast(stop_flag, src=0)
 
 
+#: `resolve_grad_checkpoint` 的第二个返回值：需要打日志解释「为什么 GC 被关掉
+#: /为什么它被保留」。`None` = 保持配置原值、无事发生。
+GC_REASON_NPU_LINEAR = 'npu-linear'
+GC_REASON_COMPILE_EXCLUSIVE = 'compile-exclusive'
+GC_REASON_GC_WITH_COMPILE = 'gc-with-compile'
+
+
+def resolve_grad_checkpoint(grad_checkpoint, *, compile_on, npu_linear_compile,
+                            gc_with_compile):
+    """算本次运行的梯度检查点开关。返回 ``(gc, reason)``。
+
+    两种图编译的**兼容性不同**，不能合成一个判据 —— 这正是本函数存在的理由：
+
+    * ``npu_linear_compile``（`--npu-graph-compile`）
+      → `_compile_linear_submodules` 把每个 ``nn.Linear`` 就地换成
+      ``torch.compile(...)``，**编译产物落在检查点段内部**。
+      `backbone.assert_grad_checkpoint_compile_compatible` 会在第一次前向
+      扫到 `_orig_mod` 并抛 —— 真的互斥，无解。
+      **绝不被 `gc_with_compile` 放行**：那会变成「启动不报、第一步前向才炸」。
+
+    * ``compile_on``（`--compile`，整模型 `torch.compile(model)`）
+      → 原模型被包在 OptimizedModule **内层**，守卫扫子树看不到 `_orig_mod`；
+      检查点走 `use_reentrant=False`（`backbone._checkpointed` 已经是），
+      正是与 ``torch.compile`` 兼容的那一种。⇒ 两者**可以同时开**。
+      默认仍然关掉（保持历史行为），`--gc-with-compile 1` 才保留 ——
+      因为关掉 GC 意味着激活全驻留、batch 被迫调小，而 batch 缩小吃掉的吞吐
+      通常远大于融合省下的。
+
+    抽成函数而不是内联在 ``main()`` 里：这条策略有 4 种输入组合，且「NPU 那条
+    不能被放行」是必须被钉住的不变量 —— 内联的话只能靠源码字面断言来测。
+    """
+    if npu_linear_compile:
+        return 0, GC_REASON_NPU_LINEAR
+    if compile_on and not gc_with_compile:
+        return 0, GC_REASON_COMPILE_EXCLUSIVE
+    if compile_on and gc_with_compile:
+        return int(grad_checkpoint), GC_REASON_GC_WITH_COMPILE
+    return int(grad_checkpoint), None
+
+
 def _build_param_groups(model, args) -> list[dict]:
     """构造 AdamW 的四组参数：{非 value, value} × {decay, no_decay}。
 
@@ -4061,12 +4101,43 @@ def main():
                         'torch 2.1.0 / torch_npu 2.1.0.post3 / CANN 8.0.RC1，'
                         '属 2023 年代组合，功能成熟度存疑。故默认关闭，'
                         '建议先短跑验证(0=关闭, 1=开启)')
-    ap.add_argument('--compile', type=int, default=0, choices=[0, 1],
-                    help='用 torch.compile 融合算子（GPU 上约 20-40%% 提速，首次迭代较慢）(0=关闭, 1=开启)')
+    ap.add_argument('--compile', type=int, default=None, choices=[0, 1],
+                    help='用 torch.compile 融合算子（GPU 上约 20-40%% 提速，'
+                         '首次迭代较慢）。\n'
+                         '**不给 = 按设备自动**：CUDA 且 sm_80 以上（A100 等）'
+                         '自动开 1，其余后端 0。本仓 CUDA 分支本来就把 BF16 + '
+                         'channels_last + FlashAttn 都默认打开了，compile 却是'
+                         '默认关的 —— 那是 NPU 时期「inductor 不可用」留下的默认值，'
+                         '对 A100 是白丢的收益。\n'
+                         '显式给 0/1 覆盖自动判定。compile 失败会自动回退 eager，'
+                         '不会把训练带崩。')
     ap.add_argument('--compile-mode', default='default',
-                    choices=['default', 'max-autotune', 'reduce-overhead'],
-                    help='torch.compile 模式: default=常规融合, max-autotune=A100 上进一步 '
-                        '自动调优提速（编译更久）, reduce-overhead=小 batch 低开销')
+                    choices=['default', 'max-autotune', 'max-autotune-no-cudagraphs',
+                             'reduce-overhead'],
+                    help='torch.compile 模式。\n'
+                         '  default                  = 常规融合，编译快，日常用这个。\n'
+                         '  max-autotune-no-cudagraphs = **A100 40G 上推荐的加档**：'
+                         '在 max-autotune 的自动调优之上关掉 CUDA Graphs。\n'
+                         '  max-autotune             = 自动调优，但**带** CUDA Graphs；'
+                         'CUDA Graphs 的私有内存池不归还，40G 卡上容易在长跑里'
+                         '把显存吃满。\n'
+                         '  reduce-overhead          = 小 batch 低开销，同样受 '
+                         'CUDA Graphs 内存池影响，长跑慎用。')
+    ap.add_argument('--gc-with-compile', type=int, default=0, choices=[0, 1],
+                    help='开 --compile 时**仍然保留**梯度检查点（1=保留，0=照旧关掉）。'
+                         '默认 0 是历史行为：compile 与 GC 被当成二选一'
+                         '（见下面 `_gc = 0` 那段）。那条策略的来源是 NPU/TorchAir 的'
+                         '图捕获限制，不是 A100/CUDA 上的技术必然 —— 检查点走 '
+                         '`use_reentrant=False`（`backbone._checkpointed` 已经是），'
+                         '与 `torch.compile` 兼容，且 `backbone.'
+                         'assert_grad_checkpoint_compile_compatible` 只在**子树里**'
+                         '扫 `_orig_mod`，整模型 `torch.compile(model)` 把原模型包在内层，'
+                         '扫不到、不会被拦。\n'
+                         '为什么要开：关掉 GC 意味着激活全驻留，batch 被迫调小，'
+                         '而 batch 缩小吃掉的吞吐通常远大于融合省下的 —— '
+                         '40GB 卡上这是「要融合就没显存」的根源。'
+                         '（V7 的 head 之前返回 dict、穿不过 checkpoint 的那个问题'
+                         '已修，见 `katago_v7._ckpt`。）')
     ap.add_argument('--flash-attn', type=int, default=1, choices=[0, 1],
                     help='flash-attn 独立库开关：A100(Ampere+) 上优先于内置 SDPA（最快，需 '
                         'pip install flash-attn），加载失败自动回退内置 SDPA。'
@@ -4240,7 +4311,10 @@ def main():
                 args.lr, args.weight_decay)
     logger.info("注意力: mode=%s attn_mode=%s window=%d heads=%d layers=%d dropout=%s compile=%s",
                 args.attention_mode, args.attn_mode, args.attn_window,
-                args.num_heads, args.num_attention_layers, args.attention_dropout, args.compile)
+                args.num_heads, args.num_attention_layers, args.attention_dropout,
+                # 设备分派在后面，这里 `args.compile` 还可能是 None（= 按设备
+                # 自动），打 None 会让人以为编译被关了。真值见 [device] 那行。
+                'auto' if args.compile is None else args.compile)
     logger.info("日志: log_every=%d eval_every=%d save_every=%d out=%s",
                 args.log_every, args.eval_every, args.save_every, args.out)
     logger.info("验证集评估: eval_max_batches=%d（<=0 = 跑满全部验证集；日志 [eval] 行的 "
@@ -4491,6 +4565,18 @@ def main():
             compile_disable_sparse = True
             logger.info("[device] %s (sm_%d%d) | 走保守路径: FP16 + 手写 math 注意力 + "
                         "稀疏注意力禁用编译", gpu_name, *compute_cap)
+
+        # `--compile` 不给时的自动判定。判据只用「CUDA 且 sm_80+」，与上面
+        # 走 A100 路径的判据**故意用同一个**（`is_ampere_plus`）：那条路径已经
+        # 把 BF16 + channels_last + FlashAttn 都默认打开了，compile 单独默认关
+        # 只会让「A100 路径」的收益少一块。V100 等老卡维持默认关。
+        if args.compile is None:
+            args.compile = 1 if is_ampere_plus else 0
+            logger.info("[device] --compile 未指定 ⇒ 按设备自动取 %d"
+                        "（sm_%d%d，%s）",
+                        args.compile, compute_cap[0], compute_cap[1],
+                        'CUDA sm_80+ 默认开，显式 --compile 0/1 可覆盖'
+                        if is_ampere_plus else '非 Ampere+ 默认关')
     elif _backend == 'npu' and npu_is_available():
         # Ascend 910B / 910C / 910A：CANN + torch_npu 后端
         gpu_name = npu_get_device_name(_dev_idx)
@@ -4563,6 +4649,11 @@ def main():
         sdpa_force_math = True
         compile_disable_sparse = True
         logger.info("[device] CPU | 走 FP32 路径（无 AMP/编译）")
+
+    # CUDA 分支已在上面把 `--compile` 的 None 收敛掉了；这里补齐其余后端，
+    # 让后面所有分支（`_gc` 判定、`elif args.compile == 1`）都只看到确定的 0/1。
+    if args.compile is None:
+        args.compile = 0
 
     # NPU 图编译（TorchAir）开关。与 --compile 互斥：NPU 上 inductor 不可用，
     # 两条路径都需要显式指定 backend，不能同时开。
@@ -4722,17 +4813,27 @@ def main():
     # `--use-checkpoint` 同样归档：检查点开关 = `KATAGO_SE_CFG['grad_checkpoint']`
     # ∧「未开图编译」，见下。
     # 没有任何 arch 分支、也没有新增任何 CLI。
-    _gc = KATAGO_SE_CFG['grad_checkpoint']
-    if args.compile == 1 or args.npu_graph_compile == 1:
-        # grad checkpointing 与 torch.compile / TorchAir 图编译互斥
-        # （P4.6b §8.2④：训练态 GC 会在第一次前向撞断言）。两者都要是
-        # **显式**决策：这里让图编译赢、检查点让位并打 warning，绝不静默
-        # 丢掉任何一边（显存会回升，日志必须能看出原因）。
-        _gc = 0
+    _gc, _gc_reason = resolve_grad_checkpoint(
+        KATAGO_SE_CFG['grad_checkpoint'],
+        compile_on=(args.compile == 1),
+        npu_linear_compile=(args.npu_graph_compile == 1),
+        gc_with_compile=(args.gc_with_compile == 1))
+    if _gc_reason == 'npu-linear':
         logger.warning(
-            "[model] compile/npu-graph-compile=1 ⇒ 本次运行关闭 gradient "
-            "checkpointing（配置的 %d 与图编译互斥，显存占用回升）",
+            "[model] --npu-graph-compile 1 ⇒ 本次运行关闭 gradient "
+            "checkpointing（配置的 %d）：逐 Linear 编译的产物落在检查点段内部，"
+            "与重算钩子真的互斥（--gc-with-compile 对这条路径无效）",
             KATAGO_SE_CFG['grad_checkpoint'])
+    elif _gc_reason == 'compile-exclusive':
+        logger.warning(
+            "[model] --compile 1 ⇒ 本次运行关闭 gradient checkpointing"
+            "（配置的 %d，显存占用回升）；要同时开请加 --gc-with-compile 1",
+            KATAGO_SE_CFG['grad_checkpoint'])
+    elif _gc_reason == 'gc-with-compile':
+        logger.info(
+            "[model] --gc-with-compile 1 ⇒ compile 与 gradient checkpointing "
+            "**同时**开启（grad_checkpoint=%d；检查点为 use_reentrant=False，"
+            "与整模型 torch.compile 兼容）", _gc)
     elif args.use_checkpoint == 0:
         logger.info("[model] --use-checkpoint 已归档：检查点开关由 "
                     "KATAGO_SE_CFG[%r]=%d 决定，本次启用（如需关闭请用 --compile 1）",
@@ -6387,7 +6488,14 @@ def main():
                 # 永远收不到停止信号。
                 _sync_stop_flag(stop_flag, is_dist, args.early_stop == 1)
 
-                if stop_flag.item():
+                # `.item()` 是**同步点**（D2H + 阻塞等队列排空），而这一行在
+                # **每个 step** 都跑。`stop_flag` 的唯一写入点是上面
+                # `if args.early_stop == 1 and is_main:` 里的 `fill_(1)` ——
+                # 早停没开时它恒为 0，这次同步每次都白付：把 host 拉回等 GPU，
+                # 下一个 step 的 kernel 发射就排不上去。
+                # 门控用的是 `args.early_stop == 1` 而不是「有没有置位」，因为
+                # 判断「有没有置位」本身就得先 `.item()`，那就等于没优化。
+                if args.early_stop == 1 and stop_flag.item():
                     break
 
         # 双层 break 之二：跳出 step 循环后还要跳出 epoch 循环（缩进 8 = epoch
