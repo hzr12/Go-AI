@@ -222,7 +222,7 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 python scripts/train_sft.py \
   --data data/sgf_19x19_full.npz --v7 1 --device cuda --board-size 19 \
   --games-npz data/labels/games.npz \
-  --batch-size 2800 --epochs 1 --lr 0.00377 --weight-decay 0.0001 \
+  --batch-size 2500 --epochs 1 --lr 0.00387 --weight-decay 0.0001 \
   --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
   --gc-with-compile 1 --flash-attn 1 --attention-dropout 0 \
   --prefetch-workers 16 --prefetch-depth 4 \
@@ -247,7 +247,7 @@ python scripts/train_sft.py \
 #   --weight-decay**。V7 初值 ‖θ‖²≈77835，wd=0.05 ⇒ l2_report≈3892，而四项真实
 #   加权和只有约 7.8 ⇒ 日志 `loss` 几乎全是那一项，总 loss 平得看不出任何进展；
 #   优化器里也真的按 0.05 衰减（Σlr≈11 ⇒ 全程权重缩到 exp(-0.55)≈58%）。
-torchrun --nproc_per_node=1 scripts/train_sft.py \
+python scripts/train_sft.py \
   --data data/sgf_19x19_full.npz --v7 1 --device cuda --board-size 19 \
   --games-npz data/labels/games.npz \
   --model models/a_v7_a100.pth.latest \
@@ -265,7 +265,7 @@ torchrun --nproc_per_node=1 scripts/train_sft.py \
 # ⚠ C 段**不要** `--games-npz`（贴目已在行里）、也**不需要** `--soft-index`
 #   （stdata 每行自带 policy_player_prob/policy_opp_prob，归一化即软标签）。
 # ⚠ batch 与 LR 同 A 段：未定档，现场调，改了按公式重算 LR。
-torchrun --nproc_per_node=1 scripts/train_sft.py \
+python scripts/train_sft.py \
   --data data/stdata --v7 1 --device cuda --board-size 19 \
   --model models/b_v7_a100.pth.latest \
   --policy-loss soft_ce --soft-weight 1.0 \

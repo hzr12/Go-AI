@@ -486,6 +486,72 @@ def _autocast_like(t):
         return contextlib.nullcontext()
 
 
+class _AutocastRecomputeProbe(torch.nn.Module):
+    """只用来做一次性探针的最小模块（见 `_recompute_preserves_autocast`）。"""
+
+    def __init__(self):
+        super().__init__()
+        self.lin = torch.nn.Linear(4, 4)
+        self.seen = []
+
+    def forward(self, x):
+        self.seen.append(torch.is_autocast_enabled(x.device.type))
+        return self.lin(x)
+
+
+#: 探针结果缓存：`{'device': 类型, 'preserved': bool|None}`。`None` = 还没探过
+#: 或探针本身失败（此时按「需要 context_fn」处理，即回到最保守的一侧）。
+_AUTOCAST_PROBE = {'device': None, 'preserved': None}
+
+
+def _recompute_preserves_autocast(device_type):
+    """`use_reentrant=False` 的 checkpoint **自己**会不会把 autocast 带进重算期？
+
+    为什么要有这个探针
+    ------------------
+    `_recompute_context_fn` 存在的两个职责之一是「恢复前向的精度」：不恢复的话
+    重算整段退回 fp32、激活体积翻倍 —— 那是 2026-10-01 四卡 910A OOM 的直接原因
+    （`Tried to allocate 1.40 GiB` 恰是 `(1000,4,46,32,64)` 的 fp32 体积）。
+
+    但**那条结论只对当时的 torch 2.1 成立**。实测 torch 2.12 上，即使完全不传
+    `context_fn`，重算期 `torch.is_autocast_enabled()` 仍然是 `True` ——
+    non-reentrant 实现自己就保住了 autocast。也就是说在 torch 2.12 上
+    `context_fn` 的这项职责**已经冗余**。
+
+    而它有实打实的代价：传 `context_fn` 会让 **Dynamo 在每个检查点段各断一次图**
+    （实测 graphs 3 / breaks 2，理由 `guard_as_python_constant
+    AutocastModeVariable()`；不传就是 graphs 1 / breaks 0）。断图 = 融合失效，
+    而这正是「A100 上开 `--compile` 还要不要留 GC」的关键。
+
+    为什么不按 torch 版本硬判
+    ------------------------
+    行为随版本变（2.1 不保、2.12 保），而**探针是在本机真 torch 上问一次**，
+    比任何版本号判断都准，也对未来的 torch 有效。探针失败一律按「需要
+    context_fn」处理 ⇒ 最坏结果是回到今天的保守行为，不会更差。
+    """
+    if _AUTOCAST_PROBE['device'] == device_type:
+        return _AUTOCAST_PROBE['preserved']
+    preserved = None
+    try:
+        m = _AutocastRecomputeProbe().to(device_type)
+        # ⚠ 用 `ones` 而不是 `randn`：探针跑在**第一次真实前向里**，若消耗 RNG
+        #   会挪动整条随机流 ⇒ 同一 seed 的两次运行不再逐位相同（可复现性门禁
+        #   `tests/test_eval_determinism.py` / 12 通道 bit-identical 基线会红）。
+        #   探针只关心「重算期在不在 autocast 里」，与数值无关，常数输入足够。
+        x = torch.ones(4, device=device_type, requires_grad=True)
+        with torch.autocast(device_type, torch.bfloat16):
+            torch.utils.checkpoint.checkpoint(
+                m, x, use_reentrant=False,
+                preserve_rng_state=False).sum().backward()
+        # 前向 1 次 + 重算 1 次 ⇒ seen 长度 2；看**后一次**（重算）是否仍在 autocast 里
+        preserved = bool(len(m.seen) >= 2 and m.seen[-1])
+    except Exception:  # noqa: BLE001 — 探针失败按最保守处理
+        preserved = None
+    _AUTOCAST_PROBE['device'] = device_type
+    _AUTOCAST_PROBE['preserved'] = preserved
+    return preserved
+
+
 def _recompute_context_fn(ac, guard):
     """`torch.utils.checkpoint(context_fn=…)` 的工厂 —— **必须定义在模块级**。
 
@@ -559,6 +625,32 @@ def _first_tensor(args):
 
 
 def _checkpointed(runner, args, bns):
+    # `context_fn` 何时**可以不给**（实测 A100 上这不是优化而是必需，见下）
+    # ------------------------------------------------------------------
+    # 两个职责分别处理：
+    #   1) BatchNorm 统计还原 —— `bns` 非空时**必须**给，没有条件。
+    #   2) 重算期恢复 autocast —— 由 `_recompute_preserves_autocast` 在本机
+    #      真 torch 上探一次；探针说「non-reentrant 自己就保住了」就不给。
+    #
+    # ⚠ 为什么第 2 条在 A100 上是**必需**而不是锦上添花：传 `context_fn` 会让
+    #   Dynamo 在**每个检查点段**各断一次图（实测 graphs 3 / breaks 2，理由
+    #   `guard_as_python_constant AutocastModeVariable()`），不传则是
+    #   graphs 1 / breaks 0。断图意味着 inductor 拿不到整图、融合基本失效 ——
+    #   那就等于「为了省显存而把融合全丢了」，是最差的组合。
+    #   而 `_recompute_context_fn` 的 docstring 里那条「不给就退回 fp32、
+    #   体积翻倍、910A OOM」是 **torch 2.1** 的现象；torch 2.12 实测不成立。
+    #   所以这里不按版本号猜，而是探针实测（见该函数 docstring）。
+    need_bn_guard = bool(bns)
+    need_ac = not _recompute_preserves_autocast(
+        _first_tensor(args).device.type if _first_tensor(args) is not None
+        else 'cpu')
+    if not (need_bn_guard or need_ac):
+        return torch.utils.checkpoint.checkpoint(
+            runner, *tuple(args),
+            use_reentrant=False,
+            preserve_rng_state=True,
+        )
+
     guard = _BatchNormStatGuard(bns)
     _ac = _autocast_like(_first_tensor(args))
     # `context_fn` 走 functools.partial（Dynamo 认 FunctoolsPartialVariable）。

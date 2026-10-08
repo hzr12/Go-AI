@@ -4958,8 +4958,16 @@ def main():
     # 走检查点（per-kind 默认可以不同；且训练态闸门还要求 self.training +
     # grad enabled）。这段日志的用处是让「GC 到底生效没有」不必翻代码，也不必
     # 在云端日志里靠猜 —— 4×910A 首跑要看的就是它。
-    _gc_kinds = getattr(getattr(model, 'backbone', None),
-                        'grad_checkpointing_kinds', None)
+    # 宿主两种拓扑都要认：
+    #   · 12 通道（`SharedBackbone`）—— mixin 挂在 `model.backbone` 上；
+    #   · 22 通道 V7（`NbtTfNet(GradCheckpointMixin, nn.Module)`）—— mixin 挂在
+    #     `model` **自己**上，它根本没有 `.backbone` 属性。
+    # 原来只查 `model.backbone` ⇒ **V7 永远打 `n/a`**，而这段日志的全部用处就是
+    # 「不翻代码就能看出 GC 到底生效没有」（注释里写的就是这个）。V7 是现役默认
+    # 模型，于是这段诊断对现役模型**完全失效**。先查 `model` 再退回 `.backbone`。
+    _gc_owner = model if hasattr(model, 'grad_checkpointing_kinds') \
+        else getattr(model, 'backbone', None)
+    _gc_kinds = getattr(_gc_owner, 'grad_checkpointing_kinds', None)
     _gc_kinds = _gc_kinds() if callable(_gc_kinds) else {}
     if _v7_on:
         # 预算锚不在本表里（`NBT_TF_CFG` 带的是 stem/block/head 的**分项**锚，
