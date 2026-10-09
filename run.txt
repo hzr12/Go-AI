@@ -200,13 +200,13 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 python scripts/train_sft.py \
   --data data/sgf_19x19_full.npz --v7 1 --device cuda --board-size 19 \
   --games-npz data/labels/games.npz \
-  --batch-size 2500 --epochs 1 --lr 0.00387 --weight-decay 0.0001 \
+  --batch-size 2000 --epochs 1 --lr 0.00320 --weight-decay 0.0001 \
   --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
   --gc-with-compile 1 --flash-attn 1 --attention-dropout 0 \
-  --prefetch-workers 16 --prefetch-depth 4 \
-  --log-every 50 --eval-every 500 --save-every 250 \
+  --prefetch-workers 24 --prefetch-depth 8 \
+  --log-every 5 --eval-every 500 --save-every 20 \
   --early-stop 1 --early-stop-patience 3 \
-  --out models/a_v7_a100.pth --swanlab 1 --ver a_v7_a100 --swanlab-every 2
+  --out models/a_v7_a100.pth --swanlab 1 --ver a_v7_a100 --swanlab-every 1
 
 # --- B 段：+ KataGo 软标签（承接 A 段，单卡 A100）---
 # ⚠ `--policy-loss soft_ce` 不写也行：给了 --soft-index 会自动选中。
@@ -234,10 +234,10 @@ python scripts/train_sft.py \
   --batch-size 2000 --epochs 30 --lr 0.00320 --weight-decay 0.0001 \
   --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
   --gc-with-compile 1 --flash-attn 1 --attention-dropout 0 \
-  --prefetch-workers 4 --prefetch-depth 8 \
-  --log-every 25 --eval-every 100 --eval-max-batches 5 --save-every 250 \
+  --prefetch-workers 24 --prefetch-depth 8 \
+  --log-every 25 --eval-every 100 --eval-max-batches 5 --save-every 20 \
   --early-stop 1 --early-stop-patience 3 \
-  --out models/b_v7_a100.pth --swanlab 1 --ver b_v7_a100 --swanlab-every 5
+  --out models/b_v7_a100.pth --swanlab 1 --ver b_v7_a100 --swanlab-every 1
 
 # --- C 段：stdata 分片（搜索分布内建），单卡 A100 ---
 # ⚠ C 段**不要** `--games-npz`（贴目已在行里）、也**不需要** `--soft-index`

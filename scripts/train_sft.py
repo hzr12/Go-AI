@@ -156,34 +156,19 @@ def _dist_preflight_check(backend, device, logger):
 # --------------------------------------------------------------------------- #
 # from-scratch 初始权重同步（2026-10-01）
 #
-# 事故形状：当时的分布式包裹层（**历史：FSDP1，已退役**）的 docstring 要求
-# from-scratch 也必须同步初始权重 ——「各 rank 独立、各自不同，不同步的话第一步
-# 拿到的就是拼错的权重」。但它的 `sync_module_states=True` **从未被传**
-# （当时的构造参数白名单里也没有），**修复前**全文件唯一的 `dist.broadcast`
-# 是 `_sync_stop_flag` 的 stop_flag —— **没有任何参数广播**。
-# `shell/train_sft_npu_4card_katago_se.sh` 不传 `--resume`/`--model` ⇒ from-scratch
-# ⇒ 第一步之后各 rank 的权重就永久分叉：梯度虽然被 all-reduce 拉齐，但被拉齐的
-# 是「起点不同」的同一份梯度，从 step 0 起两份权重就不是同一个模型了。
+# 事故形状：换轨前的分片包裹层 docstring 要求 from-scratch 也同步初始权重
+# （「各 rank 独立就会第一步拿到拼错的权重」），但 `sync_module_states` 从未被传
+# ⇒ 全文件当时唯一的 `dist.broadcast` 是 stop_flag，**没有任何参数广播**。
+# 而 from-scratch 脚本不传 `--resume`/`--model` ⇒ 各 rank 权重从 step 0 就分叉：
+# 梯度虽被 all-reduce 拉齐，被拉齐的却是「起点不同」的同一份梯度。
 #
-# 为什么用显式 broadcast 而不是包裹层自带的 `sync_module_states`
-# --------------------------------------------------------
-# 1. 后者在 torch 2.1 上需要 `param_init_fn` 配套（未初始化的参数会留在 CPU），
-#    而本文件所有参数在包裹前已 `.to(device)`；当时为绕这条还要维护一层
-#    「按已安装签名过滤未知 kwarg」的版本兼容（**历史：随 FSDP1 包裹层一并删除的
-#    `_drop_unsupported_kwargs`**）。
-# 2. buffer 不需要额外同步：`BatchNorm2d` 的 `running_mean`/`running_var`/
-#    `num_batches_tracked` 是确定性 0/1 初始化，各 rank 本来就逐位一致。
-# 3. 显式 broadcast 是**无条件**的 —— 不依赖「resume 路径已经同步了」这类推理，
-#    运行时可验证，且能被 AST 测试直接钉住顺序。
-#
-# 与 DDP 自带同步的关系（**顺序的硬理由**，详见 main() 里包裹点上方的注释）：
-#   `DistributedDataParallel.__init__` 在**它自己构造时**也会把 rank0 的
-#   params/buffers 广播出去（`_ddp_init_helper` → `_sync_module_states`），但那时
-#   EMA 已经构造完、把各 rank 自己的随机权重 clone 进了 shadow。所以必须由本组
-#   函数把广播放在 EMA 之前，包裹层自带的那次只能当第二道保险。
-#
-# 代价：36.4 MB 一次性广播 + 226 次小 collective（= `build_katago_se_net` 的参数
-# 张量数，实测 226 个 / 9,112,005 参数），**只在启动时发生一次**。
+# 用显式 broadcast 而非包裹层自带的 `sync_module_states`：后者在 torch 2.1 上
+# 需要 `param_init_fn` 配套（本文件参数包裹前已 `.to(device)`），为此还得维护
+# 一层按已安装签名过滤 kwarg 的版本兼容（随分片包裹层一并删）。buffer 无需额外同步
+# —— BN 的 running_mean/var/num_batches_tracked 是确定性 0/1，各 rank 逐位一致。
+# 显式 broadcast 还是**无条件**的：不靠「resume 路径已经同步了」这类推理，且能
+# 被 AST 测试钉住顺序 —— 必须排在 EMA 之前（详见包裹点上方的注释）。
+# 代价：36.4 MB + 226 次小 collective，只在启动时发生一次。
 # --------------------------------------------------------------------------- #
 
 def _dist_active() -> bool:
@@ -356,18 +341,10 @@ def _check_training_env(logger):
         comp_status = "不可用（torch<2.0）"
     # 3) 混合精度（按后端能力）
     if torch.cuda.is_available():
-        # ⚠ **不能用 `torch.cuda.get_device_properties`**：它会 `_lazy_init()`
-        #   建 CUDA primary context。本函数在 main() 里跑在 `_BatchPrefetcher`
-        #   构造**之前**（预取 worker 是 fork 出来的，会整份继承父进程的设备
-        #   上下文与显存映射），而 `_BatchPrefetcher.__init__` 有一条硬护栏：
-        #   设备已初始化就 RuntimeError。
-        #   这条在 **NPU 机上从不触发**（`torch.cuda.is_available()` 为 False，
-        #   整个分支跳过），所以它是潜伏的 **CUDA-only** 缺陷 —— 直到迁到
-        #   A100 才第一次炸，且报错信息（"请把它挪到 init_process_group 之前"）
-        #   指向的地方并不是真正的原因。
-        #   改走 NVML（`nvidia-smi`）：拿同样的型号与算力，**不建 context**。
-        #   `device_count()` 走的是 NVML 路径、也不建 context，所以上面的
-        #   `is_available()` 判断同样是安全的。
+        # ⚠ 不能用 `torch.cuda.get_device_properties`：它会 `_lazy_init()` 建
+        #   CUDA context。本函数在 `_BatchPrefetcher` 构造**之前**跑，预取
+        #   worker 是 fork 的、会整份继承设备上下文，撞上那里的硬护栏就抛
+        #   （2026-10-08 A100 首启才炸，且报错指向的位置不是真因）。改走 NVML。
         name, cap = _cuda_name_and_capability()
         if cap is None:
             amp_status = "CUDA 可用（型号/算力读取失败，不影响训练）"
@@ -398,27 +375,23 @@ from scripts.build_dataset import build
 # v4+ 的 bottleneck + SE 路线）。旧 CLI flag（--arch / --backbone-channels /
 # --res-blocks / --policy-layers …）**仍然不参与建网**，下面这张表才是真的。
 #
-# 参数量是**实测值**（`sum(p.numel() for p in model.parameters())`，19×19 /
-# action_size=362 / 12 通道 / 随机初始化下数出来的，不是估算）：
-#     主干 8,392,995 + 头 719,010 = 全网 9,112,005
+# 参数量是**实测值**（19×19 / action_size=362 / 12 通道 / 随机初始化下数出来的，
+# 不是估算）：主干 8,392,995 + 头 719,010 = 全网 9,112,005
 #   主干 = stem 26,400 + 13 × SEBottleneck(240) 195,375
 #          + 4 × AttentionResBlock(240) 1,442,160 + out 58,080
-#   头   = ValueNetwork(96 宽 / 2 残差块) 540,193 + PolicyNetwork(128 宽 / 3 层)
-#          178,817
-#   （块数：17 段里 mix 插了 4 个 AttentionResBlock、13 个 SEBottleneck。）
-# 宽度为什么是 240 而不是 160：`SEBottleneck` 只 195,375 参数（C=240；C=160 时
-# 87,050 —— 同宽度的 `ResBlock` 是 461,440，省下 5.3 倍），所以 160 宽 × 17 块
-# 只有约 4M，离 9M 的预算差一半多。这里**保留目标形状的块布局**（17 块 / mix /
-# 4 个注意力 / value_res_blocks=2），只把宽度从 160 提到 240 把参数填满 ——
-# 实测 9,112,005，落在 8.5~9.5M 窗口正中。同布局的宽度实测对照：
+#   头   = ValueNetwork(96 宽 / 2 残差块) 540,193 + PolicyNetwork(128 宽 / 3 层) 178,817
+# 改这张表之后**必须**重数这两个数（启动时也会把实测值打出来，可对账）。
+#
+# 宽度为什么是 240 而不是 160：`SEBottleneck` 只 195,375 参数（C=160 时 87,050，
+# 而同宽度的 `ResBlock` 是 461,440，省下 5.3 倍）⇒ 160 宽 × 17 块只有约 4M，离 9M
+# 预算差一半多。这里**保留目标形状的块布局**（17 块 / mix / 4 个注意力 /
+# value_res_blocks=2），只把宽度从 160 提到 240 把参数填满。同布局宽度实测对照：
 #     C=192 → 6,050,622   C=208 → 6,996,907   C=224 → 8,017,368
 #     C=232 → 8,552,392   C=240 → 9,112,005   C=248 → 9,683,909
-# 改这张表之后**必须**重数这两个数（`scripts/train_sft.py` 启动时也会把实测值
-# 打出来，可与下面这两个数字对账）。
 #
-# 显存口径**尚未实测**：上面 9.11M 的宽度是按参数量定的，而 240 通道 ×
-# 19×19 的激活比 160 通道大 2.25 倍，`shell/train_sft_npu_4card_katago_se.sh`
-# 里的 BATCH=1000 是按 184 通道那档定的。上云首跑请按报错往下调 BATCH。
+# 显存口径**尚未实测**：9.11M 的宽度是按参数量定的，而 240 通道 × 19×19 的激活
+# 比 160 通道大 2.25 倍，旧脚本里的 BATCH=1000 是按 184 通道那档定的。首跑请按
+# 报错往下调 BATCH。
 # =========================================================================== #
 KATAGO_SE_CFG = {
     # ---- 形状（结构，全部对应 AlphaGoNet.__init__ 的参数名）----
@@ -475,37 +448,24 @@ def build_katago_se_net(*, action_size, attention_dropout=0.1,
 # =========================================================================== #
 # V7 路径（22 通道 NBT+Transformer）—— **可选**，`--v7 1` 才走，默认关闭
 #
-# 与 `KATAGO_SE_CFG`（12 通道 / 9.11M）的关系
-# --------------------------------------------
-# 上面那张表**没有**被删，也没有被改：默认路径（`--v7 0`）的建网、标签与损失
-# 一行都没动。V7 是**并排的第二条路**，只在 `--v7 1` 时接管「造特征 + 前向 +
-# 损失」三件事；DDP / EMA / 调度器 / 保存 / 评估这些 run 级机制两条路共用。
+# 与 `KATAGO_SE_CFG`（12 通道 / 9.11M）是**并排的第二条路**：`--v7 0`（默认）的
+# 建网/标签/损失一行都没动；V7 只在 `--v7 1` 时接管「造特征 + 前向 + 损失」，
+# DDP / EMA / 调度器 / 保存 / 评估两条路共用。
 #
-# 段 1 的四个目标
-# ---------------
-# ================  ==========================================================
-# 目标              装配位置
-# ================  ==========================================================
-# policy            `KataGoV7Loss` #1（系数 1.0，行权重恒 1）
-# π_opp             `KataGoV7Loss` #2（系数 0.15，`w['policy_opp']`）
-# value             `KataGoV7Loss` #3（系数 1.20，三分类 CE）
-# futurepos         `KataGoV7Loss` #11（0.25 已内嵌，`w['futurepos']`）
-# ================  ==========================================================
+# 段 1 的四个目标（系数见 `KataGoV7Loss`）：policy #1（1.0，行权重恒 1）、
+# π_opp #2（0.15，`w['policy_opp']`）、value #3（1.20，三分类 CE）、
+# futurepos #11（0.25 已内嵌，`w['futurepos']`）。
 #
-# **score 系在段 1 不作为主目标，权重默认 0，但结构上保留。**
-# 依据：81.09% 的 SGF 是认输，只有约 18.5% 有数值分差 ⇒ `score` / `scoring` /
-# `ownership` / `sb_center` 这些标签在段 1 的绝大多数行上是**占位零值**，拿占位
-# 零值当回归目标 = 教网络「分差永远是 0」。段 2/3 接上 sidecar 之后把
-# `V7_STAGE1_SCORE_WEIGHTS` 整表换掉即可，**不需要动网络、不需要动 loss**。
+# **score 系在段 1 不作主目标，权重默认 0，但结构保留。** 依据：81.09% 的 SGF
+# 是认输，只有约 18.5% 有数值分差 ⇒ score/scoring/ownership/sb_center 在段 1
+# 绝大多数行上是**占位零值**，拿占位零值当回归目标 = 教网络「分差永远是 0」。
+# 段 2/3 接上 sidecar 后整表换掉即可，不动网络、不动 loss。
 #
-# 为什么用**系数**（`KataGoV7Loss(coeff=...)`）而不是行权重 `w` 来关掉它们：
-#   12 项里有两个**没有**行权重可用 ——
-#     · #7 `score_stdev` 的行权重是 `game_weight`（官方 `col25`），不是 `w['score']`，
-#       而 `game_weight` 在本仓默认**恒 1**（无 `game_weights` 列时）⇒ 行权重关不掉；
-#     · #9 `lead` 的 `w['lead']` 这个键**根本不存在**，`_weighted_mean` 的
-#       `w_of('lead')` 缺键时返回 `ones`（不是 0）⇒ 行权重同样关不掉。
-#   用系数是**唯一**能一次关全这 8 项的杠杆，且它是 loss 自带的公开入口
-#   （`KataGoV7Loss.__init__(coeff=...)`），不需要改 `src/networks/**`。
+# 为什么用**系数**（`KataGoV7Loss(coeff=...)`）而不是行权重 `w` 关这 8 项：
+# 12 项里有两个没有行权重可用 —— #7 `score_stdev` 的行权重是 `game_weight`
+# （官方 `col25`，本仓恒 1）；#9 `lead` 的 `w['lead']` 键根本不存在，
+# `_weighted_mean` 缺键时返回 `ones`（不是 0）⇒ 都关不掉。系数是唯一能一次关全
+# 的杠杆，且是 loss 自带的公开入口，不动 `src/networks/**`。
 # =========================================================================== #
 
 #: V7 的输入形状（由 `fillRowV7` 决定，**不从棋局重新推算**）。
@@ -1104,22 +1064,21 @@ def _clone_to_cpu(obj):
 class _AsyncSnapshotWriter:
     """后台线程写盘，让训练步不等磁盘。
 
-    为什么需要
-    ----------
-    2026-10-08 的 A100 40G 实测：GPU 利用率曲线每~25 秒准时跌到 **0**，
-    曲线形状与「GPU Time Spent Accessing Memory」几乎一致 ⇒ 卡的是 host，
-    不是显存带宽。eval 期间 GPU 是**忙**的（只会出现 60-70% 的浅谷），
-    能把利用率打到 0 的只有保存：`save_model` 要把整个模型 + optimizer
-    state（Adam 的 m/v 是参数量的两倍）+ EMA 一次性 D2H 再 `torch.save`，
-    V7 约 5.5M 参数 ⇒ 每次约几十 MB 的同步拷贝 + 落盘，全在 step 循环里。
+    为什么需要：2026-10-08 的 A100 40G 实测，GPU 利用率每~25 秒准时跌到 **0**，
+    形状与「GPU Time Spent Accessing Memory」一致 ⇒ 卡的是 host。eval 期间 GPU
+    是**忙**的（只有 60-70% 的浅谷），能把利用率打到 0 的只有保存：模型 +
+    optimizer state（Adam 的 m/v 是参数量的两倍）+ EMA 一次性 D2H 再
+    `torch.save`，全在 step 循环里。
 
     契约
     ----
-    * **至多一个在飞**：`submit` 先 join 上一个。所以显存里最多多留一份快照，
-      不会因为写盘慢而堆积（堆积 = 吃显存 = 本末倒置）。
-    * `close()` 必须被调用（训练结束 / 收尾前），否则最后一份可能没写完。
-    * 写盘失败**不抛回训练线程**（训练已经跑了很久，不能因为一次 IO 失败崩掉），
-      只记 warning。同步版本是会崩的 —— 这是行为变化，故在此写明。
+    * **至多一个在飞**：`submit` 先 join 上一个 ⇒ 显存里最多多留一份快照，不会
+      因写盘慢而堆积（堆积 = 吃显存 = 本末倒置）。
+    * `close()` 必须被调用，否则最后一份可能没写完。
+    * 写盘失败**不抛回训练线程**（训练已跑很久，不能因一次 IO 失败崩掉），只记
+      error 日志。同步版本是会崩的 —— 这是行为变化，故在此写明。
+    * 自己 `makedirs`：干净检出（`models/` 不存在）时首次周期快照会抛
+      `Parent directory does not exist`，而该异常正好被上面那条吞掉。
     """
 
     def __init__(self, logger):
@@ -1130,13 +1089,22 @@ class _AsyncSnapshotWriter:
 
     def _write(self, model_sd, train_state, model_path, state_path):
         try:
+            for p in (model_path, state_path):
+                d = os.path.dirname(p)
+                if d:
+                    os.makedirs(d, exist_ok=True)
             torch.save(model_sd, model_path)
             torch.save(train_state, state_path)
             self._logger.info("[save] 后台写盘完成: %s（第 %d 次快照）",
                               os.path.basename(model_path), self._n)
         except Exception as e:  # noqa: BLE001 — 写盘失败不该带走训练
-            self._logger.warning("[save] 后台写盘失败（训练继续）: %s: %s",
-                                 type(e).__name__, e)
+            # error 而非 warning：失败被吞掉是有意设计，但周期快照失败的后果是
+            # 「崩溃后无法恢复」，等级必须够高且写清是哪个文件，否则排查时
+            # 根本不会注意到。2026-10-09 真机事故：干净检出（models/ 不存在）
+            # 首次快照即抛 FileNotFoundError，被这里吞掉后训练照跑、快照一路
+            # 静默失败 ⇒ 上面那行 makedirs 就是为此加的。
+            self._logger.error("[save] 后台写盘失败（训练继续）: %s: %s | model=%s state=%s",
+                               type(e).__name__, e, model_path, state_path)
 
     def submit(self, model_sd, train_state, model_path, state_path):
         """排一次快照。`model_sd` / `train_state` 会被**深拷贝成 CPU 副本**。"""
@@ -1754,12 +1722,6 @@ def _eval_batch_budget(n_samples, bs, max_batches):
         return total, False
     return min(total, max_batches), total > max_batches
 
-
-#: 昇腾 aclnn 的 ``aclFormat`` 取值。`torch_npu.Format` 枚举在 2.1.0 上不存在，
-#: 只能用字面量；取值来自 CANN 文档的格式表，实测（2026-10-07，torch_npu
-#: 2.1.0.post10）`npu_format_cast(x, 1)` 之后 `get_npu_format(x)` 确实变成 1。
-ACL_FORMAT_NHWC = 1
-ACL_FORMAT_NCHW = 0
 
 
 def _apply_channels_last_(model, backend='cuda'):
@@ -2911,31 +2873,27 @@ def _read_log_scalars(loss, policy_loss, value_loss):
     return loss.item(), policy_loss.item(), value_loss.item()
 
 
-# ---- D4（SFT 侧）：policy/value 损失口径 ------------------------------------------------
+# ---- D4（SFT 侧）：policy/value 损失口径 --------------------------------------
 # 三个 CLI 开关：--policy-loss {huber,ce}（**默认 ce**，P4.5b 由 huber 改回 ce）、
-# --value-loss {huber,mse}（默认 huber）、--huber-beta（默认 0.5，既是 smooth L1
-# 的 beta 也是拐点 delta）。C8 修正：value 的 BCE 分支已删（见
-# compute_value_loss docstring）。RL 侧（scripts/selfplay_train.py）的损失是
-# P3-C/P3-D，**不经过这里** —— 本文件的函数只服务 train_sft 自己的调用点，改语义
-# 不会波及 RL。
+# --value-loss {huber,mse}（默认 huber）、--huber-beta（默认 0.5）。C8 修正：value
+# 的 BCE 分支已删。RL 侧（scripts/selfplay_train.py）的损失是 P3-C/P3-D，**不经过
+# 这里** —— 本文件的函数只服务 train_sft 自己的调用点，改语义不会波及 RL。
 #
-# 日志契约（不可动）：main() 打点仍用 loss / policy_loss / value_loss 三个键，
-# 下游 run.txt、看板与 tests/test_run_txt_sync.py 的消费者绑着它们，
-# tests/test_huber_loss.py::test_log_keys_unchanged 把三个键钉死。
-# `loss` 这个键的**含义**在 P4.5b 变过（多了 c‖θ‖²），键名没变 —— 跨新旧 run
-# 的曲线不可直接比，见 compute_l2_report docstring 与 report `## Fix2（b）增补`。
+# 日志契约（不可动）：main() 仍用 loss / policy_loss / value_loss 三个键，下游
+# run.txt、看板与 tests/test_run_txt_sync.py 绑着它们，
+# tests/test_huber_loss.py::test_log_keys_unchanged 把三个键钉死。`loss` 的**含义**
+# 在 P4.5b 变过（多了 c‖θ‖²）、键名没变 ⇒ 跨新旧 run 的曲线不可直接比。
 #
-# P4.5 遗留问题的收口（用户 2026-09-27 裁决 = P4.5b）：policy 默认从 huber 改回
-# ce 之后，「policy 梯度天生弱 ~A 倍、共享主干因此 value-only」这个结构性缺陷
-# 从根上消失（Huber 打在概率域，梯度带 softmax 雅可比的 p≈1/A；CE 打在 log-prob
-# 上，d(CE)/d(logit)=p−y 每坐标有界且与 A 无关）。实测 ce+huber、w=1 的
-# value:policy 梯度比 = 1.113:1（与 P4.5 报告记录的 ce 备选口径逐位一致），
-# 与老的 ce+5·bce（2.225:1）同一量级，**不需要补偿旋钮**。
+# P4.5 遗留收口（用户 2026-09-27 裁决 = P4.5b）：policy 默认改回 ce 之后，「policy
+# 梯度天生弱 ~A 倍、共享主干因此 value-only」从根上消失（Huber 打在概率域，梯度
+# 带 softmax 雅可比的 p≈1/A；CE 打在 log-prob 上，d(CE)/d(logit)=p−y 有界且与 A
+# 无关）。实测 ce+huber、w=1 的 value:policy 梯度比 = 1.113:1，与 P4.5 记录的 ce
+# 备选口径逐位一致 ⇒ **不需要补偿旋钮**。
 #
-# **软标签接入（A2）新增了第三种 kind `soft_ce`（软 CE），但 CLI 侧
-# `--policy-loss` 的 choices 仍冻结在 ['huber','ce']** —— tests/test_huber_loss.py
-# ::test_no_new_cli_params 以 D1「零新增/零删除/零改名」把 61 个 flag 整个钉死。
-# `soft_ce` 与 `--soft-weight` 的 CLI 入口属 A4（那一票才允许改冻结集）。
+# `soft_ce`（软 CE）已实现，但 CLI 的 `--policy-loss` choices 仍冻结在
+# ['huber','ce'] —— tests/test_huber_loss.py::test_no_new_cli_params 以 D1
+# 「零新增/零删除/零改名」把 61 个 flag 整个钉死。`soft_ce` 与 `--soft-weight`
+# 的 CLI 入口属 A4。
 
 
 
@@ -4305,31 +4263,22 @@ def main():
 
     use_amp = args.use_amp == 1 or device.split(':')[0] == 'cuda'
 
-    # ---- 多后端自适应路径（CUDA / NPU / CPU）----
-    # 各后端能力差异很大，逐后端决定：
-    #   - amp_dtype:       A100/A800/H100(sm_80+) -> bfloat16（原生支持）
-    #                     Ascend 910B/910Pro -> float16 + GradScaler（**判据见
-    #                     `_backend == 'npu'` 分支的注释，那里是唯一事实源**）
-    #                     Ascend 910A/910C/其它 -> bfloat16、无 GradScaler
-    #                     ⚠ 本批卡 = `Ascend 910-9392`（910C），实测走 BF16。
-    #                       别拿「910B 只能 fp16」去推本批卡——910C 根本不匹配
-    #                       那三个子串，落到 else 的 BF16 分支。
+    # ---- 后端自适应（CUDA / CPU）----
+    #   - amp_dtype:       A100/A800/H100(sm_80+) -> bfloat16（原生支持）；
     #                     V100(sm_70, Volta) -> float16（无 bf16）
-    #   - use_scaler:      BF16 下关闭 GradScaler（不下溢，且 scaler 根本不会被创建
-    #                     ⇒ --scaler-init-scale / --scaler-growth-interval 是死参数）；
-    #                     FP16 下开启，此时这两个参数**仍然要给**（默认 0.0 = PyTorch
-    #                     的 65536，大 batch 下必炸）
-    #   - use_channels_last: A100 卷积走 NHWC 更快；NPU/CPU 收益有限默认关
-    #   - sdpa_force_math: 各后端天然默认不同——A100 走 SDPA/FlashAttn（False），
-    #                     V100/CPU 强制手写 math（True），NPU 默认放开 CANN 融合 SDPA
-    #                     （除非旧 torch_npu(<2.1)/SDPA API 缺失）。随后统一由
-    #                     --use-sdpa 总开关覆盖：--use-sdpa 0 强制所有后端回退手写
-    #                     math（调试/兼容性），--use-sdpa 1（默认）保留上述天然默认。
-    #   - compile_disable_sparse: 所有后端统一禁用——unfold 产生 (B, Hh*d, N, ws²) 巨型
-    #                      中间张量，inductor freezing 常量折叠会以 fp32 物化
-    #                      (B,N,Hh,ws²,d)（batch512 下单个 4.3GB）直接编译期 OOM；
-    #                      稀疏/窗口注意力走 eager+autocast（V100 验证过的稳定路径），
-    #                      编译图仅覆盖卷积/线性/FFN。NPU 上 inductor 本身不可用
+    #   - use_scaler:      BF16 下关闭（下溢不会发生 ⇒ scaler 不创建，
+    #                     --scaler-init-scale 等成了死参数）；FP16 下必须开，
+    #                     且两个参数仍要给（默认 0.0 = PyTorch 的 65536，大
+    #                     batch 下必炸）
+    #   - use_channels_last: A100 卷积走 NHWC 更快；CPU 收益有限，默认关
+    #   - sdpa_force_math: A100 走 SDPA/FlashAttn（False），V100/CPU 强制手写
+    #                     math（True）。随后由 --use-sdpa 总开关覆盖：0 强制全部
+    #                     回退 math（调试/兼容），1（默认）保留上述默认。
+    #   - compile_disable_sparse: 全后端统一禁用 —— unfold 产生
+    #                     (B, Hh*d, N, ws²) 巨型中间张量，inductor 常量折叠会以
+    #                     fp32 物化 (B,N,Hh,ws²,d)（batch512 下单个 4.3GB），
+    #                     编译期直接 OOM。稀疏/窗口注意力走 eager+autocast，
+    #                     编译图只覆盖卷积/线性/FFN。
     amp_dtype = torch.float16
     use_scaler = use_amp
     use_channels_last = False
@@ -4635,13 +4584,9 @@ def main():
     # 走检查点（per-kind 默认可以不同；且训练态闸门还要求 self.training +
     # grad enabled）。这段日志的用处是让「GC 到底生效没有」不必翻代码，也不必
     # 在云端日志里靠猜 —— 4×910A 首跑要看的就是它。
-    # 宿主两种拓扑都要认：
-    #   · 12 通道（`SharedBackbone`）—— mixin 挂在 `model.backbone` 上；
-    #   · 22 通道 V7（`NbtTfNet(GradCheckpointMixin, nn.Module)`）—— mixin 挂在
-    #     `model` **自己**上，它根本没有 `.backbone` 属性。
-    # 原来只查 `model.backbone` ⇒ **V7 永远打 `n/a`**，而这段日志的全部用处就是
-    # 「不翻代码就能看出 GC 到底生效没有」（注释里写的就是这个）。V7 是现役默认
-    # 模型，于是这段诊断对现役模型**完全失效**。先查 `model` 再退回 `.backbone`。
+    # mixin 宿主有两种拓扑：12 通道挂 `model.backbone`，V7（NbtTfNet 自己
+    # 继承 mixin、没有 `.backbone`）挂 `model`。原来只查后者 ⇒ V7 永远打 `n/a`，
+    # 而这段日志的全部用处就是让人不翻代码就看出 GC 有没有生效。
     _gc_owner = model if hasattr(model, 'grad_checkpointing_kinds') \
         else getattr(model, 'backbone', None)
     _gc_kinds = getattr(_gc_owner, 'grad_checkpointing_kinds', None)
@@ -4916,58 +4861,49 @@ def main():
     # 分布式：DDP 包裹需在 torch.compile 之后（算子融合与梯度同步可共存；反过来
     # compile 会被 wrapper 的动态边界吞掉，拿到的是未融合图）。
     #
-    # 为什么现在用 DDP（2026-10-01 换轨；**历史：换轨前用的是 FSDP1，已退役**）
+    # 为什么用 DDP 而非分片包裹（2026-10-01 换轨，FSDP1 已退役）
     # ------------------------------------------------------------------
-    # 触发事件：4 卡 910A 训练崩在 `ema.update()` 的
-    # `KeyError: 'backbone.stem_bn._fsdp_wrapped_module.weight'`。那套分片式
-    # 包裹层会把**内部**模块就地换成 wrapper（wrapper 又把自己的 `_fsdp_wrapped_module`
-    # 注册进父模块的 `_modules`），于是「包裹前建好的 EMA shadow」与
-    # 「包裹后 named_parameters() 遍历出来的键」不再是同一个键空间 ⇒ 每步都
-    # KeyError。DDP 只在**顶层**加一层 wrapper（键只是多一个 `module.` 前缀），
-    # 内部模块树原样不动 ⇒ 这整类崩溃消失，不需要任何针对它的补丁。
+    # 触发事件：4 卡训练崩在 `ema.update()` 的
+    # `KeyError: 'backbone.stem_bn._fsdp_wrapped_module.weight'`。分片包裹会把
+    # **内部**模块就地换成 wrapper，于是「包裹前建好的 EMA shadow」与「包裹后
+    # `named_parameters()` 遍历出来的键」不再是同一个键空间 ⇒ 每步都 KeyError。
+    # DDP 只在**顶层**加一层（键多一个 `module.` 前缀），内部模块树原样不动 ⇒
+    # 这整类崩溃消失，不需要任何针对它的补丁。
     #
     # 两个数字（9,067,443 参数 = fp32 36.3 MB / 32 GiB 卡）：
-    #   1. 显存：FSDP1 每 rank 约 145 MB（参数分片 + 梯度分片 + Adam 两矩分片），
-    #      DDP 每 rank 约 36.3 MB × 4（参数 + 梯度 + Adam 两矩各一份全量），
-    #      差约 109 MB = 0.33% 的卡。参数本来就装得下，分片省下的这点余量
-    #      不值得拿正确性风险换。
-    #   2. 通信：FSDP1 每步是「16 个分片单元 × 2 次 collective」（前向 all-gather
-    #      参数、反向 reduce-scatter 梯度），DDP 每次**反向**只有 1 次梯度
-    #      all-reduce +（`broadcast_buffers=True`）1 次 buffer broadcast。
-    # **「每步 1 次」是错的说法，本文件全无 `no_sync()`**（见本文件
-    #      `_compute_l2_report` docstring 里那条同源的说明）：每个 micro-batch 都
-    #      `backward()`，梯度累积只在 `_accum_steps` 满了才 `optimizer.step()`，
-    #      而 DDP 的梯度 all-reduce 挂在**每一次 backward 的收尾**上 ⇒ 默认的
-    #      `GRAD_ACCUM=2` 下**每个 optimizer step 是 2 次梯度 all-reduce + 2 次
-    #      buffer broadcast**（payload ≈ 2 × 36.4 MB ≈ 72.9 MB）。数量仍是
-    #      「16 个分片单元 × 2」的零头，通信量小到不像瓶颈，而本仓库的实际瓶颈
-    #      在算子（见 `[profile]` 日志）。
+    #   1. 显存：FSDP1 每 rank 约 145 MB（参数/梯度/Adam 两矩各分片），DDP 约
+    #      36.3 MB × 4（每项一份全量），差约 109 MB = 0.33% 的卡。参数本来就
+    #      装得下，这点余量不值得拿正确性风险换。
+    #   2. 通信：FSDP1 每步是「16 个分片单元 × 2 次 collective」，DDP 每次
+    #      **反向** 1 次梯度 all-reduce + 1 次 buffer broadcast。注意「每步 1 次」
+    #      是错的说法 —— 本文件全无 `no_sync()`（同源说明见
+    #      `_compute_l2_report` docstring）：每个 micro-batch 都 `backward()`，
+    #      all-reduce 挂在每次 backward 的收尾上 ⇒ `GRAD_ACCUM=2` 下每个
+    #      optimizer step 是 2 次 all-reduce + 2 次 broadcast（≈72.9 MB）。仍是
+    #      「16 × 2」的零头，通信不是瓶颈（本仓库瓶颈在算子，见 `[profile]`）。
     #
-    # 为什么 Task 1 的两个同步函数必须留在包裹点**之前**（顺序的硬要求）：
+    # 为什么上面两个同步函数必须留在包裹点**之前**（顺序的硬要求）：
     # `DistributedDataParallel.__init__` 在**它自己构造时**（`_ddp_init_helper` →
-    # `_sync_module_states`）把 rank0 的 params/buffers 广播出去，而构造发生在
-    # **EMA 构造之后**。所以若依赖 DDP 自带的同步：rank0 的 EMA shadow = rank0
-    # 自己的随机权重（正确），rank1~3 的 shadow = 各自被丢弃的随机权重（陈旧）
-    # ⇒ `ema.update()` 每步都把正确权重混进陈旧 shadow ⇒ **EMA 跨 rank 发散**，
-    # 且不报错。`main()` 里 `_sync_init_weights_from_rank0` /
-    # `_assert_init_weights_identical` 在 `.to(device)` 之后、EMA 之前，恰好堵住它。
+    # `_sync_module_states`）就广播 rank0 的 params/buffers，而构造发生在
+    # **EMA 构造之后** ⇒ rank1~3 的 shadow 会是各自被丢弃的随机权重，
+    # `ema.update()` 每步把正确权重混进陈旧 shadow ⇒ **EMA 跨 rank 发散**，且
+    # 不报错。`_sync_init_weights_from_rank0` / `_assert_init_weights_identical`
+    # 在 `.to(device)` 之后、EMA 之前，恰好堵住它。
     #
     # 构造参数**只有** `device_ids`，其余全默认（不新增任何 CLI flag）：
-    #   · `find_unused_parameters=False`（默认）：两个头（policy/value）每个 step
-    # 都参与 loss ⇒ 所有参数都有梯度。 这是**隐含前提**：将来若出现「某个头
-    #     不参与 loss」的分支，DDP 会抛
-    #     `Expected to have finished reduction in the prior iteration`
-    #     —— 好在它是**响亮**地失败，不会安静地错。
-    #   · `broadcast_buffers=True`（默认）：BN 的 `running_mean`/`running_var`
-    #     跨卡一致靠它；上一代分片式包裹层默认也是 True ⇒ 行为不变。
-    #   · `gradient_as_bucket_view=False`（默认）：本文件用
-#     `optimizer.zero_grad(set_to_none=True)`，bucket view 的别名每轮被销毁，
-#     省不掉拷贝，收益仅 ~36.27 MB/rank（= **全部梯度**的大小，torch 对该开关
-#     的定义就是"saved memory size will be equal to the total gradients
-#     size"；占 32 GiB 的 0.106%）；真正的风险是混用 view / 非 view 的 grad
-#     状态触发 `Expected to mark a variable ready only once`。收益配不上这类风险。
-    #   · `static_graph=False`（默认）：打开会禁止「iteration 边界内参数集合
-    #     变化」，收益未验证。
+    #   · `find_unused_parameters=False`：两个头每 step 都参与 loss ⇒ 所有参数都有
+    #     梯度。这是**隐含前提**：将来若出现「某个头不参与 loss」的分支，DDP 会抛
+    #     `Expected to have finished reduction in the prior iteration` —— 好在它
+    #     是**响亮**地失败，不会安静地错。
+    #   · `broadcast_buffers=True`：BN 的 `running_mean`/`running_var` 跨卡一致
+    #     靠它；上一代默认也是 True ⇒ 行为不变。
+    #   · `gradient_as_bucket_view=False`：本文件用 `zero_grad(set_to_none=True)`，
+    #     bucket view 的别名每轮被销毁、省不掉拷贝，收益仅 ~36.27 MB/rank
+    #     （= 全部梯度大小，torch 对该开关的定义就是如此；占 32 GiB 的 0.106%），
+    #     真正的风险是混用 view / 非 view 的 grad 状态触发
+    #     `Expected to mark a variable ready only once`。收益配不上这类风险。
+    #   · `static_graph=False`：打开会禁止「iteration 边界内参数集合变化」，
+    #     收益未验证。
     if is_dist:
         model = DistributedDataParallel(model, device_ids=[local_rank])
 
@@ -5449,27 +5385,19 @@ def main():
                         value_loss = compute_value_loss(
                             value_logit, value_t, args.value_loss,
                             huber_beta=args.huber_beta)
-                        # ---- 被 backward 的量：不含 c‖θ‖² ------------------------
-                        # 为什么 opt_loss **不含** L2 项：正则走的是 AdamW 的**解耦**
-                        # weight decay（θ ← θ − lr·wd·θ，发生在参数更新里），按构造就
-                        # 不在梯度里。若把 c‖θ‖² 加进来，优化目标会从「解耦衰减」变成
-                        # 「耦合 L2 + 再次解耦衰减」的双重正则，训练行为立刻变化且不报错
-                        # —— 这是 P4.5b 最容易踩的坑，故 opt_loss / log_loss 分开命名。
-                        #
-                        # ---- 被写进日志 `loss` 键的量：加上 c‖θ‖² ----------------
-                        # 为什么 log_loss 与 opt_loss **不相等**：用户裁决的总损失口径
-                        # 是 L = L_policy + L_value + c‖θ‖²，要让恒等式在日志上字面成立。
-                        # l2_report 是**报告口径**的量（compute_l2_report：从
-                        # optimizer.param_groups 读回真实的 weight_decay，只覆盖
-                        # weight_decay != 0 的组，与优化器实际衰减同一批参数），在本次
-                        # optimizer.step() **之前**算，故与两个损失项取自同一个 θ。
-                        # 恒等式在一次 fp32 加法的精度内成立； 反过来用
-                        # `log_loss − policy − value` 反推 l2_report 时要记得 fp32
-                        # 舍入：两项都是 O(1)~O(10)，差值只剩 ~1e-7 的绝对精度
-                        # （test_log_loss_identity 按这个容差断言）。
-                        # 但**真正的**精度上限是 stdout 的 `%.4f`（下面 logger.info
-                        # 里 loss/p/v 都是 4 位小数 ⇒ 量化步长 1e-4，对初值
-                        # l2_report=0.588 而言是 0.017%），不是 fp32 舍入。且
+                        # ---- 被 backward 的量 vs 写进日志 `loss` 的量 -------------
+                        # opt_loss **不含** L2 项：正则走的是 AdamW 的**解耦** weight
+                        # decay（θ ← θ − lr·wd·θ，发生在参数更新里），按构造就不在
+                        # 梯度里。把 c‖θ‖² 加进来会让目标从「解耦衰减」变成
+                        # 「耦合 L2 + 再次解耦衰减」的双重正则，训练行为立刻变化且
+                        # 不报错 —— 故 opt_loss / log_loss 分开命名。
+                        # log_loss 与 opt_loss **不相等**（用户裁决的总损失口径是
+                        # L = L_policy + L_value + c‖θ‖²，要让恒等式在日志上字面成立）：
+                        # l2_report 从 param_groups 读回真实 weight_decay、只覆盖
+                        # wd != 0 的组，在本次 step() **之前**算 ⇒ 与两个损失项取自
+                        # 同一个 θ，恒等式在一次 fp32 加法的精度内成立。
+                        # 但真正的精度上限是 stdout 的 `%.4f`（量化步长 1e-4，对
+                        # 初值 0.588 是 0.017%），不是 fp32 舍入。且
                         # `log_loss − policy − value` 只在 `--value-loss-weight == 1`
                         # 时等于 l2_report；w≠1 时它是 w·value。
                         # 读 loss 曲线的人必须知道：log_loss **不是**被优化的目标。
@@ -6146,13 +6074,9 @@ def main():
                 # 永远收不到停止信号。
                 _sync_stop_flag(stop_flag, is_dist, args.early_stop == 1)
 
-                # `.item()` 是**同步点**（D2H + 阻塞等队列排空），而这一行在
-                # **每个 step** 都跑。`stop_flag` 的唯一写入点是上面
-                # `if args.early_stop == 1 and is_main:` 里的 `fill_(1)` ——
-                # 早停没开时它恒为 0，这次同步每次都白付：把 host 拉回等 GPU，
-                # 下一个 step 的 kernel 发射就排不上去。
-                # 门控用的是 `args.early_stop == 1` 而不是「有没有置位」，因为
-                # 判断「有没有置位」本身就得先 `.item()`，那就等于没优化。
+                # `.item()` 是同步点，而 stop_flag 只在 `args.early_stop == 1`
+                # 时才可能被置位 ⇒ 早停没开时每次都白付（把 host 拉回等 GPU）。
+                # 不能改成「先查有没有置位」—— 那本身就得先 `.item()`。
                 if args.early_stop == 1 and stop_flag.item():
                     break
 

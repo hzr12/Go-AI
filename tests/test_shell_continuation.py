@@ -7,8 +7,8 @@
 --prefetch-workers / --log-every / --early-stop / --out / --export-onnx / --c2net /
 "$@" 等全部丢失，脚本再把余下各行当成独立命令 → `command not found`（exit 127）。
 
-实测这正是 shell/train_sft_npu_4card.sh 与 _2card.sh 的 `--scaler-growth-interval`
-那一行。详见 .superpowers/sdd/2026-09-25-v21-roadmap/task-p1-5-report.md。
+实测这正是 shell/ 下多卡脚本的 `--scaler-growth-interval` 那一行。详见
+.superpowers/sdd/2026-09-25-v21-roadmap/task-p1-5-report.md。
 
 为什么 tests/test_run_py_sh.py 的 test_shell_script_args_are_parseable 也没抓到：
 它确实把 .sh 的参数抽出来真送进了 argparse，但总是追加 `--help`。argparse 在
@@ -19,8 +19,8 @@ exit 0、stderr 无 unrecognized）。
 所以这里改成真跑 bash：用 stub 顶替 torchrun，把脚本里那段**真实字节**原样接在
 stub 之后执行，然后检查 stub 实际收到的 argv。
 
-探针不执行真实训练：stub 必须在被 source 的真实字节**之前**定义，torchrun/NPU/
-训练脚本一个都不会被启动。抽取的字节里那些 $DATA/$BATCH 等变量未定义（探针刻意
+探针不执行真实训练：stub 必须在被 source 的真实字节**之前**定义，torchrun 与训练脚本
+一个都不会被启动。抽取的字节里那些 $DATA/$BATCH 等变量未定义（探针刻意
 不带上半部分），bash 默认展开为空串——本测试只关心 argv 的**结构与完整性**，
 不校验取值。
 """
@@ -36,7 +36,8 @@ SHELL_DIR = os.path.join(ROOT, 'shell')
 
 SENTINEL = '--sentinel-d7-probe'
 
-TARGETS = ('train_sft_npu_4card.sh', 'train_sft_npu_2card.sh')
+# 现存的训练脚本（2026-10-09 NPU 移除后只剩 A100 单卡这一支）。
+TARGETS = ('train_sft_a100_1card.sh',)
 
 # 续行一旦断掉就会丢掉的参数：全在出问题那一行之后。
 REQUIRED_FLAGS = (
@@ -90,7 +91,7 @@ def _run_probe(script_name, tmp_path):
 
 @pytest.mark.skipif(shutil.which('bash') is None, reason='无 bash')
 @pytest.mark.parametrize('script', TARGETS)
-def test_sft_npu_scripts_deliver_complete_argv(script, tmp_path):
+def test_sft_scripts_deliver_complete_argv(script, tmp_path):
     """训练命令必须把完整 argv 交给 torchrun，且 "$@" 透传到末尾。"""
     argv, stderr, rc = _run_probe(script, tmp_path)
 

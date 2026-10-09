@@ -609,21 +609,13 @@ def _first_tensor(args):
 
 
 def _checkpointed(runner, args, bns):
-    # `context_fn` 何时**可以不给**（实测 A100 上这不是优化而是必需，见下）
-    # ------------------------------------------------------------------
-    # 两个职责分别处理：
-    #   1) BatchNorm 统计还原 —— `bns` 非空时**必须**给，没有条件。
-    #   2) 重算期恢复 autocast —— 由 `_recompute_preserves_autocast` 在本机
-    #      真 torch 上探一次；探针说「non-reentrant 自己就保住了」就不给。
-    #
-    # ⚠ 为什么第 2 条在 A100 上是**必需**而不是锦上添花：传 `context_fn` 会让
-    #   Dynamo 在**每个检查点段**各断一次图（实测 graphs 3 / breaks 2，理由
-    #   `guard_as_python_constant AutocastModeVariable()`），不传则是
-    #   graphs 1 / breaks 0。断图意味着 inductor 拿不到整图、融合基本失效 ——
-    #   那就等于「为了省显存而把融合全丢了」，是最差的组合。
-    #   而 `_recompute_context_fn` 的 docstring 里那条「不给就退回 fp32、
-    #   体积翻倍、910A OOM」是 **torch 2.1** 的现象；torch 2.12 实测不成立。
-    #   所以这里不按版本号猜，而是探针实测（见该函数 docstring）。
+    # `context_fn` 何时可以不给：
+    #   1) BN 统计还原 —— `bns` 非空时必须给，没有条件；
+    #   2) 重算期 autocast —— 由探针在本机真 torch 上问一次。
+    # 第 2 条在 A100 上是**必需**而非优化：传 `context_fn` 会让 Dynamo 每个
+    # 检查点段断一次图（graphs 3/breaks 2，不传是 1/0），融合基本失效。
+    # 「不给就退回 fp32、910A OOM」是 torch 2.1 的现象，2.12 不成立 ——
+    # 故按探针实测而非版本号硬判。
     need_bn_guard = bool(bns)
     need_ac = not _recompute_preserves_autocast(
         _first_tensor(args).device.type if _first_tensor(args) is not None

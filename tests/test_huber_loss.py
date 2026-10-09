@@ -1547,14 +1547,9 @@ def test_no_new_cli_params():
         '--attn-query-chunk',     # math 注意力 query 分块
         '--attn-chunk-ckpt',      # math 注意力逐 chunk 检查点
         # ---- 2026-10-08 新增的 1 个：图编译与梯度检查点共存（A100 40G 迁移）----
-        # `--gc-with-compile`（默认 0）让 `--compile` 与 gradient checkpointing
-        # **同时**开启。默认 0 = 保持历史行为，所以既有命令行逐位不变。
-        # 为什么要留这个口：40GB 卡上「开 compile 就强制 `_gc = 0`」等于
-        # 「要融合就得把 batch 调小到吃不满算力」，而 batch 缩小吃掉的吞吐通常
-        # 远大于融合省下的。技术上成立是因为检查点走 `use_reentrant=False`
-        # （`backbone._checkpointed` 已经是），与整模型 `torch.compile` 兼容。
-        # **不适用**于 `--npu-graph-compile`（逐 Linear 编译的产物落在检查点段
-        # 内部，真的互斥）—— 判据见 `train_sft.resolve_grad_checkpoint`。
+        # `--gc-with-compile`（默认 0 = 保持历史行为，既有命令行逐位不变）让
+        # `--compile` 与 GC 同时开：40GB 卡上「要融合就得把 batch 调小到吃不满
+        # 算力」，而 batch 缩小的吞吐损失通常大于融合收益。
         '--gc-with-compile',
     }
     got = set(kw)
