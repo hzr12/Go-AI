@@ -400,14 +400,29 @@ def test_bn_guard_is_actually_entered_only_on_recompute():
     finally:
         _BatchNormStatGuard.__enter__ = orig
     # 被检查点的**块**数（不是段数！）：`GC_PER_BLOCK_DEFAULT` 里 res 与
-    # transformer 都是**逐块**粒度（= V18 旧机制），所以守卫在重算期进入的
-    # 次数 = 被检查点的块数。TransformerBlock 不含 BN，守卫对它空转，
-    # 但「每个被检查点的块进一次」这个口径不变。
+    # transformer 都是**逐块**粒度（= V18 旧机制）。
+    #
+    # ⚠ 计数口径 2026-10-08 收窄为「**含 BatchNorm 的**被检查点块」。
+    #   原来数的是全部被检查点块，靠「BN-less 的 transformer 块也传 context_fn、
+    #   守卫对它空转」凑够数。现在 `_checkpointed` 在 `bns` 为空**且**探针确认
+    #   「non-reentrant 自己就保住重算期 autocast」时**不再传 `context_fn`**
+    #   （传了会让 Dynamo 每个检查点段断一次图 ⇒ 融合失效，理由见该函数
+    #   docstring），于是 BN-less 段的守卫压根不进。
+    #   这不是把不变量放宽：BN-less 段本来就没有 BN 统计要还原，守卫进去也是
+    #   空转。真正被这条测试锁住的是「**有 BN 的段，守卫只在重算期进、且恰好
+    #   一次**」—— 那部分一分没松。
     slices = {GC_RES: RES_SLICE, GC_TRANSFORMER: TRANS_SLICE}
-    n_ckpt = sum(len(m.blocks[sl]) for k, sl in slices.items()
-                 if m.grad_checkpointing_for(k))
-    assert len(seen) == n_ckpt, \
-        '重算期间守卫进入次数应为「被检查点的块数」%d，实得 %d' % (n_ckpt, len(seen))
+    n_ckpt_bn = 0
+    for k, sl in slices.items():
+        if not m.grad_checkpointing_for(k):
+            continue
+        for blk in m.blocks[sl]:
+            if any(isinstance(mod, torch.nn.modules.batchnorm._BatchNorm)
+                   for mod in blk.modules()):
+                n_ckpt_bn += 1
+    assert len(seen) == n_ckpt_bn, (
+        '重算期间守卫进入次数应为「含 BN 的被检查点块数」%d，实得 %d'
+        % (n_ckpt_bn, len(seen)))
 
 
 # ============================================================================ #
