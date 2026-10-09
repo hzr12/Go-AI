@@ -11,7 +11,7 @@
 AICore 0% 说明它们只占显存不干活（纯 numpy 取数）。
 
 根因：`_BatchPrefetcher` 用 `mp.Process`（Linux 默认 fork）构造于
-`init_process_group` / `torch.npu.set_device` / 分布式包裹**之后**。fork 复制
+`init_process_group` / `torch.cuda.set_device` / 分布式包裹**之后**。fork 复制
 地址空间 ⇒ CANN 设备上下文与显存映射被整份继承。GC 只管 torch 张量，管不到
 别的进程继承来的映射，所以任何 GC / batch / chunk 调整都治不了它。
 
@@ -91,33 +91,22 @@ def test_guard_rejects_prefetcher_after_device_init():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
-    class _FakeNpu:
+    class _FakeCuda:
         @staticmethod
         def is_initialized():
             return True
 
-    class _FakeCuda:
-        @staticmethod
-        def is_initialized():
-            return False
-
-    real_npu = getattr(torch, 'npu', None)
     real_cuda = getattr(torch, 'cuda', None)
-    torch.npu = _FakeNpu
     torch.cuda = _FakeCuda
     try:
         with pytest.raises(RuntimeError, match='继承设备上下文'):
             mod._BatchPrefetcher(object(), num_workers=2, prefetch=1)
     finally:
-        if real_npu is not None:
-            torch.npu = real_npu
-        else:
-            delattr(torch, 'npu')
         torch.cuda = real_cuda
 
 
 def test_guard_passes_when_no_device_runtime():
-    """没有设备运行时时护栏不得误伤（真机首启时 torch.npu.is_initialized 为 False）。"""
+    """没有设备运行时时护栏不得误伤（真机首启时 torch.cuda.is_initialized 为 False）。"""
     import importlib.util
     spec = importlib.util.spec_from_file_location('_train_sft_probe2', SRC_PATH)
     mod = importlib.util.module_from_spec(spec)

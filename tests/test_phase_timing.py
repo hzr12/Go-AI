@@ -125,18 +125,26 @@ def test_no_synchronize_in_training_path():
 
     计时必须纯 CPU 侧。插 synchronize 会把预取与双缓冲流水打断，
     测出来的数还比真实更慢。
-    注意 _cuda_free/_npu_free 里的 synchronize 属设备选择、在 main 之前，
+    注意 _cuda_free 里的 synchronize 属设备选择、在 main 之前，
     是合法且必须保留的，故只检查 main 之后的区域。
     """
     m = re.search(r'^def main\(', CODE, re.M)
     assert m, '未找到 main()'
     body = CODE[m.start():]
-    for bad in ('npu.synchronize', 'cuda.synchronize'):
+    for bad in ('cuda.synchronize',):
         assert bad not in body, \
             f'main() 内出现 {bad}：会打断预取/双缓冲流水'
-    # 设备选择辅助函数在 main 之前，允许存在
-    assert 'cuda.synchronize' in CODE[:m.start()], \
-        '设备选择的 _cuda_free 应保留 synchronize（用于探测空闲显存）'
+    # ⚠ 2026-10-08：这条断言的方向**反转**了。
+    # 原来要求「main 之前保留 `cuda.synchronize`」，因为设备选择要用它探测空闲
+    # 显存。但那个 synchronize（连同 `get_device_properties` /
+    # `memory_allocated`）会 `_lazy_init()` 建 CUDA primary context，而设备
+    # 选择发生在 **fork 预取 worker 之前** ⇒ worker 整份继承设备上下文
+    # （A100 40G 上直接被 `_BatchPrefetcher` 的护栏拒绝启动，报错还指向错的地方）。
+    # 现在设备选择一律走 NVML（`nvidia-smi`），所以这里**禁止**再出现。
+    # 顺序不变量由 `tests/test_prefetch_fork_ordering.py` 用 AST 锁住。
+    assert 'cuda.synchronize' not in CODE, \
+        '全仓库不得再出现 cuda.synchronize：它会建 CUDA context，而 fork 出的' \
+        '预取 worker 会继承它（A100 首次启动就是这么崩的）。用 nvidia-smi。'
 
 
 def test_all_four_accumulators_initialised():
@@ -347,23 +355,28 @@ def test_memory_line_reports_reserved_only():
       · **OOM 报错本身就是更好的报告**：它在压力最大那一刻给出 allocated +
         reserved + free，配合 `total` 就能反推 torch 之外的占用
         （`32.00 − 27.02 − 0.62 = 4.36 GiB`）。常打一个「平时的 reserved」信息更少。
-      · `torch.npu.max_memory_allocated` 当时全仓库只有那一处、没在 torch_npu 2.1
-        上验证过，而它在日志路径上抛异常就是**第 50 步崩** —— 正好毁掉最需要那个
-        数的时刻。观测不该有能力杀死被观测的进程。
+      · `max_memory_allocated` 当时全仓库只有那一处、且在部分后端上没验证过，
+        而它在日志路径上抛异常就是**第 50 步崩** —— 正好毁掉最需要那个数的
+        时刻。观测不该有能力杀死被观测的进程。
     本测试锁住这个「刻意不加」的选择：将来有人看到只有一个数又想把三个加回来时，
     会先撞到这里。
     """
     assert re.search(r'mem=%\.2fGB', SRC), 'mem 行应打 reserved'
     assert 'max_memory_allocated' not in CODE, \
-        'max_memory_allocated 全仓库不该出现（当时只有那一处、未在 torch_npu 2.1 验证）'
+        'max_memory_allocated 全仓库不该出现（理由见 docstring）'
     # 只在**日志打点附近**禁 memory_allocated：`_auto_select_device` 里选最空的卡
-    # 本来就在用 `torch.npu.memory_allocated(idx)`，那是既有且必要的。
+    # 本来就在用 `torch.cuda.memory_allocated(idx)`，那是既有且必要的。
     i = CODE.find('mem=%.2fGB')
     window = CODE[max(0, i - 2500):i + 2500]
     assert 'memory_allocated' not in window, \
         '日志打点附近不应再出现 memory_allocated（见 docstring 的两条理由）'
     # OOM 恢复路径里的 empty_cache 是既有的、必须保留
-    assert SRC.count('npu_empty_cache()') >= 2, 'OOM 恢复路径的 empty_cache 被误删'
+    # OOM 恢复路径（`except` 分支）里那一次 empty_cache 必须还在。
+    # 计数从 >=2 收紧成 >=1：NPU 后端下线前这个断言靠 `npu_empty_cache()` 凑够
+    # 两处，现在 CUDA 只剩 OOM 分支这一处真实调用（另一处引用在注释里）。
+    # 要守的是「它在」，不是「它有几处」。
+    assert SRC.count('torch.cuda.empty_cache()') >= 1, \
+        'OOM 恢复路径的 empty_cache 被误删'
 
 
 def test_effective_batch_for_throughput_includes_accumulation():

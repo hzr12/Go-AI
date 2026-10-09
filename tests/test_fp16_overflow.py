@@ -284,23 +284,6 @@ def test_scaler_init_scale_and_growth_are_configurable():
     assert m and int(m.group(1)) == 0, 'growth-interval 默认应为 0（沿用 PyTorch 默认）'
 
 
-def test_npu_grad_scaler_forwards_kwargs():
-    """torch.npu.amp.GradScaler 必须能收到 init_scale / growth_interval。"""
-    assert 'def npu_grad_scaler(enabled: bool, **kwargs):' in SRC, \
-        'npu_grad_scaler 需接受并转发关键字参数，否则 NPU 上的配置无效'
-    assert 'torch.npu.amp.GradScaler(enabled=enabled, **kwargs)' in SRC
-
-
-def test_scaler_kwargs_actually_applied():
-    """配置非零时才传参，避免给不支持关键字的旧版后端传空 kwargs。"""
-    blk = SRC[max(0, SRC.index('_scaler_kwargs = {}') - 200):
-              SRC.index('npu_grad_scaler(enabled=use_scaler')]
-    assert 'if args.scaler_init_scale and args.scaler_init_scale > 0:' in blk, \
-        'init_scale 应有非零判断'
-    assert 'if args.scaler_growth_interval and args.scaler_growth_interval > 0:' in blk, \
-        'growth_interval 应有非零判断'
-
-
 def test_resume_may_override_scale():
     """resume 会 load_state_dict 覆盖缩放值——这是预期行为，但需留有痕迹。
 
@@ -450,3 +433,21 @@ def test_locate_overflow_handles_no_grads():
     t._locate_overflow(opt, _L())
     assert any('没有 inf/nan' in m or '未在参数组中找到' in m
                for m in msgs), f'应提示未找到 inf/nan：{msgs}'
+
+
+def test_scaler_kwargs_actually_applied():
+    """配置非零时才把 `init_scale` / `growth_interval` 传进去。
+
+    为什么重要（且仍成立）：V100 是 fp16 路径，`--scaler-init-scale` 是真参数。
+    不传 ⇒ 用代码默认 0.0 = PyTorch 的 65536，大 batch 下要靠减半一路往下搜
+    平衡点，每次溢出都白扔一个 batch。给了已知平衡点（1024）并把
+    `growth_interval` 调大（关掉自动回涨）就能一次到位、且防震荡。
+    """
+    blk = SRC[max(0, SRC.index('_scaler_kwargs = {}') - 200):
+              SRC.index('_scaler_kwargs = {}') + 700]
+    assert "if args.scaler_init_scale and args.scaler_init_scale > 0:" in blk, \
+        'init_scale 必须**非零才传**，否则等于把 0.0 塞给后端'
+    assert "_scaler_kwargs['init_scale'] = float(args.scaler_init_scale)" in blk
+    assert ("if args.scaler_growth_interval and args.scaler_growth_interval > 0:"
+            in blk), 'growth_interval 同理：0 不该传'
+    assert "_scaler_kwargs['growth_interval'] = int(args.scaler_growth_interval)" in blk

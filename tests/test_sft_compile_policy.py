@@ -35,7 +35,6 @@ if ROOT not in sys.path:
 from scripts.train_sft import (  # noqa: E402
     GC_REASON_COMPILE_EXCLUSIVE,
     GC_REASON_GC_WITH_COMPILE,
-    GC_REASON_NPU_LINEAR,
     resolve_grad_checkpoint,
 )
 
@@ -44,37 +43,52 @@ _SRC = open(os.path.join(ROOT, 'scripts', 'train_sft.py'),
 
 #: 整张策略表。`(开关, 期望的 gc, 期望的 reason)`；`grad_checkpoint` 固定传 1。
 #:
-#: 写成一张表而不是一条条 test，是为了让「NPU 那条优先于整模型那条」这条
-#: **顺序不变量**和其余组合在同一处可见 —— 拆成独立 test 时，判据顺序写错
-#: 反而可能各自都绿。reason 也在同一行被钉住，所以三个常量撞名会让本表红。
+#: 写成一张表而不是一条条 test，是为了让所有组合在同一处可见。
+#: reason 也在同一行被钉住，所以两个常量撞名会让本表红。
+#:
+#: ⚠ 2026-10-08 表里少了「NPU 逐 Linear 编译」那三行：整个 NPU 后端连同
+#:   `--npu-graph-compile` 已删除（硬件迁到 A100 / V100）。原先那条不变量
+#:   「NPU 那条不许被 `--gc-with-compile` 放行」随之后端一起消失 —— 现在
+#:   **只剩一种编译形态**（整模型 `torch.compile`），而它与 GC 是兼容的，
+#:   所以 `resolve_grad_checkpoint` 只剩两个 reason。
 _POLICY = [
     ('无图编译', dict(), 1, None),
     ('整模型 compile（默认关 GC）',
      dict(compile_on=True), 0, GC_REASON_COMPILE_EXCLUSIVE),
     ('整模型 compile + gc-with-compile',
      dict(compile_on=True, gc_with_compile=True), 1, GC_REASON_GC_WITH_COMPILE),
-    ('NPU 逐 Linear compile',
-     dict(npu_linear_compile=True), 0, GC_REASON_NPU_LINEAR),
-    # 下面两行是**不许被放行**的那两条：放行 = 启动不报错、第一个 step 才炸。
-    ('NPU 逐 Linear + gc-with-compile（仍须关）',
-     dict(npu_linear_compile=True, gc_with_compile=True), 0, GC_REASON_NPU_LINEAR),
-    ('两种 compile 同开（逐 Linear 优先）',
-     dict(compile_on=True, npu_linear_compile=True, gc_with_compile=True),
-     0, GC_REASON_NPU_LINEAR),
 ]
+
+
+def test_npu_backend_is_gone_from_the_compile_policy():
+    """NPU 已整体移除，`resolve_grad_checkpoint` 不得再留那条互斥分支。
+
+    这条钉的是「删干净了」而不是行为：若有人把 `--npu-graph-compile` 复活，
+    签名里就会多回一个维度，而**那一维必须重新决定是否放行 GC**（逐 Linear
+    编译的产物落在检查点段内部，真的互斥）。这里提醒的是那条推理，不是禁令。
+    """
+    import inspect
+    import scripts.train_sft as t
+    params = inspect.signature(t.resolve_grad_checkpoint).parameters
+    assert 'npu_linear_compile' not in params, (
+        'resolve_grad_checkpoint 又出现了 npu_linear_compile —— 若 NPU 逐 Linear '
+        '编译被复活，必须同时决定它与 --gc-with-compile 的关系（真互斥，不放行）')
+    assert not hasattr(t, 'GC_REASON_NPU_LINEAR')
+    assert "--npu-graph-compile" not in _SRC, \
+        '训练脚本里还有 --npu-graph-compile（后端已删除）'
 
 
 @pytest.mark.parametrize('flags,exp_gc,exp_reason', [c[1:] for c in _POLICY],
                          ids=[c[0] for c in _POLICY])
 def test_policy_table(flags, exp_gc, exp_reason):
-    kw = dict(compile_on=False, npu_linear_compile=False, gc_with_compile=False)
+    kw = dict(compile_on=False, gc_with_compile=False)
     kw.update(flags)
     assert resolve_grad_checkpoint(1, **kw) == (exp_gc, exp_reason)
 
 
 def test_configured_zero_is_respected():
     """配置本身是 0 时不要被「无图编译」这条路径抬成 1。"""
-    off = dict(compile_on=False, npu_linear_compile=False, gc_with_compile=False)
+    off = dict(compile_on=False, gc_with_compile=False)
     assert resolve_grad_checkpoint(0, **off) == (0, None)
     assert resolve_grad_checkpoint(0, **dict(off, compile_on=True,
                                               gc_with_compile=True)) == (

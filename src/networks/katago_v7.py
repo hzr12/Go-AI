@@ -10,7 +10,7 @@
 ==========  ====  ====================================================
 ``C``        256    trunk 宽度
 ``M``        128    nbt 内宽 = C/2，须被 32 整除
-``H``        4      注意力头数 ⇒ ``head_dim = M/H = 32``（CANN 支持集 {16,32,64}）
+``H``        4      注意力头数 ⇒ ``head_dim = M/H = 32``（对齐主流 attention kernel 的 head_dim 支持集）
 ``F``        384    SwiGLU 隐层 = 1.5C
 ``B``        11     nbt 块数。每个块 2 个内块，纯 nbt（GAU 已关，见 `gau_positions=None`）
 ``G``        0      无 gpool 块
@@ -55,60 +55,6 @@ from src.networks.backbone import (
     GradCheckpointMixin,
     _sdpa,
 )
-
-# ---- NPU 融合 SwiGLU（可选加速，带运行时回退）----------------------------
-# torch_npu 缺失或 npu_swiglu 不可用/自检不过时，SwiGLU 退化为标准实现
-# （F.silu(up(x)) * gate(x) 再 down），数值行为完全不变。
-try:
-    import torch_npu  # 仅在 NPU 环境可导入
-    _HAS_NPU_SWIGLU = hasattr(torch_npu, 'npu_swiglu')
-except Exception:
-    torch_npu = None
-    _HAS_NPU_SWIGLU = False
-
-
-def set_npu_swiglu(enabled: bool) -> None:
-    """NPU 融合 SwiGLU 开关（对应 CLI ``--npu-swiglu``，2026-10-06 从环境变量搬来）。
-
-    `False` = 强制走标准路径（`F.silu(up(x)) * gate(x)` 再 down），数值不变、
-    只慢不坏。是「融合路径是不是坏的」这个问题的总闸（2026-10-06 融合首次真跑后
-    真机出现过前向 NaN，需要能单独二分它）。
-    """
-    global _HAS_NPU_SWIGLU
-    _HAS_NPU_SWIGLU = bool(enabled) and torch_npu is not None
-
-#: 融合可用性（运行时会被自检/调用异常降级为 False）。模块级 ⇒ **失败只告警一次**
-#: —— 原实现每个 SwiGLU 每 step 都 warning 一条（V7 主干 6 处 × 每 step），真机日志
-#: 已被 `[SwiGLU] NPU 融合失败` 刷爆（2026-10-06）。
-_npu_swiglu_ok = _HAS_NPU_SWIGLU
-_npu_swiglu_checked = False
-
-
-def _npu_swiglu(y, dim=-1):
-    """torch_npu.npu_swiglu 薄封装。
-
-    CANN 签名是 ``npu_swiglu(Tensor input, int dim=-1)``：**输入是已沿 dim 拼好
-    的 (…, 2H) 张量**，内部自己分半，返回 ``silu(a) * b``（a=前半过 SiLU，b=后半），
-    与 Megatron-core / MindSpeed 的 chunk 口径一致。它**不吃**两张权重矩阵 ——
-    旧封装 ``npu_swiglu(x, w1, w2)`` 正是因此每次都抛
-    ``expected at most 2 argument(s) but received 3``，整体退回标准路径。
-    """
-    return torch_npu.npu_swiglu(y, dim)
-
-
-def _swiglu_fusion_selfcheck(dev):
-    """分半顺序自检：钉住「silu(前半) * 后半」。
-
-    若某个 CANN 版本的分半语义相反（silu 在后半），融合会给出**错值而非异常** ——
-    forward 的 try/except 抓不住，训练会静默学错。故在首个融合调用处用随机小张量
-    对拍一次；不匹配则调用方永久关闭融合（退标准路径）。
-    """
-    y = torch.randn(16, 64, device=dev, dtype=torch.float16)
-    a, b = y[:, :32], y[:, 32:]
-    fused = torch_npu.npu_swiglu(y, -1).float()
-    ref = (F.silu(a) * b).float()
-    return bool(torch.allclose(fused, ref, atol=1e-2, rtol=1e-2))
-
 
 #: spec §3 的形状常量。结构**只由这张表**决定（与 `train_sft.KATAGO_SE_CFG`
 #: 同一立场：结构不许由调用方零散覆盖）。
@@ -408,7 +354,7 @@ class MHSA(nn.Module):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError(f'dim {dim} 必须被 num_heads {num_heads} 整除'
-                             f'（head_dim 要落在 CANN 支持集 {{16,32,64}}）')
+                             f'（head_dim 要落在主流 kernel 的支持集 {{16,32,64}}）')
         self.dim = int(dim)
         self.num_heads = int(num_heads)
         self.head_dim = self.dim // self.num_heads
@@ -536,32 +482,6 @@ class SwiGLU(nn.Module):
         return self
 
     def forward(self, x):
-        global _npu_swiglu_ok, _npu_swiglu_checked
-        # NPU 融合：npu_swiglu 把「SiLU 激活 + 门控相乘」合成一个 kernel（GEMM 仍是
-        # up/gate 两次，融合的是逐元素部分），减少 kernel launch / 显存往返。
-        # 输入须沿末维拼成 (…, 2H)：silu(up(x)) * gate(x) ⟺ npu_swiglu(cat(up, gate))
-        # （前半过 SiLU）。bias=False 的 _ScaledLinear 的缩放已在 initialize 时
-        # bake 进 weight，无运行时额外缩放，数学上与下方标准路径等价。
-        if x.device.type == 'npu' and _npu_swiglu_ok:
-            try:
-                if not _npu_swiglu_checked:
-                    _npu_swiglu_checked = True
-                    if not _swiglu_fusion_selfcheck(x.device):
-                        _npu_swiglu_ok = False
-                        import logging
-                        logging.getLogger(__name__).warning(
-                            "[SwiGLU] npu_swiglu 分半顺序自检不匹配"
-                            "（非 silu(前半)*后半），本进程内永久退回标准路径")
-                        return self.down(F.silu(self.up(x)) * self.gate(x))
-                return self.down(
-                    _npu_swiglu(torch.cat((self.up(x), self.gate(x)), dim=-1)))
-            except Exception as _e:
-                # 融合失败（签名/设备异常等）不要静默吞掉，但也**不要每 step 都重试
-                # 刷告警**：置 False 永久退回标准路径，只告警一次。
-                _npu_swiglu_ok = False
-                import logging
-                logging.getLogger(__name__).warning(
-                    "[SwiGLU] NPU 融合失败，本进程内永久退回标准路径: %s", _e)
         return self.down(F.silu(self.up(x)) * self.gate(x))
 
 
@@ -670,16 +590,16 @@ class GatedAttentionUnit(nn.Module):
     --------------
     ``e``（U/V 的宽度）必须能被 ``head_dim`` 整除：V 要切成 ``Hg = e/hd`` 份当
     注意力的 value 头。**这样 value 的 head_dim 与 Q/K 相同** —— 手写注意力
-    （``relu²(QKᵀ·s+b)``）要求 q/k/v 的 head_dim 一致，CANN 同理。
+    （``relu²(QKᵀ·s+b)``）要求 q/k/v 的 head_dim 一致。
     ``head_dim`` 由调用方给的 ``num_heads`` 推出
-    （``dim // num_heads``），锁在 CANN 支持集 {16,32,64}。
+    （``dim // num_heads``），锁在主流 kernel 的支持集 {16,32,64}。
     """
 
     def __init__(self, dim, num_heads, hidden=None, attn_dropout=0.0):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError(f'dim {dim} 必须被 num_heads {num_heads} 整除'
-                             f'（head_dim 要落在 CANN 支持集 {{16,32,64}}）')
+                             f'（head_dim 要落在主流 kernel 的支持集 {{16,32,64}}）')
         self.dim = int(dim)
         self.head_dim = self.dim // int(num_heads)
         # U/V 的宽度。默认沿用 `ffn_hidden`，让 GAU 的 FFN 宽度与 `SwiGLU` 一致。

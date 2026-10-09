@@ -211,44 +211,6 @@ def test_fused_path_matches_standard_within_tolerance():
         f'（实测基准 2.38e-7；超此容差说明超参/分组口径分叉，不是 ULP 噪声）')
 
 
-# --------------------------------------------------------------------------- #
-# 3. NPU：torch_npu 在场 ⇒ fused；不在场 ⇒ standard（import 失败回退）。
-#    历史：2026-10-06 曾因「post10 构造疑似挂死」短暂关闭（_NPU_FUSED_ATTEMPT
-#    =False），随后 12:20 的 B 段 run 用 fused 在 post10 上完整跑了 100+ 步
-#    （900 s/s），证明构造可用——那次挂死更可能是 C 段 V7PackedDataset 读
-#    37.6GB 分片的静默加载期。故门控回到 True；若真机再复现构造挂死，用
-#    py-spy 抓栈后把 _NPU_FUSED_ATTEMPT 翻回 False。
-# --------------------------------------------------------------------------- #
-def test_npu_fused_adamw_selected_when_torch_npu_available(monkeypatch):
-    """torch_npu（桩）存在 ⇒ npu 走 fused，且构造吃的是**同一个** param_groups。"""
-    import types
-
-    seen = {}
-
-    class _FakeNPUFusedAdamW(torch.optim.AdamW):
-        def __init__(self, params):
-            super().__init__(params)
-            seen['n_groups'] = len(params)
-            seen['lrs'] = [g['lr'] for g in params]
-
-    fake_opt = types.ModuleType('torch_npu.optim')
-    # 真名是小写 npu 前缀（真机 torch_npu 2.1.0.post10 的 dir() 实测：
-    # NpuFusedAdamW；旧文档拼作 NPUFusedAdamW，build_adamw 两种都吃）。
-    fake_opt.NpuFusedAdamW = _FakeNPUFusedAdamW
-    fake_tnpu = types.ModuleType('torch_npu')
-    fake_tnpu.optim = fake_opt
-    monkeypatch.setitem(sys.modules, 'torch_npu', fake_tnpu)
-    monkeypatch.setitem(sys.modules, 'torch_npu.optim', fake_opt)
-
-    net = _seeded()
-    groups = _build_param_groups(net, _Args())
-    opt, mode = build_adamw(groups, 'npu')
-    assert mode == 'fused', f'torch_npu 在场时 npu 必须走 fused，实得 {mode!r}'
-    assert seen['n_groups'] == len(groups), 'param_groups 没有原样传给 NpuFusedAdamW'
-    # value 头 5x lr 的逐组超参不许被融合构造吞掉
-    assert seen['lrs'] == [g['lr'] for g in groups], '逐组 lr 在融合构造中被改动'
-
-
 def test_npu_without_torch_npu_falls_back_to_standard():
     """本地无 torch_npu ⇒ `'npu'` / `'npu:0'` import 失败回退 standard、不报错。"""
     for dev in ('npu', 'npu:0'):
@@ -437,69 +399,6 @@ def test_main_wiring_uses_build_adamw():
 
     assert '_build_param_groups(model, args)' in main_src, \
         'param_groups 的来源被换掉了'
-
-
-# --------------------------------------------------------------------------- #
-# 7. EMA / --compile（_orig_mod.）互不回归
-# --------------------------------------------------------------------------- #
-def test_ema_and_compile_interplay_unchanged():
-    """按 main() 的真实顺序（optimizer/EMA 先建 → 后做 Linear-only compile，D2）
-    验证三件事：
-
-    1. 优化器持有的是**参数对象**，包装前后 id 集不变，step 仍推动 net 权重；
-    2. EMA 的 shadow 键始终是未编译布局（`_ema_key` 剥 `_orig_mod.`），
-       `update/apply_shadow/restore` 三连不炸；
-    3. `compute_l2_report(optimizer.param_groups)` 包装前后**逐位相等**
-       （报告读的是同一批张量，与名字无关）。
-    """
-    net = _seeded()
-    opt, mode = build_adamw(_build_param_groups(net, _Args()), 'cpu')
-    assert mode == 'standard'
-    ema = t.EMA(net, decay=0.999)
-    shadow_keys_before = set(ema.shadow)
-    assert all('_orig_mod.' not in k for k in shadow_keys_before)
-
-    ids_before = {id(p) for g in opt.param_groups for p in g['params']}
-    l2_before = t.compute_l2_report(opt.param_groups)
-
-    # 生产的 Linear-only compile（D2）；backend='eager' 免编译器，包装/命名与真实一致
-    rollback = t._compile_linear_submodules(net, backend='eager')
-    assert rollback, '前提失效：一个 Linear 都没包上'
-
-    names_now = [n for n, _ in net.named_parameters()]
-    assert any('_orig_mod.' in n for n in names_now), \
-        f'前提失效：包装后名字里没有 _orig_mod. 段：{names_now}'
-
-    ids_now = {id(p) for g in opt.param_groups for p in g['params']}
-    assert ids_now == ids_before, (
-        'compile 包装改变了参数对象 —— 优化器/EMA 指向失效'
-        f'（少了 {len(ids_before - ids_now)} 个旧对象，多了 {len(ids_now - ids_before)} 个新对象）')
-
-    # 3) 报告口径与名字无关，逐位相等
-    l2_mid = t.compute_l2_report(opt.param_groups)
-    assert l2_mid == l2_before, (
-        f'包装改变了 l2_report：{l2_before!r} -> {l2_mid!r}（必须逐位相等）')
-
-    # 1) step 仍推动 net 权重（优化器抓的是同一批对象）
-    before = _named_params(net)
-    with torch.no_grad():
-        for p in net.parameters():
-            p.grad = torch.full_like(p, 0.05)
-    opt.step()
-    assert any(not torch.equal(a, b) for a, b in zip(before, _named_params(net))), \
-        '包装后 optimizer.step() 没有推动任何参数（优化器指向失效）'
-
-    # 2) EMA 三连：键经 _ema_key 归一，不得 KeyError、不得新增编译段
-    ema.update()
-    assert set(ema.shadow) == shadow_keys_before, 'shadow 键空间被改写'
-    assert all('_orig_mod.' not in k for k in ema.shadow), \
-        'shadow 键里混进了 _orig_mod.（_ema_key 剥段失效）'
-    ema.apply_shadow()
-    ema.restore()
-
-    # 中段形态（Linear-only）与顶层形态（整模型 compile）都得剥
-    assert t._ema_key('backbone.qkv._orig_mod.weight') == 'backbone.qkv.weight'
-    assert t._ema_key('_orig_mod.backbone.conv.weight') == 'backbone.conv.weight'
 
 
 # --------------------------------------------------------------------------- #

@@ -15,18 +15,25 @@
   - 只保存最佳权重：latest + best 两个文件
   - 紧凑 buffer：内存中最多保留 500 局数据
 
-CPU 上建议 9 路小规模验证流程；19 路正式训练请上 GPU/NPU 并加大 --sims。
+CPU 上建议 9 路小规模验证流程；19 路正式训练请上 GPU 并加大 --sims。
 每个迭代保存 models/az_<size>_iter<N>.pth，可用 eval_elo.py 对比新旧棋力。
 
 用法:
     python scripts/selfplay_train.py --board-size 9 --iters 5 --games 4 --sims 32 \
         --model models/sft_19x19_v3.pth --out models/az
 
-NPU 正式训练（4 卡 DDP）:
-    torchrun --nproc_per_node=4 scripts/selfplay_train.py \
-        --board-size 19 --iters 20 --games 16 --sims 400 \
-        --parallel-games 4 --ddp --streaming \
-        --model models/sft_19x19_v12.pth --out models/az_best.pth
+V100 32GB 单卡正式训练:
+    python scripts/selfplay_train.py \
+        --board-size 19 --iters 20 --sims 48 \
+        --parallel-games 8 --mcts-threads 3 --streaming \
+        --device cuda --model models/c_v7_a100.pth.latest --out models/az_v7
+
+  ⚠ V100 是 sm_70：**没有 bf16**，所以本入口恒为 **FP16 + GradScaler**
+    （`maybe_autocast` 默认 float16，`_scaler` 在 cuda 上恒建）。SFT 那边在
+    A100 上是 BF16 无 scaler，两条链路的精度口径**不同**、别互相套用。
+  ⚠ V100 也**没有 flash-attn**（需 sm_80+），注意力走
+    `F.scaled_dot_product_attention` 的内置后端。
+  ⚠ 没有多卡 RL：`--ddp 1` 默认 0，多卡未验证。
 """
 import sys
 import os
@@ -73,46 +80,24 @@ def _sample_rollout_move(policy, board, step, rng):
 
 
 # --------------------------------------------------------------------------- #
-# NPU 辅助函数（与 train_sft.py 保持一致）
+# 设备辅助函数（与 train_sft.py 保持一致）
 # --------------------------------------------------------------------------- #
-def npu_is_available() -> bool:
-    if not hasattr(torch, 'npu'):
-        return False
-    try:
-        return bool(torch.npu.is_available())
-    except Exception:
-        return False
-
-
-def npu_get_device_name(idx: int = 0) -> str:
-    try:
-        return str(torch.npu.get_device_name(idx))
-    except Exception:
-        return 'Ascend-NPU'
-
 
 def _auto_select_device():
-    """自动选择最优设备（CUDA > NPU > CPU）"""
+    """自动选择最优设备（CUDA > CPU）"""
     if torch.cuda.is_available():
         return 'cuda'
-    if npu_is_available():
-        return 'npu'
     return 'cpu'
 
 
 def maybe_autocast(device, dtype=torch.float16):
-    """在 CUDA/NPU 上开启 autocast"""
+    """在 CUDA 上开启 autocast"""
     dev = device.split(':')[0] if isinstance(device, str) else str(device)
     if dev == 'cuda' and hasattr(torch, 'amp'):
         try:
             return torch.amp.autocast(dev, dtype=dtype)
         except TypeError:
             return torch.cuda.amp.autocast(enabled=True, dtype=dtype)
-    if dev == 'npu' and hasattr(torch, 'npu'):
-        try:
-            return torch.npu.amp.autocast(enabled=True, dtype=dtype)
-        except Exception:
-            pass
     return nullcontext()
 
 
@@ -953,12 +938,7 @@ def train_epochs(ai, buffer, args, device):
     # C3: 首轮创建 optimizer/scaler/EMA 并缓存到 ai，后续迭代复用
     if getattr(ai, '_opt', None) is None:
         ai._opt = torch.optim.AdamW(opt_groups)
-        if device_prefix == 'npu' and hasattr(torch, 'npu'):
-            try:
-                ai._scaler = torch.npu.amp.GradScaler(enabled=True)
-            except Exception:
-                ai._scaler = None
-        elif device_prefix == 'cuda':
+        if device_prefix == 'cuda':
             if hasattr(torch.amp, 'GradScaler'):
                 ai._scaler = torch.amp.GradScaler('cuda', enabled=True)
             else:
@@ -989,7 +969,7 @@ def train_epochs(ai, buffer, args, device):
     if not buffer:
         return 0.0
 
-    # N4: pin_memory 仅 CUDA（NPU 直传，对齐 train_sft 的 cuda-only pin 策略）
+    # N4: pin_memory 仅 CUDA（对齐 train_sft 的 cuda-only pin 策略）
     pin_mem = device_prefix == 'cuda'
 
     # G1: 双缓冲 H2D —— 两个预分配 pinned 槽交替使用：槽 A 异步搬运到 device 期间，
@@ -1271,7 +1251,7 @@ def main():
                          "1.0 = 不修正（退化成去 MCTS 之前的 PPO）")
     ap.add_argument("--buffer-size", type=int, default=500, help="replay buffer 容量（局数，非样本数）")
     ap.add_argument("--batch-size", type=int, default=256,
-                    help="训练 batch（C2: NPU 甜点 256，显存约 2-3x 旧 64）")
+                    help="训练 batch")
     ap.add_argument("--epochs", type=int, default=2,
                     help="PPO 更新轮数：每轮迭代把 replay buffer 走几遍 PPO 更新"
                          "（原「每轮迭代训练遍数」；语义改写于 P3.0，"
@@ -1327,7 +1307,7 @@ def main():
     
     # 设备
     ap.add_argument("--device", default="auto",
-                    help="设备选择：auto/cuda/npu/cpu")
+                    help="设备选择：auto/cuda/cpu")
     
     ap.add_argument("--no-augment", type=int, default=0, choices=[0, 1],
                     help="关闭 8 对称增强 (0=开启, 1=关闭)")
@@ -1612,7 +1592,7 @@ def main():
             # 同步模式：原有逻辑
             if args.parallel_games > 1 and args.ddp == 0:
                     # 多进程并行生成
-                    # N2: Linux 下 fork 会复制主进程已初始化的 NPU/CUDA 上下文导致挂死，
+                    # N2: Linux 下 fork 会复制主进程已初始化的 CUDA 上下文导致挂死，
                     # 显式用 spawn context（Windows 本就是 spawn，无行为变化）
                     ctx = mp.get_context('spawn')
                     result_queue = ctx.Queue(maxsize=args.result_queue_max)

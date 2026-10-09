@@ -185,11 +185,6 @@ def _sync(device):
     d = str(device)
     if d.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
-    elif d.startswith("npu") and hasattr(torch, "npu"):
-        try:
-            torch.npu.synchronize()
-        except Exception:
-            pass
 
 
 def pick_sgf_paths(root, n_games, seed):
@@ -258,12 +253,7 @@ def main():
     sims_list = [int(x) for x in args.sims.split(",")]
 
     if args.device == "auto":
-        if torch.cuda.is_available():
-            args.device = "cuda"
-        elif hasattr(torch, "npu") and torch.npu.is_available():
-            args.device = "npu"
-        else:
-            args.device = "cpu"
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
 
     model = None if str(args.model).lower() == "none" else args.model
     if model and not os.path.exists(model):

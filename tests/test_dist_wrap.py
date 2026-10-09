@@ -431,7 +431,16 @@ def test_save_model_uses_plain_state_dict():
     `is_main` 分支里调用既安全也无额外开销。
     """
     body = _body_src(_func('save_model'))
-    assert 'model.state_dict()' in body, 'save_model 必须直接用 model.state_dict()'
+    # 2026-10-08：存档走 `_plain_state_dict(model)` 而不是内联`model.state_dict()`。
+    # 起因是后台异步写盘（`_AsyncSnapshotWriter`）：**同步保存与异步快照必须剥出
+    # 同一套键名**，否则两条路会写出两种布局的 checkpoint，`--resume` 挑到哪个都
+    # 可能是坏的 —— 所以把剥前缀那段抽成了两边共用的 helper。
+    # 本测试要守的不变量是「存档走的是 model.state_dict()、没有分片汇聚」，那现在
+    # 由 `_plain_state_dict` 的函数体承担，故两处都查。
+    helper_body = _body_src(_func('_plain_state_dict'))
+    assert ('model.state_dict()' in body
+            or 'model.state_dict()' in helper_body), \
+        '存档必须走 model.state_dict()（直接或经共用 helper）'
     assert '_fsdp_full_state_dict' not in SRC, '汇聚 helper 已被删除（退役符号）'
 
 

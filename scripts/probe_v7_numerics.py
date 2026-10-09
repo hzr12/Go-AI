@@ -90,9 +90,6 @@ def main():
     args = ap.parse_args()
 
     dev = torch.device(args.device)
-    if dev.type == 'npu':
-        import torch_npu  # noqa: F401
-        torch.npu.set_device(0)
 
     # ---- 数据：与训练同一条路（board 级 V7Dataset + 可选 sidecar）----
     kw = {}

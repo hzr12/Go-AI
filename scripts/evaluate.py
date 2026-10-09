@@ -18,8 +18,8 @@ from src.game.go_rules import GoBoard
 
 
 def load_ai(args):
-    # 设备交给 GoAI 统一解析：其 auto 逻辑会按 cuda → npu → cpu 自动识别。
-    # 切勿在此提前把 "auto" 解析成 cpu，否则会漏掉 Ascend NPU 的自动识别
+    # 设备交给 GoAI 统一解析：其 auto 逻辑会按 cuda → cpu 自动识别。
+    # 切勿在此提前把 "auto" 解析成 cpu，否则会漏掉 CUDA 的自动识别
     # （GoAI 的 auto 分支只在收到 "auto" 时触发）。
     ai = GoAI(
         model_path=args.model, board_size=args.board_size, device=args.device,

@@ -15,7 +15,7 @@
 ----
     python scripts/bench_search.py                  # 全部四段
     python scripts/bench_search.py --only fwd       # 只跑前向吞吐曲线（决定性数字）
-    python scripts/bench_search.py --device npu     # 4×910A 上跑（决策看这个）
+    python scripts/bench_search.py --device cuda     # A100 上跑（决策看这个）
     python scripts/bench_search.py --model none     # 随机权重（只验脚本，不看棋力）
 
  本机是 torch+CPU：跑出来的曲线**只能验证脚本本身**。决策用的数字必须在
@@ -100,11 +100,6 @@ def sync(device):
     d = str(device)
     if d.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
-    elif d.startswith("npu") and hasattr(torch, "npu"):
-        try:
-            torch.npu.synchronize()
-        except Exception:
-            pass
 
 
 def timeit(fn, device, *, warmup=3, reps=6, budget=8.0, probe=None):
@@ -563,12 +558,7 @@ def main():
     args.positions = parse_list(args.positions)
 
     if args.device == "auto":
-        if torch.cuda.is_available():
-            args.device = "cuda"
-        elif hasattr(torch, "npu") and torch.npu.is_available():
-            args.device = "npu"
-        else:
-            args.device = "cpu"
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
 
     model = None if str(args.model).lower() == "none" else args.model
     if model and not os.path.exists(model):

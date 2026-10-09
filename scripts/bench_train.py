@@ -65,7 +65,6 @@ def bench(device, board_size, batch_size, warmup_steps, bench_steps,
         elif cc[0] >= 5:
             amp_dtype = torch.float16
             use_scaler = True
-    elif 'npu' in str(device):
         amp_dtype = torch.bfloat16
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)

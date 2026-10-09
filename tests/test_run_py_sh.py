@@ -6,7 +6,7 @@
   3. 启动文件必须是 .py
 
 因此多卡训练不能直接用 `torchrun run.py ...`，但可以：
-    python run.py --sh shell/train_npu_2card.sh --epochs 3
+    python run.py --sh shell/train_sft_a100_1card.sh --epochs 3
 入口是 .py（run.py），参数是 --名 值（--sh <路径>），bash 由 run.py 内部拉起。
 
 本测试覆盖派发语义、退出码透传、错误提示、参数保序，以及 shell 脚本的
@@ -78,7 +78,7 @@ def test_run_sh_resolves_relative_path_against_root(monkeypatch):
                         raising=False)
     monkeypatch.chdir(os.path.dirname(ROOT))   # 故意切到仓库外
     with pytest.raises(SystemExit):
-        runpy_mod.run_sh(['shell/train_sft_npu_2card.sh'])
+        runpy_mod.run_sh(['shell/train_sft_a100_1card.sh'])
     assert os.path.isfile(seen['cmd'][1]), \
         f"相对路径应解析到仓库内: {seen['cmd'][1]}"
 
@@ -181,12 +181,12 @@ def test_gitattributes_forces_lf_for_sh():
 
 
 @pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
-def test_shell_scripts_exist_expected_five():
+def test_shell_scripts_exist_expected_set():
     """应有 5 个训练脚本：A100 1卡 / 910A 1·2·4卡 / RL 910A 1卡。"""
     got = _existing_sh()
-    for expect in ('train_sft_a100_1card.sh', 'train_sft_npu_1card.sh',
-                   'train_sft_npu_2card.sh', 'train_sft_npu_4card.sh',
-                   'train_rl_npu_1card.sh'):
+    # 2026-10-08：NPU 后端下线后只剩 A100 一个 SFT 脚本；RL 走 V100 单卡、
+    # 由 run.txt 第 3 节直接给命令，不再有 shell 副本。
+    for expect in ('train_sft_a100_1card.sh',):
         assert expect in got, f"缺少脚本 {expect}（现有: {got}）"
 
 
@@ -241,16 +241,6 @@ def test_sft_scripts_use_swanlab_every_10():
 
 
 @pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
-def test_npu_scripts_omit_compile_and_flash_attn():
-    """NPU 脚本不应传 --compile / --flash-attn（NPU 上自动禁用，只出警告）。"""
-    for f in _existing_sh():
-        if 'a100' in f or f.startswith('train_rl'):
-            continue
-        txt = open(os.path.join(SHELL_DIR, f), encoding='utf-8').read()
-        cmd = '\n'.join(l for l in txt.splitlines()
-                        if not l.strip().startswith('#'))
-        assert '--compile' not in cmd, f"{f} 不应传 --compile"
-        assert '--flash-attn' not in cmd, f"{f} 不应传 --flash-attn"
 
 
 @pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
@@ -403,61 +393,17 @@ def test_prefetch_depth_reasonable():
 # --------------------------------------------------------------------------- #
 # NPU 显存相关参数：910A 是 32GB 卡，有实测上界
 # --------------------------------------------------------------------------- #
-def _npu_sft():
-    return [f for f in _existing_sh() if f.startswith('train_sft_npu')]
+def _a100_sft():
+    """现役 SFT shell 脚本（NPU 下线后只剩 A100 一个）。
+
+    判据从 `train_sft_npu` 改成 `train_sft_a100`：**两条测试真正要守的是
+    「脚本里的显存相关参数有界」**，而那条约束与后端无关 —— 换硬件不该让它
+    失去守卫，所以按文件名匹配的对象跟着换、断言一字未改。
+    """
+    return [f for f in _existing_sh() if f.startswith('train_sft_a100')]
 
 
 @pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
-def test_npu_scripts_fit_memory_budget():
-    """NPU 每卡脚本的预测显存必须低于 32GB 卡的上限。
-
-    这里**不再**用「BATCH <= 某个数」这种硬编码上限：那个 2800 是从 v18 结构
-    （value 96x8 + attn-window 5 + 12.86M 参数）推出来的，对别的结构并不成立。
-    改为用 scripts/search_arch.py 的实测显存模型判断——该模型已用 v18 的
-    实测占用 31.12GB 标定过（误差 0.0%）。
-
-    保留的实证事实：同一 v18 结构下 B=3200 确实 OOM 过（backward 的
-    BatchMatMul 申请 1.46GB 时 rtMalloc 失败），模型外推 35.7G > 32G，与之相符。
-    """
-    import sys as _sys
-    _sys.path.insert(0, ROOT)
-    _sys.path.insert(0, os.path.join(ROOT, 'scripts'))
-    import search_arch as _sa
-
-    got = _npu_sft()
-    assert got, '未找到 NPU SFT 脚本'
-    for f in got:
-        txt = open(os.path.join(SHELL_DIR, f), encoding='utf-8').read()
-        code = '\n'.join(l for l in txt.splitlines()
-                         if not l.lstrip().startswith('#'))
-
-        def _int(flag, default=None):
-            m = re.search(r'--' + flag + r'\s+(\d+)', code)
-            if m:
-                return int(m.group(1))
-            m = re.search(r'(?m)^' + flag.upper().replace('-', '_')
-                          + r'=(\d+)', code)
-            if m:
-                return int(m.group(1))
-            if default is not None:
-                return default
-            raise AssertionError('{} 缺少 {}'.format(f, '--' + flag))
-
-        cfg = dict(_sa.ANCHOR['cfg'],
-                   backbone_channels=_int('backbone-channels'),
-                   res_blocks=_int('res-blocks', 0),
-                   convnext_blocks=_int('convnext-blocks', 0),
-                   attn_blocks=_int('attn-blocks', 0),
-                   value_channels=_int('value-channels', 64),
-                   value_res_blocks=_int('value-res-blocks', 3),
-                   policy_channels=_int('policy-channels', 32),
-                   policy_layers=_int('policy-layers', 2),
-                   attn_window=_int('attn-window', 5))
-        batch = int(re.search(r'(?m)^BATCH=(\d+)', txt).group(1))
-        r = _sa.project(cfg, batch)
-        assert r['total_gb'] < 32.0, \
-            '{}: B={} 预测显存 {:.1f}GB 超过 32GB 卡上限'.format(
-                f, batch, r['total_gb'])
 
 
 @pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
@@ -468,11 +414,15 @@ def test_value_head_depth_is_memory_bounded():
     每块约 0.46GB 线性吃显存。实测 96ch x 11 blocks = 32.7G，已越过 32GB 上限。
     上限取 8：那是 v18 跑得动的深度（31.12G），不是推荐值——新配置应取 3。
     """
-    got = _npu_sft()
-    assert got, '未找到 NPU SFT 脚本'
+    got = _a100_sft()
+    assert got, '未找到 A100 SFT 脚本'
     for f in got:
         txt = open(os.path.join(SHELL_DIR, f), encoding='utf-8').read()
-        m = re.search(r'--value-res-blocks\s+(\d+)', txt)
+        # 只扫**非注释**行：脚本注释里写着「--value-res-blocks 11→8」这类
+        # 变更说明，而 `re.search` 取第一个匹配 ⇒ 注释里的 11 会被当成
+        # 实际取值，让配置断言被一句说明文字顶翻。注释不该有断言权。
+        code = '\n'.join(l.split('#', 1)[0] for l in txt.splitlines())
+        m = re.search(r'--value-res-blocks\s+(\d+)', code)
         if m:
             v = int(m.group(1))
             assert v <= 8, \
@@ -481,23 +431,6 @@ def test_value_head_depth_is_memory_bounded():
 
 
 @pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
-def test_npu_scripts_drop_falsified_measured_claim():
-    """那句被 OOM 证伪的「910A 实测可用」必须消失。
-
-    B=3200 当时只是按内存公式估的，脚本却写成「910A 实测可用」，
-    后被 backward BatchMatMul 的 rtMalloc OOM 证伪。
-
-    只禁这一句**正面的**误称；「B=3200 实测 OOM」这类真实的负向结论
-    应当保留（它记录了实测边界）。BATCH 值本身由
-    test_npu_scripts_batch_within_proven_limit 把关。
-    """
-    for f in _npu_sft():
-        txt = open(os.path.join(SHELL_DIR, f), encoding='utf-8').read()
-        assert '910A 实测可用' not in txt, \
-            f'{f} 仍写着「910A 实测可用」——该结论已被 OOM 证伪'
-        # 只查行首的真实赋值（注释里记录「B=3200 实测 OOM」是合法且必要的）
-        assert re.search(r'(?m)^BATCH=3200', txt) is None, \
-            f'{f} 仍把 BATCH 实际赋值为 3200'
 
 
 @pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
@@ -525,7 +458,7 @@ def test_sft_scripts_attn_window_is_5():
 
 @pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
 def test_sft_scripts_value_res_blocks_bounded():
-    """NPU 脚本的 --value-res-blocks 不得超过 8（32GB 卡的显存约束）。
+    """--value-res-blocks 不得超过 8（40GB 卡的显存约束）。
 
     早期版本把这条写成「所有 SFT 脚本必须为 8」，那是两处问题：
       1. 从 v18 单点配置推出的，不适用于别的结构——v19 用 3 块；
@@ -534,8 +467,8 @@ def test_sft_scripts_value_res_blocks_bounded():
     每块约 0.46GB 线性吃显存；96ch x 11 实测 32.7G，已越过 32GB 上限。
     真正的判据是显存，见 test_npu_scripts_fit_memory_budget。
     """
-    got = _npu_sft()
-    assert got, '未找到 NPU SFT 脚本'
+    got = _a100_sft()
+    assert got, '未找到 A100 SFT 脚本'
     for f in got:
         txt = open(os.path.join(SHELL_DIR, f), encoding='utf-8').read()
         # 必须剥注释：说明文字里会出现「11→8」这类对照，会被误当成实际取值
@@ -563,23 +496,6 @@ def test_sft_scripts_c2net_flag_is_zero_or_one():
 
 
 @pytest.mark.skipif(not _existing_sh(), reason='shell/ 下暂无 .sh')
-def test_multicard_sft_scripts_warn_c2net_prepare_all_ranks():
-    """多卡 SFT 脚本需提示 c2net 的 prepare() 会被所有 rank 调用。
-
-    train_sft.py 的 c2net 初始化没有 is_main 守卫，DDP 下每个 rank 都会
-    prepare()；若该函数有写盘/建连副作用，多卡并发调用可能互相干扰。
-    """
-    for f in _existing_sh():
-        txt = open(os.path.join(SHELL_DIR, f), encoding='utf-8').read()
-        if not f.startswith('train_sft'):
-            continue
-        m = re.search(r'(?m)^WORLD_SIZE=(\d+)', txt)
-        if not m or int(m.group(1)) < 2:
-            continue
-        comments = '\n'.join(l for l in txt.splitlines()
-                             if l.strip().startswith('#'))
-        assert 'prepare' in comments or 'rank' in comments.lower(), \
-            f"{f} 是多卡脚本，需注释说明 c2net prepare() 会被所有 rank 调用"
 
 
 # --------------------------------------------------------------------------- #

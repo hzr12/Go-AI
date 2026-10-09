@@ -24,15 +24,6 @@ from src.game.go_rules import GoBoard
 from src.networks.alphanet import AlphaGoNet
 
 
-def _ensure_torch_npu():
-    """导入 torch_npu（必须先于 .to('npu') 调用，注册 Ascend 后端）。返回是否可用。"""
-    try:
-        import torch_npu  # noqa: F401
-        return True
-    except Exception:
-        return False
-
-
 # --------------------------------------------------------------------------- #
 # 通道数 → 网络构建器注册表（P4.8/P4.13）
 #
@@ -253,10 +244,6 @@ class GoAI:
         ai.analyze()
     """
 
-    # NPU batch 归桶：CANN 按输入形状编译算子，MCTS 的零散 batch（尾批 6、7 等）
-    # 每种形状都要单独编译一次；归桶补零后形状固定，编译缓存才能跨调用命中。
-    _NPU_BATCH_BUCKETS = (1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 192, 256)
-
     def __init__(self, model_path=None, board_size=19, device="auto", use_amp=False,
                  backbone_channels=128, backbone_res_blocks=12, policy_channels=32, value_channels=64,
                  attention_mode="mix", num_attention_layers=4, num_heads=4, attention_dropout=0.0,
@@ -264,19 +251,14 @@ class GoAI:
                  channels_last=True, policy_layers=2, value_res_blocks=3,
                  komi=7.5, rules_flags=None):
         if device == "auto":
-            device = "cuda" if torch.cuda.is_available() else (
-                "npu" if _ensure_torch_npu() and torch.npu.is_available() else "cpu")
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device.startswith("npu"):
+            raise RuntimeError(
+                "--device npu 已下线（硬件换成 A100 / V100）。"
+                "V100 是 sm_70、无 bf16 ⇒ 那一档走 fp16 autocast + 内置 SDPA。")
         self.device = device
-        self.is_npu = device.startswith("npu")
-        if self.is_npu and not _ensure_torch_npu():
-            raise RuntimeError("--device npu 需要 torch_npu（须与 CANN 版本匹配，"
-                               "910A 用 torch_npu 1.11~2.1 均可）")
-        # 910A 不支持 bf16，NPU 上一律 fp16 autocast；CPU 不开 amp
-        self.use_amp = use_amp and (self.device.startswith("cuda") or self.is_npu)
-        if self.is_npu:
-            print("[GoAI] Ascend NPU 推理：fp16 autocast（910A 无 bf16），"
-                  "math 注意力，勿开 --compile。若每次启动 warmup 都超过 1 分钟，"
-                  "先执行 export ASCEND_CACHE_PATH=~/ascend_cache 持久化算子编译缓存")
+        # CPU 不开 amp；CUDA 上由调用方的 amp 开关决定（A100=bf16、V100=fp16）
+        self.use_amp = use_amp and self.device.startswith("cuda")
         self.board_size = board_size
         # ---- 局级标量：V7 的 19 维全局输入要用（12 通道路径完全不用）----
         # 贴目/规则不是盘面状态，是「这局按什么下」。放这里是唯一的：全局特征
@@ -364,9 +346,7 @@ class GoAI:
         # dummy 输入做一次 warmup 以触发真实编译并捕获异常。
         if self.channels_last:
             self.model = self.model.to(memory_format=torch.channels_last)
-        if compile and self.is_npu:
-            print("[GoAI] NPU 不支持 torch.compile，已忽略")
-        elif compile and hasattr(torch, "compile"):
+        if compile and hasattr(torch, "compile"):
             try:
                 self.model = torch.compile(self.model, dynamic=False)
                 with torch.inference_mode():
@@ -458,28 +438,6 @@ class GoAI:
             self.model.eval()
             print(f"[GoAI] 已加载模型: {model_path}  ({device})")
 
-        # NPU 首次前向会触发 CANN 算子初始化（可能 1-3 分钟且无输出），
-        # 这里主动 warmup 并打印进度，避免被误认为卡死。
-        if self.is_npu and model_path:
-            print("[GoAI] NPU 首次前向 warmup 中（CANN 算子初始化，可能需要 1-3 分钟）…",
-                  flush=True)
-            t0 = time.time()
-            # 预热 predict_batch 真实路径（含 autocast + batch 归桶补零）：
-            # 让每个桶形状的 CANN 图在启动时一次性编译并落盘到 ASCEND_CACHE_PATH，
-            # 避免自对弈每个新进程 / 新 batch 形状都冷编译 ~100s 而误判卡死。
-            board = GoBoard(self.board_size)
-            my_hist = [[-1, -1, -3], [-1, -1, -3]]
-            # 只预热自对弈实际会命中的桶形状（expand-chunk=16 → B≤16）。
-            # 32..256 自对弈用不到，留到运行时按需冷编译一次（已落盘缓存，安全）。
-            max_warmup_batch = 16
-            for nb in [b for b in self._NPU_BATCH_BUCKETS if b <= max_warmup_batch]:
-                states = [(board, list(my_hist[0]), list(my_hist[1]), 1)] * nb
-                with torch.inference_mode():
-                    self.predict_batch(states)
-                print(f"  [warmup] batch={nb} 编译完成 ({time.time() - t0:.1f}s)",
-                      flush=True)
-            print(f"[GoAI] NPU warmup 完成: {time.time() - t0:.1f}s（仅首次，后续为毫秒级）",
-                  flush=True)
 
     def _infer_board_size(self, state):
         """从 policy 头输出层权重形状推断训练棋盘大小（输出维 = n²+1）。"""
@@ -844,16 +802,6 @@ class GoAI:
           ``[-1,1]``，所以 MCTS 的 PUCT / value_sum / 符号约定都不用改。
         """
         B = x.shape[0]
-        if self.is_npu and B > 1:
-            # batch 归桶补零：稳定算子形状，命中 CANN 编译缓存
-            bucket = next((b for b in self._NPU_BATCH_BUCKETS if b >= B), None)
-            if bucket is not None and bucket > B:
-                x = torch.cat([x, x.new_zeros(bucket - B, *x.shape[1:])], 0)
-                if global_features is not None:
-                    global_features = torch.cat(
-                        [global_features,
-                         global_features.new_zeros(bucket - B,
-                                                   *global_features.shape[1:])], 0)
         if self.needs_global_features and global_features is None:
             raise RuntimeError(
                 f"{type(self.model).__name__} 声明了 REQUIRES_GLOBAL_FEATURES，"
@@ -861,18 +809,8 @@ class GoAI:
                 f"「拿一份没见过的输入硬跑」，不报错但结果全错，所以在这里拦。")
         with torch.inference_mode():
             if self.use_amp:
-                if self.is_npu:
-                    # 兼容老 torch_npu：新 torch.autocast("npu") API 不可用时
-                    # 回退 torch.npu.amp.autocast()
-                    try:
-                        with torch.autocast(device_type="npu", dtype=torch.float16):
-                            out = self._model_forward(x, global_features)
-                    except (RuntimeError, AttributeError, TypeError):
-                        with torch.npu.amp.autocast():
-                            out = self._model_forward(x, global_features)
-                else:
-                    with torch.cuda.amp.autocast():
-                        out = self._model_forward(x, global_features)
+                with torch.cuda.amp.autocast():
+                    out = self._model_forward(x, global_features)
             else:
                 out = self._model_forward(x, global_features)
         policy_logits, value = self._split_model_output(out)

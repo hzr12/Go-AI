@@ -23,7 +23,7 @@ pip install onnx onnxruntime
 #   | 链路 | 入口            | 硬件          | 精度              |
 #   |------|-----------------|---------------|-------------------|
 #   | SFT  | train_sft.py    | **A100 40G 单卡** | BF16，无 GradScaler |
-#   | RL   | selfplay_train.py | Ascend NPU   | **FP16 + GradScaler** |
+#   | RL   | selfplay_train.py | **V100 32G 单卡** | **FP16 + GradScaler** |
 #
 # ---- SFT：A100 40G 单卡（本节 A/B/C 全部命令）----
 #   `train_sft.py` 的 `_backend == 'cuda' and compute_cap >= (8,0)` 分支（唯一事实源）
@@ -32,7 +32,7 @@ pip install onnx onnxruntime
 #   + fused AdamW + `--compile` 按设备自动开 1。
 #   ⇒ **`--scaler-init-scale` / `--scaler-growth-interval` 在 SFT 上是死参数**
 #     （GradScaler 根本不会被创建），下面所有 SFT 命令都不给它们。
-#     与 NPU 的 910B 路径不同：A100 是 Ampere+，BF16 原生支持，不需要 scaler。
+#     与 RL 的 V100 路径不同：A100 是 Ampere+，BF16 原生支持，不需要 scaler。
 #   ⇒ `--compile` **不给即可**（自动开）。要关就显式 `--compile 0`。
 #     启动日志看两行：`[device] --compile 未指定 ⇒ 按设备自动取 1` 与 `[train] 已启用 torch.compile 算子融合`。
 #   ⚠ `--compile` 与梯度检查点默认**二选一**（开 compile 就强制 `_gc = 0`）。
@@ -42,9 +42,6 @@ pip install onnx onnxruntime
 #     与整模型 `torch.compile` 兼容；且 V7 的 head 原来返回 dict、穿不过 checkpoint
 #     的问题已修（`katago_v7._ckpt`，回归测试
 #     `tests/test_katago_v7_grad_checkpointing.py::test_grad_checkpoint_survives_aot_autograd`）。
-#     ⚠ 这条**不适用于** `--npu-graph-compile`（逐 Linear 编译的产物落在检查点段内部，
-#       真的互斥，`--gc-with-compile` 对它无效；判据见 `train_sft.resolve_grad_checkpoint`）。
-#   ⚠ `--compile-mode max-autotune` 与 `reduce-overhead` 都**带 CUDA Graphs**，
 #     私有内存池不归还 ⇒ 40G 卡上长跑容易吃满显存。要自动调优就用
 #     `--compile-mode max-autotune-no-cudagraphs`（新选项）。
 #   ⚠ flash-attn 需 `pip install flash-attn`；加载失败**自动回退内置 SDPA**，
@@ -58,14 +55,19 @@ pip install onnx onnxruntime
 #     CUDA-only 缺陷。已改为走 NVML（`nvidia-smi`）读型号/算力/空闲显存。
 #     回归测试 `tests/test_prefetch_fork_ordering.py` 用 AST 锁这条顺序不变量。
 #
-# ---- RL：仍在 NPU，且是 FP16（见第 3 节）----
-#   型号判据在 `train_sft.py` 的 `_backend == 'npu'` 分支：
-#     命中 FP16 + GradScaler：名字含 `910B` / `910Pro` / `910-2`
-#     其余（含 910C）：BF16、无 GradScaler
-#   ⚠ RL 走的是 `selfplay_train.py`，它**自己**用 `torch.npu.amp.GradScaler`（:958）
-#     且 `maybe_autocast` 默认 float16 ⇒ RL 侧恒为 FP16 + GradScaler，与 SFT 那套
-#     BF16 口径**不同**，两条链路的 `--scaler-*` 语义不要互相套用。
-#   ⚠ NPU 上 inductor 无效：`--compile` 在 NPU 被忽略（图编译走 `--npu-graph-compile`）。
+# ---- RL：V100 32G 单卡，FP16 + GradScaler（见第 3 节）----
+#   V100 是 **sm_70，没有 bf16** ⇒ RL 侧恒为 **FP16 + GradScaler**
+#   （`selfplay_train.py` 的 `maybe_autocast` 默认 float16、`_scaler` 在 cuda 上恒建）。
+#   与 SFT 的 A100/BF16 **精度口径不同**，两条链路的 `--scaler-*` 语义别互相套用。
+#   V100 也**没有 flash-attn**（需 sm_80+），注意力走内置 SDPA。
+#
+# ---- 硬件已全部迁出 NPU（2026-10-08）----
+#   * SFT = **A100 40G 单卡**，BF16、无 GradScaler、channels_last、flash-attn、
+#     `torch.compile` 按设备自动开。
+#   * RL  = **V100 32G 单卡**，FP16 + GradScaler、无 flash-attn。
+#   * NPU 后端连同 `torch_npu` / `torch_npu.optim` / CANN SDPA / SFA / npu_swiglu /
+#     `--npu-graph-compile` 与 `shell/train_*_npu_*.sh` 全部删除。启动日志里出现
+#     `[device] ... (NPU/CANN)` 就说明跑的是旧代码或旧 shell 脚本。
 
 # ---------- 1. 数据（都已就位，不要重建）----------
 # 1) data/sgf_19x19_full.npz = 34,264,225 行 / 163,535 局，加压 447 MB、解压 12.3 GB
@@ -131,8 +133,8 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 #   预取 worker 是**每 rank** 的：单卡 ⇒ 给 24（旧实测的 CPU 甜点，总量不变）。
 # ⚠ `--scaler-init-scale` / `--scaler-growth-interval` 在 **SFT（A100）上是死参数**：
 #   A100 是 Ampere+，走 BF16、`use_scaler=False`，GradScaler 根本不会被创建。
-#   ⚠ **RL（NPU）不同**：RL 走 `selfplay_train.py`，恒为 FP16 + GradScaler，
-#     scaler 参数在那条链路上是真参数；旧记录里「910A 走 FP16 时不给就是代码默认
+#   ⚠ **RL（V100）不同**：RL 走 `selfplay_train.py`，恒为 FP16 + GradScaler，
+#     scaler 参数在那条链路上是真参数；旧记录里「V100 走 FP16 时不给就是代码默认
 #     0.0 = PyTorch 的 65536，大 batch 下必炸（fp16 未来点平方溢出 65504）」，
 #     需要时给 `--scaler-init-scale 1024 --scaler-growth-interval 100000`
 #     （growth 调大 = 关掉自动增益，防震荡）。
@@ -153,53 +155,29 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 #   打点步就出表 ⇒ 配 `--log-every 5` 用 `GOAI_PROFILE=5 GOAI_PROFILE_STEPS=0`
 #   即「第 5 步出表」，不必等满 50 步）。总闸都是
 #   **只慢不坏**（数值口径不变），出问题置 0 即回到已验证配置。
-#   **A100/SFT 上有意义的是下面这组**，其后是 NPU 专用、在 CUDA 上是死参数：
+#   **A100/SFT 上有意义的全部开关**（2026-10-08：NPU 后端下线，原来那批 `--npu-*`
+#   旗与 TorchAir 路径已一并删除）：
 #     --flash-attn 1|0      融合注意力独立库（默认 1=自动优先；加载失败回退内置 SDPA）
 #     --compile 1|0         inductor 算子融合（**不给=按设备自动**，A100 上自动 1）
 #     --compile-mode ...    见第 0 节；A100 上别用带 CUDA Graphs 的两个值
 #     --gc-with-compile 1|0 compile 与梯度检查点共存（默认 0；**SFT 建议给 1**）
 #     --use-sdpa 1|0        0 = 强制回退手写 math（默认 1）
 #     --use-checkpoint      **已归档**，别传（见下）
-#   以下四个**只对 NPU/RL 有意义**，SFT 命令里给了不起作用：
-#     --npu-sfa 1|0         融合注意力 SFA/PFA，优先于 SDPA（默认 1；探针+自检+回退）
-#     --npu-swiglu 1|0      融合 SwiGLU（默认 1）
-#     --npu-channels-last   NPU 卷积 NHWC（**默认 1**；走 torch_npu.npu_format_cast，
-#                           非 torch.channels_last，见下方详注；失败自动降级）
 #     --attn-query-chunk N  math 注意力 query 分块（默认 64；只影响 math 路径）
-#     --attn-chunk-ckpt 1|0 math 注意力逐块检查点（默认 1）
+#     --attn-chunk-ckpt 1|0 math 注意力逐 chunk 检查点（默认 1）
 # ⚠ `--use-checkpoint` 已归档：由 `KATAGO_SE_CFG['grad_checkpoint']` 决定。唯一让
 #   它让位的路径是 `--compile 1`（且不给 `--gc-with-compile 1`）。别传它。
 # ✅ eval 特征预取池（2026-10-06）：eval 的梯子特征曾是主进程串行计算，10 万行磨
 #   25-30 分钟（GPU 归零、无日志，两次被当成挂死）。现在与训练预取器同点 fork 一个
 #   2-4 worker 的 eval 池（augment=False，指标逐位不变），墙钟 ÷ worker 数；
 #   启动日志锚点：`[data] eval 预取池已启用`。仍建议配 `--eval-max-batches 5`。
-# ⚠ `--npu-graph-compile 1`（**仅 NPU/RL**）与梯度检查点**互斥**：逐 Linear 编译的
-#   产物落在检查点段内部，开图编译会强制关 GC（日志有 warning），且 `--gc-with-compile`
-#   对它**无效**。Linear-only（非整图）由 tests/test_npu_graph_compile.py 钉住。
-#   ⚠ 旧记录里「显存/样本从 4.65 MB 涨到 ~278 MB ⇒ batch 上限 200 出头」是 **NPU
-#     口径**且三个数互相矛盾（12.67 / 4.65 / 277），**对 A100 一律不适用**。
-#   SFT 侧要走图编译就用 `--compile`（整模型），它与 GC 可以共存。
-# ⚠ `--npu-channels-last 1`（**仅 NPU**）**不是** `torch.channels_last`
-#   （2026-10-07 探针定论）：
-#   本机 torch 2.1.0 + torch_npu 2.1.0.post10 上，`torch.channels_last` 整条路不通 ——
-#     · `model.to(memory_format=…)` → `Only contiguous_format or preserve_format is supported.`
-#     · 逐参数 `.contiguous(memory_format=…)` → `NPU contiguous operator only supportted
-#       contiguous memory format` (ERR01007 OPS feature not supported)
-#   但**布局控制本身是有的**：`scripts/probe_npu_layout.py` 实测 ⇒
-#     · `torch_npu.npu_format_cast` 存在，**只能用整数 aclFormat 调用**（枚举
-#       `torch_npu.Format` 在该版本上不存在，引用它会 AttributeError）
-#     · `npu_format_cast(x, 1)` 之后 `get_npu_format(x)` 由 0 → **1（NHWC）**
-#   故代码走整数 aclFormat（NHWC=1），并在转完后**读回校验** format 真的是 1 ——
-#   转换「声称」成功不算数（静默不生效时日志照样说「已启用」，而布局没变）。
-#   转换失败自动降级回默认布局 + warning，训练照常（只少这项优化），不会崩。
-#   启动日志锚点：`[model] channels_last 逐参数转换: N 个 4D 权重 | … | 入口=…`
-#   ⚠ **收益仍未实测**：转成了不等于更快。要用 `speed_per_card` 与
-#   `--npu-channels-last 0` 同配置对比，别只看这行日志就下结论。
-#   换机器/换版本后先跑 `python scripts/probe_npu_layout.py` 确认入口还在。
-#   📌 A100 上**不需要**这一摊：CUDA 分支自动 `use_channels_last=True` 并用标准
-#   `torch.channels_last` 转换（`model.to(memory_format=…)` 在 CUDA 上是正常路径）。
-# ✅ AdamW：CUDA 上用 `torch.optim.AdamW(..., fused=True)`（日志
-#   `已启用 fused AdamW (backend=cuda)`）；NPU 上优先 `torch_npu.optim.NpuFusedAdamW`，
+# ⚠ 「设备初始化之前」这条不变量：A100 首次启动时崩过一次
+#   `RuntimeError: _BatchPrefetcher 不能在 torch.cuda 初始化之后构造`。
+#   报错指的位置**不是真正原因** —— 预取器一直就在 `init_process_group` 之前，
+#   真正原因是启动期那行环境诊断调了 `torch.cuda.get_device_properties(0)`
+#   （它会建 CUDA context），诊断打完才构造预取器，撞上自己的护栏。已改为走
+#   NVML（`nvidia-smi`）读型号/算力/空闲显存。回归测试
+#   `tests/test_prefetch_fork_ordering.py` 用 AST 锁这条顺序不变量。
 #   不可用自动回退 standard+foreach。
 #   C 段启动若卡在 [device] 之后：先 py-spy dump——大概率是 V7PackedDataset
 #   读 37.6GB 分片的静默加载期（无日志），不是挂死。
@@ -329,23 +307,24 @@ python scripts/train_sft.py --data tmp/coding/c64 --v7 1 --device cpu \
 # `soft_row_frac` 在 --soft-only-sampling 1 下应恒 1.0；不是 1.0 说明软标签没生效。
 
 # ============================================================================
-# ---------- 3. ★ RL：自对弈（**仍在 NPU，FP16 + GradScaler**）----------
-# 📌 SFT 已迁到 A100 40G 单卡（BF16），**RL 没有迁**、仍在 NPU 且是 FP16。
-#    下面的命令按原样保留 `--device npu`，别跟着 SFT 改成 cuda。
+# ---------- 3. ★ RL：自对弈（**V100 32G 单卡，FP16 + GradScaler**）----------
+# 📌 SFT 在 A100 40G 单卡（BF16），RL 在 V100 32G 单卡（FP16）。
+#    ⚠ V100 是 sm_70、无 bf16 ⇒ 这一段恒为 FP16 + GradScaler，
+#      与 SFT 的 BF16 口径不同，`--scaler-*` 的语义别互相套用。
 # ============================================================================
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python scripts/selfplay_train.py \
-  --device npu --board-size 19 \
+  --device cuda --board-size 19 \
   --model models/c_v7_a100.pth.latest --out models/az_v7 \
   --iters 20 --sims 48 --parallel-games 8 --mcts-threads 3 \
   --batch-cap 64 --expand-topk 16 --buffer-size 500 \
   --td 1 --td-steps 3 --use-rollout 1 --leaf-ab-depth 2 --rollout-lambda 0.25 \
   --grad-accum-steps 1 --mcts-vector-backup 1 --lr 1e-3 --swanlab 1
 
-# ⚠ **没有多卡 RL**。shell/ 里只有 train_rl_npu_1card.sh；selfplay_train 的
-#   `--ddp 1` 默认 0，多卡未验证。
-# 📌 **SFT 已迁到 A100 40G 单卡，RL 仍在 NPU**（见第 0 节的两条链路表）。
+# ⚠ **没有多卡 RL**（selfplay_train 的
+#   `--ddp 1` 默认 0，多卡未验证；shell/ 下也没有 RL 脚本副本。
+# 📌 **SFT 在 A100 40G 单卡，RL 在 V100 32G 单卡**（见第 0 节的两条链路表）。
 #   ⇒ 两条链路用的**不是同一块卡**，可以同时跑；但 RL 的 `--model` 要指
-#     **A100 上 C 段的产物**（`models/c_v7_a100.pth.latest`），不是 NPU 产物。
+#     **A100 上 C 段的产物**（`models/c_v7_a100.pth.latest`）。
 #   ⇒ RL 是 FP16 + GradScaler，SFT 是 BF16 无 scaler，两边的 `--scaler-*` 语义
 #     不要互相套用（详见第 0 节与上面「参数为什么是这些值」）。
 # ⚠ **RL 是 CPU 瓶颈**：CPU 预算 = parallel_games × mcts_threads，24 是实测甜点
@@ -353,8 +332,7 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python scripts/selfplay_train.py \
 # ⚠ `--sims 48` 是强烈建议：默认 400 在 19 路卡上近似白跑，必须显式给并调小
 #   --parallel-games；过 MCTS 门槛后有效率下降，慢棋直接拖垮吞吐。
 # ⚠ `--model` 要指**真实存在**的 checkpoint（注意 `.latest` 后缀）。
-#   shell/train_rl_npu_1card.sh 里写死的是 models/sft_19x19_v18.pth，**不存在** ——
-#   首选上面的直连命令，别用 run.py --sh。
+#   RL 没有 shell 副本，直接用上面的命令。
 # ⚠ `--iters 20` 是 1 回合的默认值，**不是实测值**。
 # ⚠ RL 的 batch/lr **没有人工调优过**，与 SFT 那套实测系数不同。
 # ⚠ MCTS 通道数由 src/inference.py 按 checkpoint 的 stem 自动推导，不用手填。
@@ -363,7 +341,7 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python scripts/selfplay_train.py \
 # ============================================================================
 # ---------- 4. ★ WebUI / 命令行推理（**本地 CPU**）----------
 # ============================================================================
-# ✅ V7 已可在原生 MCTS 上跑，**不需要 KataGo 引擎、不需要 .bin.gz、不占 NPU**。
+# ✅ V7 已可在原生 MCTS 上跑，**不需要 KataGo 引擎、不需要 .bin.gz、不占 GPU**。
 #    引擎后端（--engine-gtp）是**可选**的，只在你需要 visits/胜率/候选着法、
 #    或想跑在导出的 .bin.gz 上时才用。
 
@@ -444,7 +422,6 @@ python -m pytest tests -q -n0 -p no:randomly --durations=10   # 找最慢 10 个
 # 软标签命中 0        ⇐ pos_hash（盘面哈希+to_play+ko 三者）查不到，见 src/data/pos_hash.py
 # soft_index 行数不符  ⇐ 数据集/labels 变过后没重建索引（启动即 SystemExit，按提示重建）
 #                       重建后自检：argmax 落占点比例应 ≈0、top1 vs 人类 ≈0.59
-# fp16 前向 NaN       ⇐ **NPU/RL 侧**走 fp16 时 CANN 融合内核处 65504 溢出。
 #                       SFT 已在 A100 上用 BF16，不适用；RL 恒 fp16，注意溢出
 # SwiGLU 融合刷警告   ⇐ NPU 专用，紧急开关 `--npu-swiglu 0` 退标准路径（默认融合）
 # eval 慢/GPU 归零    ⇐ 已池化（eval 预取池）；仍慢就减 --eval-max-batches

@@ -162,9 +162,16 @@ def test_optimizer_states_are_not_created_in_low_precision():
     assert st['exp_avg_sq'].dtype == torch.float32
 
 
-def test_grad_scaler_is_enabled_on_npu_path():
-    """910A 无 BF16，FP16 必须配 GradScaler —— 它依赖 fp32 的状态量。"""
+
+def test_grad_scaler_is_enabled_on_v100_fp16_path():
+    """**V100（sm_70）没有 bf16** ⇒ 那一档是 FP16，必须配 GradScaler。
+
+    2026-10-08 硬件换成 A100（SFT）+ V100（RL）之后，这条不变量换了个载体：
+    原来盯的是 NPU/910A 的 fp16 路径，现在盯 V100。断言形态不变 ——
+    缩放/反缩放依赖 fp32 的状态量，而 V100 上 AMP 就是 fp16。
+    """
     src = (ROOT / 'scripts' / 'train_sft.py').read_text(encoding='utf-8')
-    assert 'torch.npu.amp.GradScaler' in src, 'NPU 路径必须用 GradScaler'
-    assert 'amp_dtype = torch.float32' in src, \
-        'CPU 路径才用 fp32；NPU 走 fp16（910A 无 BF16）'
+    assert 'GradScaler' in src, 'FP16 路径必须有 GradScaler'
+    # V100（compute_cap < 8.0）必须真的建 scaler
+    assert 'use_scaler = use_amp' in src, \
+        'V100 落在保守分支（fp16 + GradScaler），那段 use_scaler 赋值必须还在'

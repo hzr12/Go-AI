@@ -1,4 +1,4 @@
-"""分布式启动自检（`_dist_preflight_check` / `_downgrade_npu_dist_debug`）。
+"""分布式启动自检（`_dist_preflight_check`）。
 
 为什么这两件事要有测试：它们守的是「只在多卡启动时发生」的错误，而本仓库的
 本地环境 `world_size=1` → `is_dist=False` → **整段代码永不执行**。2026-09-30 的
@@ -33,8 +33,7 @@ TREE = ast.parse(SRC)
 
 sys.path.insert(0, str(ROOT))
 from scripts.train_sft import (_dist_debug_level,  # noqa: E402
-                               _dist_env_snapshot, _dist_preflight_check,
-                               _downgrade_npu_dist_debug)
+                               _dist_env_snapshot, _dist_preflight_check)
 
 
 def _func(name):
@@ -114,21 +113,22 @@ def test_preflight_failure_message_carries_remedy(monkeypatch, _gloo_pg):
     import scripts.train_sft as st
 
     def _boom(*a, **k):
-        raise RuntimeError('[ERROR] HCCL error in: ProcessGroupHCCL.cpp:64')
+        raise RuntimeError('[ERROR] NCCL error in: ProcessGroupNCCL.cpp:64')
 
     monkeypatch.setattr(dist, 'all_reduce', _boom)
     with pytest.raises(RuntimeError) as ei:
-        # 设备用 cpu：本机没有 npu，而我们要测的是「all_reduce 抛异常时异常长什么样」
-        _dist_preflight_check('hccl', 'cpu', _Log())
+        # 设备用 cpu：本机没有 GPU，而我们要测的是「all_reduce 抛异常时异常长什么样」
+        _dist_preflight_check('nccl', 'cpu', _Log())
     msg = str(ei.value)
-    # 真因线索要带（用户看到 HCCL 通用错误时，靠这句知道去翻什么）
-    assert 'HCCL error' in msg, msg
+    # 真因线索要带（用户看到 NCCL 通用错误时，靠这句知道去翻什么）
+    assert 'NCCL error' in msg, msg
     assert 'EJ0001' in msg and 'last training process is running' in msg, \
         '异常里必须复述真正的报错线索（EJ0001 ... last training process）：%s' % msg
     # 处置三步（这是这个函数存在的意义）
     assert 'pkill' in msg, '缺少「杀掉残留进程」的处置：%s' % msg
     assert 'sleep 30' in msg, '缺少「等待 HCCP 清理」的处置：%s' % msg
-    assert 'npu-smi info -t reset' in msg, '缺少「逐卡复位」的处置：%s' % msg
+    assert 'CUDA_VISIBLE_DEVICES' in msg or 'nvidia-smi' in msg, \
+        '缺少「查卡/复位」的处置：%s' % msg
     # 环境快照
     assert 'WORLD_SIZE=' in msg and 'LOCAL_RANK=' in msg, msg
     assert st is not None
@@ -146,56 +146,9 @@ def test_preflight_detects_wrong_sum(monkeypatch, _gloo_pg):
     monkeypatch.setattr(dist, 'all_reduce', _noop)
     monkeypatch.setattr(dist, 'get_world_size', lambda *a, **k: 4)
     with pytest.raises(RuntimeError) as ei:
-        _dist_preflight_check('hccl', 'cpu', _Log())
+        _dist_preflight_check('nccl', 'cpu', _Log())
     msg = str(ei.value)
     assert '数值不符' in msg, msg
-
-
-# --------------------------------------------------------------------------- #
-# 3. DETAIL 降级：行为 + 位置
-# --------------------------------------------------------------------------- #
-def test_downgrade_only_touches_detail(monkeypatch):
-    log = _Log()
-    monkeypatch.setenv('TORCH_DISTRIBUTED_DEBUG', 'DETAIL')
-    _downgrade_npu_dist_debug(log)
-    assert _dist_debug_level() == 'OFF', 'DETAIL 应被降为 OFF'
-    assert any('DETAIL' in m for m in log.lines_info), log.lines_info
-
-    # 非 DETAIL 一律不动（含未设置 / WARN / OFF）
-    for value in (None, 'WARN', 'OFF'):
-        if value is None:
-            monkeypatch.delenv('TORCH_DISTRIBUTED_DEBUG', raising=False)
-        else:
-            monkeypatch.setenv('TORCH_DISTRIBUTED_DEBUG', value)
-        log2 = _Log()
-        _downgrade_npu_dist_debug(log2)
-        assert _dist_debug_level() == (value or ''), \
-            '非 DETAIL 的取值不该被改：%r' % value
-        assert not log2.lines_info, \
-            '没降级就不该打日志：%s' % log2.lines_info
-
-
-def test_downgrade_is_before_init_and_preflight_after():
-    """顺序即语义：DETAIL 降级在通信域建立**之前**，自检在**之后**。
-
-     这条**与包裹层无关**：判据是「环境变量必须在通信域建立前改掉」，而不是
-    「哪种包裹层在 DETAIL 下更贵」。2026-10-01 FSDP1 → DDP 换轨时降级**保留**、
-    理由被改写过一次又再改回（spec §5.4：真理由是 DETAIL 会在建域时给每个 PG 套
-    一层一致性检查 wrapper，**每次 collective 前跑一次 `monitored_barrier`** ——
-    这个代价来自 PG wrapper，与 FSDP1/DDP 无关；旧理由里那条「FSDP1 exec-order
-    自检每次前向多发一次 all_gather」只是其中最贵的一种，换轨后已不存在）。
-    降级**行为**与**位置**都不变 ⇒ 断言不变。
-    """
-    main = _func('main')
-    seg = ast.get_source_segment(SRC, main) or ''
-    i_down = seg.find('_downgrade_npu_dist_debug(')
-    i_init = seg.find('init_process_group(')
-    i_pre = seg.find('_dist_preflight_check(')
-    assert -1 not in (i_down, i_init, i_pre), \
-        'main 里三步必须都在：downgrade=%d init=%d preflight=%d' % (i_down, i_init, i_pre)
-    assert i_down < i_init, \
-        'DETAIL 降级必须早于 init_process_group（否则通信域与分布式包裹层已按 DETAIL 建好）'
-    assert i_pre > i_init, '通信自检必须晚于 init_process_group（要先有通信域才试得起来）'
 
 
 def test_preflight_is_called_exactly_once():

@@ -154,12 +154,6 @@ def set_seed(seed: int = 42):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    try:
-        import torch_npu
-        if torch.npu.is_available():
-            torch.npu.manual_seed_all(seed)
-    except Exception:
-        pass
 
 
 def get_device(device_str: str = 'auto') -> torch.device:
