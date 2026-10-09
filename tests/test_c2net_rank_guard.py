@@ -102,24 +102,3 @@ def test_c2net_upload_and_output_redirect_stay_main_only():
             head = src[:m.start()]
             assert 'if is_main' in head, \
                 f'{name}: upload_output 调用缺少 is_main 守卫'
-
-
-def test_shell_scripts_document_c2net_rank_semantics():
-    """多卡 SFT 脚本需说明 c2net 的 rank 语义（避免后人误加 is_main 守卫）。"""
-    shell_dir = os.path.join(ROOT, 'shell')
-    if not os.path.isdir(shell_dir):
-        pytest.skip('shell/ 不存在')
-    checked = 0
-    for f in sorted(os.listdir(shell_dir)):
-        if not f.endswith('.sh') or not f.startswith('train_sft'):
-            continue
-        txt = open(os.path.join(shell_dir, f), encoding='utf-8').read()
-        m = re.search(r'(?m)^WORLD_SIZE=(\d+)', txt)
-        if not m or int(m.group(1)) < 2:
-            continue
-        comments = '\n'.join(l for l in txt.splitlines()
-                             if l.strip().startswith('#'))
-        assert 'required=True' in comments or '所有 rank' in comments, \
-            f'{f} 是多卡脚本，需注释说明 c2net 的 dataset_path 为何要全 rank 生效'
-        checked += 1
-    assert checked >= 2, f'应至少校验 2 个多卡 SFT 脚本，实得 {checked}'

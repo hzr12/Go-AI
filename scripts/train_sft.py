@@ -1454,18 +1454,23 @@ class EMA:
 
 
 def maybe_autocast(device, dtype=torch.float16):
-    """在 CUDA/NPU 上开启 autocast，dtype 由设备能力决定（A100/BF16、V100/FP16、NPU/BF16）。
-    CPU 或 amp 关闭时返回 nullcontext。device 字符串支持 'cuda'/'cuda:0'/'npu'/'npu:0' 等。"""
+    """在 CUDA 上开启 autocast，dtype 由设备能力决定（A100/BF16、V100/FP16）。
+
+    CPU 或 amp 关闭时返回 `nullcontext`。device 字符串支持 'cuda'/'cuda:0'。
+
+    ⚠ 必须**总有返回值**：调用点直接 `with maybe_autocast(...)`，一旦落到函数
+    末尾（隐式返回 None）就是 `TypeError: 'NoneType' object does not support
+    the context manager protocol` —— 而且只在 CPU 路径上炸（eval / 全精度对照），
+    GPU 训练那条路完全看不见。
+    """
     dev = device.split(':')[0] if isinstance(device, str) else str(device)
-    if dev == 'cuda':
-        if hasattr(torch, 'amp') and hasattr(torch.amp, 'autocast'):
-            try:
-                return torch.amp.autocast(dev, dtype=dtype)
-            except TypeError:
-                # 老接口回退
-                if dev == 'cuda':
-                    return torch.cuda.amp.autocast(enabled=True, dtype=dtype)
-                return nullcontext()
+    if dev == 'cuda' and hasattr(torch, 'amp') and hasattr(torch.amp, 'autocast'):
+        try:
+            return torch.amp.autocast(dev, dtype=dtype)
+        except TypeError:
+            # 老接口回退
+            return torch.cuda.amp.autocast(enabled=True, dtype=dtype)
+    return nullcontext()
 
 
 def _positive_beta(text):

@@ -735,10 +735,19 @@ def test_zero_grad_uses_set_to_none_true():
         kw = {k.arg: ast.unparse(k.value) for k in n.keywords}
         assert kw.get('set_to_none') == '_zero_set_none', (
             'L%d 的 zero_grad 应为 set_to_none=_zero_set_none（唯一变量来源，'
-            'NPU+fused 时求值为 False），实测 %s' % (n.lineno, kw))
-    # 变量本身必须是那个条件表达式，不能被改成别的东西
-    assert '_zero_set_none = not (_opt_mode == ' in SRC, (
-        '_zero_set_none 的定义被改动了 —— 它是 zero_grad 的唯一行为来源')
+            'L%d 的 zero_grad 应为 set_to_none=_zero_set_none（唯一变量来源），实测 %s' % (n.lineno, kw))
+    # 变量本身必须是**具名常量**，不能被改成散落的字面量。
+    # 2026-10-08：它原先是 `_opt_mode == 'fused' and backend == 'npu'` 的条件
+    # 表达式 —— 那个条件**只为 torch_npu 的 fused 优化器存在**（它的 zero_grad
+    # 不支持 set_to_none=True，置 None 会破坏融合 kernel 的内部引用）。
+    # NPU 后端下线后条件恒假 ⇒ 现在恒为 True。故只守「仍有这个具名来源」。
+    assert '_zero_set_none = ' in SRC, (
+        '_zero_set_none 的定义被删了 —— 它是 zero_grad 的唯一行为来源')
+    # 收窄到 _zero_set_none 那一行：源码别处仍可能合法提到 npu（注释/历史说明）。
+    _zsn = [l for l in SRC.splitlines() if '_zero_set_none = ' in l]
+    assert _zsn, '找不到 _zero_set_none 的定义'
+    assert "npu" not in _zsn[0], (
+        "_zero_set_none 的条件里不该再有 NPU 判断（后端已删除）: %s" % _zsn[0])
 
 
 # --------------------------------------------------------------------------- #

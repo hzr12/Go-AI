@@ -93,18 +93,28 @@ def test_clone_to_cpu_handles_nested_structures():
 
 
 def test_at_most_one_write_in_flight(tmp_path):
-    """`submit` 必须先 join 上一次 ⇒ 写盘慢也不会堆积（堆积 = 吃显存）。"""
+    """`submit` 必须先 join 上一次 ⇒ 写盘慢也不会堆积（堆积 = 吃显存）。
+
+    ⚠ 计数用的是**本类自己**的并发计数，不是 `threading.active_count()` ——
+      后者数的是**进程内所有线程**，并行跑测试时 pytest/xdist 自己的线程会灌进来，
+      断言会飘（实测过一次并行下失败、单跑通过）。本测试要问的是「写盘线程自己
+      有没有并发」，所以在 `_write` 入口做 +1 / 出口 -1，记录峰值。
+    """
     w = _AsyncSnapshotWriter(_Log())
-    peak = []
     real_write = w._write
+    state = {'now': 0, 'peak': 0}
 
-    def slow_write(*a, **k):
-        peak.append(threading.active_count())
-        # 故意慢一点，逼出「若不 join 就会出现并发」的时序
-        threading.Event().wait(0.05)
-        return real_write(*a, **k)
+    def counted_write(*a, **k):
+        state['now'] += 1
+        state['peak'] = max(state['peak'], state['now'])
+        try:
+            # 故意慢一点，逼出「若不 join 就会出现并发」的时序
+            threading.Event().wait(0.05)
+            return real_write(*a, **k)
+        finally:
+            state['now'] -= 1
 
-    w._write = slow_write
+    w._write = counted_write
     try:
         for i in range(4):
             w.submit({'w': torch.ones(2)},
@@ -113,8 +123,8 @@ def test_at_most_one_write_in_flight(tmp_path):
                      str(tmp_path / ('s%d.pth' % i)))
     finally:
         w.close()
-    # 4 次串行 ⇒ 写盘线程最多 1 个（+主线程）
-    assert max(peak) <= 2, '写盘出现了并发，submit 没有 join 上一次: %s' % peak
+    assert state['peak'] <= 1, \
+        '写盘出现了并发，submit 没有 join 上一次（峰值 %d）' % state['peak']
 
 
 def test_write_failure_does_not_kill_the_run(tmp_path):
