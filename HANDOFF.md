@@ -116,8 +116,8 @@ JSON 解析失败（prompt 含未转义换行导致截断）。**下次派发时
   oracle 161.2/260.1/325.1/550.0/1774.9 ms；fwd+bwd 快 10–12×，前向交叉点 B≈3。
   ⚠ 这意味着 **selfplay MCTS 推理（B=1）的前向会比顺序路径慢 1.8×**，
   是已接受的代价。
-- **D1**：v21 不加任何 CLI 参数。**D5**：`shell/train_sft_npu_4card.sh` 与
-  `shell/train_sft_npu_4card_v19.sh` 禁止修改。
+- **D1**：v21 不加任何 CLI 参数。**D5**（已作废）：原 NPU 4 卡 `shell/train_sft_npu_4card*.sh`
+  等脚本随 NPU 下线已删除，不再有「禁止修改」约束。
 - **Loss 口径（P4.5b，已提交）**：policy 默认 `CE`，value 默认 `Huber`
   （`--value-loss-weight=1.0`、`--huber-beta=0.5`），**无 `--l2-coef`**；
   AdamW `--weight-decay=1e-4` 是唯一实际正则；`compute_l2_report` 只把
@@ -159,8 +159,9 @@ JSON 解析失败（prompt 含未转义换行导致截断）。**下次派发时
    `selfplay_train.py`/`async_pipeline.py` 两处 `n_channels=12` pin +
    `test_v21_budget`；接线契约等 P4.6b report 给出）→ **P3-D** →
    **P4.4**（export_onnx dummy 12 → `V21_CFG['in_channels']`）→
-   **P4.10**（`shell/train_sft_npu_4card_v21.sh`，新文件，不碰 D5 禁改的两个）。
-5. 长期阻塞：P4.11 MindSpeed、P5 云端 910A 实跑（需云端/用户提供环境）。
+   **P4.10**（4 卡训练启动脚本；D5 约束因 NPU 下线已作废，沿用现有
+   `shell/train_sft_a100_1card.sh` 框架扩展即可）。
+5. 长期阻塞（原 NPU 相关，已随 NPU 下线作废）：P4.11 MindSpeed、P5 云端 910A 实跑。
 
 ## Suggested skills
 

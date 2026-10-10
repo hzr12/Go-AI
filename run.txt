@@ -428,7 +428,6 @@ python -m pytest tests -q -n0 -p no:randomly --durations=10   # 找最慢 10 个
 # soft_index 行数不符  ⇐ 数据集/labels 变过后没重建索引（启动即 SystemExit，按提示重建）
 #                       重建后自检：argmax 落占点比例应 ≈0、top1 vs 人类 ≈0.59
 #                       SFT 已在 A100 上用 BF16，不适用；RL 恒 fp16，注意溢出
-# SwiGLU 融合刷警告   ⇐ NPU 专用，紧急开关 `--npu-swiglu 0` 退标准路径（默认融合）
 # eval 慢/GPU 归零    ⇐ 已池化（eval 预取池）；仍慢就减 --eval-max-batches
 # 全局特征异常 = 32.5  ⇐ foxpro 无 KM[650] 处（100 局里 1.62%），需加 --no-komi-outlier-fix
 # ImportError: scipy   ⇐ requirements.txt 漏了

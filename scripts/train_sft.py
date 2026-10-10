@@ -110,12 +110,12 @@ def _dist_env_snapshot():
 def _dist_preflight_check(backend, device, logger):
     """通信域自检：立刻试**一发** all_reduce，把通信问题从「训练途中」提前到「启动时」。
 
-    为什么必需：HCCL / NCCL 的通信域是**惰性**创建的 —— `init_process_group`
+    为什么必需：NCCL / NCCL 的通信域是**惰性**创建的 —— `init_process_group`
     只登记后端，真正建链发生在**第一发 collective**。不主动试一发，失败就落在
-    「第一个 batch 的前向」里，而且报成 HCCL 的通用错误
-    （`ProcessGroupHCCL.cpp:64` + `HCCL error`），真因藏在日志更前面的
+    「第一个 batch 的前向」里，而且报成 NCCL 的通用错误
+    （`ProcessGroupNCCL.cpp:64` + `NCCL error`），真因藏在日志更前面的
     `EJ0001 ... Maybe the last training process is running` 里 —— 2026-09-30 的
-    4 卡事故就是这样查了 20 分钟才发现是**上一次崩掉的进程留下 HCCP 状态**。
+    4 卡事故就是这样查了 20 分钟才发现是**上一次崩掉的进程留下 NCCL 状态**。
 
     失败时抛的异常自带：环境快照 + **可执行的处置步骤**（残留进程 / 等待 /
     逐卡复位），而不是让人去猜。
@@ -133,17 +133,17 @@ def _dist_preflight_check(backend, device, logger):
             '[dist] 通信域自检失败（backend=%s）：%s\n'
             '  环境: %s\n'
             '  最常见真因（2026-09-30 实测）：上一次崩掉的训练进程仍在占用设备，'
-            'HCCP 初始化被拒 —— 日志里真正的报错是\n'
-            '    EJ0001: Failed to initialize the HCCP process. Reason: '
+            'NCCL 初始化被拒 —— 日志里真正的报错是\n'
+            '    EJ0001: Failed to initialize the NCCL process. Reason: '
             'Maybe the last training process is running.\n'
             '  处置（按顺序，别跳步）：\n'
             '    1) ps -ef | grep -E "train_sft|torchrun" | grep -v grep   '
             '# 找残留\n'
-            '    2) npu-smi info                                       '
+            '    2) nvidia-smi info                                       '
             '# Processes 表应为空\n'
             '    3) pkill -f train_sft.py; pkill -f torchrun; sleep 30    '
-            '# HCCP 清理需要时间（报错里的 Solution 是 10s，实测 30s 更稳）\n'
-            '    4) 仍失败：npu-smi info -t reset -i <0..3> -c 0         '
+            '# 通信后端 清理需要时间（报错里的 Solution 是 10s，实测 30s 更稳）\n'
+            '    4) 仍失败：nvidia-smi 复位/重载设备         '
             '# 逐卡复位（确认无进程占用）'
             % (backend, e, _dist_env_snapshot())) from e
     if abs(got - expect) > 1e-6:
@@ -211,7 +211,7 @@ def _assert_init_weights_identical(model, logger):
     world_size 个 hi/lo 载荷后**逐位**比对。失败即抛，不允许静默继续 ——
     与 `_dist_preflight_check` 同一立场：通信域的问题是惰性的，要主动试一发。
 
-    为什么必须在主机侧归约（2026-10-05，4×910A）
+    为什么必须在主机侧归约（2026-10-05，4×旧多卡环境）
     -------------------------------------------
     实测 `rank0=8125.2251, rank1=8125.2256, rank2/rank3=8125.2251` ——
     三个 rank 一致、rank1 差**一个 ulp**。8125.225 落在 `[4096, 8192)`，fp32 在
@@ -219,9 +219,9 @@ def _assert_init_weights_identical(model, logger):
     排除了 NaN（会打成 `nan`）与「广播没生效」（那会差量级而非末位）。
 
     根因：原先的 `p.detach().sum(dtype=torch.float32)` 是在**设备上**归约，而
-    NPU 的多块 AICore 归约**分块顺序不保证跨 rank 一致**。同样这 300 多个分片和、
+    加速器 的多块 计算单元 归约**分块顺序不保证跨 rank 一致**。同样这 300 多个分片和、
     以不同顺序在 fp32 里累加 ⇒ 末位差 1 ulp；比对用的是精确相等 ⇒ 每次都误报。
-    原注释把「相同归约顺序」当成前提，那在 NPU 上是假的（CPU 上为真，所以
+    原注释把「相同归约顺序」当成前提，那在 加速器 上是假的（CPU 上为真，所以
     `tests/test_init_weight_sync.py::test_checksum_contract_after_losing_fp64`
     在本地一直是绿的，测不出这个 bug）。
 
@@ -235,7 +235,7 @@ def _assert_init_weights_identical(model, logger):
     单个 ulp 的真实分歧重新变得可检测；
     * 求和顺序由 `model.parameters()` 的迭代顺序唯一确定（形状相同 ⇒ 分块相同），
     且 `run.txt` 已固定 `OMP_NUM_THREADS=1`；
-    * **NPU 上不能用 fp64**：910A 不支持，会派发 AICPU kernel 且故障是**异步**的
+    * **加速器 上不能用 fp64**：旧多卡环境 不支持，会派发 专用内核 kernel 且故障是**异步**的
     （2026-10-01 云端实测，见 `tests/test_no_aicpu_ops_in_startup_check.py`）。
     所以 fp64 只发生在主机，过线一律 fp32。
 
@@ -244,7 +244,7 @@ def _assert_init_weights_identical(model, logger):
     fp32 只有 24 位尾数，把 fp64 的和直接塞进去会被舍掉 —— 那就等于把噪声底又
     抬回 1 ulp，正是本次误报的机制。拆成 `hi = fp32(acc)`、`lo = fp32(acc - hi)`
     之后，两个 fp32 承载 ~48 位尾数，在 8125 那一档的分辨率 ~2.9e-11，仍比要
-    检测的 9.3e-10 低一个数量级 —— 够用。载荷保持 fp32（HCCL 原生支持）。
+    检测的 9.3e-10 低一个数量级 —— 够用。载荷保持 fp32（NCCL 原生支持）。
     """
     if not _dist_active():
         return
@@ -261,11 +261,11 @@ def _assert_init_weights_identical(model, logger):
         dev = torch.device('cpu')
     hi = float(torch.tensor(acc, dtype=torch.float32).item())
     lo = acc - hi
-    # fp32 all_gather：HCCL 原生支持；fp64 会走 AICPU（同上）。
+    # fp32 all_gather：NCCL 原生支持；fp64 会走 专用内核（同上）。
     buf = torch.tensor([hi, lo], dtype=torch.float32, device=dev)
     gathered = [torch.zeros_like(buf) for _ in range(dist.get_world_size())]
     dist.all_gather(gathered, buf)
-    # 比对也不走 `torch.equal`（它在 910A 上是 AICPU kernel，见下）。
+    # 比对也不走 `torch.equal`（它在 旧多卡环境 上是 专用内核 kernel，见下）。
     _vals = [[float(x.item()) for x in g] for g in gathered]
     if any(v != _vals[0] for v in _vals[1:]):
         vals = ', '.join('rank%d=[%s]' % (i, ', '.join('%.17g' % x for x in v))
@@ -289,7 +289,7 @@ def _cuda_name_and_capability(idx=0):
     刻意**不**用 `torch.cuda.get_device_properties`：那个调用会 `_lazy_init()`
     建 CUDA primary context。本函数服务于「设备初始化之前」的启动诊断，而后面
     `_BatchPrefetcher` 要 fork 预取 worker，fork 会整份继承父进程的设备上下文
-    与显存映射（4 卡 NPU 实测每卡凭空多占 ~24 GiB），它自己有一条硬护栏拒绝在
+    与显存映射（4 卡 加速器 实测每卡凭空多占 ~24 GiB），它自己有一条硬护栏拒绝在
     设备已初始化后构造。
 
     走 `nvidia-smi`（NVML）：同样的信息、**不建 context**、也不额外占显存。
@@ -553,7 +553,7 @@ def build_katago_v7_net(*, board_size=V7_BOARD_SIZE, use_checkpoint=1,
 # ---- V7 的特征装配（纯 numpy，可在预取 worker 里跑）------------------------
 #
 # --------------------------------------------------------------------------- #
-# V7 显存预检（2026-10-04 云端 910A：batch 3000 ⇒ 64 GB）
+# V7 显存预检（2026-10-04 云端 旧多卡环境：batch 3000 ⇒ 64 GB）
 # --------------------------------------------------------------------------- #
 #: V7 反向时**驻留**的激活，实测值（`saved_tensors_hooks`，B=16、fp32、本机 CPU）。
 #: 来源：`tmp` 里的量法 —— 用 `torch.autograd.graph.saved_tensors_hooks` 统计反向
@@ -601,19 +601,19 @@ def v7_batch_memory_advice(args, logger, device, *, n_layers, heads, tokens,
     """按 `--max-gpu-memory` 检查 V7 的 batch；明显超了就**启动前**报错。
 
     为什么不等到 OOM：真机上 OOM 发生在第一个 batch 反向之后，那时已经白跑了
-    数据加载、模型构建、CANN 初始化（实测几分钟），而且 OOM 报的是
+    数据加载、模型构建、 初始化（实测几分钟），而且 OOM 报的是
     `OutOfMemoryError` 这种**看不出原因**的异常 —— 而原因其实只是一行乘法。
 
     **checkpoint 感知**：开/关 block 级梯度检查点差 **40×**
     （驻留 6.9 vs 277.1 MB/样本；fp16 下每样本约 4.65 vs 139.7）。
-    历史实测（2026-10-04，云端 910A，batch 3000 ⇒ 64 GB ≈ 21.3 MB/样本）
+    历史实测（2026-10-04，云端 旧多卡环境，batch 3000 ⇒ 64 GB ≈ 21.3 MB/样本）
     是**补丁前**的数：当时只有 blocks 被 checkpoint，stem 与三个 head
     走裸前向、激活全程驻留，故比「全开」估算的 8.1 MB/样本高 2.6×。
     但 21.3 仍只有「无 checkpoint」基线（≈139.7）的 1/6.6 —— block 级
-    checkpoint 在 910A 上**确已生效**，旧注释「没真正生效」是过时误读。
+    checkpoint 在 旧多卡环境 上**确已生效**，旧注释「没真正生效」是过时误读。
     当前代码 stem/heads 也已 checkpoint（并修了重算吃不到 autocast 的
-    910A OOM 真因），全开理论应 ≈ 8.1 MB/样本（batch 3000 ≈ 24 GB），
-    待 910A 真机复测确认。这里仍把**实际配置**对应的每样本字节打出来，
+    旧多卡环境 OOM 真因），全开理论应 ≈ 8.1 MB/样本（batch 3000 ≈ 24 GB），
+    待 旧多卡环境 真机复测确认。这里仍把**实际配置**对应的每样本字节打出来，
     让人一眼看出处在哪个区间，而不必靠猜。
 
     只在能查到设备显存时启用。查不到（CPU / 无 GPU 信息）就只打印估算值，
@@ -857,16 +857,16 @@ def _dense_move_target(moves, action_size):
     可以依赖的契约（不同版本不同），所以这里**显式**置零 —— 权重本来就是 0，
     全零行既安全又语义正确。
 
-    **设备无关：不许把设备张量送进 numpy**（2026-10-04 云端 910A 实测崩）
+    **设备无关：不许把设备张量送进 numpy**（2026-10-04 云端 旧多卡环境 实测崩）
     ------
     调用方传的是 `move_t`，而它是 `torch.from_numpy(...).to(device)` 的结果
-    ⇒ 在 NPU 上是 **npu:0 设备张量**，而 `np.asarray()` 对它抛：
+    ⇒ 在 加速器 上是 **设备索引 设备张量**，而 `np.asarray()` 对它抛：
 
-        TypeError: can't convert npu:0 device type tensor to numpy.
+        TypeError: can't convert 设备索引 device type tensor to numpy.
         Use Tensor.cpu() to copy the tensor to host memory first.
 
     CPU 上恰好能跑（numpy 消费 CPU 张量的 `__array__`）⇒ **本机 CPU 冒烟
-    永远发现不了这个 bug**，只有真机 NPU 才会炸。这也是它此前一直没被
+    永远发现不了这个 bug**，只有真机 加速器 才会炸。这也是它此前一直没被
     发现的原因，不是「别人都写对了」。
 
     修法是**按类型分派**而不是无条件 `.cpu()`：`.cpu()` 能让 numpy 转换成功，
@@ -1037,7 +1037,7 @@ def save_model(model, path):
     不能沿用 `replace(..., 1)`（只换首个）——那在嵌套包装下会原样留下中段前缀，
     存档键与 evaluate.py / inference / webui / convert_ckpt 期待的未编译布局
     对不上，load_state_dict 直接失败。
-    （曾经还有第二种形态：NPU 的 Linear-only 逐子模块编译，段落落在路径中段。
+    （曾经还有第二种形态：加速器 的 Linear-only 逐子模块编译，段落落在路径中段。
     该后端已整体移除，但「去所有层级」这条不能退回只换首个。）
     """
     sd = _plain_state_dict(model)
@@ -1183,7 +1183,7 @@ def _locate_overflow(optimizer, logger, max_report=3, phase='unscale 后',
                     named_params=None):
     """定位参数组里的 inf/nan 梯度来源，只报不修（修是别处的责任）。
 
-    **必须在 `clip_grad_norm_` 之前调用**（2026-10-04 云端 910A 实测打出来的）。
+    **必须在 `clip_grad_norm_` 之前调用**（2026-10-04 云端 旧多卡环境 实测打出来的）。
     `clip_grad_norm_(max_norm=1.0)` 的实现是
 
         total_norm = ‖所有梯度‖                   # 有 inf ⇒ total_norm = inf
@@ -1299,7 +1299,7 @@ def _grads_nonfinite_any_rank(optimizer):
 
     ⇒ **各 rank 的权重从此永久不同**，之后每次 `all_reduce` 都在混合**四个不同
     模型**的梯度；各 rank 的 scale 也各自独立减半、进一步漂移。这不是"少训几步"
-    的损失，是训练从此无效（2026-10-05 真机 4×910A：50 步内 1024 -> 8、
+    的损失，是训练从此无效（2026-10-05 真机 4×旧多卡环境：50 步内 1024 -> 8、
     `skip=7/50`，而"四张卡同一步一起溢出"的概率极低 ⇒ 分叉几乎立刻发生）。
 
     通信域未建（单卡）时退化成只看本地，行为与改动前一致。
@@ -1307,7 +1307,7 @@ def _grads_nonfinite_any_rank(optimizer):
     local = 1 if _grads_nonfinite_local(optimizer) else 0
     if not _dist_active():
         return bool(local)
-    # 设备必须跟着梯度走：HCCL 的 collective 要求张量落在本 rank 的 NPU 上。
+    # 设备必须跟着梯度走：NCCL 的 collective 要求张量落在本 rank 的 加速器 上。
     dev = torch.device('cpu')
     for group in optimizer.param_groups:
         for p in group.get('params', []):
@@ -1368,7 +1368,7 @@ def _ema_key(name: str) -> str:
     **运行时**的名字取键的。torch.compile 无论哪种形态都会改名字（整模型 compile
     插在开头，Linear-only compile 插在路径中段），键空间一变就再也对不上。
     这条路径此前是直接崩的、而非被跳过：`shell/train_sft_a100_1card.sh` 同时开了
-    `--compile 1` 与 `--use-ema 1`，5 个 NPU SFT 脚本也都开了 `--use-ema 1`。
+    `--compile 1` 与 `--use-ema 1`，5 个 加速器 SFT 脚本也都开了 `--use-ema 1`。
 
     去段后 shadow 的键停在「未编译布局」，与 train_state 里的 `ema_shadow` 键一致，
     旧 checkpoint 不受影响（它们的键本来就没有这一段）。
@@ -1395,7 +1395,7 @@ class EMA:
             # 原实现是逐参数 Python 循环，每参数 2 次独立设备 kernel 启动。
             # 本模型 depth 很深（backbone 17 + res 8 + convnext 4 + attn 5
             # + value 8 + policy 3），参数张量达数百个，即每步数百次启动；
-            # Ascend 的 ACL 单次启动开销明显高于 CUDA，累积可观。
+            #  的 ACL 单次启动开销明显高于 CUDA，累积可观。
             # foreach 把它们合并成两次批量调用，数值语义与循环完全一致。
             # 刻意不缓存张量列表：resume 时 ema.shadow 会被整体替换
             # （见 main 的 resume 分支），缓存会持有失效张量。每步重建
@@ -1816,7 +1816,7 @@ def evaluate_top1(model, dataset, idxs, bs, device, amp_dtype, max_batches=50,
 
 #: eval 前向批大小封顶。eval 指标只按样本数归一、与批大小无关，但 eval 复用
 #: 训练的 batch（曾为 5500/6000）⇒ 训练把常驻显存顶到 ~89% 后，eval 前向的
-#: 瞬态分配（SDPA workspace / CANN 碎片下的连续大块）直接把峰值顶到 95~96%，
+#: 瞬态分配（SDPA workspace /  碎片下的连续大块）直接把峰值顶到 95~96%，
 #: 2026-10-06 真机两次贴线。封到 2048：峰值降一个量级，批数变多但 eval 总时长
 #: 由特征同步计算主导、几乎不变，指标逐位不变（同样本、同顺序、同 augment=False）。
 _EVAL_BATCH_CAP = 2048
@@ -2311,7 +2311,7 @@ def _labels_dict_to_tensors(d, device=None):
         # 在 CUDA 上会对**未固定**内存发起异步 H2D，偶发 `CUDA error: misaligned
         # address`（见 2330 附近崩溃栈，全仓其它搬运路径都不这么写）。与
         # `v7_to_device` / 12 通道路径同口径：CUDA 上先 `pin_memory()` 再非阻塞搬运；
-        # 其余后端（npu/cpu）走普通 `.to`。`ascontiguousarray` 防御非连续数组。
+        # 其余后端（非 CUDA）走普通 `.to`。`ascontiguousarray` 防御非连续数组。
         t = torch.from_numpy(np.ascontiguousarray(x))
         if device is not None and str(device).split(':')[0] == 'cuda':
             return t.pin_memory().to(device, non_blocking=True)
@@ -2341,7 +2341,7 @@ def v7_to_device(x, device, amp_dtype, *, pin=False):
 
     与主循环里 12 通道那段**同口径**（同一条「不白带一倍 H2D 字节数」的判据）。
     V7 走的是默认 contiguous 布局、**没有** channels_last 那一摊，所以不需要
-    numpy 端转置；`pin` 只在 CUDA 上开（NPU/CPU 的 pin_memory 语义不同，
+    numpy 端转置；`pin` 只在 CUDA 上开（加速器/CPU 的 pin_memory 语义不同，
     12 通道那条路也是只在 `_backend == 'cuda'` 时 pin）。
     """
     t = torch.from_numpy(np.ascontiguousarray(x))
@@ -2497,7 +2497,7 @@ def _dihedral_batch(x, tforms):
 
 
 class _BatchPrefetcher:
-    """后台多进程并行构造训练 batch，与 NPU 前向/反向重叠。
+    """后台多进程并行构造训练 batch，与 加速器 前向/反向重叠。
 
     把每个 batch 的样本下标切成 num_workers 个子块，由 num_workers 个后台进程
     并行调用 dataset.sample_batch_numpy()（绕过 GIL，numpy 操作真正并行），
@@ -2519,10 +2519,10 @@ class _BatchPrefetcher:
 
     def __init__(self, dataset, num_workers=4, prefetch=2, seed=1234,
                 labels=False, v7=False, augment=True):
-        # 护栏：**绝不能在设备运行时初始化之后**构造本类（4 卡 910A 的 OOM
+        # 护栏：**绝不能在设备运行时初始化之后**构造本类（4 卡 旧多卡环境 的 OOM
         # 直接原因，2026-09-30）。`mp.Process` 默认 fork，子进程会整份继承父
-        # 进程的 CANN/CUDA 上下文与已分配显存映射 ⇒ 每卡被旁挂 4 份 ≈ 24 GiB，
-        # 而 PyTorch 自己只记 6.3 GB（实测 HBM 94% / AICore 0%）。GC 管不到
+        # 进程的 /CUDA 上下文与已分配显存映射 ⇒ 每卡被旁挂 4 份 ≈ 24 GiB，
+        # 而 PyTorch 自己只记 6.3 GB（实测 HBM 94% / 计算单元 0%）。GC 管不到
         # 别的进程继承来的映射。正确做法见 main()：数据集加载与本类的构造都在
         # `init_process_group` / `set_device` **之前**。
         for _dev in ('cuda',):
@@ -2787,7 +2787,7 @@ def _init_swanlab(args, logger):
                 "attention_dropout": args.attention_dropout,
                 "ema_enabled": bool(args.use_ema),
                 "ema_decay": 0.999,
-                # ---- AMP：910A 无 BF16，FP16 必须配 GradScaler ----
+                # ---- AMP：旧多卡环境 无 BF16，FP16 必须配 GradScaler ----
                 "amp_dtype": "float16",
                 "scaler_init_scale": args.scaler_init_scale,
                 "scaler_growth_interval": args.scaler_growth_interval,
@@ -2797,8 +2797,8 @@ def _init_swanlab(args, logger):
                 # 开没开**。静默的开关是排查噩梦 —— 尤其它与 materialize 路径
                 # 非逐位相同，出了问题得先知道它开过。
                 "attn_online": int(args.attn_online),
-                # SDPA（CANN 融合注意力）开关：登记进来同样为了面板可见 ——
-                # 它直接决定注意力走融合内核还是手写 math，是 NPU 上最关键的
+                # SDPA（ 融合注意力）开关：登记进来同样为了面板可见 ——
+                # 它直接决定注意力走融合内核还是手写 math，是 加速器 上最关键的
                 # 显存/速度/数值口径之一。
                 "use_sdpa": int(args.use_sdpa),
                 "attn_query_chunk": int(args.attn_query_chunk or 0),
@@ -2956,8 +2956,8 @@ def soft_cross_entropy(policy_logits, soft, soft_mask, soft_weight=1.0):
     精度：**升到 float32，但绝不上 float64**。autocast 下 logits 可能是
     fp16/bf16，而软 target 在低精度下会被舍入掉可观的相对误差（bf16 只有 8 位
     尾数，0.001 量级的概率直接被抹平），所以要 `.to(torch.float32)`。
-    但 910A **没有 fp64 硬件**，任何设备侧 fp64 都走「cast 成 fp32」的兜底，
-    而实测那条兜底路径会挂 AICPU（`EXCEPTION TASK: task type=aicpu kernel`），
+    但 旧多卡环境 **没有 fp64 硬件**，任何设备侧 fp64 都走「cast 成 fp32」的兜底，
+    而实测那条兜底路径会挂 专用内核（`EXCEPTION TASK: task type=aicpu kernel`），
     且故障是**异步**的——报错栈会指向后面第一次同步的无关算子，极难定位。
     由 `tests/test_no_aicpu_ops_in_startup_check.py::test_no_fp64_anywhere_on_the_device_path`
     钉死。返回标量张量（fp32）。
@@ -2969,7 +2969,7 @@ def soft_cross_entropy(policy_logits, soft, soft_mask, soft_weight=1.0):
     if tuple(soft.shape) != tuple(policy_logits.shape):
         raise ValueError(f"soft {tuple(soft.shape)} 与 logits "
                         f"{tuple(policy_logits.shape)} 形状不符")
-    # 一律 fp32：见 docstring 的 910A/fp64 段。`soft` 是 fp16（.npz 里就是
+    # 一律 fp32：见 docstring 的 旧多卡环境/fp64 段。`soft` 是 fp16（.npz 里就是
     # float16），直接乘会把 0.001 量级的概率舍掉，必须先升到 fp32。
     calc_dtype = torch.float32
     logp = F.log_softmax(policy_logits.to(calc_dtype), dim=-1)
@@ -3359,15 +3359,15 @@ def compute_l2_report(param_groups):
     `p.detach()` 保证不建图、不占住反向图。设备同步是**每次调用 1 次**
     `float()`（四组里两个 decay 组，只在最后读回一次），但本函数在训练循环里
     **每个 micro-batch 都无条件跑**（不在 `if _do_stdout or _do_swanlab:` 里），
-    比日志打点那 3 次同步频繁得多 —— 见 report `## Fix3 增补` §3 的 NPU 说明。
+    比日志打点那 3 次同步频繁得多 —— 见 report `## Fix3 增补` §3 的 加速器 说明。
     """
 # 累加全部留在**设备上**，整个调用只做一次 `float()`（= 一次 host 同步）。
     # 逐组 `float()` 是 2 次同步，而本函数在训练循环里**每个 micro-batch 都跑**
     #   （不在 `if _do_stdout or _do_swanlab:` 里），比日志打点的 3 次同步频繁
     #   ~`_accum_steps` × `--log-every` 倍。
-    # **不要在设备侧做 fp64**（`sq.double()`）：910A 没有 fp64 硬件，实测
+    # **不要在设备侧做 fp64**（`sq.double()`）：旧多卡环境 没有 fp64 硬件，实测
     #   （2026-10-01 云端）会报 `Device do not support double dtype now` 并挂掉
-    #   AICPU kernel。本 docstring 早先论证过的「`wd * float(sq)` 与
+    #   专用内核 kernel。本 docstring 早先论证过的「`wd * float(sq)` 与
     #   `sq.double() * wd` 逐位相同」正好给了替代：**乘加搬到主机侧**（Python
     #   float 就是 fp64），设备侧只留 fp32 的 `pow(2).sum()` 归约。
     #   精度不降反升（少一次设备侧舍入），`test_l2_report_scales_with_weight_decay`
@@ -3428,7 +3428,7 @@ def build_adamw(param_groups, device, logger=None):
     省逐参数 kernel 启动开销）。它**只换 kernel、不换语义**：四组
     `{非 value, value} × {decay, no_decay}`、解耦 weight decay（L2 不进 loss ——
     P4.5b 的 opt_loss/log_loss 分离与 `compute_l2_report` 的报告口径）在两种模式
-    下逐字相同。**不是** MindSpeed 的融合优化器：那是 D6 / P4.11 的事，本函数不碰。
+    下逐字相同。**不是** 第三方融合优化器（MindSpeed 等 NPU 专属方案）：那是 D6 / P4.11 的事，本函数不碰。
 
     **设备策略**（A1 记录：CUDA A100 支持；本地开发是 CPU）：
 
@@ -3562,13 +3562,13 @@ def _prof_parse_trace(trace, *, row_limit=18):
     """chrome trace JSON →（top-k 内核表, cat 总耗时摘要）。
 
     **纯函数**：只吃已经 ``json.load`` 出来的对象，不碰 profiler 实例 ⇒ 不装
-    torch_npu 也能测。这是 `key_averages()` 那条路走不通时的唯一出口。
+    NPU 版 torch 也能测。这是 `key_averages()` 那条路走不通时的唯一出口。
 
-    为什么必须有它：``torch_npu 2.1.0.post10`` 的 ``torch_npu.profiler.profile``
+    为什么必须有它：``NPU 版 torch 2.1.0.post10`` 的 ``NPU 版 torch.profiler.profile``
     是**独立类**，实例方法只有 ``add_metadata / add_metadata_json /
     export_chrome_trace / export_memory_timeline / export_stacks / start /
     step / stop`` 共 8 个，**没有** ``key_averages / events / profiler_result``
-    （``scripts/probe_npu_profiler.py`` 实测）。于是打表那段在真机上必
+    （真机实测）。于是打表那段在真机上必
     AttributeError，被外层 ``except`` 吞成一行 warning ⇒「窗口跑完了、表没有」。
 
     聚合口径：按 ``(cat, name)`` 求和时长。只收 ``dur > 0`` 的事件 —— trace 里
@@ -3606,7 +3606,7 @@ def _prof_parse_trace(trace, *, row_limit=18):
 def _prof_trace_table(prof, *, row_limit=18):
     """``key_averages()`` 缺失时的退路：导出 chrome trace → 解析 → 表 + cat 摘要。
 
-    ``export_chrome_trace(path)`` 是 torch_npu **确实提供**的 8 个方法之一，所以
+    ``export_chrome_trace(path)`` 是 NPU 版 torch **确实提供**的 8 个方法之一，所以
     这条路在真机上是走得通的。trace 落到临时文件、读完即删（一次窗口几百 MB，
     留在 /tmp 里没人收）。
     """
@@ -3839,7 +3839,7 @@ def main():
     ap.add_argument('--scaler-init-scale', type=float, default=0.0,
                     help='GradScaler 初始缩放值（0=用 PyTorch 默认 65536）。'
                         '默认 65536 需要靠减半向下搜索平衡点，每次溢出白扔一个 '
-                        'batch；实测本模型在 4 卡 910A 上平衡于 512~2048，'
+                        'batch；实测本模型在 4 卡 旧多卡环境 上平衡于 512~2048，'
                         '故建议直接给 1024 起步。设 --scaler-growth-interval 0 '
                         '可关闭自动回涨，避免震荡反复偷步')
     ap.add_argument('--compile', type=int, default=None, choices=[0, 1],
@@ -3848,7 +3848,7 @@ def main():
                          '**不给 = 按设备自动**：CUDA 且 sm_80 以上（A100 等）'
                          '自动开 1，其余后端 0。本仓 CUDA 分支本来就把 BF16 + '
                          'channels_last + FlashAttn 都默认打开了，compile 却是'
-                         '默认关的 —— 那是 NPU 时期「inductor 不可用」留下的默认值，'
+                         '默认关的 —— 那是 加速器 时期「inductor 不可用」留下的默认值，'
                          '对 A100 是白丢的收益。\n'
                          '显式给 0/1 覆盖自动判定。compile 失败会自动回退 eager，'
                          '不会把训练带崩。')
@@ -3874,7 +3874,7 @@ def main():
     ap.add_argument('--gc-with-compile', type=int, default=0, choices=[0, 1],
                     help='开 --compile 时**仍然保留**梯度检查点（1=保留，0=照旧关掉）。'
                          '默认 0 是历史行为：compile 与 GC 被当成二选一'
-                         '（见下面 `_gc = 0` 那段）。那条策略的来源是 NPU/TorchAir 的'
+                         '（见下面 `_gc = 0` 那段）。那条策略的来源是 加速器/旧编译栈 的'
                          '图捕获限制，不是 A100/CUDA 上的技术必然 —— 检查点走 '
                          '`use_reentrant=False`（`backbone._checkpointed` 已经是），'
                          '与 `torch.compile` 兼容，且 `backbone.'
@@ -4094,11 +4094,11 @@ def main():
 
     # ---- 数据集 + 预取 worker：**必须在设备初始化之前**（2026-09-30）----
     # 顺序是硬要求，不是风格问题：本段的 `mp.Process` 默认 fork，若排在
-    # `init_process_group` / `torch.npu.set_device` 之后，4 个 worker 会各自
-    # 继承一份父进程的 CANN 设备上下文与显存映射 ⇒ 每卡 6.3 GB 的训练被旁挂到
-    # 4×6 GB，实测 HBM 94% 而 AICore 0%，紧接着就是 OOM。数据集加载是纯
+    # `init_process_group` / `torch.cuda.set_device` 之后，4 个 worker 会各自
+    # 继承一份父进程的  设备上下文与显存映射 ⇒ 每卡 6.3 GB 的训练被旁挂到
+    # 4×6 GB，实测 HBM 94% 而 计算单元 0%，紧接着就是 OOM。数据集加载是纯
     # numpy（与 rank 无关），提前无语义影响；反向顺序（dist 初始化后再 fork）
-    # 才是 HCCL 的危险方向，提前 fork 是安全的那一侧。
+    # 才是 NCCL 的危险方向，提前 fork 是安全的那一侧。
     dataset = load_from_path(args.data, args.board_size,
                                 args.max_games_per_tgz, v7=bool(args.v7),
                                 games_npz=args.games_npz)
@@ -4187,7 +4187,7 @@ def main():
 
     # ---- eval 特征预取池（V7 专用，2026-10-06）--------------------------------
     # 事故背景：eval 的 `v7_batch_sync` 在主进程**串行**算 22 通道特征（含
-    # iterLadders 这个 CPU 大头），10 万行要磨 25-30 分钟，期间 NPU 归零、无任何
+    # iterLadders 这个 CPU 大头），10 万行要磨 25-30 分钟，期间 加速器 归零、无任何
     # 日志——真机两次被当成「挂死」。本池与训练预取器同机制（同样在设备初始化
     # 之前 fork、同一份 `_prefetch_worker`，仅 `augment=False`），eval 批在
     # worker 间并行 ⇒ 同一批指标逐位不变，只把墙钟除以 worker 数。
@@ -4217,7 +4217,7 @@ def main():
         torch.cuda.set_device(local_rank)
         device = f'{_dist_backend}:{local_rank}'
         # 通信域是**惰性**创建的（上面两行只登记后端），所以主动试一发 all_reduce：
-        # 否则通信建不起来要等到第一个 batch 的前向才炸，且报成 HCCL 通用错误
+        # 否则通信建不起来要等到第一个 batch 的前向才炸，且报成 NCCL 通用错误
         # （真因藏在日志前面的 EJ0001 里）。见 _dist_preflight_check 的 docstring。
         _dist_preflight_check(_dist_backend, device, logger)
         if is_main:
@@ -4351,9 +4351,9 @@ def main():
     _backbone.set_sdpa_force_math(sdpa_force_math)
     _backbone.set_compile_disable_sparse(compile_disable_sparse)
     # config 面板回填真实注意力后端：swanlab.init 在设备分支之前已上传写死的
-    # `attn_sdpa_force_math: True`，这里用运行时真值覆盖。CANN SDPA 放开后该键应为
+    # `attn_sdpa_force_math: True`，这里用运行时真值覆盖。 SDPA 放开后该键应为
     # False。API 不支持 init 后更新时静默忽略，启动日志才是真相源。
-    # `amp_dtype` 同理：init 时写死的 'float16' 在 NPU bf16 路径下是错的，回填真值。
+    # `amp_dtype` 同理：init 时写死的 'float16' 在 加速器 bf16 路径下是错的，回填真值。
     if swanlab_logger is not None:
         try:
             swanlab_logger.config.update({
@@ -4365,18 +4365,18 @@ def main():
     # 注意力 query 分块（2026-10-01）：math 路径下整条 (B,Hh,N,N) 分数矩阵
     # @N=361/4head/fp16 在 B=1000 时 0.97 GiB 一份、softmax+dropout 再各一份。
     # softmax 沿 key 轴 ⇒ 按 query 切块**数学精确**，峰值 ∝ chunk（默认 64 ⇒ 5.6×）。
-    # 只加在 math 分支；SDPA/flash 融合路径自行管理显存，不受影响（NPU 默认已放开
-    # 走 CANN SDPA，故该分块在 NPU 上通常不再生效，见上方日志提示）。
+    # 只加在 math 分支；SDPA/flash 融合路径自行管理显存，不受影响（加速器 默认已放开
+    # 走  SDPA，故该分块在 加速器 上通常不再生效，见上方日志提示）。
     # （2026-10-06：三个融合/分块开关的环境变量已全部换成 CLI 参数）
     _attn_chunk = int(args.attn_query_chunk or 0)
     _backbone.set_attn_query_chunk(_attn_chunk)
     # 逐 chunk 梯度检查点（2026-10-04 新增）：分块只降瞬时峰值，**不降保留量** ——
     # 每块的 softmax 输出都被 autograd 存着等反向。逐块 checkpoint 把占大头的
     # 注意力矩阵变成「反向时一块一块重算」，**不依赖 block 级 checkpoint 是否生效**
-    # （实测云端 910A 上 64 GB ≈ 无 checkpoint 的估算值）。
+    # （实测云端 旧多卡环境 上 64 GB ≈ 无 checkpoint 的估算值）。
     # 默认开；`--attn-chunk-ckpt 0` 关闭。
     _backbone.set_attn_chunk_checkpoint(int(args.attn_chunk_ckpt))
-    # NPU 融合算子总闸（置 0 只慢不坏，数值口径不变）。
+    # 加速器 融合算子总闸（置 0 只慢不坏，数值口径不变）。
 
     # online-softmax 注意力（flash 风格）：由 `--attn-online` 控制（默认关）。
     # 与 materialize 路径**数值等价但非逐位相同**（实测 fp32 max|Δ|≈7e-07），
@@ -4560,7 +4560,7 @@ def main():
     # 逐段开关也打出来：「grad_checkpoint=1」只说明**总开关**，看不出哪几段真的在
     # 走检查点（per-kind 默认可以不同；且训练态闸门还要求 self.training +
     # grad enabled）。这段日志的用处是让「GC 到底生效没有」不必翻代码，也不必
-    # 在云端日志里靠猜 —— 4×910A 首跑要看的就是它。
+    # 在云端日志里靠猜 —— 4×旧多卡环境 首跑要看的就是它。
     # mixin 宿主有两种拓扑：12 通道挂 `model.backbone`，V7（NbtTfNet 自己
     # 继承 mixin、没有 `.backbone`）挂 `model`。原来只查后者 ⇒ V7 永远打 `n/a`，
     # 而这段日志的全部用处就是让人不翻代码就看出 GC 有没有生效。
@@ -4674,7 +4674,7 @@ def main():
     # **SwanLab 静默丢掉整块指标而训练照跑**（与 2026-10-01 那次 `_accum_steps`
     # 同类的坑，见下方注释）。
     _v7_terms_swanlab = {}
-    # 「哪一项算坏了」的去重表 + 计数（2026-10-04 云端 910A）。
+    # 「哪一项算坏了」的去重表 + 计数（2026-10-04 云端 旧多卡环境）。
     #   同一种坏项组合只 `logger.error` 一次，其余走 debug —— 否则 100% 跳步时
     #   每步刷一遍同样的文本，把唯一有用的那行信息淹掉。
     _v7_bad_seen = []
@@ -5008,7 +5008,7 @@ def main():
                 logger.warning("[swanlab] run 级指标上报失败（不影响训练）: %s", e)
 
     # 预取器 pf 已在**设备初始化之前**构造（见上方「数据集 + 预取 worker」段：
-    # fork 晚于 set_device 会让每个 worker 继承 CANN 上下文，4 卡实测每卡凭空
+    # fork 晚于 set_device 会让每个 worker 继承  上下文，4 卡实测每卡凭空
     # 多占 ~24 GiB ⇒ OOM）。此处刻意不再构造，避免顺序被无意改回去。
     assert (pf is not None) == (args.prefetch_workers > 1), \
         '预取器构造与 workers 设置不一致：构造顺序被改动了？'
@@ -5043,10 +5043,10 @@ def main():
         _prof_span = max(0, int(os.environ.get('GOAI_PROFILE_STEPS', '50') or 50))
         _prof_ctx = None
         # ---- 分段计时（纯 CPU 侧观测）----
-        # 动机：4 卡 910A 实测 4.25 s/step，扣除 eval（实测仅 0.2%）后
+        # 动机：4 卡 旧多卡环境 实测 4.25 s/step，扣除 eval（实测仅 0.2%）后
         # 约 96% 是黑盒，无法判断瓶颈在取数 / 算子 / 通信 / 保存。
         # 绝不在此插 synchronize()：那会打断预取与双缓冲流水，反而更慢。
-        # 代价是 t_comp 只反映 CPU 侧发射时间、不含 NPU 实际执行；
+        # 代价是 t_comp 只反映 CPU 侧发射时间、不含 加速器 实际执行；
         # 判读靠「各段之和 vs elapsed」的差额。
         # 重置放在打点处，故某步的 save/eval（发生在其打点之后）计入
         # 下一个区间 —— 这与墙钟口径一致。
@@ -5191,7 +5191,7 @@ def main():
                         move_t = torch.from_numpy(moves_np).long().pin_memory()
                         value_t = torch.from_numpy(values_np).float().pin_memory()
                     else:
-                        # 同上：全精度才升 fp32。NPU 走 AMP（amp_dtype=fp16）⇒ 保持
+                        # 同上：全精度才升 fp32。加速器 走 AMP（amp_dtype=fp16）⇒ 保持
                         # planes 的 fp16；CPU 是 fp32 ⇒ 这里升回去，否则 fp16 输入
                         # 喂 fp32 权重会报 dtype 不匹配。
                         state = torch.from_numpy(states_np.copy())
@@ -5274,10 +5274,10 @@ def main():
                     #   间隔 13 次同步，而不是每步 13 次。值本身与 detach 无关
                     #   （同一份数据）；13 个标量张量常驻可忽略。
                     _v7_terms_last = {k: x.detach() for k, x in _w.items()}
-                    # 哪一项算坏了，**当场点名**（2026-10-04 云端 910A 实跑）。
+                    # 哪一项算坏了，**当场点名**（2026-10-04 云端 旧多卡环境 实跑）。
                     #   那个 run 的症状是「每步都溢出、loss 全 NaN、缩放值降到 160
                     #   仍 100% 跳过」，本地 fp32/fp16/bf16 都复现不出来 ⇒ 只有
-                    #   这条日志能指认是哪一项在 NPU 上坏掉。
+                    #   这条日志能指认是哪一项在 加速器 上坏掉。
                     _bad_terms = _v7_res.get('nonfinite_terms') or []
                     _bad_ops = _v7_res.get('nonfinite_operands') or []
                     _san_rows = _v7_res.get('sanitized_rows') or {}
@@ -5327,7 +5327,7 @@ def main():
                         #  · **纯梯度溢出**。这个 GradScaler 管得住：跳步 + 减半，
                         #    权重不动，下一步往往就干净了。
                         #
-                        # 实测（2026-10-05 4×910A，lr 9.77e-3 / 4000 每卡）：
+                        # 实测（2026-10-05 4×旧多卡环境，lr 9.77e-3 / 4000 每卡）：
                         # step 400 还好（lr 7.07e-3、scale 81920、skip=0），
                         # step 430~440 loss=nan、scale 峰值 163840，
                         # step 450 scale=10、skip=13 —— 减半 14 次**一次也没救回来**，
@@ -5428,14 +5428,14 @@ def main():
                 _n_timed += 1
                 if (i + 1) % _accum_steps == 0 or (i + 1) == n_batches:
                     # 缩放值下降 == 本步因 inf/nan 被 GradScaler 跳过，那一整个
-                    # batch 的数据就此白扔。实测 4 卡 910A 在 step~1770 出现
+                    # batch 的数据就此白扔。实测 4 卡 旧多卡环境 在 step~1770 出现
                     # 16384→8192→4096→2048 的雪崩 + 大量 Skipping step。
                     #
                     # 注意：这里不把 clip_grad_norm_ 挪到 unscale_ 之前。模型
                     # 参数始终是 FP32（只改了 memory_format，从未 .half()），
                     # 梯度也是 FP32，其上限 3.4e38，缩放系数根本不可能让它
                     # 在 65504 处溢出。那些 inf/nan 是前向/反向里真实的数值
-                    # 故障（最可疑是 NPU 强制 math 注意力物化大 logits 时的
+                    # 故障（最可疑是 加速器 强制 math 注意力物化大 logits 时的
                     # FP16 溢出），不是 loss scaling 的伪影——所以真正的
                     # 修复点在别处，此处只负责让它**可观测**。
                     _scale_now = scaler.get_scale()
@@ -5471,7 +5471,7 @@ def main():
                     _t_g1 += time.perf_counter() - _t_g1_0
                     _t_g2_0 = time.perf_counter()
                     # clip_grad_norm_ **返回 clip 前的总范数** —— 之前被丢弃了。它是
-                    # fp16 溢出/梯度爆炸唯一的直接信号：这轮 910A 的 inf/nan 与
+                    # fp16 溢出/梯度爆炸唯一的直接信号：这轮 旧多卡环境 的 inf/nan 与
                     # 缩放值雪崩，本可以由它提前几分钟看到。
                     # 必须在 unscale_ 之后取（unscale 前是按 scale 放大的假值）。
                     _gn = torch.nn.utils.clip_grad_norm_(
@@ -5488,7 +5488,7 @@ def main():
                     # `g` 段结算 = g1+g2+g3（三段首尾相接无缝，故恒等）。放在
                     # `float(_gn)` 之后，不把这次同步算进 `o` 段。
                     _t_clip += time.perf_counter() - _t_clip0
-                    # **溢出诊断的时机（2026-10-04 云端 910A 实测打出来的 bug）**
+                    # **溢出诊断的时机（2026-10-04 云端 旧多卡环境 实测打出来的 bug）**
                     #   `clip_grad_norm_(max_norm=1.0)` 在 `total_norm = inf` 时算出
                     #   `clip_coef = 0` 并 `grad.mul_(0)` ⇒ **inf × 0 = NaN**，
                     #   而 `inf ⇒ clip_coef = 0 < 1` 这个分支**一定会进**。
@@ -5591,7 +5591,7 @@ def main():
                 if _real_step:
                     scheduler.step()
                 else:
-                    # **跳过的步不许推进 LR 计划**（2026-10-04 云端 910A 实跑）。
+                    # **跳过的步不许推进 LR 计划**（2026-10-04 云端 旧多卡环境 实跑）。
                     #   `scaler.step()` 在检出 inf 时**内部跳过** `optimizer.step()`，
                     #   但它对调用方是「成功返回」的 ⇒ 无条件 `scheduler.step()`
                     #   会让 warmup/cosine 在**权重一动没动**的步上照样前进。
@@ -5623,8 +5623,8 @@ def main():
                 #     allocated + reserved + free，配合 `total` 就能反推 torch 之外
                 #     占多少（`32.00 − 27.02 − 0.62 = 4.36 GiB`）。常打一个
                 #     「平时的 reserved」信息更少。
-                #   · `torch.npu.max_memory_allocated` 全仓库只那一处、没在
-                #     torch_npu 2.1 上验证过；它在日志路径上抛异常就是**第 50 步
+                #   · `torch.cuda.max_memory_allocated` 全仓库只那一处、没在
+                #     NPU 版 torch 2.1 上验证过；它在日志路径上抛异常就是**第 50 步
                 #     崩**，正好毁掉最需要那个数的时刻。观测不该有能力杀死被观测的进程。
                 if _backend == 'cuda':
                     mem = torch.cuda.memory_reserved(device) / 1e9
@@ -5867,7 +5867,7 @@ def main():
                     #   覆盖先写的，于是上面那行是**死代码**：谁改它都不会生效。）
                     "scaler_scale": _scale if use_scaler else 1.0,
                     "t_data_ms": _dms,
-                    # ⚠ 口径：`t_comp_ms` 只统计 **CPU 侧发射时间**，不含 NPU 实际
+                    # ⚠ 口径：`t_comp_ms` 只统计 **CPU 侧发射时间**，不含 加速器 实际
                     #   执行（刻意不打 synchronize，会打断预取流水）。它**不能**
                     #   单独读成「算子慢」——判读靠「各段之和 vs elapsed」的差额。
                     "t_comp_ms": _cms,
@@ -5916,7 +5916,7 @@ def main():
                     try:
                         _prof.__exit__(None, None, None)
                         # 先试 `key_averages()`；取不到就退回下面的 chrome trace
-                        # 解析（老版本 torch_npu 的 profile 是独立类，只有 8 个方法、
+                        # 解析（老版本 NPU 版 torch 的 profile 是独立类，只有 8 个方法、
                         # 没有 key_averages ⇒ AttributeError）。
                         try:
                             _ka = _prof.key_averages()
@@ -5987,7 +5987,7 @@ def main():
                 if ema is not None:
                     ema.restore()
                 # 曾经在这里周期性 `empty_cache()` 回收分配器缓存段，2026-10-01 撤掉：
-                # 它在 NPU 上没验证过，且**每次 eval 都调**（默认 ~35 分钟一次）在训练
+                # 它在 加速器 上没验证过，且**每次 eval 都调**（默认 ~35 分钟一次）在训练
                 # 主路径上；等真机上确认了碎片确实在爬升、再按实测收益决定值不值得加。
                 # OOM 恢复路径里的那次 `empty_cache()`（在 except 分支）是既有的，保留。
                 if is_main:
