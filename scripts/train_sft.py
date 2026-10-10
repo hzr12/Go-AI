@@ -1089,25 +1089,21 @@ def _grads_nonfinite_any_rank(optimizer):
 
 def _scaler_step_global(scaler, optimizer, *, scale_before, use_scaler,
                         logger=None):
-    """按**全局**判定决定跳/不跳，返回 True = 这一步真的更新了权重。
+    """按**本地（单卡即全局）**判定决定跳/不跳，返回 True = 这一步真的更新了权重。
 
     为什么不直接用 `scaler.step(optimizer)`
     -------------------------------------
-    `scaler.step` 内部只看本地 `found_inf`，多卡下各 rank 会做出**不同**的跳/不跳
-    决定 ⇒ 权重分叉（见 `_grads_nonfinite_any_rank`）。所以这里改成：
+    `scaler.step` 内部只看本地 `found_inf` 并据此**就地**调整 scale：溢出时跳过
+    `optimizer.step()` 并把 scale 调小，连续成功时调大。这里改成：
 
     * `use_scaler=False`（bf16 路径）⇒ 直接 `optimizer.step()`，不做任何判定；
-    * 全局有非有限 ⇒ **所有 rank 一起跳**，并把 scale 显式设成
-    `scale_before * backoff_factor`。**显式给值**是关键：`update()` 免参版会读
-    本地 `found_inf`（在没溢出的 rank 上是 0，于是那个 rank 会把 scale 往**上**调）
-    ⇒ 各 rank 的 scale 就此错位，而 `scaler.unscale_` 是在各 rank 上各自除以
-    自己的 scale 的，除数不同 ⇒ all_reduce 混合的是不同尺度的梯度；
-    * 全局干净 ⇒ `optimizer.step()` + `scaler.update()` 免参版（保持
-    `growth_interval` 的增长语义不变；此时每个 rank 本地都没 inf，
-    `update()` 看到的是一致的 0）。
+    * 本地有非有限 ⇒ 跳步，并把 scale **显式**设成
+      `scale_before * backoff_factor`。**显式给值**是关键：不能让 `update()` 免参版
+      去读本地 `found_inf` 自作主张地调整 scale；
+    * 本地干净 ⇒ `optimizer.step()` + `scaler.update()` 免参版（保持
+      `growth_interval` 的增长语义不变）。
 
-    代价：跳步那条走的是显式 `new_scale`，不会顺手重置 `growth_tracker`。
-    全部 rank 走**同一条**分支，所以 tracker 仍然跨 rank 一致；只是"连续成功"的
+    代价：跳步那条走的是显式 `new_scale`，不会顺手重置 `growth_tracker`；
     计数跨过一次跳步而不是被清零 —— `growth_interval` 默认 1e5 量级时可忽略。
     """
     if not use_scaler:
@@ -3077,9 +3073,6 @@ def compute_l2_report(param_groups):
     **不做任何跨进程归约**（`_read_log_scalars` 直接 `.item()`，stdout 由
     rank0 的 logger 过滤、swanlab 只在 is_main 建），本项跟随同一口径：本地
     计算、本地 `.item()`、无 collective、无同步点。
-    例外：`GradScaler.step` 只在**本地**查 `found_inf`、不做 all_reduce，
-    所以一次 inf/nan 触发的 step 跳过是**单 rank** 的 —— 那一步各 rank 的 θ
-    会分叉，本项在那一行就会跨 rank 不一致。稳态（无跳过）下不影响。
 
     代价（ 分清「参数字节」与「实际流量」，两者差 ~3×）：`p.detach().pow(2).sum()`
     是「逐元素 kernel + 归约 kernel」两段，流量是 **读 θ + 写 θ² + 读 θ²**
@@ -3776,8 +3769,8 @@ def main():
 
     # ---- 数据集 + 预取 worker：**必须在设备初始化之前**（2026-09-30）----
     # 顺序是硬要求，不是风格问题：本段的 `mp.Process` 默认 fork，若排在
-    # `torch.cuda.set_device` 之后，worker 会继承父进程的 CUDA 上下文与显存映射
-    # ⇒ 每卡凭空多占 ~24 GiB ⇒ OOM。数据集加载是纯 numpy，提前无语义影响。
+    # 设备初始化（如 set_device / 分布式上下文）之后，worker 会继承父进程的
+    # CUDA 上下文与显存映射 ⇒ 每卡凭空多占 ~24 GiB ⇒ OOM。数据集加载是纯 numpy，提前无语义影响。
     dataset = load_from_path(args.data, args.board_size,
                                 args.max_games_per_tgz, v7=bool(args.v7),
                                 games_npz=args.games_npz)
@@ -3887,6 +3880,12 @@ def main():
         device = _auto_select_device()
     else:
         device = args.device
+
+    # 单卡：显式固定 CUDA 默认设备（仅 cuda 后端；CPU/NPU 无需）。
+    # 必须排在预取器（_BatchPrefetcher，约 L3850/3870）**之后**，否则 fork 出的
+    # worker 会继承 CUDA context（见上方「设备初始化之前」不变量）。
+    if device.split(':')[0] == 'cuda':
+        torch.cuda.set_device(int(device.split(':')[1]) if ':' in device else 0)
 
     use_amp = args.use_amp == 1 or device.split(':')[0] == 'cuda'
 

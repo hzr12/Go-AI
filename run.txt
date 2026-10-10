@@ -48,7 +48,7 @@ pip install onnx onnxruntime
 #     只少速度不会崩。`--flash-attn 0` 可强制禁用。启动日志看 `[env]` 那行。
 #   ⚠ 「设备初始化之前」这条不变量：A100 首次启动时崩过一次
 #     `RuntimeError: _BatchPrefetcher 不能在 torch.cuda 初始化之后构造`。
-#     报错指的位置**不是真正原因** —— 预取器一直就在 `init_process_group` 之前，
+#     报错指的位置**不是真正原因** —— 预取器一直就在 `set_device` 之前，
 #     真正原因是启动期那行环境诊断调了 `torch.cuda.get_device_properties(0)`
 #     （它会建 CUDA context），诊断打完才构造预取器，撞上自己的护栏。
 #     在 NPU 机上 `torch.cuda.is_available()` 为 False、整个分支跳过 ⇒ 潜伏的
@@ -173,7 +173,7 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 #   启动日志锚点：`[data] eval 预取池已启用`。仍建议配 `--eval-max-batches 5`。
 # ⚠ 「设备初始化之前」这条不变量：A100 首次启动时崩过一次
 #   `RuntimeError: _BatchPrefetcher 不能在 torch.cuda 初始化之后构造`。
-#   报错指的位置**不是真正原因** —— 预取器一直就在 `init_process_group` 之前，
+#   报错指的位置**不是真正原因** —— 预取器一直就在 `set_device` 之前，
 #   真正原因是启动期那行环境诊断调了 `torch.cuda.get_device_properties(0)`
 #   （它会建 CUDA context），诊断打完才构造预取器，撞上自己的护栏。已改为走
 #   NVML（`nvidia-smi`）读型号/算力/空闲显存。回归测试

@@ -11,13 +11,12 @@
 AICore 0% 说明它们只占显存不干活（纯 numpy 取数）。
 
 根因：`_BatchPrefetcher` 用 `mp.Process`（Linux 默认 fork）构造于
-`init_process_group` / `torch.cuda.set_device` / 分布式包裹**之后**。fork 复制
+`torch.cuda.set_device` / 任何设备初始化**之后**。fork 复制
 地址空间 ⇒ CANN 设备上下文与显存映射被整份继承。GC 只管 torch 张量，管不到
 别的进程继承来的映射，所以任何 GC / batch / chunk 调整都治不了它。
 
- 2026-10-01：包裹层从 FSDP1 换成 DDP（FSDP1 已退役）。本文件钉的是「fork 必须
-早于**任何**设备初始化与分布式初始化」，与用哪种包裹层无关 ⇒ 断言不变，只有这
-句历史指涉改成中性表述。
+ 分布式包裹层（FSDP/DDP）已移除，本仓库现仅单卡训练。本文件钉的是「fork 必须
+早于**任何**设备初始化」，与是否分布式无关 ⇒ 断言不变。
 
 这两个测试分别钉住「顺序」与「护栏」：顺序靠源码位置（这是**唯一**能证明
 fork 时机的手段 —— 运行时真机上没法观察继承），护栏用假设备运行时验证真的会拦。
@@ -42,7 +41,7 @@ def _line_of(node):
 
 
 def test_prefetcher_is_forked_before_device_initialization():
-    """`_BatchPrefetcher(` 的调用行号必须早于 set_device / init_process_group。
+    """`_BatchPrefetcher(` 的调用行号必须早于 set_device（设备初始化）。
 
     2026-10-06 起构造点为 **2 个**：训练预取器 + eval 特征预取池（V7 eval 的
     梯子特征串行计算曾让每次 eval 磨 25-30 分钟）。两个池都必须在 fork 前。
@@ -57,8 +56,8 @@ def test_prefetcher_is_forked_before_device_initialization():
     device_lines = [n.lineno for n in ast.walk(TREE)
                     if isinstance(n, ast.Call)
                     and isinstance(n.func, ast.Attribute)
-                    and n.func.attr in ('set_device', 'init_process_group')]
-    assert device_lines, '没找到 set_device / init_process_group'
+                    and n.func.attr in ('set_device',)]
+    assert device_lines, '没找到 set_device'
     first_device = min(device_lines)
     assert max(calls) < first_device, (
         '_BatchPrefetcher 在 %s 构造，但设备初始化在 L%d —— 晚于它 fork 的 '
@@ -76,7 +75,7 @@ def test_dataset_load_also_precedes_device_init():
     device_lines = [n.lineno for n in ast.walk(TREE)
                     if isinstance(n, ast.Call)
                     and isinstance(n.func, ast.Attribute)
-                    and n.func.attr in ('set_device', 'init_process_group')]
+                    and n.func.attr in ('set_device',)]
     assert load_lines[0] < min(device_lines), \
         '数据集加载（L%d）必须早于设备初始化（L%d）' % (load_lines[0],
                                                      min(device_lines))

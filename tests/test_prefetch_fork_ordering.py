@@ -6,10 +6,10 @@ r"""「设备初始化之前」这条不变量：预取 worker 是 fork 出来�
 
     RuntimeError: _BatchPrefetcher 不能在 torch.cuda 初始化之后构造：
     fork 出的 worker 会继承设备上下文，4 卡实测每卡凭空多占 ~24 GiB（OOM）。
-    请把它挪到 init_process_group / set_device 之前。
+    请把它挪到 set_device 之前。
 
 而报错里指的地方**不是真正的原因** —— `_BatchPrefetcher` 一直就在
-`init_process_group` 之前。真正的原因是 `main()` 开头为了打一行环境诊断调了
+`set_device` 之前。真正的原因是 `main()` 开头为了打一行环境诊断调了
 `torch.cuda.get_device_properties(0)`，那个调用会 `_lazy_init()` **建 CUDA
 primary context**；诊断打完之后才去构造预取器，于是撞上自己的护栏。
 
@@ -21,7 +21,7 @@ False，整个 CUDA 分支被跳过 ⇒ 这是一条潜伏的、只在 CUDA 上�
 --------------------------------
 这条不变量是**关于 main() 里语句先后顺序**的，而 main() 不能在测试里真跑
 （要数据集、要设备、要分布式）。仓库里同类 wiring 不变量也是用 AST 锁的
-（`tests/test_ddp_early_stop_sync.py` 锁停止标志广播的位置），本文件是同一路子。
+（同类 AST 锁 wiring 不变量的思路），本文件是同一路子。
 
 判据
 ----
