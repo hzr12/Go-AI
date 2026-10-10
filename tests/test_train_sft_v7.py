@@ -1351,14 +1351,14 @@ def test_prefetcher_next_returns_v7_quadruple(tmp_path):
 def test_v7_batch_sync_matches_worker_features():
     """`--prefetch-workers <=1` 的回退路径造出的特征与 worker 那条**同形**。"""
     ds = make_dataset(n_games=1, game_len=32, seed=34)
-    sp, gl, mv, lbl = v7_batch_sync(ds, np.arange(8), None,
+    sp, gl, mv, lbl, _tf = v7_batch_sync(ds, np.arange(8), None,
                                     rng=np.random.default_rng(5))
     assert sp.shape == (8, V7_SPATIAL_CHANNELS, BOARD, BOARD)
     assert sp.dtype == np.float16 and gl.dtype == np.float16
     assert gl.shape == (8, V7_GLOBAL_CHANNELS)
     assert mv.shape == (8,) and lbl['future'].shape == (8, 2, BOARD * BOARD)
     # augment=False ⇒ 恒等变换（回退路径在评估/对拍时要用）。
-    sp0, gl0, _mv0, _l0 = v7_batch_sync(ds, np.arange(8), None,
+    sp0, gl0, _mv0, _l0, _tf0 = v7_batch_sync(ds, np.arange(8), None,
                                         rng=np.random.default_rng(5),
                                         augment=False)
     ref_sp, ref_gl = v7_batch_features(ds, np.arange(8))

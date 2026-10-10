@@ -28,6 +28,12 @@ _os_alloc = os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '')
 if 'expandable_segments' not in _os_alloc:
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = (
         (_os_alloc + ',') if _os_alloc else '') + 'expandable_segments:True'
+# Inductor FX 图缓存：同配置（图结构 + 输入 shape/dtype 哈希）下复用已编译的
+# kernel，免去每次重启重跑 max-autotune（动辄几分钟）。必须在 import torch 前设置，
+# inductor 首次访问 config 时读取该环境变量（TORCHINDUCTOR_* 前缀）。注意：该特性
+# **torch 2.2+** 才有；本仓云端若仍是 2.1.0 则设了也白设，需升级 torch 才真正生效。
+if not os.environ.get('TORCHINDUCTOR_FX_GRAPH_CACHE'):
+    os.environ['TORCHINDUCTOR_FX_GRAPH_CACHE'] = '1'
 import torch
 import torch.nn.functional as F
 
@@ -1718,9 +1724,13 @@ def evaluate_metrics_v7(model, dataset, idxs, bs, device, amp_dtype, *,
             win -= 1
             yield prefetcher.next()
 
-    for sp_np, gl_np, moves, lbl in _iter_batches():
+    for sp_np, gl_np, moves, lbl, tf_np in _iter_batches():
         batches += 1
         sp = v7_to_device(sp_np, device, amp_dtype)
+        # GPU 8 路对称增强（eval 恒 tforms=0 ⇒ 恒等变换，零随机，与训练侧同口径）。
+        _tf_t = torch.as_tensor(np.ascontiguousarray(tf_np),
+                               device=device, dtype=torch.long)
+        sp = _dihedral_batch_torch(sp, _tf_t)
         if use_channels_last:      # 与训练侧同一布局（见训练循环里的同名注释）
             sp = _to_nhwc(sp)
         gl = v7_to_device(gl_np, device, torch.float32)
@@ -2094,7 +2104,9 @@ def v7_batch_sync(dataset, idxs, device=None, *, rng=None, augment=True):
             else np.zeros(idxs.size, dtype=np.int64))
     moves, lbl = _v7_labels_and_moves(dataset, idxs, tforms)
     sp, gl = v7_batch_features(dataset, idxs)
-    return _dihedral_batch(sp, tforms), gl, moves, lbl
+    # 返回 raw spatial + tforms，增强在主循环用 `_dihedral_batch_torch` 上 GPU 做
+    # （与前后向重叠）。tforms 与 moves/labels 同源，输入/标签仍一致。
+    return sp, gl, moves, lbl, tforms
 
 
 def v7_to_device(x, device, amp_dtype, *, pin=False):
@@ -2171,8 +2183,10 @@ def _prefetch_worker(wi, task_q, res_q, seed, dataset, labels=False, v7=False,
                 moves, lbl = _v7_labels_and_moves(dataset, sub_idx, tforms)
                 spatial, gl = v7_batch_features(dataset, sub_idx,
                                                 boards=v7_boards or None)
-                res_q.put((step, pos, _dihedral_batch(spatial, tforms), gl,
-                        moves, lbl, None))
+                # raw spatial + tforms 一并回传，增强改在主循环 H2D 之后用
+                # `_dihedral_batch_torch` 在 GPU 上施加（与前后向重叠，不再占
+                # worker CPU）。tforms 与 moves/labels 同源，输入/标签仍一致。
+                res_q.put((step, pos, spatial, gl, moves, lbl, None, tforms))
             else:
                 out = dataset.sample_batch_numpy(sub_idx, rng=rng, labels=labels)
                 if labels:
@@ -2254,6 +2268,29 @@ def _dihedral_batch(x, tforms):
         if k:
             arr = np.rot90(arr, k=-k, axes=(2, 3))
         out[mask] = arr
+    return out
+
+
+def _dihedral_batch_torch(x, tforms):
+    """torch 版 8 路 dihedral，语义与 :func:`_dihedral_batch` 逐位一致。
+
+    ``x``: ``(B,C,H,W)`` 张量（CUDA 上即在 GPU 做增强，与前后向同流重叠）；
+    ``tforms``: ``(B,)`` 长整型。约定同 numpy 版：``t>=4`` 先翻 W 轴（末维），
+    ``k=t%4`` 再顺时针转 ``k``（torch.rot90 取逆时针，故 ``k`` 取负）。
+    纯索引/翻转，无算术，fp16 下与 numpy 版逐位相同。
+    """
+    out = x.clone()
+    for t in range(8):
+        mask = (tforms == t)
+        if not mask.any():
+            continue
+        sub = x[mask]
+        if t >= 4:
+            sub = sub.flip(-1)
+        k = t % 4
+        if k:
+            sub = torch.rot90(sub, k=-int(k), dims=(2, 3))
+        out[mask] = sub
     return out
 
 
@@ -2360,19 +2397,26 @@ class _BatchPrefetcher:
         parts = self._pending.pop(step, [])
         # 如果不够 k 个，从队列中继续收
         while len(parts) < self.k:
-            r_step, pos, s, m, v, lbl, err = self._res_q.get()
+            _item = self._res_q.get()
+            # v7 成功 payload 是 8 元组（末位带 tforms），错误 payload 仍是 7 元组；
+            # 非 v7 路径也始终是 7 元组。按长度 + self.v7 判别，错误元组统一走 7 分支。
+            if self.v7 and len(_item) == 8:
+                r_step, pos, s, m, v, lbl, err, tf = _item
+            else:
+                r_step, pos, s, m, v, lbl, err = _item
+                tf = None
             if r_step == step:
-                parts.append((pos, s, m, v, lbl, err))
+                parts.append((pos, s, m, v, lbl, err, tf))
             else:
                 # 缓存未来 step 的结果
                 self._pending.setdefault(r_step, []).append(
-                    (pos, s, m, v, lbl, err))
+                    (pos, s, m, v, lbl, err, tf))
         # 检查错误
-        for pos, s, m, v, lbl, err in parts:
+        for pos, s, m, v, lbl, err, tf in parts:
             if err is not None:
                 raise err
         # 按 pos 排序并拼接
-        parts = [(pos, s, m, v, lbl) for pos, s, m, v, lbl, _ in parts
+        parts = [(pos, s, m, v, lbl, tf) for pos, s, m, v, lbl, _, tf in parts
                 if s is not None]
         parts.sort(key=lambda x: x[0])
         if not parts:
@@ -2383,14 +2427,15 @@ class _BatchPrefetcher:
         labels_dict = _concat_label_dicts([p[4] for p in parts]) if (
             self.labels or self.v7) else None
         if self.v7:
-            # worker 的 payload 是 (step, pos, spatial, gl, moves, lbl, err)，而
-            # 上面三行的解包位置固定把 s/m/v 收进来 ⇒ 这里 s=spatial、m=gl、
-            # v=moves。名字改成 V7 的口径再返回，别让上面三行误导读代码的人。
+            # worker 的 payload 是 (step, pos, spatial, gl, moves, lbl, err, tforms)，
+            # 上面三行的解包位置固定把 s/m/v 收进来 ⇒ 这里 s=spatial、m=gl、v=moves。
+            # 名字改成 V7 的口径再返回，别让上面三行误导读代码的人。
             spatial = states
             gl = moves
             mv = values
+            tf_all = np.concatenate([p[5] for p in parts], axis=0)
             return (spatial, gl, mv,
-                    _labels_dict_to_tensors(labels_dict, device=device))
+                    _labels_dict_to_tensors(labels_dict, device=device), tf_all)
         if not self.labels:
             return states, moves, values
         return (states, moves, values,
@@ -4443,6 +4488,9 @@ def main():
             # `~/.cache/torch/inductor`，换 batch/模型会失效，需同配置复用。
             # 注意：该特性 **torch 2.2+** 才有；本仓云端是 2.1.0，`fx_graph_cache`
             # 属性不存在 ⇒ 下面用 hasattr 显式判定，缺失时报警而不是静默 no-op。
+            # 环境变量主开关 `TORCHINDUCTOR_FX_GRAPH_CACHE=1` 已在文件头部 import
+            # torch 前设好（见顶部 PYTORCH_CUDA_ALLOC_CONF 之后）；torch>=2.2 时
+            # 读取该变量即生效，下面这步 Python API 只是再显式确认一次。
             # log_graph_breaks：compile 时逐条把 graph break 及原因写进日志——
             # 有断点的子图会**静默回退 eager**，融合收益没全拿到（见下方探测）。
             try:
@@ -4695,13 +4743,19 @@ def main():
                         nxt = i + args.prefetch_depth
                         if nxt < n_batches:
                             pf.submit(perm[nxt * bs:(nxt + 1) * bs])
-                        _sp_np, _gl_np, _mv_np, lbl = pf.next(device=device)
+                        _sp_np, _gl_np, _mv_np, lbl, _tf_np = pf.next(device=device)
                     else:
-                        _sp_np, _gl_np, _mv_np, lbl = v7_batch_sync(
+                        _sp_np, _gl_np, _mv_np, lbl, _tf_np = v7_batch_sync(
                             dataset, sel, device)
                     _in32 = (amp_dtype == torch.float32)
                     state = v7_to_device(_sp_np, device, amp_dtype,
                                         pin=(_backend == 'cuda'))
+                    # GPU 8 路对称增强：raw spatial H2D 后在加速器上施加，与前后向重叠，
+                    # 不再占 dataloader worker 的 CPU。tforms 与 moves/labels 同源。
+                    _tf_t = torch.as_tensor(
+                        np.ascontiguousarray(_tf_np),
+                        device=device, dtype=torch.long)
+                    state = _dihedral_batch_torch(state, _tf_t)
                     # NHWC（2026-10-06）：与模型权重的 channels_last 对齐，否则
                     # 卷积拿到 channels_last 权重 + NCHW 输入，每次卷积都白搬一次。
                     if use_channels_last:
