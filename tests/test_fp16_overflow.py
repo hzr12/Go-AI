@@ -219,8 +219,8 @@ def test_real_step_is_derived_from_the_global_verdict_with_one_d2h():
         '整条本地判定只允许一次 D2H（V7 有 322 个参数张量），实得 %d 处' % _n_bool
 
     seg2 = _code_only(_fn_span(SRC, '_grads_nonfinite_any_rank'))
-    assert 'dist.all_reduce' in seg2 and 'ReduceOp.MAX' in seg2, \
-        '必须做一次跨 rank 的 MAX 归约 —— 这正是 GradScaler 缺的那一步'
+    assert '_grads_nonfinite_local' in seg2, \
+        '单卡下必须复用本地有限性判定（无跨 rank 归约）'
 
 
 def test_terms_float_call_detaches_before_synchronising():
