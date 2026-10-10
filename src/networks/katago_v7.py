@@ -115,10 +115,7 @@ OFF_BOARD_LOGIT = -5000.0
 #: ``SiLU`` 的 init gain。官方注释：理论值 √2.8108，为兼容保留 √2.0。
 GAIN_SILU = math.sqrt(2.0)
 
-#: ``relu²`` 的 init gain。与 `GAIN_SILU` 同取 √2.0：代码库对这些门控激活统一用
-#: √2.0（不精确匹配各自方差；relu² 的保方差理论 gain 为 √0.8≈0.894），保持与既有
-#: 初始化口径一致即可，避免 GAU 初值偏离其它块太多。
-GAIN_RELU2 = math.sqrt(2.0)
+
 
 #: stem / global 两条输入投影各自的 init scale（spec §3.4）。
 SCALE_INIT_CONV = 0.8
@@ -528,212 +525,14 @@ class TransformerBlock(nn.Module):
 
 
 def _resolve_inner_kinds(attn_impl, gau_positions, inner_len):
-    """把内块类型解析成 ``['nbt' | 'gau', ...]``（长度 == ``inner_len``）。
+    """内块类型解析：V7 当前只用 ``'nbt'``（MHSA+SwiGLU），GAU 改版已移除。
 
-    - ``attn_impl``：所有内块的**默认**实现，``'nbt'``（现有 MHSA+SwiGLU）或
-      ``'gau'``（GAU 改版）。
-    - ``gau_positions``：要**强制**用 GAU 的内块下标集合（覆盖 ``attn_impl``）。
-      ``None`` ⇒ 不强制，全用 ``attn_impl``。下标越界即报错。
-
-    默认（``attn_impl='nbt'`` 且 ``gau_positions=None``）⇒ 全 ``'nbt'``，与改造前
-    **逐位相同**：已有 checkpoint 与参数预算锚继续成立。
-
-    「每层分别 1 个 GAU + 1 个 nbt」＝ ``attn_impl='nbt', gau_positions=[0]``
-    （``inner_len=2`` ⇒ ``['gau', 'nbt']``）。
+    保留签名以维持旧调用点兼容；结果恒为 ``['nbt'] * inner_len``。
     """
-    impl = str(attn_impl).strip().lower()
-    if impl not in ('nbt', 'gau'):
-        raise ValueError(f'attn_impl 只能是 nbt/gau，收到 {attn_impl!r}')
-    positions = set()
-    if gau_positions is not None:
-        positions = {int(p) for p in gau_positions}
-    invalid = [p for p in positions if not (0 <= p < int(inner_len))]
-    if invalid:
-        raise ValueError(f'gau_positions 下标越界（需 0..{int(inner_len) - 1}），'
-                         f'收到 {invalid}')
-    return ['gau' if i in positions else impl
-            for i in range(int(inner_len))]
+    return ['nbt'] * int(inner_len)
 
 
-def _relu2(x):
-    """GAU 的门控激活：``relu(x)²``（GAU 论文的 ReLU² 变体，非负、零中心梯度）。
 
-    比 SiLU 更稀疏：``x≤0`` 直接归零（整段梯度为零），且输出非负，门控时不会翻转
-    符号。放在 `GatedAttentionUnit` 的 U（GLU 的门）与 V（注意力 value）两处。
-    """
-    return F.relu(x).square()
-
-
-#: GAU 门控输出（``o`` 投影之前）的幅值兜底。``relu²`` 门控非负、只下界有界，
-#: 叠加 11 层后极端 step 仍可能把门控值推大；这里硬性夹到 ±C，避免 GAU 输出
-#: 无限制放大（尤其 fp16 推理对大值敏感）。仅作安全网，正常训练几乎不触顶。
-_GAU_GATED_CLAMP = 64.0
-
-#: GAU 手写注意力的 query 分块长度（0/负 = 关闭）。沿用 `_sdpa_math` 的口径：
-#: 按 query 切块令峰值显存 ∝ chunk 而非 ∝ N（N=361 下 64 ⇒ 6 块）。
-_GAU_Q_CHUNK = 64
-
-
-class GatedAttentionUnit(nn.Module):
-    """GAU（Gated Attention Unit）核心：把注意力与门控前馈融合成**一个**单元。
-
-    论文：Hua et al., *Transformer Quality in Linear Time*（2022）§3.2。
-
-        U = SiLU(x·W_u);   V = SiLU(x·W_v)          # 各 (B, N, e)
-        Q = RoPE2D(x·W_q); K = RoPE2D(x·W_k)        # 各 (B, Hg, N, hd)
-        A = relu²(QKᵀ·s + b)                         # 多头注意力（无 softmax）
-        V̂ = V ⊙ (A @ V_heads)                       # ① 注意力对 V 的门控
-        O = (U ⊙ V̂) · W_o                           # ② GLU 门控
-
-    与 ``MHSA + SwiGLU`` 两条子层的差别
-    ----------------------------------
-    - V **不再**单独投影：注意力直接拿 GLU 的 value 分支当 value；
-    - 于是「注意力 + 门控前馈」合成**一个**残差子层，而不是两个（论文实测一个
-      GAU ≈ 两个 transformer 子层的质量，参数更省）。
-
-    形状约束（重要）
-    --------------
-    ``e``（U/V 的宽度）必须能被 ``head_dim`` 整除：V 要切成 ``Hg = e/hd`` 份当
-    注意力的 value 头。**这样 value 的 head_dim 与 Q/K 相同** —— 手写注意力
-    （``relu²(QKᵀ·s+b)``）要求 q/k/v 的 head_dim 一致。
-    ``head_dim`` 由调用方给的 ``num_heads`` 推出
-    （``dim // num_heads``），锁在主流 kernel 的支持集 {16,32,64}。
-    """
-
-    def __init__(self, dim, num_heads, hidden=None, attn_dropout=0.0):
-        super().__init__()
-        if dim % num_heads != 0:
-            raise ValueError(f'dim {dim} 必须被 num_heads {num_heads} 整除'
-                             f'（head_dim 要落在主流 kernel 的支持集 {{16,32,64}}）')
-        self.dim = int(dim)
-        self.head_dim = self.dim // int(num_heads)
-        # U/V 的宽度。默认沿用 `ffn_hidden`，让 GAU 的 FFN 宽度与 `SwiGLU` 一致。
-        self.e = int(hidden) if hidden else self.dim
-        if self.e % self.head_dim != 0:
-            raise ValueError(
-                f'GAU 的 hidden {self.e} 必须被 head_dim {self.head_dim} 整除'
-                f'（V 要切成整数个 value 头；可改成 '
-                f'{self.head_dim * max(1, round(self.e / self.head_dim))}）')
-        self.num_heads = self.e // self.head_dim
-        self.scale = 1.0 / math.sqrt(self.head_dim)
-        self.u = _ScaledLinear(self.dim, self.e, bias=False)
-        self.v = _ScaledLinear(self.dim, self.e, bias=False)
-        self.q = _ScaledLinear(self.dim, self.e, bias=False)
-        self.k = _ScaledLinear(self.dim, self.e, bias=False)
-        self.o = _ScaledLinear(self.e, self.dim, bias=False)
-        self.rope = RoPE2D(self.num_heads, self.head_dim)
-        self.attn_dropout = float(attn_dropout)
-        # 注意力的可学习标量偏置 b：加到每个 score 元素上（位置无关 ⇒ 平移等变保留）。
-        # 配合 relu²，b 控制「多少对 (q,k) 关系能透过门」——b 越大越多项存活。
-        # 初值 0（= 退化为纯 relu²(QKᵀ·s)），训练自行学。
-        self.b = nn.Parameter(torch.zeros(()))
-
-    def initialize(self, scale=1.0, gain=GAIN_RELU2):
-        for lin in (self.u, self.v, self.q, self.k, self.o):
-            lin.initialize(scale=scale, gain=gain)
-        self.rope.initialize()
-        return self
-
-    def _heads(self, t):
-        """``(B,N,e)`` → ``(B,Hg,N,hd)``。"""
-        b, n, _ = t.shape
-        return t.reshape(b, n, self.num_heads, self.head_dim) \
-                .permute(0, 2, 1, 3).contiguous()
-
-    def forward(self, t, pos):
-        """``t``: ``(B, N, C)`` token 序列；``pos``: ``(B, N, 2)`` 行列坐标。
-
-        注意力用 **relu²(QKᵀ·s + b)** 取代 softmax：``s = 1/√head_dim``（√ 归一），
-        ``b`` 为可学习标量偏置；score 经 relu² 后按 **key 维行 L1 归一**（"除以序列
-        长度"），保证序列长度不变性、并把 ``A@V`` 压成 ``V`` 的凸组合，避免 11 层
-        叠乘放大 / fp16 溢出。门控激活 ``relu²``（见 `_relu2`）。
-        """
-        b, n, _ = t.shape
-        u = _relu2(self.u(t))                        # (B,N,e)  GLU 的门
-        v = _relu2(self.v(t))                        # (B,N,e)  兼作注意力的 value
-        q = self.rope(self._heads(self.q(t)), pos)   # (B,Hg,N,hd)
-        k = self.rope(self._heads(self.k(t)), pos)   # (B,Hg,N,hd)
-        # value **不**再投影：直接切 GLU 的 V，其 head_dim 与 q/k 相同（见类文档）。
-        vh = v.reshape(b, n, self.num_heads, self.head_dim) \
-              .permute(0, 2, 1, 3).contiguous()
-        ctx = self._attn(q, k, vh)                    # (B,Hg,N,hd)
-        ctx = ctx.permute(0, 2, 1, 3).reshape(b, n, self.e)
-        # ① 注意力输出门控 V；② U 门控（GLU）。两层门控都发生在 e 维上。
-        # clamp 兜底：防止门控值无限制放大（见 `_GAU_GATED_CLAMP`）。
-        gated = (u * (v * ctx)).clamp(-_GAU_GATED_CLAMP, _GAU_GATED_CLAMP)
-        return self.o(gated)
-
-    def _attn(self, q, k, v):
-        """``relu²(QKᵀ·s + b)`` 注意力，按 query 分块约束显存（沿用 `_sdpa_math` 口径）。
-
-        q,k,v: ``(B, Hg, N, hd)`` → 返回 ``(B, Hg, N, hd)``。
-        """
-        kt = k.transpose(-2, -1)
-        step = _GAU_Q_CHUNK
-        nq = q.shape[-2]
-        if step and nq > step:
-            outs = []
-            for i in range(0, nq, step):
-                qc = q[..., i:i + step, :]
-                a = _relu2((qc @ kt) * self.scale + self.b)      # (B,Hg,chunk,N)
-                a = a / (a.sum(-1, keepdim=True) + 1e-6)         # 行 L1 归一
-                if self.attn_dropout > 0.0:
-                    a = F.dropout(a, p=self.attn_dropout,
-                                 training=self.training)
-                outs.append(a @ v)
-            return torch.cat(outs, dim=-2)
-        a = _relu2((q @ kt) * self.scale + self.b)
-        a = a / (a.sum(-1, keepdim=True) + 1e-6)
-        if self.attn_dropout > 0.0:
-            a = F.dropout(a, p=self.attn_dropout, training=self.training)
-        return a @ v
-
-
-class GatedAttentionBlock(nn.Module):
-    """GAU 改版的 transformer 内块：``x + GAU(RMSNorm(x))``。
-
-    与 `TransformerBlock` 的接口**完全对齐**（``forward(x, pos)`` 4D→4D、
-    ``initialize(scale, gain, fixup_scale)``），所以两种块能混进
-    `Nbt2TransformerBlock.inner` 同一个 `ModuleList` —— 这就是「每层 1 个 GAU +
-    1 个 nbt」的挂载方式（``attn_impl='nbt', gau_positions=[0]``）。
-
-    这个块**包含**（而非单纯调用外部）：
-      - `RoPE2D`：q/k 的旋转位置编码（在 `GatedAttentionUnit` 里）；
-      - **手写 `relu²(QKᵀ·s + b)` 注意力**：自己实现、按 query 分块（`_GAU_Q_CHUNK`）
-        约束显存，长序列不爆炸；不含 softmax（见 `GatedAttentionUnit`）；
-      - **融合 FFN**：GAU 把「注意力 + 门控前馈」融成**一个**残差子层（而非
-        `TransformerBlock` 的 MHSA + SwiGLU 两条），容量相当、参数更省；
-      - **自己的 `initialize`**：内部权重按 `GAIN_RELU2` 截断正态、RoPE 频率按对数
-        均匀初始化，与 `TransformerBlock.initialize` 签名对齐但不依赖其 fixup。
-
-    门控激活用 `relu²`（见 `GatedAttentionUnit`）；Q/K 走与 `MHSA` 同一套 `RoPE2D`
-    ⇒ 平移等变性一致。
-    """
-
-    def __init__(self, dim, num_heads, ffn_hidden=None, attn_dropout=0.0,
-                 hidden=None):
-        super().__init__()
-        self.norm = RMSNorm(dim, eps=1e-6)
-        # `ffn_hidden` 只为与 `TransformerBlock` 的构造签名对齐（工厂按同一组
-        # 参数造两种块）；GAU 没有独立的 FFN 隐藏维，容量由 `hidden`（= e）决定，
-        # 默认沿用 `ffn_hidden`，好让两种块的 FFN 宽度一致。
-        self.gau = GatedAttentionUnit(dim, num_heads,
-                                      hidden=hidden or ffn_hidden,
-                                      attn_dropout=attn_dropout)
-
-    def initialize(self, scale=1.0, gain=GAIN_RELU2, fixup_scale=None):
-        # GAU 用 relu² 门控 ⇒ 内部权重一律按 `GAIN_RELU2` 初始化，忽略传入的 gain。
-        self.gau.initialize(scale=scale, gain=GAIN_RELU2)
-        # `backbone.RMSNorm` 的 weight 初值恒 1（它是**真**归一化，自己除以实测
-        # RMS），不需要 fson 那种 fixup 缩放。`fixup_scale` 只为与
-        # `TransformerBlock.initialize` 的签名对齐。
-        return self
-
-    def forward(self, x, pos):
-        b, c, h, w = x.shape
-        t = x.reshape(b, c, h * w).permute(0, 2, 1)      # (B,N,C)
-        t = t + self.gau(self.norm(t), pos)
-        return t.permute(0, 2, 1).reshape(b, c, h, w)
 
 
 class Nbt2TransformerBlock(nn.Module):
@@ -771,17 +570,12 @@ class Nbt2TransformerBlock(nn.Module):
                                     bias=False)
 
     def _make_inner(self, kind, num_heads, ffn_hidden, attn_dropout,
-                    gau_hidden):
-        """按类型造一个内块：``'nbt'`` → `TransformerBlock`，``'gau'`` → `GatedAttentionBlock`。
-
-        两者接口对齐（4D→4D 的 ``forward(x, pos)``），所以放进同一个 `ModuleList`
-        后 `forward` 的循环与 `initialize` 的逐块调用都不用改。
-        """
-        if kind == 'nbt':
-            return TransformerBlock(self.mid_channels, num_heads, ffn_hidden,
-                                    attn_dropout=attn_dropout)
-        return GatedAttentionBlock(self.mid_channels, num_heads, ffn_hidden,
-                                   attn_dropout=attn_dropout, hidden=gau_hidden)
+                    gau_hidden=None):
+        """造一个内块：当前只用 ``'nbt'``（MHSA+SwiGLU），GAU 改版已移除。"""
+        if kind != 'nbt':
+            raise ValueError(f'内块类型只支持 nbt，收到 {kind!r}')
+        return TransformerBlock(self.mid_channels, num_heads, ffn_hidden,
+                                attn_dropout=attn_dropout)
 
     def initialize(self, scale=1.0, fixup_scale=None):
         """spec §3.3 的 K 调度。
@@ -1301,23 +1095,13 @@ class NbtTfNet(GradCheckpointMixin, nn.Module):
         M = c['nbt_mid']
         self.stem = _ScaledConv2d(c['in_channels'], C, 3, padding=1, bias=False)
         self.global_fc = _ScaledLinear(c['global_channels'], C, bias=False)
-        # GAU 按块布局：前 `gau_first_nbt` 块与末 `gau_last_nbt` 块是纯 nbt 边缘块，
-        # 中间块才挂 GAU（位置由 `gau_positions` 指定）。这样 GAU 只出现在网络中部，
-        # 两端保留纯 MHSA+SwiGLU，总参仍守在硬预算内（见 spec §6.1 / 预算测试）。
-        gau_first = int(c.get('gau_first_nbt', 0))
-        gau_last = int(c.get('gau_last_nbt', 0))
-        gau_pos = c.get('gau_positions')
-        gau_hidden = c.get('gau_hidden')
+        # 内块统一用 MHSA+SwiGLU（'nbt'）；GAU 改版已移除（见删除说明）。
         self.blocks = nn.ModuleList([
             Nbt2TransformerBlock(C, M, c['num_heads'], c['ffn_hidden'],
                                  inner_len=c['num_inner_blocks'],
                                  attn_dropout=self.attn_dropout,
-                                 attn_impl=c.get('attn_impl', 'nbt'),
-                                 gau_positions=(None if (i < gau_first
-                                                 or i >= c['num_blocks'] - gau_last)
-                                                 else gau_pos),
-                                 gau_hidden=gau_hidden)
-            for i in range(c['num_blocks'])
+                                 attn_impl='nbt')
+            for _ in range(c['num_blocks'])
         ])
         self.norm_trunkfinal = RMSNormMask(C)
         self.policy_head = PolicyHead(C, channels=c['policy_channels'],

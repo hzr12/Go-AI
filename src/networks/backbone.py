@@ -871,10 +871,11 @@ def set_flash_attn(enabled: bool):
 
 
 # 模块级开关：是否强制走手写 math 注意力。
-# 默认 True（最保守，兼容 V100 等老卡）；train_sft.py 在检测到 Ampere+ 后会设为 False
-# 以启用 FlashAttention 后端。窗口/稀疏注意力在 A100 上 batch 维被展开为 B*N，
-# 但若序列长度极小（ws²+ng≈数十），较新 torch 的 SDPA 后端能正常处理，无需 math。
-_sdpa_force_math = True
+# 默认 False（启用 FlashAttention 后端：优先 flash-attn 独立库，否则 torch SDPA 自动选
+# flash/mem-efficient）；V100 等老卡（无 flash 内核）由 train_sft.py 检测后设为 True。
+# 窗口/稀疏注意力在 A100 上 batch 维被展开为 B*N，但若序列长度极小（ws²+ng≈数十），
+# 较新 torch 的 SDPA 后端能正常处理，无需 math。
+_sdpa_force_math = False
 
 
 def set_sdpa_force_math(flag: bool) -> None:

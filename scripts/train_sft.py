@@ -3558,6 +3558,12 @@ def main():
                     help='启用 EMA（指数移动平均）权重，eval/save 时用 shadow 权重，提升 1-3%% accuracy (0=关闭, 1=开启)')
     ap.add_argument('--gradient-accumulation-steps', type=int, default=1,
                     help='梯度累积步数（模拟更大 batch size，效果等同于 batch_size * N）')
+    ap.add_argument('--clip-every', type=int, default=1,
+                    help='每 N 个 optimizer step 才做一次梯度裁剪(clip_grad_norm_)'
+                         '及其 D2H 同步。默认 1=每步都裁。>1 时跳过中间步的'
+                         '全参数范数归约与设备同步（异步队列在下一个裁剪步统一'
+                         'drain），省下 g3 同步开销；梯度尖刺罕见，稀疏裁剪通常'
+                         '无害，bf16 下更无风险。溢出探测仍每步进行（仅 fp16 生效）。')
     ap.add_argument('--scaler-init-scale', type=float, default=0.0,
                     help='GradScaler 初始缩放值（0=用 PyTorch 默认 65536）。'
                         '默认 65536 需要靠减半向下搜索平衡点，每次溢出白扔一个 '
@@ -5026,24 +5032,39 @@ def main():
                             named_params=dict(model.named_parameters()))
                     # g1 结算（unscale_ + 溢出探测）/ g2 起点。
                     _t_g1 += time.perf_counter() - _t_g1_0
+                    # ---- 提速点：按 --clip-every 降低裁剪/同步频率 ----
+                    # 默认 clip_every=1（每步都裁）。>1 时只在前 1/N 个 optimizer
+                    # step 做 `clip_grad_norm_` 及其 D2H 同步（g3），其余步跳过：
+                    # 省掉一次全参数范数归约 + 一次设备→主机同步。异步队列会在
+                    # 下一个裁剪步的 `float(_gn)` 处统一 drain，延迟被计算掩盖。
+                    # 梯度尖刺罕见，稀疏裁剪通常无害；bf16 下本就无 GradScaler，
+                    # 更无风险。溢出探测（_grads_nonfinite_local）仍每步进行，
+                    # 仅 fp16 下生效。
+                    _do_clip = (args.clip_every <= 1) or (_n_opt % args.clip_every == 0)
                     _t_g2_0 = time.perf_counter()
                     # clip_grad_norm_ **返回 clip 前的总范数** —— 之前被丢弃了。它是
                     # fp16 溢出/梯度爆炸唯一的直接信号：这轮 旧多卡环境 的 inf/nan 与
                     # 缩放值雪崩，本可以由它提前几分钟看到。
                     # 必须在 unscale_ 之后取（unscale 前是按 scale 放大的假值）。
-                    _gn = torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), max_norm=1.0)
-                    # g2 结算 / g3 起点。
-                    _t_g2 += time.perf_counter() - _t_g2_0
-                    _t_g3_0 = time.perf_counter()
-                    _grad_norm_last = float(_gn)
-                    # g3 结算。`float(_gn)` 本身要等一次设备→主机同步，而它是
-                    # backward 之后**第一次**同步 ⇒ 整个待执行队列（前向/反向的
-                    # 实际执行、反向、clip kernel）都在这里 drain。
-                    # 真机 2026-10-07：这 10.45 s 占 79.9%，是本段存在的理由。
-                    _t_g3 += time.perf_counter() - _t_g3_0
+                    if _do_clip:
+                        _gn = torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), max_norm=1.0)
+                        # g2 结算 / g3 起点。
+                        _t_g2 += time.perf_counter() - _t_g2_0
+                        _t_g3_0 = time.perf_counter()
+                        _grad_norm_last = float(_gn)
+                        # g3 结算。`float(_gn)` 本身要等一次设备→主机同步，而它是
+                        # backward 之后**第一次**同步 ⇒ 整个待执行队列（前向/反向的
+                        # 实际执行、反向、clip kernel）都在这里 drain。
+                        # 真机 2026-10-07：这 10.45 s 占 79.9%，是本段存在的理由。
+                        _t_g3 += time.perf_counter() - _t_g3_0
+                    else:
+                        # 跳过裁剪：仅记 g2 区域耗时（≈0），不触发 `float(_gn)`
+                        # 同步；`_grad_norm_last` 保留上一次裁剪步的值供日志。
+                        _gn = None
+                        _t_g2 += time.perf_counter() - _t_g2_0
                     # `g` 段结算 = g1+g2+g3（三段首尾相接无缝，故恒等）。放在
-                    # `float(_gn)` 之后，不把这次同步算进 `o` 段。
+                    # 裁剪/跳过之后，不把这次同步算进 `o` 段。
                     _t_clip += time.perf_counter() - _t_clip0
                     # **溢出诊断的时机（2026-10-04 云端 旧多卡环境 实测打出来的 bug）**
                     #   `clip_grad_norm_(max_norm=1.0)` 在 `total_norm = inf` 时算出
