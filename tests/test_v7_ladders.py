@@ -22,9 +22,8 @@ import numpy as np
 import pytest
 
 from src.data.feature_v7_ladders import (
-    BOARD_SIZE, LADDER_DTYPE, BLACK, WHITE, C_EMPTY, _Board, _pack, _put,
-    assert_consistent, ladder_channels, search_is_ladder_captured,
-    search_is_ladder_captured_attacker_first_2_libs,
+    BOARD_SIZE, LADDER_DTYPE, BLACK, WHITE, C_EMPTY, _Board, _pack, assert_consistent,
+    ladder_channels, search_is_ladder_captured, search_is_ladder_captured_attacker_first_2_libs,
 )
 
 # ---------------------------------------------------------------------------
@@ -391,7 +390,6 @@ def test_chain_liberties_are_distinct_empty_neighbours():
     b = _board([(3, 3, 1), (3, 4, 1), (4, 3, 1),      # 3 子的 L 形，1 气
                 (3, 5, 1), (5, 3, 1)])
     bd = _Board(_pack(b), N)
-    arr = np.asarray(bd.colors, np.int8).reshape(N + 2, N + 2)
     for cid, stones in enumerate(bd.ch_stones):
         if not stones:
             continue

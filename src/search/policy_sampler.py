@@ -32,7 +32,7 @@ RL 采集原来每手跑 `MCTS.search(simulations=sims)`：1 卡 910A 上 `--sim
 「采样分布 = 温度作用后的分布」是本模块的契约，而 `logq` 必须取**同一次**
 采样分布上的 log-prob（动作与 logq 锚定同一个分布，否则重要性权重无意义）。
 """
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
 import numpy as np
 

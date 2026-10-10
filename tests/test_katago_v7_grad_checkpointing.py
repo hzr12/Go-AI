@@ -275,7 +275,6 @@ def test_heads_recompute_under_the_same_autocast_as_the_forward():
 
 def test_heads_recompute_is_safe_when_a_probe_needs_no_sync():
     """`GC_HEADS` 段的重算不得引入主机侧同步（BN 守卫为空时开销为 0）。"""
-    net = _net(True)
     src = _fn_code_of_backbone('_checkpointed')
     assert 'context_fn' in src, '段级重算必须挂 context_fn（autocast + BN 守卫）'
     assert 'preserve_rng_state=True' in src

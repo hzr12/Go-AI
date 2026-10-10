@@ -9,7 +9,6 @@ MPV-MCTS: Main-Policy-Value 大小网协同
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class LiteValueNetwork(nn.Module):

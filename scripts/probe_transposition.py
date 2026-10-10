@@ -37,7 +37,7 @@ A−B 的差 = 「真 DAG」相对「只做前向缓存」的额外收益。
 跑法
 ----
     python scripts/probe_transposition.py --device cpu
-    python scripts/probe_transposition.py --device npu --sims 100,400
+    python scripts/probe_transposition.py --device cuda --sims 100,400
 """
 from __future__ import annotations
 

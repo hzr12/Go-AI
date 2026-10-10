@@ -9,7 +9,6 @@ AppImage **自带的** libzip 报成「not found」。不修正就会把用户�
 已经有的库。
 """
 import os
-import subprocess
 import sys
 
 import pytest

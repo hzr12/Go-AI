@@ -3,14 +3,14 @@
 
 为什么需要它
 ------------
-2026-10-04 云端 910A 的实测症状：
+2026-10-04 云端 A100 的实测症状：
 
 * 每步都被 GradScaler 跳过，缩放值 10240 → 5120 → … → 160 仍 100% 跳过；
 * 每步的 NaN 参数计数**完全一样**（211 / 98 / 8）；
 * 逐项点名指向 **`score_stdev`**。
 
 而**本机怎么都复现不出来**：fp32 / fp16 / bf16 三种精度下，`score_stdev` 的
-前向有限、梯度 NaN 张量 0/322。CPU 与 NPU 的 kernel 实现不同（Welford vs
+前向有限、梯度 NaN 张量 0/322。不同后端 / 精度的 kernel 实现不同（Welford vs
 两遍、softplus 的线性兜底分支、规约的累加顺序），**只有真机能回答**。
 
 而每次真机跑一轮训练要几分钟，且被这个 NaN 挡着根本跑不起来 ⇒ 需要一个
@@ -29,11 +29,11 @@
 用法
 ----
     python scripts/probe_v7_numerics.py \
-        --data data/sgf_19x19_full.npz --v7 1 --device npu --board-size 19 \
+        --data data/sgf_19x19_full.npz --v7 1 --device cuda --board-size 19 \
         --games-npz data/labels/games.npz
 
  只读不写：不建 checkpoint、不碰 optimizer、不改任何状态。
- 不依赖 torch_npu 也能跑（`--device cpu`）—— 那样只会得到「全都正常」，
+ 不依赖 GPU 也能跑（`--device cpu`）—— 那样只会得到「全都正常」，
   但可以确认脚本本身没写错。
 """
 from __future__ import annotations

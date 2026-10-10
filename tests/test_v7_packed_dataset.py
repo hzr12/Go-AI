@@ -16,7 +16,6 @@
 4. dihedral 增强必须对空间平面与所有平面标签**同步**施加
 5. ``var_time_left`` 缺席时**跳过**而非喂 0
 """
-import os
 import pathlib
 import sys
 

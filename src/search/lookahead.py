@@ -27,7 +27,7 @@
 见 `scripts/selfplay_train.py` 的 P3-C 契约），所以这里一并返回。
 `MCTS.lookahead` 的转发层把它丢掉，保持 4 元组返回 —— webui 不改。
 """
-from typing import Dict, NamedTuple, Optional, Tuple
+from typing import Dict, NamedTuple, Optional
 
 import numpy as np
 
@@ -63,8 +63,6 @@ def child_states(board, moves, my_hist, op_hist, to_play, *, with_prev=False,
     # 父局面自己的前一手/前二手，作为子局面的 prev_prev / 更前一手。
     # None 一律原样传下去（= 历史不足），**不要**拿空盘冒充。
     parent_prev = None if prev_board is None else np.asarray(prev_board, dtype=np.int8)
-    parent_prev_prev = (None if prev_prev_board is None
-                        else np.asarray(prev_prev_board, dtype=np.int8))
 
     out = []
     for mv in moves:

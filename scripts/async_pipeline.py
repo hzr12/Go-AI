@@ -30,13 +30,12 @@ import os
 import time
 import queue
 import multiprocessing as mp
-from multiprocessing import Process, Queue, Value, Lock
-from typing import List, Dict, Any, Optional
+from multiprocessing import Process, Queue, Value
+from typing import Dict, Any, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
-import torch
 
 
 class AsyncDataQueue:
@@ -134,7 +133,6 @@ class SelfPlayWorker(Process):
                 use_amp=True
             )
         
-        from src.game.go_rules import GoBoard
         
         n_actions = self.args.board_size * self.args.board_size + 1
         max_moves = self.args.max_moves or 3 * self.args.board_size * self.args.board_size
@@ -160,10 +158,8 @@ class SelfPlayWorker(Process):
                 # 进度回调
                 if self.progress_cb:
                     self.progress_cb(self.worker_id, game_data, score)
-                
                 game_id += 1
-                
-            except Exception as e:
+            except Exception :
                 # 进程内异常不崩溃
                 time.sleep(0.1)
     

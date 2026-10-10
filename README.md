@@ -84,7 +84,7 @@ ko 规则、计分制度、tax、encore、`passWouldEndPhase`、komi 奇偶三�
 **8 路恒 0 通道（保留不裁剪）**：空间 `7, 8, 20, 21` + 全局 `12, 13, 15, 16`。
 保留理由是严格复刻官方张量布局，未来接官方 checkpoint 零改形状；裁剪只省 0.3% 参数。
 
-**性能闸门**：NPU 侧需 ~2635 行/s，`--prefetch-workers 8` 下每行预算 **3.04 ms**，
+**性能闸门**：训练侧（GPU）需 ~2635 行/s，`--prefetch-workers 8` 下每行预算 **3.04 ms**，
 现有 12 通道单盘基线 1.78 ms ⇒ **1.7× 余量**。贵的是 `iterLadders`（3 块盘面）与
 `calculateArea`（1 块）。
 
@@ -125,21 +125,17 @@ A→B→C 的 `load_state_dict` 承接（strict 零缺失）。
 ### 2.4 训练层
 
 - **段 A/B/C SFT**：`scripts/train_sft.py --v7 1`，三段同一个 22 通道模型、
-  `--model` 逐段承接（DDP + HCCL + BF16；910B 才走 fp16+GradScaler）。
-  ⚠️ shell/ 里的 `train_sft_npu_4card_katago_se.sh` 是**不带 `--v7`** 的 12 通道
-  旧入口，别拿它跑 V7 链；`run.txt` 里给的是直连 `torchrun` 命令。
+  `--model` 逐段承接（DDP + NCCL + BF16；无 BF16 的旧卡如 V100 / sm_70 才走 fp16+GradScaler）。
+  ⚠️ shell/ 里的 `train_sft_npu_4card_katago_se.sh` 是**NPU 专用**的旧入口
+  （不带 `--v7` 的 12 通道），非 NPU 环境别拿它跑；`run.txt` 里给的是直连 `torchrun` 命令。
 - **⚙️ 调优开关一律是 CLI 参数，没有环境变量**（2026-08 起陆续登记；`GOAI_PROFILE`
   与 `GOAI_PROFILE_STEPS` 是仅有的例外——两个都是诊断开关，与训练配置无关，语义是
   「从第 N 步抓 M 步 kernel 表」，M 默认 50，`M=0` = 起点即终点、在起点后的第一个
   打点步出表）：
-  - `--use-sdpa 0/1`（默认 1）：NPU 注意力走 CANN 融合 SDPA；0 = 全后端手写 math。
-  - `--npu-sfa 0/1`（默认 1）：NPU 融合注意力 SFA/PFA，**优先于** SDPA；带能力探针
-    + 与 SDPA 的数值自检 + 运行期回退，dropout>0 时自动不启用。
-  - `--npu-swiglu 0/1`（默认 1）：NPU 融合 SwiGLU；0 = 退回 `F.silu(up)*gate`。
-  - `--npu-channels-last 0/1`（**默认 0**）：NPU 卷积走 NHWC；未实测收益，开了要盯显存。
+  - `--use-sdpa 0/1`（默认 1）：注意力走融合 SDPA（CUDA SDPA / FlashAttn）；0 = 全后端手写 math。
   - `--attn-query-chunk 0|64`（默认 64）/ `--attn-chunk-ckpt 0/1`（默认 1）：手写
-    math 注意力的分块与逐块检查点（只影响 math 路径，SDPA/SFA 融合路径不生效）。
-  这五个都是**只慢不坏**的总闸（数值口径不变），出问题置 0 即回到已验证配置。
+    math 注意力的分块与逐块检查点（只影响 math 路径，SDPA 融合路径不生效）。
+  这几个都是**只慢不坏**的总闸（数值口径不变），出问题置 0 即回到已验证配置。
 - **V7 tracer bullet**：`scripts/smoke_train_v7.py` —— 302 行 / batch 8 / 40 步，
   直接吃 stdata，用来回答「12 项 loss 每项到底降不降」。
 
@@ -274,7 +270,7 @@ ownership / scorebelief / varTimeLeft。B 段的软标签要 `--soft-index`；
 
 ### 3.4 fp16 下 V7 的 LR 稳定边界（**别用 run.txt 那条 LR 公式**）
 
-2026-10-05 实测（4×910A，段 A，`--batch-size 4000`/卡）：
+2026-10-05 实测（4× 多卡，段 A，`--batch-size 4000`/卡）：
 
 | step | lr | loss | scale | skip |
 |---:|---:|---|---:|---:|
@@ -334,7 +330,7 @@ scale。没有这道闸门时，「训练死了但还在跑」—— 除 `loss=n
 | 22ch builder 注册 | ✅ | `src/inference.py:177` |
 | 12 项 loss 装配 | ✅ | `tests/test_katago_v7_loss.py` 24 项 |
 | V7 端到端冒烟 | ✅ 跑过 | 40 步，11/12 项下降；`score_stdev` **−0.0%** |
-| **`train_sft.py` 切 22 通道** | ✅ **已做** | `--v7 1` 走 `NbtTfNet`；4 卡 910A 实跑（2026-10） |
+| **`train_sft.py` 切 22 通道** | ✅ **已做** | `--v7 1` 走 `NbtTfNet`；4 卡实跑（2026-10） |
 | 软标签 CLI 接线 | ✅ 已做 | `--soft-index/--soft-weight/--soft-every/--soft-only-sampling/--policy-loss soft_ce` |
 | 邻行 gather（5 偏移）接线 | ✅ 已做 | ch14–17 与 futurepos 共用，纯 `boards` 索引 |
 | A/B/C 共用一个 V7 模型 | ✅ 已做 | `load_from_path(v7=1)` 按布局分派 + `--model` 承接，`tests/test_v7_single_model.py` |
@@ -344,7 +340,7 @@ scale。没有这道闸门时，「训练死了但还在跑」—— 除 `loss=n
 | A 段整轮正式训练 | ⚠ **跑到 step 400 后炸** | `--lr 9.77e-3` 越过 fp16 前向上限；见 [§3.4](#34-fp16-下-v7-的-lr-稳定边界别用-runtxt-那条-lr-公式) |
 | B 段正式训练 | ⬜ 未做 | 通路已通 |
 | RL（段外） | ✅ 可跑 | 但 MCTS 已归档，采集走 lookahead |
-| 910A 融合注意力探针 | ⬜ 未做 | R1，见 [§7](#7-已知限制) |
+| NPU 融合注意力探针 | — 已废弃 | NPU 支持已移除（详见 [§7](#7-已知限制) 条目 10） |
 
 ---
 
@@ -578,14 +574,13 @@ B/C 段覆盖它**正是蒸馏的目的**。K=3 只在「同一部位两个 poli
    `zzb28c512` 那批是 **seki 富集**（131,706 行里 104,905 行含 seki 格子）⇒ 当作
    seki 专项单独用，不混进主训练。
 9. **`col3` / `col22` 的精确语义未定**（stdata）⇒ 目前**不作为任何 loss 的目标**，只记录。
-10. **910A 融合注意力未探针。** 现有 `head_dim=46 ∉ 支持集 {16,32,64}`
-    （推测是 `force_math` 的根因）。V7 的 `head_dim=32` 落在支持集内，
-    若融合可用 ⇒ 注意力显存 6.2–9.3 GiB → **~0.7 GiB**，总峰值 21–25 → 15–19 GiB。
-    最坏情形就是维持现在的 `force_math`，所以这只是「可能更好」，不是阻塞项。
+10. **NPU 融合注意力已移除。** NPU 支持于 2026-10 彻底下线，相关融合注意力探针、
+    `head_dim` 支持集、`force_math` 等仅针对 NPU 的判断不再适用。CUDA 走 SDPA /
+    FlashAttn，`head_dim` 不受 {16,32,64} 限制；V7 注意力显存按 CUDA SDPA 实测标定。
 11. **`run.py` 的 `default_argv` 是旧代残留** —— 仍带 `--compile-mode reduce-overhead`
     （走 CUDA Graphs，维持不归还的私有内存池，临界 batch 下直接 OOM）。
     **别照抄 `python run.py sft` 的默认值。**
-12. **显存结论都标着「旧代」。** run.txt 里那张 4 卡 910A 账本是 v21 时代
+12. **显存结论都标着「旧代」。** run.txt 里那张 4 卡账本是 v21 时代
     （184 通道）量的；V7 是 256 通道，换硬件前必须重新标定并先跑 50 步 smoke。
     ⚠ **2026-10-05 实测：`v7_batch_memory_advice` 低估约 3.2 倍** —— 它预测
     batch=1900 约 8.8 GB，实测 **28.28 GB**（64 GiB 卡的 44%；4000/卡时更到

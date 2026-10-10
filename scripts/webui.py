@@ -541,7 +541,6 @@ class Session:
         mv = ai_info["move"]
         wr = ai_info.get("ai_winrate", 0.5)
         human_color = self.human_color
-        my_color_name = "黑" if human_color == 1 else "白"
         ai_color_name = "白" if human_color == 1 else "黑"
 
         # 胜率解读

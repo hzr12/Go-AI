@@ -1339,7 +1339,6 @@ class MultiHeadSelfAttention(nn.Module):
 
         # ---- 4) 联合注意力：key 序列 = [局部 ws² 个；全局 ng 个]，一次 SDPA ----
         BnW = B * nW
-        ws2 = ws * ws
         # 全局 token 广播到每个窗口（与原「两路 logits 联合 softmax」语义一致）。
         # 注意先 permute 把 nW 挪到第 1 维再 reshape——(B,Hh,nW,...) 直接
         # reshape 成 (BnW,...) 会因 Hh 夹在中间而错位。
@@ -1372,15 +1371,11 @@ class MultiHeadSelfAttention(nn.Module):
 
         # 行注意力：每行 H 个 token 互相看，把 (B,Hh,H,W,d) 重排为 (B*Hh*H, W, d)
         qr = q.view(B, Hh, H, W, d).reshape(B * Hh * H, W, d)
-        kr = k.view(B, Hh, H, W, d).reshape(B * Hh * H, W, d)
-        vr = v.view(B, Hh, H, W, d).reshape(B * Hh * H, W, d)
         out_r = attn_1d(qr)  # (B*Hh*H, W, d)
         out_r = out_r.view(B, Hh, H, W, d)
 
         # 列注意力：转置后同理，把 (B,Hh,W,H,d) 重排为 (B*Hh*W, H, d)
         qc = out_r.transpose(2, 3).reshape(B * Hh * W, H, d)
-        kc = k.view(B, Hh, H, W, d).transpose(2, 3).reshape(B * Hh * W, H, d)
-        vc = v.view(B, Hh, H, W, d).transpose(2, 3).reshape(B * Hh * W, H, d)
         out_c = attn_1d(qc)  # (B*Hh*W, H, d)
         out_c = out_c.view(B, Hh, W, H, d).transpose(2, 3)  # (B,Hh,H,W,d)
         return out_c.reshape(B, N, self.num_heads * d)

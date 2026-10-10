@@ -195,7 +195,6 @@ def make_positions(board_size, move_counts, seed):
 # --------------------------------------------------------------------------- #
 def run_fwd(ai, positions, args, results):
     board, mh, oh, tp = positions[0]
-    n = ai.board_size * ai.board_size + 1
     rows = []
     print("\n=== 1. 前向吞吐曲线（predict_batch，给定 batch 尺寸 B）===")
     print("    nn  = 只算网络（平面预计算，5 元组）——MCTS 与 lookahead 都走这条")

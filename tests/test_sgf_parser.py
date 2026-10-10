@@ -2,7 +2,7 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.data.sgf_parser import SGFParser, GameRecord
+from src.data.sgf_parser import SGFParser
 
 
 def test_pass_parsed():

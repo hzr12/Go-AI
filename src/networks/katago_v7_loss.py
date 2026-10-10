@@ -136,7 +136,7 @@ def huber(pred, target, beta):
     """Huber，口径与 `train_sft.huber_loss` **逐位一致**（= `smooth_l1`）。
 
     单独实现而不是 `from scripts.train_sft import huber_loss`：那个 import 会把
-    整个训练脚本（torch_npu 探测、argparse、SwanLab…）拖进 loss 模块，而 loss
+    整个训练脚本（argparse、SwanLab…）拖进 loss 模块，而 loss
     要被单测直接引用。`test_katago_v7_loss.py::test_huber_matches_train_sft`
     用两个实现逐位对拍，防止这份复制品漂移。
     """

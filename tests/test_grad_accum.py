@@ -13,7 +13,6 @@ import sys
 import types
 
 import numpy as np
-import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -89,7 +88,7 @@ def test_cli_default_grad_accum_is_1():
     old = sys.argv
     sys.argv = argv
     try:
-        import argparse as _ap
+        pass
         # 直接检查 parse 逻辑：调用 main 会跑训练，这里只验证参数定义存在且默认 1
         import inspect
         src = inspect.getsource(st.main)

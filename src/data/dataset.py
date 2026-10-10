@@ -830,7 +830,7 @@ class SupervisedDataset:
         """
         out = self.sample_batch_numpy(idxs, labels=labels)
         dev_prefix = device.split(':')[0] if isinstance(device, str) else str(device)
-        pinned = (dev_prefix in ('cuda', 'npu'))
+        pinned = (dev_prefix == 'cuda')
         conv = ([lambda a: torch.from_numpy(a).pin_memory().to(device, non_blocking=True)]
                 if pinned else
                 [lambda a: torch.from_numpy(a).to(device)])

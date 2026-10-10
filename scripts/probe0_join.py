@@ -25,8 +25,6 @@ hash 口径 = (board 361B, to_play 1B, ko 2B)
 from __future__ import annotations
 
 import argparse
-import glob
-import hashlib
 import os
 import sys
 import tarfile

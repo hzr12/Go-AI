@@ -23,7 +23,6 @@ AICore 0% 说明它们只占显存不干活（纯 numpy 取数）。
 fork 时机的手段 —— 运行时真机上没法观察继承），护栏用假设备运行时验证真的会拦。
 """
 import ast
-import os
 import pathlib
 import sys
 
@@ -150,7 +149,7 @@ def test_guard_passes_when_no_device_runtime():
     real_mp = mod.mp
     mod.mp = _StubMP
     try:
-        pf = mod._BatchPrefetcher(object(), num_workers=2, prefetch=1)
+        mod._BatchPrefetcher(object(), num_workers=2, prefetch=1)
         assert len(started) == 2, '护栏放行后应照常起 2 个 worker：%s' % started
     finally:
         mod.mp = real_mp

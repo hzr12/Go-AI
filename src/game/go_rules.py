@@ -1445,7 +1445,6 @@ class GoBoard:
 
     def _neighbor_groups(self, r, c):
         """返回 (r,c) 的 4 邻域内不同颜色的连通块列表。"""
-        n = self.board_size
         groups = []
         seen = set()
         for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
@@ -1483,7 +1482,6 @@ class GoBoard:
         `_neighbor_groups` / `_group_has_liberty_excluding` / `_group_liberty_count`
         一起**保留为参考实现（oracle）**，供测试对拍，别再挂进 MCTS 路径。
         """
-        n = self.board_size
         color = self.board[seed_r, seed_c]
         stack = [(seed_r, seed_c)]
         seen = {(seed_r, seed_c)}
@@ -1550,7 +1548,6 @@ class GoBoard:
 
     def _group_liberty_count(self, seed_r, seed_c) -> int:
         """返回 (seed_r, seed_c) 所在同色连通块的气数。"""
-        n = self.board_size
         color = self.board[seed_r, seed_c]
         stack = [(seed_r, seed_c)]
         seen = {(seed_r, seed_c)}
@@ -2054,7 +2051,6 @@ class GoBoard:
             return False
 
         color = self.current_player
-        opponent = -color
 
         # ---- 结构判定：全走增量表，零 flood fill、**零试落子**（P2.7a）----
         #

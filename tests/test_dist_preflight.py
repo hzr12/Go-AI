@@ -23,7 +23,6 @@ import socket
 import sys
 
 import pytest
-import torch
 import torch.distributed as dist
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]

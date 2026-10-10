@@ -1,7 +1,6 @@
 import numpy as np
 import torch
 from typing import List, Tuple
-import os
 
 
 def board_to_string(board: np.ndarray) -> str:

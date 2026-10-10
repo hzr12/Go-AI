@@ -2,7 +2,6 @@
 import os
 import sys
 import numpy as np
-import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -73,7 +72,6 @@ def test_light_rollout_runs():
     """LightPLS 轻量 rollout 应当能在终局返回 [-1,1] 的 Tromp-Taylor 胜率。"""
     from src.search.light_rollout import FastPolicy, light_rollout
     board = GoBoard(9)
-    hist = [[-1, -1, -3], [-1, -1, -3]]
     policy = FastPolicy(9)
     rng = np.random.default_rng(0)
     # 跑几局随机推演，结果都应在 [-1,1]

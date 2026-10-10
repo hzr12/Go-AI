@@ -18,7 +18,6 @@
 5.  往返：写出去的字节能原样读回
 6.  导出前置条件不满足时**响亮失败**（缺张量 / sv3 不是 6 通道）
 """
-import os
 import pathlib
 import sys
 
@@ -311,7 +310,6 @@ def test_model_version_16_is_impossible_and_17_is_not(monkeypatch):
     行为由 ``tests/test_katago_export.py`` 的人工验证记录在案。
     """
     from src.data import katago_export as kx
-    import src.data.katago_bin as _kb
 
     torch.manual_seed(0)
     net = build_katago_v7_net()

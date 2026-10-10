@@ -57,7 +57,7 @@ def test_permute_matches_symmetries_on_single_move():
     bs = 19
     n_sq = bs * bs
     A = n_sq + 1
-    data = _toy_dataset(bs=bs, n=32, seed=1)
+    _toy_dataset(bs=bs, n=32, seed=1)
 
     for t in range(8):
         # 造一个 one-hot 软标签，峰在落点 c（不是 pass）

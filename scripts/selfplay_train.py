@@ -40,7 +40,6 @@ import os
 import math
 import time
 import queue
-import struct
 import traceback
 import argparse
 import multiprocessing as mp
@@ -57,6 +56,9 @@ from src.game.go_rules import GoBoard
 # （`src/search/policy_sampler.py`）。`MCTS` **只**为「归档参数的启动提示」保留
 # 引用之外的需求而不再导入 —— 引擎本身保留给 webui / cli_play / evaluate /
 # eval_elo（见 `src/search/mcts.py`）。
+# `temperature_sample` 本模块不直接用，但 `tests/test_rl_ppo_policy.py` 从这里
+# 导入它（PPO 的 logp_old 要和采集端逐字一致）⇒ 这个别名是**跨模块契约**，
+# 删掉会让该测试 ImportError。autoflake / pyflakes 都看不见跨模块消费者。
 from src.search.policy_sampler import (DEFAULT_MIX, sample_move,
                                        temperature_sample as _temperature_sample)
 from src.search.light_rollout import FastPolicy, DiverseRolloutPolicy
@@ -308,7 +310,6 @@ def _log_archived_search_args(args, logger=None):
             continue
         val = getattr(args, name)
         # 与 argparse 默认比较：只有「非默认」才是用户真的想调它
-        default = None
         for a in (_ap.ArgumentParser(),):
             pass
         touched.append((name, val))
@@ -888,11 +889,11 @@ def train_epochs(ai, buffer, args, device):
       steps, v_mse, v_clip_frac, w_mean, w_clip_frac} 供 main() 写 swanlab
       （既有键一个不动；w_* 两个是 B2 新增）。
 
-    N1: 910A 无 BF16，FP16 autocast 配 GradScaler 防下溢（对齐 train_sft 的
-        npu_grad_scaler）；CUDA 旧卡 FP16 同样需要。
+    N1: 旧卡（如 V100/sm_70）无 BF16，FP16 autocast 配 GradScaler 防下溢；
+        CUDA 旧卡 FP16 同样需要。
     C3: optimizer/EMA/GradScaler 跨迭代挂在 ai 上复用（保留 Adam 动量与 EMA
         shadow 轨迹），LR scheduler 每轮按当前 buffer 大小重建。
-    N4: pin_memory 收窄为仅 CUDA（NPU 直传，对齐 train_sft）。
+    N4: pin_memory 收窄为仅 CUDA（与 train_sft 对齐）。
     """
     if buffer and len(buffer[0]) != 7:
         raise ValueError(
@@ -1417,13 +1418,13 @@ def main():
     use_swanlab = args.swanlab == 1 or os.environ.get('SWANLAB_API_KEY')
     swanlab_logger = None
     if use_swanlab and is_main:
-        # 刻意**不在训练进程内** pip install swanlab：调用点在 torch / torch_npu
+        # 刻意**不在训练进程内** pip install swanlab：调用点在 torch
         # 已加载之后，此时改动 site-packages 可能破坏后续惰性导入；且 shell/*.sh
         # 在启动 python 之前已装过一次，那次失败的话这里必然也失败，只是白等一轮。
         # 「手动安装没问题」正是这个差别：装在解释器启动前，依赖已就位。
         #
         # 用 find_spec 区分「没装」与「装了但坏」：后者是云端常见坑——swanlab 依赖
-        # pydantic>=2，而 MindSpore / torch_npu 常把 pydantic 钉在 1.x，于是
+        # pydantic>=2，而部分环境常把 pydantic 钉在 1.x，于是
         # `import swanlab` 抛 "cannot import name 'TypeAdapter' from 'pydantic'"。
         # 旧代码把任何 ImportError 都当成「未安装」而误触发自动安装，掩盖了真因。
         _mod = sys.modules.get('swanlab')
@@ -1480,7 +1481,7 @@ def main():
                 _emsg = str(e)
                 if 'pydantic' in _emsg or 'TypeAdapter' in _emsg:
                     print("[swanlab] 疑似 pydantic 版本冲突：swanlab 需要 pydantic>=2，"
-                          "而 MindSpore / torch_npu 常钉 pydantic<2。"
+                          "而部分环境常钉 pydantic<2。"
                           "请在启动训练前解决版本冲突（如在独立环境装 swanlab），"
                           "不要依赖训练进程内自动安装。", flush=True)
 

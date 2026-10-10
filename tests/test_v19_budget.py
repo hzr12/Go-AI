@@ -88,7 +88,7 @@ def test_v19_fits_memory_with_margin():
                value_res_blocks=int(f['value-res-blocks']))
     r = S.project(cfg, b)
     assert r['fits'], 'B={} 显存 {:.1f}G 超出预算'.format(b, r['total_gb'])
-    margin = S.NPU_GB - r['total_gb']
+    margin = S.DEVICE_GB - r['total_gb']
     assert margin >= 4.0, \
         '显存余量仅 {:.1f}GB，太薄（标定只经过单一实测点）'.format(margin)
 

@@ -14,9 +14,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import math
 import re
-import time
 import numpy as np
 import torch
 
@@ -252,10 +250,6 @@ class GoAI:
                  komi=7.5, rules_flags=None):
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
-        if device.startswith("npu"):
-            raise RuntimeError(
-                "--device npu 已下线（硬件换成 A100 / V100）。"
-                "V100 是 sm_70、无 bf16 ⇒ 那一档走 fp16 autocast + 内置 SDPA。")
         self.device = device
         # CPU 不开 amp；CUDA 上由调用方的 amp 开关决定（A100=bf16、V100=fp16）
         self.use_amp = use_amp and self.device.startswith("cuda")
@@ -915,14 +909,12 @@ class GoAI:
                     self.model, dummy, quant_path,
                     input_names=["x"], output_names=["policy", "value"],
                     opset_version=17, dynamo=False)
-                quantized = False
                 try:
                     from onnxruntime.quantization import quantize_dynamic, QuantType
                     quantize_dynamic(
                         model_input=quant_path,
                         model_output=onnx_path,
                         weight_type=QuantType.QInt8)
-                    quantized = True
                     print(f"[GoAI] 已应用 ONNX int8 动态量化: {onnx_path}")
                 except Exception as e:  # noqa: BLE001
                     print(f"[GoAI] int8 量化失败，使用 FP32 模型: {e}")

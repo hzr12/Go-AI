@@ -16,14 +16,18 @@ import logging
 import math
 import multiprocessing as mp
 import os
-import queue
-import random
 import sys
-import threading
 import time
 from contextlib import contextmanager, nullcontext
 
 import numpy as np
+# CUDA 显存分配器：开启 expandable_segments 减少碎片 —— 能塞下更大 batch
+# （直接放大 `--gc-with-compile` 的吞吐收益）、并避免分配器偶发卡顿。
+# 必须在任何 CUDA 分配发生前设置（故放在 import torch 之前）。
+_os_alloc = os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '')
+if 'expandable_segments' not in _os_alloc:
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = (
+        (_os_alloc + ',') if _os_alloc else '') + 'expandable_segments:True'
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -34,16 +38,15 @@ def _auto_select_device():
     """自动选择最优训练设备。
 
     策略（按优先级）：
-    1. 探测 CUDA 与 NPU 各卡的空闲显存，挑空闲显存最大的那张卡。
-    2. 若两后端都可用，选「空闲显存更大」的后端（A100 通常 > 910B，但按实测）。
-    3. 都不可用则回退 CPU。
-    返回形如 'cuda:0' / 'npu:1' / 'cpu' 的具体设备串。
+    1. 探测 CUDA 各卡的空闲显存，挑空闲显存最大的那张卡。
+    2. 都不可用则回退 CPU。
+    返回形如 'cuda:0' / 'cpu' 的具体设备串。
     """
     def _cuda_free(idx):
         # 同样**不能**用 `torch.cuda.memory_allocated` / `get_device_properties`：
         # 它们会 `_lazy_init()` 建 CUDA context，而本函数在 `--device auto` 时
-        # 跑在 `_BatchPrefetcher` fork **之前** ⇒ 预取 worker 继承设备上下文
-        # （4 卡 NPU 实测每卡凭空多占 ~24 GiB），护栏会直接拒绝构造。
+        # 跑在 `_BatchPrefetcher` fork **之前** ⇒ 预取 worker 继承设备上下文，
+        # 护栏会直接拒绝构造。
         # 改走 NVML：同样的「空闲显存」语义、**不建 context**。
         try:
             import subprocess
@@ -613,7 +616,7 @@ def v7_batch_memory_advice(args, logger, device, *, n_layers, heads, tokens,
     待 910A 真机复测确认。这里仍把**实际配置**对应的每样本字节打出来，
     让人一眼看出处在哪个区间，而不必靠猜。
 
-    只在能查到设备显存时启用。查不到（CPU / 未装 torch_npu）就只打印估算值，
+    只在能查到设备显存时启用。查不到（CPU / 无 GPU 信息）就只打印估算值，
     不拦 —— 本地冒烟不该被这个门控挡住。
     """
     ckpt = bool(use_checkpoint)
@@ -1728,27 +1731,11 @@ def _apply_channels_last_(model, backend='cuda'):
     （吞掉的话调用方会以为转换成功、继续把输入也转成 NHWC ⇒ 权重 NCHW +
     输入 NHWC 错配）。调用方拿到异常就把 ``use_channels_last`` 置回 False。
 
-    为什么不能用 ``model.to(memory_format=torch.channels_last)``
+    为什么用 ``param.data = param.data.contiguous(memory_format=channels_last)``
+    而不是 ``model.to(memory_format=channels_last)``
     --------------------------------------------------------------
-    ``torch_npu`` 覆写了 ``Module.to``（``torch_npu/utils/_module.py``），
-    只接受 ``contiguous_format`` / ``preserve_format``，传 channels_last 直接
-    ``RuntimeError: Only contiguous_format or preserve_format is supported.``
-    （真机 torch 2.1.0 实测）。
-
-    torch 2.1.0 上连**张量级** ``.contiguous(memory_format=channels_last)`` 也不行
-    —— ``torch_npu`` 的 contiguous 算子只认 contiguous 布局：
-
-        RuntimeError: NPU contiguous operator only supportted contiguous
-        memory format.  [ERROR] ERR01007 OPS feature not supported
-
-    ⇒ NPU 上必须走**昇腾自己的** format cast API：
-    ``torch_npu.npu_format_cast(t, torch_npu.Format.NHWC)``。
-    它作用在 aclnn 的 ``aclFormat`` 上（NHWC=1），是 CANN 卷积核真正认的布局；
-    ``torch.channels_last`` 只是 stride 的排列，在 NPU 这条路上根本走不通。
-    该 API 返回**新张量**（不改原张量），且标注为 beta，所以要探测存在性。
-    非 NPU 后端仍走 ``.contiguous(memory_format=...)``（CUDA/CPU 有效）。
-
-    ``param.data = ...`` 就地换张量而非新建 Parameter，是为了保住 optimizer
+    直接在 4D 卷积核上做 NHWC stride 转换（``.contiguous`` 在 CUDA/CPU 上均有效），
+    并把结果写回 ``param.data`` 而非新建 Parameter，是为了保住 optimizer
     已经持有的引用 —— 否则这个 flag 一开，优化器就管不到卷积核了（会静默变成
     「卷积核不更新」，比崩溃更难查）。
     """
@@ -1768,9 +1755,8 @@ def _to_nhwc(t):
     （5 处），多传一个 backend 参数等于给每处都留一个传错的机会，而「权重用
     A 转换、输入用 B 转换」正是这次要根治的错。
 
-    与 `_apply_channels_last_` 用同一套后端判据：NPU 走
-    ``torch_npu.npu_format_cast``（``.to(memory_format=channels_last)`` 在
-    torch 2.1.0 + torch_npu 上会 ERR01007），其余走 PyTorch 原生转换。
+    与 `_apply_channels_last_` 同一套判据：统一走 PyTorch 原生
+    ``torch.channels_last`` 转换（CUDA/CPU 均有效）。
 
     ⚠ 输入与权重必须用同一套转换：权重转了、输入没转（或反过来）会让每次
     卷积白搬一次布局 —— 那等于 flag 没开。调用方只在权重转换**成功**后才置
@@ -1929,7 +1915,6 @@ def evaluate_metrics_v7(model, dataset, idxs, bs, device, amp_dtype, *,
     Returns:
         与 :func:`evaluate_metrics` 同构的 dict（另加 ``n`` 便于确认覆盖度）。
     """
-    from src.networks.katago_v7_loss import KataGoV7Loss
 
     bs = min(int(bs), _EVAL_BATCH_CAP)   # 见 _EVAL_BATCH_CAP 注释
     model.eval()
@@ -2091,10 +2076,6 @@ def evaluate_metrics(model, dataset, idxs, bs, device, amp_dtype, max_batches=50
             # --- policy KL 散量 ---
             # expert: one-hot at move_t -> log prob; model: log_softmax
             log_p = F.log_softmax(policy_logits, dim=-1)  # (B, A)
-            with torch.inference_mode():
-                target = torch.zeros_like(log_p).scatter_(
-                    1, move_t.unsqueeze(1).clamp(
-                        max=log_p.shape[1] - 1), 1.0)
             # KL(expert || model) = sum(expert * (log_expert - log_model))
             # expert 为 one-hot，简化为 -log_p[expert_move]（即 cross-entropy）
             # 但更标准的 KL = sum(expert * log(expert / model))
@@ -2326,8 +2307,15 @@ def _labels_dict_to_tensors(d, device=None):
     def conv(x):
         if isinstance(x, dict):
             return {k: conv(v) for k, v in x.items()}
-        t = torch.from_numpy(x)
-        return t.to(device, non_blocking=True) if device is not None else t
+        # 标签张量来自 pageable 的 numpy 内存：直接 `.to(device, non_blocking=True)`
+        # 在 CUDA 上会对**未固定**内存发起异步 H2D，偶发 `CUDA error: misaligned
+        # address`（见 2330 附近崩溃栈，全仓其它搬运路径都不这么写）。与
+        # `v7_to_device` / 12 通道路径同口径：CUDA 上先 `pin_memory()` 再非阻塞搬运；
+        # 其余后端（npu/cpu）走普通 `.to`。`ascontiguousarray` 防御非连续数组。
+        t = torch.from_numpy(np.ascontiguousarray(x))
+        if device is not None and str(device).split(':')[0] == 'cuda':
+            return t.pin_memory().to(device, non_blocking=True)
+        return t.to(device) if device is not None else t
     return {k: conv(v) for k, v in d.items()}
 
 
@@ -2667,13 +2655,13 @@ def _init_swanlab(args, logger):
     决策，本函数只负责"装/登录/init"。任何异常都吞掉并降级为 None。
     """
     try:
-        # 刻意**不在训练进程内** pip install swanlab。调用点在 torch / torch_npu
+        # 刻意**不在训练进程内** pip install swanlab。调用点在 torch
         # 已加载之后，此时改动 site-packages 可能破坏后续惰性导入；而 shell/*.sh
         # 在启动 python 之前已装过一次，那次失败的话这里必然也失败，只是白等一轮。
         # 「手动安装没问题」正是这个差别：装在解释器启动前，依赖已就位。
         #
         # 用 find_spec 区分「没装」与「装了但坏」：后者是云端常见坑——swanlab 依赖
-        # pydantic>=2，而 MindSpore / torch_npu 常把 pydantic 钉在 1.x，于是
+        # pydantic>=2，而部分环境常把 pydantic 钉在 1.x，于是
         # `import swanlab` 抛 "cannot import name 'TypeAdapter' from 'pydantic'"。
         # 旧代码把任何 ImportError 都当成「未安装」而误触发自动安装，掩盖了真因。
         _mod = sys.modules.get('swanlab')
@@ -2834,7 +2822,7 @@ def _init_swanlab(args, logger):
         _emsg = str(e)
         if 'pydantic' in _emsg or 'TypeAdapter' in _emsg:
             logger.warning("[swanlab] 疑似 pydantic 版本冲突：swanlab 需要 pydantic>=2，"
-                        "而 MindSpore / torch_npu 常钉 pydantic<2。"
+                        "而部分环境常钉 pydantic<2。"
                         "请在启动训练前解决版本冲突（如在独立环境装 swanlab），"
                         "不要依赖训练进程内自动安装。")
         return None
@@ -3442,17 +3430,11 @@ def build_adamw(param_groups, device, logger=None):
     P4.5b 的 opt_loss/log_loss 分离与 `compute_l2_report` 的报告口径）在两种模式
     下逐字相同。**不是** MindSpeed 的融合优化器：那是 D6 / P4.11 的事，本函数不碰。
 
-    **设备策略**（A1 记录：CUDA A100 支持；本地开发是 CPU。2026-10-06 起接入
-    torch_npu 自带的 NPU fused kernel）：
+    **设备策略**（A1 记录：CUDA A100 支持；本地开发是 CPU）：
 
     * `cuda` → `try: AdamW(param_groups, fused=True)`；构造抛 `TypeError`（老
     torch 无此 kwarg）或 `RuntimeError`（无 fused kernel）→ **回退标准构造，
     异常不冒泡**；
-    * `npu` → `try: from torch_npu.optim import NPUFusedAdamW`（torch_npu 随包
-    提供，apex 风格多张量融合 kernel，一趟完成 exp_avg/exp_avg_sq/decoupled
-    decay/参数写回；支持逐组 lr ⇒ value 头 5x lr 分组不受影响）。本地无
-    torch_npu ⇒ `ImportError` → 回退标准构造，异常不冒泡。数值与 standard
-    **容差内一致、非逐位**（同 CUDA fused 的口径）。
     * `cpu` / 其它 → **直接标准构造**（不尝试、不报错）。
 
     **回退契约（bit-for-bit）**：标准分支就是 `torch.optim.AdamW(param_groups)`
@@ -3870,18 +3852,25 @@ def main():
                          '对 A100 是白丢的收益。\n'
                          '显式给 0/1 覆盖自动判定。compile 失败会自动回退 eager，'
                          '不会把训练带崩。')
-    ap.add_argument('--compile-mode', default='default',
+    ap.add_argument('--compile-mode', default=None,
                     choices=['default', 'max-autotune', 'max-autotune-no-cudagraphs',
                              'reduce-overhead'],
-                    help='torch.compile 模式。\n'
-                         '  default                  = 常规融合，编译快，日常用这个。\n'
-                         '  max-autotune-no-cudagraphs = **A100 40G 上推荐的加档**：'
-                         '在 max-autotune 的自动调优之上关掉 CUDA Graphs。\n'
+                    help='torch.compile 模式（默认 None = 不显式指定，交给下方设备分支）。\n'
+                         '  A100(sm_80+)：未显式指定时**自动取 max-autotune-no-cudagraphs**'
+                         '（见设备分支）—— 拿到 autotune 的融合/调度收益、不背 CUDA Graphs\n'
+                         '  的显存（40G 卡长跑 OOM 风险，已在注释里否决 reduce-overhead）。\n'
+                         '  非 Ampere+ 或显式指定时尊重用户值：\n'
+                         '  default                  = 常规融合，编译快。\n'
                          '  max-autotune             = 自动调优，但**带** CUDA Graphs；'
-                         'CUDA Graphs 的私有内存池不归还，40G 卡上容易在长跑里'
-                         '把显存吃满。\n'
+                         '私有内存池不归还，40G 卡上容易在长跑里把显存吃满。\n'
                          '  reduce-overhead          = 小 batch 低开销，同样受 '
                          'CUDA Graphs 内存池影响，长跑慎用。')
+    ap.add_argument('--compile-fullgraph-probe', type=int, default=0, choices=[0, 1],
+                    help='诊断用：编译时额外用 `fullgraph=True` 探测一次，把所有 '
+                         'graph break 一次性列进日志（抛异常即逐条列出断点），'
+                         '随后正常训练仍用 `fullgraph=False`。开启会多编译一次 '
+                         '（max-autotune 下多花几分钟），仅排查时临时启用，'
+                         '默认 0 = 不探测。配合已开启的 `log_graph_breaks` 看断点原因。')
     ap.add_argument('--gc-with-compile', type=int, default=0, choices=[0, 1],
                     help='开 --compile 时**仍然保留**梯度检查点（1=保留，0=照旧关掉）。'
                          '默认 0 是历史行为：compile 与 GC 被当成二选一'
@@ -4215,16 +4204,15 @@ def main():
                     "workers=%d | augment=False", _eval_workers)
 
     # ---- 分布式训练：设备由 LOCAL_RANK 决定，忽略 --device 卡号 ----
-    # 后端选择：NPU 走 hccl，CUDA 走 nccl。多卡前必须 init_process_group，
+    # 后端固定为 nccl（CUDA）。多卡前必须 init_process_group，
     # 否则后续 .to(device) / DDP 包裹会失败或各卡不互通。
     if is_dist:
         _dist_backend = (args.device.split(':')[0]
                         if args.device not in ('auto', '') else
                         'cuda')
         # 必须在 init_process_group **之前**：DETAIL 是在建域那一刻给每个 PG 套
-        # 一层一致性检查 wrapper（每次 collective 前一发 monitored_barrier），NPU
-        # 上未验证过其开销 ⇒ 降为 OFF（该代价与用哪种包裹层无关，换轨后依旧存在）。
-        # 见 _downgrade_npu_dist_debug 的 docstring。
+        # 一层一致性检查 wrapper（每次 collective 前一发 monitored_barrier）；
+        # 其开销与用哪种包裹层无关，统一降为 OFF。
         dist.init_process_group('nccl')
         torch.cuda.set_device(local_rank)
         device = f'{_dist_backend}:{local_rank}'
@@ -4270,7 +4258,7 @@ def main():
     gpu_name = 'N/A'
     compute_cap = (0, 0)
     _backend = device.split(':')[0]
-    # 具体卡号（device 形如 'cuda:1' / 'npu:0' / 'cpu'），无索引时默认 0
+    # 具体卡号（device 形如 'cuda:1' / 'cpu'），无索引时默认 0
     try:
         _dev_idx = int(device.split(':')[1]) if ':' in device else 0
     except ValueError:
@@ -4301,8 +4289,16 @@ def main():
             # unfold 巨型中间张量会触发 inductor freezing 以 fp32 物化 (B,N,Hh,ws²,d)
             # 导致编译期 OOM（batch512 下单个 4.3GB），必须排除出编译图
             compile_disable_sparse = True
+            # A100 默认把 compile 档提到 `max-autotune-no-cudagraphs`：autotune 的
+            # 融合/调度收益、不背 CUDA Graphs 的显存（40G 卡长跑 OOM，见
+            # --compile-mode 帮助与 4793 附近注释）。仅当用户**未显式**指定
+            # --compile-mode（默认 None）时覆盖；显式给 'default' / 'reduce-overhead'
+            # 等一律尊重用户意图。非 Ampere+ 分支不动（留给 torch.compile 默认档）。
+            if args.compile_mode is None:
+                args.compile_mode = 'max-autotune-no-cudagraphs'
             logger.info("[device] %s (sm_%d%d) | 启用 A100 路径: BF16 + FlashAttn(优先,回退SDPA) + "
-                        "channels_last + compile(卷积/线性/FFN)", gpu_name, *compute_cap)
+                        "channels_last + compile(卷积/线性/FFN, mode=%s)",
+                        gpu_name, *compute_cap, args.compile_mode)
             # flash-attn 的实际加载/回退统一在下方「flash-attn 独立库启用决策」块处理
             # （A100 默认优先尝试，--flash-attn 0 才禁用），此处不再重复。
         else:
@@ -4341,9 +4337,8 @@ def main():
         args.compile = 0
 
     # 全局 SDPA 总开关（--use-sdpa）：在各后端选定天然默认后做一次统一覆盖，
-    # 让该参数对 CUDA / NPU / CPU 全部后端生效。
-    #   - 默认 1：保留各后端天然选择（A100=SDPA/FlashAttn，V100/CPU=手写 math，
-    #     NPU=CANN 融合 SDPA 或受旧 CANN/torch_npu<2.1 保护回退 math）。
+    # 让该参数对 CUDA / CPU 全部后端生效。
+    #   - 默认 1：保留各后端天然选择（A100=SDPA/FlashAttn，V100/CPU=手写 math）。
     #   - 0：强制所有后端回退手写 _sdpa_math（跨后端统一关闭融合注意力，便于
     #     调试数值差异 / 兼容不支持 SDPA 的环境）。
     if args.use_sdpa == 0 and not sdpa_force_math:
@@ -4382,7 +4377,6 @@ def main():
     # 默认开；`--attn-chunk-ckpt 0` 关闭。
     _backbone.set_attn_chunk_checkpoint(int(args.attn_chunk_ckpt))
     # NPU 融合算子总闸（置 0 只慢不坏，数值口径不变）。
-    from src.networks import katago_v7 as _v7mod
 
     # online-softmax 注意力（flash 风格）：由 `--attn-online` 控制（默认关）。
     # 与 materialize 路径**数值等价但非逐位相同**（实测 fp32 max|Δ|≈7e-07），
@@ -4604,16 +4598,13 @@ def main():
     # 排除 bias / BatchNorm / LayerNorm 参数的 weight decay（标准做法）
     _opt_groups = _build_param_groups(model, args)
     # A1: CUDA(A100) 启用 fused AdamW（单 kernel 融合 param 更新，省启动开销）；
-    # NPU/CPU 走默认实现（910A 不支持 fused）。P4.6 起这段决策收进 build_adamw：
-    # 设备策略、构造、回退契约（fused 不可用 ⇒ 标准实现，bit-for-bit 等于旧路径）
-    # 集中在唯一入口，全模块不再有第二处 AdamW 构造点。
+    # CPU 走默认实现。P4.6 起这段决策收进 build_adamw：设备策略、构造、回退契约
+    # （fused 不可用 ⇒ 标准实现，bit-for-bit 等于旧路径）集中在唯一入口，全模块
+    # 不再有第二处 AdamW 构造点。
     optimizer, _opt_mode = build_adamw(_opt_groups, device, logger)
-    # torch_npu fused 优化器的 zero_grad **不支持 set_to_none=True**（融合 kernel
-    # 要求梯度张量常驻，置 None 会破坏其内部引用；实测 ValueError 直崩）。
-    # set_to_none=False 原地清零，训练语义等价（仅多一次写带宽）。其余后端维持
-    # True（省一次 memset，原行为）。
+    # zero_grad 用 set_to_none=True（省一次 memset，CUDA fused AdamW 亦支持）。
     _zero_set_none = True
-    # BF16 后端（A100/NPU）下 use_scaler=False（BF16 不下溢，省去 loss scaling 的额外同步）；
+    # BF16 后端（A100）下 use_scaler=False（BF16 不下溢，省去 loss scaling 的额外同步）；
     # V100/FP16 下开启 GradScaler。按设备选择 GradScaler 实现。
     # 缩放值策略可配：从 65536 起步要靠减半向下搜索平衡点，每次溢出都白扔一个
     # batch；已知平衡点后直接给 init_scale 并关掉回涨，可消除这段浪费与后续震荡。
@@ -4755,6 +4746,27 @@ def main():
                     # 所以显式记一条。
                     logger.info("[resume] EMA shadow: %d 处 attn.q/k/v 已合并为 qkv",
                                 moved)
+                # 丢弃「模型里根本没有」的 shadow 项。
+                # 判据是**对 named_parameters 求差**，不是按 `.q.weight` 之类的
+                # 后缀猜 —— 后缀那种写法在今天两个现役模型上都恰好安全（两者
+                # named_parameters 里 `.q/.k/.v.weight` 都是 0 个），但哪天有
+                # 模块真的加了 `.q.weight` 参数，删掉的就是**活参数**的 shadow
+                # 项，`EMA.update()` 第一步就 KeyError。
+                #
+                # 为什么这些多余项无害、可以放心丢：`EMA.update()` 是遍历
+                # `model.named_parameters()` 再去 shadow 取键，**从不遍历 shadow
+                # 自己的键**，所以多余项从来不会被读到（既不会算错也不会报错）。
+                # 反过来「模型有、shadow 没有」才会 KeyError —— 那才是要防的方向。
+                # 典型来源：某次 snapshot 恰好在 qkv 迁移过程中落盘，于是
+                # `attn.qkv.weight` 与残留的 `attn.q/k/v.weight` 并存；不清掉
+                # 它们会一直躺在每个 checkpoint 里白占空间。
+                _known = {_ema_key(n) for n, _ in model.named_parameters()}
+                _stale = [k for k in shadow if k not in _known]
+                if _stale:
+                    shadow = {k: v for k, v in shadow.items() if k in _known}
+                    logger.warning(
+                        "[resume] EMA shadow: 丢弃 %d 个模型中不存在的项（%s…）",
+                        len(_stale), _stale[:3])
                 ema.shadow = shadow
                 logger.info("[resume] 恢复 EMA shadow 状态")
             elif ema is not None:
@@ -4786,6 +4798,38 @@ def main():
                     256, _dynamo_mod.config.cache_size_limit)
             except Exception:  # noqa: BLE001
                 pass
+            # ---- Inductor：编译缓存 + graph break 检查 ----
+            # fx_graph_cache：同配置（图结构 + 输入 shape/dtype 哈希）下复用已编译
+            # 的 kernel，避免每次重启重编译（max-autotune 动辄几分钟）。缓存落在
+            # `~/.cache/torch/inductor`，换 batch/模型会失效，需同配置复用。
+            # 注意：该特性 **torch 2.2+** 才有；本仓云端是 2.1.0，`fx_graph_cache`
+            # 属性不存在 ⇒ 下面用 hasattr 显式判定，缺失时报警而不是静默 no-op。
+            # log_graph_breaks：compile 时逐条把 graph break 及原因写进日志——
+            # 有断点的子图会**静默回退 eager**，融合收益没全拿到（见下方探测）。
+            try:
+                _ind_cfg = torch._inductor.config
+                if hasattr(_ind_cfg, 'fx_graph_cache'):
+                    _ind_cfg.fx_graph_cache = True
+                    logger.info("[compile] 已启用 Inductor FX 图缓存（重启免重编译）")
+                else:
+                    logger.warning(
+                        "[compile] 当前 torch %s 不支持 fx_graph_cache（需 >=2.2），"
+                        "编译缓存未启用；升级 torch 可免去每次重启的 max-autotune 重编译。",
+                        torch.__version__)
+                _ind_cfg.log_graph_breaks = True
+            except Exception:  # noqa: BLE001
+                pass
+            # 可选 fullgraph 探测：`fullgraph=True` 编译一次，把所有 graph break
+            # 一次性抛出来（异常里逐条列出断点），随后正常训练仍用 fullgraph=False。
+            # 仅 `--compile-fullgraph-probe 1` 时启用，避免生产路径重复编译。
+            if getattr(args, 'compile_fullgraph_probe', 0):
+                try:
+                    torch.compile(model, dynamic=False,
+                                  mode=args.compile_mode, fullgraph=True)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "[compile] fullgraph 探测发现 graph break（不影响训练，"
+                        "已回退 fullgraph=False）:\n%s", e)
             try:
                 # `backend` 不显式给：`torch.compile` 的默认 backend 就是 inductor，
                 # 写死反而会在需要临时切 eager/aot_eager 排查时多一处要改的地方。
@@ -4867,10 +4911,24 @@ def main():
     #     （= 全部梯度大小，torch 对该开关的定义就是如此；占 32 GiB 的 0.106%），
     #     真正的风险是混用 view / 非 view 的 grad 状态触发
     #     `Expected to mark a variable ready only once`。收益配不上这类风险。
-    #   · `static_graph=False`：打开会禁止「iteration 边界内参数集合变化」，
-    #     收益未验证。
+    #   · `static_graph=True`：DDP 要求**每个 iteration 参与反向的参数集合完全一致**
+    #     —— 本模型满足：两个头每步都进 loss（见上方 find_unused_parameters=False
+    #     的隐含前提）、loss 的系数门控是**按 run 而非 per-step** 恒定（`katago_v7_loss`
+    #     里 `self.coeff` 在构造时定、训练中不切）、全仓无任何 `requires_grad` 切换。
+    #     静态图让 DDP 跳过每轮 unused-param 复检、固化 bucket 分配，省一点反向开销。
+    #     风险是 fail-loud：将来若引入「某步某参数不进图」的分支，DDP 会立刻报错
+    #     （而非安静错）。下方断言先把「全参数 requires_grad」这个前置不变量钉住。
     if is_dist:
-        model = DistributedDataParallel(model, device_ids=[local_rank])
+        # static_graph 前置不变量：所有参数都参与反向（DDP 要求每步参数集合一致）。
+        # 若将来出现冻结参数，应在此前显式处理；当前全仓不冻结任何参数。
+        _frozen = [n for n, p in model.named_parameters() if not p.requires_grad]
+        if _frozen:
+            raise RuntimeError(
+                'static_graph=True 要求所有参数 requires_grad，但发现 %d 个冻结参数'
+                '（static_graph 不允许 iteration 间参数集合变化）：%s'
+                % (len(_frozen), _frozen[:4]))
+        model = DistributedDataParallel(
+            model, device_ids=[local_rank], static_graph=True)
 
     # `_accum_steps` 必须定义在**任何**用它之前（2026-10-01 云端教训）。
     #   它原先在下面训练循环的开头才赋值，而上面「run 级指标上报」已经用它算
@@ -5087,9 +5145,15 @@ def main():
                         state = _to_nhwc(state)
                     gl = v7_to_device(_gl_np, device, amp_dtype,
                                     pin=(_backend == 'cuda'))
-                    move_t = torch.from_numpy(
-                        np.ascontiguousarray(_mv_np)).long().to(
-                            device, non_blocking=True)
+                    # 与 state/gl 同口径：moves 也是 pageable numpy，CUDA 上必须
+                    # 先 pin_memory 再非阻塞 H2D，否则和标签那处一样会
+                    # `misaligned address`（见 _labels_dict_to_tensors 处注释）。
+                    _mv_t = torch.from_numpy(
+                        np.ascontiguousarray(_mv_np)).long()
+                    if _backend == 'cuda':
+                        move_t = _mv_t.pin_memory().to(device, non_blocking=True)
+                    else:
+                        move_t = _mv_t.to(device)
                 elif pf is not None:
                     # P0: 先提交下一个 batch，再取当前 batch（给 worker 更多预计算时间）
                     nxt = i + args.prefetch_depth
@@ -5439,8 +5503,6 @@ def main():
                     #   而不是再去数参数里的 inf（那时已经没有了）。
                     # 归属仍然准确：`inf × 0 = NaN` 是**原地**写在同一个张量上，
                     #     所以「哪些张量现在是 NaN」= 「哪些张量原来是 inf」。
-                    _gn_bad = not bool(torch.isfinite(
-                        torch.as_tensor(_grad_norm_last)))
                     # **跳/不跳按全局判定**（2026-10-05 真机 4 卡事故的修复）。
                     # 原来用 `scaler.step(optimizer)`，而它只查**本地** `found_inf`
                     #   —— 某个 rank 有 inf 时它跳过、其余 rank 照常更新

@@ -57,9 +57,9 @@ from src.networks.alphanet import AlphaGoNet  # noqa: E402
 
 ACTION_SIZE = 362          # 19 路
 PROBE_BS = 8               # 显存探针 batch（小 batch 省内存，结果线性外推）
-NPU_GB = 32.0              # 910A 单卡 HBM
+DEVICE_GB = 32.0           # 单卡 HBM 预算（目标卡 HBM；910A=32 / A100=40，按需调整）
 SAFE_FRAC = 0.90           # 留 10% 余量给碎片/workspace
-SAFE_GB = NPU_GB * SAFE_FRAC
+SAFE_GB = DEVICE_GB * SAFE_FRAC
 
 # 已实测的锚点（4 卡 910A，batch 2800/卡，attn-window 5，use_checkpoint 1）
 ANCHOR = {
@@ -569,7 +569,7 @@ def main(argv=None):
     if args.preset:
         calibrate(verbose=True)
         print()
-        rows = run_preset(args.batch, key=args.preset)
+        run_preset(args.batch, key=args.preset)
         if args.emit_flags:
             print()
             for name, cfg, _, _ in preset_cfgs():

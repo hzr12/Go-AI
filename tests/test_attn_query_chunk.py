@@ -7,7 +7,6 @@ Mamba 扫描）都是倍数级，这一条是小一号的（~2.4 GiB / 次调用
 `softmax` 的反向要用它自己的输出。这两个量必须分开量，量错会得出「分块反而更费」
 的反直觉结论（本次先踩过一次）。
 """
-import os
 import pathlib
 import sys
 

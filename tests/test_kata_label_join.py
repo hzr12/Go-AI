@@ -206,7 +206,7 @@ def _fake_dataset_npz(path, b, tp, ko):
 def test_sidecar_roundtrip_and_diagnostics(tmp_path):
     b, tp, ko = _rand_positions(12, seed=11)
     h = pos_hash_block(b, tp, ko)
-    ds = _fake_dataset_npz(str(tmp_path / 'ds.npz'), b, tp, ko)
+    _fake_dataset_npz(str(tmp_path / 'ds.npz'), b, tp, ko)
     _fake_labels_npz(str(tmp_path / 'lb.npz'), h)
     out = str(tmp_path / 'side.npz')
     diag = build_sidecar(str(tmp_path / 'ds.npz'), str(tmp_path / 'lb.npz'), out)

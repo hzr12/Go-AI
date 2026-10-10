@@ -1038,7 +1038,6 @@ def judge(env, comps, workers, mem, gather=None):
 
 def recommend(env, batch_curve, comps, workers, gather):
     """给出 ``prefetch-workers`` / ``batch`` 的推荐值与**外推依据**。"""
-    n_log = env.get('cpu_count_logical') or os.cpu_count() or 1
     rec = {}
 
     # ---- workers：看扩展曲线在哪里开始不再涨 ----

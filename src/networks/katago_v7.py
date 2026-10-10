@@ -39,7 +39,6 @@
 """
 
 import math
-import os
 
 import torch
 import torch.nn as nn
@@ -312,6 +311,13 @@ def _migrate_ema_shadow_qkv(shadow):
     沿 dim0 拼接即可（与 `qkv_to_qkv` 的逆运算，**无损**）。
 
     返回 ``(新 shadow, 迁移了几处)``。不是 MHSA 的键原样透传。
+
+    **刻意不在这里丢弃「模型里没有」的键**（例如残缺的 ``attn.q.weight``）：
+    本函数拿不到模型，无法判断某个键是「多余」还是「未来某个模块真的叫这个名」。
+    按 ``.q.weight`` 这类**后缀**去删尤其危险：哪天有模块真的有个 ``.q.weight``
+    参数，删掉的就是活参数的 shadow 项，``EMA.update()`` 第一步直接 KeyError ——
+    正好是它本想防的故障。判「模型里没有」这件事留给调用点做（那里有 ``model``），
+    见 ``train_sft.py`` 的 resume 分支。
     """
     out, moved = {}, 0
     i = 0
@@ -454,7 +460,6 @@ class MHSA(nn.Module):
 
         这样**旧 checkpoint 无需迁移脚本**即可加载（`--resume` / `--model`）。
         """
-        d = self.dim
         parts = [state_dict.get(prefix + n + '.weight') for n in ('q', 'k', 'v')]
         qkv_key = prefix + 'qkv.weight'
         if qkv_key not in state_dict and all(p is not None for p in parts):

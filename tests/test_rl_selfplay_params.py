@@ -271,7 +271,6 @@ def test_flag_params_normalized_to_bool():
     而下游按 float 用，症状是采样分布悄悄变差（不报错）。所以断言映射出来的
     值与 argparse 默认**同类型**。
     """
-    import argparse as _ap
     ns = _real_args()
     kw = st._selfplay_kwargs(ns, _BS)
     for key in ('temperature', 'lookahead_temp', 'mix'):

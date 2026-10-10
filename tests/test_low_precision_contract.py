@@ -15,12 +15,10 @@
 本文件把「退了也不改数值」的那几条钉住，并明确列出**不能退**的那些 —— 否则下一
 个人会为了省显存把优化器状态或 loss 累加也改成 fp16。
 """
-import os
 import pathlib
 import sys
 
 import numpy as np
-import pytest
 import torch
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]

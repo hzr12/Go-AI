@@ -20,7 +20,6 @@ V7 的 dim=128，MHSA 里 q/k/v 各是一个 ``Linear(128,128)``。M 极小，
 
 import math
 
-import pytest
 import torch
 import torch.nn as nn
 
@@ -260,12 +259,70 @@ def test_state_dict_expansion_works_when_nested_in_parent():
     assert torch.equal(fused, net.blocks[0].inner[0].attn.qkv.weight.detach())
 
 
-def test_migrate_leaves_stray_q_weight_alone():
-    """只有 q 而没有 k/v 时不能瞎拼（宁可透传，让 EMA.update 报错也不要静默错值）。"""
+def test_migrate_passes_stray_q_weight_through_untouched():
+    """只有 q 而没有 k/v 时**不拼**，原样透传。
+
+    ⚠ 别把这条读成「多余项要保留到 EMA 报错为止」—— 那是错的：
+    `EMA.update()`（`train_sft.py` 的 `EMA` 类）是遍历
+    `model.named_parameters()` 再去 shadow 取键，**从不遍历 shadow 自己的键**
+    ⇒ 多余项永远不会被读到，既不会算错值也**不会抛 KeyError**。
+    真正会 KeyError 的是反方向：「模型有、shadow 没有」。
+    真正丢弃多余项的动作在 resume 分支做，且判据是对 `named_parameters`
+    求差（那里拿得到 `model`）—— 见 `train_sft.py` 同名注释。
+    """
     odd = {'blocks.0.inner.0.attn.q.weight': torch.randn(DIM, DIM)}
     migrated, moved = _migrate_ema_shadow_qkv(odd)
     assert moved == 0
+    # 透传 = 本函数不越权判断「模型里没有它」。丢弃是调用点的职责。
     assert set(migrated) == set(odd)
+
+
+def test_stale_shadow_pruning_never_drops_a_real_q_parameter():
+    """**模型里真的有 `.q.weight` 参数时，清理逻辑不许把它当垃圾丢掉。**
+
+    这是把判据从「后缀长得像」改成「对 `named_parameters()` 求差」的原因。
+    今天的两个现役模型（V7 278 个 / 12 通道 226 个参数）里 `.q/.k/.v.weight`
+    都是 0 个，所以按后缀删**今天也安全** —— 正因为安全，这个 bug 不会有任何
+    现存测试能抓到，直到有人给某个模块加一个真的 `.q.weight` 参数那天。
+    那时按后缀删掉的就是**活参数**的 shadow 项，`EMA.update()` 第一步直接
+    KeyError —— 恰好是它本想防止的故障。
+    """
+    from scripts.train_sft import EMA, _ema_key
+
+    class _Attn(torch.nn.Module):
+        """真的带 `.q/.k/.v.weight` 三个参数（必须**嵌套**，顶层 `self.q`
+        的参数名是 `q.weight`，没有前导的点，测不到后缀陷阱）。"""
+
+        def __init__(self):
+            super().__init__()
+            self.q = torch.nn.Linear(2, 2)
+            self.k = torch.nn.Linear(2, 2)
+            self.v = torch.nn.Linear(2, 2)
+
+    class _Fake(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = _Attn()
+
+    net = _Fake()
+    ema = EMA(net)
+    live = {_ema_key(n) for n, _ in net.named_parameters()}
+    assert {'attn.q.weight', 'attn.k.weight', 'attn.v.weight'} <= live, \
+        sorted(live)
+
+    # shadow 里既有活键、也有一个模型里不存在的垃圾键
+    shadow = dict(ema.shadow)
+    shadow['blocks.0.inner.0.attn.q.weight'] = torch.randn(2, 2)
+    kept = {k: v for k, v in shadow.items() if k in live}
+
+    assert any(k.endswith('.q.weight') for k in kept), \
+        '活着的 .q.weight 被误当成残留删掉了 —— 这就是按后缀匹配的陷阱'
+    assert 'blocks.0.inner.0.attn.q.weight' not in kept, \
+        '模型里不存在的残留项应当被丢掉'
+    # 关键：剩下的是一套完整、可直接挂回去的 shadow
+    ema.shadow = kept
+    ema.update()          # 缺键 / 多键都不会炸，缺键才会
+    ema.apply_shadow()
 
 
 # --------------------------------------------------------------------------- #

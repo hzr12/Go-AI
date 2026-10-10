@@ -515,14 +515,12 @@ def test_no_inprocess_pip_install(fname):
 
 def _swanlab_present(spec_result):
     """把 importlib.util.find_spec('swanlab') 固定为指定返回值。"""
-    import importlib.util
     return lambda name: spec_result
 
 
 def test_absent_swanlab_degrades_with_actionable_message(caplog):
     """swanlab 真的没装时：返回 None，且提示如何安装（而不是自己装）。"""
     import logging
-    import types as _types
     import scripts.train_sft as t
 
     class _Args:

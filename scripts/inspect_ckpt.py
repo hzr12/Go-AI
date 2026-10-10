@@ -18,7 +18,6 @@ board_size **无法**从 state_dict 读出：policy 头是 conv 到 1 通道后 
 """
 
 import argparse
-import math
 import re
 import sys
 

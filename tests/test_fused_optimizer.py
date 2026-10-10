@@ -13,11 +13,9 @@ fused AdamW 路径（融合 exp_avg/exp_avg_sq 更新与参数写回的单 kerne
 回退契约（测试 1/3/4 从三个方向钉）：
 * `cpu` → 标准构造，**bit-for-bit 等于 HEAD**（HEAD 的非 CUDA 分支就是
   `torch.optim.AdamW(_opt_groups)`，见 `train_sft.py` A1 锚点）；
-* `npu` → 尝试 `torch_npu.optim.NpuFusedAdamW`（torch_npu 随包提供，
-  `_NPU_FUSED_ATTEMPT=True`）。2026-10-06 当天曾因「post10 构造疑似挂死」短暂
-  关闭，随后同日的 B 段 run 用 fused 在 post10 上完整跑了 100+ 步 ⇒ 挂死另有
-  原因（C 段分片加载），门控恢复 True。无 torch_npu 的环境（本地 CPU）
-  import 失败 ⇒ 回退标准构造（+foreach），异常不冒泡；
+* `npu` → 与 `cpu` / 其它非 CUDA 后端一致，**直接标准构造**（`torch.optim.AdamW`
+  + `foreach`），不尝试任何 NPU 融合算子。NPU 融合优化器（MindSpeed /
+  `torch_npu.optim.NpuFusedAdamW`）本仓已不再使用，相关尝试分支已移除；
 * `cuda` 上 fused 构造抛 `TypeError/RuntimeError`（老 torch / 无 kernel）→
   回退标准构造，异常不冒泡。
 

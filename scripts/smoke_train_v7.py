@@ -120,7 +120,6 @@ def main():
     lossf = KataGoV7Loss().to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
-    g = torch.Generator().manual_seed(1)
     first = last = None
     t0 = time.perf_counter()
     for step in range(args.steps):

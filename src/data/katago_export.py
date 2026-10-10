@@ -35,7 +35,6 @@
 from __future__ import annotations
 
 import argparse
-import gzip
 import os
 import sys
 from typing import Any, Dict, List, Optional
@@ -362,7 +361,6 @@ def _build_policy_head(sd: Dict[str, Any], cfg: Dict[str, Any]) -> PolicyHeadDes
         p1Conv → (加 gpoolToBiasMul 的 bias) → p1BN → p2Conv ⇒ policy
         g1Conv → g1BN → gpool(3G) → {gpoolToBiasMul, gpoolToPassMul…} ⇒ pass
     """
-    C = int(cfg['trunk_channels'])
     P = int(cfg['policy_channels'])
     G = int(cfg['gpool_channels'])
     K = int(cfg['policy_outputs'])
@@ -415,7 +413,6 @@ def _build_value_head(sd: Dict[str, Any], cfg: Dict[str, Any]) -> ValueHeadDesc:
                 └→ sv3Mul + sv3Bias（六通道 score）
                 └→ vOwnershipConv  （1 通道 pretanh）
     """
-    C = int(cfg['trunk_channels'])
     V = int(cfg['value_channels'])
     W = int(cfg['value_hidden'])
 

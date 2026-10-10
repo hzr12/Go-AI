@@ -30,7 +30,6 @@ import sys
 import pytest
 
 import torch
-import torch.nn as nn
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)

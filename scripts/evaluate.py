@@ -11,7 +11,6 @@ import argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
-import torch
 
 from src.inference import GoAI
 from src.game.go_rules import GoBoard

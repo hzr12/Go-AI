@@ -17,7 +17,6 @@ import os
 import re
 import sys
 
-import pytest
 import torch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -212,7 +211,6 @@ def test_real_step_is_derived_from_the_global_verdict_with_one_d2h():
     设备标量，最后只 `bool()` 一次（**一次** D2H），再做一次 `all_reduce(MAX)`
     把四个 rank 的判定合起来。
     """
-    i = SRC.index('def _grads_nonfinite_local(')
     seg = _code_only(_fn_span(SRC, '_grads_nonfinite_local'))
     assert 'acc = b if acc is None else (acc | b)' in seg, \
         '有限性必须在设备侧累积成一个标量，而不是逐参数 bool()'
@@ -314,7 +312,6 @@ def test_model_params_stay_fp32():
 # --------------------------------------------------------------------------- #
 def test_locate_overflow_identifies_value_head_by_lr():
     """按 LR 比值区分 value head 与 backbone/policy，不依赖参数组下标。"""
-    import logging
     backbone = torch.nn.Parameter(torch.zeros(2))
     value = torch.nn.Parameter(torch.zeros(2))
     value.grad = torch.tensor([float('nan'), 1.0])
@@ -336,7 +333,6 @@ def test_locate_overflow_identifies_value_head_by_lr():
 
 def test_locate_overflow_classification_is_index_independent():
     """打乱参数组顺序后仍应正确分类（这是按下标判断会踩的坑）。"""
-    import logging
     b1 = torch.nn.Parameter(torch.zeros(2))
     v1 = torch.nn.Parameter(torch.zeros(2))
     v1.grad = torch.tensor([float('inf'), 1.0])
@@ -405,7 +401,7 @@ def test_locate_overflow_names_the_module_that_actually_had_inf():
     net.value_head(torch.randn(2, 4)).sum().backward()
     net.value_head.weight.grad[0, 0] = float('inf')
     # 先 clip（复现真机顺序：unscale → clip → 诊断）
-    gn = torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+    torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
 
     msgs = []
 
@@ -421,7 +417,6 @@ def test_locate_overflow_names_the_module_that_actually_had_inf():
 
 def test_locate_overflow_handles_no_grads():
     """梯度全为 None 时不应抛异常。"""
-    import logging
     p = torch.nn.Parameter(torch.zeros(2))
     opt = torch.optim.SGD([{'params': [p], 'lr': 0.01}], lr=0.01)
     msgs = []

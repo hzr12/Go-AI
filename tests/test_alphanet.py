@@ -4,9 +4,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 import torch
-import numpy as np
 
-from src.networks.backbone import SharedBackbone, ResBlock, MultiHeadSelfAttention
+from src.networks.backbone import SharedBackbone, MultiHeadSelfAttention
 from src.networks.policy_network import PolicyNetwork
 from src.networks.value_network import ValueNetwork
 from src.networks.alphanet import AlphaGoNet

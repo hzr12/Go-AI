@@ -187,7 +187,7 @@ def _tiny_model_build_lineno():
 # --------------------------------------------------------------------------- #
 
 def test_ddp_wrapper_passes_only_device_ids():
-    """DDP 构造**只**传 `device_ids`，其余全默认 —— 防止「顺手优化」构造参数。
+    """DDP 构造**只**传 `device_ids` + `static_graph`，其余全默认 —— 防止「顺手优化」构造参数。
 
     每个被否决的开关都有一个具体理由（写在包裹点上方那段注释里），收益都抵不上
     风险：
@@ -199,7 +199,11 @@ def test_ddp_wrapper_passes_only_device_ids():
         现在就会**响亮地**抛 `Expected to have finished reduction in the prior
         iteration` —— 不响亮的失败更危险；
       · `broadcast_buffers=False` 会让 BN 的 running_mean/var 跨卡漂移；
-      · `static_graph=True` 会禁止 iteration 边界内的参数集合变化，收益未验证。
+    已**启用**的 `static_graph=True`（不再是否决项）：两个头每步都进 loss
+    （`find_unused_parameters=False` 的隐含前提）、loss 系数门控按 run 恒定、全仓
+    无 `requires_grad` 切换 ⇒ 每步参与反向的参数集合一致，正是 static_graph 要求的；
+    它由构造处的冻结参数守卫钉住（有冻结参数立即响亮报错）。跳过 unused-param 复检、
+    固化 bucket 分配，省一点反向开销。
 
     断言顺带钉住「kwarg 必须散装写」：`**d` 展开的键在 AST 里不可见，若哪天把
     参数集挪进 dict 再展开，本文件所有构造参数断言会**集体失明**而不是报错。
@@ -215,11 +219,15 @@ def test_ddp_wrapper_passes_only_device_ids():
         '构造必须散装写 kwarg：`%s` 展开会让本文件的构造参数断言集体失明'
         % '**')
     names = [k.arg for k in call.keywords]
-    assert names == ['device_ids'], (
-        'DDP 构造只允许传 device_ids（其余全默认），实得 %s' % names)
+    assert names == ['device_ids', 'static_graph'], (
+        'DDP 构造只允许传 device_ids + static_graph（其余全默认），实得 %s' % names)
     assert ast.unparse(call.keywords[0].value) == '[local_rank]', \
         'device_ids 应为 [local_rank]（local_rank 是本文件的权威卡号），实得 %s' \
         % ast.unparse(call.keywords[0].value)
+    # static_graph 必须是字面的 True（守卫在构造前已确认无冻结参数，不会让它失效）。
+    _sg = [k for k in call.keywords if k.arg == 'static_graph']
+    assert len(_sg) == 1 and ast.unparse(_sg[0].value) == 'True', \
+        'static_graph 应为字面 True，实得 %s' % (ast.unparse(_sg[0].value) if _sg else '缺失')
 
 
 def test_no_new_ddp_cli_flag_was_introduced():

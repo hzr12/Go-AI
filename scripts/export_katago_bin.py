@@ -44,7 +44,7 @@ import hashlib
 import os
 import sys
 from dataclasses import dataclass
-from typing import NoReturn, Optional, Sequence
+from typing import Optional, Sequence
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

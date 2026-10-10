@@ -220,7 +220,6 @@ def v7_batch_features(nodes, komi=7.5, rules_flags=DEFAULT_RULES_FLAGS,
         prev_bs.append(nd[4] if len(nd) > 4 else None)
         prev_pbs.append(nd[5] if len(nd) > 5 else None)
 
-    n = len(nodes)
     size = int(nodes[0][0].board_size)
     if size != 19:
         raise ValueError(

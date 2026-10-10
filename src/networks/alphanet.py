@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from typing import Tuple, Optional
+from typing import Tuple
 
 from .backbone import SharedBackbone
 from .policy_network import PolicyNetwork

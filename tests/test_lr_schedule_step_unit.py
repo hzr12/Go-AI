@@ -10,7 +10,6 @@ accum 倍 ⇒ **余弦在 epoch 末只走完 1/accum**，lr 停在峰值 ~77%（
 本文件钉住「口径必须一致」这个不变量，并给出可解析的闭式判据。
 """
 import ast
-import os
 import pathlib
 import sys
 

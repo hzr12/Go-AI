@@ -43,7 +43,6 @@ import os
 import re
 import sys
 
-import pytest
 import torch
 import torch.nn as nn
 

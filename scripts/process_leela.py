@@ -6,12 +6,9 @@
 """
 import argparse
 import hashlib
-import os
 import re
 import shutil
-import subprocess
 import sys
-import tempfile
 from datetime import datetime
 from pathlib import Path
 
