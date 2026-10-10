@@ -1211,20 +1211,6 @@ def train_epochs(ai, buffer, args, device):
     return ret
 
 
-def resolve_c2net_model(pretrain_model_path):
-    """从 C2NET 上下文的预训练目录确定性地挑一个 ``.pth`` 权重。
-
-    必须 ``sorted`` 后再取第一个：glob 的返回顺序依赖文件系统，直接取
-    ``[0]`` 会导致同一目录多次运行可能选中不同权重。目录为空 / 无 ``.pth`` /
-    路径为假值时返回 None（调用方据此不覆盖 --model）。
-    """
-    if not pretrain_model_path:
-        return None
-    import glob
-    pth_files = sorted(glob.glob(os.path.join(pretrain_model_path, '*.pth')))
-    return pth_files[0] if pth_files else None
-
-
 def main():
     ap = argparse.ArgumentParser(description="AlphaZero 式自对弈无监督训练（50GB 约束优化版）")
     ap.add_argument("--model", type=str, default=None, help="初始权重（如 SFT 预训练）")
@@ -1354,9 +1340,6 @@ def main():
                     help="TD α 调度初值（开局，偏 r_soft）")
     ap.add_argument("--td-alpha-end", type=float, default=0.9,
                     help="TD α 调度终值（残局，偏 v_td）")
-    ap.add_argument("--c2net", type=int, default=0, choices=[0, 1],
-                    help="启用 C2NET (OpenI 启智平台) 支持 (0=关闭, 1=开启)")
-
     # ---- PPO / KL（路线图 D13）----
     # P3.0 **只声明不消费**；P3-C（策略侧：PPO 裁剪代理目标 + KL 惩罚 + β 自适应
     # + 2×target 提前中止）与 P3-D（value 侧：MSE + PPO value clipping，ε 复用
@@ -1381,38 +1364,9 @@ def main():
     # 搜索参数已随 MCTS 归档：打一行汇总（忽略但留痕）。旧命令行照抄即可继续跑，
     # 但「--sims 48 起得快」这类预期现在不成立 —— 每手只做 depth 次批量前向。
     _log_archived_search_args(args)
-    # DDP/多卡：rank/world_size/is_main（c2net、swanlab 块均引用 is_main，须先定义）
-    rank = int(os.environ.get('RANK', '0'))
-    world_size = int(os.environ.get('WORLD_SIZE', '1'))
-    is_main = (rank == 0)
-
-    # ---- C2NET 支持（OpenI 启智平台）----
-    # 关于 rank 守卫：prepare() 与 --model 覆盖**必须**在所有 rank 上执行——
-    # 每个 rank（含各 _selfplay_worker 子进程所在的 rank）都要独立解析初始权重路径。
-    # 故这里只对「日志打印」做 is_main 过滤（避免 N 卡刷出 N 份重复日志）。
-    # 若 c2net 的 prepare() 未来被发现有写盘/建连副作用，正确做法是挪到
-    # init_process_group 之后由 rank 0 调用再广播路径，而非简单加 if is_main。
-    _c2net_ctx = None
-    if args.c2net == 1:
-        try:
-            from c2net.context import prepare, upload_output as _c2net_upload
-            _c2net_ctx = prepare()
-            if is_main:
-                print("[c2net] 已初始化 C2NET 上下文", flush=True)
-                print(f"[c2net] output_path={_c2net_ctx.output_path}", flush=True)
-                print(f"[c2net] pretrain_model_path={_c2net_ctx.pretrain_model_path}", flush=True)
-            # 覆盖 --model：从 c2net 预训练模型目录加载（仅在未显式指定 --model 时）
-            # 直接运行 selfplay_train.py 时 --model 默认为 None，此分支会生效，
-            # 故必须用 resolve_c2net_model 做确定性选择。
-            if not args.model:
-                _c2net_model = resolve_c2net_model(_c2net_ctx.pretrain_model_path)
-                if _c2net_model:
-                    args.model = _c2net_model
-                    if is_main:
-                        print(f"[c2net] 使用预训练模型: {args.model}", flush=True)
-        except ImportError:
-            if is_main:
-                print("[c2net] c2net 未安装，--c2net 已忽略", flush=True)
+    # 单卡：rank 恒为 0、is_main 恒为 True（仅用于 swanlab 日志过滤，无分布式语义）。
+    rank = 0
+    is_main = True
 
     # SwanLab 实验跟踪（可选）
     use_swanlab = args.swanlab == 1 or os.environ.get('SWANLAB_API_KEY')
@@ -1493,13 +1447,6 @@ def main():
     
     torch.manual_seed(42)
     np.random.seed(42)
-
-    # C2NET 输出路径重定向
-    if _c2net_ctx is not None and is_main:
-        _c2net_out = os.path.join(_c2net_ctx.output_path, os.path.basename(args.out))
-        print(f"[c2net] 输出路径已重定向: {args.out} -> {_c2net_out}", flush=True)
-        args._c2net_orig_out = args.out
-        args.out = _c2net_out
 
     ai = GoAI(model_path=args.model, board_size=args.board_size, device=device,
               use_amp=True, attn_mode="window", attn_window=7)
@@ -1695,16 +1642,6 @@ def main():
         if swanlab_logger is not None:
             swanlab.log({"total_games": total_games, "final_iter": args.iters}, step=args.iters)
             swanlab.finish()
-
-    # C2NET 回传结果
-    if _c2net_ctx is not None and is_main:
-        try:
-            from c2net.context import upload_output as _c2net_upload
-            _c2net_upload()
-            print("[c2net] 结果已回传到 OpenI 平台", flush=True)
-        except Exception as e:
-            print(f"[c2net] 回传失败: {e}", flush=True)
-
 
 def _process_game_data(game_data, score, bs, n_actions, buffer, args):
     """处理一局自对弈数据（TD 价值标签 + 8 对称增强），加入 buffer。

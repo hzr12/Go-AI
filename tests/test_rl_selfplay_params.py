@@ -370,7 +370,6 @@ _EXPECTED_PARAM_SURFACE = (
     ('--swanlab', 'int', 0),
     ('--swanlab-api-key', 'str', ''),
     ('--ver', None, 'rl'),
-    ('--c2net', 'int', 0),
     # ---- MCTS（路线图 D11：P3-B 删 19 个参数，含本组 17 个）----
     ('--expand-topk', 'int', 64),
     ('--expand-chunk', 'int', 0),

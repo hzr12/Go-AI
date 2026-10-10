@@ -29,9 +29,7 @@ if 'expandable_segments' not in _os_alloc:
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = (
         (_os_alloc + ',') if _os_alloc else '') + 'expandable_segments:True'
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel
 
 
 def _auto_select_device():
@@ -75,212 +73,6 @@ def _auto_select_device():
     return f'{backend}:{idx}'
 
 
-def _dist_debug_level():
-    """当前 `TORCH_DISTRIBUTED_DEBUG` 的取值（大写；未设置返回 ''）。"""
-    return (os.environ.get('TORCH_DISTRIBUTED_DEBUG') or '').strip().upper()
-
-
-def _dist_env_snapshot():
-    """通信相关环境快照（失败诊断用；全部是只读查询）。"""
-    import torch as _t
-    import torch.distributed as dist
-    bits = ['torch={}'.format(_t.__version__)]
-    try:
-        bits.append('可见GPU数={}'.format(_t.cuda.device_count()))
-    except Exception:  # noqa: BLE001
-        bits.append('设备数=?')
-    bits.append('CUDA_VISIBLE_DEVICES={!r}'.format(
-        os.environ.get('CUDA_VISIBLE_DEVICES')))
-    # `get_rank/get_world_size` 在**未** `init_process_group` 时会抛
-    # ValueError。本函数被 `_dist_preflight_check` 的失败分支调用 —— 那里正
-    # 需要把环境快照打进消息里，抛异常会把**真正要报的通信错误**顶掉
-    # （用户看到的是「未初始化进程组」，而真因是 all_reduce 失败）。
-    # 故这里单独兜住，宁可少两个字段也不能让诊断信息自己失败。
-    try:
-        bits.append('RANK={}'.format(dist.get_rank()))
-        bits.append('WORLD_SIZE={}'.format(dist.get_world_size()))
-    except Exception:  # noqa: BLE001
-        bits.append('RANK=?/WORLD_SIZE=?')
-    bits.append('LOCAL_RANK={}'.format(os.environ.get('LOCAL_RANK')))
-    bits.append('MASTER_ADDR={}:{}'.format(os.environ.get('MASTER_ADDR'),
-                                        os.environ.get('MASTER_PORT')))
-    return ' | '.join(bits)
-
-
-def _dist_preflight_check(backend, device, logger):
-    """通信域自检：立刻试**一发** all_reduce，把通信问题从「训练途中」提前到「启动时」。
-
-    为什么必需：NCCL / NCCL 的通信域是**惰性**创建的 —— `init_process_group`
-    只登记后端，真正建链发生在**第一发 collective**。不主动试一发，失败就落在
-    「第一个 batch 的前向」里，而且报成 NCCL 的通用错误
-    （`ProcessGroupNCCL.cpp:64` + `NCCL error`），真因藏在日志更前面的
-    `EJ0001 ... Maybe the last training process is running` 里 —— 2026-09-30 的
-    4 卡事故就是这样查了 20 分钟才发现是**上一次崩掉的进程留下 NCCL 状态**。
-
-    失败时抛的异常自带：环境快照 + **可执行的处置步骤**（残留进程 / 等待 /
-    逐卡复位），而不是让人去猜。
-    """
-    import torch.distributed as dist
-    rank = dist.get_rank()
-    world = dist.get_world_size()
-    expect = world * (world - 1) / 2.0
-    t = torch.ones(1, device=torch.device(device)) * float(rank)
-    try:
-        dist.all_reduce(t)
-        got = float(t.item())
-    except Exception as e:  # noqa: BLE001
-        raise RuntimeError(
-            '[dist] 通信域自检失败（backend=%s）：%s\n'
-            '  环境: %s\n'
-            '  最常见真因（2026-09-30 实测）：上一次崩掉的训练进程仍在占用设备，'
-            'NCCL 初始化被拒 —— 日志里真正的报错是\n'
-            '    EJ0001: Failed to initialize the NCCL process. Reason: '
-            'Maybe the last training process is running.\n'
-            '  处置（按顺序，别跳步）：\n'
-            '    1) ps -ef | grep -E "train_sft|torchrun" | grep -v grep   '
-            '# 找残留\n'
-            '    2) nvidia-smi info                                       '
-            '# Processes 表应为空\n'
-            '    3) pkill -f train_sft.py; pkill -f torchrun; sleep 30    '
-            '# 通信后端 清理需要时间（报错里的 Solution 是 10s，实测 30s 更稳）\n'
-            '    4) 仍失败：nvidia-smi 复位/重载设备         '
-            '# 逐卡复位（确认无进程占用）'
-            % (backend, e, _dist_env_snapshot())) from e
-    if abs(got - expect) > 1e-6:
-        raise RuntimeError(
-            '[dist] 通信域自检数值不符（backend=%s）：期望 %.1f，实得 %.1f'
-            '（all_reduce 结果被污染，常见于设备被别的 rank/进程同时占用）\n'
-            '  环境: %s'
-            % (backend, expect, got, _dist_env_snapshot()))
-    logger.info("[dist] 通信域自检通过 | backend=%s world_size=%d | 环境: %s",
-                backend, world, _dist_env_snapshot())
-
-
-# --------------------------------------------------------------------------- #
-# from-scratch 初始权重同步（2026-10-01）
-#
-# 事故形状：换轨前的分片包裹层 docstring 要求 from-scratch 也同步初始权重
-# （「各 rank 独立就会第一步拿到拼错的权重」），但 `sync_module_states` 从未被传
-# ⇒ 全文件当时唯一的 `dist.broadcast` 是 stop_flag，**没有任何参数广播**。
-# 而 from-scratch 脚本不传 `--resume`/`--model` ⇒ 各 rank 权重从 step 0 就分叉：
-# 梯度虽被 all-reduce 拉齐，被拉齐的却是「起点不同」的同一份梯度。
-#
-# 用显式 broadcast 而非包裹层自带的 `sync_module_states`：后者在 torch 2.1 上
-# 需要 `param_init_fn` 配套（本文件参数包裹前已 `.to(device)`），为此还得维护
-# 一层按已安装签名过滤 kwarg 的版本兼容（随分片包裹层一并删）。buffer 无需额外同步
-# —— BN 的 running_mean/var/num_batches_tracked 是确定性 0/1，各 rank 逐位一致。
-# 显式 broadcast 还是**无条件**的：不靠「resume 路径已经同步了」这类推理，且能
-# 被 AST 测试钉住顺序 —— 必须排在 EMA 之前（详见包裹点上方的注释）。
-# 代价：36.4 MB + 226 次小 collective，只在启动时发生一次。
-# --------------------------------------------------------------------------- #
-
-def _dist_active() -> bool:
-    """通信域是否已建立**且** world_size > 1。
-
-    这里刻意问的是 PG 本身（`dist.is_initialized()`）而不是 `main()` 里解析的
-    `world_size` 环境变量 —— 两者可以不一致（env 写了但 PG 没起），而本组函数
-    的正确行为取决于后者。解耦也让测试能用 monkeypatch 精确控制分支。
-    """
-    try:
-        return bool(dist.is_available() and dist.is_initialized()
-                    and dist.get_world_size() > 1)
-    except Exception:  # noqa: BLE001 — 老版本/异常路径一律按「未建域」处理
-        return False
-
-
-def _sync_init_weights_from_rank0(model, logger):
-    """把 rank0 的初始权重广播给其余 rank（from-scratch 起手，见上方注释）。
-
-    `world_size == 1` / 通信域未建时**直接 return** —— 单卡路径逐字不变。
-    """
-    if not _dist_active():
-        return
-    n = 0
-    with torch.no_grad():
-        for p in model.parameters():
-            dist.broadcast(p.data, src=0)
-            n += 1
-    logger.info("[dist] 初始权重已从 rank0 同步 | tensors=%d | world_size=%d",
-                n, dist.get_world_size())
-
-
-def _assert_init_weights_identical(model, logger):
-    """各 rank 初始权重一致性自检（启动时验证，不等训练途中）。
-
-    本地 checksum = 全部参数在**主机侧**以 fp64 求和；`all_gather` 出
-    world_size 个 hi/lo 载荷后**逐位**比对。失败即抛，不允许静默继续 ——
-    与 `_dist_preflight_check` 同一立场：通信域的问题是惰性的，要主动试一发。
-
-    为什么必须在主机侧归约（2026-10-05，4×旧多卡环境）
-    -------------------------------------------
-    实测 `rank0=8125.2251, rank1=8125.2256, rank2/rank3=8125.2251` ——
-    三个 rank 一致、rank1 差**一个 ulp**。8125.225 落在 `[4096, 8192)`，fp32 在
-    这一档的 ulp = `2**(12-23) = 4.88e-4`，实测差 `5.0e-4`，精确对上；这个量级
-    排除了 NaN（会打成 `nan`）与「广播没生效」（那会差量级而非末位）。
-
-    根因：原先的 `p.detach().sum(dtype=torch.float32)` 是在**设备上**归约，而
-    加速器 的多块 计算单元 归约**分块顺序不保证跨 rank 一致**。同样这 300 多个分片和、
-    以不同顺序在 fp32 里累加 ⇒ 末位差 1 ulp；比对用的是精确相等 ⇒ 每次都误报。
-    原注释把「相同归约顺序」当成前提，那在 加速器 上是假的（CPU 上为真，所以
-    `tests/test_init_weight_sync.py::test_checksum_contract_after_losing_fp64`
-    在本地一直是绿的，测不出这个 bug）。
-
-    顺带修掉的第二个缺陷：旧 checksum 是 fp32 跑马和，噪声底 = 总量的 1 ulp
-    ≈ 4.9e-4，而单个 1e-2 量级参数差**一个 fp32 ulp** 只有 ~9.3e-10 —— 低 5 个
-    数量级，**检测不到**。即这个闸门既误报又漏报。
-
-    为什么是主机 fp64、而不是「设备上换个更准的算法」
-    ----------------------------------------------
-    * 主机 fp64 的噪声底 ~1e-12（相对 1e-16），比 fp32 的 4.9e-4 好 11 个数量级，
-    单个 ulp 的真实分歧重新变得可检测；
-    * 求和顺序由 `model.parameters()` 的迭代顺序唯一确定（形状相同 ⇒ 分块相同），
-    且 `run.txt` 已固定 `OMP_NUM_THREADS=1`；
-    * **加速器 上不能用 fp64**：旧多卡环境 不支持，会派发 专用内核 kernel 且故障是**异步**的
-    （2026-10-01 云端实测，见 `tests/test_no_aicpu_ops_in_startup_check.py`）。
-    所以 fp64 只发生在主机，过线一律 fp32。
-
-    为什么载荷要拆成 hi/lo 两个 fp32
-    ------------------------------
-    fp32 只有 24 位尾数，把 fp64 的和直接塞进去会被舍掉 —— 那就等于把噪声底又
-    抬回 1 ulp，正是本次误报的机制。拆成 `hi = fp32(acc)`、`lo = fp32(acc - hi)`
-    之后，两个 fp32 承载 ~48 位尾数，在 8125 那一档的分辨率 ~2.9e-11，仍比要
-    检测的 9.3e-10 低一个数量级 —— 够用。载荷保持 fp32（NCCL 原生支持）。
-    """
-    if not _dist_active():
-        return
-    acc = 0.0
-    dev = None
-    with torch.no_grad():
-        for p in model.parameters():
-            # `.to('cpu')` 是位精确的 D2H 拷贝；fp64 只在主机上出现，`sum(dtype=)`
-            # 在归约过程中升精度，不会把整份参数物化成 fp64。
-            acc += float(p.detach().to('cpu').sum(dtype=torch.float64))
-            if dev is None:
-                dev = p.device
-    if dev is None:
-        dev = torch.device('cpu')
-    hi = float(torch.tensor(acc, dtype=torch.float32).item())
-    lo = acc - hi
-    # fp32 all_gather：NCCL 原生支持；fp64 会走 专用内核（同上）。
-    buf = torch.tensor([hi, lo], dtype=torch.float32, device=dev)
-    gathered = [torch.zeros_like(buf) for _ in range(dist.get_world_size())]
-    dist.all_gather(gathered, buf)
-    # 比对也不走 `torch.equal`（它在 旧多卡环境 上是 专用内核 kernel，见下）。
-    _vals = [[float(x.item()) for x in g] for g in gathered]
-    if any(v != _vals[0] for v in _vals[1:]):
-        vals = ', '.join('rank%d=[%s]' % (i, ', '.join('%.17g' % x for x in v))
-                        for i, v in enumerate(_vals))
-        raise RuntimeError(
-            '[dist] 初始权重一致性自检失败：各 rank 的参数 checksum 不一致。\n'
-            '  各 rank checksum: %s\n'
-            '  两种可能：\n'
-            '    1) from-scratch 起手时初始权重确实不同 —— 说明广播没生效或\n'
-            '       调用点晚于模型构造，检查 _sync_init_weights_from_rank0 的位置；\n'
-            '    2) 初始权重里有 NaN/Inf —— NaN != NaN，会把这一种误报成前一种\n'
-            '       （真因通常是某个 zero-init 假设被破坏）。\n'
-            '  环境: %s' % (vals, _dist_env_snapshot()))
-    logger.info("[dist] 初始权重一致性自检通过 | world_size=%d | checksum=%.17g",
-                dist.get_world_size(), _vals[0][0] + _vals[0][1])
 
 
 def _cuda_name_and_capability(idx=0):
@@ -453,7 +245,7 @@ def build_katago_se_net(*, action_size, attention_dropout=0.1,
 #
 # 与 `KATAGO_SE_CFG`（12 通道 / 9.11M）是**并排的第二条路**：`--v7 0`（默认）的
 # 建网/标签/损失一行都没动；V7 只在 `--v7 1` 时接管「造特征 + 前向 + 损失」，
-# DDP / EMA / 调度器 / 保存 / 评估两条路共用。
+# EMA / 调度器 / 保存 / 评估两条路共用。
 #
 # 段 1 的四个目标（系数见 `KataGoV7Loss`）：policy #1（1.0，行权重恒 1）、
 # π_opp #2（0.15，`w['policy_opp']`）、value #3（1.20，三分类 CE）、
@@ -1022,15 +814,12 @@ def _plain_state_dict(model):
 
 
 def save_model(model, path):
-    """保存模型权重，并剥离 DDP 包裹产生的 'module.' 前缀与 torch.compile 产生的
-    '_orig_mod.' 段，保证存档无论是否经 DDP/compile 都能被后续普通加载/resume 使用。
+    """保存模型权重，并剥离 torch.compile 产生的 '_orig_mod.' 段（可能出现在路径
+    任意层级），保证经 compile 的模型也能被普通加载 / resume。
 
-    DDP 下**直接** `model.state_dict()` 就是完整权重，不需要任何汇聚 helper：
-    DDP 每 rank 各持一份完整模型、只同步梯度，`state_dict()` 本身**不是
-    collective**（没有 all-gather）。所以调用方把它放在 `is_main` 分支里既安全
-    也没有额外开销 —— 键名形如 'module.backbone.…'，剥掉 'module.' 之后与包裹前
-    完全同形，`src/inference.py` / `scripts/evaluate.py` / `webui.py` /
-    `_load_model_state` 一行都不用改，旧 checkpoint 继续可读。
+    同时为兼容旧 DDP checkpoint，也一并剥掉 'module.' 前缀；因此
+    `src/inference.py` / `scripts/evaluate.py` / `webui.py` / `_load_model_state`
+    无需改动，旧存档继续可读。
 
     '_orig_mod.' 由 `torch.compile` 插入，出现在**路径任意层级**（不只在开头）。
     故这里按 `'_orig_mod.' in k` 判存在性、按 `str.replace` 去**所有**层级，
@@ -1144,7 +933,7 @@ class _AsyncSnapshotWriter:
 def setup_logging(log_file, level: int = logging.INFO, rank: int = 0) -> logging.Logger:
     """配置 logging：同时写文件与输出到控制台（无缓冲，实时可见）。
 
-    rank>0（DDP 非主进程）时仅保留 ERROR 以上到 stderr，避免多卡日志刷屏——
+    rank>0 时仅保留 ERROR 以上到 stderr（单卡下 rank 恒为 0，此分支不触发）——
     各进程是独立进程，各自的 logger 互不干扰，这里只控制本进程输出量。
     """
     logger = logging.getLogger('train')
@@ -1290,36 +1079,12 @@ def _grads_nonfinite_local(optimizer):
 
 
 def _grads_nonfinite_any_rank(optimizer):
-    r"""**任一 rank** 的梯度非有限？—— 这正是 `GradScaler` 缺的那一次归约。
+    r"""梯度中是否存在非有限值（单卡训练：只看本地，无跨卡归约）。
 
-    `GradScaler` 的 `found_inf` 是纯本地状态：`unscale_` 只登记本 rank 检出的非有限，
-    `step` 只看本地标记，全程没有任何 collective。于是在多卡下：
-
-        某 rank 有 inf  ->  它跳过；其余 rank 照常 `optimizer.step()`
-
-    ⇒ **各 rank 的权重从此永久不同**，之后每次 `all_reduce` 都在混合**四个不同
-    模型**的梯度；各 rank 的 scale 也各自独立减半、进一步漂移。这不是"少训几步"
-    的损失，是训练从此无效（2026-10-05 真机 4×旧多卡环境：50 步内 1024 -> 8、
-    `skip=7/50`，而"四张卡同一步一起溢出"的概率极低 ⇒ 分叉几乎立刻发生）。
-
-    通信域未建（单卡）时退化成只看本地，行为与改动前一致。
+    历史上多卡下各 rank 的 `GradScaler` 会各自独立决定跳/不跳，导致权重永久分叉；
+    现已不支持多卡，保留此函数名仅为兼容调用点，内部即本地判定。
     """
-    local = 1 if _grads_nonfinite_local(optimizer) else 0
-    if not _dist_active():
-        return bool(local)
-    # 设备必须跟着梯度走：NCCL 的 collective 要求张量落在本 rank 的 加速器 上。
-    dev = torch.device('cpu')
-    for group in optimizer.param_groups:
-        for p in group.get('params', []):
-            if p.grad is not None:
-                dev = p.grad.device
-                break
-        else:
-            continue
-        break
-    t = torch.tensor([local], dtype=torch.int32, device=dev)
-    dist.all_reduce(t, op=dist.ReduceOp.MAX)
-    return bool(int(t.item()) > 0)
+    return bool(_grads_nonfinite_local(optimizer))
 
 
 def _scaler_step_global(scaler, optimizer, *, scale_before, use_scaler,
@@ -2519,12 +2284,12 @@ class _BatchPrefetcher:
 
     def __init__(self, dataset, num_workers=4, prefetch=2, seed=1234,
                 labels=False, v7=False, augment=True):
-        # 护栏：**绝不能在设备运行时初始化之后**构造本类（4 卡 旧多卡环境 的 OOM
-        # 直接原因，2026-09-30）。`mp.Process` 默认 fork，子进程会整份继承父
-        # 进程的 /CUDA 上下文与已分配显存映射 ⇒ 每卡被旁挂 4 份 ≈ 24 GiB，
+        # 护栏：**绝不能在设备运行时初始化之后**构造本类（fork 出的 worker 会继承设备
+        # 上下文导致 OOM，2026-09-30）。`mp.Process` 默认 fork，子进程会整份继承父
+        # 进程的 /CUDA 上下文与已分配显存映射 ⇒ 4 个 worker 各继承一份 ≈ 24 GiB，
         # 而 PyTorch 自己只记 6.3 GB（实测 HBM 94% / 计算单元 0%）。GC 管不到
         # 别的进程继承来的映射。正确做法见 main()：数据集加载与本类的构造都在
-        # `init_process_group` / `set_device` **之前**。
+        # `torch.cuda.set_device` **之前**。
         for _dev in ('cuda',):
             _is_init = getattr(getattr(torch, _dev, None), 'is_initialized', None)
             try:
@@ -2535,8 +2300,7 @@ class _BatchPrefetcher:
                 raise RuntimeError(
                     '_BatchPrefetcher 不能在 torch.{0} 初始化之后构造：'
                     'fork 出的 worker 会继承设备上下文，4 卡实测每卡凭空多占 '
-                    '~24 GiB（OOM）。请把它挪到 init_process_group / '
-                    'set_device 之前。'.format(_dev))
+                    '~24 GiB（OOM）。请把它挪到 set_device 之前。'.format(_dev))
         self.dataset = dataset
         self.k = max(1, int(num_workers))
         self.prefetch = max(1, int(prefetch))
@@ -2637,17 +2401,6 @@ class _BatchPrefetcher:
                 _labels_dict_to_tensors(labels_dict, device=device))
 
 
-def resolve_c2net_data(dataset_path):
-    """把 C2NET 上下文的数据集路径转成 ``--data`` 可直接使用的值。
-
-    目录 → 原样返回，让 ``--data`` 的目录模式（load_from_path）递归扫描并
-    **合并全部** .npz/.tgz 分片；文件 → 原样返回。
-    不可直接把目录展开成 glob 再取 [0]：那只会加载一个分片，且 glob 顺序依赖
-    文件系统，未排序时选中哪个不确定。
-    """
-    return dataset_path
-
-
 def _init_swanlab(args, logger):
     """初始化 SwanLab 跟踪，返回 swanlab 模块；失败返回 None（训练照常进行）。
 
@@ -2687,7 +2440,7 @@ def _init_swanlab(args, logger):
         # policy_channels / policy_layers …）—— 它们完全不参与建网，记进去就是
         # 虚构值，而 config 面板恰恰是对比两次 run 时第一个看的东西。
         # `blocks` 那个描述串同理：从真形状数出来（se×13 + attn×4），不是抄配置。
-        _ws = max(1, int(os.environ.get('WORLD_SIZE', '1') or '1'))
+        # 单卡训练：world_size 恒为 1。
         _accum = max(1, int(args.gradient_accumulation_steps))
         swanlab.init(
             project="go-ai",
@@ -2764,8 +2517,8 @@ def _init_swanlab(args, logger):
                 # ---- batch/lr：有效 batch 含累积（漏乘会把学习率口径搞错）----
                 "batch_size_per_card": args.batch_size,
                 "grad_accum": _accum,
-                "world_size": _ws,
-                "effective_batch": args.batch_size * _ws * _accum,
+                "world_size": 1,
+                "effective_batch": args.batch_size * _accum,
                 "lr": args.lr,
                 "epochs": args.epochs,
                 "weight_decay": args.weight_decay,
@@ -3167,26 +2920,7 @@ def _early_stop_decision(early_stop_metric, current_metric, best_metric, counter
     return improved, new_counter, new_counter >= patience
 
 
-def _sync_stop_flag(stop_flag, is_dist, early_stop_enabled):
-    """把 rank0 的早停结论广播给所有 rank（**没停也必须调用**）。
 
-    判定只在 rank0 做（计数器语义不变），但「停不停」必须所有 rank 一致：否则
-    rank0 跳出训练进入收尾的 eval、其余 rank 还在 step 循环里做反向，collectives
-    次序错配 → 挂死或 DDP 崩。
-
-    这里刻意**不**加 `if stop_flag.item()` 之类的短路：eval 块在所有 rank 上
-    同点到达（`--eval-every` / `--early-stop` 是逐 rank 相同的 CLI 参数，
-    `len(eval_idx) > 0` 也是全 rank 一致的本地条件），所以无条件 broadcast
-    才能保证「每个 rank 参加同样次数、同样次序的 collective」。一旦短路，
-    没停的 rank 直接跳过 broadcast、停了的 rank 阻塞在上面 —— 只是把
-    「epoch/step 次序错配」换成「broadcast 挂死」。
-
-    非 DDP 或未启用早停时不做任何事：单卡走 collective 纯属浪费，未启用早停时
-    stop_flag 恒为 0，广播一个常量没有意义。
-    """
-    if not is_dist or not early_stop_enabled:
-        return
-    dist.broadcast(stop_flag, src=0)
 
 
 #: `resolve_grad_checkpoint` 的第二个返回值：需要打日志解释「为什么 GC 被关掉
@@ -3235,12 +2969,10 @@ def _build_param_groups(model, args) -> list[dict]:
     value 归属按**前缀** `'value.'` 判定而非子串 `'value' in n`：子串判定会把将来
     主干里新增的 `backbone.value_proj` 之类（非 value 头、名字里带 value）误归到 value 组。
 
-    调用前提：`model` 必须是**裸模块**。DDP 包裹后 `named_parameters()` 的名字会带
-    `module.` 前缀，`startswith('value.')` 就不再成立。main() 里本函数在
-    DDP 包裹之前调用（分组只依赖模块自身结构，与 is_dist 无关），
-    改调用顺序时留意这一条。
+    调用前提：`model` 必须是**裸模块**（未经任何分布式包裹层）。分组只依赖模块自身
+    结构，`startswith('value.')` 据此成立；改调用顺序时留意这一条。
 
-    DDP **不扁平化参数**，所以本函数抓到的分组对象与 optimizer 绑定的始终是同一批
+    裸模块参数不被包裹层扁平化，所以本函数抓到的分组对象与 optimizer 绑定的始终是同一批
     `nn.Parameter`：包裹层只在顶层加一层 wrapper，内部 `model.value` / 每个
     `p.ndim` 都保持原样。`p.ndim == 1` 的 no_decay 判据与 `'value.'` 的前缀判据
     因此在包裹前后等价 —— 这正是「分组必须在包裹前建、但语义不会被包裹改坏」的
@@ -3341,13 +3073,10 @@ def compute_l2_report(param_groups):
     backward，等于把**解耦**衰减变成**耦合** L2 塞进梯度：AdamW 自己的
     weight decay 会与它叠加，训练行为立刻变化且没有任何报错。
 
-    DDP：`train_sft.py` 的日志标量（含 `loss`/`policy_loss`/`value_loss`）
-    **一律不做 all_reduce**（`_read_log_scalars` 直接 `.item()`，stdout 由
+    单卡：`train_sft.py` 的日志标量（含 `loss`/`policy_loss`/`value_loss`）
+    **不做任何跨进程归约**（`_read_log_scalars` 直接 `.item()`，stdout 由
     rank0 的 logger 过滤、swanlab 只在 is_main 建），本项跟随同一口径：本地
-    计算、本地 `.item()`、不加 collective。DDP 构造时把 rank0 的参数
-    broadcast 给所有 rank、每步再 all_reduce 梯度（`find_unused_parameters`
-    =False、无 `no_sync`），故各 rank 的 θ 恒一致，本项在各 rank 上是同一个数
-    —— 同一个日志键不会在不同 rank 上打架，也就没有引入新的同步点/挂死风险。
+    计算、本地 `.item()`、无 collective、无同步点。
     例外：`GradScaler.step` 只在**本地**查 `found_inf`、不做 all_reduce，
     所以一次 inf/nan 触发的 step 跳过是**单 rank** 的 —— 那一步各 rank 的 θ
     会分叉，本项在那一行就会跨 rank 不一致。稳态（无跳过）下不影响。
@@ -3643,7 +3372,7 @@ def main():
     ap.add_argument('--save-every', type=int, default=2000)
     ap.add_argument('--out', default='models/sft.pt')
     ap.add_argument('--ver', default='v17',
-                    help='模型版本号 (用于 swanlab name 和 --out 默认值，如 v17, c2net-v1)')
+                    help='模型版本号 (用于 swanlab name 和 --out 默认值，如 v17, v1)')
     # 注意力相关
     ap.add_argument('--backbone-channels', type=int, default=128,
                     help='主干卷积通道数。容量主开关，实测（19路, mix/window'
@@ -3917,8 +3646,6 @@ def main():
                     help='早停监控指标：loss=验证集损失（越小越好），top1=Top-1准确率（越大越好）')
     ap.add_argument('--max-gpu-memory', type=float, default=0.9,
                     help='GPU 显存使用上限比例（默认 0.9，防止 OOM）')
-    ap.add_argument('--c2net', type=int, default=0, choices=[0, 1],
-                    help='启用 C2NET (OpenI 启智平台) 支持 (0=关闭, 1=开启)')
     # ---- B8（V7 接线）：唯一的两个新旗都在这里 --------------------------------
     # **只有一个** `--v7`：V7 的其余选择（段位权重、batch、LR…）都不新增旋钮
     #   —— 段位权重是**代码里的常量表**（`V7_STAGE1_SCORE_TERMS`），不是 CLI。
@@ -3939,15 +3666,9 @@ def main():
                         '两条都开会静默互相覆盖 —— 给了就报错。')
     args = ap.parse_args()
 
-    # ---- 分布式训练环境变量（由 torchrun / mp.spawn 注入）----
-    # RANK/WORLD_SIZE/LOCAL_RANK 同时存在且 WORLD_SIZE>1 时进入 DDP 模式。
-    # B1: rank/is_main/logger 必须在 C2NET 初始化前求值——下方 c2net 分支
-    # 会用 is_main 过滤打印、用 logger 输出。
-    rank = int(os.environ.get('RANK', '0'))
-    world_size = int(os.environ.get('WORLD_SIZE', '1'))
-    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
-    is_dist = world_size > 1
-    is_main = (rank == 0)
+    # 单卡训练：rank 恒为 0、is_main 恒为 True（仅用于日志过滤，无分布式语义）。
+    rank = 0
+    is_main = True
     log_file = args.log_file if args.log_file else None
     logger = setup_logging(log_file, rank=rank)
 
@@ -4020,39 +3741,6 @@ def main():
             logger.warning("[v7] --export-onnx 走 `GoAI`，它是 12 通道推理链；"
                         "V7 需要另一条导出路径（本次未接），导出结果不可用。")
 
-    # ---- C2NET 支持（OpenI 启智平台）----
-    # 关于 rank 守卫：prepare() 与 --data 覆盖**必须**在所有 rank 上执行——
-    # 每个 rank 都要独立加载数据集，而 --data 是 required=True，非 rank 0 若拿不到
-    # c2net 给的 dataset_path 会直接 argparse 报错退出。因此这里只对「日志打印」
-    # 做 is_main 过滤（否则 N 卡会刷出 N 份重复日志），prepare() 本身保持全 rank 调用。
-    # 若 c2net 的 prepare() 将来被发现有写盘/建连副作用，正确做法是把它挪到
-    # init_process_group 之后、由 rank 0 调用再用 dist.broadcast_object_list 广播
-    # 路径，而不是简单地加 if is_main（那会丢掉非 rank 0 的数据集路径）。
-    _c2net_ctx = None
-    if args.c2net == 1:
-        try:
-            from c2net.context import prepare, upload_output as _c2net_upload
-            _c2net_ctx = prepare()
-            if is_main:
-                logger.info("[c2net] 已初始化 C2NET 上下文")
-                logger.info("[c2net] dataset_path=%s", _c2net_ctx.dataset_path)
-                logger.info("[c2net] output_path=%s", _c2net_ctx.output_path)
-            # 覆盖 --data：目录原样传入，让 --data 的目录模式合并**全部** npz/tgz 分片
-            if _c2net_ctx.dataset_path:
-                args.data = resolve_c2net_data(_c2net_ctx.dataset_path)
-                if is_main:
-                    if os.path.isdir(args.data):
-                        import glob
-                        _n_npz = len(glob.glob(os.path.join(args.data, '**', '*.npz'),
-                                            recursive=True))
-                        logger.info("[c2net] 使用数据集目录（合并全部分片）: %s"
-                                    "（npz 分片 %d 个）", args.data, _n_npz)
-                    else:
-                        logger.info("[c2net] 使用数据集: %s", args.data)
-        except ImportError:
-            if is_main:
-                logger.warning("[c2net] c2net 未安装，--c2net 已忽略")
-
     logger.info("=" * 60)
     _check_training_env(logger)
     logger.info("=" * 60)
@@ -4069,12 +3757,6 @@ def main():
                 args.log_every, args.eval_every, args.save_every, args.out)
     logger.info("验证集评估: eval_max_batches=%d（<=0 = 跑满全部验证集；日志 [eval] 行的 "
                 "batches/truncated 即本次实际覆盖度）", args.eval_max_batches)
-    # C2NET 输出路径重定向
-    if _c2net_ctx is not None and is_main:
-        _c2net_out = os.path.join(_c2net_ctx.output_path, os.path.basename(args.out))
-        logger.info("[c2net] 输出路径已重定向: %s -> %s", args.out, _c2net_out)
-        args._c2net_orig_out = args.out
-        args.out = _c2net_out
     logger.info("=" * 60)
 
     # SwanLab 实验跟踪（可选，通过 --swanlab 启用）
@@ -4094,11 +3776,8 @@ def main():
 
     # ---- 数据集 + 预取 worker：**必须在设备初始化之前**（2026-09-30）----
     # 顺序是硬要求，不是风格问题：本段的 `mp.Process` 默认 fork，若排在
-    # `init_process_group` / `torch.cuda.set_device` 之后，4 个 worker 会各自
-    # 继承一份父进程的  设备上下文与显存映射 ⇒ 每卡 6.3 GB 的训练被旁挂到
-    # 4×6 GB，实测 HBM 94% 而 计算单元 0%，紧接着就是 OOM。数据集加载是纯
-    # numpy（与 rank 无关），提前无语义影响；反向顺序（dist 初始化后再 fork）
-    # 才是 NCCL 的危险方向，提前 fork 是安全的那一侧。
+    # `torch.cuda.set_device` 之后，worker 会继承父进程的 CUDA 上下文与显存映射
+    # ⇒ 每卡凭空多占 ~24 GiB ⇒ OOM。数据集加载是纯 numpy，提前无语义影响。
     dataset = load_from_path(args.data, args.board_size,
                                 args.max_games_per_tgz, v7=bool(args.v7),
                                 games_npz=args.games_npz)
@@ -4203,34 +3882,11 @@ def main():
         logger.info("[data] eval 预取池已启用（与训练预取器同点 fork）| "
                     "workers=%d | augment=False", _eval_workers)
 
-    # ---- 分布式训练：设备由 LOCAL_RANK 决定，忽略 --device 卡号 ----
-    # 后端固定为 nccl（CUDA）。多卡前必须 init_process_group，
-    # 否则后续 .to(device) / DDP 包裹会失败或各卡不互通。
-    if is_dist:
-        _dist_backend = (args.device.split(':')[0]
-                        if args.device not in ('auto', '') else
-                        'cuda')
-        # 必须在 init_process_group **之前**：DETAIL 是在建域那一刻给每个 PG 套
-        # 一层一致性检查 wrapper（每次 collective 前一发 monitored_barrier）；
-        # 其开销与用哪种包裹层无关，统一降为 OFF。
-        dist.init_process_group('nccl')
-        torch.cuda.set_device(local_rank)
-        device = f'{_dist_backend}:{local_rank}'
-        # 通信域是**惰性**创建的（上面两行只登记后端），所以主动试一发 all_reduce：
-        # 否则通信建不起来要等到第一个 batch 的前向才炸，且报成 NCCL 通用错误
-        # （真因藏在日志前面的 EJ0001 里）。见 _dist_preflight_check 的 docstring。
-        _dist_preflight_check(_dist_backend, device, logger)
-        if is_main:
-            logger.info("[dist] 初始化分布式训练 | backend=%s world_size=%d | 策略=DDP"
-                        "（各 rank 各持完整模型；每个 micro-batch 反向做 1 次梯度 "
-                        "all-reduce；本文件全无 no_sync()，故梯度累积**不摊薄**同步"
-                        "次数：accum=N 时每个 optimizer step 做 N 次）",
-                        _dist_backend, world_size)
+    # ---- 单卡训练：设备由 --device 决定（默认 auto 挑空闲卡）----
+    if args.device == 'auto':
+        device = _auto_select_device()
     else:
-        if args.device == 'auto':
-            device = _auto_select_device()
-        else:
-            device = args.device
+        device = args.device
 
     use_amp = args.use_amp == 1 or device.split(':')[0] == 'cuda'
 
@@ -4465,13 +4121,8 @@ def main():
                     100.0 * n_train / max(_before, 1))
     logger.info("[data] 总样本数=%d | 训练=%d | 验证=%d", n, len(train_idx), len(eval_idx))
 
-    # 分布式：每张卡用 DistributedSampler 取到不相交的训练分片（会自动 pad 到
-    # 能被 world_size 整除），各卡步数因此一致，避免 DDP 在 barrier 处互相等待。
-    if is_dist:
-        train_sampler = torch.utils.data.DistributedSampler(
-            torch.arange(len(train_idx)), num_replicas=world_size, rank=rank, shuffle=True)
-    else:
-        train_sampler = None
+    # 单卡：不启用分布式采样器，训练循环直接对 train_idx 做本地 shuffle。
+    train_sampler = None
 
 # ------------------------------------------------------ 结构（唯一）----
     # 训练结构**唯一** = `KATAGO_SE_CFG`（本文件顶部那张表，KataGo
@@ -4530,14 +4181,6 @@ def main():
             grad_checkpoint=_gc,
         )
     model = model.to(device)
-    # from-scratch 起手必须把 rank0 的初始权重广播给其余 rank（2026-10-01）。
-    # 位置是硬要求：**必须在 EMA 构造（本文件下方 `EMA(model, ...)`）之前** ——
-    # EMA 在构造时就把参数 `clone()` 进 `shadow`，放晚了 shadow 会持有广播前的
-    # 随机权重，之后每个 step 的 `ema.update()` 都往这个陈旧 shadow 上混。
-    # 也必须在 DDP 包裹之前：先建 EMA 再包裹，EMA 持有的引用就正好是 DDP 的
-    # `module`，键空间一致（见下方包裹点上方的注释）。
-    _sync_init_weights_from_rank0(model, logger)
-    _assert_init_weights_identical(model, logger)
     n_params = sum(p.numel() for p in model.parameters())
     # V7 没有 `backbone` 子模块（11 个 `Nbt2TransformerBlock` 直接挂在 `blocks`
     # 上），主干参数量按「全网 − 三个头」算；12 通道路径仍读 `model.backbone`。
@@ -4631,13 +4274,7 @@ def main():
     # ---- 学习率调度：基于“总 step 数”而非 epoch 数 ----
     # 旧版用 T_max=args.epochs 导致余弦在第 1 个 epoch 结束就被砍到 ~0，
     # 后续 epoch 在 lr≈0 附近横盘。这里用真实总 step 数，并加前 5% step 线性 warmup。
-    # DDP 下“每卡”样本数约为 n_train/world_size，调度按每卡步数推进，
-    # 这样各卡 LR 曲线一致；有效全局 batch = batch_size * world_size。
-    if is_dist:
-        per_rank = (n_train + world_size - 1) // world_size
-        n_batches = (per_rank + args.batch_size - 1) // args.batch_size
-    else:
-        n_batches = (n_train + args.batch_size - 1) // args.batch_size
+    n_batches = (n_train + args.batch_size - 1) // args.batch_size
     # 调度器的步数口径必须是 **optimizer step**，不是 micro-batch（2026-10-01 修）。
     #   `scheduler.step()` 只在每个 optimizer.step() 之后调一次（见训练循环），而
     #   `n_batches` 是 micro-batch 数。accum=1 时两者相等，accum>1 时差 accum 倍：
@@ -4684,9 +4321,8 @@ def main():
     start_epoch = 0
     t0 = time.time()
     # 本进程起点。resume 会把 step 覆盖成 checkpoint 里的累计值，原式
-    # speed = step * bs / (now - t0) 于是把「累计步数」当成「本进程步数」；
-    # 且 bs 是每卡值未乘 world_size —— 两重错误。实测续训时该式输出
-    # 1059 s/s，而真实速率约 2635 s/s。
+    # speed = step * bs / (now - t0) 于是把「累计步数」当成「本进程步数」，
+    # 实测续训时该式输出 1059 s/s，而真实速率约 2635 s/s。
     _step_at_start = 0
     # 瞬时速率基准：只在 stdout 打点时推进，保证与打印行同口径
     # （_should_log 会因 swanlab_every 让打点块每 10 步触发一次，
@@ -4697,10 +4333,8 @@ def main():
     # 早停机制初始化
     early_stop_counter = 0
     best_eval_metric = float('inf') if args.early_stop_metric == 'loss' else -1.0
-    # 停止标志：判定只在 rank0 做，但「停不停」要所有 rank 一致（否则 rank0 跳出
-    # 训练、其余 rank 还在 step 循环里做反向 → collectives 次序错配 → 挂死）。
-    # 每个 eval 点由 _sync_stop_flag 无条件 broadcast 回所有 rank，step/epoch 两层
-    # break 都读它。非 DDP 也建（单一代码路径，不写两套）。
+    # 停止标志：单卡下为本地张量，早停判定（rank0 即本进程）置位后，step/epoch
+    # 两层 break 都读它。
     stop_flag = torch.zeros(1, dtype=torch.long, device=device)
 
     # ---- 断点续训：从 --resume 指定的模型权重 + 同目录 .train_state.pt 恢复 ----
@@ -4867,68 +4501,7 @@ def main():
         else:
             logger.info("[train] 当前 torch 版本不支持 torch.compile，跳过")
 
-    # 分布式：DDP 包裹需在 torch.compile 之后（算子融合与梯度同步可共存；反过来
-    # compile 会被 wrapper 的动态边界吞掉，拿到的是未融合图）。
-    #
-    # 为什么用 DDP 而非分片包裹（2026-10-01 换轨，FSDP1 已退役）
-    # ------------------------------------------------------------------
-    # 触发事件：4 卡训练崩在 `ema.update()` 的
-    # `KeyError: 'backbone.stem_bn._fsdp_wrapped_module.weight'`。分片包裹会把
-    # **内部**模块就地换成 wrapper，于是「包裹前建好的 EMA shadow」与「包裹后
-    # `named_parameters()` 遍历出来的键」不再是同一个键空间 ⇒ 每步都 KeyError。
-    # DDP 只在**顶层**加一层（键多一个 `module.` 前缀），内部模块树原样不动 ⇒
-    # 这整类崩溃消失，不需要任何针对它的补丁。
-    #
-    # 两个数字（9,067,443 参数 = fp32 36.3 MB / 32 GiB 卡）：
-    #   1. 显存：FSDP1 每 rank 约 145 MB（参数/梯度/Adam 两矩各分片），DDP 约
-    #      36.3 MB × 4（每项一份全量），差约 109 MB = 0.33% 的卡。参数本来就
-    #      装得下，这点余量不值得拿正确性风险换。
-    #   2. 通信：FSDP1 每步是「16 个分片单元 × 2 次 collective」，DDP 每次
-    #      **反向** 1 次梯度 all-reduce + 1 次 buffer broadcast。注意「每步 1 次」
-    #      是错的说法 —— 本文件全无 `no_sync()`（同源说明见
-    #      `_compute_l2_report` docstring）：每个 micro-batch 都 `backward()`，
-    #      all-reduce 挂在每次 backward 的收尾上 ⇒ `GRAD_ACCUM=2` 下每个
-    #      optimizer step 是 2 次 all-reduce + 2 次 broadcast（≈72.9 MB）。仍是
-    #      「16 × 2」的零头，通信不是瓶颈（本仓库瓶颈在算子，见 `[profile]`）。
-    #
-    # 为什么上面两个同步函数必须留在包裹点**之前**（顺序的硬要求）：
-    # `DistributedDataParallel.__init__` 在**它自己构造时**（`_ddp_init_helper` →
-    # `_sync_module_states`）就广播 rank0 的 params/buffers，而构造发生在
-    # **EMA 构造之后** ⇒ rank1~3 的 shadow 会是各自被丢弃的随机权重，
-    # `ema.update()` 每步把正确权重混进陈旧 shadow ⇒ **EMA 跨 rank 发散**，且
-    # 不报错。`_sync_init_weights_from_rank0` / `_assert_init_weights_identical`
-    # 在 `.to(device)` 之后、EMA 之前，恰好堵住它。
-    #
-    # 构造参数**只有** `device_ids`，其余全默认（不新增任何 CLI flag）：
-    #   · `find_unused_parameters=False`：两个头每 step 都参与 loss ⇒ 所有参数都有
-    #     梯度。这是**隐含前提**：将来若出现「某个头不参与 loss」的分支，DDP 会抛
-    #     `Expected to have finished reduction in the prior iteration` —— 好在它
-    #     是**响亮**地失败，不会安静地错。
-    #   · `broadcast_buffers=True`：BN 的 `running_mean`/`running_var` 跨卡一致
-    #     靠它；上一代默认也是 True ⇒ 行为不变。
-    #   · `gradient_as_bucket_view=False`：本文件用 `zero_grad(set_to_none=True)`，
-    #     bucket view 的别名每轮被销毁、省不掉拷贝，收益仅 ~36.27 MB/rank
-    #     （= 全部梯度大小，torch 对该开关的定义就是如此；占 32 GiB 的 0.106%），
-    #     真正的风险是混用 view / 非 view 的 grad 状态触发
-    #     `Expected to mark a variable ready only once`。收益配不上这类风险。
-    #   · `static_graph=True`：DDP 要求**每个 iteration 参与反向的参数集合完全一致**
-    #     —— 本模型满足：两个头每步都进 loss（见上方 find_unused_parameters=False
-    #     的隐含前提）、loss 的系数门控是**按 run 而非 per-step** 恒定（`katago_v7_loss`
-    #     里 `self.coeff` 在构造时定、训练中不切）、全仓无任何 `requires_grad` 切换。
-    #     静态图让 DDP 跳过每轮 unused-param 复检、固化 bucket 分配，省一点反向开销。
-    #     风险是 fail-loud：将来若引入「某步某参数不进图」的分支，DDP 会立刻报错
-    #     （而非安静错）。下方断言先把「全参数 requires_grad」这个前置不变量钉住。
-    if is_dist:
-        # static_graph 前置不变量：所有参数都参与反向（DDP 要求每步参数集合一致）。
-        # 若将来出现冻结参数，应在此前显式处理；当前全仓不冻结任何参数。
-        _frozen = [n for n, p in model.named_parameters() if not p.requires_grad]
-        if _frozen:
-            raise RuntimeError(
-                'static_graph=True 要求所有参数 requires_grad，但发现 %d 个冻结参数'
-                '（static_graph 不允许 iteration 间参数集合变化）：%s'
-                % (len(_frozen), _frozen[:4]))
-        model = DistributedDataParallel(
-            model, device_ids=[local_rank], static_graph=True)
+    # 单卡训练：不做任何分布式包裹，EMA 构造与参数分组直接在裸模块上进行。
 
     # `_accum_steps` 必须定义在**任何**用它之前（2026-10-01 云端教训）。
     #   它原先在下面训练循环的开头才赋值，而上面「run 级指标上报」已经用它算
@@ -4961,9 +4534,8 @@ def main():
                 "run/warmup_steps": warmup_steps,
                 "run/n_train": n_train,
                 "run/n_eval": len(eval_idx),
-                "run/effective_batch": bs * max(1, world_size) * _accum_steps,
-                # DDP 下 `parameters()` 带 `module.` 前缀但**数量不变**，
-                #   要真参数名得先 unwrap；这里只要个数，所以直接数即可。
+                "run/effective_batch": bs * _accum_steps,
+                # `parameters()` 直接数即可（单卡无 `module.` 前缀）。
                 "run/params_actual": int(sum(p.numel()
                                             for p in model.parameters())),
                 # ---- 数据源形态：board 级实时算 / stdata 预算好 ----
@@ -5018,13 +4590,8 @@ def main():
     _snap_writer = _AsyncSnapshotWriter(logger) if is_main else None
 
     for epoch in range(start_epoch, args.epochs):
-        # DDP：每卡取本 rank 的不相交分片；set_epoch 让每 epoch 重新洗牌
-        if is_dist and train_sampler is not None:
-            train_sampler.set_epoch(epoch)
-            perm = [int(train_idx[j]) for j in train_sampler]
-        else:
-            rng.shuffle(train_idx)
-            perm = train_idx
+        rng.shuffle(train_idx)
+        perm = train_idx
         model.train()
         n_batches = (len(perm) + bs - 1) // bs
         # 预取器：每 epoch 先灌满流水线（提前 depth 个 batch 造好数据）
@@ -5098,16 +4665,7 @@ def main():
             try:
                 if i % _accum_steps == 0:
                     optimizer.zero_grad(set_to_none=_zero_set_none)
-                # DDP 梯度累积加速：非末步跳过 all-reduce（与 no_sync() 语义等价）。
-                # 数学上 (accum-1) 次本地累加 + 末步一次 all_reduce(SUM) 与「每步都
-                # all_reduce(SUM) 再累加」完全相等，仅省 (accum-1) 次跨卡通信。
-                # 置于 backward 的 with 块之前、测试 AST 切片（tail）之外：test_log_loss_identity
-                # exec 的是「含 compute_l2_report 的 with 块」+「其后到 backward 的切片」，
-                # 本段不在其中，故门禁不受影响。单卡/非 DDP 时 model 无该属性，由
-                # hasattr 跳过（保持原每步同步行为）。
-                _is_last = ((i + 1) % _accum_steps == 0) or ((i + 1) == n_batches)
-                if is_dist and hasattr(model, 'require_backward_grad_sync'):
-                    model.require_backward_grad_sync = _is_last
+
                 if _prof_at > 0 and step == _prof_at and _prof_ctx is None:
                     try:
                         # 活动集固定 CPU + CUDA。
@@ -5482,7 +5040,7 @@ def main():
                     _grad_norm_last = float(_gn)
                     # g3 结算。`float(_gn)` 本身要等一次设备→主机同步，而它是
                     # backward 之后**第一次**同步 ⇒ 整个待执行队列（前向/反向的
-                    # 实际执行、DDP all-reduce、clip kernel）都在这里 drain。
+                    # 实际执行、反向、clip kernel）都在这里 drain。
                     # 真机 2026-10-07：这 10.45 s 占 79.9%，是本段存在的理由。
                     _t_g3 += time.perf_counter() - _t_g3_0
                     # `g` 段结算 = g1+g2+g3（三段首尾相接无缝，故恒等）。放在
@@ -5631,10 +5189,8 @@ def main():
                 else:
                     mem = 0.0
                 _now = time.time()
-                # 有效 batch 必须含梯度累积：原来写的是 bs×world_size，漏乘
-                # accumulation ⇒ 用了 `--gradient-accumulation-steps 2` 时日志把
-                # 吞吐**报成实际的一半**（2026-10-01 修）。
-                _eff_bs = bs * max(1, world_size) * max(1, _accum_steps)
+                # 有效 batch 必须含梯度累积（2026-10-01 修）。
+                _eff_bs = bs * max(1, _accum_steps)
                 speed = (step - _step_at_start) * _eff_bs / max(1e-6, _now - t0)
                 # 瞬时速率：距上一次 stdout 打点。与分段耗时同口径，
                 # 二者相乘即该区间理论样本数，可直接核对时间丢在哪。
@@ -5654,7 +5210,7 @@ def main():
                 _oms = _t_opt * 1000.0 / _no
                 _mms = _t_ema * 1000.0 / _no
                 # `u` = 未归因 = 墙钟 −(d+c+g+o+m+s+e)。它不是残差噪声，而是
-                # 「**当前已知但尚未分段**」的部分（DDP all-reduce、Python 与
+                # 「**当前已知但尚未分段**」的部分（Python 与
                 # 调度开销、log-every 处的同步）。2026-10-07 真机 a_v7.4_npu2：
                 # 墙钟 12.0 s/step、c=2.29、d=0.03 ⇒ 这 9.7 s 全落进 `u`。
                 # 加 g/o/m 就是为了把它劈开。
@@ -5847,7 +5403,7 @@ def main():
                     "speed": speed,
                     "speed_inst": spd_inst,
                     # 每卡吞吐与 ETA：长跑时「还剩多久」比「多快」更需要盯
-                    "speed_per_card": speed / max(1, world_size),
+                    "speed_per_card": speed,
                     "elapsed_min": (_now - t0) / 60.0,
                     "eta_min": ((total_steps - step)
                                 * (_now - t0) / max(1, step - _step_at_start)
@@ -6088,11 +5644,7 @@ def main():
                         # 而这里在 step 循环内，break 只能跳完本 epoch —— 见下方双层 break
                         stop_flag.fill_(1)
 
-                # 停止标志同步：所有 rank 必然同点到达（eval 块的进入条件与 CLI
-                # 参数逐 rank 相同），故**无条件** broadcast，stop_flag 未置位
-                # 也照发。放在 `is_main` 之外是关键：这里少了它，其他 rank 就
-                # 永远收不到停止信号。
-                _sync_stop_flag(stop_flag, is_dist, args.early_stop == 1)
+                # 单卡训练：stop_flag 为本地张量，无需跨进程广播。
 
                 # `.item()` 是同步点，而 stop_flag 只在 `args.early_stop == 1`
                 # 时才可能被置位 ⇒ 早停没开时每次都白付（把 host 拉回等 GPU）。
@@ -6169,15 +5721,6 @@ def main():
                     logger.info("[swanlab] 实验跟踪已完成")
                 except Exception as e:
                     logger.warning("[swanlab] finish 失败: %s", e)
-
-    # C2NET 回传结果
-    if _c2net_ctx is not None and is_main:
-        try:
-            from c2net.context import upload_output as _c2net_upload
-            _c2net_upload()
-            logger.info("[c2net] 结果已回传到 OpenI 平台")
-        except Exception as e:
-            logger.warning("[c2net] 回传失败: %s", e)
 
 if __name__ == "__main__":
     main()

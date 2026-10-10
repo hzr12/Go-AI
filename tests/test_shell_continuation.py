@@ -4,7 +4,7 @@
 `bash -n` 只做语法检查。行尾写成 `\\`（不在引号内）在语法上完全合法，但它的含义
 是「反斜杠转义反斜杠」= 一个**字面反斜杠**，换行**不再续行**。于是命令在该行被
 截断，字面 `\\` 成为训练脚本的最后一个 argv，其后
---prefetch-workers / --log-every / --early-stop / --out / --export-onnx / --c2net /
+--prefetch-workers / --log-every / --early-stop / --out / --export-onnx /
 "$@" 等全部丢失，脚本再把余下各行当成独立命令 → `command not found`（exit 127）。
 
 实测这正是 shell/ 下多卡脚本的 `--scaler-growth-interval` 那一行。详见
@@ -43,7 +43,7 @@ TARGETS = ('train_sft_a100_1card.sh',)
 REQUIRED_FLAGS = (
     '--prefetch-workers', '--prefetch-depth', '--log-every', '--swanlab-every',
     '--eval-every', '--save-every', '--early-stop', '--early-stop-patience',
-    '--out', '--export-onnx', '--ver', '--c2net',
+    '--out', '--export-onnx', '--ver',
 )
 
 # 顶替 torchrun，只把收到的 argv 原样吐出来。用 NUL 分隔而非换行/尖括号，

@@ -119,7 +119,6 @@ def run_sft(argv=None):
         '--out', 'models/sft_19x19_v17.pth',
         '--export-onnx', '0',
         '--swanlab', '1',
-        '--c2net', '1',
     ]
     if argv:
         # 合并：默认参数在前，覆盖参数在后（argparse 以后者为准）
@@ -152,7 +151,6 @@ def run_selfplay(argv=None):
         '--model', 'models/sft_19x19_v17.pth',
         '--out', 'models/az_best.pth',
         '--swanlab', '0',
-        '--c2net', '1',
     ]
     if argv:
         sys.argv = default_argv + argv

@@ -28,7 +28,6 @@ PREFETCH_W=24         # 预取进程数（单卡即全部）。24 核机器留 0
 PREFETCH_D=16         # 在途 batch 数；每个约 58MB(float32 12x19x19xB)，16→约0.9GB
 DATA=data/sgf_19x19_full.npz
 OUT=models/sft_19x19_v18.pth
-C2NET=1               # 1=启用 OpenI 启智平台对接；平台已自带数据/输出时改 0
 
 # ---- 为什么以前 OOM、现在能到 3500 ----
 # 根因不是 batch 本身，而是 --compile-mode reduce-overhead：它走 CUDA Graphs，
@@ -65,5 +64,4 @@ torchrun --nproc_per_node="$WORLD_SIZE" scripts/train_sft.py \
   --out "$OUT" \
   --export-onnx 1 --use-checkpoint 1 \
   --swanlab 1 --ver v18 \
-  --c2net "$C2NET" \
   "$@"

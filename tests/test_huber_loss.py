@@ -1502,7 +1502,7 @@ def test_no_new_cli_params():
         '--compile-mode', '--flash-attn', '--arch', '--export-onnx',
         '--onnx-quantize', '--swanlab', '--swanlab-api-key', '--swanlab-every',
         '--early-stop', '--early-stop-patience', '--early-stop-metric',
-        '--max-gpu-memory', '--c2net',
+        '--max-gpu-memory',
         # ---- A4（2026-10-02）新增的 4 个：软标签（KataGo 访问分布）----
         # **为什么要显式登记而不是删掉本测试**：D1 的门禁价值不在「61 这个
         #   数字」，而在「新增必须是一次**留痕**的改动」。删掉整个测试等于把
