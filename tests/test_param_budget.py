@@ -1,13 +1,14 @@
-"""参数量基准测试：用实际实例化测量，锁住 run.txt 里的数字。
+"""参数量基准测试：用实际实例化测量，锁住各子模块的实测值。
 
 起因：run.txt 曾写「V17 Value: 1.01M (96ch, 11 blocks)」，而实测
 96ch+11blocks = 1,995,169（2.00M），1.01M 其实对应 96ch + 5 blocks。
 文字与数字自相矛盾，导致「v18 是否比 v12 差」这类对照建立在错误基准上。
 
-本测试把各子模块的实测值钉死，并校验 run.txt 与代码实际一致。
+⚠ 本文件**不再**校验 run.txt（`test_run_txt_records_are_consistent` 与
+`test_run_txt_sync.py` 都随 v18 退役删除，见下方说明）⇒ run.txt 里的数字与
+flag 现在**必须人工核对**。
 """
 import os
-import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -84,18 +85,16 @@ def test_value_head_table_in_run_txt_is_accurate():
 #   若日后 run.txt 再次变长、值得机器校验，应改为校验「run.txt 实际写了哪些
 #   数字」而不是「必须写 v18 的数字」。
 
-
-def test_shell_script_config_matches_v18_definition():
-    """4 卡 NPU 脚本的结构参数必须与本测试的 V18 定义一致。"""
-    txt = open(os.path.join(ROOT, 'shell', 'train_sft_npu_4card.sh'),
-               encoding='utf-8').read()
-    for flag, expect in (
-        ('--backbone-channels', 192), ('--backbone-res-blocks', 17),
-        ('--res-blocks', 8), ('--convnext-blocks', 4), ('--attn-blocks', 5),
-        ('--value-channels', 96), ('--value-res-blocks', 8),
-        ('--policy-channels', 128), ('--policy-layers', 3),
-    ):
-        mm = re.search(re.escape(flag) + r'\s+(\d+)', txt)
-        assert mm, f'4 卡脚本缺少 {flag}'
-        assert int(mm.group(1)) == expect, \
-            f'4 卡脚本 {flag}={mm.group(1)}，与 V18 定义 {expect} 不符'
+# 已删：test_shell_script_config_matches_v18_definition（2026-10-09）
+# 它 open `shell/train_sft_npu_4card.sh` 并逐项断言 9 个结构 flag 等于本测试的
+# **V18** 定义。两头都已退役：
+#   · 脚本随 NPU 后端一起删除，`shell/` 现在只剩 `train_sft_a100_1card.sh`；
+#   · V18 架构已退役（现役是 V7 / `KATAGO_SE_CFG` 12ch）。
+# **改指 A100 脚本也不成立**：那一支的 `--value-res-blocks` 是 **11** 而 V18 是 8
+# （这处差异 `tests/test_run_py_sh.py` 另有记录），说明现役脚本本来就不是 V18 配置。
+#
+# 它提供的保证现在由谁接手：结构参数的**唯一真相源**是 `KATAGO_SE_CFG`，由
+# `tests/test_no_undefined_names.py` 与 train_sft 自己的建网日志兜底；脚本里的
+# flag **能不能被 argparse 接受**由 `tests/test_run_py_sh.py` 真送 argparse 把关。
+# 换句话说「flag 存在但已不参与建网」这件事，本来就没有可断言的对象了 ——
+# 结构参数已归档在 CLI 之外（见 `train_sft.py` 里 `KATAGO_SE_CFG` 上方的说明）。

@@ -1652,22 +1652,19 @@ def load_dataset(path):
 
 
 # ---- eval 的确定性：固定采样源 + 与训练 RNG 流隔离 + 关闭数据增强 ----
-# 验证集评估本来要走 8 路对称增强抽样（`SupervisedDataset.sample_batch_numpy`）。修复前
-# 两个评估函数都不给 rng，抽样便落到**全局** np.random 上，后果有两层：
-#   ① 同一份权重、同一份 eval_idx 连跑两次 eval，指标不同（KL/Brier 尤其抖）——
+# 修复前两个评估函数都不给 rng，抽样落到**全局** np.random，后果两层：
+#   ① 同一份权重、同一份 eval_idx 连跑两次 eval 指标不同（KL/Brier 尤其抖）——
 #      「模型变好了」与「这次抽到的变换不一样」分不开；
-#   ② 每次 eval 都推进全局流 → 训练侧 `rng.shuffle(train_idx)` 与训练 batch 的增强抽样
-#      结果取决于「eval 跑过几次、什么时候跑」→ **eval 频率会改写训练轨迹**。
-# P2.2 用下面这个固定种子的独立 Generator + `_isolated_global_rng()` 兜底解决了这两层。
+#   ② 每次 eval 推进全局流 → 训练侧 `rng.shuffle(train_idx)` 与训练 batch 的增强
+#      抽样结果取决于「eval 跑过几次、什么时候跑」⇒ **eval 频率会改写训练轨迹**。
+# P2.2 用固定种子的独立 Generator + `_isolated_global_rng()` 兜住了这两层。
 #
-# 但「固定」不等于「正确」：被评估的仍然是**随机挑了对称**的验证集，推理时不会出现
-# 随机翻转的棋盘，顶-1 的分母里还混进了「对称等价但标签已同步」的一致性。故评估路径
-# 一律传 `augment=False` —— **评估零随机**，于是「指标与采样种子无关」才真正成立。
-# 连带后果：`EVAL_SAMPLING_SEED` 与 `evaluate_*(..., rng=)` 现在**不被消费**（只是被
-# 透传给 `sample_batch_numpy`），保留这条链路是为了既有的契约锁与将来的显式入口 ——
-# 训练侧 `_BatchPrefetcher` 的 `seed=1234` 与它数值相同但依旧互不相干。
-# 增强**只在训练侧**发生（`sample_batch` / 预取器 worker / `train_sft_ms.py` 走默认
-# `augment=True`），见 `tests/test_eval_no_augment.py`。
+# 但「固定」不等于「正确」：被评估的仍是**随机挑了对称**的验证集，推理时不会出现
+# 随机翻转的棋盘。故评估路径一律传 `augment=False` —— **评估零随机**，于是「指标与
+# 采样种子无关」才真正成立。连带后果：`EVAL_SAMPLING_SEED` 与 `evaluate_*(...,
+# rng=)` 现在**不被消费**（只是透传给 `sample_batch_numpy`），保留是为了既有的契约锁
+# 与将来的显式入口；训练侧 `_BatchPrefetcher` 的 `seed=1234` 与它数值相同但互不相干。
+# 增强**只在训练侧**发生，见 `tests/test_eval_no_augment.py`。
 EVAL_SAMPLING_SEED = 1234
 
 
@@ -2880,7 +2877,7 @@ def _read_log_scalars(loss, policy_loss, value_loss):
 # 这里** —— 本文件的函数只服务 train_sft 自己的调用点，改语义不会波及 RL。
 #
 # 日志契约（不可动）：main() 仍用 loss / policy_loss / value_loss 三个键，下游
-# run.txt、看板与 tests/test_run_txt_sync.py 绑着它们，
+# run.txt、看板与 `tests/test_huber_loss.py::test_log_keys_unchanged` 绑着它们，
 # tests/test_huber_loss.py::test_log_keys_unchanged 把三个键钉死。`loss` 的**含义**
 # 在 P4.5b 变过（多了 c‖θ‖²）、键名没变 ⇒ 跨新旧 run 的曲线不可直接比。
 #
@@ -3428,16 +3425,7 @@ def compute_l2_report(param_groups):
 
 
 # ---- P4.6：fused AdamW 的设备策略与回退（全模块唯一构造入口）------------------
-# D1：不加 `--fused` 旗标 —— 选择由设备驱动的代码级默认决定，不读环境变量、
-# 不接 CLI。NPU 的 fused kernel 不必等 MindSpeed（D6/P4.11）：torch_npu 自带
-# `torch_npu.optim.NpuFusedAdamW`（apex 风格多张量融合 kernel），2026-10-06 接入。
-#
-# ⚠ 但接入当天**真机实测挂死**（torch_npu 2.1.0.post10）：两个 DDP rank 的构造
-#   都静默卡死——无异常、无日志，双 rank RSS 同停 ~605MB / HBM 仅 CANN 上下文
-#   ~3.4GB，卡在 [device] 日志之后、[model] 日志之前。post3 没有这个类、post10
-#   有但构造挂 ⇒ 没有已知良好版本。故暂时**关闭 NPU fused 尝试**（回退 standard
-#   + foreach，foreach 已拿到大部分 kernel-launch 收益且语义不变）。等 py-spy
-#   定位挂点 / 升级 torch_npu 后，把 _NPU_FUSED_ATTEMPT 改回 True 重试（代码保留）。
+# D1：不加 `--fused` 旗标 —— 选择由设备驱动的代码级默认决定，不读环境变量、不接 CLI。
 _FUSED_OK_BACKENDS = frozenset({'cuda'})
 
 
@@ -4165,29 +4153,24 @@ def main():
                     _soft_every)
 
     # ---- B8 · futurepos 挂载 + warm：**必须在 fork 之前** --------------------
-    # `warm_futurepos()` 是本次接线里唯一一处「顺序错了不报错」的调用，必须
-    # 钉死：
-    #   · 它做的是**惰性解析**（`_futurepos_boards` 首次调用时真正解析 boards
-    #     来源，可能触发 `materialize_dataset` 落 12.3 GB 的 `boards.npy`）。
-    #   · 若它排在 `_BatchPrefetcher` 之后，惰性解析就发生在**每个 worker 里**
-    #     ⇒ 12.3 GB × worker 数（还可能几个进程同时写同一个路径互相踩坏）。
-    #     实测代价（同一份 gather）：冷 IO 8 worker 273 行/s vs warm 1161 行/s
-    #     （**差 4.3×**）；gather 冷读 10.4–24.7 ms/行 vs 热读 0.005–0.008
-    #     （**1500×**）。
-    #   · 本仓是 Windows 优先环境，`mp.Process` 走 **spawn**：worker 还会
-    #     **重新 open 一次**（`_rebind_futurepos_mmap`），所以 warm 还决定了
-    #     「worker 能不能拿到一个可 mmap 的路径」——没 warm 过就没有
-    #     `materialized_paths`，也就退化成继承句柄（spawn 下那是错的）。
+    # `warm_futurepos()` 是本次接线里唯一一处「顺序错了不报错」的调用：
+    #   · 它做**惰性解析**（`_futurepos_boards` 首次调用才解析 boards 来源，可能
+    #     触发 `materialize_dataset` 落 12.3 GB 的 `boards.npy`）。排在
+    #     `_BatchPrefetcher` 之后 ⇒ 惰性解析发生在**每个 worker 里**
+    #     ⇒ 12.3 GB × worker 数（还可能几个进程同时写同一路径互相踩坏）。
+    #     实测同一份 gather：冷 IO 8 worker 273 行/s vs warm 1161 行/s（**4.3×**）；
+    #     gather 冷读 10.4–24.7 ms/行 vs 热读 0.005–0.008（**1500×**）。
+    #   · 本仓是 Windows 优先环境，`mp.Process` 走 **spawn**，worker 还会重新
+    #     open 一次（`_rebind_futurepos_mmap`）⇒ 没 warm 过就没有
+    #     `materialized_paths`，退化成继承句柄（spawn 下那是错的）。
     #
-    # `source=None` ⇒ `_futurepos_boards` 走优先级第 2 步（直接用
-    # `self.boards`），**零磁盘写**。这是本仓主 npz 的正确选择：数据本来就已经
-    # 在内存里了，为 futurepos 再落一份 12.3 GB 是纯浪费。需要真 mmap 的场景
-    # （超大数据集放不进内存）走 `dataset_npz` + `materialized_dir`，那是
-    # `_rebind_futurepos_mmap` 的测试覆盖的另一条分支。
+    # `source=None` ⇒ 走优先级第 2 步（直接用 `self.boards`），**零磁盘写**——这是
+    # 本仓主 npz 的正确选择，数据已在内存里，再落一份 12.3 GB 是纯浪费。超大数据集
+    # 走 `dataset_npz` + `materialized_dir`（`_rebind_futurepos_mmap` 覆盖的另一支）。
     #
     # `V7PackedDataset` 的 futurepos **就在分片里**（`futurepos` 键，19×19×2），
-    # 不需要再挂载/预热 —— 那是 board 级路径才需要的（那里 futurepos 要跨着法
-    # 往后看，落在另一个 .npy 里）。给它一个「已完成」的状态，让下游日志走同一形状。
+    # 不需挂载/预热——那是 board 级路径才需要的。给它一个「已完成」状态，让下游
+    # 日志走同一形状。
     _fp_status = None
     if _v7_on:
         if hasattr(dataset, 'attach_futurepos'):
@@ -4612,28 +4595,10 @@ def main():
 
     # 把卷积型特征（N,C,H,W）转 channels_last(NHWC)，卷积算子走更快内存布局。
     # 输入也需同步转格式（见训练/评估循环），故这里仅转换模型权重布局。
-    # 门槛 2026-10-06 放开：NPU 上由 CLI `--npu-channels-last 1` 驱动（V7 的卷积
-    # 权重是 4D，同样可转），此前只有 cuda 能进 ⇒ NPU 上这个 flag 形同虚设。
     if use_channels_last and _backend == 'cuda':
-        # ⚠ NPU 上 `torch.channels_last` 这条路**整条都不通**（真机 torch 2.1.0
-        #   + torch_npu 两次实测，两个不同的错）：
-        #     1) `model.to(memory_format=channels_last)`
-        #        → `Only contiguous_format or preserve_format is supported.`
-        #          （torch_npu 覆写了 `Module.to`，`torch_npu/utils/_module.py`）
-        #     2) 逐参数 `param.data.contiguous(memory_format=channels_last)`
-        #        → `NPU contiguous operator only supportted contiguous memory
-        #           format.` [ERROR] ERR01007 OPS feature not supported
-        #          （torch_npu 的 contiguous 算子只认 contiguous 布局）
-        #   ⇒ 昇腾的布局控制走 `npu_format_cast` / `Format` 这一套（改的是 aclnn 的
-        #     aclFormat，NHWC=1，那才是 CANN 卷积核认的布局）。但它是 CANN 8.x
-        #     才有的 beta API，**本仓库的 torch_npu 2.1.0 上连 `Format` 都没有**
-        #     （2026-10-07 实测 AttributeError），所以可用入口由
-        #     `_npu_nhwc_formats()` 探测决定，不是写死的。
-        #     细节见那三个连续踩过的坑与 `_cast_nhwc_npu`。
-        if _backend == 'cuda':
-            model = model.to(memory_format=torch.channels_last)
-            logger.info("[model] 已启用 channels_last (NHWC) | backend=%s v7=%s",
-                        _backend, _v7_on)
+        model = model.to(memory_format=torch.channels_last)
+        logger.info("[model] 已启用 channels_last (NHWC) | backend=%s v7=%s",
+                    _backend, _v7_on)
 
     # 参数组：value head 独立 LR（参数量小，需要更高学习率补偿梯度不足）
     # 排除 bias / BatchNorm / LayerNorm 参数的 weight decay（标准做法）
@@ -5030,28 +4995,22 @@ def main():
         _t_data = _t_comp = _t_save = _t_eval = 0.0
         _t_data_max = 0.0
         _n_timed = 0
-        # ---- 2026-10-07：backward() 之后的三个区间（g/o/m）--------------
-        # 起因：真机 a_v7.4_npu2 实测 —— 墙钟 **12.0 s/step**，而 `c`（前向+反向）
-        # 只有 2.29 s、`d`（等数据）0.03 s ⇒ **约 81% 的步时落在 `_t_comp`
-        # 结算之后**，旧计时刻画里完全没有这一段。也就是说 `c` vs `d` 只解释
-        # 了 19%，拿它们判断瓶颈会把剩下 81% 当成不存在。
+        # ---- backward() 之后的三个区间（g/o/m）-----------------------------
+        # 起因：真机实测墙钟 12.0 s/step，而 `c` 只有 2.29、`d` 0.03 ⇒ 约 81% 的
+        # 步时落在 `_t_comp` 结算**之后**，旧计时刻画里完全没有这一段。拿 c vs d
+        # 判断瓶颈会把那 81% 当成不存在。
         #
-        # 三段按「每个 optimizer step」计，故单独用 `_n_opt` 归一：
+        # 三段按「每个 optimizer step」计，故单独用 `_n_opt` 归一（accum>1 时它们
+        # 每 optimizer step 才发生一次，除以 `_n_timed` 会缩小 accum 倍）：
         #   g = unscale_ + 溢出探测 + clip_grad_norm_（含全局范数归约的同步）
-        #   o = optimizer.step（含 NpuFusedAdamW）+ zero_grad
-        #   m = EMA update（278 个参数的 foreach_mul_/foreach_add_）
-        # accum>1 时它们每个 optimizer step 才发生一次，**不能**除以
-        # `_n_timed`（那是 micro-batch 数）—— 那样会缩小 accum 倍、
-        # 读成「这几段几乎不耗时」。
-        #
-        # `g` 再劈三段（2026-10-07 真机 a_v7.3_npu2：13.09 s/step 里 `g` 独占
-        #   79.9%，必须先分清是 clip 自己有病还是整个待执行队列在这里 drain）：
-        #     g1 = unscale_ + 溢出探测（BF16 下两者都应 ≈0）
+        #   o = optimizer.step + zero_grad
+        #   m = EMA update（foreach_mul_/foreach_add_）
+        # `g` 再劈三段（实测 `g` 独占 79.9%，必须分清是 clip 有病还是队列在此 drain）：
+        #     g1 = unscale_ + 溢出探测（BF16 下应 ≈0）
         #     g2 = clip_grad_norm_ 调用本身（返回 device 张量 ⇒ 纯发射）
         #     g3 = float(_gn) 的设备→主机同步 = 队列 drain（真正干活的地方）
-        # 判读：g2 ≫ g3 ⇒ clip 在同步，改 foreach；g3 ≫ g2 ⇒ clip 无辜，
-        #       瓶颈在 graph-compile / channels-last A/B。
-        # 三段与 `_t_clip` 同为「每个 optimizer step」归一，故同样走 `_no`。
+        # 判读：g2 ≫ g3 ⇒ clip 在同步，改 foreach；g3 ≫ g2 ⇒ clip 无辜，瓶颈在
+        #       graph-compile / channels-last A/B。
         _t_clip = _t_opt = _t_ema = 0.0
         _t_g1 = _t_g2 = _t_g3 = 0.0
         _n_opt = 0
@@ -5093,16 +5052,8 @@ def main():
                     model.require_backward_grad_sync = _is_last
                 if _prof_at > 0 and step == _prof_at and _prof_ctx is None:
                     try:
-                        # 活动集**按后端选**（2026-10-06 真机两次修正）：
-                        #   · NPU 上用 `torch.profiler` 的 CUDA 活动会得到
-                        #     「CUDA is not available, disabling CUDA profiling」
-                        #     且**采不到任何 NPU kernel**；
-                        #   · `torch.profiler.ProfilerActivity.NPU` 在
-                        #     torch 2.1 + torch_npu 2.1 上**不存在**
-                        #     （AttributeError: … has no attribute 'NPU'）——
-                        #     NPU 的入口是 **`torch_npu.profiler`**（自带
-                        #     `profile` / `ProfilerActivity.NPU` 与
-                        #     `self_npu_time_total` 计时键）。
+                        # 活动集固定 CPU + CUDA。
+
                         from torch.profiler import (profile, ProfilerActivity)
                         _acts = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
                         _prof_ctx = profile(activities=_acts)
@@ -5706,19 +5657,15 @@ def main():
                 # （2026-10-02 B8 返工）：`tests/test_swanlab_metrics.py` 里三条
                 # 门禁 —— `test_health_metric_is_reported`（6 个键必须在
                 # main() 的源码里）、`test_health_metrics_only_computed_on_log_steps`
-                # （本 dict 字面量在**整个文件**里只许出现 1 次）、
-                # `test_reported_values_are_floats_not_tensors`（用正则抓这个
-                # 字面量的花括号体，并要求 ≥6 处 `float(`）—— 全都是按**字面量**
-                # 在 main() 里定位这块的。B8 曾把它抽成
-                # `compute_training_health()`，三条门禁一起变红：抽取让 12 通道
-                # 默认路径**唯一**的上报面门禁集体失明，而那 9 个失败之所以被漏掉，
-                # 正是因为自测没跑这个文件。
-                # 顺带一提：上面那三条判据是**纯文本**判据，所以连注释里都
-                # 不能写出上面那个字面量（写出来 `count` 就会变成 3）—— 这正是
-                # 「就地构造」这条要求的代价，也是它必须留下的原因。
-                # 与 `test_huber_loss.py::test_log_loss_identity` 要求
-                # `.backward()` 与 `compute_l2_report` 是兄弟语句是同一类约束
-                # （见上面那段「各写一份」的注释）：**门禁的形状优先于 DRY**。
+                # `test_reported_values_are_floats_not_tensors`（正则抓这个字面量
+                # 的花括号体，要求 ≥6 处 `float(`）—— 全都按**字面量**在 main() 里
+                # 定位这块。B8 曾把它抽成 `compute_training_health()`，三条门禁一起
+                # 变红：抽取让 12 通道默认路径**唯一**的上报面门禁集体失明，而那 9 个
+                # 失败之所以被漏掉，正是因为自测没跑这个文件。
+                # 上面三条判据是**纯文本**判据，所以连注释里都不能写出那个字面量
+                # （写出来 count 就变 3）—— 这是「就地构造」的代价，也是它必须留下
+                # 的原因。与 `test_log_loss_identity` 要求 `.backward()` 与
+                # `compute_l2_report` 是兄弟语句同理：**门禁的形状优先于 DRY**。
                 with torch.no_grad():
                     # V7 的 `out['policy_logits']` 是 `(B, 2, A)`：第 0 路 =
                     # `policy_player`、第 1 路 = `policy_opp`（与 loss #1/#2 的取用
@@ -5772,6 +5719,26 @@ def main():
                         _og = torch.as_tensor(lbl['outcome']).reshape(-1).to(torch.long)
                         _health_last['value_acc3'] = float(
                             (_ol.argmax(-1) == _og).float().mean())
+                        # ---- 三类占比 + 多数类基线：`value_acc3` 的地板 ----------
+                        # 为什么必须有：没有它 `value_acc3` **无法判读**。三分类里
+                        # 「永远猜多数类」就能拿到 max(p) 的命中率，可能远高于 1/3
+                        # 而毫无判别力 —— run.txt 把 1/3 写成基线是错的，真基线是
+                        # 多数类占比。
+                        # 实测（2026-10-09）575 步 `value_acc3` 钉在 0.50，而 value
+                        # 的三分类 CE ≈ 0.83 已**低于** ln(3)=1.0986 ⇒ 模型至少学到
+                        # 了类先验。那 0.50 与先验隐含的多数类占比同量级，正是
+                        # 「先验学到了、判别力没有」的形状 —— 没有这条基线就看不出
+                        # 它其实**不如**猜多数类。
+                        # 同时这两者合起来还能区分两种病：acc ≈ 1/3 ⇒ 先验都没学到；
+                        # acc ≈ `value_prior_top1` ⇒ 先验学到了但没有判别力。
+                        # ⚠ 三个占比在**单个训练 batch** 上估计，噪声与 acc 同量级
+                        # （二项，n≈batch）；要读趋势看平滑曲线，别读单点。
+                        _n3 = max(1, int(_og.numel()))
+                        for _ci in range(3):
+                            _health_last['value_prior%d' % _ci] = (
+                                float((_og == _ci).sum()) / _n3)
+                        _health_last['value_prior_top1'] = max(
+                            _health_last['value_prior%d' % _ci] for _ci in range(3))
                         # ---- policy **目标**的口径（2026-10-04）----
                         # 为什么必须报目标侧：`policy_loss` 与 `policy_entropy` 说的
                         # 都是**模型**（预测分布），而 A/B/C 三段的**目标**根本不
@@ -5886,26 +5853,17 @@ def main():
                     _prof_ctx = None
                     try:
                         _prof.__exit__(None, None, None)
-                        # **先试**在位的 `key_averages()`（torch.profiler 有）。
-                        # torch_npu 2.1.0.post10 的 `profile` 是**独立类**，实例
-                        # 方法只有 add_metadata / export_chrome_trace /
-                        # export_memory_timeline / export_stacks / start / step /
-                        # stop 共 8 个，**没有** `key_averages` ⇒ 真机必
-                        # AttributeError。2026-10-07 真机实测：窗口一过，之后每个
-                        # stdout 步都刷一行 `'profile' object has no attribute
-                        # 'key_averages'` —— 表永远拿不到。取不到就走下面的
-                        # chrome trace 退路（scripts/probe_npu_profiler.py 就是
-                        # 为探明这件事写的探针）。
+                        # 先试 `key_averages()`；取不到就退回下面的 chrome trace
+                        # 解析（老版本 torch_npu 的 profile 是独立类，只有 8 个方法、
+                        # 没有 key_averages ⇒ AttributeError）。
                         try:
                             _ka = _prof.key_averages()
-                            # 排序键按后端选：NPU 的活动键是 `self_npu_time_total`，
-                            # 用 CUDA 的键会 KeyError ⇒「跑了但没有表」（2026-10-06 真机）。
                             _sort_key = 'self_cuda_time_total'
                             try:
                                 table = _ka.table(sort_by=_sort_key, row_limit=18)
                             except KeyError:
-                                # 键名随 torch_npu 版本变：退一步用无排序的表，
-                                # 至少能看到有哪些 kernel 与它们的事件数。
+                                # 键名随 torch 版本变：退一步用无排序的表，至少能看到
+                                # 有哪些 kernel 与它们的事件数。
                                 table = _ka.table(row_limit=18)
                             logger.info("[profile] 内核耗时 top-18（按 %s 排序）:\n%s",
                                         _sort_key, table)

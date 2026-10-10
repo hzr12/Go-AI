@@ -518,7 +518,8 @@ def _script_args(txt):
 def test_shell_script_args_are_parseable():
     """每个 .sh 的参数必须被对应训练脚本接受（防手写长命令出现拼写错误）。
 
-    run.txt 的命令由 tests/test_run_txt_sync.py 校验，但 .sh 是独立副本，
+    run.txt 的命令**已无自动校验**（`tests/test_run_txt_sync.py` 随 v18 退役被
+    删除，spec 明记「不恢复」），而 .sh 又是独立副本，
     同样需要真实解析一遍。
     """
     target = {

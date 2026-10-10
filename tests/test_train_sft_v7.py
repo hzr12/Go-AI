@@ -1068,11 +1068,17 @@ def test_stage1_four_objectives_are_bit_identical_across_score_stdev_betas(net,
 
 
 def test_health_block_reports_3class_accuracy_on_the_v7_path(net, v7_batch):
-    """V7 的 value 是 3 分类 CE ⇒ 报 `value_acc3`，且**不假装** value_rmse。
+    """V7 的 value 是 3 分类 CE ⇒ 报 `value_acc3` + 三类占比/多数类基线，且
+    **不假装** value_rmse。
 
-    压成标量的任何做法都是新发明的口径（且与 12 通道的 `value_rmse` 不可比）
-    ⇒ 那两个键给 `nan`（键仍在，图上形状不变），而不是编一个数。
-    """
+压成标量的任何做法都是新发明的口径（且与 12 通道的 `value_rmse` 不可比）
+⇒ 那两个键给 `nan`（键仍在，图上形状不变），而不是编一个数。
+
+`value_prior{0,1,2}` / `value_prior_top1` 是 `value_acc3` 的**地板**：三分类里
+「永远猜多数类」就能拿到 max(p)，可能远高于 1/3 而毫无判别力 ⇒ 没有基线时
+`value_acc3` 不可判读（2026-10-09 实测：acc 钉在 0.50、CE 已低于 ln(3)，正是
+「先验学到了、判别力没有」）。
+"""
     sp, gl, moves, lbl = v7_batch
     net.eval()
     with torch.no_grad():
@@ -1084,13 +1090,41 @@ def test_health_block_reports_3class_accuracy_on_the_v7_path(net, v7_batch):
     })
     assert {'train_top1', 'train_top5', 'policy_ce_random',
             'policy_entropy', 'value_rmse', 'value_rmse_zero',
-            'value_acc3'} == set(h), h
+            'value_acc3', 'value_prior0', 'value_prior1', 'value_prior2',
+            'value_prior_top1'} == set(h), h
     _assert_all_plain_floats({k: v for k, v in h.items()
                               if k not in ('value_rmse', 'value_rmse_zero')})
     assert 0.0 <= h['value_acc3'] <= 1.0, h
     assert 0.0 <= h['train_top1'] <= 1.0, h
     assert math.isnan(h['value_rmse']) and math.isnan(h['value_rmse_zero']), \
         'V7 下的 value_rmse / value_rmse_zero 必须是 nan（不假装同一个口径）'
+
+
+def test_value_prior_keys_reconstruct_the_floor(net, v7_batch):
+    """三个占比必须**加起来等于 1**，且 `value_prior_top1` 等于其中最大者。
+
+    这条不是形式主义：`value_acc3` 的全部判读价值就在「它与地板比」，
+    而地板是这几个键算出来的。若它们不自洽（例如把 `w==0` 的净化行也算进
+    分母、或类别索引写错），基线就会**静默错**，`value_acc3` 随之不可读 ——
+    且没有任何异常会报出来。
+    """
+    sp, gl, moves, lbl = v7_batch
+    net.eval()
+    with torch.no_grad():
+        out = net(torch.from_numpy(sp.astype(np.float32)),
+                  torch.from_numpy(gl.astype(np.float32)))
+    h = _run_health_block({
+        '_v7_on': True, 'out': out,
+        'move_t': torch.from_numpy(np.ascontiguousarray(moves)), 'lbl': lbl,
+    })
+    priors = [h['value_prior0'], h['value_prior1'], h['value_prior2']]
+    assert abs(sum(priors) - 1.0) < 1e-6, \
+        '三个类的占比之和必须为 1（分母算错会让基线静默失真）：%r' % (priors,)
+    assert abs(h['value_prior_top1'] - max(priors)) < 1e-12, \
+        'value_prior_top1 必须等于三类占比的最大者：%r vs %r' % (
+            h['value_prior_top1'], max(priors))
+    # 地板必须真的是「永远猜多数类」能做到的水平 —— 即 ≥ 1/3。
+    assert h['value_prior_top1'] >= 1.0 / 3.0 - 1e-9, h
 
 
 def test_health_block_never_touches_the_12ch_names_under_v7():
