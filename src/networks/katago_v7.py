@@ -1071,9 +1071,13 @@ class NbtTfNet(nn.Module):
         x = x + g
         pos = _board_pos(x.shape[0], x.shape[2], x.shape[3], x.device)
         # 梯度检查点（默认关）。`pos` 是**张量**，所以 `(x, pos)` 两个位置参数
-        # 都满足「只收 Tensor」的约定，Dynamo 能 trace。
+        # 都满足「只收 Tensor」的约定，Dynamo 能 trace。`modules=None` ⇒ 不挂
+        # BN 守卫：`Nbt2TransformerBlock` 用的是 RMSNorm/SwiGLU，全网 0 个
+        # BatchNorm，守卫保护不了任何东西，而它要的 `context_fn` 会让
+        # `torch.compile` 整段 trace 不了。**这里不传守卫正是为了白拿 compile
+        # 兼容性**（实测 `fullgraph=True` 通过）。
         x = checkpointed(self._run_blocks, x, pos,
-                         modules=self.blocks, enabled=self.grad_checkpoint)
+                         modules=None, enabled=self.grad_checkpoint)
         return F.silu(self.norm_trunkfinal(x))
 
     def forward(self, spatial, global_features, board_mask=None):
@@ -1090,14 +1094,19 @@ class NbtTfNet(nn.Module):
         return torch.tanh(out['ownership_pretanh'])
 
 
-def build_katago_v7_net(*, board_size=19, attn_dropout=None, cfg=None):
+def build_katago_v7_net(*, board_size=19, attn_dropout=None, cfg=None,
+                        grad_checkpoint=False):
     """按 `NBT_TF_CFG` 建 V7 网并跑一次 `initialize()`。
 
     **返回已初始化的模型**（不是随机权重）—— fson 的 γ 必须带 K，否则残差流
     方差随深度线性增长，深层一开始就饱和，而那种「模型能跑但 loss 离谱」的
     现象很难回溯到这里。`tests/test_katago_v7_budget.py` 也依赖这一点。
+
+    `grad_checkpoint` 是**纯行为开关**（默认关）：不影响任何形状与参数量，
+    开启前后前向/反向逐位一致。
     """
     c = dict(cfg or {})
     c.setdefault('board_size', int(board_size))
-    net = NbtTfNet(cfg=c, attn_dropout=attn_dropout)
+    net = NbtTfNet(cfg=c, attn_dropout=attn_dropout,
+                  grad_checkpoint=grad_checkpoint)
     return net.initialize()

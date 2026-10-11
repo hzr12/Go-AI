@@ -578,7 +578,11 @@ def test_legacy_class_signatures_untouched():
             "in_channels=12, channels=128, num_res_blocks=12, attention_mode='mix', "
             "num_attention_layers=4, num_heads=4, attention_dropout=0.0, "
             "attn_mode='global', attn_window=7, arch='convnext', "
-            "res_blocks=0, convnext_blocks=0, attn_blocks=0"),
+            "res_blocks=0, convnext_blocks=0, attn_blocks=0, "
+            # 2026-10-11 GC 回归：尾追加的**纯行为**开关。安全理由与下面
+            # AlphaGoNet 那条相同（默认值 + 尾部追加 ⇒ 既有调用逐字不变、
+            # state_dict 键一个不多），但它**确实**改了签名，故照样登记。
+            "grad_checkpoint=False"),
     }
     for cls, want in expect_backbone.items():
         got = _init_sig(os.path.join(ROOT, 'src', 'networks', 'backbone.py'), cls)
@@ -591,9 +595,18 @@ def test_legacy_class_signatures_untouched():
                      'ValueNetwork') == (
         "in_channels=64, hidden_channels=32, num_res_blocks=3, arch='resnet'")
 
-    # AlphaGoNet.__init__ 零改动
+    # AlphaGoNet.__init__：除 2026-10-11 尾追加的 `grad_checkpoint` 外零改动
     got = _init_sig(os.path.join(ROOT, 'src', 'networks', 'alphanet.py'),
                     'AlphaGoNet')
+    # 2026-10-11 GC 回归登记。上面那句「签名一旦被改过，存量 checkpoint 会在
+    # **形状对不上**的地方崩」正是本次改动安全的依据 —— 而非「谁都不许改签名」：
+    #   * 它是**尾部追加的、带默认值的关键字参数** ⇒ 任何既有调用（位置或
+    #     关键字）逐字照旧，不需要改一行存量脚本；
+    #   * 它**不是子模块**，`state_dict()` 的键一个不多不少 ⇒ 存量 checkpoint
+    #     加载路径不受影响（`_load_legacy_weight` 那类按 `named_parameters()`
+    #     对账的代码也不会多/少看到东西）。
+    # 即「崩在形状上」这个具体风险没有发生，但仍属留痕改动，故登记。
+    # 默认关 + 逐位中性由 tests/test_grad_checkpoint.py 钉。
     assert got == (
         "in_channels: int=12, backbone_channels: int=128, backbone_res_blocks: int=12, "
         "attention_mode: str='mix', num_attention_layers: int=4, num_heads: int=4, "
@@ -601,7 +614,8 @@ def test_legacy_class_signatures_untouched():
         "policy_channels: int=32, value_channels: int=64, action_size: int=362, "
         "arch: str='resnet', res_blocks: int=0, "
         "convnext_blocks: int=0, attn_blocks: int=0, value_res_blocks: int=3, "
-        "policy_layers: int=2"), f'AlphaGoNet.__init__ 签名被改了：{got}'
+        "policy_layers: int=2, grad_checkpoint: bool=False"), \
+        f'AlphaGoNet.__init__ 签名被改了：{got}'
 
 
 def test_legacy_forward_untouched():

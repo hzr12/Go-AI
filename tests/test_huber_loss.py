@@ -1552,6 +1552,18 @@ def test_no_new_cli_params():
         # ---- 2026-10-11 新增的 2 个 ----
         '--clip-every',                  # 稀疏梯度裁剪周期
         '--compile-fullgraph-probe',     # fullgraph 探针
+        # ---- 2026-10-11 新增的 1 个：梯度检查点总开关（GC 子系统回归）----
+        # `--grad-checkpoint`（默认 **0**）用显存换一次主干重算。
+        # 为什么值得占一个 CLI 位：OOM 时它比砍 `--batch-size` 更划算 ——
+        #   砍 batch 会加大梯度噪声（段 2 的 256×8 甜点就是实测出来的），
+        #   开 GC 只慢一次前向、**数值逐位不变**。
+        # 与 D1 门禁哲学一致：登记是把"为什么有这个旗"钉死；默认值 0 与
+        # 「逐位中性」由 tests/test_grad_checkpoint.py 钉。
+        # 旧 GC 那三个旗（`--use-checkpoint` / `--attn-chunk-ckpt` /
+        # `--gc-with-compile`）**不回归**：它们是自定义 `autograd.Function`
+        # 实现，与 `torch.compile` 互斥；新旗走标准
+        # `torch.utils.checkpoint`（`use_reentrant=False`），一个旋钮就够。
+        '--grad-checkpoint',
     }
     got = set(kw)
     assert got == expected, (
@@ -1565,11 +1577,12 @@ def test_no_new_cli_params():
     #        + online-softmax 开关 `--attn-online`（补登）+ 2026-10-06 的 `--use-sdpa`
     #        + 2026-10-06 的 5 个 GOAI_* 环境变量搬家旗
     #        + 2026-10-11 的 `--clip-every` / `--compile-fullgraph-probe`
+    #        + 2026-10-11 GC 回归带来的 `--grad-checkpoint`
     #        − 2026-10-11 随 GC 子系统删除的 `--use-checkpoint` /
     #          `--attn-chunk-ckpt` / `--gc-with-compile`
-    #        ⇒ 相对 71 那版基线净 −2（+2 新旗 / −3 GC 旗，另有一项在别轮次退役）
-    assert len(expected) == 69, (
-        f'冻结的基线本身变了：{len(expected)} != 69'
+    #        ⇒ 相对 69 那版基线 +1（GC 回归新增 1 个，旧三旗不回来）
+    assert len(expected) == 70, (
+        f'冻结的基线本身变了：{len(expected)} != 70'
         f'（61 + A4 的 4 个 + B8 的 1 个 + --games-npz 的 1 个 + --attn-online 的 1 个'
         f' + --use-sdpa 的 1 个 + GOAI_* 搬家里留下的 2 个'
         f' + 2026-10-11 的 2 个 − 随 GC 删除的 3 个）')

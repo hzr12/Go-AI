@@ -36,9 +36,15 @@ class AlphaGoNet(nn.Module):
                  convnext_blocks: int = 0,
                  attn_blocks: int = 0,
                  value_res_blocks: int = 3,
-                 policy_layers: int = 2):
+                 policy_layers: int = 2,
+                 grad_checkpoint: bool = False):
         """
         Args:
+            grad_checkpoint:     共享骨干是否用梯度检查点（省激活、慢一次前向）。
+                                 **纯行为开关**，不影响任何形状/参数量 —— 开启
+                                 前后前向与反向逐位一致（`SharedBackbone` 的
+                                 `checkpointed` 用 `torch.utils.checkpoint` 的
+                                 非重入式实现）。默认关。
             attention_mode:      主干中注意力的使用方式
                                  "none"(纯卷积) | "mix"(卷积+注意力混合) | "all"(全注意力)
             num_attention_layers: mix 模式下注意力块数量
@@ -65,6 +71,7 @@ class AlphaGoNet(nn.Module):
             res_blocks=res_blocks,
             convnext_blocks=convnext_blocks,
             attn_blocks=attn_blocks,
+            grad_checkpoint=grad_checkpoint,
         )
 
         self.policy = PolicyNetwork(
