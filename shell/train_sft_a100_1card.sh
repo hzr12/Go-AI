@@ -33,8 +33,7 @@ OUT=models/sft_19x19_v18.pth
 # 根因不是 batch 本身，而是 --compile-mode reduce-overhead：它走 CUDA Graphs，
 # 会维持一个**不归还**的私有内存池，在临界 batch 上直接吃光显存。
 # 去掉该参数（只留 --compile 1）后 3500 实测通过。
-# 另外一处：--value-res-blocks 11→8（value head 不受 --use-checkpoint 保护，
-# 是最大一块常驻激活）。
+# 另外一处：--value-res-blocks 11→8（value head 是最大一块常驻激活）。
 # --attn-window 固定 5，不要改：实测（B=2800/heads=4/d=48）
 #   ws=3  QK 28.6M + AV 47M = 76M MACs，但注意力激活约 3.1GB（爆）
 #   ws=5  QK 184M + AV 215M = 399M MACs，注意力激活约 1.07GB  ← 最优
@@ -62,6 +61,6 @@ torchrun --nproc_per_node="$WORLD_SIZE" scripts/train_sft.py \
   --log-every 50 --swanlab-every 10 --eval-every 2000 --save-every 500 \
   --early-stop 1 --early-stop-patience 3 \
   --out "$OUT" \
-  --export-onnx 1 --use-checkpoint 1 \
+  --export-onnx 1 \
   --swanlab 1 --ver v18 \
   "$@"

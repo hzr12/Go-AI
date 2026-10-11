@@ -19,7 +19,7 @@ from src.networks.value_network import ValueNetwork  # noqa: E402
 
 # v18 实际配置：对应 shell/train_sft_npu_4card.sh 的全部结构参数
 V18 = dict(
-    in_channels=12, action_size=362, use_checkpoint=True, arch='resnet',
+    in_channels=12, action_size=362, arch='resnet',
     backbone_channels=192, backbone_res_blocks=17,
     attention_mode='mix', num_attention_layers=4, num_heads=4,
     attention_dropout=0.1, attn_mode='window_global', attn_window=5,

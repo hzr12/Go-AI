@@ -39,15 +39,6 @@ pip install onnx onnxruntime
 #     与 RL 的 V100 路径不同：A100 是 Ampere+，BF16 原生支持，不需要 scaler。
 #   ⇒ `--compile` **不给即可**（自动开）。要关就显式 `--compile 0`。
 #     启动日志看两行：`[device] --compile 未指定 ⇒ 按设备自动取 1` 与 `[train] 已启用 torch.compile 算子融合`。
-#   ⚠ `--compile` 与梯度检查点默认**二选一**（开 compile 就强制 `_gc = 0`）。
-#     40G 卡上那等于「要融合就得把 batch 调小到吃不满算力」，而 batch 缩小吃掉的
-#     吞吐通常远大于融合省下的 ⇒ **SFT 命令一律加 `--gc-with-compile 1`**（两者共存）。
-#     前提已就位：检查点走 `use_reentrant=False`（`backbone._checkpointed`），
-#     与整模型 `torch.compile` 兼容；且 V7 的 head 原来返回 dict、穿不过 checkpoint
-#     的问题已修（`katago_v7._ckpt`，回归测试
-#     `tests/test_katago_v7_grad_checkpointing.py::test_grad_checkpoint_survives_aot_autograd`）。
-#     私有内存池不归还 ⇒ 40G 卡上长跑容易吃满显存。要自动调优就用带 autotune 的档
-#     （`--compile-mode`，2026-10-11 起本机实测推荐 `reduce-overhead`；见下方说明）。
 #   ⚠ flash-attn 需 `pip install flash-attn`；加载失败**自动回退内置 SDPA**，
 #     只少速度不会崩。`--flash-attn 0` 可强制禁用。启动日志看 `[env]` 那行。
 #   ✅ 8 路对称增强已迁 GPU：训练侧 dihedral 增强走 `_dihedral_batch_torch`
@@ -173,13 +164,8 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 #     --compile-mode ...    见下方「⚠ --compile-mode 实测结论」；2026-10-11 本机推荐
 #                          `reduce-overhead`（带 CUDA Graphs，已实测可跑且常更快）；
 #                          带 CUDA Graphs 的档仍需注意私有内存池不归还、长跑吃显存
-#     --gc-with-compile 1|0 compile 与梯度检查点共存（默认 0；**SFT 建议给 1**）
 #     --use-sdpa 1|0        0 = 强制回退手写 math（默认 1）
-#     --use-checkpoint      **已归档**，别传（见下）
 #     --attn-query-chunk N  math 注意力 query 分块（默认 64；只影响 math 路径）
-#     --attn-chunk-ckpt 1|0 math 注意力逐 chunk 检查点（默认 1）
-# ⚠ `--use-checkpoint` 已归档：由 `KATAGO_SE_CFG['grad_checkpoint']` 决定。唯一让
-#   它让位的路径是 `--compile 1`（且不给 `--gc-with-compile 1`）。别传它。
 # ✅ eval 特征预取池（2026-10-06）：eval 的梯子特征曾是主进程串行计算，10 万行磨
 #   25-30 分钟（GPU 归零、无日志，两次被当成挂死）。现在与训练预取器同点 fork 一个
 #   2-4 worker 的 eval 池（augment=False，指标逐位不变），墙钟 ÷ worker 数；
@@ -197,18 +183,16 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 
 # --- A 段：board 级 full.npz（人类着法 one-hot），单卡 A100 40G ---
 # ⚠ **batch 用「micro × accum」表达**（有效 batch = micro × 卡数 × accum）。
-#   本机 A100 40G 实测（2026-10-11）：micro 512 × accum 4（有效 2048）≈ **1400 s/s**；
-#   micro 1024 × accum 2（有效 2048）是推荐甜点（预期 ~1000+ s/s，待一轮实测确认）；
-#   ⚠ **micro 2048 × accum 1 是悬崖**：同有效 2048 却暴跌到 ~550 s/s（显存/算法悬崖，
-#   别直接把 micro 拉到 2048）。要加有效 batch 就加 accum，micro 别过 1024。
+#   本机 A100 40G 实测（2026-10-11）：micro 512 × accum 4（有效 2048）≈ **1400 s/s**，
+#   是实测甜点；micro 1024 × accum 2 同有效 2048 却更慢（~1000+ s/s）—— 故统一回 512×4。
+#   ⚠ **micro 2048 × accum 1 是悬崖**：同有效 2048 暴跌到 ~550 s/s，永远别用。
+#   要加有效 batch 就加 accum（micro 别过 1024）。
 #   仓库里 `v7_batch_memory_advice` 的每样本 MB（4.65/12.67/277）是 910A/NPU 口径、
 #   对 A100 不可信，只当量级参考。**定档后把下面 B/C 的 `--batch-size` /
 #   `--gradient-accumulation-steps` 与 LR 一起改掉**（LR 必须跟着有效 batch 走）。
 # ⚠ LR = 0.00356 × √(有效batch / 2500)，有效batch = batch × 卡数 × accum。
 #   单卡 ⇒ 卡数 = 1。有效 2048 → 0.00322；batch 2800 → 0.00377；batch 1400 → 0.00267；
 #   batch 5600 → 0.00533。**换了有效 batch 一定要按公式重算 LR**，别沿用旧值。
-# ⚠ `--gc-with-compile 1` 必给（见第 0 节）：否则开 compile 就强制关 GC，
-#   40G 卡上 batch 被迫调小到吃不满算力。
 # ⚠ `--compile-mode` 2026-10-11 本机实测结论（Ampere+）：
 #   - 脚本默认已从 `max-autotune-no-cudagraphs` 改成 **`reduce-overhead`**（L4004）：
 #     原默认档在本机曾报 `CUDA error: misaligned address`——疑似刚启用的
@@ -225,9 +209,9 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 python scripts/train_sft.py \
   --data data/sgf_19x19_full.npz --v7 1 --device cuda --board-size 19 \
   --games-npz data/labels/games.npz \
-  --batch-size 1024 --epochs 1 --lr 0.00320 --weight-decay 0.0001 \
-  --gradient-accumulation-steps 2 --use-amp 1 --use-ema 1 \
-  --gc-with-compile 1 --flash-attn 1 --attention-dropout 0 \
+  --batch-size 512 --epochs 1 --lr 0.00320 --weight-decay 0.0001 \
+  --gradient-accumulation-steps 4 --use-amp 1 --use-ema 1 \
+  --flash-attn 1 --attention-dropout 0 \
   --prefetch-workers 24 --prefetch-depth 8 \
   --log-every 5 --eval-every 500 --save-every 20 \
   --early-stop 1 --early-stop-patience 3 \
@@ -236,7 +220,7 @@ python scripts/train_sft.py \
 # --- B 段：+ KataGo 软标签（承接 A 段，单卡 A100）---
 # ⚠ `--policy-loss soft_ce` 不写也行：给了 --soft-index 会自动选中。
 # 🔴 `--epochs 30` 不是笔误：--soft-only-sampling 把训练集从 3426 万行收窄到
-#   225,338 行 ⇒ 单卡 micro 1024（accum 2，有效 2048）约 220 微步/epoch
+#   225,338 行 ⇒ 单卡 micro 512（accum 4，有效 2048）约 440 微步/epoch
 #   （= 110 优化步/epoch）。epochs=1 ⇒ cosine 在 step ~100 就退火到 0
 #   （2026-10-06 实测：policy 纹丝不动）。30 epochs ≈ 3300 优化步，才是有效预算。
 #   **micro/accum 一改，这里的 epochs 要重算**：目标总优化步 ≈ 3300。
@@ -256,9 +240,9 @@ python scripts/train_sft.py \
   --model models/a_v7_a100.pth.latest \
   --soft-index data/labels/soft_index.npz --soft-only-sampling 1 \
   --soft-weight 1.0 --soft-every 1 --policy-loss soft_ce \
-  --batch-size 1024 --epochs 30 --lr 0.00320 --weight-decay 0.0001 \
-  --gradient-accumulation-steps 2 --use-amp 1 --use-ema 1 \
-  --gc-with-compile 1 --flash-attn 1 --attention-dropout 0 \
+  --batch-size 512 --epochs 30 --lr 0.00320 --weight-decay 0.0001 \
+  --gradient-accumulation-steps 4 --use-amp 1 --use-ema 1 \
+  --flash-attn 1 --attention-dropout 0 \
   --prefetch-workers 24 --prefetch-depth 8 \
   --log-every 25 --eval-every 100 --eval-max-batches 5 --save-every 20 \
   --early-stop 1 --early-stop-patience 3 \
@@ -267,14 +251,14 @@ python scripts/train_sft.py \
 # --- C 段：stdata 分片（搜索分布内建），单卡 A100 ---
 # ⚠ C 段**不要** `--games-npz`（贴目已在行里）、也**不需要** `--soft-index`
 #   （stdata 每行自带 policy_player_prob/policy_opp_prob，归一化即软标签）。
-# ⚠ batch 与 LR 同 A 段：**1024×2（有效 2048，LR 0.00320）**，已定档，与 A 一致。
+# ⚠ batch 与 LR 同 A 段：**512×4（有效 2048，LR 0.00320）**，实测甜点，与 A 一致。
 python scripts/train_sft.py \
   --data data/stdata --v7 1 --device cuda --board-size 19 \
   --model models/b_v7_a100.pth.latest \
   --policy-loss soft_ce --soft-weight 1.0 \
-  --batch-size 1024 --epochs 1 --lr 0.00320 --weight-decay 0.0001 \
-  --gradient-accumulation-steps 2 --use-amp 1 --use-ema 1 \
-  --gc-with-compile 1 --flash-attn 1 --attention-dropout 0 \
+  --batch-size 512 --epochs 1 --lr 0.00320 --weight-decay 0.0001 \
+  --gradient-accumulation-steps 4 --use-amp 1 --use-ema 1 \
+  --flash-attn 1 --attention-dropout 0 \
   --prefetch-workers 4 --prefetch-depth 8 \
   --log-every 50 --eval-every 500 --save-every 250 \
   --early-stop 1 --early-stop-patience 3 \

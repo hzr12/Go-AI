@@ -331,21 +331,6 @@ def test_ownership_tanh_is_bounded(net):
     assert (ow >= -1).all() and (ow <= 1).all()
 
 
-def test_grad_checkpointing_paths_agree(net):
-    """`use_checkpoint=True` 与 `False` 的前向必须一致（§3.5 第 4 条）。"""
-    torch.manual_seed(0)
-    ref = build_katago_v7_net(use_checkpoint=False).eval()
-    torch.manual_seed(0)
-    chk = build_katago_v7_net(use_checkpoint=True).eval()
-    chk.load_state_dict(ref.state_dict())
-    sp = torch.randn(1, 22, 19, 19)
-    gl = torch.randn(1, 19)
-    with torch.no_grad():
-        a = ref(sp, gl)['policy_logits']
-        b = chk(sp, gl)['policy_logits']
-    assert torch.allclose(a, b, atol=1e-5), '梯度检查点改变了前向结果'
-
-
 def test_backward_reaches_every_parameter(net):
     """一次反传后不允许有梯度为 None 的参数 —— 漏接一个头就会在这里暴露。"""
     net.train()

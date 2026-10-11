@@ -24,7 +24,6 @@ import torch
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import src.networks.backbone as bb  # noqa: E402
 from scripts.train_sft import KATAGO_SE_CFG, build_katago_se_net  # noqa: E402
 
 
@@ -73,60 +72,14 @@ def test_single_and_batched_planes_agree_bitwise():
 
 
 # --------------------------------------------------------------------------- #
-# 2. 检查点重算：必须恢复前向的 autocast 低精度（OOM 直接机制）
-# --------------------------------------------------------------------------- #
 # 已删除：test_scan_dtype_follows_dt_not_the_fp32_parameter —— v21 被硬删除
 # （MambaLTI/_chunked_scan 不复存在），扫描 dtype 契约随 Mamba 一起无对象。
-
-def test_checkpoint_recompute_restores_low_precision():
-    """块级检查点的**重算**必须在低精度下跑（旧路径 16 段全覆盖）。
-
-    这是 OOM 的直接机制：`backward()` 时前向的 autocast 已退出，不显式恢复就
-    整段 fp32，体积翻倍。判据用「上下文里做一次 matmul 看输出 dtype」，而不是
-    `torch.is_autocast_enabled()` —— 后者只报 CUDA 的状态，对 cpu/npu 读不到。
-
-    段数口径（v21 硬删除后按存活架构重定）：`KATAGO_SE_CFG` 的 17 块走
-    `SharedBackbone` 的 GC_LEGACY 逐块粒度 + `uncapped_last=True`
-    ⇒ 恰好 16 个检查点段（第 17 块按 checkpoint_sequential 语义豁免），
-    与 `SharedBackbone.forward` 注释里的「16 段入口」一致。
-    """
-    seen = []
-    orig = bb._autocast_like
-
-    def spy(t):
-        ctx = orig(t)
-        import contextlib
-
-        @contextlib.contextmanager
-        def wrapped():
-            with ctx:
-                a = torch.ones(4, 4)
-                seen.append(str((a @ a).dtype).replace('torch.', ''))
-                yield
-        return wrapped()
-
-    bb._autocast_like = spy
-    try:
-        net, _cfg = build_katago_se_net(
-            action_size=362,
-            grad_checkpoint=KATAGO_SE_CFG['grad_checkpoint'])
-        net.train()
-        x = torch.randn(2, KATAGO_SE_CFG['in_channels'], 19, 19)
-        with torch.autocast(device_type='cpu', dtype=torch.float16):
-            out = net(x)
-            loss = (out[0].float().pow(2).mean() if isinstance(out, (tuple, list))
-                    else out.float().pow(2).mean())
-        loss.backward()
-    finally:
-        bb._autocast_like = orig
-    assert seen, '重算上下文一次都没进入 —— 检查点没生效，测试无意义'
-    assert all(d == 'float16' for d in seen), \
-        f'有段在 fp32 下重算：{sorted(set(seen))}'
-    assert len(seen) == 16, f'应覆盖 16 个段，实得 {len(seen)}'
-
+# 已删除：test_checkpoint_recompute_restores_low_precision —— 梯度检查点子系统
+# 已整体移除，没有「重算恢复 autocast」这回事了（`_autocast_like` 随之退场）。
+# --------------------------------------------------------------------------- #
 
 # --------------------------------------------------------------------------- #
-# 3. 明确**不能**退的那几处（防下一个人为省显存去动它们）
+# 2. 明确**不能**退的那几处（防下一个人为省显存去动它们）
 # --------------------------------------------------------------------------- #
 def test_parameters_stay_fp32():
     """AMP 下**参数主权重必须 fp32** —— 优化器状态按它建立，GradScaler 也靠它。

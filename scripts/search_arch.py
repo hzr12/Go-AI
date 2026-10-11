@@ -16,12 +16,12 @@
   * 参数量    —— 直接 sum(p.numel())
   * FLOPs     —— forward hook 统计卷积/线性，按 batch=1
   * 激活显存  —— torch.autograd.graph.saved_tensors_hooks 精确计量
-                 **真正被反向保留**的张量总量，因此天然正确反映
-                 gradient checkpointing（backbone 开了 checkpoint 后
-                 只保留块输入，value head 未开则全量保留）。
-                  检查点的**语义由本探针钉死**（见 measure 的
-                 use_checkpoint 参数）：主干的 checkpoint 实现怎么改，
-                 计量口径都不动——否则 k 标定会随实现漂移。
+                 **真正被反向保留**的张量总量。检查点打开时只保留块输入，
+                 关掉则全量保留，所以这个口径天然对两种形态都对。
+                 检查点的**语义由本探针钉死**（见 measure 的
+                 use_checkpoint 参数）：主干已无任何检查点实现（GC 子系统
+                 2026-10-11 整体删除），本探针自包 `checkpoint_sequential`，
+                 计量口径与主干解耦。
 
 用法
 ----
@@ -61,7 +61,10 @@ DEVICE_GB = 32.0           # 单卡 HBM 预算（目标卡 HBM；910A=32 / A100=
 SAFE_FRAC = 0.90           # 留 10% 余量给碎片/workspace
 SAFE_GB = DEVICE_GB * SAFE_FRAC
 
-# 已实测的锚点（4 卡 910A，batch 2800/卡，attn-window 5，use_checkpoint 1）
+# 已实测的锚点（4 卡 910A，batch 2800/卡，attn-window 5，探针自包检查点）
+# ⚠ 2026-10-11：主干 GC 已整体删除，训练侧**不再**检查点 ⇒ 本锚点标定出的
+#   act_gb/total_gb/fits 对**现役训练**系统性低估。本次刻意不重标定（无硬件，
+#   改锚点等于编数据）；下面的自洽性断言仍过只是因为探针口径自洽 ≠ 准确。
 ANCHOR = {
     'name': 'v18',
     'mem_gb': 31.12,
@@ -95,7 +98,8 @@ V12_CFG = dict(backbone_channels=192, backbone_res_blocks=17,
 # 刻意不进本表的 KATAGO_SE_CFG 键：
 #   * in_channels=12 —— 归 preset_in_channels('se')（通道数是预设属性，
 #     不是可拨的旋钮，理由见该函数 docstring）；
-#   * grad_checkpoint —— 行为键；计量口径由探针钉死（见 measure）；
+#   * grad_checkpoint —— 已随 GC 子系统整体删除（2026-10-11），本表本就不含；
+#     检查点口径改由探针自包，见 measure；
 #   * params_backbone / params_total —— train_sft 侧对账硬数；本工具不抄，
 #     由 test_se_measure_matches_katago_budget 现场实测后与之对账。
 # attn_mode/attn_window 显式写出：KATAGO_SE_CFG 不传它们，AlphaGoNet 默认
@@ -119,9 +123,9 @@ SE_CFG = dict(backbone_channels=240, backbone_res_blocks=17,
 class _ProbeCheckpointBlocks(nn.Module):
     """探针专属的检查点包裹：`use_checkpoint=True` 时替换 `backbone.blocks`。
 
-    为什么计量要自己包，而不是把 `use_checkpoint` 交给主干
-    -----------------------------------------------------
-    锚点 31.12GB（v18 / 4 卡 910A / use_checkpoint 1）是用
+    为什么计量要自己包，而不是依赖主干
+    -----------------------------
+    锚点 31.12GB（v18 / 4 卡 910A / 探针自包检查点）是用
     `torch.utils.checkpoint.checkpoint_sequential(blocks, len(blocks), x)`
     实测出来的，该函数的**文档语义**就是「除最后一段外都不保留中间激活」
     （源码注释 "the last chunk has to be non-volatile"）——最后一块的内部
@@ -129,14 +133,15 @@ class _ProbeCheckpointBlocks(nn.Module):
     与 `test_attention_window_affects_memory`（attn_window 影响显存）都建立
     在这套口径上：锚点配置的块序是 res→convnext→attn，注意力块恰好是最后一块。
 
-    P4.6b 把主干的 `use_checkpoint=True` 换成了「每一块都检查点」（新
-    `run_grad_segment` 的逐块循环没有沿用「最后一段不检查点」），同一探针下
-    锚点保留量 115MB→70MB、k 0.83→1.35、attn_window 敏感性被抹平。教训：
-    **计量口径不能由被测实现决定**——主干的检查点策略一变，k 和所有绝对
-    预测就静默漂移（且方向是低估，会把装不下的配置判成 fits）。
+    教训（P4.6b，主干当时还存在 GC 时）：主干的检查点粒度一变，k 与所有绝对
+    预测就静默漂移（方向是低估，会把装不下的配置判成 fits）。**计量口径不能
+    由被测实现决定**。
 
-    所以：`measure()` 构造模型时恒传 `use_checkpoint=False` 并显式关掉主干
-    自己的开关，再由本类按锚点口径包裹。`use_checkpoint=False` 则完全不包。
+    ⚠ 现状（2026-10-11 GC 子系统已整体删除）：主干**不再有**任何检查点实现，
+    本类是探针**自己**的包装，走 `checkpoint_sequential` 这条独立代码路径，
+    语义归探针、不再受主干变更影响。但 `use_checkpoint` 这个形参**刻意保留**
+    —— 它控制的是「探针要不要自己包」，且 `test_search_arch.py::
+    test_checkpointing_reduces_retained_memory` 仍在用它。
     """
     def __init__(self, blocks):
         super().__init__()
@@ -166,23 +171,20 @@ def measure(cfg, probe_bs=PROBE_BS, use_checkpoint=True, in_channels=12):
     * True（默认）：把 `model.backbone.blocks` 换成 `_ProbeCheckpointBlocks`
       （锚点口径的 `checkpoint_sequential` 逐块检查点）；
     * False：完全不检查点。
-    两种情况下主干自己的 `use_checkpoint` / `set_grad_checkpointing` 都被
-    显式关掉——探针**不继承**主干策略。理由见 `_ProbeCheckpointBlocks` 的
-    docstring：k 标定要求「计量口径 ≡ 锚点实测口径」，而主干的检查点实现
-    是会变的（P4.6b 就变了）；语义归探针，主干怎么改都不影响计量。
+    探针**自己**包裹 `checkpoint_sequential`。主干的梯度检查点子系统已整体
+    删除（2026-10-11），这个形参现在是纯粹的探针开关，语义与训练侧解耦。
+    ⚠ 因此它标定出的绝对显存对**现役训练**系统性低估（训练不再检查点），
+    理由与「未重标定」的后果见 ANCHOR 上方与 `_ProbeCheckpointBlocks`。
     """
     kwargs = dict(cfg)
     arch = kwargs.pop('arch', 'resnet')
     model = AlphaGoNet(in_channels=in_channels, action_size=ACTION_SIZE,
-                       arch=arch, attention_dropout=0.0,
-                       use_checkpoint=False, **kwargs)
+                       arch=arch, attention_dropout=0.0, **kwargs)
     backbone = getattr(model, 'backbone', None)
     if backbone is None or not hasattr(backbone, 'blocks'):
         raise RuntimeError(
             'AlphaGoNet 没有 backbone.blocks —— 探针的检查点语义要挂在这上面，'
             '请同步修改 scripts/search_arch.py 的 measure()')
-    # 主干自己的检查点开关：恒关（哪怕构造函数/子类把它打开）。语义归探针。
-    backbone.use_checkpoint = False
     if use_checkpoint:
         backbone.blocks = _ProbeCheckpointBlocks(backbone.blocks)
     n_params = sum(p.numel() for p in model.parameters())

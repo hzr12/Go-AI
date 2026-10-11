@@ -16,9 +16,8 @@
 的守护交给 `tests/test_katago_se.py::test_legacy_class_signatures_untouched`，
 本文件只加一条「另外两条 arch 没被顺手改」的对照。
 
-梯度检查点的 BN 机制（`_BatchNormStatGuard`）在 `tests/test_grad_checkpointing.py`
-里有机制级覆盖；本文件只保证**新块的 BN 落进那条机制的范围**（能被
-`_collect_batchnorms` 收进来、重算后统计逐位还原），不重复它的机制断言。
+梯度检查点子系统已整体移除（2026-10-11），不再有重算污染 BN 统计的问题，
+原先守护 `_collect_batchnorms` 口径的用例随之退场。
 
 全部 CPU、秒级：不加载真实权重、不读真实数据。
 """
@@ -444,45 +443,6 @@ def test_bn_running_var_is_fp32_under_autocast():
         assert m.running_var.dtype == torch.float32, m.running_var.dtype
         assert m.running_mean.dtype == torch.float32, m.running_mean.dtype
         assert m.num_batches_tracked.dtype == torch.int64, m.num_batches_tracked.dtype
-
-
-# =========================================================================== #
-# 七、梯度检查点的 BN 覆盖（`_BatchNormStatGuard` 机制对新块生效）
-# =========================================================================== #
-def test_block_batchnorms_are_collected_by_the_checkpoint_helper():
-    """新块的 BN 必须落进 `_collect_batchnorms` 的口径（否则 guard 形同虚设）。"""
-    from src.networks.backbone import _collect_batchnorms
-
-    blk = SEBottleneck(16)
-    assert len(_collect_batchnorms([blk])) == 2
-
-
-def test_grad_checkpointing_leaves_bn_stats_bit_identical():
-    """开检查点：重算不得让 BN 统计前进两次（guard 的既有语义对新块成立）。"""
-    from src.networks.backbone import GC_LEGACY, run_grad_segment
-
-    torch.manual_seed(21)
-    blocks = [SEBottleneck(16), SEBottleneck(16), SEBottleneck(16)]
-    x = torch.randn(4, 16, 5, 5)
-
-    def run(use_checkpoint):
-        for b in blocks:                     # 同一份权重，只让 BN 统计走一遍
-            b.train()
-            b.bn1.reset_running_stats()
-            b.bn2.reset_running_stats()
-        return run_grad_segment(blocks, (x,), use_checkpoint=use_checkpoint,
-                                per_block=True, uncapped_last=True, kind=GC_LEGACY)
-
-    off, _ = run(False)
-    snap_off = [(b.bn1.num_batches_tracked.clone(), b.bn2.num_batches_tracked.clone(),
-                 b.bn1.running_var.clone(), b.bn2.running_var.clone()) for b in blocks]
-    on, _ = run(True)
-    snap_on = [(b.bn1.num_batches_tracked.clone(), b.bn2.num_batches_tracked.clone(),
-                b.bn1.running_var.clone(), b.bn2.running_var.clone()) for b in blocks]
-    assert torch.equal(off, on), '开检查点改了前向输出（max|Δ|=%.3e）' % (off - on).abs().max()
-    for i, (a, b) in enumerate(zip(snap_off, snap_on)):
-        for j, (u, v) in enumerate(zip(a, b)):
-            assert torch.equal(u, v), '块%d 第%d 项 BN 统计被重算污染' % (i, j)
 
 
 # =========================================================================== #

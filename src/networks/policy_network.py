@@ -40,8 +40,8 @@ class FCPolicyHead(nn.Module):
     """v21 代遗留的全连接策略头（P4.1），逐项 **2,366,730** 参数。
 
      v21 架构已随其顶层构建函数一并删除，本类**没有现役架构调用方**；
-    保留是因为它仍是「生产头」规格的参照（tests/test_grad_checkpointing.py、
-    tests/test_huber_loss.py 直接拿它当被测对象）。输入通道与 in_channels=
+    保留是因为它仍是「生产头」规格的参照（tests/test_huber_loss.py 直接拿它
+    当被测对象）。输入通道与 in_channels=
     184 的 v21 中间层配套，默认值沿用当时的规格，不随现役 12 通道输入改。
 
     结构（权威表 §2 的 policy 行）：

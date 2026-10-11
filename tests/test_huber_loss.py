@@ -1496,7 +1496,7 @@ def test_no_new_cli_params():
         '--value-channels', '--policy-channels', '--policy-layers',
         '--prefetch-workers', '--prefetch-depth', '--resume', '--model',
         '--value-loss-weight', '--policy-loss', '--value-loss', '--huber-beta',
-        '--value-lr-mult', '--label-smoothing', '--use-checkpoint', '--use-ema',
+        '--value-lr-mult', '--label-smoothing', '--use-ema',
         '--gradient-accumulation-steps', '--scaler-init-scale',
         '--scaler-growth-interval', '--compile',
         '--compile-mode', '--flash-attn', '--arch', '--export-onnx',
@@ -1545,12 +1545,13 @@ def test_no_new_cli_params():
         # ---- math 注意力的两个分块开关（原 GOAI_ATTN_QUERY_CHUNK / GOAI_ATTN_CHUNK_CKPT）----
         # 曾与 4 个 `--npu-*` 一起登记（GOAI_* 搬家那批），NPU 后端下线后一并删除。
         '--attn-query-chunk',     # math 注意力 query 分块
-        '--attn-chunk-ckpt',      # math 注意力逐 chunk 检查点
-        # ---- 2026-10-08 新增的 1 个：图编译与梯度检查点共存（A100 40G 迁移）----
-        # `--gc-with-compile`（默认 0 = 保持历史行为，既有命令行逐位不变）让
-        # `--compile` 与 GC 同时开：40GB 卡上「要融合就得把 batch 调小到吃不满
-        # 算力」，而 batch 缩小的吞吐损失通常大于融合收益。
-        '--gc-with-compile',
+        # ⚠ `--use-checkpoint` / `--attn-chunk-ckpt` / `--gc-with-compile` 已随
+        #   GC 子系统整体删除（2026-10-11），从冻结集移除。传这三个旗标现在会
+        #   直接 `unrecognized arguments` 退出——这是有意的，留着只会变成静默
+        #   假旋钮。若云端 shell 仍在传，须同步删。
+        # ---- 2026-10-11 新增的 2 个 ----
+        '--clip-every',                  # 稀疏梯度裁剪周期
+        '--compile-fullgraph-probe',     # fullgraph 探针
     }
     got = set(kw)
     assert got == expected, (
@@ -1563,12 +1564,15 @@ def test_no_new_cli_params():
     # 基线 = 61 原始 + A4 的 4 个软标签 + B8 的 `--v7` + 2026-10-04 的 `--games-npz`
     #        + online-softmax 开关 `--attn-online`（补登）+ 2026-10-06 的 `--use-sdpa`
     #        + 2026-10-06 的 5 个 GOAI_* 环境变量搬家旗
-    #        + 2026-10-08 的 `--gc-with-compile`（A100 40G：compile 与 GC 共存）
-    assert len(expected) == 71, (
-        f'冻结的基线本身变了：{len(expected)} != 71'
+    #        + 2026-10-11 的 `--clip-every` / `--compile-fullgraph-probe`
+    #        − 2026-10-11 随 GC 子系统删除的 `--use-checkpoint` /
+    #          `--attn-chunk-ckpt` / `--gc-with-compile`
+    #        ⇒ 相对 71 那版基线净 −2（+2 新旗 / −3 GC 旗，另有一项在别轮次退役）
+    assert len(expected) == 69, (
+        f'冻结的基线本身变了：{len(expected)} != 69'
         f'（61 + A4 的 4 个 + B8 的 1 个 + --games-npz 的 1 个 + --attn-online 的 1 个'
         f' + --use-sdpa 的 1 个 + GOAI_* 搬家里留下的 2 个'
-        f' + --gc-with-compile 的 1 个）')
+        f' + 2026-10-11 的 2 个 − 随 GC 删除的 3 个）')
     # 特别地：L2 系数不许有独立参数，label smoothing 也不许有第二个旋钮
     for banned in ('--l2-coef', '--l2-weight', '--weight-decay-l2',
                    '--l2-report', '--label-smoothing-ce'):

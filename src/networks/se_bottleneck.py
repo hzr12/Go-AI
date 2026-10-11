@@ -74,10 +74,7 @@ class SEBottleneck(nn.Module):
     不是 `conv3` 的输出：门控描述的是「这一层该关注哪些通道」，用块入口才与
     该层的输入分布对齐。
 
-     关于梯度检查点：本块的 BN 与 `ResBlock` 的 BN 在 `GC_LEGACY` 段里是同类
-    东西，重算时的 running stats 还原由 `backbone.py` 的 `_BatchNormStatGuard`
-    统一兜住（`_collect_batchnorms` 遍历 `modules()`，本块的两个 BN 自动被收进去），
-    这里**不需要**、也刻意不做任何 BN 统计的额外处理。
+     梯度检查点子系统已整体移除，本块不再有任何 BN 统计相关的特殊处理。
     """
 
     def __init__(self, channels, mid_channels=None, se_reduction=SE_REDUCTION_DEFAULT):

@@ -21,8 +21,8 @@ import time
 from contextlib import contextmanager, nullcontext
 
 import numpy as np
-# CUDA 显存分配器：开启 expandable_segments 减少碎片 —— 能塞下更大 batch
-# （直接放大 `--gc-with-compile` 的吞吐收益）、并避免分配器偶发卡顿。
+# CUDA 显存分配器：开启 expandable_segments 减少碎片 —— 能塞下更大 batch、
+# 并避免分配器偶发卡顿。
 # 必须在任何 CUDA 分配发生前设置（故放在 import torch 之前）。
 _os_alloc = os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '')
 if 'expandable_segments' not in _os_alloc:
@@ -209,7 +209,6 @@ KATAGO_SE_CFG = {
     'policy_channels': 128,
     'policy_layers': 3,
     # ---- 行为（非结构，可被调用方覆盖）----
-    'grad_checkpoint': 1,         # 必开；compile=1 时由调用方关掉并记日志
     # ---- 预算锚（实测，硬数）----
     'params_backbone': 8_392_995,
     'params_total': 9_112_005,
@@ -217,7 +216,7 @@ KATAGO_SE_CFG = {
 
 
 def build_katago_se_net(*, action_size, attention_dropout=0.1,
-                        grad_checkpoint=1, **overrides):
+                        **overrides):
     """按 `KATAGO_SE_CFG` 建网；返回 `(model, cfg)`，`cfg` 是**实际生效**的取值。
 
     `overrides` 只用于行为参数（见调用点），结构键不接受覆盖 —— 与 D1 的
@@ -226,7 +225,6 @@ def build_katago_se_net(*, action_size, attention_dropout=0.1,
     """
     c = dict(KATAGO_SE_CFG)
     c['attention_dropout'] = float(attention_dropout)
-    c['grad_checkpoint'] = int(grad_checkpoint)
     model = AlphaGoNet(
         in_channels=c['in_channels'],
         backbone_channels=c['channels'],
@@ -241,7 +239,6 @@ def build_katago_se_net(*, action_size, attention_dropout=0.1,
         policy_layers=c['policy_layers'],
         action_size=int(action_size),
         arch=c['arch'],
-        use_checkpoint=bool(c['grad_checkpoint']),
     )
     return model, c
 
@@ -326,11 +323,11 @@ def build_v7_stage1_loss(action_size=V7_ACTION_SIZE, num_bins=None):
                         **kw)
 
 
-def build_katago_v7_net(*, board_size=V7_BOARD_SIZE, use_checkpoint=1,
+def build_katago_v7_net(*, board_size=V7_BOARD_SIZE,
                         attn_dropout=None):
     """按 `NBT_TF_CFG` 建 V7 网（已跑 `initialize()`），返回 `(model, cfg)`。
 
-    `cfg` 是**实际生效**的取值（把 `use_checkpoint` / `attn_dropout` 回写进去），
+    `cfg` 是**实际生效**的取值（把 `attn_dropout` 回写进去），
     好让启动日志里的参数量能与 `NBT_TF_CFG` 的预算锚对账 —— 与
     `build_katago_se_net` 的返回契约一致。
     """
@@ -339,10 +336,9 @@ def build_katago_v7_net(*, board_size=V7_BOARD_SIZE, use_checkpoint=1,
     kw = {}
     if attn_dropout is not None:
         kw['attn_dropout'] = float(attn_dropout)
-    model = _build(board_size=int(board_size), use_checkpoint=bool(use_checkpoint),
+    model = _build(board_size=int(board_size),
                 **kw)
     cfg = dict(NBT_TF_CFG)
-    cfg['use_checkpoint'] = bool(use_checkpoint)
     cfg['attn_dropout'] = float(
         attn_dropout if attn_dropout is not None else NBT_TF_CFG['attn_dropout'])
     return model, cfg
@@ -395,50 +391,28 @@ def _device_total_bytes(device):
 
 
 def v7_batch_memory_advice(args, logger, device, *, n_layers, heads, tokens,
-                        use_checkpoint=True):
+                        ):
     """按 `--max-gpu-memory` 检查 V7 的 batch；明显超了就**启动前**报错。
 
     为什么不等到 OOM：真机上 OOM 发生在第一个 batch 反向之后，那时已经白跑了
     数据加载、模型构建、 初始化（实测几分钟），而且 OOM 报的是
     `OutOfMemoryError` 这种**看不出原因**的异常 —— 而原因其实只是一行乘法。
 
-    **checkpoint 感知**：开/关 block 级梯度检查点差 **40×**
-    （驻留 6.9 vs 277.1 MB/样本；fp16 下每样本约 4.65 vs 139.7）。
-    历史实测（2026-10-04，云端 旧多卡环境，batch 3000 ⇒ 64 GB ≈ 21.3 MB/样本）
-    是**补丁前**的数：当时只有 blocks 被 checkpoint，stem 与三个 head
-    走裸前向、激活全程驻留，故比「全开」估算的 8.1 MB/样本高 2.6×。
-    但 21.3 仍只有「无 checkpoint」基线（≈139.7）的 1/6.6 —— block 级
-    checkpoint 在 旧多卡环境 上**确已生效**，旧注释「没真正生效」是过时误读。
-    当前代码 stem/heads 也已 checkpoint（并修了重算吃不到 autocast 的
-    旧多卡环境 OOM 真因），全开理论应 ≈ 8.1 MB/样本（batch 3000 ≈ 24 GB），
-    待 旧多卡环境 真机复测确认。这里仍把**实际配置**对应的每样本字节打出来，
-    让人一眼看出处在哪个区间，而不必靠猜。
+    **checkpoint 已移除**：本仓不再使用梯度检查点，激活全驻留。这里按「无
+    checkpoint」口径估算每样本字节，让人一眼看出显存处在哪个区间，而不必靠猜。
 
     只在能查到设备显存时启用。查不到（CPU / 无 GPU 信息）就只打印估算值，
     不拦 —— 本地冒烟不该被这个门控挡住。
     """
-    ckpt = bool(use_checkpoint)
-    if ckpt:
-        # 驻留（fp16）+ 重算瞬时
-        per_sample = (V7_RESIDENT_MB_PER_SAMPLE[True] / 2.0
-                    + V7_TRANSIENT_MB_PER_SAMPLE_FP16)
-        basis = ('block 级 checkpoint 开：驻留 %.1f + 瞬时 %.1f = %.1f MB/样本'
-                % (V7_RESIDENT_MB_PER_SAMPLE[True] / 2.0,
-                    V7_TRANSIENT_MB_PER_SAMPLE_FP16, per_sample))
-    else:
-        attn_mb = (n_layers * heads * tokens * tokens * 2) / 1e6
-        per_sample = attn_mb + V7_TRANSIENT_MB_PER_SAMPLE_FP16
-        basis = ('block 级 checkpoint **关**：注意力 %d 层 × %.3f MB = %.1f MB/样本'
-                % (n_layers, attn_mb, attn_mb))
+    attn_mb = (n_layers * heads * tokens * tokens * 2) / 1e6
+    per_sample = attn_mb + V7_TRANSIENT_MB_PER_SAMPLE_FP16
+    basis = ('checkpoint 已移除（无重算）：注意力 %d 层 × %.3f MB = %.1f MB/样本'
+            % (n_layers, attn_mb, attn_mb))
     attn = per_sample * args.batch_size * 1e6
     total = _device_total_bytes(device)
     logger.info("[mem] V7 显存：%d 层 × %d 头 × %d² token | %s"
                 " | batch=%d ⇒ 约 %.1f GB",
                 n_layers, heads, tokens, basis, args.batch_size, attn / 1e9)
-    if not ckpt:
-        logger.warning("[mem] block 级 checkpoint 没开 —— 这是 40× 的差距"
-                    "（277 vs 6.9 MB/样本）。它由 KATAGO_SE_CFG['grad_checkpoint']"
-                    "决定，且与 --compile 互斥。")
     if total is None:
         logger.info("[mem] 查不到设备显存总量 ⇒ 跳过 batch 预检"
                     "（--max-gpu-memory 本次不生效）")
@@ -2551,10 +2525,6 @@ def _init_swanlab(args, logger):
                                         if args.v7 else 0),
                 "arch/policy_outputs": (NBT_TF_CFG['policy_outputs']
                                         if args.v7 else 1),
-                # 同样按 `--v7` 分派：V7 用 `NBT_TF_CFG['use_checkpoint']`（也是
-                #   唯一真相源），此前这个键无条件取 12 通道那张表。
-                "grad_checkpoint": (NBT_TF_CFG['use_checkpoint'] if args.v7
-                                    else KATAGO_SE_CFG['grad_checkpoint']),
                 # ---- batch/lr：有效 batch 含累积（漏乘会把学习率口径搞错）----
                 "batch_size_per_card": args.batch_size,
                 "grad_accum": _accum,
@@ -2962,35 +2932,6 @@ def _early_stop_decision(early_stop_metric, current_metric, best_metric, counter
 
 
 
-
-
-#: `resolve_grad_checkpoint` 的第二个返回值：需要打日志解释「为什么 GC 被关掉
-#: /为什么它被保留」。`None` = 保持配置原值、无事发生。
-GC_REASON_COMPILE_EXCLUSIVE = 'compile-exclusive'
-GC_REASON_GC_WITH_COMPILE = 'gc-with-compile'
-
-
-def resolve_grad_checkpoint(grad_checkpoint, *, compile_on, gc_with_compile):
-    """算本次运行的梯度检查点开关。返回 ``(gc, reason)``。
-
-    唯一还在的图编译形态是 ``compile_on``（整模型 ``torch.compile(model)``），
-    而它与梯度检查点**兼容**：原模型被包在 OptimizedModule **内层**，
-    `backbone.assert_grad_checkpoint_compile_compatible` 扫子树看不到
-    ``_orig_mod``；检查点走 ``use_reentrant=False``（``backbone._checkpointed``
-    已经是），正是与 ``torch.compile`` 兼容的那一种。⇒ 两者**可以同时开**。
-
-    默认仍然关掉（保持历史行为），``--gc-with-compile 1`` 才保留 —— 因为关掉 GC
-    意味着激活全驻留、batch 被迫调小，而 batch 缩小吃掉的吞吐通常远大于融合
-    省下的（40GB 卡上这条尤其硬：GC 关掉后 batch 直接对不上算力）。
-
-    抽成函数而不是内联在 ``main()`` 里：这条策略有两个输入组合、且两个 reason
-    各对应一条不同的 warning/info，内联的话只能靠源码字面断言来测。
-    """
-    if compile_on and not gc_with_compile:
-        return 0, GC_REASON_COMPILE_EXCLUSIVE
-    if compile_on and gc_with_compile:
-        return int(grad_checkpoint), GC_REASON_GC_WITH_COMPILE
-    return int(grad_checkpoint), None
 
 
 def _build_param_groups(model, args) -> list[dict]:
@@ -3434,10 +3375,7 @@ def main():
                     help='手写 math 注意力按 query 分块的长度（0=关闭）：softmax 沿 '
                         'key 轴 ⇒ 分块数学精确，峰值 ∝ chunk。只影响 math 路径，'
                         'SDPA/SFA 融合路径自行管理显存（默认 64，0=关闭）')
-    ap.add_argument('--attn-chunk-ckpt', type=int, default=1, choices=[0, 1],
-                    help='math 路径逐 chunk 梯度检查点：把注意力矩阵变成反向时一块块'
-                        '重算（不依赖 block 级 checkpoint 是否生效）。'
-                        '0=关闭，1=开启（默认开启）')
+
     ap.add_argument('--attn-online', type=int, default=0, choices=[0, 1],
                     help='手写 math 注意力改用 online-softmax（flash 风格）实现：'
                         '不物化 (Nq,Nk) 分数矩阵 ⇒ 反向不保留它（省显存），'
@@ -3597,8 +3535,7 @@ def main():
                         '那几步里的软行会按 one-hot 训 —— 这正是 spec §5 退路表'
                         '点名的「混合训练 ⇒ index 0 向两种语义折中」，只在'
                         '明确知道后果时才用。必须 >= 1')
-    ap.add_argument('--use-checkpoint', type=int, default=0, choices=[0, 1],
-                    help='用 gradient checkpointing 减少显存占用（约省 50%%，训练慢 ~30%%）(0=关闭, 1=开启)')
+
     ap.add_argument('--use-ema', type=int, default=0, choices=[0, 1],
                     help='启用 EMA（指数移动平均）权重，eval/save 时用 shadow 权重，提升 1-3%% accuracy (0=关闭, 1=开启)')
     ap.add_argument('--gradient-accumulation-steps', type=int, default=1,
@@ -3644,21 +3581,7 @@ def main():
                          '随后正常训练仍用 `fullgraph=False`。开启会多编译一次 '
                          '（max-autotune 下多花几分钟），仅排查时临时启用，'
                          '默认 0 = 不探测。配合已开启的 `log_graph_breaks` 看断点原因。')
-    ap.add_argument('--gc-with-compile', type=int, default=0, choices=[0, 1],
-                    help='开 --compile 时**仍然保留**梯度检查点（1=保留，0=照旧关掉）。'
-                         '默认 0 是历史行为：compile 与 GC 被当成二选一'
-                         '（见下面 `_gc = 0` 那段）。那条策略的来源是 加速器/旧编译栈 的'
-                         '图捕获限制，不是 A100/CUDA 上的技术必然 —— 检查点走 '
-                         '`use_reentrant=False`（`backbone._checkpointed` 已经是），'
-                         '与 `torch.compile` 兼容，且 `backbone.'
-                         'assert_grad_checkpoint_compile_compatible` 只在**子树里**'
-                         '扫 `_orig_mod`，整模型 `torch.compile(model)` 把原模型包在内层，'
-                         '扫不到、不会被拦。\n'
-                         '为什么要开：关掉 GC 意味着激活全驻留，batch 被迫调小，'
-                         '而 batch 缩小吃掉的吞吐通常远大于融合省下的 —— '
-                         '40GB 卡上这是「要融合就没显存」的根源。'
-                         '（V7 的 head 之前返回 dict、穿不过 checkpoint 的那个问题'
-                         '已修，见 `katago_v7._ckpt`。）')
+
     ap.add_argument('--scaler-growth-interval', type=int, default=0,
                     help='连续多少个无溢出 step 后把缩放值翻倍')
     ap.add_argument('--flash-attn', type=int, default=1, choices=[0, 1],
@@ -4041,7 +3964,7 @@ def main():
         logger.info("[device] CPU | 走 FP32 路径（无 AMP/编译）")
 
     # CUDA 分支已在上面把 `--compile` 的 None 收敛掉了；这里补齐其余后端，
-    # 让后面所有分支（`_gc` 判定、`elif args.compile == 1`）都只看到确定的 0/1。
+    # 让后面所有分支（`elif args.compile == 1`）都只看到确定的 0/1。
     if args.compile is None:
         args.compile = 0
 
@@ -4079,19 +4002,12 @@ def main():
     # （2026-10-06：三个融合/分块开关的环境变量已全部换成 CLI 参数）
     _attn_chunk = int(args.attn_query_chunk or 0)
     _backbone.set_attn_query_chunk(_attn_chunk)
-    # 逐 chunk 梯度检查点（2026-10-04 新增）：分块只降瞬时峰值，**不降保留量** ——
-    # 每块的 softmax 输出都被 autograd 存着等反向。逐块 checkpoint 把占大头的
-    # 注意力矩阵变成「反向时一块一块重算」，**不依赖 block 级 checkpoint 是否生效**
-    # （实测云端 旧多卡环境 上 64 GB ≈ 无 checkpoint 的估算值）。
-    # 默认开；`--attn-chunk-ckpt 0` 关闭。
-    _backbone.set_attn_chunk_checkpoint(int(args.attn_chunk_ckpt))
     # 加速器 融合算子总闸（置 0 只慢不坏，数值口径不变）。
 
     # online-softmax 注意力（flash 风格）：由 `--attn-online` 控制（默认关）。
     # 与 materialize 路径**数值等价但非逐位相同**（实测 fp32 max|Δ|≈7e-07），
     # 而 12 通路的 test_twelve_channel_path_bit_identical 正是靠逐位一致发现
-    # 意外的数值变化 ⇒ 默认关闭，开关走命令行而不是环境变量（`--use-checkpoint`
-    # 当年被「归档」就是因为开关只藏在 config 表里、没有干净入口）。
+    # 意外的数值变化 ⇒ 默认关闭，开关走命令行而不是环境变量。
     #
     # 打开前建议先跑 `pytest tests/test_online_softmax_attn.py`（前向等价 + 梯度
     # gradcheck + bf16/autocast）。`dropout_p > 0` 时它自动回退 materialize
@@ -4175,7 +4091,7 @@ def main():
     logger.info("[data] 总样本数=%d | 训练=%d | 验证=%d", n, len(train_idx), len(eval_idx))
 
     # 单卡：不启用分布式采样器，训练循环直接对 train_idx 做本地 shuffle。
-    train_sampler = None
+    # （原 `train_sampler = None` 是 DDP 移除后的残留，删于 2026-10-11。）
 
 # ------------------------------------------------------ 结构（唯一）----
     # 训练结构**唯一** = `KATAGO_SE_CFG`（本文件顶部那张表，KataGo
@@ -4184,27 +4100,7 @@ def main():
     # 与下面这一整串）**全部归档：不参与建网**，仍被 argparse 接受只为旧 shell
     # 不必改命令行（忽略而非报错，是这条约束的硬要求；运行日志里那句
     # 「结构参数已归档」就是这里）。
-    # `--use-checkpoint` 同样归档：检查点开关 = `KATAGO_SE_CFG['grad_checkpoint']`
-    # ∧「未开图编译」，见下。
     # 没有任何 arch 分支、也没有新增任何 CLI。
-    _gc, _gc_reason = resolve_grad_checkpoint(
-        KATAGO_SE_CFG['grad_checkpoint'],
-        compile_on=(args.compile == 1),
-        gc_with_compile=(args.gc_with_compile == 1))
-    if _gc_reason == 'compile-exclusive':
-        logger.warning(
-            "[model] --compile 1 ⇒ 本次运行关闭 gradient checkpointing"
-            "（配置的 %d，显存占用回升）；要同时开请加 --gc-with-compile 1",
-            KATAGO_SE_CFG['grad_checkpoint'])
-    elif _gc_reason == 'gc-with-compile':
-        logger.info(
-            "[model] --gc-with-compile 1 ⇒ compile 与 gradient checkpointing "
-            "**同时**开启（grad_checkpoint=%d；检查点为 use_reentrant=False，"
-            "与整模型 torch.compile 兼容）", _gc)
-    elif args.use_checkpoint == 0:
-        logger.info("[model] --use-checkpoint 已归档：检查点开关由 "
-                    "KATAGO_SE_CFG[%r]=%d 决定，本次启用（如需关闭请用 --compile 1）",
-                    'grad_checkpoint', _gc)
     _v7_lossf = None
     if _v7_on:
         # ---- B8 · V7（22 通道 NBT+Transformer）----------------------------
@@ -4213,7 +4109,6 @@ def main():
         # 仍是行为参数，照旧透传（V7 的默认是 0.0）。
         model, _eff_cfg = build_katago_v7_net(
             board_size=V7_BOARD_SIZE,
-            use_checkpoint=_gc,
             attn_dropout=args.attention_dropout,
         )
         _v7_lossf = build_v7_stage1_loss(
@@ -4225,13 +4120,11 @@ def main():
             v7_batch_memory_advice(
                 args, logger, device, n_layers=_n_att,
                 heads=NBT_TF_CFG['num_heads'],
-                tokens=V7_BOARD_SIZE * V7_BOARD_SIZE,
-                use_checkpoint=bool(_gc))
+                tokens=V7_BOARD_SIZE * V7_BOARD_SIZE)
     else:
         model, _eff_cfg = build_katago_se_net(
             action_size=args.board_size * args.board_size + 1,  # +1 为 pass 类别
             attention_dropout=args.attention_dropout,           # 行为参数，仍生效
-            grad_checkpoint=_gc,
         )
     model = model.to(device)
     n_params = sum(p.numel() for p in model.parameters())
@@ -4253,35 +4146,22 @@ def main():
                 "（全网 / 主干），锚 %d / %d。改了结构表就要重数这两个数。",
                 n_params, _n_backbone,
                 _eff_cfg['params_total'], _eff_cfg['params_backbone'])
-    # 逐段开关也打出来：「grad_checkpoint=1」只说明**总开关**，看不出哪几段真的在
-    # 走检查点（per-kind 默认可以不同；且训练态闸门还要求 self.training +
-    # grad enabled）。这段日志的用处是让「GC 到底生效没有」不必翻代码，也不必
-    # 在云端日志里靠猜 —— 4×旧多卡环境 首跑要看的就是它。
-    # mixin 宿主有两种拓扑：12 通道挂 `model.backbone`，V7（NbtTfNet 自己
-    # 继承 mixin、没有 `.backbone`）挂 `model`。原来只查后者 ⇒ V7 永远打 `n/a`，
-    # 而这段日志的全部用处就是让人不翻代码就看出 GC 有没有生效。
-    _gc_owner = model if hasattr(model, 'grad_checkpointing_kinds') \
-        else getattr(model, 'backbone', None)
-    _gc_kinds = getattr(_gc_owner, 'grad_checkpointing_kinds', None)
-    _gc_kinds = _gc_kinds() if callable(_gc_kinds) else {}
     if _v7_on:
         # 预算锚不在本表里（`NBT_TF_CFG` 带的是 stem/block/head 的**分项**锚，
         # 主干合计与全网合计由 tests/test_katago_v7_budget.py 钉），所以这里
         # 只打实测值并指向那个测试，不做「与锚不符」的判定 —— 否则每次都误报。
         logger.info("[model] v7 NBT2+Transformer (%dch / %d 段 / %d 头 / %dch 空间"
-                    "+%dch 全局) 参数量=%.2fM（主干 %.2fM）| grad_checkpoint=%d"
+                    "+%dch 全局) 参数量=%.2fM（主干 %.2fM）"
                     " | 设备=%s（预算锚见 tests/test_katago_v7_budget.py）",
                     _eff_cfg['trunk_channels'], _eff_cfg['num_blocks'],
                     _eff_cfg['num_heads'], V7_SPATIAL_CHANNELS, V7_GLOBAL_CHANNELS,
-                    n_params / 1e6, _n_backbone / 1e6, _gc, device)
+                    n_params / 1e6, _n_backbone / 1e6, device)
     else:
         logger.info("[model] %s (%dch / %d 段 / mix+%d 注意力) 参数量=%.2fM"
-                    "（主干 %.2fM）| grad_checkpoint=%d | 设备=%s",
+                    "（主干 %.2fM）| 设备=%s",
                     _eff_cfg['arch'], _eff_cfg['channels'], _eff_cfg['blocks'],
                     _eff_cfg['num_attention_layers'],
-                    n_params / 1e6, _n_backbone / 1e6, _gc, device)
-    logger.info("[model] GC 逐段开关=%s | 生效还需 training 态+grad enabled"
-                "（eval/推理恒不检查点，零开销）", _gc_kinds or 'n/a')
+                    n_params / 1e6, _n_backbone / 1e6, device)
 
     # 把卷积型特征（N,C,H,W）转 channels_last(NHWC)，卷积算子走更快内存布局。
     # 输入也需同步转格式（见训练/评估循环），故这里仅转换模型权重布局。

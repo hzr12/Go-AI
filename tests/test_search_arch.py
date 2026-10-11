@@ -3,12 +3,13 @@
 三项测量都必须可信，否则整个搜索无意义：
   * 参数量  —— 直接求和，最容易错的是漏算/重算
   * FLOPs   —— 必须按 batch=1 测，否则被 batch 放大
-  * 激活显存 —— 必须按 **storage 去重**，且要正确反映 gradient checkpointing
+  * 激活显存 —— 必须按 **storage 去重**，且要正确反映（探针用
+    `checkpoint_sequential` 包裹主干 blocks 时的）梯度检查点重算
 
 尤其第三项：曾用 `t.numel() * element_size()` 累加，实测高估 48%
 （反向保存大量视图，共享同一块 storage，被重复计数）；改按
 `untyped_storage().nbytes()` + `data_ptr()` 去重后误差降到 21%，剩余
-部分来自 checkpoint 重算临时量被按「同时存活」计入。
+部分来自探针 checkpoint 重算临时量被按「同时存活」计入。
 
 P4.9 另覆盖两件事：`--preset` 取值修型（store_true -> choices）、measure 的
 多通道支持（默认 12 零回归）。
@@ -106,38 +107,6 @@ def test_checkpointing_reduces_retained_memory():
     assert ret_ckpt < ret_plain, \
         '开启 checkpoint 后保留显存未减少（{} vs {}），计量或实现有问题'.format(
             ret_ckpt, ret_plain)
-
-
-def test_probe_owns_checkpoint_semantics(monkeypatch):
-    """计量口径必须由探针钉死，不随主干的检查点策略漂移（P4.6b 回归钉）。
-
-    背景：锚点 31.12GB（use_checkpoint 1）是 `checkpoint_sequential` 口径
-    实测的（逐块检查点、最后一块保留），k≈0.83 与 attn_window 显存敏感性
-    都建立在它上面。P4.6b 把主干 `use_checkpoint=True` 换成「每块都检查点」
-    后，同一探针 k 漂到 1.35、attn_window 敏感性消失——上两个测试因此变红。
-
-    修复契约：`measure()` 构造后**显式关掉主干自己的检查点开关**、自己包裹
-    `_ProbeCheckpointBlocks`。故无论子类在构造时把主干策略设成 True 还是
-    False，`measure(use_checkpoint=True)` 的结果都必须逐项相等。开/关两种
-    策略至少一种会在「探针继承主干策略」的旧实现上撞出差异。
-    """
-    baseline = S.measure(SMALL, probe_bs=2)
-
-    def force_policy(policy):
-        class ForceNet(S.AlphaGoNet):
-            def __init__(self, *args, **kwargs):
-                super().__init__(*args, **kwargs)
-                self.backbone.use_checkpoint = policy
-                if hasattr(self.backbone, 'set_grad_checkpointing'):
-                    self.backbone.set_grad_checkpointing(policy)
-        return ForceNet
-
-    for policy in (False, True):
-        monkeypatch.setattr(S, 'AlphaGoNet', force_policy(policy))
-        got = S.measure(SMALL, probe_bs=2)
-        assert got == baseline, \
-            '主干检查点策略={} 影响了计量（探针没有钉死语义）: {} != {}'.format(
-                policy, got, baseline)
 
 
 def test_attention_window_affects_memory():
@@ -350,7 +319,7 @@ def test_measure_default_unchanged():
     a = S.measure(SMALL, probe_bs=2)
     b = S.measure(SMALL, probe_bs=2, in_channels=12)
     assert a == b, '默认通道数与显式 12 结果不一致（零回归被破坏）'
-    # 既有调用方（test_run_py_sh / test_v19_budget）的形态：不传 in_channels
+    # 既有调用方（test_run_py_sh 等）的形态：不传 in_channels
     r1 = S.project(dict(SMALL), 2800)
     r2 = S.project(dict(SMALL), 2800, in_channels=12)
     assert r1 == r2
@@ -421,7 +390,7 @@ def test_se_cfg_actually_builds_se_and_attn_blocks():
     from src.networks.backbone import AttentionResBlock
     from scripts.train_sft import KATAGO_SE_CFG as K
     m = AlphaGoNet(in_channels=12, action_size=362,
-                   attention_dropout=0.0, use_checkpoint=False, **dict(S.SE_CFG))
+                   attention_dropout=0.0, **dict(S.SE_CFG))
     blocks = list(m.backbone.blocks)
     n_se = sum(isinstance(b, SEBottleneck) for b in blocks)
     n_attn = sum(isinstance(b, AttentionResBlock) for b in blocks)

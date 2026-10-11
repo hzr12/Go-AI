@@ -1,5 +1,3 @@
-import contextlib
-import functools
 import math
 
 import torch
@@ -108,187 +106,6 @@ class ResBlock(nn.Module):
         return out
 
 
-# ============================================================================
-# 梯度检查点（P4.6b）
-#
-# 本节是**通用机制**，不含任何具体主干容器 —— 容器归 `SharedBackbone` /
-# `AlphaGoNet`（src/networks/alphanet.py）。两者通过 `GradCheckpointMixin` +
-# `run_grad_segment()` 这一对接口对接。
-# ============================================================================
-
-#: 块类型标识。现役只有 `legacy`：`SharedBackbone.blocks` 那个混合列表（resnet /
-#: convnext / se_bottleneck / attention 混排）走这一段。
-#:
-#: `res` / `transformer` 两个 kind **注册但当前无人调用** —— `ResBlock` 与
-#: `TransformerBlock` 都还在（前者是 v12/v18 的基本块，后者是可复用的 pre-norm
-#: 块），但没有任何现役主干按 kind 分段调用它们。保留这两个常量是为了
-#: `run_segment(..., kind=...)` 的调用面与既有测试不必因为「删了一个类」而重写；
-#: 随 v21 一起退役的 `mamba` / `cross_attn_res` 两个 kind 已删除（对应块类
-#: `MambaLTI` / `CrossAttnRes` 不复存在，留着就是两个永远点不到的死常量）。
-GC_RES = 'res'
-GC_TRANSFORMER = 'transformer'
-GC_LEGACY = 'legacy'
-
-#: 逐 kind 的默认开关。语义不变：`legacy` 默认**关**（不改变既有路径的行为）。
-GRAD_CHECKPOINT_DEFAULTS = {
-    GC_RES: True,
-    GC_TRANSFORMER: True,
-    GC_LEGACY: False,
-}
-
-#: 旧路径的**段粒度**：`checkpoint_sequential(blocks, len(blocks), x)` 的粒度
-#: 就是「每块一段」，所以旧路径必须逐块，不能并段。
-#:
-#: 这**不是**一个可以随手「顺手统一」的默认值 —— 它是旧路径显存口径的一部分。
-#: v18 形状（17 块、192 通道）实测留给反向的字节：
-#:     逐块（本值）  16 个段入口   ≈ 与 HEAD 的 `checkpoint_sequential` 一致
-#:     并段                1 个段入口   ≈ 省 16×
-#: 换句话说：把本表清空（`{}`）会让旧路径的真实训练显存**静默大降**，而
-#: `search_arch` 的标定因子 k 是照着「逐块」那一档锚在 v18 的 31.12GB 实测上的。
-#: 并段本身是更好的显存策略，但它是一次**需要重标 k** 的行为变化，不能混在
-#: 「机制重构」里做。见 `tests/test_grad_checkpointing.py::
-#: test_legacy_granularity_is_pinned_to_checkpoint_sequential`。
-#: 见上面那段裁决：逐块。
-GC_PER_BLOCK_DEFAULT = {
-    GC_RES: True, GC_TRANSFORMER: True,
-    GC_LEGACY: True,
-}
-
-
-# 粒度裁决（2026-09-30，用户 4×910A OOM 之后实测；历史，裁决对象已退役）
-# --------------------------------------------------------
-# 原裁决：某些 kind 用**段级**（同类型连续块合并成一个 checkpoint 段，brief §2 的
-# (b)），理由是「(a) 会在每块边界留激活、(b) 只留 1 个；重算的调度开销两者相同，(b)
-# 的 autograd 钩子还少 4/5」。
-#
-# 那个比较**只看了留给反向的存储，没看重算期的峰值** —— 而 OOM 是被后者打爆的：
-# 段级把整段包进**一个** `checkpoint`（`run_grad_segment` 的 `if not per_block:`
-# 分支），于是反向重算时**整段内部所有块的中间激活同时活着**，峰值按「段」计。
-#
-# 实测（tests 同款 harness，B=32 / 19 路 / 184ch / fp32 CPU，区间峰值增量）：
-#     段级   fwd 292.9 MB   fwd+bwd 1306.6 MB   fwd+bwd 26.36 s
-#     逐块   fwd 189.9 MB   fwd+bwd  149.0 MB   fwd+bwd 26.08 s
-# 逐块在**两个峰值上都更低**（B=8 时前向驻留反而高 91.7 vs 72.5，那是 16 个段的开销
-# 还压得住的小 batch 情形），而**耗时不增**（重算总量本来就一样，只是峰值从「一段」
-# 降到「一块」）。
-#
-# 与分片并行的关系：分片包装本来就是按块类切（每个块是一个 wrap unit），逐块检查点
-# 与它 1:1 对齐，重算时只重新 all-gather 一个 unit —— 段级则会让重算横跨多个 unit。
-# 留下这段是为了**别再犯同一个错**：本表里现役只有 `legacy`，而 `legacy` 是
-# **逐块**；任何新增的分段主干请直接沿用逐块，除非愿意像上面那样实测重算峰值。
-
-
-class _BatchNormStatGuard:
-    """**只包住重算**的 BatchNorm running stats 快照/还原（P4.6b §4.2）。
-
-    为什么必须有它
-    --------------
-    `nn.BatchNorm2d` 在 `self.training` 下每次前向都会原地更新
-    `running_mean` / `running_var` / `num_batches_tracked`。检查点段在反向时会把
-    段内前向**再跑一遍**，于是统计被更新两次：`num_batches_tracked` 变成 2、
-    `running_mean` 被 `(1-m)²·orig + …` 污染。`ResBlock` 有两个 BN，8 个块就是
-    16 次额外更新。
-
-    为什么是「快照 + 原地还原」而不是 brief 建议的 `track_running_stats=False`
-    -------------------------------------------------------------------
-    `track_running_stats=False` 会**改变反向要存的张量集合**：
-    `native_batch_norm` 只有在拿到 `running_mean/running_var` 时才把 `save_mean`
-    与 `save_invstd` 留给反向更新统计，实测 saved tensor 数从 9 掉到 7，
-    `torch.utils.checkpoint` 的 `determinism_check='default'` 直接抛
-    `CheckpointError: A different number of tensors was saved during the original
-    forward and recomputation`。要么关掉 determinism 检查（那会连带关掉对真正
-    非确定性的防护），要么改用本类。
-     归一化数值本身两者**相同**（`training=True` 时 BN 一律按 batch 统计归一化，
-    `track_running_stats` 只决定要不要写 buffer）—— 所以本方案不碰计算图，
-    只在重算前后把三个 buffer 还原，输出/梯度/`determinism_check` 全部一字不变，
-    而 buffer 与单次前向**逐位相等**（含 `num_batches_tracked` 回到 1）。
-
-    用 `context_fn` 的第二个 context（recompute）而不是「数调用次数」
-    ------------------------------------------------------------
-    `checkpoint(..., use_reentrant=False, context_fn=f)` 的 `f()` 返回
-    `(forward_ctx, recompute_ctx)`；`recompute_ctx` **只在重算期间**被进入
-    （实测进入 1 次），`forward_ctx` 包原前向。语义正好对上「重算时把统计还回去」。
-    """
-
-    def __init__(self, bns):
-        self._bns = list(bns)
-        self._snap = []
-        self.entries = 0
-
-    def __enter__(self):
-        self.entries += 1
-        self._snap = [
-            (bn,
-             None if bn.running_mean is None else bn.running_mean.clone(),
-             None if bn.running_var is None else bn.running_var.clone(),
-             None if bn.num_batches_tracked is None else bn.num_batches_tracked.clone())
-            for bn in self._bns
-        ]
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        for bn, rm0, rv0, nb0 in self._snap:
-            if bn.running_mean is not None and rm0 is not None:
-                bn.running_mean.copy_(rm0)
-            if bn.running_var is not None and rv0 is not None:
-                bn.running_var.copy_(rv0)
-            if bn.num_batches_tracked is not None and nb0 is not None:
-                bn.num_batches_tracked.copy_(nb0)
-        return False
-
-
-def _collect_batchnorms(blocks):
-    """收集段内所有 `_BatchNorm`（含段元素本身就是 BN 的情况）。"""
-    out = []
-    for b in blocks:
-        for m in b.modules():
-            if isinstance(m, nn.modules.batchnorm._BatchNorm):
-                out.append(m)
-    return out
-
-
-def compiled_module_paths(module):
-    """返回 `module` 子树里被 `torch.compile` 包过的模块名（P4.7 的 D2 形态）。
-
-    P4.7 不再 `torch.compile(整模型)`，而是**就地**把每个 `nn.Linear` 换成
-    `torch.compile(...)` 的 `OptimizedModule`；`OptimizedModule` 恒有 `_orig_mod`
-    属性（`inference.py` 的 `getattr(model, '_orig_mod', model)`、`train_sft.py` 的
-    `_ema_key` 归一化都靠它），所以 `_orig_mod` 就是「这段子图被编译了」的结构判据。
-    顺带把 `module` 自身也算进去（整模型被 `torch.compile` 包住的情形）。
-    """
-    bad = []
-    if hasattr(module, '_orig_mod'):
-        bad.append('<self>')
-    for name, m in module.named_modules():
-        if name and hasattr(m, '_orig_mod'):
-            bad.append(name)
-    return bad
-
-
-def assert_grad_checkpoint_compile_compatible(module, where=''):
-    """梯度检查点与 `torch.compile` 互斥守卫（P4.6b；P4.7b 必须保留）。
-
-    冲突面：`torch.utils.checkpoint` 靠 `saved_tensors_hooks` 工作，而
-    `torch.compile` 靠 Dynamo/inductor 的图捕获工作；P4.7 把 `nn.Linear` 逐个编译
-    之后，一个检查点段内部会同时出现「编译过的 Linear」与「重算钩子」，收益
-    不可预期（段的重算要么被 Dynamo 拆成 graph break、要么整段退化成 eager），
-
-     覆盖面：这里只能看见**本子树内**的 `_orig_mod`。若整个模型被
-    `torch.compile(model)` 包住（`inference.py` 的 CUDA `--compile` 路径），
-    `module` 是被包在里面的那个原始模块、自树扫不到 —— 那一条要在**编译的调用点**
-    上再查一次，用同一个函数（`assert_grad_checkpoint_compile_compatible(model)`
-    在 `torch.compile` 之后调）。本函数在「检查点开着的前向」里也会被调一次，
-    所以 P4.7 的逐 Linear 形态在训练第一步之前就会被抓住。
-    """
-    bad = compiled_module_paths(module)
-    if bad:
-        raise RuntimeError(
-            '梯度检查点与 torch.compile 互斥%s：以下子模块已被 torch.compile 包成 '
-            'OptimizedModule（带 _orig_mod）：%s。请二选一 —— 关掉梯度检查点'
-            '（model.set_grad_checkpointing(False)）或关掉编译。'
-            % ('（%s）' % where if where else '', ', '.join(bad[:8])))
-
-
 def _segment_runner(blocks, taps_want):
     """造出「按顺序跑 `blocks`、顺带记下若干抽头」的函数。"""
     tapset = set(taps_want)
@@ -306,7 +123,7 @@ def _segment_runner(blocks, taps_want):
             # 抽头取该块的**输出**（不是下一个块的输入）—— 两者在 i>0 时是同一个
             # 张量对象，只有 i=0 才差一个块，而那正是 P4.1 §7.3 编号歧义最容易
             # 踩错的位置（s1 = ResBlock #1 的输出 ⇒ `tap_positions=(0,)`，不是 stem
-            # 的输出）。判据见 test_grad_checkpointing 里那条逐块 hook 对照。
+            # 的输出）。
             if i in tapset:
                 captured[i] = out[0] if isinstance(out, tuple) else out
             cur = tuple(out) if isinstance(out, tuple) else (out,) + cur[1:]
@@ -317,445 +134,12 @@ def _segment_runner(blocks, taps_want):
     return run
 
 
-def run_grad_segment(blocks, args, use_checkpoint=False, tap_positions=(),
-                     per_block=None, uncapped_last=False, kind=None,
-                     guard_root=None):
-    """把 `blocks` 当作**一个段**跑；`use_checkpoint` 时整段走梯度检查点。
-
-    Args:
-        blocks: 段的模块序列（同一块类型的一段，见 §2 的粒度裁决）。
-        args: 段入口的位置参数元组。`ResBlock`/`TransformerBlock`/`SEBottleneck`
-            是 `(x,)`；多输入块是 `(x, taps)`。**逐位置传入**，所以不假设签名。
-        use_checkpoint: 段是否走检查点。调用方（`GradCheckpointMixin.run_segment`）
-            已把 `self.training` 与总开关合并进来。
-        tap_positions: 需要额外返回的**块下标**（0-based，升序）—— 取的是这些块的
-            **输出**（`tap_positions=(0,)` = 段内第 1 块的输出，不是段入口）。
-            这些张量作为检查点段的**额外出参**返回，因此仍参与反向，但段内的其它
-            中间激活不留。
-        per_block: 逐块检查点（`True`）还是整段合并（`False`）。默认按 kind 取
-            `GC_PER_BLOCK_DEFAULT`（只有旧路径为 True，与 `checkpoint_sequential`
-            的既有粒度一致）。
-        uncapped_last: **段的最后一块不检查点**。这是
-            `torch.utils.checkpoint.checkpoint_sequential` 的文档语义
-            （"All segments except the last will not store the intermediate
-            activations" / 源码注释 "the last chunk has to be non-volatile"），
-            旧路径必须照搬，否则 `use_checkpoint=True` 就是一次**未声明的既有
-            行为变化**（见 `SharedBackbone.forward` 的注释与
-            `task-p4-6b-fix-report.md` B1）。逐块粒度下**不要**开这个选项 ——
-            豁免末块等于白放弃最后一块的收益。
-        kind: 仅用于取默认粒度与报错信息。
-        guard_root: 传模块则每次前向做一次 compile 互斥检查（便宜：一个模型 ~100
-            个子模块，微秒级；换来「编译发生在构造之后」也能被抓住）。
-
-    Returns:
-        `(out, taps)`；`taps` 是长度为 `len(tap_positions)` 的元组，顺序与
-        `tap_positions` 的升序一致。
-
-    `use_reentrant=False` 的理由（不是默认值偷懒，是有依据地选）
-    -----------------------------------------------------------
-    1. `context_fn` **只在非重入路径可用**（重入路径直接 `ValueError`）——
-       `_BatchNormStatGuard` 就挂在这里，这是硬需求。
-    2. 重入路径要求「至少一个输入张量 `requires_grad`」，否则整段**静默不产生
-       梯度**。非重入路径靠段内的 `saved_tensors_hooks` 建图，段入口不需要
-       `requires_grad`（上游被 `no_grad` / 冻结时也不会悄悄丢梯度）。
-    3. 非重入支持 `autograd.grad`、非张量出参、以及嵌套检查点；重入路径不支持
-       非张量出参（本函数在有抽头时返回 tuple）。
-    4. 重入路径不支持关键字参数与 `torch.autograd.function` 的一些边角。
-    代价：重入路径对「有副作用的段」更宽容，而本文件的段**没有**副作用
-    （BN 的 buffer 写已由 `_BatchNormStatGuard` 兜住）—— 所以这条代价在这里是 0。
-    """
-    blocks = list(blocks)
-    taps_want = sorted(int(p) for p in tap_positions)
-    for p in taps_want:
-        if not 0 <= p < len(blocks):
-            raise ValueError('抽头下标 %d 越界：段里只有 %d 个块' % (p, len(blocks)))
-    if per_block is None:
-        per_block = GC_PER_BLOCK_DEFAULT.get(kind, False)
-
-    # `active` 里的 `torch.is_grad_enabled()` **不是**死代码，但**在经
-    # `GradCheckpointMixin.run_segment` 的路径上确实观察不到**（mixin 的
-    # `grad_checkpointing_for` 已经先算过一遍同样的条件，见下）。它守的是
-    # `run_grad_segment` 这个**公开函数被直接调用**的路径 —— 那条路上没有 mixin
-    # 也没有 `self.training`，`use_checkpoint` 是调用者自己传的。这不是理论上的
-    # 假设：`tests/test_grad_checkpointing.py::
-    # test_run_grad_segment_itself_never_checkpoints_under_no_grad` 就走这条路，
-    # 而把本行删掉会让那条测试变红。两条门必须**都**在：mixin 的门负责
-    # eval/推理的零行为变化，本行的门负责直接调用者的 no_grad 契约。
-    active = bool(use_checkpoint) and torch.is_grad_enabled()
-    if active and guard_root is not None:
-        assert_grad_checkpoint_compile_compatible(
-            guard_root, 'kind=%s' % kind if kind else '')
-
-    # `uncapped_last`：最后一块**不进**任何检查点段（`checkpoint_sequential`
-    # 的文档语义）。段长 <= 1 时于是「无可检查点」，与 torch 在单段时的
-    # 落空行为（`range(0, 0, 1)` 空循环 → 直接跑 `functions[-1]`）一致。
-    capped = blocks[:-1] if uncapped_last else blocks
-
-    if not active or not capped:
-        ret = _segment_runner(blocks, taps_want)(*tuple(args))
-        if taps_want:
-            return ret[0], tuple(ret[1])
-        return ret, ()
-
-    if not per_block:
-        out = _checkpointed(_segment_runner(capped, taps_want), args,
-                            _collect_batchnorms(capped))
-        if taps_want:
-            return out[0], tuple(out[1])
-        return out, ()
-
-    want = set(taps_want)
-    cur = tuple(args)
-    captured = {}
-    for i, blk in enumerate(blocks):
-        if i < len(capped):
-            o = _checkpointed(_segment_runner([blk], ()), cur,
-                              _collect_batchnorms([blk]))
-        else:
-            o = blk(*cur)
-        new_x = o[0] if isinstance(o, tuple) else o
-        if i in want:
-            captured[i] = new_x
-        cur = tuple(o) if isinstance(o, tuple) else (new_x,) + cur[1:]
-    if not want:
-        return cur[0], ()
-    return cur[0], tuple(captured[i] for i in taps_want)
 
 
-def _autocast_like(t):
-    """按**区域输入张量的 dtype** 造一个等价的 autocast 上下文（重算期间用）。
-
-    为什么不用「查 autocast 状态」：2026-10-01 的 OOM 根因就是重算不在 autocast
-    里（`backward()` 时前向的 `with autocast(...)` 早已退出），而查状态这条路
-    不可靠 —— `torch.is_autocast_enabled()` 只反映 **CUDA** 的 autocast，对
-    查状态这条路不可靠：部分后端自己实现 autocast，`device_type` 不对就读不到
-    （实测在本地抓到 None ⇒ 修复静默失效）。
-
-    输入张量的 dtype 反而是**最准**的信号：它就是前向在该边界实际产出的精度。
-      输入 fp16/bf16 ⇒ 前向在低精度下 ⇒ 重算也该在低精度下；
-      输入 fp32      ⇒ 前向本来就是全精度 ⇒ 不需要任何 autocast。
-    dtype 沿参数推进时可能被提升（如 Mamba 的 `A_log` 是 fp32 参数，
-    `dt(fp16) * A(fp32)` → fp32），这由 ops 自己的类型提升处理，与 autocast 无关。
-
-    抓不到 / 构造失败一律退回 `nullcontext` ⇒ 最坏是「没改善」，不会更差。
-    """
-    if not isinstance(t, torch.Tensor):
-        return contextlib.nullcontext()
-    if t.dtype not in (torch.float16, torch.bfloat16):
-        return contextlib.nullcontext()
-    try:
-        return torch.autocast(device_type=t.device.type, dtype=t.dtype)
-    except Exception:  # noqa: BLE001
-        return contextlib.nullcontext()
 
 
-class _AutocastRecomputeProbe(torch.nn.Module):
-    """只用来做一次性探针的最小模块（见 `_recompute_preserves_autocast`）。"""
-
-    def __init__(self):
-        super().__init__()
-        self.lin = torch.nn.Linear(4, 4)
-        self.seen = []
-
-    def forward(self, x):
-        self.seen.append(torch.is_autocast_enabled(x.device.type))
-        return self.lin(x)
 
 
-#: 探针结果缓存：`{'device': 类型, 'preserved': bool|None}`。`None` = 还没探过
-#: 或探针本身失败（此时按「需要 context_fn」处理，即回到最保守的一侧）。
-_AUTOCAST_PROBE = {'device': None, 'preserved': None}
-
-
-def _recompute_preserves_autocast(device_type):
-    """`use_reentrant=False` 的 checkpoint **自己**会不会把 autocast 带进重算期？
-
-    为什么要有这个探针
-    ------------------
-    `_recompute_context_fn` 存在的两个职责之一是「恢复前向的精度」：不恢复的话
-    重算整段退回 fp32、激活体积翻倍 —— 那是 2026-10-01 四卡 910A OOM 的直接原因
-    （`Tried to allocate 1.40 GiB` 恰是 `(1000,4,46,32,64)` 的 fp32 体积）。
-
-    但**那条结论只对当时的 torch 2.1 成立**。实测 torch 2.12 上，即使完全不传
-    `context_fn`，重算期 `torch.is_autocast_enabled()` 仍然是 `True` ——
-    non-reentrant 实现自己就保住了 autocast。也就是说在 torch 2.12 上
-    `context_fn` 的这项职责**已经冗余**。
-
-    而它有实打实的代价：传 `context_fn` 会让 **Dynamo 在每个检查点段各断一次图**
-    （实测 graphs 3 / breaks 2，理由 `guard_as_python_constant
-    AutocastModeVariable()`；不传就是 graphs 1 / breaks 0）。断图 = 融合失效，
-    而这正是「A100 上开 `--compile` 还要不要留 GC」的关键。
-
-    为什么不按 torch 版本硬判
-    ------------------------
-    行为随版本变（2.1 不保、2.12 保），而**探针是在本机真 torch 上问一次**，
-    比任何版本号判断都准，也对未来的 torch 有效。探针失败一律按「需要
-    context_fn」处理 ⇒ 最坏结果是回到今天的保守行为，不会更差。
-    """
-    if _AUTOCAST_PROBE['device'] == device_type:
-        return _AUTOCAST_PROBE['preserved']
-    preserved = None
-    # ⚠⚠ **探针必须对全局 RNG 完全中性**，否则它挪动的随机流会改变本次训练
-    #   之后所有的 dropout 掩码 —— 表现是「同一 seed 的两次运行不再逐位相同」。
-    #   这不是理论风险：`tests/test_grad_checkpointing.py::
-    #   test_checkpointing_preserves_output_and_grad` 就是拿 `manual_seed(11)`
-    #   前后比 `torch.equal` 的，探针里一句 `nn.Linear(4, 4)` 的权重初始化
-    #   就足以让它红（实测 max|Δ|=0.30）。而输入张量改成 `ones` 是不够的 ——
-    #   **模块构造本身就要 RNG**。所以这里显式存档 / 还原。
-    cpu_state = torch.get_rng_state()
-    cuda_state = None
-    if device_type == 'cuda' and getattr(torch, 'cuda', None) is not None \
-            and torch.cuda.is_available():
-        try:
-            cuda_state = (torch.cuda.current_device(),
-                          [torch.cuda.get_rng_state(i)
-                           for i in range(torch.cuda.device_count())])
-        except Exception:  # noqa: BLE001
-            cuda_state = None
-    try:
-        m = _AutocastRecomputeProbe().to(device_type)
-        # 用 `ones` 而不是 `randn`：输入张量同样不该消耗 RNG。
-        x = torch.ones(4, device=device_type, requires_grad=True)
-        with torch.autocast(device_type, torch.bfloat16):
-            torch.utils.checkpoint.checkpoint(
-                m, x, use_reentrant=False,
-                preserve_rng_state=False).sum().backward()
-        # 前向 1 次 + 重算 1 次 ⇒ seen 长度 2；看**后一次**（重算）是否仍在 autocast 里
-        preserved = bool(len(m.seen) >= 2 and m.seen[-1])
-    except Exception:  # noqa: BLE001 — 探针失败按最保守处理
-        preserved = None
-    finally:
-        torch.set_rng_state(cpu_state)
-        if cuda_state is not None:
-            cur, states = cuda_state
-            for i, st in enumerate(states):
-                torch.cuda.set_rng_state(st, i)
-            torch.cuda.set_device(cur)
-    _AUTOCAST_PROBE['device'] = device_type
-    _AUTOCAST_PROBE['preserved'] = preserved
-    return preserved
-
-
-def _recompute_context_fn(ac, guard):
-    """`torch.utils.checkpoint(context_fn=…)` 的工厂 —— **必须定义在模块级**。
-
-    为什么不能在 `_checkpointed` 里就地 `def context_fn()`
-    ----------------------------------------------------
-    Dynamo 对 `context_fn` 只认两种形态（torch 源码
-    `torch/_dynamo/variables/higher_order_ops.py:3849-3861`）::
-
-        ctx = kwargs.pop("context_fn")
-        if isinstance(ctx, UserFunctionVariable):        # 模块级 def
-            ...
-        elif isinstance(ctx, FunctoolsPartialVariable):  # functools.partial
-            ...
-        else:
-            raise NotImplementedError(
-                f"checkpoint not implemented for {type(ctx)} context_fn")
-
-    函数体内就地定义的 `context_fn` 得到的是 `NestedUserFunctionVariable`，其 MRO 是
-    `BaseUserFunctionVariable → VariableTracker`，**不是** `UserFunctionVariable`
-    的子类 ⇒ isinstance 必然落空。于是 GC 一旦与 `torch.compile` 同用（块级/整模型
-    编译），前向第一帧就抛上面那条 `NotImplementedError`。注意行尾的
-    ``" context_fn"`` 是**消息里的字面量**，``type(ctx)`` 指的才是实参类型 ——
-    这条报错说的不是被 checkpoint 的那个函数。
-
-    闭包里的 `ac` / `guard` 改由参数传入，调用方用 `functools.partial` 绑定
-    （对应上面第二个分支）。
-
-    实测：`tmp/coding/repro_context_fn.py` 的 3×4 矩阵证明**把被 checkpoint 的
-    函数改写成纯模块级函数治不了这个错**（那样仍然 FAIL），改 `context_fn` 才行；
-    `tmp/coding/repro_ctxfn_real_guard.py` 用**真的** `_BatchNormStatGuard` 复验 ——
-    过 Dynamo、输出与梯度与原写法逐位相等、`num_batches_tracked` 仍为 1，
-    而「不传 context_fn」则会挂在 `modified by an inplace operation`（即守卫必需）。
-    """
-    @contextlib.contextmanager
-    def recompute_ctx():
-        # 重算期间依次做两件事，**两者都不能省**：
-        #   1. 恢复前向的精度（fp16/bf16）—— 否则整段退回 fp32，体积翻倍，
-        #      这是 4 卡 910A OOM 的直接原因（`Tried to allocate 1.40 GiB`
-        #      恰是 (1000,4,46,32,64) 的 fp32 体积）；
-        #   2. BN guard 把统计还回去 —— P4.5b 为 `determinism_check` 装的
-        #      （前向与重算保存的张量数必须一致，否则 CheckpointError）。
-        with ac:
-            with guard:
-                yield
-
-    # 第二个 context 只在**重算期间**进入（实测进入 1 次），第一个包原前向。
-    # 传的是 `recompute_ctx()` —— **实例**不是工厂：checkpoint 拿到的
-    #   是「已构造好的上下文管理器」，直接 `with` 它。
-    return contextlib.nullcontext(), recompute_ctx()
-
-
-def _first_tensor(args):
-    """`args` 里第一个 `torch.Tensor`，没有则 None。
-
-    为什么不用 `next((a for a in args if isinstance(a, torch.Tensor)), None)`：
-    **那个写法会让每个检查点段各断一次图。** `next(genexpr, default)` 是**两个**
-    位置参数，Dynamo 的 builtin 处理器只认有限几种 arity，落到
-    `torch/_dynamo/variables/builtin.py` 的 `call_next` 分支上就报
-    `incorrect arg count ... too many positional arguments and no constant
-    handler` 并**放弃整段**。而本函数在 `_checkpointed` 里、被 Dynamo 追踪，
-    于是 A100 上开 `--compile` + `--gc-with-compile 1` 时，每个 block 边界
-    都断一次 —— 融合收益被吃光，而日志里只是一行 WARNING。
-
-    改写成显式循环：对**静态 tuple** 的 `for` + `isinstance` 是 Dynamo 的
-    基本功（直接展开），不会断图。语义与原来逐位相同。
-    """
-    for a in args:
-        if isinstance(a, torch.Tensor):
-            return a
-    return None
-
-
-def _checkpointed(runner, args, bns):
-    # `context_fn` 何时可以不给：
-    #   1) BN 统计还原 —— `bns` 非空时必须给，没有条件；
-    #   2) 重算期 autocast —— 由探针在本机真 torch 上问一次。
-    # 第 2 条在 A100 上是**必需**而非优化：传 `context_fn` 会让 Dynamo 每个
-    # 检查点段断一次图（graphs 3/breaks 2，不传是 1/0），融合基本失效。
-    # 「不给就退回 fp32、910A OOM」是 torch 2.1 的现象，2.12 不成立 ——
-    # 故按探针实测而非版本号硬判。
-    need_bn_guard = bool(bns)
-    need_ac = not _recompute_preserves_autocast(
-        _first_tensor(args).device.type if _first_tensor(args) is not None
-        else 'cpu')
-    if not (need_bn_guard or need_ac):
-        return torch.utils.checkpoint.checkpoint(
-            runner, *tuple(args),
-            use_reentrant=False,
-            preserve_rng_state=True,
-        )
-
-    guard = _BatchNormStatGuard(bns)
-    _ac = _autocast_like(_first_tensor(args))
-    # `context_fn` 走 functools.partial（Dynamo 认 FunctoolsPartialVariable）。
-    # **不要**改回就地 `def context_fn()` —— 那会变成 NestedUserFunctionVariable，
-    # 与 torch.compile 同用时前向直接抛 NotImplementedError。缘由见
-    # `_recompute_context_fn` 的文档；`tests/test_katago_v7_grad_checkpointing.py`
-    # 的 `test_heads_recompute_under_the_same_autocast_as_the_forward` 盯重算精度，
-    # `test_heads_recompute_is_safe_when_a_probe_needs_no_sync` 盯本函数源码里
-    # 必须保留 `context_fn` 与 `preserve_rng_state=True` 两处字面量。
-    context_fn = functools.partial(_recompute_context_fn, _ac, guard)
-
-    return torch.utils.checkpoint.checkpoint(
-        runner, *tuple(args),
-        use_reentrant=False,
-        preserve_rng_state=True,
-        context_fn=context_fn,
-    )
-
-
-class GradCheckpointMixin:
-    """按块类型分组的梯度检查点开关（P4.6b）。
-
-    为什么是 mixin 而不是某个主干容器的一个方法
-    ----------------------------------------
-    现役挂载点是 `SharedBackbone`；新架构（KataGo SE-bottleneck）走的也是它。
-    而 `SharedBackbone.__init__` 的签名被
-    `tests/test_katago_se.py::test_legacy_class_signatures_untouched`
-    逐字锁死（不能加 kwarg）—— 所以开关只能是**构造后**可调的方法。
-
-    开关形态
-    --------
-    * 不带任何 CLI 参数，由模型属性控制（`SharedBackbone.use_checkpoint` 的
-      setter 就是它的入口）。
-    * 默认值见 `GRAD_CHECKPOINT_DEFAULTS`：`res`/`transformer` = True，
-      `legacy` = False（不改变既有路径的行为）。
-    * `set_grad_checkpointing()` 可以在**不重建模型**的情况下切换 —— 属性不进
-      `state_dict`（既不是 parameter 也不是 buffer），所以切换前后存档逐位相同。
-
-     **开关属于「调用 `run_segment` 的那个模块」**（接线必读）
-    ----------------------------------------------------------
-    开关是**普通实例属性**，不自动向子模块传播。若某个全网类持有 mixin 而
-    `forward` 只调 `self.backbone(x)`，那么 `net.set_grad_checkpointing(True)`
-    只会改到 net 自己，主干容器里的 `run_segment` 看不到 —— **静默不生效**。
-    正确形态二选一：
-      (a) mixin 只挂在**主干容器**上，调用方走
-          `net.backbone.set_grad_checkpointing(...)`（`SharedBackbone` 就是这一条）；
-      (b) mixin 挂在 net 上，但 net 必须**显式转发**给 `self.backbone`。
-    两条路都要求「开关的持有者 == `run_segment` 的调用者」。测试
-    `test_switch_owner_must_be_the_module_that_calls_run_segment` 把这个坑钉住。
-    """
-
-    GRAD_CHECKPOINT_KINDS = (GC_RES, GC_TRANSFORMER, GC_LEGACY)
-
-    #: 逐 kind 的默认开关。**做成类属性**是为了让子类能扩自己的 kind
-    #: （V7 加了 `stem` / `heads`，见 `src/networks/katago_v7.py`）而不用去改
-    #: 这张模块级表——那张表被 `tests/test_grad_checkpointing.py` 逐字钉着。
-    #: 默认仍指向模块级常量，所以 `SharedBackbone` 的行为一个字节都不变。
-    GRAD_CHECKPOINT_DEFAULTS = GRAD_CHECKPOINT_DEFAULTS
-
-    def _init_grad_checkpointing(self, enabled=True, **kinds):
-        unknown = sorted(set(kinds) - set(self.GRAD_CHECKPOINT_KINDS))
-        if unknown:
-            raise ValueError(
-                '未知的块类型 %s；可用的是 %s'
-                % (unknown, list(self.GRAD_CHECKPOINT_KINDS)))
-        self._gc_enabled = bool(enabled)
-        self._gc_kinds = dict(self.GRAD_CHECKPOINT_DEFAULTS)
-        for k, v in kinds.items():
-            if v is not None:
-                self._gc_kinds[k] = bool(v)
-
-    @property
-    def grad_checkpointing(self):
-        """总开关。`False` 时所有段都不走检查点（`eval` / 推理恒为「不生效」）。"""
-        return getattr(self, '_gc_enabled', False)
-
-    def grad_checkpointing_kinds(self):
-        """返回逐类型的开关副本（`dict`，改它不影响模型）。"""
-        return dict(getattr(self, '_gc_kinds', GRAD_CHECKPOINT_DEFAULTS))
-
-    def set_grad_checkpointing(self, enabled=None, **kinds):
-        """在**不重建模型**的前提下改开关。返回 `self`（便于链式）。
-
-        Args:
-            enabled: `True`/`False` 改总开关；`None`（默认）表示不动。
-            **kinds: 逐类型覆盖，如 `res=False`。值 `None` 表示不动。
-
-        打开时会立刻做一次 compile 互斥检查（`torch.compile` 若已在模型里生效
-        就地报错），避免「训练跑了几百步才发现两条优化互相抵消」。
-        """
-        self._init_grad_checkpointing(
-            enabled=self.grad_checkpointing if enabled is None else enabled,
-            **kinds)
-        if self.grad_checkpointing:
-            assert_grad_checkpoint_compile_compatible(
-                self, 'set_grad_checkpointing')
-        return self
-
-    def grad_checkpointing_for(self, kind):
-        """某一段在**当前**是否真的走检查点。
-
-        `eval` / `no_grad` / `inference_mode` 下一律 False —— 「检查点只在
-        `self.training` 且启用时生效」是 eval/推理零行为变化的**唯一**保证。
-        """
-        if kind not in self.GRAD_CHECKPOINT_KINDS:
-            raise ValueError('未知的块类型 %r' % (kind,))
-        if not self.grad_checkpointing:
-            return False
-        if not bool(getattr(self, '_gc_kinds', {}).get(kind, False)):
-            return False
-        return bool(self.training) and torch.is_grad_enabled()
-
-    def run_segment(self, blocks, args, kind, tap_positions=(), per_block=None,
-                    uncapped_last=False):
-        """跑一段。`kind` 决定是否检查点；返回 `(out, taps)`，语义同
-        `run_grad_segment`。主干 forward 唯一要调的入口。
-
-        `uncapped_last=True` 只给**旧路径**用（照搬 `checkpoint_sequential`
-        的「最后一块不检查点」）；逐块粒度的段不要传。"""
-        on = self.grad_checkpointing_for(kind)
-        return run_grad_segment(
-            blocks, args,
-            use_checkpoint=on,
-            tap_positions=tap_positions,
-            per_block=per_block,
-            uncapped_last=uncapped_last,
-            kind=kind,
-            guard_root=self if on else None,
-        )
 
 
 # flash-attn 内核的 batch 维参与 CUDA grid 坐标，受 grid y/z 维上限 65535 约束。
@@ -894,29 +278,6 @@ def set_sdpa_force_math(flag: bool) -> None:
 # 0.17 GiB（原 0.97）。设 0 或 ≥N 即退回原路径（逐位不变）。
 _attn_query_chunk = 64
 
-#: 逐 chunk 梯度检查点（2026-10-04 新增）。见 `_sdpa` math 分块循环里的说明。
-#: 默认开：它只影响**保留**的显存（反向时逐块重算），数学上逐位等价，唯一
-#: 例外是 `dropout_p > 0` 时 mask 取样位置会变（分布等价）。设 0 关闭。
-_attn_chunk_checkpoint = True
-
-
-def set_attn_chunk_checkpoint(flag: int) -> None:
-    """开关逐 chunk 检查点（0 = 关闭）。由训练脚本启动时调用。"""
-    global _attn_chunk_checkpoint
-    _attn_chunk_checkpoint = bool(flag)
-
-
-def _attn_chunk_fn(qc, kt, v, dropout_p):
-    """一个 query 块的注意力（``(B,Hh,chunk,N)``）。
-
-    必须是**模块级函数**：`torch.utils.checkpoint` 只接受可 pickle / 可重入的
-    callable，闭包与 lambda 在 `use_reentrant=False` 下也可能被
-    `torch.compile` 判为 graph break。
-    """
-    a = (qc @ kt).softmax(dim=-1)
-    if dropout_p > 0.0:
-        a = torch.nn.functional.dropout(a, p=dropout_p)
-    return a @ v
 
 
 # ---- online-softmax 注意力（flash 风格，不物化 (Nq,Nk) 注意力矩阵）----
@@ -1436,7 +797,7 @@ class AttentionResBlock(nn.Module):
         return x
 
 
-class SharedBackbone(GradCheckpointMixin, nn.Module):
+class SharedBackbone(nn.Module):
     """共享表示网络：将棋盘状态编码为隐藏状态。
 
     注意力模式（attention_mode 控制主干如何堆叠注意力块）：
@@ -1447,22 +808,13 @@ class SharedBackbone(GradCheckpointMixin, nn.Module):
 
     注意力块内部的计算模式由 attn_mode 控制（全局/窗口/轴向），
     通过 --attn-mode 配置；窗口大小由 --attn-window 控制。
-
-     mixin 写在 `nn.Module` **前面**（P4.6b fix B5）
-    ------------------------------------------------
-    mixin 优先于 `nn.Module`。本类的方法名（`_init_grad_checkpointing` /
-    `grad_checkpointing` / `set_grad_checkpointing` / `run_segment` /
-    `use_checkpoint`）**全部**可能被 `nn.Module` 将来新增的同名成员静默劫持 ——
-    `nn.Module` 优先时，mixin 的实现会被 `nn.Module.__getattr__` 之前的正常属性
-    查找挡住，症状是「方法不见了」或「调到了 nn.Module 的实现」，而不是报错。
-    `run_segment` 这种通用名尤其危险。反过来写（mixin 在后）没有任何好处。
     """
 
     def __init__(self, in_channels=12, channels=128, num_res_blocks=12,
                  attention_mode="mix", num_attention_layers=4,
                  num_heads=4, attention_dropout=0.0,
                  attn_mode="global", attn_window=7,
-                 use_checkpoint=False, arch="convnext",
+                 arch="convnext",
                  res_blocks=0, convnext_blocks=0, attn_blocks=0):
         """
         Args:
@@ -1472,7 +824,6 @@ class SharedBackbone(GradCheckpointMixin, nn.Module):
             attention_dropout: 注意力 dropout
             attn_mode:         注意力计算模式 "global"|"window"|"axial"
             attn_window:       window 模式的窗口边长
-            use_checkpoint:    是否启用梯度检查点（显存优化）
             arch:              网络架构风格 "resnet" (默认，向后兼容) | "convnext"
                                  | "se_bottleneck"（KataGo 风格 bottleneck+SE）
             res_blocks:        ResBlock 数量（浅层，局部细节），0 表示使用默认模式
@@ -1482,11 +833,6 @@ class SharedBackbone(GradCheckpointMixin, nn.Module):
         super(SharedBackbone, self).__init__()
         self.channels = channels
         self.attention_mode = attention_mode
-        # P4.6b：走与全仓库同一套检查点机制，但默认关（不改变既有路径的行为）。
-        # `use_checkpoint=True` 与 `set_grad_checkpointing(True)` 等价 ——
-        # 赋这个属性就是走 `use_checkpoint` 的 property setter（见类末尾），
-        # 它把总开关与 `GC_LEGACY` 段开关**一起**设成同一个值，不会分叉。
-        self.use_checkpoint = use_checkpoint
         self.arch = arch
 
         # 输入卷积
@@ -1579,65 +925,14 @@ class SharedBackbone(GradCheckpointMixin, nn.Module):
             out = self.norm(self.conv1(x))
         else:
             out = F.relu(self.bn1(self.conv1(x)))
-        if self.training and self.use_checkpoint:
-            # P4.6b：旧路径保持 `checkpoint_sequential` 的**逐块**粒度
-            # （`per_block=True`），但换成本节的新实现 —— 于是多了 BN
-            # running stats 的重算保护（旧的 `checkpoint_sequential` 会把
-            # `num_batches_tracked` 翻倍、污染 `running_mean/var`）。
-            # `uncapped_last=True` 是 B1：`checkpoint_sequential` 的文档语义
-            # 是「除最后一段外都检查点」（源码注释 "the last chunk has to be
-            # non-volatile"）。不传它，`use_checkpoint=True` 的显存口径就从
-            # 「16 段入口」变成「16 个段入口且末块也重算」，v18/v19 的真实
-            # 训练显存会低于 31.12GB 锚点（`search_arch.py:63` 的 k 标定基准），
-            # 而锚点重测已由业主裁决取消（D15 同期裁决：不重测）⇒ 这里必须
-            # 逐字还原旧行为，让锚点与 k=0.8235 继续有效。
-            out, _ = self.run_segment(self.blocks, (out,), GC_LEGACY,
-                                      uncapped_last=True)
-        else:
-            out = self.blocks(out)
+        out = self.blocks(out)
         if self.arch == "convnext":
             out = self.norm_out(self.conv_out(out))
         else:
             out = F.relu(self.bn_out(self.conv_out(out)))
         return out
 
-    def set_grad_checkpointing(self, enabled=None, **kinds):
-        """旧路径的开关入口。`use_checkpoint` 是本类的 property，它读的
-        **不是**总开关，而是「总开关 ∧ `legacy` 段开关」—— 见下面 getter。
 
-        `kinds.setdefault(GC_LEGACY, True)` 只在没显式传 `legacy=` 时补
-        `legacy=True`：`SharedBackbone` 只用得到 legacy 段，`set_grad_checkpointing(True)`
-        若不补，就会变成「总开关 True 而什么都不检查点」（P4.6b fix B4 的
-        反面），而 `GRAD_CHECKPOINT_DEFAULTS[GC_LEGACY] is False` 是
-        **默认**（不传就关）不是本方法的语义。
-        """
-        kinds.setdefault(GC_LEGACY, True)
-        super(SharedBackbone, self).set_grad_checkpointing(enabled, **kinds)
-        return self
-
-    @property
-    def use_checkpoint(self):
-        """历史上的开关属性（P4.6b 之前 `SharedBackbone.forward` 直接读它）。
-
-        做成 property 而不是普通属性，是为了**堵住「直接赋值静默失效」这个坑**：
-        若它只是 `self.__dict__` 里的一个 bool，而 `forward` 改读 mixin 的
-        `_gc_enabled`，那么 `model.backbone.use_checkpoint = True`（既有代码里
-        常见的写法）就会变成**看起来开了、其实没开**的静默回退。setter 把赋值
-        路由进 mixin，读写两侧因此永远一致。
-
-        读的是「总开关 ∧ legacy 段开关」（P4.6b fix B4）：只读总开关会在
-        `set_grad_checkpointing(True, legacy=False)` 时读出 True 而实际什么都不
-        检查点 —— property 必须等于**本类 forward 真正生效的状态**，否则
-        `if self.use_checkpoint` 与属性读数就会分叉。要看全部五类的逐项状态
-        用 `grad_checkpointing_kinds()`；eval 下 `grad_checkpointing_for` 的
-        training/no_grad 门不影响这里（读的是**开关状态**，不是"此刻是否生效"）。
-        """
-        return (bool(getattr(self, '_gc_enabled', False))
-                and bool(self.grad_checkpointing_kinds().get(GC_LEGACY, False)))
-
-    @use_checkpoint.setter
-    def use_checkpoint(self, value):
-        self._init_grad_checkpointing(enabled=bool(value), **{GC_LEGACY: True})
 
 
 # ============================================================================
@@ -1798,33 +1093,12 @@ def _sdpa_math(q, k, v, dropout_p=0.0, scale=None):
     if step and nq > step:
         kt = k.transpose(-2, -1)
         outs = []
-        # **逐 chunk 梯度检查点**（2026-10-04 新增，为了真正省显存）。
-        #   分块只降**瞬时**峰值，**不降保留量** —— 每块的 softmax 输出
-        #   `(B,Hh,chunk,N)` 都被 autograd 存下来等反向，6 块加起来与
-        #   整条 `(B,Hh,N,N)` **一样多**。实测 V7（22 层注意力、N=361、4 头）
-        #   每样本每层 1.043 MB ⇒ B=3000 时约 68.8 GB。
-        #
-        #   为什么不能只靠 block 级 `torch.utils.checkpoint`：那依赖后端
-        #   autograd 的支持程度，而实测云端 910A 上 64 GB ≈ **无** checkpoint
-        #   的估算值（本地 CPU 上 checkpoint 是有效的：278.5 → 7.0 MB/样本，
-        #   40×）。逐 chunk 检查点把占大头的注意力矩阵从「保留」变成
-        #   「反向时一块一块重算」，**不依赖 block 级那层是否生效**。
-        #
-        # 行为变化只有一处：`dropout_p > 0` 时 mask 的取样位置会变
-        #     （分布等价、不逐位相同）。eval 态 dropout 恒 0，指标不受影响。
-        #     V7 的 `attn_dropout` 默认 0.0 ⇒ 这条对 V7 不适用。
-        use_ckpt = _attn_chunk_checkpoint and torch.is_grad_enabled() \
-            and q.requires_grad
+        # 按 query 切块计算（降**瞬时**峰值，数学精确；不重算）。
         for i in range(0, nq, step):
-            if use_ckpt:
-                outs.append(torch.utils.checkpoint.checkpoint(
-                    _attn_chunk_fn, q[..., i:i + step, :], kt, v,
-                    dropout_p, use_reentrant=False))
-            else:
-                a = (q[..., i:i + step, :] @ kt).softmax(dim=-1)
-                if dropout_p > 0.0:
-                    a = torch.nn.functional.dropout(a, p=dropout_p)
-                outs.append(a @ v)
+            a = (q[..., i:i + step, :] @ kt).softmax(dim=-1)
+            if dropout_p > 0.0:
+                a = torch.nn.functional.dropout(a, p=dropout_p)
+            outs.append(a @ v)
         return torch.cat(outs, dim=-2)
     attn = (q @ k.transpose(-2, -1))
     attn = attn.softmax(dim=-1)

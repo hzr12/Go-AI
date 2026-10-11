@@ -103,7 +103,7 @@ def v7_batch(ds):
 
 @pytest.fixture(scope='module')
 def net():
-    return build_katago_v7_net(use_checkpoint=False)[0]
+    return build_katago_v7_net()[0]
 
 
 # --------------------------------------------------------------------------- #

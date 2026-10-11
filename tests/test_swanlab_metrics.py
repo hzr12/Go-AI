@@ -150,7 +150,7 @@ def test_config_panel_has_no_archived_flags():
 
 @pytest.mark.parametrize('key', [
     'arch/in_channels', 'arch/channels', 'arch/blocks', 'arch/params_total',
-    'grad_checkpoint', 'batch_size_per_card', 'grad_accum', 'world_size',
+    'batch_size_per_card', 'grad_accum', 'world_size',
     'effective_batch', 'lr', 'weight_decay', 'clip_grad_max_norm',
     'label_smoothing', 'attention_dropout', 'ema_enabled', 'ema_decay',
     'amp_dtype', 'scaler_init_scale', 'attn_sdpa_force_math',
@@ -440,7 +440,7 @@ def test_config_arch_numbers_follow_the_v7_flag():
       只能按「键名到下一个键名之间」切片，不能按源码的多行排版写正则。
     """
     for key in ('arch/in_channels', 'arch/channels', 'arch/params_total',
-                'arch/num_heads', 'grad_checkpoint', 'arch/blocks'):
+                'arch/num_heads', 'arch/blocks'):
         k = "'%s'" % key
         assert k in INIT, f'config 里找不到 {key}'
         i = INIT.index(k)

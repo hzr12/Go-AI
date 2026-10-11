@@ -114,7 +114,7 @@ def main():
     n = min(lb['_kept'], args.rows)
     print(f'用 {n} 行训练，batch={args.batch}，steps={args.steps}', flush=True)
 
-    model = _build_for_in_channels(22, use_checkpoint=False).to(device)
+    model = _build_for_in_channels(22).to(device)
     model.train()
     print(f'模型参数量 {sum(p.numel() for p in model.parameters()):,}', flush=True)
     lossf = KataGoV7Loss().to(device)

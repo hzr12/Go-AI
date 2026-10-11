@@ -151,6 +151,13 @@ def test_locals_read_after_the_backend_branch_are_defined_on_all_paths(name):
             "%s 只在 engine 分支里赋值，orelse 没赋值 ⇒ 非引擎路径读它就是"
             "UnboundLocalError（这正是本用例要钉的那个 bug）" % name)
 
-    assert name in top_level_stores, (
+    # 能走到这里说明 `name` **不在**顶层（第 139 行已 return）⇒ 它只在某个分支
+    # 里赋值，没走那条分支时读它就是 UnboundLocalError —— 这正是本用例要抓的形状。
+    # ⚠ 2026-10-11 修：这里原先写的是 `assert name in top_level_stores`，而那个
+    # 变量在本函数里**从未定义**（上面建的名字叫 `top`）。于是这条路径抛的是
+    # NameError 而不是可读的断言信息 —— 门禁坏了，而且坏在它自己身上。
+    # 另：上面两条 assert 已覆盖「分支存在 + 两条分支都赋值」；走到这里本身就是
+    # 缺陷，所以显式 fail 而不是再断言一个恒假条件。
+    pytest.fail(
         "%s 没在 main() 顶层赋值 —— 只在某个分支里赋值的话，没走那条分支时"
         "读它就是 UnboundLocalError（默认路径会直接崩）" % name)

@@ -25,8 +25,7 @@ v21（`V21Backbone` / `V21Net` / `build_v21_net` / `MambaLTI` / `CrossAttnRes`�
   （LF 结尾、shebang + `set -euo pipefail`、`bash -n`、flag 必须在
   `train_sft.py` 的 argparse 里有定义）在 `tests/test_run_py_sh.py` 里对**其余
   脚本**仍有一份等价的守护，不因为这个文件消失而丢覆盖面。
-* 梯度检查点的**机制**（段划分 / tap / 开关持有者契约）归
-  `tests/test_grad_checkpointing.py`，本文件不重复。
+* 梯度检查点子系统已整体移除（段划分 / tap / 开关持有者契约等机制级测试随之退场）。
 
 全部 CPU、秒级：不加载真实权重、不读真实数据。
 """
@@ -578,7 +577,7 @@ def test_legacy_class_signatures_untouched():
         'SharedBackbone': (
             "in_channels=12, channels=128, num_res_blocks=12, attention_mode='mix', "
             "num_attention_layers=4, num_heads=4, attention_dropout=0.0, "
-            "attn_mode='global', attn_window=7, use_checkpoint=False, arch='convnext', "
+            "attn_mode='global', attn_window=7, arch='convnext', "
             "res_blocks=0, convnext_blocks=0, attn_blocks=0"),
     }
     for cls, want in expect_backbone.items():
@@ -600,7 +599,7 @@ def test_legacy_class_signatures_untouched():
         "attention_mode: str='mix', num_attention_layers: int=4, num_heads: int=4, "
         "attention_dropout: float=0.0, attn_mode: str='global', attn_window: int=7, "
         "policy_channels: int=32, value_channels: int=64, action_size: int=362, "
-        "use_checkpoint: bool=False, arch: str='resnet', res_blocks: int=0, "
+        "arch: str='resnet', res_blocks: int=0, "
         "convnext_blocks: int=0, attn_blocks: int=0, value_res_blocks: int=3, "
         "policy_layers: int=2"), f'AlphaGoNet.__init__ 签名被改了：{got}'
 
