@@ -5393,9 +5393,13 @@ def main():
                 if _v7_on and _v7_terms_last:
                     # 值是设备张量（见 `_v7_terms_last` 处注释），float() 就是
                     # 本行的 D2H —— 每个打点间隔 13 次，而非每步 13 次。
+                    # 一次 D2H 读回所有 term，省 13 次 cudaStreamSynchronize
+                    _terms = _v7_terms_last
+                    vals = torch.stack([v.detach() for v in _terms.values()])
+                    vals_cpu = vals.tolist()
                     logger.info("[step %d v7] " + ' '.join(
                         '%s=%.4f' % (k, float(v))
-                        for k, v in _v7_terms_last.items()),
+                        for k, v in zip(_terms.keys(), vals_cpu)),
                         step)
 
             if _do_swanlab:

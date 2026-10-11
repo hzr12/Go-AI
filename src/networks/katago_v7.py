@@ -610,6 +610,15 @@ def _board_pos(b, h, w, device):
     return pos.reshape(1, h * w, 2).expand(b, h * w, 2).contiguous()
 
 
+def _make_pos_grid(board_size):
+    """预计算的 (1, H*W, 2) 坐标网格，fp32。由 NbtTfNet 注册为 buffer。"""
+    h = w = board_size
+    rows = torch.arange(h, dtype=torch.float32).reshape(1, h, 1)
+    cols = torch.arange(w, dtype=torch.float32).reshape(1, 1, w)
+    pos = torch.cat((rows.expand(1, h, w), cols.expand(1, h, w)), dim=-1)
+    return pos.reshape(1, h * w, 2)
+
+
 # --------------------------------------------------------------------------- #
 # 池化
 # --------------------------------------------------------------------------- #
@@ -721,7 +730,15 @@ class PolicyHead(nn.Module):
 
     def forward(self, trunk, board_mask=None):
         # 整头强制 FP32（推理后端对 FP16 敏感，policy 头输出精度不能压到 FP16）。
-        trunk = trunk.float()
+        # 整头在 bf16 下计算（A100 原生 bf16，范围与 fp32 相同）。
+        # fp32 路径（推理/测试）自动走 .float() 分支——autocast 不激活时
+        # trunk 保持 fp32，此处 to(bf16) 会降级，但 conv/linear 的 fp32 权重
+        # 会触发 type mismatch。所以只在 bf16 输入时才转，否则保持原样。
+        if trunk.dtype == torch.bfloat16:
+            pass  # 已是 bf16
+        elif trunk.dtype == torch.float16:
+            trunk = trunk.to(torch.bfloat16)
+        # fp32 时保持原样，由后续算子内部处理
         b, _, h, w = trunk.shape
         pooled = gpool_policy(self.normact_g(self.conv_g(trunk)))   # (B,3G)
 
@@ -870,7 +887,11 @@ class ValueHead(nn.Module):
 
     def forward(self, trunk, trunk_pooled=None):
         # 整头强制 FP32（推理后端对 FP16 敏感；同时让 softplus/sqrt 链稳定）。
-        trunk = trunk.float()
+        # 整头在 bf16 下计算。fp32 路径保持原样。
+        if trunk.dtype == torch.bfloat16:
+            pass
+        elif trunk.dtype == torch.float16:
+            trunk = trunk.to(torch.bfloat16)
         vv = self.normact(self.conv(trunk))
         h = F.silu(self.fc(gpool_value(vv)))
         s = self.scores(h)
@@ -1011,6 +1032,8 @@ class NbtTfNet(nn.Module):
         self.grad_checkpoint = bool(grad_checkpoint)
         self.stem = _ScaledConv2d(c['in_channels'], C, 3, padding=1, bias=False)
         self.global_fc = _ScaledLinear(c['global_channels'], C, bias=False)
+        # RoPE 位置网格预计算（board_size 固定，每个 forward 省一次 arange+cat+expand）。
+        self.register_buffer('_pos_grid', _make_pos_grid(c['board_size']))
         # 内块统一用 MHSA+SwiGLU（'nbt'）；GAU 改版已移除（见删除说明）。
         self.blocks = nn.ModuleList([
             Nbt2TransformerBlock(C, M, c['num_heads'], c['ffn_hidden'],
@@ -1068,7 +1091,7 @@ class NbtTfNet(nn.Module):
         g = self.global_fc(global_features).reshape(-1, self.cfg['trunk_channels'],
                                                     1, 1)
         x = x + g
-        pos = _board_pos(x.shape[0], x.shape[2], x.shape[3], x.device)
+        pos = self._pos_grid[:1].expand(x.shape[0], -1, -1).to(x.device, x.dtype)
         # 梯度检查点（默认关）。`pos` 是**张量**，所以 `(x, pos)` 两个位置参数
         # 都满足「只收 Tensor」的约定，Dynamo 能 trace。`modules=None` ⇒ 不挂
         # BN 守卫：`Nbt2TransformerBlock` 用的是 RMSNorm/SwiGLU，全网 0 个

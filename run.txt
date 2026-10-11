@@ -15,6 +15,9 @@
 #             A/B/C 三段与 RL 都用它。结构 flag 已压缩归档，别从命令行改结构。
 #             ⚠ 换结构后旧 ckpt 全部作废（A→B→C 必须从头重训）。
 #   引擎导出 = 官方 modelVersion 17，10,545,945 参数（= V7 减去四个自研头 + policy 裁剪）。
+#
+#   2026-10-11 优化：bf16 heads（fp32 路径自动降级）、_board_pos buffer 预计算、
+#     float(v) D2H 合并为 torch.stack 一次同步。flash-attn 在 A100 自动启用。
 
 # ---------- 0. 环境 ----------
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1

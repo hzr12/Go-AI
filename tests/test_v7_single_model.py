@@ -106,7 +106,8 @@ def test_both_sources_feed_the_identical_architecture():
     """
     net = build_katago_v7_net(board_size=BOARD)
     n_v7 = sum(p.numel() for p in net.parameters())
-    first = tuple(net.state_dict().values())[0]
+    # 取 stem.weight（按 state_dict 排序是第一个参数字段，buffer 不参与 .parameters()）
+    first = net.stem.weight
     assert first.shape[1] == 22, f'V7 stem 应吃 22 通道，实得 {first.shape}'
     # 12 通道的旧结构通道数不同 ⇒ 权重形状不同，承接必然失败
     se = SupervisedDataset.__mro__  # 仅确认父类还在位

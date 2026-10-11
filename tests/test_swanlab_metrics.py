@@ -566,8 +566,8 @@ def test_terms_prefix_keeps_stdout_reading_bare_names():
     # 反向：stdout 那处**不能**带前缀
     _seg = MAIN.split('_v7_terms_last')[1][:200]
     assert 'loss_v7/' not in _seg, 'stdout 的裸名 dict 里混进了上报前缀'
-    assert "'%s=%.4f' % (k, float(v))" in MAIN, \
-        'stdout 打点行没有在消费处做 float 转换'
+    assert "vals = torch.stack([v.detach() for v in _terms.values()])" in MAIN, \
+        'stdout 打点行消费处应做 stack D2H 合并'
 
 
 @pytest.mark.parametrize('key', [

@@ -243,8 +243,9 @@ def test_terms_float_call_detaches_before_synchronising():
     assert '_v7_terms_last = {k: float(x) for' not in SRC, \
         '未 detach 的 float(x) 每步都会触发 requires_grad 警告'
     # 两个消费点各自做转换，缺一个就少上报一路
-    assert "'%s=%.4f' % (k, float(v))" in SRC, \
-        'stdout 打点行没有在消费处做 float 转换'
+    # 消费处做转换（合并为 torch.stack 一次 D2H，2026-10-11）
+    assert "vals = torch.stack([v.detach() for v in _terms.values()])" in SRC, \
+        'stdout 打点行消费处应做 stack D2H 合并'
     assert '**_scalar_dict_to_host(_v7_terms_swanlab)' in SRC, \
         'swanlab 上报没有在消费处做读回转换'
     # 🔴 2026-10-11：消费处原为 `**{k: float(v) for k, v in _v7_terms_swanlab.items()}`
