@@ -196,15 +196,17 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 #   读 37.6GB 分片的静默加载期（无日志），不是挂死。
 
 # --- A 段：board 级 full.npz（人类着法 one-hot），单卡 A100 40G ---
-# ⚠ **batch 未定档，由你现场调**（2026-10-08：A100 40G 上还没测过上限）。
-#   仓库里 `v7_batch_memory_advice` 的每样本 MB 三个数（4.65 / 12.67 / 277）全是
-#   **910A/NPU 口径**，对 A100 不可信 —— 照它算出来的 batch 建议值会系统性偏。
-#   调法：从 2800 起步（= 旧单卡 910A 的定档，作为同 LR 口径的锚），OOM 就减半；
-#   稳定且 `memory_gb` 平台还有余量就往上加。**定档后把下面 B/C 的 `--batch-size`
-#   与 LR 一起改掉**（LR 必须跟着 batch 走，见上面的公式）。
+# ⚠ **batch 用「micro × accum」表达**（有效 batch = micro × 卡数 × accum）。
+#   本机 A100 40G 实测（2026-10-11）：micro 512 × accum 4（有效 2048）≈ **1400 s/s**；
+#   micro 1024 × accum 2（有效 2048）是推荐甜点（预期 ~1000+ s/s，待一轮实测确认）；
+#   ⚠ **micro 2048 × accum 1 是悬崖**：同有效 2048 却暴跌到 ~550 s/s（显存/算法悬崖，
+#   别直接把 micro 拉到 2048）。要加有效 batch 就加 accum，micro 别过 1024。
+#   仓库里 `v7_batch_memory_advice` 的每样本 MB（4.65/12.67/277）是 910A/NPU 口径、
+#   对 A100 不可信，只当量级参考。**定档后把下面 B/C 的 `--batch-size` /
+#   `--gradient-accumulation-steps` 与 LR 一起改掉**（LR 必须跟着有效 batch 走）。
 # ⚠ LR = 0.00356 × √(有效batch / 2500)，有效batch = batch × 卡数 × accum。
-#   单卡 ⇒ 卡数 = 1。batch 2800 → 0.00377；batch 1400 → 0.00267；
-#   batch 5600 → 0.00533。**换了 batch 一定要按公式重算 LR**，别沿用旧值。
+#   单卡 ⇒ 卡数 = 1。有效 2048 → 0.00322；batch 2800 → 0.00377；batch 1400 → 0.00267；
+#   batch 5600 → 0.00533。**换了有效 batch 一定要按公式重算 LR**，别沿用旧值。
 # ⚠ `--gc-with-compile 1` 必给（见第 0 节）：否则开 compile 就强制关 GC，
 #   40G 卡上 batch 被迫调小到吃不满算力。
 # ⚠ `--compile-mode` 2026-10-11 本机实测结论（Ampere+）：
@@ -223,8 +225,8 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 python scripts/train_sft.py \
   --data data/sgf_19x19_full.npz --v7 1 --device cuda --board-size 19 \
   --games-npz data/labels/games.npz \
-  --batch-size 2000 --epochs 1 --lr 0.00320 --weight-decay 0.0001 \
-  --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
+  --batch-size 1024 --epochs 1 --lr 0.00320 --weight-decay 0.0001 \
+  --gradient-accumulation-steps 2 --use-amp 1 --use-ema 1 \
   --gc-with-compile 1 --flash-attn 1 --attention-dropout 0 \
   --prefetch-workers 24 --prefetch-depth 8 \
   --log-every 5 --eval-every 500 --save-every 20 \
@@ -234,10 +236,10 @@ python scripts/train_sft.py \
 # --- B 段：+ KataGo 软标签（承接 A 段，单卡 A100）---
 # ⚠ `--policy-loss soft_ce` 不写也行：给了 --soft-index 会自动选中。
 # 🔴 `--epochs 30` 不是笔误：--soft-only-sampling 把训练集从 3426 万行收窄到
-#   225,338 行 ⇒ 单卡 batch 2000 只有约 113 步/epoch。epochs=1 ⇒ cosine 在
-#   step ~100 就退火到 0（2026-10-06 实测：policy 纹丝不动）。
-#   30 epochs ≈ 3400 步，才是有效预算。**batch 一改，这里的 epochs 要重算**：
-#   目标总步数 ≈ 3400。
+#   225,338 行 ⇒ 单卡 micro 1024（accum 2，有效 2048）约 220 微步/epoch
+#   （= 110 优化步/epoch）。epochs=1 ⇒ cosine 在 step ~100 就退火到 0
+#   （2026-10-06 实测：policy 纹丝不动）。30 epochs ≈ 3300 优化步，才是有效预算。
+#   **micro/accum 一改，这里的 epochs 要重算**：目标总优化步 ≈ 3300。
 # ⚠ `--eval-max-batches 5`：eval 特征已池化（多 worker），但跑满仍要数分钟；
 #   5 批对 top1/kl 的估计精度足够。
 # 🔴 soft_index.npz **必须对当前数据集/标签构建**（行数变了行号全体平移——
@@ -254,8 +256,8 @@ python scripts/train_sft.py \
   --model models/a_v7_a100.pth.latest \
   --soft-index data/labels/soft_index.npz --soft-only-sampling 1 \
   --soft-weight 1.0 --soft-every 1 --policy-loss soft_ce \
-  --batch-size 2000 --epochs 30 --lr 0.00320 --weight-decay 0.0001 \
-  --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
+  --batch-size 1024 --epochs 30 --lr 0.00320 --weight-decay 0.0001 \
+  --gradient-accumulation-steps 2 --use-amp 1 --use-ema 1 \
   --gc-with-compile 1 --flash-attn 1 --attention-dropout 0 \
   --prefetch-workers 24 --prefetch-depth 8 \
   --log-every 25 --eval-every 100 --eval-max-batches 5 --save-every 20 \
@@ -265,13 +267,13 @@ python scripts/train_sft.py \
 # --- C 段：stdata 分片（搜索分布内建），单卡 A100 ---
 # ⚠ C 段**不要** `--games-npz`（贴目已在行里）、也**不需要** `--soft-index`
 #   （stdata 每行自带 policy_player_prob/policy_opp_prob，归一化即软标签）。
-# ⚠ batch 与 LR 同 A 段：未定档，现场调，改了按公式重算 LR。
+# ⚠ batch 与 LR 同 A 段：**1024×2（有效 2048，LR 0.00320）**，已定档，与 A 一致。
 python scripts/train_sft.py \
   --data data/stdata --v7 1 --device cuda --board-size 19 \
   --model models/b_v7_a100.pth.latest \
   --policy-loss soft_ce --soft-weight 1.0 \
-  --batch-size 2800 --epochs 1 --lr 0.00377 --weight-decay 0.0001 \
-  --gradient-accumulation-steps 1 --use-amp 1 --use-ema 1 \
+  --batch-size 1024 --epochs 1 --lr 0.00320 --weight-decay 0.0001 \
+  --gradient-accumulation-steps 2 --use-amp 1 --use-ema 1 \
   --gc-with-compile 1 --flash-attn 1 --attention-dropout 0 \
   --prefetch-workers 4 --prefetch-depth 8 \
   --log-every 50 --eval-every 500 --save-every 250 \
