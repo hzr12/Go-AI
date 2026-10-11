@@ -273,6 +273,71 @@ def _count_host_syncs():
     with counter:
         yield counter
 
+def test_log_scalar_readback_is_one_host_sync_not_n():
+    """日志路径读标量必须是**一发** D2H，不是逐项一发（2026-10-11 A100）。
+
+    为什么这条要有门禁：每次 D2H 都是**把设备流水线排空**的一次阻塞读回，
+    实测 A100 上约 5.8 ms/次。一个 optimizer step 要读 16 个标量
+    （3 个 loss + 13 个 `loss_v7/*`）⇒ 逐项读 ~93 ms，而每 step 墙钟才 665 ms。
+    这段时间落在 `u`（未归因）里，在 SwanLab 上表现为"莫名其妙慢一截"。
+
+    探针是**同步点个数**而不是时间（见 `_count_host_syncs` 的 docstring：CPU 上
+    逐项读几乎免费，真机代价在 CPU 上原理上不可测）。⚠ `.tolist()` 对这个探针
+    **结构性看不见**（实测报 0），所以断言是「≤ 1 次代理可见同步」——与
+    `test_l2_report_uses_decay_group_only` 同一套口径。**旧写法会被抓到**：逐项
+    `.item()` 是 3 次与 13 次，远超阈值。
+    """
+    g = torch.Generator().manual_seed(11)
+    loss, pol, val = (torch.randn((), generator=g) for _ in range(3))
+
+    with _count_host_syncs() as c:
+        t._read_log_scalars(loss, pol, val)
+    assert c.n <= 1, f'_read_log_scalars 有 {c.n} 次代理可见同步（应 ≤1）'
+    # 旧写法（逐项 .item）确实是 3 次 —— 证明这个阈值不是恒真
+    with _count_host_syncs() as c_old:
+        (loss.item(), pol.item(), val.item())
+    assert c_old.n == 3, f'探针本身失效：逐项 .item 只报了 {c_old.n} 次'
+
+    terms = {'loss_v7/policy': loss, 'loss_v7/value': val,
+             'loss_v7/seki': 0.0}          # 混一个字面量 0（权重为 0 的项）
+    with _count_host_syncs() as c2:
+        t._scalar_dict_to_host(terms)
+    assert c2.n <= 1, f'_scalar_dict_to_host 有 {c2.n} 次代理可见同步（应 ≤1）'
+
+    big = {'loss_v7/t%d' % i: loss for i in range(13)}
+    with _count_host_syncs() as c_old2:
+        {k: float(v) for k, v in big.items()}
+    assert c_old2.n == 13, f'探针失效：13 次 float() 只报了 {c_old2.n} 次'
+
+
+def test_log_scalar_readback_is_bit_identical_to_per_item():
+    """合并读回**只改读回方式，不改任何数值**。
+
+    门禁「同步点变少」很容易被一个同时改了精度的实现蒙混过关 —— 比如有人为了
+    凑 stack 而加 `.half()`/`.float()`。这里拿旧写法当参考实现对照。
+    """
+    g = torch.Generator().manual_seed(12)
+    loss, pol, val = (torch.randn((), generator=g) for _ in range(3))
+    assert t._read_log_scalars(loss, pol, val) == (loss.item(), pol.item(),
+                                                   val.item())
+
+    mixed = {'a': loss, 'lit': 0.0, 'b': val, 'lit2': 2.5}
+    want = {k: float(v) for k, v in mixed.items()}
+    got = t._scalar_dict_to_host(mixed)
+    assert sorted(got) == sorted(want)
+    assert got == want
+
+    # bf16 输入：损失内部恒产 fp32，但这里也守住「合并不引入转换」
+    bl, bv = loss.bfloat16(), val.bfloat16()
+    assert t._scalar_dict_to_host({'x': bl, 'y': bv}) == {
+        'x': float(bl), 'y': float(bv)}
+
+    # 边界：全字面量 / 空 dict / 单元素都不得炸
+    assert t._scalar_dict_to_host({'a': 1.0, 'b': 0.0}) == {'a': 1.0, 'b': 0.0}
+    assert t._scalar_dict_to_host({}) == {}
+    assert t._scalar_dict_to_host({'x': loss}) == {'x': float(loss)}
+
+
 # --------------------------------------------------------------------------- #
 # 1. Huber 实现正确性 oracle：与 F.smooth_l1_loss 逐位相同 + 手写公式复核
 # --------------------------------------------------------------------------- #
@@ -667,8 +732,18 @@ def test_log_keys_unchanged():
     # stdout 打点行与单同步点 helper 一起钉住（下游解析的是这些字面量）
     assert 'loss=%.4f (p=%.4f v=%.4f)' in SRC, \
         'stdout 打点行 loss/p/v 格式变了'
-    assert 'return loss.item(), policy_loss.item(), value_loss.item()' in SRC, \
-        '_read_log_scalars 的三元组变了'
+    assert ('_lv, _pv, _vv = torch.stack((loss, policy_loss, value_loss)).tolist()'
+            in SRC), '_read_log_scalars 的三元组变了'
+    # 🔴 2026-10-11：这一行原为 `return loss.item(), policy_loss.item(),
+    #   value_loss.item()`（3 次 D2H）。逐项读回每步要 3 发同步，而 A100 上一发
+    #   D2H ≈ 5.8 ms（排空设备流水线），整个日志路径 16 个标量逐项读 ≈ 93 ms /
+    #   665 ms 墙钟 ⇒ ~14%。改成一次 `stack().tolist()`。
+    #   **数值逐位不变**（同一批张量、同一顺序），由
+    #   `test_log_scalar_readback_is_bit_identical_to_per_item` 钉；
+    #   **同步点降到 ≤1** 由 `test_log_scalar_readback_is_one_host_sync_not_n` 钉。
+    #   这里仍守原意图：单同步点 helper + 三元组顺序不能变。
+    assert 'return loss.item(), policy_loss.item(), value_loss.item()' not in SRC, \
+        '_read_log_scalars 退回逐项 .item() 了（3 次 D2H / 每步）'
 
 # --------------------------------------------------------------------------- #
 # 6. ce / mse 两条路径数值与改前一致（期望值全部手算）

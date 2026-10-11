@@ -245,8 +245,15 @@ def test_terms_float_call_detaches_before_synchronising():
     # 两个消费点各自做转换，缺一个就少上报一路
     assert "'%s=%.4f' % (k, float(v))" in SRC, \
         'stdout 打点行没有在消费处做 float 转换'
-    assert '**{k: float(v) for k, v in _v7_terms_swanlab.items()}' in SRC, \
-        'swanlab 上报没有在消费处做 float 转换'
+    assert '**_scalar_dict_to_host(_v7_terms_swanlab)' in SRC, \
+        'swanlab 上报没有在消费处做读回转换'
+    # 🔴 2026-10-11：消费处原为 `**{k: float(v) for k, v in _v7_terms_swanlab.items()}`
+    #   —— **13 次 D2H**。改为 `_scalar_dict_to_host(...)` **一发**
+    #   （`torch.stack(...).tolist()`，字面量 0.0 的项原样带过）。
+    #   本用例要守的三件事一件没变：仍 detach、dict 里不就地 float、D2H 仍在
+    #   **消费点**（打点节奏）而不在每步。变的只是「消费点读 13 次 vs 1 次」。
+    assert '**{k: float(v) for k, v in _v7_terms_swanlab.items()}' not in SRC, \
+        'swanlab 上报退回逐项 float() 了（13 次 D2H / 每打点）'
 
 
 def test_overflow_diagnostics_are_rank0_only():

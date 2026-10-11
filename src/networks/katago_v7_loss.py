@@ -294,37 +294,90 @@ def _weighted_mean(per_sample, weight, probe=None, tag=''):
     p = per_sample.reshape(-1)
     w = weight.reshape(-1)
     bad_w = ~torch.isfinite(w) | (w > W_WEIGHT_CEILING)
-    if bool(bad_w.any()):
-        if probe is not None:
-            probe[tag + ':w_bad'] = int(bad_w.sum())
-        # 替换成**有限**的默认值即可同时满足两头：
-        #   前向：`p * w` 不再溢出；
-        #   反向：`grad_p = grad_v * w` 里 w 有限 ⇒ 与 grad_v=0 相乘得 0，
-        #         不再是 `0 * inf = NaN`。
-        # w 是标签（requires_grad=False），改它不引入任何梯度。
-        w = torch.where(bad_w, torch.full_like(w, W_WEIGHT_DEFAULT), w)
+    # 下面两处净化**无条件**执行（原来各自包在一个 `if bool(...)` 里）。
+    # 这样改的依据是一条可验证的事实：**mask 全 False 时 `torch.where` 原样返回**，
+    # 前向逐位相同、反向梯度也逐位相同（`where` 的反向把梯度按 mask 分流，
+    # 全 False 时等于 `grad * 1.0`）。省掉的是 `bool(tensor)` —— 每次都是
+    # **排空设备流水线**的一次阻塞读回（真机 A100 约 0.6 ms/次）。
+    # 代价量化：13 项 × 2 处 = **26 次 / micro-batch**，256×8 下
+    # **每 optimizer step 208 次**，占墙钟里 `c` 段的很大一块。
+    #
+    # ⚠ 计数（probe）**延迟**到 forward 末尾一次性读回（见 `_resolve_probe`）：
+    #   `int(x)` 同样是一次同步。它暂存在 dict 里当 0 维**设备张量**。
+    if probe is not None:
+        # `[计数, 存在标志]`：旧写法是「条件成立才写这个键」，而**条件不等于
+        # 计数 > 0** —— 见 `_resolve_probe` 的说明。两者必须一起延迟。
+        probe[tag + ':w_bad'] = torch.stack(
+            [bad_w.sum(), bad_w.any().to(bad_w.dtype)])
+    # 替换成**有限**的默认值即可同时满足两头：
+    #   前向：`p * w` 不再溢出；
+    #   反向：`grad_p = grad_v * w` 里 w 有限 ⇒ 与 grad_v=0 相乘得 0，
+    #         不再是 `0 * inf = NaN`。
+    # w 是标签（requires_grad=False），改它不引入任何梯度。
+    w = torch.where(bad_w, torch.full_like(w, W_WEIGHT_DEFAULT), w)
     zero = (w == 0)
-    if bool(zero.any()):
-        # 不能用 `torch.nan_to_num` —— **Ascend 后端没有这个 kernel**。
-        # 2026-10-05 真机 4×910A（A 段 batch=1900/卡）：
-        #   EZ3003: No supported Ops kernel and engine are found for
-        #           [NanToNum266], optype [NanToNum].
-        #   [ERROR] ERR00100 PTA call acl api failed
-        # 建图失败是**异步**的，报错落在下一个同步点（`bool(...)`）上，栈因此指向
-        # 完全无关的一行 —— 日志自己都写了「the stacktrace may be inaccurate」。
-        # `where(isfinite(x), x, 0)` 与 `nan_to_num(x, 0, 0, 0)` **前向与反向都
-        # 逐位等价**（实测前向 [1,0,0,-2]、梯度 [1,0,0,1]），而 `isfinite` 与
-        # `where` 在本文件里已被真机验证可用（见 `_weighted_mean` 的两处）。
-        clean = torch.where(torch.isfinite(p), p,
-                            torch.zeros((), dtype=p.dtype, device=p.device))
-        if probe is not None and not bool(torch.isfinite(p).all()):
-            # 记「有几行本该是 0 而实际是非有限」—— 这是坏数据的直接证据
-            probe[tag] = int((zero & ~torch.isfinite(p)).sum())
-        # 只在**被丢弃**的那些行上清成 0：w!=0 的行原样保留，
-        # 所以 `per_sample` 有限时结果与原来**逐位相同**（分母仍是 batch 大小，
-        # 不改变 spec §4.5 的口径）。
-        p = torch.where(zero, clean, p)
+    # 不能用 `torch.nan_to_num` —— **Ascend 后端没有这个 kernel**。
+    # 2026-10-05 真机 4×910A（A 段 batch=1900/卡）：
+    #   EZ3003: No supported Ops kernel and engine are found for
+    #           [NanToNum266], optype [NanToNum].
+    #   [ERROR] ERR00100 PTA call acl api failed
+    # 建图失败是**异步**的，报错落在下一个同步点（`bool(...)`）上，栈因此指向
+    # 完全无关的一行 —— 日志自己都写了「the stacktrace may be inaccurate」。
+    # `where(isfinite(x), x, 0)` 与 `nan_to_num(x, 0, 0, 0)` **前向与反向都
+    # 逐位等价**（实测前向 [1,0,0,-2]、梯度 [1,0,0,1]），而 `isfinite` 与
+    # `where` 在本文件里已被真机验证可用（见 `_weighted_mean` 的两处）。
+    clean = torch.where(torch.isfinite(p), p,
+                        torch.zeros((), dtype=p.dtype, device=p.device))
+    if probe is not None:
+        # 记「有几行本该是 0 而实际是非有限」—— 这是坏数据的直接证据。
+        # 存在条件与旧写法逐字一致：`zero.any() and not isfinite(p).all()`，
+        # **不是**「计数 > 0」（实测 `{'score_stdev': 0}` 这种「计数 0 但键存在」
+        # 的情形是真实的，见 `_resolve_probe`）。
+        _bad_p = ~torch.isfinite(p)
+        probe[tag] = torch.stack(
+            # ⚠ 存在条件是 `_bad_p.any()`（**有**一个非有限），不是
+            # `_bad_p.all()`（**每**一个都非有限）—— 旧守卫写的是
+            # `not isfinite(p).all()`，两者差一个 `not`，搞反就会让
+            # 「零权重行但 p 有限」这种本不该记的情形凭空记一条。
+            [(zero & _bad_p).sum(), (zero.any() & _bad_p.any()).to(p.dtype)])
+    # 只在**被丢弃**的那些行上清成 0：w!=0 的行原样保留，
+    # 所以 `per_sample` 有限时结果与原来**逐位相同**（分母仍是 batch 大小，
+    # 不改变 spec §4.5 的口径）。
+    p = torch.where(zero, clean, p)
     return (p * w).mean()
+
+
+def _resolve_probe(probe, vals=None):
+    """把延迟读回的设备张量一次性读成 ``int`` dict，键的**存在性**逐字还原旧语义。
+
+    每个延迟键存的是 ``[计数, 存在标志]``（见 `_weighted_mean` 里的两处写入）。
+    **「键在不在」由标志位决定，而不是「计数 > 0」** —— 这条区分是被实测逼出来的：
+    旧 `probe[tag]` 的写入条件是 ``zero.any() and not isfinite(p).all()``，
+    于是像 ``{'score_stdev': 0}`` 这种**计数为 0 但键确实存在**的返回值是真实的
+    （`p` 含 NaN、但 NaN 不落在零权重行上）。按计数过滤会把它悄悄抹掉，
+    而 `sanitized_rows` 是训练循环逐项上报的诊断，抹掉等于丢证据。
+
+    为什么值得延迟：``int(tensor)`` 与 ``bool(tensor)`` 一样是**排空设备流水线**
+    的阻塞读回，而 `_weighted_mean` 每项要报两个计数 ⇒ 26 次 / micro-batch
+    （256×8 ⇒ 每 optimizer step 208 次）。合成一发 ``torch.stack().tolist()``
+    之后只剩 1 次。
+
+    `vals` 可由调用方传入**已读回好的那一段**（forward 把所有诊断读回合成一发），
+    那时本函数不再触发任何同步。
+    """
+    if not probe:
+        return {}
+    _keys = [k for k, v in probe.items() if torch.is_tensor(v)]
+    out = {k: v for k, v in probe.items() if not torch.is_tensor(v)}
+    if _keys:
+        # 两条分支都产出「每个键一个 [计数, 标志] 的配对」
+        _pairs = ([v.reshape(-1).tolist() for v in probe.values()
+                   if torch.is_tensor(v)] if vals is None
+                  else [vals[i:i + 2] for i in range(0, len(vals), 2)])
+        for k, (cnt, has) in zip(_keys, _pairs):
+            if has:
+                out[k] = int(cnt)
+    return out
 
 
 class KataGoV7Loss(nn.Module):
@@ -803,14 +856,28 @@ class KataGoV7Loss(nn.Module):
         # 那时再补扫一遍全表。
         _zero_bad = []
         _zero_terms = [v for k, v in terms.items() if self.coeff[k] == 0.0]
-        if _zero_terms:
-            _stacked = torch.stack([t.reshape(-1) for t in _zero_terms])
-            if not bool(torch.isfinite(_stacked).all()):
-                _names = [k for k in terms if self.coeff[k] == 0.0]
-                _per = torch.isfinite(_stacked).all(dim=1)
-                _zero_bad = [n for n, ok in zip(_names, _per.tolist())
-                             if not ok]
-        if not bool(torch.isfinite(total)):
+        _stacked = (torch.stack([t.reshape(-1) for t in _zero_terms])
+                    if _zero_terms else None)
+        _total_fin_t = torch.isfinite(total).reshape(1)
+        # 两次 `bool(torch.isfinite(total))`（判坏 + 填 `total_finite`）**共用一次**
+        # 读回 —— 同一个表达式算两遍就是两次排空流水线的阻塞读回。
+        # 顺带把 `_resolve_probe` 的一发也合并进来：诊断类读回**整个 forward
+        # 只做一次**（原来 28 次 / micro-batch，256×8 下 224 次 / step）。
+        _diag = [_total_fin_t,
+                 # 固定布局：即使没有零系数项也占一格，保证 probe 从下标 2 开始
+                 (torch.isfinite(_stacked).all().reshape(1) if _zero_terms
+                  else torch.ones(1, dtype=torch.bool, device=total.device))]
+        if _sanitized:
+            _diag.extend(v.reshape(-1) for v in _sanitized.values()
+                         if torch.is_tensor(v))
+        _diag_vals = torch.cat(_diag).tolist()
+        _total_fin = bool(_diag_vals[0])          # 旧写法返回 python bool，别退成 int
+        if _zero_terms and not _diag_vals[1]:
+            _names = [k for k in terms if self.coeff[k] == 0.0]
+            _per = torch.isfinite(_stacked).all(dim=1)
+            _zero_bad = [n for n, ok in zip(_names, _per.tolist())
+                         if not ok]
+        if not _total_fin:
             _zero_bad = sorted(set(_zero_bad) | {
                 k for k, v in terms.items()
                 if not bool(torch.isfinite(v).all())})
@@ -818,6 +885,6 @@ class KataGoV7Loss(nn.Module):
         return {'loss': total, 'terms': terms, 'weighted': weighted,
                 'nonfinite_terms': bad,
                 'nonfinite_operands': sorted(set(_bad_operands)),
-                'sanitized_rows': dict(_sanitized),
-                'total_finite': bool(torch.isfinite(total)),
+                'sanitized_rows': _resolve_probe(_sanitized, _diag_vals[2:]),
+                'total_finite': _total_fin,
                 'seki_adaptive_scale': adaptive.detach()}

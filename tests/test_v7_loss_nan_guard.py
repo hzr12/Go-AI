@@ -32,6 +32,23 @@ from src.networks.katago_v7_loss import (  # noqa: E402
     KataGoV7Loss,
 )
 
+
+def _resolved(probe):
+    """把 `_weighted_mean` 的 probe dict **解析**成最终形态再看。
+
+    🔴 2026-10-11：`_weighted_mean` 不再就地 `int(...)`，而是把
+    `[计数, 存在标志]` 暂存成 0 维设备张量，等 `forward` 末尾用
+    `torch.stack(...).tolist()` **一次**读回（每次 `int()/bool()` 都是
+    **排空设备流水线**的阻塞读回，13 项 × 2 处 = 26 次 / micro-batch，
+    256×8 下每 optimizer step 208 次）。
+
+    **被检视的行为一个字没变**：这些用例断言的「净化 + 留证据」全部照旧，
+    只是观察点从 dict 本身移到了 `_resolve_probe(probe)`。
+    直接拿 dict 比会看到一堆张量 —— 那不是行为变了，是表示变了。
+    """
+    from src.networks.katago_v7_loss import _resolve_probe
+    return _resolve_probe(probe)
+
 B, A = 4, 362
 ZERO_STAGE1 = ('lead', 'ownership', 'score_mean', 'score_stdev',
                'scorebelief_cdf', 'scorebelief_pdf', 'scoring', 'seki',
@@ -449,7 +466,7 @@ def test_weighted_mean_records_sanitised_rows_for_diagnostics():
     ps = torch.tensor([float('inf'), 1.0, float('nan'), 3.0])
     w = torch.tensor([0., 1., 0., 1.])
     _weighted_mean(ps, w, probe, 'demo')
-    assert probe['demo'] == 2, probe
+    assert _resolved(probe)['demo'] == 2, _resolved(probe)
 
 
 def test_weighted_mean_records_nothing_when_finite():
@@ -457,7 +474,7 @@ def test_weighted_mean_records_nothing_when_finite():
     probe = {}
     _weighted_mean(torch.tensor([1.0, 2.0]),
                    torch.tensor([0.0, 1.0]), probe, 'demo')
-    assert probe == {}, probe
+    assert _resolved(probe) == {}, _resolved(probe)
 
 
 def test_weighted_mean_does_not_swallow_nonzero_weight_rows():
@@ -650,7 +667,7 @@ def test_weighted_mean_neutralises_a_bad_weight():
         out = _weighted_mean(p, w, probe, 'score_stdev')
         assert torch.isfinite(out), (bad_w, out)
         # 净化必须**留下证据**：不报就成了「悄悄把坏数据吞掉」
-        assert probe.get('score_stdev:w_bad') == 1, (bad_w, probe)
+        assert _resolved(probe).get('score_stdev:w_bad') == 1, (bad_w, _resolved(probe))
         out.backward()
         assert torch.isfinite(p.grad).all(), (bad_w, p.grad)
         # 好行的梯度不许被牵连成 0（替换 != 摘掉）
@@ -694,7 +711,7 @@ def test_oversized_weight_does_not_overflow_the_product():
     probe = {}
     out = _weighted_mean(p, w, probe, 'score_stdev')
     assert torch.isfinite(out), out          # 修复前这里是 inf
-    assert probe.get('score_stdev:w_bad') == 1, probe
+    assert _resolved(probe).get('score_stdev:w_bad') == 1, _resolved(probe)
     out.backward()
     assert torch.isfinite(p.grad).all(), p.grad
     # 坏权重被换成了默认值，所以这一行仍然**有**有限的梯度（不是被摘掉）

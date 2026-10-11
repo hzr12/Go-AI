@@ -518,8 +518,13 @@ def test_v7_loss_terms_are_uploaded_not_only_printed():
     assert "'loss_v7/%s' % k" in MAIN, '逐项 loss 未按 loss_v7/ 前缀上报'
     # 2026-10-06 D2H 收口：dict 里存的是**设备张量**，float() 转换移到了
     # swanlab.log 字面量处（打点节奏）——见 `_v7_terms_last` 处注释。
-    assert '**{k: float(v) for k, v in _v7_terms_swanlab.items()}' in MAIN, \
+    assert '**_scalar_dict_to_host(_v7_terms_swanlab)' in MAIN, \
         '逐项 dict 未进 swanlab.log 的字面量（或 D2H 被提前到每步）'
+    # 2026-10-11 D2H 合并：原为 `{k: float(v) for k, v in _v7_terms_swanlab.items()}`
+    # （13 次同步）。改为一次读回，**上报内容与位置一字未变** —— 本用例守的
+    # 「12/13 项逐项 loss 必须进 swanlab、且 D2H 在消费处」仍然成立。
+    assert '**{k: float(v) for k, v in _v7_terms_swanlab.items()}' not in MAIN, \
+        '逐项上报退回逐项 float() 了（13 次 D2H / 每打点）'
 
 
 def test_v7_zero_weight_terms_are_still_uploaded():

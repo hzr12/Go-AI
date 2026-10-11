@@ -2704,17 +2704,46 @@ def _should_log(step, log_every, swanlab_every, swanlab_on):
 
 
 def _read_log_scalars(loss, policy_loss, value_loss):
-    """日志的**单一同步点**：三个 loss 张量各取一次标量。
+    """日志的**单一同步点**：三个 loss 标量**一次**读回。
 
     旧实现在同一打点里取了两遍（一次给 stdout、一次给 swanlab），共 6 次设备
-    同步，其中 3 次完全重复。这里只取一次并返回给两处复用——数值逐位不变，
-    同步次数减半。
+    同步，其中 3 次完全重复；后来合并成 3 次 `.item()`。现在是
+    `torch.stack(...).tolist()` **一发**。
+
+    ⚠ **为什么合并是值得的**（2026-10-11 A100 实测）：每次 D2H 都是**把设备
+    流水线排空**的一次阻塞读回，约 5.8 ms/次。日志路径上一个 optimizer step 要读
+    16 个标量 ⇒ 逐项读就是 ~93 ms，而每 step 墙钟才 665 ms。这段时间落在计时里
+    **看不见的 `u` 段**（`t_comp_ms` 只统计 CPU 发射时间、不含设备执行，见该字段
+    注释），所以「日志读回」在 SwanLab 曲线上表现为"莫名其妙慢一截"。
+    **合并只改读回方式，不改任何数值**（同一批张量、同一顺序）。
 
     第一个参数传的是 **`log_loss`（报告口径）**，不是被 backward 的
     `opt_loss`。两者相差一个 `l2_report = c‖θ‖²`（P4.5b §3.1），故意不相等；
     形参名沿用 `loss` 是为了不打乱本仓既有的调用/断言写法，含义以上行为准。
     """
-    return loss.item(), policy_loss.item(), value_loss.item()
+    _lv, _pv, _vv = torch.stack((loss, policy_loss, value_loss)).tolist()
+    return _lv, _pv, _vv
+
+
+def _scalar_dict_to_host(d):
+    """把「一堆标量张量（可能混着几个 Python 浮点）」**一次**读回主机。
+
+    `loss_v7/*` 那 13 项此前是 `{k: float(v) for ...}` —— **13 次 D2H**。
+    现在一发 `torch.stack(...).tolist()`。
+
+    值是混的：`_v7_terms_last` 带来的都是设备标量张量，而「权重为 0」的那几项
+    是**字面量 `0.0`**（见 `_v7_terms_swanlab` 处注释），`torch.stack` 不吃
+    Python 浮点，所以分开过一遍再并回同一个 dict。
+
+    **数值逐位不变**：`weighted` 各项恒为 fp32（损失内部已 `.float()`，bf16 输入
+    也一样 —— 实测两种输入下都是 12/13 项 torch.float32），故 `stack` 不引入任何
+    类型转换；逐项 `float()` 与 `stack().tolist()` 实测完全相等。
+    """
+    _tk = [k for k, v in d.items() if torch.is_tensor(v)]
+    _out = {k: v for k, v in d.items() if not torch.is_tensor(v)}
+    if _tk:
+        _out.update(zip(_tk, torch.stack([d[k] for k in _tk]).tolist()))
+    return _out
 
 
 # ---- D4（SFT 侧）：policy/value 损失口径 --------------------------------------
@@ -5523,7 +5552,9 @@ def main():
                         # 的**求和口径不同**（这里是 `weighted`，已乘系数）。
                         # 这里才是 `loss_v7/*` 的**唯一** D2H 点（打点节奏）：
                         # 上游存的是设备张量，见 `_v7_terms_last` 处注释。
-                        **{k: float(v) for k, v in _v7_terms_swanlab.items()},
+                        # 逐项 `float()` 是 13 次同步，一发读回是 1 次（见
+                        # `_scalar_dict_to_host` 的 docstring：为什么值得合）。
+                        **_scalar_dict_to_host(_v7_terms_swanlab),
                     }
                     # ---- 面板过滤（2026-10-06 瘦身）----
                     #  · `_SWANLAB_DROP_KEYS`：照算不报的键（见常量处注释）；

@@ -15,6 +15,7 @@ import os
 import sys
 
 import pytest
+import torch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -216,38 +217,39 @@ def test_swanlab_every_one_logs_every_step():
 
 
 # --------------------------------------------------------------------------- #
-# 单一同步点：三个张量各取一次
+# 单一同步点：三个标量**一次**读回
 # --------------------------------------------------------------------------- #
-class _CountingTensor:
-    """记录 .item() 调用次数的张量替身。"""
+def test_read_log_scalars_reads_back_all_three_in_one_shot():
+    """三个 loss 标量一次读回，**顺序与数值**逐位正确。
 
-    def __init__(self, value):
-        self.value = value
-        self.calls = 0
+    🔴 2026-10-11：原实现是 `loss.item(), policy_loss.item(), value_loss.item()`
+    —— 3 次 D2H；现为 `torch.stack(...).tolist()` **一发**。
+    动机：每次 D2H 都是**把设备流水线排空**的一次阻塞读回（A100 实测约
+    5.8 ms/次），整个日志路径 16 个标量逐项读 ≈ 93 ms，而每 step 墙钟才
+    665 ms ⇒ ~14%。这时间落在 `u`（未归因）里。
 
-    def item(self):
-        self.calls += 1
-        return self.value
-
-
-def test_read_log_scalars_syncs_each_tensor_exactly_once():
-    """每打点 loss/policy_loss/value_loss 各只 .item() 一次（3 次同步，非 6 次）。"""
-    a, b, c = _CountingTensor(1.5), _CountingTensor(0.25), _CountingTensor(0.125)
+    旧用例用 `_CountingTensor` 假张量数 `.item()` 次数。**`torch.stack` 只吃
+    真张量**，假张量已不适用 —— 这本身说明「数 `.item()` 次数」这个代理量在
+    机制换掉后不再是合适的观测口（同步点个数改由
+    `tests/test_huber_loss.py::test_log_scalar_readback_is_one_host_sync_not_n`
+    用 `TorchDispatchMode` 钉）。那个替身随之删除，别再加回来。
+    """
+    a, b, c = torch.tensor(1.5), torch.tensor(0.25), torch.tensor(0.125)
     got = _read_log_scalars(a, b, c)
-    assert a.calls == 1, f"loss 被取 {a.calls} 次"
-    assert b.calls == 1, f"policy_loss 被取 {b.calls} 次"
-    assert c.calls == 1, f"value_loss 被取 {c.calls} 次"
-    assert got == (1.5, 0.25, 0.125)
+    assert got == (1.5, 0.25, 0.125), got
 
 
 def test_read_log_scalars_returns_plain_floats():
-    """返回值是普通 float（供 %-格式化与 swanlab 字典直接使用）。
+    """返回值是**真正的** python float（供 %-格式化与 swanlab 字典直接使用）。
 
-    真实的 torch 浮点张量 .item() 就返回 python float，这里用 float 替身对齐该语义。
+    `.tolist()` 返回 python float，而 `.item()` 与 `float(x)` 也一样 —— 但这条
+    现在有实际意义了：若有人把 `stack(...).tolist()` 改成 `.cpu()` 或直接返回
+    张量，下游的 `'%.4f' % v` 与 swanlab 字典就会各自炸在别处、报不出根因。
     """
-    a, b, c = _CountingTensor(3.0), _CountingTensor(2.0), _CountingTensor(1.0)
+    a, b, c = torch.tensor(3.0), torch.tensor(2.0), torch.tensor(1.0)
     vals = _read_log_scalars(a, b, c)
-    assert all(isinstance(v, float) for v in vals)
+    assert all(type(v) is float for v in vals), [type(v) for v in vals]
+    assert all(not torch.is_tensor(v) for v in vals)
 
 
 # --------------------------------------------------------------------------- #
