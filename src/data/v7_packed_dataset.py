@@ -44,6 +44,7 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
@@ -126,21 +127,40 @@ class V7PackedDataset:
         print('[data] V7 分片加载中：%d 片，合计 %.1f GB（整读进内存，不 mmap）；'
               '机器装不下就会换页变慢 —— 这是加载期，不是挂死'
               % (len(self.shard_paths), sum(_sizes) / 1e9), flush=True)
-        for _i, p in enumerate(self.shard_paths):
-            print('  [data] V7 分片 %d/%d 读取中 %s (%.2f GB) …'
-                  % (_i + 1, len(self.shard_paths), p, _sizes[_i] / 1e9),
-                  flush=True)
-            z = np.load(p, allow_pickle=True)
-            n = int(np.asarray(z['spatial_packed']).shape[0])
-            for k in z.files:
-                if k in _META_KEYS:
-                    continue
-                collected.setdefault(k, []).append(np.asarray(z[k]))
-            offsets.append(total)
-            total += n
-            print('  [data] V7 分片 %d/%d 完成 %s（%d 行，累计 %d 行）'
-                  % (_i + 1, len(self.shard_paths),
-                     os.path.basename(p), n, total), flush=True)
+        def _load_one(path):
+            """解压一个分片，返回 ``(逐键数组, 行数)``。
+
+            ⚠ `spatial_packed` **只读一次**：原实现先 `np.asarray(z['spatial_packed'])`
+            取行数、循环里又 `np.asarray(z[k])` 读它第二遍，而 `np.load` 对 npz
+            返回的是惰性 `NpzFile` —— **每次 `z[k]` 都从头解压一遍**，于是最大
+            的那个键被白解压一次。
+            """
+            z = np.load(path, allow_pickle=True)
+            try:
+                out = {k: np.asarray(z[k]) for k in z.files if k not in _META_KEYS}
+            finally:
+                z.close()                 # 原实现从不关 ⇒ 8 个 zip 句柄一直挂着
+            return out, int(out['spatial_packed'].shape[0])
+
+        # 分片之间**并行**解压：zlib 的 inflate 与文件读都释放 GIL，所以线程池
+        # 在这里是真并行（不是被 GIL 串行化的假象）。`ex.map` 保序 ⇒ `_offsets`
+        # 与 `_shards` 里逐片列表的顺序仍与 `shard_paths` 严格一致（`_gather`
+        # 靠这个对应关系定位分片，乱序会静默取错行）。
+        n_paths = len(self.shard_paths)
+        if n_paths > 1:
+            print('[data] 分片并行解压（zlib 释放 GIL，线程池 %d 路）'
+                  % min(8, n_paths), flush=True)
+        with ThreadPoolExecutor(max_workers=max(1, min(8, n_paths))) as _ex:
+            for _i, (_one, n) in enumerate(
+                    _ex.map(_load_one, self.shard_paths)):
+                for k, arr in _one.items():
+                    collected.setdefault(k, []).append(arr)
+                offsets.append(total)
+                total += n
+                print('  [data] V7 分片 %d/%d 完成 %s（%d 行，累计 %d 行）'
+                      % (_i + 1, n_paths,
+                         os.path.basename(self.shard_paths[_i]), n, total),
+                      flush=True)
         offsets.append(total)
 
         self._shards = collected

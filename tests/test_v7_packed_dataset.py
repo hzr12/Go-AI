@@ -324,6 +324,92 @@ def test_resolve_shards_rejects_empty_dir(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# 加载器：并行解压带来的两条新约束（2026-10-11 C 段「加载太慢」优化时加）
+# --------------------------------------------------------------------------- #
+def test_spatial_packed_is_decompressed_only_once(tmp_path, monkeypatch):
+    """``spatial_packed`` 每个分片**只解压一遍**。
+
+    `np.load` 对 npz 返回的是惰性 `NpzFile`：每次 `z[key]` 都从头解压一次。
+    原实现先 `np.asarray(z['spatial_packed'])` 取行数、循环里又
+    `np.asarray(z[k])` 读它第二遍 —— 于是**最大的那个键被白解压一次**
+    （3.13M 行 × 22 × 46 ≈ 3.17 GB 的纯浪费）。
+
+    夹具很小、所以测不出「多花多少时间」，但**「读了几遍」是确定的**：数
+    `NpzFile.__getitem__` 的调用次数即可。
+    """
+    import src.data.v7_packed_dataset as _mod
+
+    class _CountingNpz:
+        """代理 NpzFile，数每个键被取了几次。
+
+        ⚠ 不能靠 `z.__getitem__ = f` 猴补：`obj[key]` 走的是**类型的
+        `mp_subscript` 槽**，实例 `__dict__` 里那个 `__getitem__` 永远不会被
+        调用（设上了也白设，实测 `reads` 恒为空）。必须用真类包一层。
+        """
+
+        def __init__(self, z, reads):
+            self._z = z
+            self._reads = reads
+
+        @property
+        def files(self):
+            return self._z.files
+
+        def __getitem__(self, key):
+            self._reads[key] = self._reads.get(key, 0) + 1
+            return self._z[key]
+
+        def close(self):
+            self._z.close()
+
+    shard = _make_shard(tmp_path / 'one.npz', n=8, seed=1)
+    real_load = np.load
+    reads = {}
+
+    def counting_load(path, *args, **kw):
+        return _CountingNpz(real_load(path, *args, **kw), reads)
+
+    monkeypatch.setattr(_mod.np, 'load', counting_load)
+    V7PackedDataset([shard])
+    assert reads, '代理没生效：NpzFile 一个键都没被取（测试本身失效，不是代码问题）'
+    assert reads.get('spatial_packed') == 1, (
+        f'spatial_packed 被解压 {reads.get("spatial_packed")} 次，'
+        f'应恰为 1（惰性 NpzFile 每次取值都重解压）')
+
+
+def test_parallel_shard_load_preserves_shard_order(tmp_path):
+    """**并行加载后分片顺序必须与 `shard_paths` 严格一致**。
+
+    这条是并行化引入的**唯一静默风险**：`_gather` 靠 `self._offsets` 把全局行号
+    映射到「`self._shards[key]` 里的第几片」。顺序一旦乱了，取到的是**别的分片
+    的同号行** —— 形状完全合法、不报任何错，只是监督信号整体错位。
+
+    用 6 片**互不相同**的内容（不同 seed）+ 逐片对照单片实例来钉住；片数 >2
+    是为了真正走线程池那条路（`_load_one` 只在 `n_paths > 1` 时并行）。
+    """
+    n, k = 7, 6
+    paths = [_make_shard(tmp_path / ('s%d.npz' % i), n=n, seed=i) for i in range(k)]
+    ds = V7PackedDataset(paths)
+    assert len(ds) == n * k
+
+    singles = [V7PackedDataset([p]) for p in paths]
+    allrows = np.arange(n * k, dtype=np.int64)
+    for key in ('outcome', 'game_weight', 'global'):
+        got = ds._gather(key, allrows)
+        want = np.concatenate([s._gather(key, np.arange(n, dtype=np.int64))
+                               for s in singles])
+        np.testing.assert_array_equal(got, want,
+                                      err_msg=f'{key} 的跨片拼接顺序不对')
+    # 行数映射也钉一下：每片首行必须来自对应的那个单片实例
+    for i, s in enumerate(singles):
+        lo = i * n
+        np.testing.assert_array_equal(
+            ds._gather('outcome', np.array([lo], dtype=np.int64)),
+            s._gather('outcome', np.array([0], dtype=np.int64)))
+    assert ds._offsets == [i * n for i in range(k + 1)], ds._offsets
+
+
+# --------------------------------------------------------------------------- #
 # 真实夹具
 #
 # 自己造，不要指向 `tmp/` 下的固定文件
