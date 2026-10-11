@@ -49,6 +49,7 @@ from src.networks.backbone import (
     RMSNorm,
     _sdpa,
     _segment_runner,
+    checkpointed,
 )
 
 #: spec §3 的形状常量。结构**只由这张表**决定（与 `train_sft.KATAGO_SE_CFG`
@@ -996,7 +997,7 @@ class NbtTfNet(nn.Module):
 
 
 
-    def __init__(self, cfg=None, attn_dropout=None):
+    def __init__(self, cfg=None, attn_dropout=None, grad_checkpoint=False):
         super().__init__()
         c = dict(NBT_TF_CFG)
         if cfg:
@@ -1006,6 +1007,9 @@ class NbtTfNet(nn.Module):
                              else float(attn_dropout))
         C = c['trunk_channels']
         M = c['nbt_mid']
+        # 梯度检查点（默认关）。**行为参数，不是结构参数**：形状仍只由
+        # `NBT_TF_CFG` 决定，这里只决定「反向时要不要重算 trunk 的块序列」。
+        self.grad_checkpoint = bool(grad_checkpoint)
         self.stem = _ScaledConv2d(c['in_channels'], C, 3, padding=1, bias=False)
         self.global_fc = _ScaledLinear(c['global_channels'], C, bias=False)
         # 内块统一用 MHSA+SwiGLU（'nbt'）；GAU 改版已移除（见删除说明）。
@@ -1054,6 +1058,11 @@ class NbtTfNet(nn.Module):
         return self
 
 
+    def _run_blocks(self, x, pos):
+        """被检查点包裹的那一段块序列。具名方法而非闭包：Dynamo 需要一个
+        签名固定、只收 Tensor 的可调用对象（`pos` 虽是常量张量，仍按张量传）。"""
+        return _segment_runner(self.blocks, ())(x, pos)
+
     def trunk(self, spatial, global_features):
         """stem + 11 个 nbt2 块 + trunk 末端归一化（spec §3.1）。"""
         x = self.stem(spatial)
@@ -1061,7 +1070,10 @@ class NbtTfNet(nn.Module):
                                                     1, 1)
         x = x + g
         pos = _board_pos(x.shape[0], x.shape[2], x.shape[3], x.device)
-        x = _segment_runner(self.blocks, ())(x, pos)
+        # 梯度检查点（默认关）。`pos` 是**张量**，所以 `(x, pos)` 两个位置参数
+        # 都满足「只收 Tensor」的约定，Dynamo 能 trace。
+        x = checkpointed(self._run_blocks, x, pos,
+                         modules=self.blocks, enabled=self.grad_checkpoint)
         return F.silu(self.norm_trunkfinal(x))
 
     def forward(self, spatial, global_features, board_mask=None):

@@ -1733,7 +1733,14 @@ def evaluate_metrics_v7(model, dataset, idxs, bs, device, amp_dtype, *,
         if use_channels_last:      # 与训练侧同一布局（见训练循环里的同名注释）
             sp = _to_nhwc(sp)
         gl = v7_to_device(gl_np, device, torch.float32)
-        with torch.no_grad():
+        # ⚠ 必须挂 autocast —— 与 12 通道的 `evaluate_metrics` 同口径。
+        # `v7_to_device` 在 AMP 下把输入留在 **fp16**（省一半 H2D 字节，刻意），
+        # 而**模型权重始终是 fp32**（训练侧靠 autocast 在算子内部转换，从不真的
+        # 把权重降精度）。这里若裸调 `model(sp, gl)`，就是
+        # `F.conv2d(fp16 input, fp32 weight)` ⇒ RuntimeError。
+        # 只有 `amp_dtype == float32`（CPU / 无 AMP）时两边 dtype 恰好一致才不炸，
+        # 所以这个缺口在真机 AMP 下必现、在 CPU 单测里永远看不见。
+        with torch.no_grad(), maybe_autocast(device, amp_dtype):
             out = model(sp, gl)
         pol = out['policy_logits']                      # (B, K, 361+1)
         pol = pol[:, 0, :action_size].float()           # 只看通道 0（π）

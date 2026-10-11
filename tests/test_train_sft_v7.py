@@ -38,7 +38,7 @@ from scripts.train_sft import (  # noqa: E402
     V7_GLOBAL_CHANNELS, V7_SPATIAL_CHANNELS, V7_STAGE1_SCORE_TERMS,
     V7_STAGE1_TERMS, _dihedral_batch, _v7_labels_and_moves, build_katago_v7_net,
     build_v7_stage1_loss, evaluate_metrics_v7, v7_batch_features,
-    v7_batch_sync, v7_loss_labels, v7_stage1_loss_weights,
+    v7_batch_sync, v7_loss_labels, v7_stage1_loss_weights, v7_to_device,
 )
 from src.data.dataset import SupervisedDataset  # noqa: E402
 from src.networks.katago_v7_loss import LOSS_COEFFS  # noqa: E402
@@ -1551,6 +1551,67 @@ def _eval_top1(ds, predict_move):
                                np.arange(len(ds.moves)), 8,
                                torch.device('cpu'), torch.float32,
                                max_batches=0, prefetcher=None)
+
+
+def test_eval_v7_survives_amp_low_precision_input():
+    """`evaluate_metrics_v7` 在 **AMP 低精度输入**下不得崩。
+
+    事故（2026-10-11 真机，段 2 第 100 步的周期 eval）：
+        RuntimeError: Input type (torch.cuda.HalfTensor) and weight type
+        (torch.cuda.FloatTensor) should be the same
+
+    构造性缺陷，不是回归：
+      * `v7_to_device` 在 AMP 下**刻意**把输入留在 fp16（省一半 H2D 字节），
+        而**模型权重始终是 fp32** —— 训练侧靠 `maybe_autocast` 在算子内部转换，
+        从不真的把权重降精度；
+      * 12 通道的 `evaluate_metrics` 挂了 `maybe_autocast`，V7 版**没挂** ⇒
+        裸调 `model(sp, gl)` 就是 `F.conv2d(fp16 input, fp32 weight)`。
+
+    为什么以前没人看见：本文件里所有 eval 用例都传 `torch.float32`
+    （`_eval_top1`），此时输入与权重 dtype 恰好一致 ⇒ 构造上就不可能触发。
+    **这正是覆盖缺口的形状：bug 恰好落在唯一没被测到的参数组合上。**
+
+    用 CPU + bf16 复现同一矛盾形态（CPU autocast 只支持 bf16，fp16 用不了）。
+    `maybe_autocast` 对 CPU 故意返回 `nullcontext`（它只在 CUDA 生效），所以这里
+    **猴补**它换成真的 CPU autocast —— 这样整条 eval 路径在单测里被真正跑到，
+    而不是只做一次源码断言。
+    """
+    ds = make_dataset(n_games=2, game_len=32, seed=77)
+    # 本文件导入的 `build_katago_v7_net` 是 train_sft 的委托版，返回
+    # `(model, cfg)`；`src.networks.katago_v7` 那一版只返回 model。
+    net, _cfg = build_katago_v7_net(board_size=19)
+    net.eval()
+
+    # 先确认矛盾形态真的存在：权重 fp32
+    assert next(net.parameters()).dtype == torch.float32
+    # 低精度输入由 `v7_to_device(sp, cpu, bfloat16)` 产生 —— 断言它确实不是 fp32，
+    # 否则这个用例会在「输入本来就是 fp32」的空转情形下假绿。
+    sp_np = np.zeros((2, V7_SPATIAL_CHANNELS, 19, 19), dtype=np.float16)
+    assert v7_to_device(sp_np, torch.device('cpu'),
+                        torch.bfloat16).dtype == torch.float16
+
+    import scripts.train_sft as _tsf
+    real = _tsf.maybe_autocast
+    entered = []
+
+    def _fake(device, dtype=torch.float16):
+        entered.append(True)
+        return torch.autocast('cpu', dtype=torch.bfloat16)
+
+    _tsf.maybe_autocast = _fake
+    try:
+        metrics = evaluate_metrics_v7(
+            net, ds, np.arange(len(ds.moves)), 8,
+            torch.device('cpu'), torch.bfloat16,
+            max_batches=1, prefetcher=None)
+    finally:
+        _tsf.maybe_autocast = real
+
+    assert entered, 'evaluate_metrics_v7 一次都没调用 maybe_autocast —— ' \
+                    '那正是这个 bug 的形态（裸调模型）'
+    for k in ('top1', 'top5', 'top10', 'kl', 'brier'):
+        assert k in metrics, metrics
+        assert np.isfinite(metrics[k]), f'{k}={metrics[k]} 不是有限值'
 
 
 def test_eval_reference_falls_back_to_real_move_when_soft_absent():
