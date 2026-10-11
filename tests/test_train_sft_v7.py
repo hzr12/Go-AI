@@ -133,7 +133,7 @@ def test_v7_forward_produces_every_loss_head_output(net, v7_batch):
         out = net(torch.from_numpy(sp.astype(np.float32)),
                   torch.from_numpy(gl.astype(np.float32)))
     # policy 两路（policy_player / policy_opp）、value 三分类、futurepos 两通道。
-    assert out['policy_logits'].shape == (8, 2, ACTION)
+    assert out['policy_logits'].shape == (8, 6, ACTION)
     assert out['outcome_logits'].shape == (8, 3)
     # futurepos 头是 1×1 卷积 ⇒ 输出**平面** (B,2,19,19)；loss 内部自己
     # reshape 成 (b,2,bs²)（见 `katago_v7_loss.py` #11）。

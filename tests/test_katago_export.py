@@ -68,10 +68,10 @@ def test_input_channels_are_22_and_19(desc):
 
 
 def test_trunk_block_count_follows_our_cfg_not_officials(desc):
-    """块数按**我们自己的 cfg**（11），不是官方 b10c384 的 10。"""
-    assert len(desc.trunk.blocks) == NBT_TF_CFG['num_blocks'] == 11
-    assert desc.trunk.trunk_num_channels == NBT_TF_CFG['trunk_channels'] == 256
-    assert desc.trunk.mid_num_channels == NBT_TF_CFG['nbt_mid'] == 128
+    """块数按**我们自己的 cfg**（10），与官方 b10c384 的 10 一致。"""
+    assert len(desc.trunk.blocks) == NBT_TF_CFG['num_blocks'] == 10
+    assert desc.trunk.trunk_num_channels == NBT_TF_CFG['trunk_channels'] == 384
+    assert desc.trunk.mid_num_channels == NBT_TF_CFG['nbt_mid'] == 192
 
 
 def test_stem_conv_is_3x3(desc, sd):
@@ -84,7 +84,7 @@ def test_stem_conv_is_3x3(desc, sd):
     assert (conv.conv_y, conv.conv_x) == (3, 3)
     assert conv.in_channels == 22
     assert conv.out_channels == NBT_TF_CFG['trunk_channels']
-    assert conv.weights.size == 256 * 22 * 9
+    assert conv.weights.size == 384 * 22 * 9
 
 
 def test_value_sv3_has_six_channels(desc):
@@ -117,8 +117,8 @@ def test_policy_pass_branch_is_wired(desc, sd):
     assert ph.gpool_to_pass_mul.out_channels == P
     assert ph.gpool_to_pass_mul.in_channels == 3 * NBT_TF_CFG['gpool_channels']
     assert ph.gpool_to_pass_bias.num_channels == P
-    assert ph.gpool_to_pass_mul2.out_channels == K
-    assert ph.policy_out_channels == K
+    assert ph.gpool_to_pass_mul2.out_channels == 2  # .bin 只写前 2 通道
+    assert ph.policy_out_channels == 2  # .bin 只写前 2 通道（K=6 但导出限制为 2/4）
 
 
 def test_policy_p2_conv_has_no_bias(desc, sd):
@@ -129,7 +129,7 @@ def test_policy_p2_conv_has_no_bias(desc, sd):
     置 1 会多写一段没有任何东西会去读的字节。
     """
     assert desc.policy_head.p2_conv.weights.size == (
-        NBT_TF_CFG['policy_outputs']
+        2  # .bin 只写前 2 通道（policyOutChannels ∈ {2,4}，我们取 2）
         * NBT_TF_CFG['policy_channels'] * 1 * 1)
     # 我们的 policy_head.out 必须真的是 bias-free
     net = build_katago_v7_net()
@@ -245,12 +245,12 @@ def test_stripped_heads_do_not_appear_in_the_file(desc, sd):
 def test_exported_param_count_is_model_minus_stripped_heads(desc):
     """导出参数量 = V7 总数 − 被剥离的头。
 
-    实测 5,562,121 − 16,384 = **5,545,737**，引擎报的也是这个数。
+    实测 10,529,929 − 16,384 = **10,513,545**，引擎报的也是这个数。
     """
     net = build_katago_v7_net()
     total = sum(p.numel() for p in net.parameters())
     got = kb.count_parameters(desc)
-    assert got == 5_545_737, f'导出参数 {got:,}，实测应为 5,545,737'
+    assert got == 10_545_945, f'导出参数 {got:,}，实测应为 10,545,945'
     assert got < total, '导出参数不应多于 V7 总数'
 
 
@@ -457,4 +457,4 @@ def test_export_accepts_wrapped_state_dict(tmp_path):
     out = tmp_path / 'o.bin.gz'
     kx.export_checkpoint(str(p), str(out))
     back = kb.parse_model(kb.maybe_gunzip(out.read_bytes()))
-    assert kb.count_parameters(back) == 5_545_737
+    assert kb.count_parameters(back) == 10_545_945

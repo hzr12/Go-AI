@@ -448,7 +448,7 @@ def test_reported_values_are_floats_not_tensors():
 # 这次扩充的动机：V7 训练早已接通，但它的上报面**只覆盖 12 通路的形状** ——
 # config 面板无条件记 12 通道的数字（于是每个 V7 run 的面板都写着
 # `in_channels: 12` / `params_total: 9,112,005`，而它实际训练的是
-# 22 通道 / 5,562,121），逐项 loss 只进 stdout 不进 SwanLab。
+# 22 通道 / 10,529,929），逐项 loss 只进 stdout 不进 SwanLab。
 #
 # 两类错误都属于「面板给了虚构值 / 该报的没报」，与本文件开头写的那两类同源。
 @pytest.mark.parametrize('key', [
@@ -583,7 +583,7 @@ def test_run_level_reports_actual_params_not_the_budget():
     """ `run/params_actual` 必须是**实测**参数量。
 
     V7 的 `NBT_TF_CFG['params_total']` 是**预算值** 5,561,832，而实测建出来
-    是 **5,562,121**（差 289，`tests/test_katago_v7_budget.py` 钉住后者）。
+    是 **10,529,929**（差 289，`tests/test_katago_v7_budget.py` 钉住后者）。
     只报预算值时，「预算表与实现漂了」这件事在图上完全看不出来。
     """
     assert 'run/params_actual' in MAIN and 'numel' in MAIN, \

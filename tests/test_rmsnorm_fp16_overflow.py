@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """`backbone.RMSNorm` 的 fp16 平方和溢出防护。
 
-背景：V7 的 `Nbt2TransformerBlock` 有 11 块 × 2 内块 × 2 个 norm = **44 处**走
+背景：V7 的 `Nbt2TransformerBlock` 有 10 块 × 2 内块 × 2 个 norm = **40 处**走
 `backbone.RMSNorm`，而 910A 无 bf16、AMP 走 fp16。原实现直接 `x.pow(2)`，
 `|x|` 超过约 256 时撞上 fp16 的 65504 上限。
 
@@ -120,10 +120,11 @@ def test_non_fp16_dtypes_are_bitwise_unchanged():
         assert torch.equal(n(x), want), '%s 的数值被改了，本测试要求零回归' % dtype
 
 
-def test_v7_actually_routes_44_norms_through_this_module():
+def test_v7_actually_routes_40_norms_through_this_module():
     """确认防护在现役路径上：数一遍 V7 里 `backbone.RMSNorm` 的实例数。
 
-    11 个 trunk 块 × 2 个 inner 块 × 2 个 norm（attn + ffn）= 44。
+    10 个 trunk 块 × 2 个 inner 块 × 2 个 norm（attn + ffn）= 40。
+    （块的 `normact` / `normact_mid` 是 `NormAct`，不是 `RMSNorm`，不计。）
     将来若 `Nbt2TransformerBlock` 换了归一化实现，这条会失败并提醒重新评估
     fp16 溢出风险 —— 避免防护悄悄失去作用对象。
     """
@@ -137,4 +138,4 @@ def test_v7_actually_routes_44_norms_through_this_module():
                                NBT_TF_CFG['ffn_hidden'], inner_len=inner)
     n_rms = sum(isinstance(m, RMSNorm) for m in blk.modules())
     assert n_rms == inner * 2, n_rms
-    assert blocks * n_rms == 44, blocks * n_rms
+    assert blocks * n_rms == 40, blocks * n_rms

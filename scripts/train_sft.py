@@ -1983,7 +1983,7 @@ def load_from_path(path, board_size, max_games_per_tgz=0, v7=False,
     无需先手动 build_dataset 成单个 npz。
     """
     if v7:
-        # `--v7 1` 下有两种**布局**，都走同一个 22 通道模型（5,562,121 参数）：
+        # `--v7 1` 下有两种**布局**，都走同一个 22 通道模型（10,529,929 参数）：
         #
         #   stdata 分片（含 spatial_packed）→ `V7PackedDataset`
         #       22 通道已预算好并位打包，每行自带 KataGo 搜索分布（C 段用）
@@ -2580,13 +2580,13 @@ def _init_swanlab(args, logger):
                 # **按 `--v7` 分派**（2026-10-04）：此前这一段无条件记 12 通道的
                 #   数字，于是**每个 V7 run 的 config 面板都写着
                 #   `in_channels: 12` / `params_total: 9,112,005`**，而它实际训练的是
-                #   22 通道 / 5,562,121。面板恰恰是对比两次 run 时第一个看的东西，
+                #   22 通道 / 10,529,929。面板恰恰是对比两次 run 时第一个看的东西，
                 #   给它虚构值比不给更糟（正是本段原注释要防的那件事，只是当时
                 #   只考虑了「归档 flag」，没考虑「另一个架构」）。
                 # V7 的结构取 `NBT_TF_CFG`（唯一真相源），**不引 args** ——
                 #     args 里那些是归档 flag，引用它们等于把面板填成虚构值。
                 # `arch/params_total` 在 V7 下取 `NBT_TF_CFG` 的**预算值**
-                #     5,561,832，而实测建出来的模型是 **5,562,121**（差 289，
+                #     5,561,832，而实测建出来的模型是 **10,529,929**（差 289，
                 #     见 `tests/test_katago_v7_budget.py`）。面板记预算、真实值由
                 #     run 级 `run/params_actual` 给（那里模型已经建好）。
                 "arch/v7": bool(args.v7),
@@ -4642,7 +4642,7 @@ def main():
             #
             # `run/params_actual` 是 config 里 `arch/params_total` 的**真值**：
             #   V7 的 `NBT_TF_CFG['params_total']` 是**预算值** 5,561,832，而实测
-            #   建出来是 **5,562,121**（差 289）。模型在这里已经建好 ⇒ 能给真值。
+            #   建出来是 **10,529,929**（差 289）。模型在这里已经建好 ⇒ 能给真值。
             #   两者并列才看得出「预算表与实现漂了」。
             _run_facts = {
                 "run/optimizer_steps_per_epoch": n_batches,

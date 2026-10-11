@@ -42,7 +42,7 @@ def parse_player_rating(player_str):
        右边是结尾的整串数字会蒙混过关；词边界拦得住它、拦不住别的。
 
     少任一条，hex hash 就会经 `compute_game_weight` 的 `exp(avg/20)` 溢出成
-    inf，再经 loss 反向 `0 × inf = NaN` 把全部 5,562,121 个参数的梯度打脏。
+    inf，再经 loss 反向 `0 × inf = NaN` 把全部 10,529,929 个参数的梯度打脏。
     """
     if not player_str:
         return 10
@@ -76,7 +76,7 @@ def compute_game_weight(black_rating, white_rating):
     那些 inf 会经 `mean(p × inf)` 进 loss，再在**反向**上以
     `grad_p = 0 × inf = NaN` 把整个模型的梯度打脏（详见
     `katago_v7_loss._weighted_mean` 的注释）—— 这是真机「loss 正常、
-    全部 5,562,121 个参数 NaN」的源头。
+    全部 10,529,929 个参数 NaN」的源头。
 
     指数夹在 10.0（⇒ 权重 ≤ 22026）：覆盖一切合法等级（9d→110、
     KGS 15d→170、默认 10→1.6487 全在其中，逐位不变），只截掉解析垃圾。

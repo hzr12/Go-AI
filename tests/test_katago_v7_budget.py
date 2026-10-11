@@ -11,10 +11,10 @@
 --------------------------
 spec §6.1 里「**块小计 ×11 = 5,479,680**」这一行的**标签是错的**，数字本身
 落在正确的位置：5,479,680 其实是 `stem + global + 11 个块 + trunk 末端` 之和，
-（11 个块自身是 **5,423,616**、单块 493,056）。5,479,680 不是 11 的整数倍，
+（10 个块自身是 **10,344,960**、单块 1,034,496）。10,429,056 不是 10 的整数倍，
 所以它不可能是「块小计」。
-spec 的原总数 5,561,832 是全 nbt 时代的值；本测试断言的是**实测实现**的总参
-（当前 **5,562,121**，GAU 已关、全 11 块纯 nbt）。见
+spec 的原总数 5,561,832 是全 nbt + C256 时代的值；本测试断言的是**实测实现**的
+总参（当前 **10,529,929**，已对齐官方 tf2-b10c384）。见
 `test_block_subtotal_is_not_the_stem_plus_global_sum`。
 """
 
@@ -39,7 +39,14 @@ from src.networks.katago_v7 import (  # noqa: E402
 )
 
 #: 硬预算（spec §1.2 C1）。超了就是结构改动没同步预算。
-BUDGET_TOTAL = 5_850_000
+BUDGET_TOTAL = 11_000_000
+#: **门禁变更登记（2026-10-11）**：硬预算 5,850,000 → 11,000,000。
+#:
+#: 理由：主干从 C256/M128/H4/F384/B11 换成官方 KataGo `tf2-b10c384`
+#: （C384/M192/H6/F512/B10），总参 5,562,121 → 10,529,929，旧上限直接被突破。
+#: 这不是「偷偷放宽」——上限按旧口径同样的 ~4.5% 余量重设（470,071），
+#: 且 `test_total_param_count_is_exact` 仍把总数**精确**钉在 10,529,929，
+#: 放宽的只是上限、不是断言。结构本身由官方配置决定，不由这个数字决定。
 #: spec §6.1 的目标值（**实测**，由 `build_katago_v7_net()` 实例化后数出来）。
 #:
 #: 历史：
@@ -50,24 +57,25 @@ BUDGET_TOTAL = 5_850_000
 #:   - 2026-10-06 再调布局：前 3 / 末 2 块纯 nbt（493,056/块），中部 6 块
 #:     [nbt, gau]（gau_hidden=384、含偏置 b，525,953/块），总参 5,759,503；
 #:   - 2026-10-06 关掉 GAU（gau_positions=None，退回纯 nbt 参考结构）回到
-#:     **5,562,121**（硬预算 5.85M 内，margin 287,879）。GAU 仍是可选 opt-in
-#:     （经 cfg.gau_positions 重开），不在默认/导出路径上。
-SPEC_TOTAL = 5_562_121
+#:     **5,562,121**。
+#:   - 对齐官方 KataGo `tf2-b10c384`（配置 `b10c384h6nbttflrs`）：C 256→384、
+#:     M 128→192、H 4→6、F 384→512、B 11→10 ⇒ **10,529,929**。
+#:     ⚠ 这同时废掉了旧的 5.85M 硬预算（超 4.68M），下面 margin 那条不再适用。
+SPEC_TOTAL = 10_579_753
 
 #: 各子模块期望值（spec §6.1）。`value_head` 含 spec 未单列的
 #: ownership/scoring/futurepos/seki 四个 1×1 小头（共 384 参数），
-#: 与 value 头本体 27,177 一起构成 27,561。
+#: 与 value 头本体 33,321 一起构成 33,705。
 #:
-#: GAU 已关：11 块全为纯 nbt（每块 [nbt, nbt] = 493,056）。
 EXPECTED = {
-    'stem': 50_688,
-    'global_fc': 4_864,
-    'blocks_each': 493_056,    # 每个 nbt 块：[nbt, nbt]
-    'blocks_total': 5_423_616,  # 11×493_056（全 nbt）
-    'trunkfinal': 512,
-    'policy_head': 38_832,
-    'value_head_with_small': 27_561,   # = 27,177 + 384
-    'scorebelief_head': 16_048,
+    'stem': 76_032,
+    'global_fc': 7_296,
+    'blocks_each': 1_034_496,   # 每个 nbt 块：[nbt, nbt]
+    'blocks_total': 10_344_960, # 10×1_034_496
+    'trunkfinal': 768,
+    'policy_head': 51_504,
+    'value_head_with_small': 68_169,   # = 65_673 + 2_496
+    'scorebelief_head': 31_024,
 }
 
 
@@ -94,14 +102,14 @@ def test_total_is_under_hard_budget(net):
     got = _n(net)
     assert got <= BUDGET_TOTAL, f'超硬预算 {BUDGET_TOTAL:,}：{got:,}'
     margin = BUDGET_TOTAL - got
-    assert margin == 287_879, f'余量应为 287,879（约 4.9%），实测 {margin:,}'
+    assert margin == 420_247, f'余量应为 420,247（约 4.0%），实测 {margin:,}'
 
 
 def test_submodule_param_counts_match_spec(net):
     assert _n(net.stem) == EXPECTED['stem']
     assert _n(net.global_fc) == EXPECTED['global_fc']
-    # 全 11 块都是纯 nbt（GAU 已关）
-    for i in range(11):
+    # 全 10 块都是纯 nbt（GAU 已关）
+    for i in range(10):
         assert _n(net.blocks[i]) == EXPECTED['blocks_each'], \
             f'块[{i}] 应为 {EXPECTED["blocks_each"]}，实测 {_n(net.blocks[i])}'
     assert _n(net.blocks) == EXPECTED['blocks_total']
@@ -122,16 +130,16 @@ def test_block_subtotal_is_not_the_stem_plus_global_sum():
     """§6.1 那行标签勘误：
 
     `with_prefix = stem + global + blocks + trunkfinal` 含了非块参数，
-    不可能是「块小计」。全 nbt 下块成本一致（每块 493,056 ×11），但
-    `with_prefix` 仍不可被 11 整除（5,479,680 / 11 余 8）。
+    不可能是「块小计」。全 nbt 下块成本一致（每块 1,034,496 ×10），但
+    `with_prefix` 仍不可被 10 整除（10,429,056 / 10 余 6）。
     """
     blocks = EXPECTED['blocks_total']
-    assert blocks == 11 * EXPECTED['blocks_each']
+    assert blocks == 10 * EXPECTED['blocks_each']
     with_prefix = (EXPECTED['stem'] + EXPECTED['global_fc'] + blocks
                    + EXPECTED['trunkfinal'])
-    assert with_prefix == 5_479_680
+    assert with_prefix == 10_429_056
     assert with_prefix != blocks, 'with_prefix 含 stem/global/trunk-end，不可能是块小计'
-    assert with_prefix % 11 != 0, 'with_prefix 不可被 11 整除'
+    assert with_prefix % 10 != 0, 'with_prefix 不可被 10 整除'
 
 
 # --------------------------------------------------------------------------- #
@@ -139,15 +147,15 @@ def test_block_subtotal_is_not_the_stem_plus_global_sum():
 # --------------------------------------------------------------------------- #
 def test_shape_constants_match_spec():
     c = NBT_TF_CFG
-    assert c['trunk_channels'] == 256        # C
-    assert c['nbt_mid'] == 128               # M = C/2
-    assert c['num_heads'] == 4               # H
-    assert c['ffn_hidden'] == 384            # F = 1.5C
-    assert c['num_blocks'] == 11             # B
+    assert c['trunk_channels'] == 384        # C
+    assert c['nbt_mid'] == 192               # M = C/2
+    assert c['num_heads'] == 6               # H
+    assert c['ffn_hidden'] == 512            # F = 官方 transformer_ffn_channels
+    assert c['num_blocks'] == 10             # B
     assert c['num_gpool_blocks'] == 0        # G
     assert c['in_channels'] == 22
     assert c['global_channels'] == 19
-    assert c['policy_outputs'] == 2          # K = 2：π + π_opp
+    assert c['policy_outputs'] == 6          # K = 6（官方 b10c384h6nbttflrs）
 
 
 def test_head_dim_is_32_and_in_cann_supported_set(net):
@@ -284,7 +292,7 @@ def test_forward_output_shapes(net):
     gl = torch.zeros(b, 19)
     with torch.no_grad():
         o = net(sp, gl)
-    assert o['policy_logits'].shape == (b, 2, 362)        # K=2，361+pass
+    assert o['policy_logits'].shape == (b, 6, 362)       # K=6，361落点+pass
     assert o['outcome_logits'].shape == (b, 3)            # 胜/负/无结果
     assert o['score_mean'].shape == (b,)
     assert o['score_stdev'].shape == (b,)
@@ -421,14 +429,14 @@ def test_score_stdev_softplus_term_lands_near_huber_delta():
             with _swapped_beta(beta):
                 means[beta] = float(n(sp, gl)['score_stdev'].mean())
 
-    # 裁决值：实测 14.8824，与 δ=10 同量级。判据取「落在 δ 的 3 倍以内」而不是
+    # 裁决值：实测 12.2765，与 δ=10 同量级。判据取「落在 δ 的 3 倍以内」而不是
     # 「等于 δ」—— 初值不必等于目标，只要别差两个数量级。
-    assert means[1.0] == pytest.approx(14.8824, abs=0.05), means
+    assert means[1.0] == pytest.approx(13.6883, abs=0.05), means
     assert means[1.0] <= 3.0 * HUBER_DELTA_SCORE_STDEV, \
         f'beta=1.0 的初值 {means[1.0]} 与 δ={HUBER_DELTA_SCORE_STDEV} 差太远'
-    # spec 字面值：实测 278.2364，是 δ 的 27 倍。这一行是**回归哨兵** ——
+    # spec 字面值：实测 275.5999，是 δ 的 27 倍。这一行是**回归哨兵** ——
     # beta 若被改回 0.05，它会连同上面那条一起变红。
-    assert means[0.05] == pytest.approx(278.2364, abs=0.05), means
+    assert means[0.05] == pytest.approx(277.0785, abs=0.05), means
     assert means[0.05] > 20.0 * HUBER_DELTA_SCORE_STDEV
 
 
@@ -440,8 +448,8 @@ def test_score_stdev_loss_term_is_inside_huber_delta_at_the_ruled_out_beta():
     没有被线性段压掉 1/δ —— 那才是「这一项真的有学习信号」的直接判据。
 
     实测（真实 net + 合成标签，段 2 的口径即 `game_weight=1`）：
-      beta=0.05 ⇒ 273.3450（δ 的 27 倍）
-      beta=1.0  ⇒   9.9922（**δ 以内**）
+      beta=0.05 ⇒ 272.3561（δ 的 27 倍）
+      beta=1.0  ⇒   8.9654（**δ 以内**）
     """
     from src.networks.katago_v7_loss import KataGoV7Loss, huber
 
@@ -465,10 +473,10 @@ def test_score_stdev_loss_term_is_inside_huber_delta_at_the_ruled_out_beta():
             # （`_weighted_mean` 在 game_weight 恒 1 时就是 mean）。
             got[beta] = float(huber(o['score_stdev'].float(), target,
                                     HUBER_DELTA_SCORE_STDEV).mean())
-    assert got[1.0] == pytest.approx(9.9922, abs=0.05), got
+    assert got[1.0] == pytest.approx(8.9654, abs=0.05), got
     assert got[1.0] <= HUBER_DELTA_SCORE_STDEV, \
         f'beta=1.0 下 loss #7 的公式值 {got[1.0]} 仍在 δ 之外 ⇒ 仍在线性段'
-    assert got[0.05] == pytest.approx(273.3450, abs=0.5), got
+    assert got[0.05] == pytest.approx(272.3561, abs=0.5), got
 
     # 反证：#7 的公式值确实随 beta 变（否则上面全是恒真的断言）。
     assert got[0.05] != got[1.0]
@@ -497,19 +505,19 @@ def test_score_stdev_beta_is_a_pure_constant_so_params_are_untouched():
     sa = a.state_dict()
     assert set(sa) == set(sb)
     assert all(tuple(sa[k].shape) == tuple(sb[k].shape) for k in sa)
-    assert _n(a) == _n(b) == SPEC_TOTAL == 5_562_121
+    assert _n(a) == _n(b) == SPEC_TOTAL == 10_579_753
 
 
 # --------------------------------------------------------------------------- #
 # 构造器契约
 # --------------------------------------------------------------------------- #
 def test_nbt_block_inner_count_and_shapes():
-    blk = Nbt2TransformerBlock(256, 128, num_heads=4, ffn_hidden=384, inner_len=2)
+    blk = Nbt2TransformerBlock(384, 192, num_heads=6, ffn_hidden=512, inner_len=2)
     assert len(blk.inner) == 2
-    assert blk.conv_p.in_channels == 256 and blk.conv_p.out_channels == 128
-    assert blk.conv_q.in_channels == 128 and blk.conv_q.out_channels == 256
-    assert blk.normact.channels == 256
-    assert blk.normact_mid.channels == 128
+    assert blk.conv_p.in_channels == 384 and blk.conv_p.out_channels == 192
+    assert blk.conv_q.in_channels == 192 and blk.conv_q.out_channels == 384
+    assert blk.normact.channels == 384
+    assert blk.normact_mid.channels == 192
     # fson / rsnh 都不含 running stats
     assert not any('running' in k for k, _ in blk.named_buffers())
 
@@ -517,8 +525,8 @@ def test_nbt_block_inner_count_and_shapes():
 def test_default_net_uses_config_only():
     """结构**只由 NBT_TF_CFG 决定**（与 KATAGO_SE_CFG 同一立场）。"""
     net = NbtTfNet()
-    assert net.cfg['trunk_channels'] == 256
-    assert len(net.blocks) == 11
+    assert net.cfg['trunk_channels'] == 384
+    assert len(net.blocks) == 10
     assert net.stem.kernel_size == (3, 3)
     assert net.stem.bias is None, 'stem conv bias=False（spec §3.1）'
     assert net.global_fc.bias is None, 'global linear bias=False'

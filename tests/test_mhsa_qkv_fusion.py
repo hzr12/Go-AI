@@ -34,7 +34,7 @@ from src.networks.katago_v7 import (
 )
 
 
-DIM, HEADS, N_BLOCKS, INNER = 128, 4, 11, 2
+DIM, HEADS, N_BLOCKS, INNER = 192, 6, 10, 2
 
 
 class _OldMHSA(nn.Module):

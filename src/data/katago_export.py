@@ -364,9 +364,13 @@ def _build_policy_head(sd: Dict[str, Any], cfg: Dict[str, Any]) -> PolicyHeadDes
     P = int(cfg['policy_channels'])
     G = int(cfg['gpool_channels'])
     K = int(cfg['policy_outputs'])
+    # modelVersion 17 的 .bin 格式只接受 policyOutChannels ∈ {2, 4}。
+    # 我们训 6 个 policy 通道（对齐官方 PyTorch 结构），但导出时只写前 2 个
+    # （π, π_opp），其余 4 个无标签不训，引擎也不读。
+    bin_policy_out = 2 if K in (2, 4) else 2
     return PolicyHeadDesc(
         name='model.policy_head',
-        policy_out_channels=K,
+        policy_out_channels=bin_policy_out,
         policy_options=(0, 0, 0),
         p1_conv=_conv('model.policy_head.conv1p', _t(sd, 'policy_head.conv.weight')),
         g1_conv=_conv('model.policy_head.conv1g', _t(sd, 'policy_head.conv_g.weight')),
@@ -384,7 +388,8 @@ def _build_policy_head(sd: Dict[str, Any], cfg: Dict[str, Any]) -> PolicyHeadDes
         p1_activation=ActivationDesc(
             name='model.policy_head.actp',
             activation=ACTIVATION_SILU_OFFICIAL),
-        p2_conv=_conv('model.policy_head.conv2p', _t(sd, 'policy_head.out.weight')),
+        p2_conv=_conv('model.policy_head.conv2p',
+                      _t(sd, 'policy_head.out.weight')[:bin_policy_out]),
         # pass 支路：gpoolToPassMul(3G→P) 与 gpoolToPassBias(P) 被我们的
         # `pass_fc1`（Linear(3G→P, bias=True)）**合并**成一步 ——
         # `Linear(xW + b)` 与 `MatMul` 后 `MatBias` 在数值上完全等价。
@@ -398,7 +403,7 @@ def _build_policy_head(sd: Dict[str, Any], cfg: Dict[str, Any]) -> PolicyHeadDes
             name='model.policy_head.actpass',
             activation=ACTIVATION_SILU_OFFICIAL),
         gpool_to_pass_mul2=_mm('model.policy_head.linear_pass2',
-                               _t(sd, 'policy_head.pass_fc2.weight')),
+                               _t(sd, 'policy_head.pass_fc2.weight')[:bin_policy_out]),
     )
 
 

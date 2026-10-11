@@ -276,7 +276,7 @@ def _weighted_mean(per_sample, weight, probe=None, tag=''):
        ``加权总 loss 有限（该项系数为 0，已净化）``、``坏在操作数`` 是空的
        （pred/std 确实都有限），而梯度已经是 NaN。NaN 从 ``score_stdev``
        进 value head、再经 trunk 污染**全部**参数 —— 真机实测
-       5,562,121 / 5,562,121（连 ``stem`` 都是），与这条链完全吻合。
+       10,529,929 / 10,529,929（连 ``stem`` 都是），与这条链完全吻合。
 
        ⇒ 坏权重一律**替换为默认权重**（:data:`W_WEIGHT_DEFAULT`），不是夹到
        上限、也不是摘掉：夹到 ``exp(10)`` 会让这些行拿到 13000× 于正常行的

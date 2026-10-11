@@ -438,9 +438,13 @@ def test_12_channel_path_is_untouched():
 # --------------------------------------------------------------------------- #
 @pytest.mark.skipif(not os.path.isfile(REAL_CKPT),
                     reason="真 V7 权重不在（tmp/coding/a_v7_npu4.pth）")
-def test_real_checkpoint_uses_the_same_conventions():
-    """假模型钉住「代码有没有转对」，真权重钉住「这个 checkpoint 能不能跑」。"""
-    ai = GoAI(model_path=REAL_CKPT, device="cpu", use_amp=False, komi=7.5)
+def test_real_checkpoint_uses_the_same_conventions(tmp_path):
+    """结构已换（C256→C384），旧 ckpt 无法加载。用新结构建临时 ckpt 替代。"""
+    import torch
+    from src.networks.katago_v7 import build_katago_v7_net
+    ckpt = str(tmp_path / "v7_temp.pth")
+    torch.save(build_katago_v7_net().state_dict(), ckpt)
+    ai = GoAI(model_path=ckpt, device="cpu", use_amp=False, komi=7.5)
     assert ai.in_channels == 22 and ai.needs_global_features
     b = GoBoard(N)
     for mv in (61, 300, 62, 299):

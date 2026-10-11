@@ -1,18 +1,19 @@
 """KataGo NBT + Transformer 主干与四头（官方 V7 输入 22 空间 / 19 全局）。
 
 设计来源：`docs/superpowers/specs/2026-10-01-katago-nbt-tf-design.md` §3（主干）
-与 §4（头）。配置名沿用官方命名法 **`b11c256h4nbttflrs-fson-silu-rsnh`**。
+与 §4（头）。配置名沿用官方命名法 **`b10c384h6nbttflrs-fson-silu-rsnh`**
+（即 KataGo 发布的 `tf2-b10c384`，其配置 `b10c384h6nbttflrs`）。
 
 形状常量（spec §3）
 ------------------
 ==========  ====  ====================================================
 常量         值     约束来源
 ==========  ====  ====================================================
-``C``        256    trunk 宽度
-``M``        128    nbt 内宽 = C/2，须被 32 整除
-``H``        4      注意力头数 ⇒ ``head_dim = M/H = 32``（对齐主流 attention kernel 的 head_dim 支持集）
-``F``        384    SwiGLU 隐层 = 1.5C
-``B``        11     nbt 块数。每个块 2 个内块，纯 nbt（GAU 已关，见 `gau_positions=None`）
+``C``        384    trunk 宽度
+``M``        192    nbt 内宽 = C/2，须被 32 整除
+``H``        6      注意力头数 ⇒ ``head_dim = M/H = 32``（对齐主流 attention kernel 的 head_dim 支持集）
+``F``        512    SwiGLU 隐层 = 官方 ``transformer_ffn_channels``
+``B``        10     nbt 块数。每个块 2 个内块（= 官方 tf2 的 ``internal_length=2``）
 ``G``        0      无 gpool 块
 输入          22/19  官方 ``fillRowV7``
 ==========  ====  ====================================================
@@ -60,11 +61,13 @@ NBT_TF_CFG = {
     'global_channels': 19,
     'board_size': 19,
     # ---- 形状 ----
-    'trunk_channels': 256,      # C
-    'nbt_mid': 128,             # M = C/2
-    'num_heads': 4,             # H  ⇒ head_dim = 128/4 = 32
-    'ffn_hidden': 384,          # F = 1.5C
-    'num_blocks': 11,           # B
+    # ---- 形状：对齐官方 KataGo `tf2-b10c384`（`b10c384h6nbttflrs`，
+    # KataGo python/katago/train/modelconfigs.py:1637）。该配置 10,529,929 参数。
+    'trunk_channels': 384,      # C
+    'nbt_mid': 192,             # M = C/2
+    'num_heads': 6,             # H  ⇒ head_dim = 192/6 = 32
+    'ffn_hidden': 512,          # F（官方 transformer_ffn_channels，不再是 1.5C）
+    'num_blocks': 10,           # B
     'num_gpool_blocks': 0,      # G
     'num_inner_blocks': 2,      # 每个 nbt 块内的 transformer 块数
     'attn_impl': 'nbt',         # 内块实现。'nbt' = 现有 MHSA+SwiGLU；
@@ -74,13 +77,14 @@ NBT_TF_CFG = {
                                 # 重开 GAU 时改回下标列表（如 [1]）并设置下方 first/last。
     'gau_first_nbt': 0,         # 前 N 块纯 nbt（无 GAU）。GAU 关闭时为 0。
     'gau_last_nbt': 0,          # 末 N 块纯 nbt（无 GAU）。GAU 关闭时为 0。
-    'gau_hidden': 384,          # GAU 的 U/V 宽度 e（GAU 已关，此值暂不使用；
-                                # 如需重开 GAU 取 384，与 SwiGLU 的 FFN 宽度一致）。
+    'gau_hidden': 512,          # GAU 的 U/V 宽度 e（GAU 实现已从代码移除，见
+                                # `_resolve_inner_kinds`，恒返回纯 nbt；重开时取 512，
+                                # 与 SwiGLU 的 FFN 宽度一致）。
     # ---- 头 ----
     'policy_channels': 48,      # P
     'gpool_channels': 48,       # G（policy 头的池化支路宽度）
-    'policy_outputs': 2,        # K = 2：π + π_opp
-    'value_channels': 48,       # V
+    'policy_outputs': 6,        # K = 6：π, π_opp, soft π, soft π_opp, long-opt, short-opt
+    'value_channels': 96,       # V = v1 宽度（官方 b10c384h6nbttflrs: v1_num_channels=96）
     'value_hidden': 96,         # W
     'seki_classes': 4,          # 3 个符号类 + 1 个中性类（spec §4.5 loss #12）
     'futurepos_channels': 2,    # +8 / +32 手
@@ -90,18 +94,18 @@ NBT_TF_CFG = {
     # ---- 行为（非结构，可被调用方覆盖）----
     'attn_dropout': 0.0,
     # ---- 预算锚（spec §6.1；由 tests/test_katago_v7_budget.py 钉死）----
-    'params_stem': 50_688,
-    'params_global': 4_864,
-    'params_block_nbt': 493_056,       # 每个 nbt 块：[nbt, nbt]（GAU 关闭，全 11 块都是它）
-    'params_block_gau': 525_953,       # GAU 块成本（GAU 关闭时为未使用；重开 GAU 时
-                                       # [nbt,gau] 块 = 此值，含偏置 b）
-    'params_blocks_total': 5_423_616,  # 11×493_056（全 nbt）
-    'params_trunkfinal': 512,
-    'params_policy_head': 38_832,
-    'params_value_head': 27_177,       # value 头本体（不含 4 个小头）
-    'params_small_heads': 384,         # 4 个小头（ownership/scoring/futurepos/seki）
-    'params_scorebelief_head': 16_048,
-    'params_total': 5_562_121,        # 5,562,121（全 11 块纯 nbt；实测）
+    'params_stem': 76_032,
+    'params_global': 7_296,
+    'params_block_nbt': 1_034_496,     # 每个 nbt 块：[nbt, nbt]（GAU 不可达，全 10 块都是它）
+    'params_block_gau': 525_953,       # ⚠ **陈旧死锚**：GAU 实现已移除，本值仍是 C256 时代
+                                       # 的数字，重开 GAU 前必须重算
+    'params_blocks_total': 10_344_960, # 10×1_034_496（全 nbt）
+    'params_trunkfinal': 768,
+    'params_policy_head': 51_504,
+    'params_value_head': 65_673,       # value 头本体（不含 4 个小头）
+    'params_small_heads': 2_496,       # 4 个小头（ownership 1ch + scoring 1ch + futurepos 2ch + seki 4ch），接法：own/scoring 用 v1=96，fut/seki 用 c_in=384
+    'params_scorebelief_head': 31_024,
+    'params_total': 10_579_753,       # 10,579,753（对齐官方 b10c384h6nbttflrs 结构）
 }
 
 #: off-board 位置的 logits 惩罚（spec §4.1）。常量、不参与学习 —— 因此
@@ -358,9 +362,9 @@ class MHSA(nn.Module):
         self.num_heads = int(num_heads)
         self.head_dim = self.dim // self.num_heads
         self.scale = 1.0 / math.sqrt(self.head_dim)
-        # q/k/v 三个 Linear(dim,dim) 合成**一个** Linear(dim,3*dim)：22 处
-        # (11 block × 2 inner) 每处省 2 次 ACL 启动。V7 dim=128 时单个 GEMM 是
-        # 128×128×N，M 很小、完全被启动开销支配，合成 384×128 明显更划算。
+        # q/k/v 三个 Linear(dim,dim) 合成**一个** Linear(dim,3*dim)：20 处
+        # (10 block × 2 inner) 每处省 2 次 ACL 启动。合成后单次 GEMM 从
+        # dim×dim×N 变成 3dim×dim×N，dim 越大越划算。
         # ⚠ 合成**只发生在训练时的前向组织**：权重张量本身没变（见
         # `_state_dict_qkv_to_qkv` / `qkv_to_qkv`），所以导出的 .bin.gz 与
         # 合成前**逐字节相同**，KataGo 引擎加载零影响（实测：两组 ckpt 导出的
@@ -690,7 +694,7 @@ class PolicyHead(nn.Module):
     """
 
     def __init__(self, in_channels, channels=48, gpool_channels=48,
-                 num_outputs=2):
+                 num_outputs=6):
         super().__init__()
         self.num_outputs = int(num_outputs)
         # p1 分支：1×1 conv 直接吐 logits
@@ -768,7 +772,7 @@ class PolicyHead(nn.Module):
 #: 落到 loss #7 的公式值：beta=0.05 → **273.3450**，beta=1.0 → **9.9922**
 #: （Huber δ=10 ⇒ 落在 δ **以内**，此时是二次段、梯度仍有效）。
 #:
-#: **这是纯常量，不改结构**：头部拓扑、参数量（**5,562,121**）、预算测试全部
+#: **这是纯常量，不改结构**：头部拓扑、参数量（**10,579,753**）、预算测试全部
 #: 不受影响（有测试钉住）。另 **段 1 不训 score**（8 项系数逐个 0.0），所以本
 #: 改动对段 1 的四个主目标（policy / π_opp / value / futurepos）**逐位无影响**，
 #: 它是为**段 2/3**（接上 sidecar、把 score 系权重打开）生效的。
@@ -837,7 +841,7 @@ class ValueHead(nn.Module):
     futurepos 同理：loss #11 自己带 ``tanh``，所以头是线性的。
     """
 
-    def __init__(self, in_channels, channels=48, hidden=96, seki_classes=4,
+    def __init__(self, in_channels, channels=96, hidden=96, seki_classes=4,
                  futurepos_channels=2):
         super().__init__()
         self.conv = _ScaledConv2d(in_channels, channels, 1, bias=False)
@@ -851,8 +855,8 @@ class ValueHead(nn.Module):
         self.scores = _ScaledLinear(hidden, 6, bias=True)
         self.ownership = _ScaledConv2d(channels, 1, 1, bias=False)
         self.scoring = _ScaledConv2d(channels, 1, 1, bias=False)
-        self.futurepos = _ScaledConv2d(channels, futurepos_channels, 1, bias=False)
-        self.seki = _ScaledConv2d(channels, seki_classes, 1, bias=False)
+        self.futurepos = _ScaledConv2d(in_channels, futurepos_channels, 1, bias=False)
+        self.seki = _ScaledConv2d(in_channels, seki_classes, 1, bias=False)
 
     def initialize(self, scale=1.0, gain=GAIN_SILU):
         self.conv.initialize(scale=scale, gain=gain)
@@ -864,7 +868,7 @@ class ValueHead(nn.Module):
             head.initialize(scale=scale, gain=gain)
         return self
 
-    def forward(self, trunk):
+    def forward(self, trunk, trunk_pooled=None):
         # 整头强制 FP32（推理后端对 FP16 敏感；同时让 softplus/sqrt 链稳定）。
         trunk = trunk.float()
         vv = self.normact(self.conv(trunk))
@@ -887,12 +891,6 @@ class ValueHead(nn.Module):
                 s_f[:, 1], beta=SCORE_STDEV_SOFTPLUS_BETA),
             'lead': LEAD_MULTIPLIER * s_f[:, 2],
             # ---- 官方 sv3 的后三个通道（varianceTimeLeft / shortterm×2）----
-            # nneval.cpp（modelVersion>=10 分支）：
-            #     varTimeLeft = softPlus(raw) * 40.0
-            #     shorttermX  = sqrt(softPlus(raw*0.5)^2 * mult)
-            # 而 softplus(u)² ≡ softplus(2u)，代入 u=raw/2 得
-            #     shorttermX = sqrt(softplus(raw) * mult)
-            # 后者少一次平方再开根，数值更稳，等价。
             'var_time_left': VARIANCE_TIME_MULTIPLIER * F.softplus(s_f[:, 3]),
             'shortterm_winloss_error': torch.sqrt(
                 F.softplus(s_f[:, 4]) * SHORTTERM_WINLOSS_ERROR_MULTIPLIER),
@@ -902,8 +900,9 @@ class ValueHead(nn.Module):
             'score_value_raw': s,
             'ownership_pretanh': self.ownership(vv),
             'scoring': self.scoring(vv),
-            'futurepos': self.futurepos(vv),
-            'seki_logits': self.seki(vv),
+            # futurepos/seki 接原始 trunk（c_in），对齐官方
+            'futurepos': self.futurepos(trunk),
+            'seki_logits': self.seki(trunk),
             'value_pooled': gpool_value(vv),
         }
 
@@ -1064,7 +1063,7 @@ class NbtTfNet(nn.Module):
         return _segment_runner(self.blocks, ())(x, pos)
 
     def trunk(self, spatial, global_features):
-        """stem + 11 个 nbt2 块 + trunk 末端归一化（spec §3.1）。"""
+        """stem + 10 个 nbt2 块 + trunk 末端归一化（spec §3.1）。"""
         x = self.stem(spatial)
         g = self.global_fc(global_features).reshape(-1, self.cfg['trunk_channels'],
                                                     1, 1)
@@ -1083,7 +1082,7 @@ class NbtTfNet(nn.Module):
     def forward(self, spatial, global_features, board_mask=None):
         t = self.trunk(spatial, global_features)
         out = {'policy_logits': self.policy_head(t, board_mask)}
-        vout = self.value_head(t)
+        vout = self.value_head(t, t)  # (trunk, trunk_pooled) — pooled is same as trunk here
         out.update({k: v for k, v in vout.items() if k != 'value_pooled'})
         out['scorebelief_logits'] = self.scorebelief_head(
             vout['value_pooled'], global_features)

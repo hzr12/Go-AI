@@ -215,7 +215,7 @@ def test_every_zero_weight_head_still_gets_a_gradient():
         f'这些参数没收到梯度 ⇒ DDP 会抛「Expected to have finished reduction」：{missing}'
     # 「结构没被掏空」要看**参数元素总数**，不能看参数张量个数：MHSA 把 q/k/v
     # 三个 Linear 合成了一个 qkv（见 tests/test_mhsa_qkv_fusion.py），张量个数
-    # 从 324 降到 278，但元素总数必须仍是 5,562,121 —— 这才是「没被掏空」的证据。
+    # 从 324 降到 278，但元素总数必须仍是 10,529,929 —— 这才是「没被掏空」的证据。
     # 断言张量个数会把「纯粹的权重重组」误判成结构缺失。
     from src.networks.katago_v7 import NBT_TF_CFG
     total = sum(p.numel() for p in net.parameters())
@@ -722,7 +722,7 @@ def test_oversized_weight_does_not_overflow_the_product():
 def test_bad_game_weight_leaves_every_parameter_gradient_finite():
     """真机签名的端到端回归：`game_weight` 坏，全模型梯度仍须有限。
 
-    真机症状是**每个**参数都 NaN（5,562,121 / 5,562,121，连 `stem` 都是）——
+    真机症状是**每个**参数都 NaN（10,529,929 / 10,529,929，连 `stem` 都是）——
     因为 NaN 从 `score_stdev` 进 value head、再经 trunk 污染全部分支。
     所以这里数的不是「某个头」，而是 `named_parameters()` 的**全集**。
 

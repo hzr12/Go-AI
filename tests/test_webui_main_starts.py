@@ -95,11 +95,15 @@ def test_main_starts_with_the_12_channel_model():
 
 @pytest.mark.skipif(not os.path.isfile(V7_CKPT),
                     reason="真 V7 权重不在（tmp/coding/a_v7_npu4.pth）")
-def test_main_starts_with_the_22_channel_v7_model():
-    """22 通道 V7 走原生 MCTS 也必须能起来（双输入 + 前两手盘面都在这条路上）。"""
+def test_main_starts_with_the_22_channel_v7_model(tmp_path):
+    """结构已换（C256→C384），旧 ckpt 无法加载。用新结构建临时 ckpt 替代。"""
+    import torch
+    from src.networks.katago_v7 import build_katago_v7_net
+    ckpt = str(tmp_path / "v7_temp.pth")
+    torch.save(build_katago_v7_net().state_dict(), ckpt)
     port = _free_port()
     ok, _ = _start_and_probe(
-        ["--model", V7_CKPT, "--device", "cpu", "--port", str(port),
+        ["--model", ckpt, "--device", "cpu", "--port", str(port),
          "--num-threads", "1", "--mode", "mcts"], port)
     assert ok, "webui 用 V7 22 通道模型起不来：\n%s" % _diagnostics()
     assert not _port_open(port), "进程退出后端口仍被占用"
