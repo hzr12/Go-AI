@@ -230,9 +230,20 @@ python scripts/train_sft.py \
   --gradient-accumulation-steps 8 --use-amp 1 --use-ema 1 \
   --flash-attn 1 --attention-dropout 0 \
   --prefetch-workers 24 --prefetch-depth 8 \
-  --log-every 5 --eval-every 500 --save-every 20 \
+  --log-every 5 --eval-every 500 --save-every 1674 \
   --early-stop 1 --early-stop-patience 3 \
   --out models/a_v7_a100.pth --swanlab 1 --ver a_v7_a100 --swanlab-every 1
+#
+# ⚠ `--save-every 1674` = **每 15 分钟**一次（2026-10-11 实测定档）。换算依据：
+#   A 段实测每步 0.5377 s（从 5 个 `elapsed` 点反推，散布极小）。
+#   16397 步 x 0.5377 s = **2.4 小时**，15 分钟→ 1674 步→ 整段 **9 个快照**。
+#   为什么不能三段统一（**B/C 段太短**，同一问题不成立**）：
+#     B 段整段只 37 分钟 → 15 分钟只存 2 个；
+#     C 段整段只 16 分钟 → 15 分钟**只存 1 个**（等于没存）。
+#   ⇒ 所以 B/C 仍保持 `--save-every 20`，**待定**（如果想按段给：
+#   B ≈15 分钟=1352 步、C ≈15 分钟=1857 步，但 C 段只有 1 个有效中间快照）。
+#   ⚠ 尽管写盘是**异步**（启动日志里 `s=0` 证实了），改间隔不影响速度，
+#     只影响**崩下重启时多少进度丢掉**：20 步→最多丢 11 秒，1674 步→最多丢 15 分钟。
 
 # --- B 段：+ KataGo 软标签（承接 A 段，单卡 A100）---
 # ⚠ `--policy-loss soft_ce` 不写也行：给了 --soft-index 会自动选中。
