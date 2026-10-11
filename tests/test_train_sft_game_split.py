@@ -49,7 +49,7 @@ def _reference(dataset):
     train_game_set = set(unique_games[:n_train_games])
     train_idx = np.array([i for i in range(n) if dataset.game_ids[i] in train_game_set])
     eval_idx = np.array([i for i in range(n) if dataset.game_ids[i] not in train_game_set])
-    return train_idx, eval_idx, len(unique_games), n_train_games
+    return train_idx, eval_idx, len(unique_games), n_train_games, rng
 
 
 class _Plain:
@@ -91,8 +91,8 @@ def test_matches_the_original_implementation(n_games, rows_per_game):
     历史 run 的 eval 指标就不可比了。
     """
     gids = _fixture(n_games, rows_per_game)
-    got = split_train_eval_by_game(_Plain(gids))
-    want = _reference(_Plain(gids))
+    got = split_train_eval_by_game(_Plain(gids))[:4]
+    want = _reference(_Plain(gids))[:4]
     assert got is not None and want is not None
     for a, b in zip(got, want):
         assert np.array_equal(a, b), (a, b)
@@ -117,7 +117,7 @@ def test_game_ids_property_is_accessed_exactly_once():
 def test_splits_are_ascending_disjoint_and_complete():
     """两侧都是升序、互斥、并集覆盖全部行 —— 索引语义本身不能被向量化改坏。"""
     gids = _fixture()
-    train_idx, eval_idx, n_games, n_train_games = split_train_eval_by_game(
+    train_idx, eval_idx, n_games, n_train_games, _ = split_train_eval_by_game(
         _Plain(gids))
     n = len(gids)
     assert np.array_equal(train_idx, np.sort(train_idx))
@@ -135,7 +135,7 @@ def test_no_game_leakage_across_the_split():
     没改坏，防不住「改成一个同样快但会泄漏的实现」。
     """
     gids = _fixture()
-    train_idx, eval_idx, _, _ = split_train_eval_by_game(_Plain(gids))
+    train_idx, eval_idx, _, _, _ = split_train_eval_by_game(_Plain(gids))
     train_games = set(gids[train_idx].tolist())
     eval_games = set(gids[eval_idx].tolist())
     assert not train_games & eval_games, '同一棋局同时落在 train 和 eval 两侧'
@@ -144,3 +144,61 @@ def test_no_game_leakage_across_the_split():
 def test_returns_none_when_dataset_has_no_game_ids():
     """没有 `game_ids` ⇒ 返回 `None`，调用方走按行随机切的退路。"""
     assert split_train_eval_by_game(_Plain(None)) is None
+
+
+def test_returns_the_same_rng_so_the_epoch_loop_keeps_drawing_from_it():
+    """**必须把 `rng` 一并返回**，且其后续抽样序列与原实现逐位一致。
+
+    事故（2026-10-11 真机，C 段）：把 `rng = np.random.default_rng(0)` 搬进
+    helper 之后，`main()` 的作用域里就没有 `rng` 了，而 epoch 循环第一行是
+    `rng.shuffle(train_idx)` ⇒
+
+        UnboundLocalError: local variable 'rng' referenced before assignment
+
+    走的正是**主路径**（`game_ids` 非 None = V7 / B / C 段全部）。
+
+    ⚠ 这条不是「顺手加的防御」：**2098 项测试全绿也没有抓到它** ——
+    没有任何测试跑过 `main()` 的分割之后那段。所以这里不只断言「有 rng」，
+    还要断言**随机流连续**：重新播种（`default_rng(0)` 再来一次）会让每个
+    epoch 的洗牌序列整体改变，跨 run 的可复现性就没了。
+    """
+    gids = _fixture()
+    train_idx, eval_idx, _, _, rng = split_train_eval_by_game(_Plain(gids))
+    want_train, _, _, _, want_rng = _reference(_Plain(gids))
+
+    # 与原实现返回的 rng **状态相同** ⇒ 后续抽样序列必然相同
+    assert np.array_equal(rng.random(8), want_rng.random(8)), \
+        'rng 状态与原实现不同 —— epoch 循环的洗牌序列会变，破坏可复现性'
+    assert np.array_equal(train_idx, want_train)
+
+    # 直接模拟 epoch 循环：同一条流上连抽三次，结果必须与原实现逐位相同
+    for _ in range(3):
+        a = train_idx.copy()
+        b = want_train.copy()
+        rng.shuffle(a)
+        want_rng.shuffle(b)
+        assert np.array_equal(a, b)
+
+
+def test_main_epoch_loop_can_reach_rng_on_both_split_paths():
+    """`main()` 的两条分割分支都必须让 `rng` 到达 epoch 循环。
+
+    这是事故的门禁形态：光断言 helper 返回了 rng 不够 —— 还要断言
+    **`main()` 真的接住了它**。用 AST 检查两条分支都把 `rng` 绑定出来。
+    """
+    import ast
+    import inspect
+    import textwrap
+    import scripts.train_sft as t
+    tree = ast.parse(textwrap.dedent(inspect.getsource(t.main)))
+    assigns = [ast.unparse(n) for n in ast.walk(tree)
+               if isinstance(n, ast.Assign)
+               for t_ in n.targets
+               if isinstance(t_, ast.Name) and t_.id == 'rng']
+    assert len(assigns) >= 1, 'main() 里没有任何地方给 rng 赋值'
+    # epoch 循环用到 rng ⇒ 它必须在某个分支里被绑定
+    assert any('default_rng' in a for a in assigns), assigns
+    # 而按棋局那条分支靠的是 helper 的第五个返回值，不是就地播种
+    assert any('split_train_eval_by_game' in ast.unparse(n)
+               for n in ast.walk(tree) if isinstance(n, ast.Assign)), \
+        'main() 没有调用 split_train_eval_by_game'

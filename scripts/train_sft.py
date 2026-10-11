@@ -1421,8 +1421,16 @@ def split_train_eval_by_game(dataset):
     train_games = np.fromiter(set(unique_games[:n_train_games]),
                               dtype=np.int64, count=n_train_games)
     is_train = np.isin(gids, train_games)
+    # ⚠ `rng` 必须**一并返回**：调用方（main()）的 epoch 循环里还有
+    #   `rng.shuffle(train_idx)`，它复用**同一个** Generator —— 即棋局洗牌之后
+    #   接着继续抽，而不是重新播种。搬进 helper 时若不把这个句柄带出来，
+    #   主路径（`game_ids` 非 None，也就是 V7 / C 段全部）会在 epoch 循环里
+    #   `UnboundLocalError: local variable 'rng' referenced before assignment`
+    #   （2026-10-11 真机事故；而 repo 里 2098 项测试全绿，因为没有测试跑过
+    #   main() 的分割之后那段）。
+    #   重新播种**也不行**：那会改变每个 epoch 的洗牌序列，破坏可复现性。
     return (np.flatnonzero(is_train), np.flatnonzero(~is_train),
-            len(unique_games), n_train_games)
+            len(unique_games), n_train_games, rng)
 
 
 def narrow_to_soft_rows(train_idx, dataset):
@@ -2175,12 +2183,31 @@ def v7_to_device(x, device, amp_dtype, *, pin=False):
     V7 走的是默认 contiguous 布局、**没有** channels_last 那一摊，所以不需要
     numpy 端转置；`pin` 只在 CUDA 上开（加速器/CPU 的 pin_memory 语义不同，
     12 通道那条路也是只在 `_backend == 'cuda'` 时 pin）。
+
+    ⚠ **非浮点输入必须在设备上转成 `amp_dtype`**（2026-10-11 真机 C 段事故）。
+    `V7PackedDataset.spatial` 解位打包后是 **`bool`**（`unpack_binary_input`
+    的天然类型，`spatial` 的 docstring 里写着），而旧的「`amp_dtype != float32`
+    就原样保留」在 BF16（A100 就是）下把 **bool 一路放行到卷积**：
+
+        RuntimeError: Input type (CUDABoolType) and weight type
+                      (CUDABFloat16Type) should be the same
+
+    这条路此前从未跑通过 —— C 段每一次尝试都死在更早的地方（分片静默加载期、
+    按棋局分割的 O(N²)、`rng` 未定义），所以这个缺陷一直被挡着。
+
+    **为什么在设备上转而不是 CPU 上转**：bool 只有 **1 字节**，比 fp16 还省一半
+    H2D。先在 CPU 转成 fp32 恰好把这个优势抵掉（还多一次全张量拷贝），
+    而设备侧那一次 cast 是按带宽走的、几乎免费。
     """
     t = torch.from_numpy(np.ascontiguousarray(x))
-    t = t.float() if amp_dtype == torch.float32 else t
+    # bool / uint8 之类：先按原样过线（1 字节），到设备再转浮点。
+    _non_float = not torch.is_floating_point(t)
+    if not _non_float and amp_dtype == torch.float32:
+        t = t.float()
     if pin:
         t = t.pin_memory()
-    return t.to(device, non_blocking=True)
+    t = t.to(device, non_blocking=True)
+    return t.to(amp_dtype) if _non_float else t
 
 
 def _prefetch_worker(wi, task_q, res_q, seed, dataset, labels=False, v7=False,
@@ -4195,7 +4222,10 @@ def main():
     #   `tests/test_train_sft_game_split.py` 钉住了访问次数与结果等价性。
     _split = split_train_eval_by_game(dataset)
     if _split is not None:
-        train_idx, eval_idx, _n_games, _n_train_games = _split
+        # `rng` 是第五个返回值，不是可有可无的附赠：epoch 循环的
+        # `rng.shuffle(train_idx)` 复用**同一个** Generator（见 helper 的注释）。
+        # 漏掉它 ⇒ 主路径直接 UnboundLocalError，且没有任何测试能抓到。
+        train_idx, eval_idx, _n_games, _n_train_games, rng = _split
         logger.info("[data] 按棋局分割：总棋局=%d 训练棋局=%d 验证棋局=%d",
                     _n_games, _n_train_games, _n_games - _n_train_games)
         n_train = len(train_idx)
