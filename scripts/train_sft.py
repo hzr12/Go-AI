@@ -3628,15 +3628,18 @@ def main():
                     choices=['default', 'max-autotune', 'max-autotune-no-cudagraphs',
                              'reduce-overhead'],
                     help='torch.compile 模式（默认 None = 不显式指定，交给下方设备分支）。\n'
-                         '  A100(sm_80+)：未显式指定时**自动取 max-autotune-no-cudagraphs**'
-                         '（见设备分支）—— 拿到 autotune 的融合/调度收益、不背 CUDA Graphs\n'
-                         '  的显存（40G 卡长跑 OOM 风险，已在注释里否决 reduce-overhead）。\n'
+                         '  **A100(sm_80+)：未显式指定时自动取 `reduce-overhead`**（见设备\n'
+                         '  分支 L3997）—— 带 CUDA Graphs，消除 kernel launch 开销，\n'
+                         '  常比 no-cudagraphs 再快 10~30%%。唯一顾虑是 **CUDA Graphs 私有\n'
+                         '  内存池不归还**，长跑 `mem=` 会缓慢爬升；顶到 OOM 就显式给\n'
+                         '  `--compile-mode default`。⚠ 换档前先 `rm -rf ~/.cache/torch/inductor`\n'
+                         '  （FX 图缓存可能存着上一档的坏图，2026-10-11 本机\n'
+                         '  `max-autotune-no-cudagraphs` 曾报 misaligned address）。\n'
                          '  非 Ampere+ 或显式指定时尊重用户值：\n'
-                         '  default                  = 常规融合，编译快。\n'
-                         '  max-autotune             = 自动调优，但**带** CUDA Graphs；'
-                         '私有内存池不归还，40G 卡上容易在长跑里把显存吃满。\n'
-                         '  reduce-overhead          = 小 batch 低开销，同样受 '
-                         'CUDA Graphs 内存池影响，长跑慎用。')
+                         '  default                       = 常规融合，编译最快，不带 CUDA Graphs。\n'
+                         '  reduce-overhead               = 小 batch 低开销（**A100 默认**）。\n'
+                         '  max-autotune                  = 全量 autotune + CUDA Graphs，最慢最吃显存。\n'
+                         '  max-autotune-no-cudagraphs    = autotune 收益但不背 CUDA Graphs 的显存池。')
     ap.add_argument('--compile-fullgraph-probe', type=int, default=0, choices=[0, 1],
                     help='诊断用：编译时额外用 `fullgraph=True` 探测一次，把所有 '
                          'graph break 一次性列进日志（抛异常即逐条列出断点），'

@@ -111,7 +111,25 @@ class V7PackedDataset:
         collected: Dict[str, List[np.ndarray]] = {}
         offsets: List[int] = []
         total = 0
+        # 进度日志：分片是**整个读进内存**（不 mmap），单片 4.70 GB、8 片 37.6 GB
+        # ⇒ 这一段会静默跑很久。2026-10-11 真机两次被当成「卡死」而 Ctrl-C，
+        # 栈底停在 `np.asarray(z[k])`（npz 是 zip，读它要解压 + 算 CRC，纯 CPU）。
+        # 所以这里**加载前打总量、每片打一行**：让「在加载」和「挂了」一眼分开。
+        # 用 `print` 而非 logger：这个模块全篇没有 logger，而 `train_sft.py`
+        # 的数据解析段（`[data] 已解析 …`）也是 print，两处口径一致。
+        _sizes = []
         for p in self.shard_paths:
+            try:
+                _sizes.append(os.path.getsize(p))
+            except OSError:                      # noqa: BLE001 — 拿不到就当 0，不因此拒绝加载
+                _sizes.append(0)
+        print('[data] V7 分片加载中：%d 片，合计 %.1f GB（整读进内存，不 mmap）；'
+              '机器装不下就会换页变慢 —— 这是加载期，不是挂死'
+              % (len(self.shard_paths), sum(_sizes) / 1e9), flush=True)
+        for _i, p in enumerate(self.shard_paths):
+            print('  [data] V7 分片 %d/%d 读取中 %s (%.2f GB) …'
+                  % (_i + 1, len(self.shard_paths), p, _sizes[_i] / 1e9),
+                  flush=True)
             z = np.load(p, allow_pickle=True)
             n = int(np.asarray(z['spatial_packed']).shape[0])
             for k in z.files:
@@ -120,12 +138,17 @@ class V7PackedDataset:
                 collected.setdefault(k, []).append(np.asarray(z[k]))
             offsets.append(total)
             total += n
+            print('  [data] V7 分片 %d/%d 完成 %s（%d 行，累计 %d 行）'
+                  % (_i + 1, len(self.shard_paths),
+                     os.path.basename(p), n, total), flush=True)
         offsets.append(total)
 
         self._shards = collected
         self._offsets = offsets
         self.N = total
         self.n_rows = total
+        print('[data] V7 分片全部加载完成：%d 片 / %d 行' % (len(self.shard_paths), total),
+              flush=True)
         self._check_layout()
 
     # ------------------------------------------------------------------ #
