@@ -1384,6 +1384,47 @@ def _soft_kind_for_step(hard_kind, step, soft_every):
     return 'soft_ce' if step % every == 0 else hard_kind
 
 
+def split_train_eval_by_game(dataset):
+    """按棋局把**行号**切成 train / eval 两侧，返回
+    ``(train_idx, eval_idx, 总棋局数, 训练棋局数)``；`dataset.game_ids is None`
+    时返回 `None`（调用方走「按行随机切」的退路）。
+
+    防泄漏：同一棋局的相邻位置若同时落在两侧，eval 指标会虚高。
+
+    ⚠⚠ **`dataset.game_ids` 必须在这里取一次，且绝不能进循环。**
+    `V7PackedDataset.game_ids` 是 **property**，每次访问都重新
+    `_gather('game_ids', arange(N))` 跑一遍全量（`searchsorted` + 花式索引，
+    **O(N)**）。原实现写成
+    ``[i for i in range(n) if dataset.game_ids[i] in train_game_set]``
+    —— n 次迭代 × 每次 O(N) 重建 = **O(N²)**。
+
+    2026-10-11 真机事故：C 段（stdata 分片，3.1M 行）启动后**卡死在按棋局分割**，
+    无任何报错也无日志，栈底（Ctrl-C 后）停在 `numpy/lib/format.py:_read_bytes`。
+    B 段同一条代码路径没事，因为 `V7Dataset.game_ids` 是 `__init__` 里的普通
+    属性、索引 O(1) —— **同一段代码，两条数据路径复杂度差一个平方级**，
+    这就是「只有 C 段卡」的原因。
+
+    修法两处：取一次属性 + 用 `np.isin` 向量化（`np.flatnonzero` 给出的
+    升序索引与原列表推导逐字一致）。语义、`rng = default_rng(0)` 的种子、
+    0.98 的切分比例全部不变。
+    """
+    gids = dataset.game_ids          # ← 就这一次
+    if gids is None:
+        return None
+    gids = np.asarray(gids)
+    unique_games = np.unique(gids)
+    rng = np.random.default_rng(0)
+    rng.shuffle(unique_games)
+    n_train_games = int(len(unique_games) * 0.98)
+    # `set(...)` 与原实现同义；`fromiter` 只是为了喂给 np.isin（unique_games
+    # 无重复 ⇒ 集合大小恰为 n_train_games，count 断言得住）。
+    train_games = np.fromiter(set(unique_games[:n_train_games]),
+                              dtype=np.int64, count=n_train_games)
+    is_train = np.isin(gids, train_games)
+    return (np.flatnonzero(is_train), np.flatnonzero(~is_train),
+            len(unique_games), n_train_games)
+
+
 def narrow_to_soft_rows(train_idx, dataset):
     """`--soft-only-sampling`：把训练行索引空间收窄到「有软标签的行」。
 
@@ -4120,16 +4161,14 @@ def main():
 
     n = len(dataset)
     # 按棋局分割 train/eval（避免同一棋局的相邻位置同时出现在 train 和 eval）
-    if dataset.game_ids is not None:
-        unique_games = np.unique(dataset.game_ids)
-        rng = np.random.default_rng(0)
-        rng.shuffle(unique_games)
-        n_train_games = int(len(unique_games) * 0.98)
-        train_game_set = set(unique_games[:n_train_games])
-        train_idx = np.array([i for i in range(n) if dataset.game_ids[i] in train_game_set])
-        eval_idx = np.array([i for i in range(n) if dataset.game_ids[i] not in train_game_set])
+    # ⚠ 复杂度契约在 `split_train_eval_by_game` 的 docstring 里：属性取一次 +
+    #   向量化。把 `dataset.game_ids` 挪回调用方会直接退化成 O(N²)，
+    #   `tests/test_train_sft_game_split.py` 钉住了访问次数与结果等价性。
+    _split = split_train_eval_by_game(dataset)
+    if _split is not None:
+        train_idx, eval_idx, _n_games, _n_train_games = _split
         logger.info("[data] 按棋局分割：总棋局=%d 训练棋局=%d 验证棋局=%d",
-                    len(unique_games), n_train_games, len(unique_games) - n_train_games)
+                    _n_games, _n_train_games, _n_games - _n_train_games)
         n_train = len(train_idx)
     else:
         n_train = int(n * 0.98)

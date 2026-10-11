@@ -396,18 +396,37 @@ def test_eval_split_order_is_deterministic():
     两条性质（按内容锚点定位，不写死行号）：
 
       ① 两条分割分支都用 `np.random.default_rng(0)`（字面量 0，种子不会被变量悄悄改掉）
-      ② 按棋局分割分支的 `eval_idx` 由对 `range(...)` 的**顺序扫描**构造 → 天然升序
+      ② 按棋局分割分支的 `eval_idx` **升序**
          （另一条分支是 `idx_all[n_train:]`，顺序由 ① 的定种子洗牌决定 —— 同样固定，
          但不是升序，故不写死成升序）
-    """
-    tree = ast.parse(textwrap.dedent(inspect.getsource(t.main)))
 
+    🔴 **2026-10-11：按棋局那条分支被搬进了 `split_train_eval_by_game`，两处都要跟过去。**
+    原 bug 是把 `dataset.game_ids`（`V7PackedDataset` 上是 O(N) 的 **property**）
+    写在列表推导式里 ⇒ **O(N²)**，真机 C 段启动直接卡死（见该函数 docstring）。
+    修法取一次属性 + `np.isin` 向量化，顺带把整段抽成了模块级 helper ——
+    **性质没变，只是换了住址**，所以这个门禁必须跟着换，不能直接删。
+
+    ② 的**写法**也变了：原来靠「`np.array([... for i in range(n) ...])` 是顺序扫描
+    ⇒ 天然升序」这个**结构**来保证；现在是 `np.flatnonzero(...)`，升序是它的定义。
+    结构断言已随实现一起消失，改由 `tests/test_train_sft_game_split.py`
+    行为化地断言（`np.array_equal(eval_idx, np.sort(eval_idx))`）——
+    **结构会随重构变，性质不会**，所以钉性质的那个测试才是关键的那道锁。
+    """
+    def _seeds_of(fn):
+        src = textwrap.dedent(inspect.getsource(fn))
+        return [ast.unparse(n.args[0]) for n in ast.walk(ast.parse(src))
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == 'default_rng' and n.args]
+
+    # ① 按棋局分支的种子已搬进 helper，按样本分支仍留在 main()
+    game_seeds = _seeds_of(t.split_train_eval_by_game)
+    assert game_seeds == ['0'], \
+        f'按棋局分割用的不是 default_rng(0)，实得 {game_seeds}'
+    tree = ast.parse(textwrap.dedent(inspect.getsource(t.main)))
     seeds = [ast.unparse(n.args[0]) for n in ast.walk(tree)
              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
              and n.func.attr == 'default_rng' and n.args]
     assert '0' in seeds, f'main() 里分割用的不是 default_rng(0)，实得 {seeds}'
-    assert seeds.count('0') >= 2, \
-        f'两条分割分支（按棋局 / 按样本）都该用 default_rng(0)，实得 {seeds}'
 
     # eval_idx 两处赋值都被 `np.array(...)` 包了一层，先剥掉这层壳再看真实形状
     def _unwrap(node):
@@ -420,17 +439,7 @@ def test_eval_split_order_is_deterministic():
                if isinstance(node, ast.Assign)
                and any(isinstance(tg, ast.Name) and tg.id == 'eval_idx'
                        for tg in node.targets)]
-    assert len(assigns) == 2, f'main() 里应有 2 处 eval_idx 赋值，实得 {len(assigns)}'
-
-    comps = [v for v in assigns if isinstance(v, ast.ListComp)]
-    assert len(comps) == 1, \
-        '按棋局分割分支的 eval_idx 应是列表推导（顺序扫描），否则「升序」无从谈起'
-    gens = comps[0].generators
-    assert len(gens) == 1, f'eval_idx 的推导应有且只有一个 for，实得 {len(gens)}'
-    scan = gens[0].iter                      # 推导的扫描源（不是 ListComp.iter）
-    assert (isinstance(scan, ast.Call) and getattr(scan.func, 'id', None) == 'range'
-            and len(scan.args) == 1), \
-        f'eval_idx 的推导应扫描一个 range(...) 才能保证升序，实得 {ast.unparse(scan)!r}'
+    assert len(assigns) == 1, f'main() 里应有 1 处 eval_idx 赋值（按样本分支），实得 {len(assigns)}'
 
     slices = [v for v in assigns if isinstance(v, ast.Subscript)]
     assert len(slices) == 1 and ast.unparse(slices[0]) == 'idx_all[n_train:]', \
