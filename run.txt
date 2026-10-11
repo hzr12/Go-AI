@@ -268,15 +268,15 @@ python scripts/train_sft.py \
 #   🔴 「实测甜点」同样含 GC 语义，已失效待重测（见 A 段红字段）。
 python scripts/train_sft.py \
   --data data/stdata --v7 1 --device cuda --board-size 19 \
-  --model models/b_v7_a100.pth.latest \
+  --model models/b_v7_a100.pth \
   --policy-loss soft_ce --soft-weight 1.0 \
   --batch-size 512 --epochs 1 --lr 0.00320 --weight-decay 0.0001 \
-  --gradient-accumulation-steps 4 --use-amp 1 --use-ema 1 \
+  --gradient-accumulation-steps 4 --use-amp 1 --use-ema 0 \
   --flash-attn 1 --attention-dropout 0 \
-  --prefetch-workers 4 --prefetch-depth 8 \
-  --log-every 50 --eval-every 500 --save-every 250 \
+  --prefetch-workers 24 --prefetch-depth 8 \
+  --log-every 50 --eval-every 500 --save-every 20 \
   --early-stop 1 --early-stop-patience 3 \
-  --out models/c_v7_a100.pth --swanlab 1 --ver c_v7_a100 --swanlab-every 10
+  --out models/c_v7_a100.pth --swanlab 1 --ver c_v7_a100 --swanlab-every 1
 
 # ⚠ **batch 数字都别当已验证**（2026-10-08）。旧文档里那套 910A 的多卡定档
 #   （A-1 单卡 2800 / A-2 每卡 6000 / C-2 每卡 2800 / C-3 每卡 1000）**全部作废**：

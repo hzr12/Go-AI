@@ -1300,6 +1300,31 @@ def attach_soft_index(dataset, path, data_npz=None):
     return diag
 
 
+def _npz_looks_packed(path):
+    """这个 npz / 目录里有没有 V7 stdata 分片（含 `spatial_packed`）。
+
+    **只读 zip 头，不载数据**（`np.load` 对 npz 是惰性的），所以在「加载数据集
+    之前」廉价地问一句是可行的 —— 这正是早期守卫需要的。
+
+    判据刻意用**文件内容**而不是文件名：目录模式下同一个目录里可能同时躺着
+    两种分片，名字（`stdata_v7_s*.npz`）只是约定、不是保证（见
+    `v7_packed_dataset.py` 顶部关于「现有分片生成于 col22 接进转换之前」的说明）。
+    """
+    import glob as _glob
+    import numpy as _np
+    cands = ([path] if os.path.isfile(path)
+             else sorted(_glob.glob(os.path.join(path, '**', '*.npz'),
+                                    recursive=True)))
+    for p in cands:
+        try:
+            with _np.load(p, allow_pickle=False) as z:
+                if 'spatial_packed' in z.files:
+                    return True
+        except Exception:      # noqa: BLE001 — 探测失败按「不是分片」处理
+            continue
+    return False
+
+
 def resolve_policy_loss_kind(policy_loss, soft_index, v7_packed=False):
     """软标签接入后，**生效**的 policy 损失 kind。
 
@@ -1903,7 +1928,8 @@ def load_from_path(path, board_size, max_games_per_tgz=0, v7=False,
         #   跨不过去）。
         #
         # 判据用「文件里有没有 `spatial_packed`」而不是文件名：目录模式下
-        # 一个目录里可能同时躺着两种分片。
+        # 一个目录里可能同时躺着两种分片。与早期守卫共用 `_npz_looks_packed`
+        # （那里在加载数据集**之前**就要回答同一个问题），避免两份实现漂移。
         import numpy as _np
 
         def _looks_packed(p: str) -> bool:
@@ -3663,8 +3689,14 @@ def main():
     #   V7 的真实分片判据要等 dataset 建好后用 `hasattr(dataset, 'sample_spatial')`
     #   （见本文件后面 `if _v7_on:` 那一次重新解析），那里才是唯一正确的口径。
     #   此处只做「加载数据集之前拒掉坏组合」这一件事，V7 的最终口径留给后面。
+    # ⚠ `v7_packed` 这里**必须真的探一次数据**，不能恒传 False，也不能用
+    #   `bool(args.v7)`：C 段（`--v7 1` + stdata 分片 + `soft_ce`）的软标签是
+    #   **内建在行里**的、不经过 `--soft-index`。恒传 False 会让这个合法的 C 段
+    #   命令在早期守卫处被拒 —— 而 run.txt 的 C 段记的就是这条命令，等于
+    #   **文档给的命令跑不起来**。`_npz_looks_packed` 只读 zip 头，代价可忽略。
+    _v7_packed_early = (args.v7 and _npz_looks_packed(args.data))
     _eff_kind = resolve_policy_loss_kind(args.policy_loss, args.soft_index,
-                                        v7_packed=False)
+                                        v7_packed=_v7_packed_early)
     if _eff_kind != _hard_policy_loss:
         logger.info("[soft] policy 损失口径 %s → %s（--soft-index 已给定）",
                     _hard_policy_loss, _eff_kind)
