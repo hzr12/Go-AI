@@ -302,8 +302,23 @@ def test_backward_tail_segments_are_measured():
     assert re.search(r'_ums = \(_wall_ms', SRC), '缺少未归因 u 的计算'
 
 
+_G_TAGS = ('_t_clip0', '_t_g1_0', '_t_g1', '_t_g2_0',
+               '_t_g2', '_t_g3_0', '_t_g3', '_t_clip')
+_G_ACC = ('_t_g1', '_t_g2', '_t_g3', '_t_clip')
+
+
+def _g_tag(node):
+    """取一个赋值/AugAssign 节点计时标签的名字，不是 g 段的返回 None。"""
+    if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+            and isinstance(node.targets[0], ast.Name):
+        return node.targets[0].id
+    if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+        return node.target.id
+    return None
+
+
 def test_g_is_split_into_three_contiguous_subsegments():
-    """`g` 必须拆成 g1/g2/g3，且首尾相接、顺序固定（和恒等于 g）。
+    """`g` 必须拆成 g1/g2/g3，且**在每条执行路径上**首尾相接、顺序固定。
 
     动机（2026-10-07 真机 a_v7.3_npu2）：13.09 s/step 里 `g` 独占 10.45 s
     （79.9%），而 `u`=1 ms、`c`=2.48 s。但 `g` 内部混着三件性质完全不同的事：
@@ -328,23 +343,61 @@ def test_g_is_split_into_three_contiguous_subsegments():
     for acc in ('_t_g1', '_t_g2', '_t_g3'):
         assert re.search(re.escape(acc) + r' \+= time\.perf_counter\(\) - ', SRC), \
             f'{acc} 未被累加'
-    # 起点与结算必须严格交错排列。走 AST 而不是 SRC.index：注释里引用一次
-    # `_t_g2_0 = ...` 就能让索引测试错位（本文件顶部那段教训的同类问题）。
-    want = ['_t_clip0', '_t_g1_0', '_t_g1', '_t_g2_0',
-            '_t_g2', '_t_g3_0', '_t_g3', '_t_clip']
-    got = []
-    for n in ast.walk(_tree()):
-        if isinstance(n, ast.Assign) and len(n.targets) == 1 \
-                and isinstance(n.targets[0], ast.Name) \
-                and n.targets[0].id in want:
-            got.append((n.lineno, n.targets[0].id))
-        elif isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name) \
-                and n.target.id in ('_t_g1', '_t_g2', '_t_g3', '_t_clip'):
-            got.append((n.lineno, n.target.id))
-    got.sort()
-    assert [x[1] for x in got] == want, \
-        'g 的起止必须按 clip0 → g1_0 → g1 → g2_0 → g2 → g3_0 → g3 → clip 排列，' \
-        f'实际 {["%d:%s" % (ln, nm) for ln, nm in got]}'
+    # 起点与结算必须**在每条路径上**严格交错排列。
+    #
+    # ⚠ 不能沿用「全文件收集 + 按行号排序」再比一条线性序列：2026-10-11 的
+    # `--clip-every` 引入了 `if _do_clip: ... else: ...`，两条**互斥**分支各自
+    # 结算一次 `_t_g2`（裁剪分支还多出 g3_0/g3）。线性扫描会把两个 g2 都收进来，
+    # 排出 `g1,g2_0,g2,g3_0,g3,g2,clip` 这种**任何一次执行都不会发生**的序列，
+    # 于是测试红了而代码是对的。所以这里改成**逐分支**校验。
+    #
+    # 两条路径（`_do_clip` 决定，走哪个由 `--clip-every` 决定）：
+    #   裁剪：clip0 → g1_0 → g1 → g2_0 → g2 → g3_0 → g3 → clip
+    #   跳过：clip0 → g1_0 → g1 → g2_0 → g2 → clip        （无 g3，本步不同步）
+    # 两条都首尾相接 ⇒ `g == g1 + g2 + g3` 在任一路径上都成立。
+    def tags_in(nodes):
+        got = []
+        for n in nodes:
+            for m in ast.walk(n):
+                if isinstance(m, ast.Assign) and len(m.targets) == 1 \
+                        and isinstance(m.targets[0], ast.Name) \
+                        and m.targets[0].id in _G_TAGS:
+                    got.append((m.lineno, m.targets[0].id))
+                elif isinstance(m, ast.AugAssign) \
+                        and isinstance(m.target, ast.Name) \
+                        and m.target.id in _G_ACC:
+                    got.append((m.lineno, m.target.id))
+        got.sort()
+        return [nm for _, nm in got]
+
+    branch = next(
+        (n for n in ast.walk(_tree())
+         if isinstance(n, ast.If) and '_do_clip' in ast.dump(n.test)),
+        None)
+    assert branch is not None, \
+        '找不到按 `_do_clip` 分叉的 if —— g 段的结算结构变了，本用例需重新推导'
+
+    assert tags_in(branch.body) == ['_t_g2', '_t_g3_0', '_t_g3'], \
+        '裁剪分支内必须依次结算 g2 / g3_0 / g3（且不得夹别的计时点）'
+    assert tags_in(branch.orelse) == ['_t_g2'], \
+        '跳过分支内只结算 g2（该步不做 clip，也就不该有 g3 同步）'
+
+    # 分支之前 = 两路公共前缀；分支之后 = 两路公共收尾。行号区间用来切分，
+    # 切分点由 if 节点的 lineno/end_lineno 给出，不写死行号（会随注释增删漂移）。
+    before = [n for n in ast.walk(_tree())
+              if isinstance(n, (ast.Assign, ast.AugAssign))
+              and getattr(n, 'lineno', 0) < branch.lineno
+              and _g_tag(n) in _G_TAGS]
+    after = [n for n in ast.walk(_tree())
+             if isinstance(n, (ast.Assign, ast.AugAssign))
+             and getattr(n, 'end_lineno', 0) > branch.end_lineno
+             and _g_tag(n) in _G_TAGS]
+    assert [_g_tag(n) for n in sorted(before, key=lambda x: x.lineno)] == \
+        ['_t_clip0', '_t_g1_0', '_t_g1', '_t_g2_0'], \
+        'if 之前必须是公共前缀 clip0 → g1_0 → g1 → g2_0'
+    assert [_g_tag(n) for n in sorted(after, key=lambda x: x.lineno)] == \
+        ['_t_clip'], \
+        'if 之后必须只有收尾的 _t_clip（保证 g 从 _t_clip0 一路盖到 _t_clip）'
 
 
 def test_memory_line_reports_reserved_only():
@@ -382,17 +435,26 @@ def test_memory_line_reports_reserved_only():
 def test_effective_batch_for_throughput_includes_accumulation():
     """吞吐口径的有效 batch 必须含梯度累积，否则日志把速度报成一半。
 
-    `_eff_bs = bs * world_size` 漏乘 accumulation steps ⇒ 用了
-    `--gradient-accumulation-steps 2` 时 `spd`/`spd_inst` 只有真实值的一半。
-    而 2026-10-01 的降档方案（每卡 batch 减半 + 累积 2）**正是** accum=2，
+    `_eff_bs = bs * accum` 漏乘 accumulation steps ⇒ 用了
+    `--gradient-accumulation-steps 4` 时 `spd`/`spd_inst` 只有真实值的 1/4。
+    2026-10-01 的降档方案（每卡 batch 减半 + 累积 2）**正是** accum=2，
     所以这条不修就会误导那次降档的判读。
+
+    ⚠ 2026-10-11：`world_size` 这个因子**已随 DDP 多卡支持整体删除**
+    （`scripts/train_sft.py` 里已无 `world_size` 变量，单卡恒为 1），所以它不再
+    是有效 batch 的组成部分。漏乘它不会让吞吐报错 —— 乘 1 与不乘完全等价 ——
+    真正会导致「报成假值」的是 accum 那一项，这里只钉后者。
     """
     m = re.search(r'_eff_bs = (.+)', SRC)
     assert m, '未找到 _eff_bs'
     expr = m.group(1)
-    for factor in ('bs', 'world_size', '_accum_steps'):
-        assert factor in expr, \
-            f'_eff_bs 漏乘 {factor}：{expr.strip()}（accum>1 时吞吐会被报成假值）'
+    assert 'bs' in expr, f'_eff_bs 连每卡 bs 都没有：{expr.strip()}'
+    assert '_accum_steps' in expr, \
+        f'_eff_bs 漏乘 _accum_steps：{expr.strip()}（accum>1 时吞吐会被报成假值）'
+    # 反向钉住：多卡已退役，别把 world_size 又当成一个必需因子加回来
+    # （真要恢复多卡，这条得同步改成「乘 world_size」而不是悄悄通过）。
+    assert 'world_size' not in expr, \
+        'world_size 随 DDP 整体删除；恢复多卡时请显式改这条断言'
 
 
 def test_eval_timing_wraps_the_dominant_cost():

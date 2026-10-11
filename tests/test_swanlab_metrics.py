@@ -95,14 +95,30 @@ def test_grad_norm_is_taken_after_unscale():
     unscale 之前梯度还乘着 loss scale（默认 1024），量出来的范数大三个数量级 ——
     曲线看着「梯度爆炸」，而那只是缩放的假值。
 
-     判据必须在 **main() 内**取位置，不能用 `CODE.index()` 找全文件第一个：
-       `_locate_overflow` 的 docstring 里也会提到 `clip_grad_norm_`（解释
-       「为什么诊断必须在 clip 之前」），而它定义在 main 之前 ⇒ 全文件搜索会
-       命中那段说明文字，于是这条门禁变成在测文档而不是测代码。
+     判据必须是 **AST 节点**，不能用文本 `index()`：
+       · 2026-10-01：`_locate_overflow` 的 docstring 里提到 `clip_grad_norm_`，
+         而它定义在 main 之前 ⇒ 全文件搜索命中的是说明文字；
+       · 2026-10-11：把范围收窄到 main() 内**仍然不够** —— `--clip-every` 的
+         argparse help 文本（「每 N 个 optimizer step 才做一次梯度裁剪
+         (clip_grad_norm_)」）也落在 main() 里，且远早于真正的调用；注释同理。
+     所以这里只认 `Call` 节点，彻底排除字符串与注释。
     """
-    i_un = MAIN.index('scaler.unscale_(optimizer)')
-    i_gn = MAIN.index('clip_grad_norm_')
-    assert i_un < i_gn, 'grad_norm 必须在 unscale_ 之后取'
+    import ast
+    tree = ast.parse(MAIN)
+    unscale_at, clip_at = None, None
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.Call):
+            continue
+        name = ast.unparse(n.func)
+        if name == 'scaler.unscale_' and unscale_at is None:
+            unscale_at = n.lineno
+        if name.endswith('clip_grad_norm_') and clip_at is None:
+            clip_at = n.lineno
+    assert unscale_at is not None, 'main() 里找不到 scaler.unscale_ 的调用'
+    assert clip_at is not None, 'main() 里找不到 clip_grad_norm_ 的调用'
+    assert unscale_at < clip_at, (
+        f'grad_norm 必须在 unscale_ 之后取：unscale_ 在第 {unscale_at} 行，'
+        f'clip_grad_norm_ 在第 {clip_at} 行')
 
 
 def test_grad_norm_carries_forward_across_micro_batches():
@@ -321,10 +337,16 @@ def _assigned_before(fn, use_line, names):
             for k, v in missing.items()}))
 
 
-def test_init_swanlab_defines_ws_and_accum_before_config():
-    """`_init_swanlab` 的 config 块用 `_ws`/`_accum`，两者必须在它之前赋值。"""
+def test_init_swanlab_defines_accum_before_config():
+    """`_init_swanlab` 的 config 块用 `_accum`，必须在它之前赋值。
+
+    ⚠ 原名 `..._ws_and_accum_...` 里的 `_ws` 已随 DDP 多卡支持整体删除
+    （单卡恒为 1，`effective_batch` 现在就是 `batch_size * _accum`）。保留 `_ws`
+    只会让这条门禁盯一个不存在的局部名 —— 与它当初盯 `_locate_overflow` 的
+    docstring 是同一类「在测不存在的东西」。
+    """
     line = SRC[:SRC.index('config={')].count('\n') + 1
-    _assigned_before('_init_swanlab', line, {'_ws', '_accum'})
+    _assigned_before('_init_swanlab', line, {'_accum'})
 
 
 def test_run_level_metrics_dict_uses_only_names_defined_earlier():
@@ -370,17 +392,26 @@ def test_config_expression_actually_evaluates():
 
     body = SRC[SRC.index('config={'):]
     expr = body[body.index('{') + 1:body.index('},\n')]
+    # ⚠ 2026-10-11：`world_size` 已随 DDP 多卡支持整体删除（单卡恒为 1），
+    # `effective_batch` 现在就是 `args.batch_size * _accum`，不再有第三个因子。
     env = {'args': ns, 'KATAGO_SE_CFG': tsf.KATAGO_SE_CFG, 'os': os,
-           '_ws': 2, '_accum': 2, 'NBT_TF_CFG': tsf.NBT_TF_CFG}
+           '_accum': 2, 'NBT_TF_CFG': tsf.NBT_TF_CFG}
     cfg = eval('{' + expr + '}', env)   # noqa: S307 — 测试内显式求值
 
     assert isinstance(cfg, dict) and len(cfg) >= 25, \
         f'config 键数异常：{len(cfg) if isinstance(cfg, dict) else type(cfg)}'
     for k in ('arch/in_channels', 'arch/blocks', 'effective_batch',
-              'grad_accum', 'world_size', 'lr', 'amp_dtype',
+              'grad_accum', 'lr', 'amp_dtype',
               'attn_query_chunk', 'ema_decay'):
         assert k in cfg, f'config 实跑后缺 {k}'
-    assert cfg['effective_batch'] == 1000 * 2 * 2, cfg['effective_batch']
+    # 实跑而非静态：bs × accum（1000 × 2）。多卡已退役，不能再乘 world_size。
+    assert cfg['effective_batch'] == ns.batch_size * 2, cfg['effective_batch']
+    # world_size 已随 DDP 退役，但键**保留**在面板里（删掉会破坏跨 run 的
+    # schema 对比）。所以这里钉的是「它必须是冻结的 1」而不是「不能有」——
+    # 若有人日后恢复多卡却忘了把它接回真值，这条会立刻变红。
+    assert cfg.get('world_size') == 1, (
+        'world_size 必须是冻结的常量 1（多卡已退役）；恢复多卡时请接回真实值，'
+        '实得 %r' % (cfg.get('world_size'),))
     for dead in ('backbone_channels', 'res_blocks', 'policy_layers'):
         assert dead not in cfg, f'归档 flag {dead} 混进了 config'
 

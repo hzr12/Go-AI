@@ -501,21 +501,36 @@ def test_labels_dict_tensor_helper_is_recursive(mod):
     assert t['soft'].numpy().tobytes() == d['soft'].tobytes()
 
 
-def test_module_level_helpers_live_outside_the_worker_slice():
-    """主进程侧 helper 必须在 worker 切片**之外**。
+def _worker_slice():
+    """`_prefetch_worker` **自身**的源码，而不是「worker 到下一个类之间」。
 
-    `test_prefetch_workers_do_not_touch_cuda_or_npu` 扫的是「worker 定义 →
-    `_BatchPrefetcher` 类定义」这一段；`_labels_dict_to_tensors` 里必须有跨设备
-    搬运，把它放进去会让那条测试误红（它守的判据是 worker 纯 numpy，
-    而搬张量的是主进程）。这条是**布局**守卫，防止以后有人「顺手」把 helper
-    挪回 worker 后面。
+    ⚠ 2026-10-11 的坑：旧写法取 `SRC[i_worker:i_cls]`，即从 `def _prefetch_worker(`
+    一路切到 `class _BatchPrefetcher`。增强迁到 GPU 后，`_dihedral_batch` /
+    `_dihedral_batch_torch` 这两个**主进程侧** helper 被放在了同一区间里，其中
+    torch 版必然含 `torch.rot90` ⇒ 「worker 段里不该出现 torch 调用」被自己人
+    违反。切片必须按函数的 AST 范围划，不能靠「下一个类在哪」来界定 ——
+    类只是恰好排在那儿，不是 worker 的边界。
     """
-    i_worker = SRC.find('def _prefetch_worker(')
-    i_cls = SRC.find('class _BatchPrefetcher')
-    assert i_worker != -1 and i_cls != -1 and i_worker < i_cls
-    seg = SRC[i_worker:i_cls]
-    for fn in ('_concat_label_dicts', '_concat_tree', '_labels_dict_to_tensors'):
+    import ast
+    tree = ast.parse(SRC)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == '_prefetch_worker')
+    lines = SRC.splitlines()
+    return '\n'.join(lines[fn.lineno - 1:fn.end_lineno])
+
+
+def test_module_level_helpers_live_outside_the_worker_slice():
+    """主进程侧 helper 必须在 worker **自身**的代码之外。
+
+    `test_prefetch_workers_do_not_touch_cuda_or_npu` 守的是「worker 纯 numpy」；
+    这条是**布局**守卫，防止以后有人「顺手」把含跨设备搬运的 helper 挪回 worker
+    后面。判据必须按函数 AST 范围划（见 `_worker_slice` 的说明），否则同区间里
+    住着的其它主进程 helper 会被误判成 worker 代码。
+    """
+    seg = _worker_slice()
+    for fn in ('_concat_label_dicts', '_concat_tree', '_labels_dict_to_tensors',
+               '_dihedral_batch', '_dihedral_batch_torch'):
         assert f'def {fn}(' not in seg, \
-            f'{fn} 落在 worker 切片里：它是主进程侧逻辑（含跨设备搬运）'
-    assert 'torch.' not in seg, 'worker 段里不该出现 torch 调用'
+            f'{fn} 落在 worker 自身里：它是主进程侧逻辑（含跨设备搬运）'
+    assert 'torch.' not in seg, 'worker 自身里不该出现 torch 调用'
 

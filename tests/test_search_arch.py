@@ -109,6 +109,39 @@ def test_checkpointing_reduces_retained_memory():
             ret_ckpt, ret_plain)
 
 
+def test_anchor_regime_mismatch_is_announced():
+    """锚点 regime 与训练 regime 分叉时，工具**必须**每次输出都带上提醒。
+
+    背景（2026-10-11）：主干 GC 子系统整体删除后训练侧不再检查点，而
+    `ANCHOR`（`mem_gb=31.12`）与 `calib_factor()` 都是**开检查点**时测的。
+    探针口径内部自洽（`--calibrate` 仍报相对误差 0.0%），但 `fits` 的判定
+    方向是**低估** ⇒ 会把装不下的配置判成能装下。这是最坏的一种错法。
+
+    本次刻意不重标定（无硬件，改锚点数字等于编数据），所以唯一的防线是
+    「让错法无法静默」。这条用例就是那道防线的回归守卫。
+    """
+    assert 'regime' in S.ANCHOR, \
+        'ANCHOR 必须带 regime 标签，否则调用方无从判断口径是否与训练一致'
+    assert S.TRAINING_REGIME == 'no-checkpoint', \
+        '训练侧自 2026-10-11 起不做任何检查点，regime 必须跟着改'
+    # 当前是分叉状态 ⇒ 提醒非空，且必须点明「低估」这个方向（方向错了人就会
+    # 反着读）。
+    assert S.REGIME_CAVEAT, 'regime 分叉时 REGIME_CAVEAT 不得为空'
+    assert '低估' in S.REGIME_CAVEAT, \
+        '提醒必须写明偏差方向，否则读者可能反着理解：%r' % S.REGIME_CAVEAT
+    # 提醒要被真正打出去，而不是只定义一个常量。
+    import io as _io
+    import contextlib as _ctx
+    buf = _io.StringIO()
+    with _ctx.redirect_stdout(buf):
+        S._announce_regime()
+    assert S.REGIME_CAVEAT in buf.getvalue(), \
+        '_announce_regime() 没有把提醒打到 stdout'
+    # project() 的返回值也要带上 regime，让下游（网格/曲线/二分）能自己判断。
+    assert 'regime' in S.project(SMALL, 2), \
+        'project() 返回值必须带 regime，否则下游拿不到口径标签'
+
+
 def test_attention_window_affects_memory():
     """attn_window 会改变窗口划分数，显存必须随之变化。
 
@@ -416,10 +449,13 @@ def test_se_project_reports_budget_fields():
     r32 = S.project(cfg, 3200)
     for r in (r1, r32):
         assert set(r) == {'params', 'flops', 'act_gb', 'total_gb',
-                          'step_s', 'samples_per_s', 'fits'}
+                          'step_s', 'samples_per_s', 'fits', 'regime'}
         assert r['params'] == 9_112_005
         assert r['flops'] == 6_212_830_720
         assert r['fits'] == (r['total_gb'] <= S.SAFE_GB)
+        # 口径标签必须跟着每个返回值走，否则下游只拿到一个无主的数字
+        # （regime 分叉的严重性见 test_anchor_regime_mismatch_is_announced）。
+        assert r['regime'] == S.ANCHOR['regime']
     assert r1['fits'], \
         'batch 1000 预测应装得下（否则 shell 的 BATCH=1000 无依据）'
     assert not r32['fits'], \

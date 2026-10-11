@@ -1258,7 +1258,13 @@ def test_v7_flag_exists_and_is_the_only_new_one():
 # 9. 预取器的 V7 payload
 # --------------------------------------------------------------------------- #
 def test_prefetch_worker_v7_payload_shape():
-    """worker 的 V7 payload 形状与标签口径（真跑 worker 函数，纯 numpy）。"""
+    """worker 的 V7 payload 形状与标签口径（真跑 worker 函数，纯 numpy）。
+
+    ⚠ payload 是 **8 元组**（末位 `tforms`）：2026-10-11 增强从 worker 的 numpy
+    侧迁到主循环的 GPU 侧（`_dihedral_batch_torch`），worker 于是必须把每行的
+    8 路对称变换编号一起带出来。`next()` 侧靠「长度 == 8 且 self.v7」与错误
+    payload（仍是 7 元组）区分，见 `_BatchPrefetcher.next`。
+    """
     m = _module()
     ds = make_dataset(n_games=2, game_len=32, seed=31)
     ds.attach_futurepos(source=None, mode='live')
@@ -1268,13 +1274,16 @@ def test_prefetch_worker_v7_payload_shape():
     task_q.put((0, 0, idxs))
     task_q.put(None)
     m._prefetch_worker(0, task_q, res_q, 1234, ds, labels=False, v7=True)
-    step, pos, sp, gl, mv, lbl, err = res_q.get_nowait()
+    step, pos, sp, gl, mv, lbl, err, tf = res_q.get_nowait()
     assert err is None, err
     assert (step, pos) == (0, 0)
     assert sp.shape == (6, V7_SPATIAL_CHANNELS, BOARD, BOARD)
     assert gl.shape == (6, V7_GLOBAL_CHANNELS)
     assert sp.dtype == np.float16 and gl.dtype == np.float16
     assert mv.shape == (6,) and lbl['future'].shape == (6, 2, BOARD * BOARD)
+    # tforms：每行一个 0..7 的变换编号，供 GPU 端复刻同一套对称增强。
+    assert np.asarray(tf).shape == (6,), tf
+    assert np.asarray(tf).min() >= 0 and np.asarray(tf).max() <= 7, tf
     ds._fp = None
 
 
@@ -1318,10 +1327,16 @@ def test_prefetch_worker_reports_errors_instead_of_dying():
     assert isinstance(err, RuntimeError) and 'boom' in str(err)
 
 
-def test_prefetcher_next_returns_v7_quadruple(tmp_path):
-    """`_BatchPrefetcher(v7=True).next()` 返回 `(spatial, gl, moves, labels)`。
+def test_prefetcher_next_returns_v7_quintuple(tmp_path):
+    """`_BatchPrefetcher(v7=True).next()` 返回 `(spatial, gl, moves, labels, tforms)`。
 
-     这里用 `prefetch-workers=1` 之外的方式构造（`_StubMP`）不可行 —— payload
+    ⚠ **5 元组**，不是 4 元组：2026-10-11 增强从 worker 的 numpy 侧迁到主循环的
+    GPU 侧（`_dihedral_batch_torch`），所以 `next()` 必须把每行的 8 路对称变换
+    编号（`tforms`）交给主循环去施加。这条用例同时钉住「tforms 真的被带出来了」
+    —— 少带一个，增益就会静默退化成恒等变换，而训练照跑、指标只是略差，
+    不会有任何报错。
+
+    这里用 `prefetch-workers=1` 之外的方式构造（`_StubMP`）不可行 —— payload
     的拼接逻辑必须真跑，所以这里起**真进程**（默认 start method，Windows 上
     就是 spawn）。数据只有 16 行，进程启动的固定开销可以接受。
     """
@@ -1331,7 +1346,7 @@ def test_prefetcher_next_returns_v7_quadruple(tmp_path):
     pf = m._BatchPrefetcher(ds, num_workers=2, prefetch=1, labels=False, v7=True)
     try:
         pf.submit(np.arange(8))
-        sp, gl, mv, lbl = pf.next(device=None)
+        sp, gl, mv, lbl, tf = pf.next(device=None)
         assert sp.shape == (8, V7_SPATIAL_CHANNELS, BOARD, BOARD)
         assert gl.shape == (8, V7_GLOBAL_CHANNELS)
         assert mv.shape == (8,)
@@ -1341,6 +1356,9 @@ def test_prefetcher_next_returns_v7_quadruple(tmp_path):
         # dataset 侧的键名是 `future`；`futurepos` 是翻译层（`v7_loss_labels`）
         # 才补上的别名 —— 预取器只搬运，不做翻译。
         assert lbl['future'].shape == (8, 2, BOARD * BOARD)
+        # 第 5 项：tforms，与行数一一对应、取值域 0..7（8 路对称变换）。
+        assert np.asarray(tf).shape == (8,), tf
+        assert np.asarray(tf).min() >= 0 and np.asarray(tf).max() <= 7, tf
     finally:
         for p in pf._processes:
             p.terminate()

@@ -61,12 +61,26 @@ DEVICE_GB = 32.0           # 单卡 HBM 预算（目标卡 HBM；910A=32 / A100=
 SAFE_FRAC = 0.90           # 留 10% 余量给碎片/workspace
 SAFE_GB = DEVICE_GB * SAFE_FRAC
 
-# 已实测的锚点（4 卡 910A，batch 2800/卡，attn-window 5，探针自包检查点）
-# ⚠ 2026-10-11：主干 GC 已整体删除，训练侧**不再**检查点 ⇒ 本锚点标定出的
-#   act_gb/total_gb/fits 对**现役训练**系统性低估。本次刻意不重标定（无硬件，
-#   改锚点等于编数据）；下面的自洽性断言仍过只是因为探针口径自洽 ≠ 准确。
+# 已实测的锚点（4 卡 910A，batch 2800/卡，attn-window 5，**探针自包检查点**）
+#
+# ⚠⚠ 这个锚点与现役训练**不同 regime**，绝对值不可直接用于选 batch
+# ---------------------------------------------------------------------------
+# 锚点测于 2026-09 前后，当时**主干带梯度检查点**。2026-10-11 GC 子系统整体删除，
+# 训练侧不再有任何检查点 ⇒ 激活全驻留，真实占用**高于**本锚点描述的口径。
+# 而 `project()` 的 `fits` 是「合计显存 ≤ 安全线」的判定，方向是**低估** ⇒
+# 会把装不下的配置判成能装下。这是最危险的一种错法（自洽但不准）。
+#
+# 本次刻意**不重标定**：重标需要在无 GC 的真实训练上复测，而手头没有硬件，
+# 改锚点数字等于编数据。因此改为把这个 regime 差显式化并让工具**每次都喊**：
+#   · `ANCHOR['regime']` 标出锚点属于哪种口径；
+#   · `REGIME_CAVEAT` 由 `project()` 一路带到每一行输出；
+#   · `tests/test_search_arch.py::test_anchor_regime_mismatch_is_announced`
+#     钉住「不得静默」。
+# 要恢复本工具的实用性：在无 GC 的真实训练上重测锚点并把 regime 改成
+# `no-checkpoint`，同时重新标定 `calib_factor()`（它同样是在旧 regime 下测的）。
 ANCHOR = {
     'name': 'v18',
+    'regime': 'checkpoint',          # 键点口径的标签，见上方警告
     'mem_gb': 31.12,
     'step_s': 4.25,
     'samples_per_s': 2635,
@@ -298,11 +312,18 @@ def project(cfg, batch, anchor=ANCHOR, in_channels=12):
     step = anchor['step_s'] * ratio
     sps = batch * 4 / step
     return dict(params=n, flops=f, act_gb=act, total_gb=total,
-                step_s=step, samples_per_s=sps, fits=total <= SAFE_GB)
+                step_s=step, samples_per_s=sps, fits=total <= SAFE_GB,
+                regime=anchor.get('regime', 'unknown'))
 
 
 def calibrate(verbose=True):
-    """用实测锚点验证外推模型是否可信。"""
+    """用实测锚点验证外推模型是否可信。
+
+    ⚠ 这只能证明**锚点自身**往返自洽（口径内 k≈1），**不能**证明它对现役训练
+    准确 —— 锚点 regime 与训练 regime 已分叉（见 ANCHOR 上方）。所以这里也把
+    regime 差一起喊出来，免得 `--calibrate` 跑出 `相对误差 0.0%` 被当成「工具可信」。
+    """
+    _announce_regime()
     n, _, ret = measure(ANCHOR['cfg'])
     act = act_gb(ret, 2800)
     raw = act + overhead_gb(n)
@@ -310,8 +331,8 @@ def calibrate(verbose=True):
     scaled = raw * k
     err = (scaled - ANCHOR['mem_gb']) / ANCHOR['mem_gb']
     if verbose:
-        print('=== 校准核对（锚点 {} 4卡 910A B=2800 实测 {:.2f}GB）==='.format(
-            ANCHOR['name'], ANCHOR['mem_gb']))
+        print('=== 校准核对（锚点 {} / regime={} / 4卡 910A B=2800 实测 {:.2f}GB）==='.format(
+            ANCHOR['name'], ANCHOR['regime'], ANCHOR['mem_gb']))
         print('  原始估算 {:.2f}GB（高估 {:.0%}，因 checkpoint 重算临时量'
               '被按同时存活计）'.format(raw, raw / ANCHOR['mem_gb'] - 1))
         print('  标定因子 {:.4f} -> {:.2f}GB，相对误差 {:.1%}'.format(
@@ -319,6 +340,24 @@ def calibrate(verbose=True):
         print('  相对排序可信（高估方向对所有配置一致）；绝对值仅靠单点锚点，'
               '换硬件/配置需重标')
     return err
+
+
+#: 训练侧当前的检查点口径。主干 2026-10-11 起**不做**任何检查点。
+TRAINING_REGIME = 'no-checkpoint'
+
+#: regime 不一致时必须出现在每一行输出里的提醒。空串 = 口径一致，无需提醒。
+REGIME_CAVEAT = '' if ANCHOR['regime'] == TRAINING_REGIME else (
+    '⚠ 显存判定按「{}」锚点外推，而训练是「{}」口径 ⇒ 合计显存与 fits 会**低估**'
+    '，不可直接用于定 batch。{}'.format(
+        ANCHOR['regime'], TRAINING_REGIME,
+        'GC 已删除（2026-10-11），需在无检查点的真实训练上重标。'))
+
+
+def _announce_regime():
+    """有 regime 差就无条件打一行。**刻意不设「只打一次」开关** ——
+    输出会被人连着看几十行，只在开头喊等于没喊。"""
+    if REGIME_CAVEAT:
+        print(REGIME_CAVEAT)
 
 
 def fmt_row(name, r, note=''):
@@ -383,6 +422,7 @@ def preset_in_channels(key):
 
 
 def run_preset(batch=None, key='all'):
+    _announce_regime()
     print(HEADER)
     print(SEP)
     rows = []
@@ -416,6 +456,7 @@ def run_sweep(keys, base=None, batch=2800, extra=None):
         'policy_layers': [2, 3],
     }
     base_r = project(base, batch)
+    _announce_regime()
     print(HEADER)
     print(SEP)
     print(fmt_row('基准', base_r, 'batch={}'.format(batch)))
@@ -449,6 +490,7 @@ def run_grid(batch=2800):
     base = {**ANCHOR['cfg'], 'attention_mode': 'mix',
             'res_blocks': 0, 'convnext_blocks': 0, 'attn_blocks': 0}
     results = []
+    _announce_regime()
     print(HEADER)
     print(SEP)
     for combo in itertools.product(*(axes[k] for k in keys)):
@@ -489,6 +531,7 @@ def run_speed_curve(batch_list=None):
     准确率无法在此测量，所以只呈现速度-显存侧的可行域；通道数是准确率风险
     最主要的来源（V12 用 192ch 拿到 top1≈50%），故把通道数单列为横轴。
     """
+    _announce_regime()
     print('通道数敏感度：每个通道数在显存预算内能装下的最大 batch 与对应吞吐')
     print(SEP)
     print('{:<12}{:>10}{:>10}{:>11}{:>10}{:>10}{:>9}'.format(

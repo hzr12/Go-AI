@@ -394,14 +394,24 @@ def test_matmul_weight_layout_survives_roundtrip(desc, sd, tmp_path):
 def test_gau_checkpoint_rejected_with_clear_error():
     """GAU 块无法保真映射到 KataGo 的层 schema，导出必须**显式**报错，而不是
     抛含糊的「缺少张量」。这条锁定 `katago_export._build_trunk` 的 GAU 守卫。
+
+    ⚠ 2026-10-11 改法：原来靠 `NbtTfNet(cfg={'gau_positions': [0], ...})`
+    **造**一份含 GAU 的权重，但 GAU 改版已随 `3dd1b6a` 从网络里删除 ⇒ 那个 cfg
+    不再产生任何 `.gau.` 键，守卫永远不触发，用例失去被测对象（却不报错 ——
+    这正是它当时没被发现的���因）。
+
+    守卫真正要防的输入是**旧 checkpoint**（GAU 时代存下来的），而那本来就不需要
+    网络还能重建：直接往现役 state_dict 里注入一个 GAU 键即可。这样测的正是
+    「拿到带 GAU 的旧权重时会怎样」，与被测行为更贴近，且不依赖网络继续支持 GAU。
     """
-    from src.networks.katago_v7 import NbtTfNet
-    net = NbtTfNet(cfg={'attn_impl': 'nbt', 'gau_positions': [0],
-                        'gau_first_nbt': 0, 'gau_last_nbt': 0})
+    from src.networks.katago_v7 import NbtTfNet, NBT_TF_CFG
+    net = NbtTfNet()
     net.initialize()
-    sd_gau = {k: v.detach().clone() for k, v in net.state_dict().items()}
+    sd = {k: v.detach().clone() for k, v in net.state_dict().items()}
+    # 注入一个形状自洽的 GAU 权重，模拟 GAU 时代的 checkpoint
+    sd['blocks.0.gau.qkv.weight'] = torch.zeros(8, 8)
     with pytest.raises(kx.ExportError, match='GAU'):
-        kx.build_model_desc(sd_gau, dict(NBT_TF_CFG))
+        kx.build_model_desc(sd, dict(NBT_TF_CFG))
 
 
 def test_missing_tensor_raises_export_error(sd, tmp_path):

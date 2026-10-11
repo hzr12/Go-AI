@@ -187,12 +187,25 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 #   是实测甜点；micro 1024 × accum 2 同有效 2048 却更慢（~1000+ s/s）—— 故统一回 512×4。
 #   ⚠ **micro 2048 × accum 1 是悬崖**：同有效 2048 暴跌到 ~550 s/s，永远别用。
 #   要加有效 batch 就加 accum（micro 别过 1024）。
+#   🔴 **这三条结论含梯度检查点语义，已随 GC 删除（2026-10-11）失效、需重测** ——
+#     详见下面「LR 公式」之后的红字段。
 #   仓库里 `v7_batch_memory_advice` 的每样本 MB（4.65/12.67/277）是 910A/NPU 口径、
 #   对 A100 不可信，只当量级参考。**定档后把下面 B/C 的 `--batch-size` /
 #   `--gradient-accumulation-steps` 与 LR 一起改掉**（LR 必须跟着有效 batch 走）。
 # ⚠ LR = 0.00356 × √(有效batch / 2500)，有效batch = batch × 卡数 × accum。
 #   单卡 ⇒ 卡数 = 1。有效 2048 → 0.00322；batch 2800 → 0.00377；batch 1400 → 0.00267；
 #   batch 5600 → 0.00533。**换了有效 batch 一定要按公式重算 LR**，别沿用旧值。
+#
+# 🔴🔴 **上面那组 s/s 数字全部作废，需要重测**（2026-10-11 梯度检查点已整体删除）
+#   GC 只影响显存、不影响前向数值，所以**收敛**结论不受影响；但它直接决定「同样的
+#   batch 装不装得下」⇒ 关掉 GC 后激活全驻留，同样的 micro 可能直接 OOM，或必须
+#   降 micro / 加 accum 才能跑。这直接影响上面「512×4 是甜点、1024×2 更慢、
+#   2048×1 是悬崖」这三条结论 —— 它们测的是**吞吐**，而吞吐又依赖能不能装下。
+#   ⇒ **重测方法**：对每个候选 micro×accum 组合先看 `mem=` 是否贴顶/是否 OOM，
+#     再看 spd；两档都记。别只看 spd 就下结论（装不下的组合 spd 没意义）。
+#   ⇒ `v7_batch_memory_advice` 已改成**无检查点**口径的估算，可先拿它筛掉明显
+#     装不下的组合，但它的每样本 MB 常数仍来自 910A，当量级参考、不能当判据。
+#   ⇒ 在此重测完成前，A/B/C 三段的 micro/accum 属于**未经 GC 变化后验证**的配置。
 # ⚠ `--compile-mode` 2026-10-11 本机实测结论（Ampere+）：
 #   - 脚本默认已从 `max-autotune-no-cudagraphs` 改成 **`reduce-overhead`**（L4004）：
 #     原默认档在本机曾报 `CUDA error: misaligned address`——疑似刚启用的
@@ -252,6 +265,7 @@ python scripts/train_sft.py \
 # ⚠ C 段**不要** `--games-npz`（贴目已在行里）、也**不需要** `--soft-index`
 #   （stdata 每行自带 policy_player_prob/policy_opp_prob，归一化即软标签）。
 # ⚠ batch 与 LR 同 A 段：**512×4（有效 2048，LR 0.00320）**，实测甜点，与 A 一致。
+#   🔴 「实测甜点」同样含 GC 语义，已失效待重测（见 A 段红字段）。
 python scripts/train_sft.py \
   --data data/stdata --v7 1 --device cuda --board-size 19 \
   --model models/b_v7_a100.pth.latest \

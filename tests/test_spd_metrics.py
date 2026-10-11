@@ -80,9 +80,14 @@ def _single_assign(stmt):
 
 
 def test_spd_uses_effective_batch():
-    """spd 必须乘 world_size（有效 batch），而不是每卡 bs。"""
-    assert '_eff_bs = bs * max(1, world_size)' in SRC, \
-        '缺少有效 batch 计算 _eff_bs = bs * world_size'
+    """spd 必须乘**有效 batch**（每卡 bs × 梯度累积），而不是每卡 bs。
+
+    ⚠ 2026-10-11：`world_size` 已随 DDP 多卡支持整体删除（单卡恒为 1，
+    乘它与不乘等价），所以有效 batch 现在是 `bs * accum`。原来这里找的是
+    `_eff_bs = bs * max(1, world_size)`，那个表达式已不存在。
+    """
+    assert re.search(r'_eff_bs = bs \* max\(1, _accum_steps\)', SRC), \
+        '缺少有效 batch 计算 _eff_bs = bs * max(1, _accum_steps)'
     assert re.search(r'speed = \(step - _step_at_start\) \* _eff_bs', SRC), \
         'spd 未使用本进程步数与有效 batch'
 

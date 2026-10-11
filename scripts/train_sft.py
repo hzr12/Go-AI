@@ -2359,9 +2359,12 @@ class _BatchPrefetcher:
         `labels=True` → 上面三项 + `labels_dict`（同 device 的张量 dict，
         含嵌套 `w`）。`device=None` 时 dict 里的张量留在 CPU。
 
-        `v7=True` → ``(spatial_np, gl_np, moves_np, labels_dict)``：
+        `v7=True` → ``(spatial_np, gl_np, moves_np, labels_dict, tforms)``：
         第 1/2 项是 22 通道与 19 维的 V7 输入，**取代** `states` / `values`
         （`moves` / `labels_dict` 的口径与上面两条路完全一致，见 `_prefetch_worker`）。
+        第 5 项 `tforms` 是每行的 8 路对称变换编号，供主循环用
+        `_dihedral_batch_torch` 在 **GPU 上**施加增强（2026-10-11 起增强从
+        worker 的 numpy 侧迁到这里 ⇒ 返回值从 4 元组变 5 元组）。
         `labels` 被强制视为 True —— V7 的 loss 需要 `labels_dict`，没有它算不出
         任何一项。
         """
@@ -2528,7 +2531,11 @@ def _init_swanlab(args, logger):
                 # ---- batch/lr：有效 batch 含累积（漏乘会把学习率口径搞错）----
                 "batch_size_per_card": args.batch_size,
                 "grad_accum": _accum,
-                "world_size": 1,
+                # 冻结常量：DDP 多卡支持已于 2026-10-11 整体删除，单卡恒为 1。
+                    # 保留这个键是为了不破坏 SwanLab 面板的 schema（历史 run 的
+                    # config 里都有它，删掉会导致跨 run 对比缺列）—— 但它**不再
+                    # 是被测量出来的**，只是恒为 1。恢复多卡时必须改成真值。
+                    "world_size": 1,
                 "effective_batch": args.batch_size * _accum,
                 "lr": args.lr,
                 "epochs": args.epochs,
