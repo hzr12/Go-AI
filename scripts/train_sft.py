@@ -3995,13 +3995,16 @@ def main():
             # unfold 巨型中间张量会触发 inductor freezing 以 fp32 物化 (B,N,Hh,ws²,d)
             # 导致编译期 OOM（batch512 下单个 4.3GB），必须排除出编译图
             compile_disable_sparse = True
-            # A100 默认把 compile 档提到 `max-autotune-no-cudagraphs`：autotune 的
-            # 融合/调度收益、不背 CUDA Graphs 的显存（40G 卡长跑 OOM，见
-            # --compile-mode 帮助与 4793 附近注释）。仅当用户**未显式**指定
-            # --compile-mode（默认 None）时覆盖；显式给 'default' / 'reduce-overhead'
+            # A100/Ampere+ 默认 compile 档改为 `reduce-overhead`：带 CUDA Graphs，
+            # 消除 kernel launch 开销、常比 no-cudagraphs 再快 10~30%；2026-10-11 本机
+            # 实测可跑（原默认 `max-autotune-no-cudagraphs` 曾报 misaligned address，
+            # 疑 inductor bug / FX 图缓存脏图，见 run.txt）。唯一顾虑是 CUDA Graphs
+            # 私有内存池不归还、长跑显存爬升，盯 `memory_gb`；顶满 OOM 就显式给
+            # `--compile-mode default`。仅当用户**未显式**指定 --compile-mode（默认
+            # None）时覆盖；显式给 'default' / 'max-autotune' / 'max-autotune-no-cudagraphs'
             # 等一律尊重用户意图。非 Ampere+ 分支不动（留给 torch.compile 默认档）。
             if args.compile_mode is None:
-                args.compile_mode = 'max-autotune-no-cudagraphs'
+                args.compile_mode = 'reduce-overhead'
             logger.info("[device] %s (sm_%d%d) | 启用 A100 路径: BF16 + FlashAttn(优先,回退SDPA) + "
                         "channels_last + compile(卷积/线性/FFN, mode=%s)",
                         gpu_name, *compute_cap, args.compile_mode)

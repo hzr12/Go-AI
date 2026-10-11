@@ -15,6 +15,10 @@
 # ---------- 0. 环境 ----------
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 # ⚠ 每次运行前都要设。不设时预取/xdist worker 抢核，实测慢 4~6 倍。
+# inductor 图缓存：`train_sft.py` 已在 import torch 前用 `os.environ` 设
+# `TORCHINDUCTOR_FX_GRAPH_CACHE=1`（免去每次重启重跑 max-autotune 编译），**仅
+# torch>=2.2 真生效**；云端若仍是 2.1.0 则白设（代码仍会 warning「需 >=2.2」），需升级
+# torch 才省编译时间。要手动显式设就在这行加：`export TORCHINDUCTOR_FX_GRAPH_CACHE=1`。
 pip install -r requirements.txt
 pip install scipy          # ⚠ requirements.txt 漏了，但 src/data/feature_v7.py 直接 import 它
 pip install onnx onnxruntime
@@ -42,10 +46,14 @@ pip install onnx onnxruntime
 #     与整模型 `torch.compile` 兼容；且 V7 的 head 原来返回 dict、穿不过 checkpoint
 #     的问题已修（`katago_v7._ckpt`，回归测试
 #     `tests/test_katago_v7_grad_checkpointing.py::test_grad_checkpoint_survives_aot_autograd`）。
-#     私有内存池不归还 ⇒ 40G 卡上长跑容易吃满显存。要自动调优就用
-#     `--compile-mode max-autotune-no-cudagraphs`（新选项）。
+#     私有内存池不归还 ⇒ 40G 卡上长跑容易吃满显存。要自动调优就用带 autotune 的档
+#     （`--compile-mode`，2026-10-11 起本机实测推荐 `reduce-overhead`；见下方说明）。
 #   ⚠ flash-attn 需 `pip install flash-attn`；加载失败**自动回退内置 SDPA**，
 #     只少速度不会崩。`--flash-attn 0` 可强制禁用。启动日志看 `[env]` 那行。
+#   ✅ 8 路对称增强已迁 GPU：训练侧 dihedral 增强走 `_dihedral_batch_torch`
+#     （`train_sft.py` L2274），在 GPU 上施加并与前后向重叠（prefetch worker 只递
+#     raw spatial + tforms），不再占 CPU。与 eval 的 `augment=False`（指标逐位不变）
+#     不冲突；增强只在训练侧发生（见 `tests/test_eval_no_augment.py`）。
 #   ⚠ 「设备初始化之前」这条不变量：A100 首次启动时崩过一次
 #     `RuntimeError: _BatchPrefetcher 不能在 torch.cuda 初始化之后构造`。
 #     报错指的位置**不是真正原因** —— 预取器一直就在 `set_device` 之前，
@@ -149,17 +157,22 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 # ⚠ `--attn-online` **默认不给**：online-softmax 注意力数值等价但**非逐位相同**
 #   （fp32 max|Δ|≈7e-07），开了会让 12 通道 bit-identical 基线失效；真机加速比未实测。
 #   且它只作用于**手写 math 路径** —— A100 上注意力走融合内核，给了也不生效。
-# ⚙️ **调优开关一律是 CLI 参数，没有环境变量**（2026-10-06 全部搬完；`GOAI_PROFILE`
-#   与 `GOAI_PROFILE_STEPS` 是仅有的例外——两个都是诊断开关、与训练配置无关，语义是
-#   「从第 N 步抓 M 步 kernel 表」，M 默认 50；`M=0` = 起点即终点，在起点后的**第一个**
+# ⚙️ **调优开关一律是 CLI 参数，没有环境变量**（2026-10-06 全部搬完）。仅有的例外：
+#   `GOAI_PROFILE` / `GOAI_PROFILE_STEPS`（诊断开关，语义见下）**与**
+#   `TORCHINDUCTOR_FX_GRAPH_CACHE`（inductor 图缓存：2026-10-11 起由代码在 import torch
+#   前用 `os.environ` 设 `1`，非 CLI；**仅 torch>=2.2 真生效**，<2.2 白设——升级 torch
+#   才免去每次重启的 max-autotune 重编译）。两个 `GOAI_*` 都是诊断开关、与训练配置无关，
+#   语义是「从第 N 步抓 M 步 kernel 表」，M 默认 50；`M=0` = 起点即终点，在起点后的**第一个**
 #   打点步就出表 ⇒ 配 `--log-every 5` 用 `GOAI_PROFILE=5 GOAI_PROFILE_STEPS=0`
-#   即「第 5 步出表」，不必等满 50 步）。总闸都是
+#   即「第 5 步出表」，不必等满 50 步。总闸都是
 #   **只慢不坏**（数值口径不变），出问题置 0 即回到已验证配置。
 #   **A100/SFT 上有意义的全部开关**（2026-10-08：NPU 后端下线，原来那批 `--npu-*`
 #   旗与 TorchAir 路径已一并删除）：
 #     --flash-attn 1|0      融合注意力独立库（默认 1=自动优先；加载失败回退内置 SDPA）
 #     --compile 1|0         inductor 算子融合（**不给=按设备自动**，A100 上自动 1）
-#     --compile-mode ...    见第 0 节；A100 上别用带 CUDA Graphs 的两个值
+#     --compile-mode ...    见下方「⚠ --compile-mode 实测结论」；2026-10-11 本机推荐
+#                          `reduce-overhead`（带 CUDA Graphs，已实测可跑且常更快）；
+#                          带 CUDA Graphs 的档仍需注意私有内存池不归还、长跑吃显存
 #     --gc-with-compile 1|0 compile 与梯度检查点共存（默认 0；**SFT 建议给 1**）
 #     --use-sdpa 1|0        0 = 强制回退手写 math（默认 1）
 #     --use-checkpoint      **已归档**，别传（见下）
@@ -194,9 +207,19 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 #   batch 5600 → 0.00533。**换了 batch 一定要按公式重算 LR**，别沿用旧值。
 # ⚠ `--gc-with-compile 1` 必给（见第 0 节）：否则开 compile 就强制关 GC，
 #   40G 卡上 batch 被迫调小到吃不满算力。
-# ⚠ `--compile-mode` 保持默认 `default`。想再要一档自动调效用
-#   `max-autotune-no-cudagraphs`；**别用** `max-autotune` / `reduce-overhead`
-#   （带 CUDA Graphs，私有内存池不归还，长跑吃显存）。
+# ⚠ `--compile-mode` 2026-10-11 本机实测结论（Ampere+）：
+#   - 脚本默认已从 `max-autotune-no-cudagraphs` 改成 **`reduce-overhead`**（L4004）：
+#     原默认档在本机曾报 `CUDA error: misaligned address`——疑似刚启用的
+#     `TORCHINDUCTOR_FX_GRAPH_CACHE=1` 缓存到坏图，或该 mode 的 inductor bug；先
+#     `rm -rf ~/.cache/torch/inductor` 清缓存重测原默认档，仍崩即属后者。
+#   - `reduce-overhead` **实测可跑**，且带 CUDA Graphs（消除 kernel launch 开销，常比
+#     no-cudagraphs 再快 10~30%）。**当前默认即它，无需显式传**。
+#   - 唯一顾虑：CUDA Graphs 私有内存池不归还，长跑 `memory_gb` 会爬升；盯 `memory_gb`，
+#     顶到 OOM 就显式 `--compile-mode default`（注意：别退回 `max-autotune-no-cudagraphs`，
+#     本机会崩）。
+#   - 也可试 `max-autotune`（同样带 Graphs + 全量 autotune），可能更顺也可能同样崩。
+#   ⚠ 用 `reduce-overhead`/`max-autotune` 配 FX 图缓存时，换 mode / torch 版本前先
+#     `rm -rf ~/.cache/torch/inductor`，避免复用错档的缓存图。
 python scripts/train_sft.py \
   --data data/sgf_19x19_full.npz --v7 1 --device cuda --board-size 19 \
   --games-npz data/labels/games.npz \
