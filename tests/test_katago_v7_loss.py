@@ -175,7 +175,7 @@ def test_weighted_equals_coeff_times_terms(lossf):
         assert res['weighted'][k] == pytest.approx(
             float(LOSS_COEFFS[k] * v), rel=1e-6), f'{k} 的系数不是 {LOSS_COEFFS[k]}'
     assert res['loss'] == pytest.approx(
-        sum(float(v) for v in res['weighted'].values()), rel=1e-6)
+        sum(float(v.detach()) for v in res['weighted'].values()), rel=1e-6)
 
 
 def test_all_twelve_terms_present(lossf):
@@ -383,7 +383,7 @@ def test_zero_coeff_terms_stay_in_graph_with_zero_grad():
         if k == 'var_time_left':
             continue
         assert k in res['weighted'], f'{k} 项消失了（装配循环必须全覆盖）'
-        assert float(res['weighted'][k]) == 0.0, f'{k} 的加权值非 0'
+        assert float(res['weighted'][k].detach()) == 0.0, f'{k} 的加权值非 0'
     for k in _STAGE1_ZERO:
         if k == 'var_time_left':
             continue
