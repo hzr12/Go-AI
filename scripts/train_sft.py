@@ -4544,13 +4544,6 @@ def main():
                 _dynamo_mod = importlib.import_module('torch._dynamo')
                 _dynamo_mod.config.cache_size_limit = max(
                     256, _dynamo_mod.config.cache_size_limit)
-                # suppress checkpoint + compile incompatibility noise:
-                # `use_reentrant=False` 的 checkpoint 在 Dynamo trace 时会 fallback
-                # 到 eager 并打印 specnlate_subgraph / HigherOrderOperator warnings，
-                # 不影响正确性也不影响其他算子的融合。GC 默认关，只有手动开时才触发。
-                import logging as _logmod
-                _logmod.getLogger('torch._dynamo.variables.higher_order_ops').setLevel(
-                    _logmod.ERROR)
             except Exception:  # noqa: BLE001
                 pass
             # ---- Inductor：编译缓存 + graph break 检查 ----

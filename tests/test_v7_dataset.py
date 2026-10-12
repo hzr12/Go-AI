@@ -460,7 +460,7 @@ def test_w_of_really_does_default_to_ones():
     def ownership_term(w):
         # forward 返回 {'loss', 'terms', 'weighted', ...}，逐项在 ['terms'] 里
         lbl = {**base, 'w': w}
-        return float(lossf(out, lbl)['terms']['ownership'])
+        return float(lossf(out, lbl)['terms']['ownership'].detach())
 
     w1 = np.ones(3, dtype=np.float32)
     w0 = np.zeros(3, dtype=np.float32)

@@ -159,12 +159,12 @@ def test_w_scales_the_surrogate_only():
     w = torch.full((4,), 20.0)
     surr = torch.min(ratio * adv, ratio.clamp(0.8, 1.2) * adv)
     expect = -(w * surr).mean() - 0.01 * (logp_old - lp_a).mean()
-    assert float(loss_w) == pytest.approx(float(expect), rel=1e-5), \
-        f'loss={float(loss_w)} 期望 {float(expect)}（KL 被乘了 w？）'
+    assert float(loss_w.detach()) == pytest.approx(float(expect.detach()), rel=1e-5), \
+        f'loss={float(loss_w.detach())} 期望 {float(expect.detach())}（KL 被乘了 w？）'
 
     # 反例：若 KL 也乘 w，loss 会更负 —— 明确排除
     wrong = -(w * surr).mean() - 0.01 * (w * (logp_old - lp_a)).mean()
-    assert abs(float(loss_w) - float(wrong)) > 1e-4, 'KL 项与被乘 w 的版本不可区分'
+    assert abs(float(loss_w.detach()) - float(wrong.detach())) > 1e-4, 'KL 项与被乘 w 的版本不可区分'
 
 
 def test_no_logq_reproduces_the_pre_b2_loss_exactly():

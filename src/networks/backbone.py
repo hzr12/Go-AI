@@ -81,6 +81,13 @@ def checkpointed(fn, *tensors, modules=None, enabled=False):
     if not enabled:
         return fn(*tensors)
 
+    # GC + torch.compile 的组合在 PyTorch 2.x 下有 incompatibility：
+    # `use_reentrant=False` 的内部 `trampoline_autograd_fwd` 接受 tuple 参数，
+    # Dynamo 无法证明安全性，会 fallback 到 eager 并打印 speculate_subgraph /
+    # HigherOrderOperator warning。编译模式下跳过 GC（GC 默认关，零开销）；
+    # 非编译模式下正常走 checkpoint。
+    if torch._dynamo.is_compiling():
+        return fn(*tensors)
     if modules is None:
         return torch.utils.checkpoint.checkpoint(fn, *tensors,
                                                  use_reentrant=False)
