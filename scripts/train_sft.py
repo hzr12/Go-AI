@@ -4555,40 +4555,63 @@ def main():
                     logger.warning(
                         "[compile] fullgraph 探测发现 graph break（不影响训练，"
                         "已回退 fullgraph=False）:\n%s", e)
-            try:
-                # `backend` 不显式给：`torch.compile` 的默认 backend 就是 inductor，
-                # 写死反而会在需要临时切 eager/aot_eager 排查时多一处要改的地方。
-                #
-                # ⚠ `mode` 由 `--compile-mode` 给，**默认不是 `reduce-overhead`**。
-                #   `reduce-overhead` 会启用 **CUDA Graphs**：它把整段 kernel 录到一张
-                #   私有内存池里，**该池不归还给 allocator**。2026-10-08 的 A100 40G
-                #   实测 `mem=40.28GB` —— 卡只有 40GB，**已经没有余量**放 cudagraph
-                #   池，长跑必然 OOM（而且 OOM 点会漂移，极难复现）。
-                #   要自动调优就用 `max-autotune-no-cudagraphs`：拿到 autotune 的
-                #   收益、不背 CUDA Graphs 的显存。
-                #   另：训练循环里交错着 eval / 保存 / 梯度累积，控制流不是静态的，
-                #   cudagraph 的录制与重放对这点很敏感。
-                model = torch.compile(model, dynamic=False, mode=args.compile_mode)
-                # 预热前向必须与真实训练一致地包 autocast：flash-attn 只接受 fp16/bf16，
-                # FP32 输入直灌会报 "FlashAttention only support fp16 and bf16 data
-                # type"，导致 compile 被误判为不可用而回退 eager。
-                with torch.no_grad(), maybe_autocast(device, amp_dtype):
-                    # flash-attn 只接受 fp16/bf16，FP32 输入直灌会被误判为
-                    # compile 不可用而静默回退 eager；形状按 forward 签名分派
-                    # （同上，就地写而不是抽 helper）。
-                    if _v7_on:
-                        model(torch.zeros(1, V7_SPATIAL_CHANNELS, args.board_size,
-                                        args.board_size, device=device),
-                            torch.zeros(1, V7_GLOBAL_CHANNELS, device=device))
-                    else:
-                        model(torch.zeros(1, KATAGO_SE_CFG['in_channels'],
-                                        args.board_size, args.board_size,
-                                        device=device))
-                logger.info("[train] 已启用 torch.compile 算子融合")
-            except Exception as e:  # noqa: BLE001
-                # 真正回退 eager：剥离 OptimizedModule 包装，恢复原始模块引用
-                model = getattr(model, '_orig_mod', model)
-                logger.warning("[train] torch.compile 不可用，回退 eager: %s", e)
+            def _compile_probe(_m):
+                """预热：forward 两次 + backward 一次，跑通才算这档可用。
+
+                🔴 backward 与**两次 forward** 都不是多余的：CUDA Graphs 与梯度
+                累积的冲突只在 `fwd → fwd → bwd` 这个序列里暴露 —— 旧预热是
+                `torch.no_grad()` 的，永远碰不到它，于是 compile 看起来配好了、
+                却在训练循环第一个 backward 才炸（`accessing tensor output of
+                CUDAGraphs that has been overwritten by a subsequent run`）。
+                forward 必须与真实训练一致地包 autocast：flash-attn 只吃
+                fp16/bf16，FP32 直灌会报 "FlashAttention only support fp16 and
+                bf16 data type"，被误判成 compile 不可用而静默回退 eager。
+                """
+                if _v7_on:
+                    _x = (torch.zeros(1, V7_SPATIAL_CHANNELS, args.board_size,
+                                      args.board_size, device=device),
+                          torch.zeros(1, V7_GLOBAL_CHANNELS, device=device))
+                else:
+                    _x = (torch.zeros(1, KATAGO_SE_CFG['in_channels'],
+                                      args.board_size, args.board_size,
+                                      device=device),)
+                with maybe_autocast(device, amp_dtype):
+                    _m(*_x)
+                    out = _m(*_x)
+                if isinstance(out, dict):
+                    _probe_loss = sum(v.float().square().mean() for v in out.values())
+                else:  # 12-通路：forward 返回 (policy_logits, value_logit)
+                    _probe_loss = sum(v.float().square().mean() for v in out)
+                _probe_loss.backward()
+                _m.zero_grad(set_to_none=True)
+
+            # 档位序列：默认 `reduce-overhead`（带 CUDA Graphs）。它一旦在预热里
+            # 就撞上 cudagraph 冲突，**自动**退到不带 cudagraph 的档，而不是一路
+            # 退到 eager 把算子融合整个丢掉 —— 那比慢更糟。
+            _base_model = model
+            _modes = [args.compile_mode]
+            if args.compile_mode in ('reduce-overhead', 'max-autotune'):
+                _modes.append('max-autotune-no-cudagraphs')
+            _errs = []
+            for _mode in _modes:
+                try:
+                    # `backend` 不显式给：默认就是 inductor。写死反而会在需要
+                    # 临时切 eager/aot_eager 排查时多一处要改的地方。
+                    model = torch.compile(_base_model, dynamic=False, mode=_mode)
+                    args.compile_mode = _mode
+                    _compile_probe(model)
+                    logger.info("[train] 已启用 torch.compile 算子融合 | mode=%s",
+                                _mode)
+                    break
+                except Exception as e:  # noqa: BLE001
+                    _errs.append('%s: %s' % (_mode, e))
+                    logger.warning("[compile] mode=%s 预热失败: %s", _mode, e)
+            else:
+                # 所有档都不行：真正回退 eager
+                model = _base_model
+                args.compile_mode = None
+                logger.warning("[train] torch.compile 全部档位不可用，回退 eager: %s",
+                               ' | '.join(_errs))
         else:
             logger.info("[train] 当前 torch 版本不支持 torch.compile，跳过")
 
