@@ -87,7 +87,8 @@ def _soft_ce_ref(out, lbl, key, ch):
     """手工复算 `w_soft * (per_row * mask).mean()`，分母恒为 B。"""
     logp = F.log_softmax(out['policy_logits'].float(), dim=-1)
     per_row = -(lbl[key] * logp[:, ch]).sum(-1)
-    return POLICY_SOFT_WEIGHT * float((per_row * lbl['soft_mask']).mean())
+    return POLICY_SOFT_WEIGHT * float(
+        (per_row * lbl['soft_mask']).mean().detach())
 
 
 # --------------------------------------------------------------------------- #
@@ -96,7 +97,7 @@ def _soft_ce_ref(out, lbl, key, ch):
 def test_soft_policy_ce_matches_reference():
     """逐位对齐手工参考实现。"""
     out, lbl = _out(b=6), _labels(b=6)
-    got = float(KataGoV7Loss()(out, lbl)['terms']['policy'])
+    got = float(KataGoV7Loss()(out, lbl)['terms']['policy'].detach())
     assert got == pytest.approx(_soft_ce_ref(out, lbl, 'soft', 0), rel=1e-6)
 
 
@@ -106,9 +107,10 @@ def test_soft_ce_matches_the_12_channel_implementation():
     from train_sft import soft_cross_entropy
 
     out, lbl = _out(b=6), _labels(b=6)
-    got = float(KataGoV7Loss()(out, lbl)['terms']['policy'])
+    got = float(KataGoV7Loss()(out, lbl)['terms']['policy'].detach())
     ref = float(soft_cross_entropy(out['policy_logits'][:, 0], lbl['soft'],
-                                   lbl['soft_mask'], POLICY_SOFT_WEIGHT))
+                                   lbl['soft_mask'],
+                                   POLICY_SOFT_WEIGHT).detach())
     assert got == pytest.approx(ref, rel=1e-6)
 
 
@@ -119,11 +121,13 @@ def test_soft_ce_denominator_is_B_not_mask_sum():
     """
     out = _out(b=8)
     lbl = _labels(b=8, mask=[1., 1., 0., 0., 0., 0., 0., 0.])
-    got = float(KataGoV7Loss()(out, lbl)['terms']['policy'])
+    got = float(KataGoV7Loss()(out, lbl)['terms']['policy'].detach())
     assert got == pytest.approx(_soft_ce_ref(out, lbl, 'soft', 0), rel=1e-6)
     logp = F.log_softmax(out['policy_logits'].float(), dim=-1)
     per_row = -(lbl['soft'] * logp[:, 0]).sum(-1)
-    wrong = float((per_row * lbl['soft_mask']).sum() / lbl['soft_mask'].sum())
+    wrong = float(
+        (per_row * lbl['soft_mask']).sum().detach()
+        / lbl['soft_mask'].sum().detach())
     assert abs(got - wrong) > 0.1, '分母若被改成 mask.sum()，这条会失败'
 
 
@@ -139,14 +143,14 @@ def test_masked_rows_contribute_exactly_zero():
     out = _out(b=4)
     lbl = _labels(b=4, soft_opp=False)
     lbl['soft_mask'] = torch.tensor([1., 0., 0., 0.])
-    base = float(KataGoV7Loss()(out, lbl)['terms']['policy'])
+    base = float(KataGoV7Loss()(out, lbl)['terms']['policy'].detach())
 
     # 把被掩掉的 3 行的 soft 换成完全不同的分布
     lbl2 = dict(lbl)
     s2 = lbl['soft'].clone()
     s2[1:] = torch.roll(s2[1:], shifts=97, dims=-1)
     lbl2['soft'] = s2
-    got = float(KataGoV7Loss()(out, lbl2)['terms']['policy'])
+    got = float(KataGoV7Loss()(out, lbl2)['terms']['policy'].detach())
     assert got == pytest.approx(base, rel=1e-6), \
         '被 mask 掉的行参与了求和（应恰好贡献 0）'
 
@@ -155,7 +159,7 @@ def test_masked_rows_contribute_exactly_zero():
     s3[0] = torch.roll(s3[0], shifts=97, dims=-1)
     lbl3 = dict(lbl)
     lbl3['soft'] = s3
-    assert float(KataGoV7Loss()(out, lbl3)['terms']['policy']) != pytest.approx(
+    assert float(KataGoV7Loss()(out, lbl3)['terms']['policy'].detach()) != pytest.approx(
         base, rel=1e-6), '未掩码的那行本该影响结果'
 
 
@@ -177,12 +181,12 @@ def test_policy_and_policy_opp_use_different_targets():
     t = KataGoV7Loss()(out, lbl)['terms']
 
     # #1 读 soft @ 通道0
-    assert float(t['policy']) == pytest.approx(
+    assert float(t['policy'].detach()) == pytest.approx(
         _soft_ce_ref(out, lbl, 'soft', 0), rel=1e-6)
     # #2 读 soft_opp @ 通道1（而不是 soft @ 通道1）
-    assert float(t['policy_opp']) == pytest.approx(
+    assert float(t['policy_opp'].detach()) == pytest.approx(
         _soft_ce_ref(out, lbl, 'soft_opp', 1), rel=1e-6)
-    assert float(t['policy_opp']) != pytest.approx(
+    assert float(t['policy_opp'].detach()) != pytest.approx(
         _soft_ce_ref(out, lbl, 'soft', 1), rel=1e-6), \
         '#2 读的是 soft 而不是 soft_opp ⇒ π_opp 与 π 同源'
 
@@ -191,8 +195,8 @@ def test_opp_falls_back_to_onehot_when_soft_opp_absent():
     """`soft_opp` 缺席时 #2 退回 one-hot，而不是跟着 #1 走软 CE。"""
     out, lbl = _out(b=4), _labels(b=4, soft_opp=False)
     logp = F.log_softmax(out['policy_logits'].float(), dim=-1)
-    ref = float((-(lbl['policy_opp'] * logp[:, 1]).sum(-1)).mean())
-    got = float(KataGoV7Loss()(out, lbl)['terms']['policy_opp'])
+    ref = float((-(lbl['policy_opp'] * logp[:, 1]).sum(-1)).mean().detach())
+    got = float(KataGoV7Loss()(out, lbl)['terms']['policy_opp'].detach())
     assert got == pytest.approx(ref, rel=1e-6)
 
 
@@ -208,8 +212,8 @@ def test_all_zero_mask_falls_back_to_onehot():
     out = _out(b=4)
     lbl = _labels(b=4, mask=[0., 0., 0., 0.])
     logp = F.log_softmax(out['policy_logits'].float(), dim=-1)
-    ref = float((-(lbl['policy_player'] * logp[:, 0]).sum(-1)).mean())
-    got = float(KataGoV7Loss()(out, lbl)['terms']['policy'])
+    ref = float((-(lbl['policy_player'] * logp[:, 0]).sum(-1)).mean().detach())
+    got = float(KataGoV7Loss()(out, lbl)['terms']['policy'].detach())
     assert got == pytest.approx(ref, rel=1e-6)
     assert got != 0.0, 'all-zero mask 时 policy 不该是 0（否则 policy 无梯度）'
 
