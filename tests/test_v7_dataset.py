@@ -697,11 +697,13 @@ def test_open_heads_are_off_on_this_corpus_so_they_get_no_gradient():
     out = net(torch.from_numpy(spatial).float(), torch.from_numpy(gl).float())
     res = KataGoV7Loss()(out, ll)
     terms = res['terms']
-    assert float(terms['ownership']) == 0.0
-    assert float(terms['scoring']) == 0.0
-    assert float(terms['seki']) == 0.0
-    assert float(terms['lead']) == 0.0
-    assert float(terms['policy']) != 0.0, 'policy 必须有梯度贡献'
+    # terms 带 requires_grad，直接 `float()` 会触发 UserWarning（且截断梯度图）；
+    # 只看数值所以先 `.detach()`。
+    assert float(terms['ownership'].detach()) == 0.0
+    assert float(terms['scoring'].detach()) == 0.0
+    assert float(terms['seki'].detach()) == 0.0
+    assert float(terms['lead'].detach()) == 0.0
+    assert float(terms['policy'].detach()) != 0.0, 'policy 必须有梯度贡献'
 
 
 def test_repr_reports_the_rebuilt_state():
