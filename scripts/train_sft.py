@@ -216,19 +216,16 @@ KATAGO_SE_CFG = {
 
 
 def build_katago_se_net(*, action_size, attention_dropout=0.1,
-                        grad_checkpoint=False, **overrides):
+                        **overrides):
     """按 `KATAGO_SE_CFG` 建网；返回 `(model, cfg)`，`cfg` 是**实际生效**的取值。
 
     `overrides` 只用于行为参数（见调用点），结构键不接受覆盖 —— 与 D1 的
     「结构只由这一张表决定」一致。实测参数量与 `cfg` 一并返回，好让日志 /
     SwanLab config 面板里出现的数字与这张表对账（而不是各写一份）。
 
-    `grad_checkpoint` 同理是**行为**参数：回写进 `cfg` 一起返回，好让启动日志
-    与 SwanLab 面板能对账「这次到底开没开」。
     """
     c = dict(KATAGO_SE_CFG)
     c['attention_dropout'] = float(attention_dropout)
-    c['grad_checkpoint'] = bool(grad_checkpoint)
     model = AlphaGoNet(
         in_channels=c['in_channels'],
         backbone_channels=c['channels'],
@@ -243,7 +240,6 @@ def build_katago_se_net(*, action_size, attention_dropout=0.1,
         policy_layers=c['policy_layers'],
         action_size=int(action_size),
         arch=c['arch'],
-        grad_checkpoint=c['grad_checkpoint'],
     )
     return model, c
 
@@ -328,25 +324,23 @@ def build_v7_stage1_loss(action_size=V7_ACTION_SIZE, num_bins=None):
                         **kw)
 
 
-def build_katago_v7_net(*, board_size=V7_BOARD_SIZE,
-                        attn_dropout=None, grad_checkpoint=False):
+def build_katago_v7_net(*, board_size=V7_BOARD_SIZE, attn_dropout=None,
+                        **kw):
     """按 `NBT_TF_CFG` 建 V7 网（已跑 `initialize()`），返回 `(model, cfg)`。
 
-    `cfg` 是**实际生效**的取值（把 `attn_dropout` / `grad_checkpoint` 回写进去），
+    `cfg` 是**实际生效**的取值（把 `attn_dropout` 回写进去），
     好让启动日志里的参数量能与 `NBT_TF_CFG` 的预算锚对账 —— 与
     `build_katago_se_net` 的返回契约一致。
     """
     from src.networks.katago_v7 import build_katago_v7_net as _build
     from src.networks.katago_v7 import NBT_TF_CFG
-    kw = {}
     if attn_dropout is not None:
         kw['attn_dropout'] = float(attn_dropout)
     model = _build(board_size=int(board_size),
-                   grad_checkpoint=bool(grad_checkpoint), **kw)
+                   **kw)
     cfg = dict(NBT_TF_CFG)
     cfg['attn_dropout'] = float(
         attn_dropout if attn_dropout is not None else NBT_TF_CFG['attn_dropout'])
-    cfg['grad_checkpoint'] = bool(grad_checkpoint)
     return model, cfg
 
 
@@ -404,21 +398,13 @@ def v7_batch_memory_advice(args, logger, device, *, n_layers, heads, tokens,
     数据加载、模型构建、 初始化（实测几分钟），而且 OOM 报的是
     `OutOfMemoryError` 这种**看不出原因**的异常 —— 而原因其实只是一行乘法。
 
-    **口径随 `--grad-checkpoint` 变**：关的时候按「激活全驻留」估算每样本字节；
-    开的时候主干块的激活在反向时重算、**不驻留**，下面这个只按注意力矩阵算的
-    数字会**高估**占用 —— 那时它只能当上限看，不能当预算。
-
     只在能查到设备显存时启用。查不到（CPU / 无 GPU 信息）就只打印估算值，
     不拦 —— 本地冒烟不该被这个门控挡住。
     """
     attn_mb = (n_layers * heads * tokens * tokens * 2) / 1e6
     per_sample = attn_mb + V7_TRANSIENT_MB_PER_SAMPLE_FP16
-    if getattr(args, 'grad_checkpoint', 0):
-        basis = ('**GC 已开**：主干块激活不驻留（反向重算），此数只含注意力 '
-                 '驻留、会高估')
-    else:
-        basis = ('GC 关（无重算）：注意力 %d 层 × %.3f MB = %.1f MB/样本'
-                 % (n_layers, attn_mb, attn_mb))
+    basis = ('注意力 %d 层 × %.3f MB = %.1f MB/样本'
+             % (n_layers, attn_mb, attn_mb))
     attn = per_sample * args.batch_size * 1e6
     total = _device_total_bytes(device)
     logger.info("[mem] V7 显存：%d 层 × %d 头 × %d² token | %s"
@@ -2668,9 +2654,7 @@ def _init_swanlab(args, logger):
                 "soft_only_sampling": bool(args.soft_only_sampling),
                 "soft_every": args.soft_every,
                 "attention_dropout": args.attention_dropout,
-                # 行为开关，进面板是为了「跨 run 对比时能分组」：两个 run 显存曲线
-                # 不同，第一嫌疑就是它。数值上开/关逐位一致（见 --grad-checkpoint help）。
-                "grad_checkpoint": bool(args.grad_checkpoint),
+                # 行为开关，进面板是为了「跨 run 对比时能分组」。
                 "ema_enabled": bool(args.use_ema),
                 "ema_decay": 0.999,
                 # ---- AMP：旧多卡环境 无 BF16，FP16 必须配 GradScaler ----
@@ -3687,14 +3671,6 @@ def main():
                         '点名的「混合训练 ⇒ index 0 向两种语义折中」，只在'
                         '明确知道后果时才用。必须 >= 1')
 
-    ap.add_argument('--grad-checkpoint', type=int, default=0, choices=[0, 1],
-                    help='梯度检查点（block 级重算）：反向时丢弃主干块的激活、'
-                         '用到时重算前向，换取显存、代价约多一次主干前向。'
-                         '**默认 0（关）** —— 40GB 卡上现有 batch 一般不需要；'
-                         'OOM 时把它开到 1，比硬砍 batch 更划算（批越小梯度噪声越大）。'
-                         '**逐位中性**：开/关前向与反向结果完全一致（BN 运行统计'
-                         '也被保护，不会被重算双累加），且与 --compile 共存不 graph break。'
-                         '0=关闭（默认） 1=开启')
     ap.add_argument('--use-ema', type=int, default=0, choices=[0, 1],
                     help='启用 EMA（指数移动平均）权重，eval/save 时用 shadow 权重，提升 1-3%% accuracy (0=关闭, 1=开启)')
     ap.add_argument('--gradient-accumulation-steps', type=int, default=1,
@@ -4279,7 +4255,6 @@ def main():
         model, _eff_cfg = build_katago_v7_net(
             board_size=V7_BOARD_SIZE,
             attn_dropout=args.attention_dropout,
-            grad_checkpoint=bool(args.grad_checkpoint),
         )
         _v7_lossf = build_v7_stage1_loss(
             action_size=args.board_size * args.board_size + 1).to(device)
@@ -4295,7 +4270,6 @@ def main():
         model, _eff_cfg = build_katago_se_net(
             action_size=args.board_size * args.board_size + 1,  # +1 为 pass 类别
             attention_dropout=args.attention_dropout,           # 行为参数，仍生效
-            grad_checkpoint=bool(args.grad_checkpoint),   # 行为参数，默认 0
         )
     model = model.to(device)
     n_params = sum(p.numel() for p in model.parameters())
@@ -4334,15 +4308,6 @@ def main():
                     _eff_cfg['num_attention_layers'],
                     n_params / 1e6, _n_backbone / 1e6, device)
 
-    if args.grad_checkpoint:
-        logger.info(
-            "[model] 已启用梯度检查点：主干块反向时重算前向"
-            "（省激活 / 慢一次主干前向）| 逐位中性，不改任何形状或参数量")
-    else:
-        # 静默降级只打一行是这个仓库的规矩（flash-attn 缺失时同理）：
-        # 显存曲线对不上时，第一嫌疑就得是这个开关。
-        logger.info("[model] 梯度检查点：关（OOM 时可 --grad-checkpoint 1，"
-                    "比砍 batch 更划算）")
 
     # 把卷积型特征（N,C,H,W）转 channels_last(NHWC)，卷积算子走更快内存布局。
     # 输入也需同步转格式（见训练/评估循环），故这里仅转换模型权重布局。

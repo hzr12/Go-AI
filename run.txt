@@ -214,16 +214,16 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 #   有效 1536（384×4）→ 0.00279；2800 → 0.00377；1400 → 0.00266；5600 → 0.00533。
 #   **换了有效 batch 一定要按公式重算 LR**，别沿用旧值。
 #
-# 🔴🔴 **上面那组 s/s 数字全部作废，需要重测**（2026-10-11 梯度检查点已整体删除）
-#   GC 只影响显存、不影响前向数值，所以**收敛**结论不受影响；但它直接决定「同样的
-#   batch 装不装得下」⇒ 关掉 GC 后激活全驻留，同样的 micro 可能直接 OOM，或必须
-#   降 micro / 加 accum 才能跑。这直接影响上面「512×4 是甜点、1024×2 更慢、
-#   2048×1 是悬崖」这三条结论 —— 它们测的是**吞吐**，而吞吐又依赖能不能装下。
+# 🔴🔴 **上面那组 s/s 数字全部作废，需要重测**（2026-10-13 梯度检查点已整体删除，
+#   2026-10-11 起主干不再有任何重算路径）
+#   旧数字测的是「带 GC」的世界 ⇒ 同样的 micro 可能直接 OOM，或必须降 micro /
+#   加 accum 才能跑。这直接影响上面「512×4 是甜点、1024×2 更慢、2048×1 是悬崖」
+#   这三条结论 —— 它们测的是**吞吐**，而吞吐又依赖能不能装下。
 #   ⇒ **重测方法**：对每个候选 micro×accum 组合先看 `mem=` 是否贴顶/是否 OOM，
 #     再看 spd；两档都记。别只看 spd 就下结论（装不下的组合 spd 没意义）。
-#   ⇒ `v7_batch_memory_advice` 已改成**无检查点**口径的估算，可先拿它筛掉明显
+#   ⇒ `v7_batch_memory_advice` 是「激活全驻留」口径的估算，可先拿它筛掉明显
 #     装不下的组合，但它的每样本 MB 常数仍来自 910A，当量级参考、不能当判据。
-#   ⇒ 在此重测完成前，A/B/C 三段的 micro/accum 属于**未经 GC 变化后验证**的配置。
+#   ⇒ 在此重测完成前，A/B/C 三段的 micro/accum 属于**未经无-GC 世界验证**的配置。
 # ⚠ `--compile-mode` 2026-10-11 本机实测结论（Ampere+）：
 #   - 脚本默认已从 `max-autotune-no-cudagraphs` 改成 **`reduce-overhead`**（L4004）：
 #     原默认档在本机曾报 `CUDA error: misaligned address`——疑似刚启用的
@@ -241,12 +241,12 @@ python scripts/train_sft.py \
   --data data/sgf_19x19_full.npz --v7 1 --device cuda --board-size 19 \
   --games-npz data/labels/games.npz \
   --batch-size 256 --epochs 1 --lr 0.00322 --weight-decay 0.0001 \
-  --gradient-accumulation-steps 4 --use-amp 1 --use-ema 0 \
+  --gradient-accumulation-steps 8 --use-amp 1 --use-ema 0 \
   --flash-attn 1 --attention-dropout 0 \
   --prefetch-workers 24 --prefetch-depth 8 \
   --log-every 25 --eval-every 500 --save-every 1674 \
   --early-stop 1 --early-stop-patience 3 \
-  --out models/a_v7_a100.pth --swanlab 1 --ver a_v7_a100 --swanlab-every 5
+  --out models/a_v7_a100.pth --swanlab 1 --ver a_v7_a100 --swanlab-every 10
 #
 # ⚠ `--save-every 1674` = **每 15 分钟**一次（2026-10-11 实测定档）。换算依据：
 #   A 段实测每步 0.5377 s（从 5 个 `elapsed` 点反推，散布极小）。

@@ -75,7 +75,7 @@ class SEBottleneck(nn.Module):
     该层的输入分布对齐。
 
      梯度检查点子系统已整体移除，本块不再有任何 BN 统计相关的特殊处理。
-    """
+     """
 
     def __init__(self, channels, mid_channels=None, se_reduction=SE_REDUCTION_DEFAULT):
         super(SEBottleneck, self).__init__()

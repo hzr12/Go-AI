@@ -1,101 +1,8 @@
-import contextlib
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.checkpoint
-
-
-@contextlib.contextmanager
-def _bn_stat_frozen(module):
-    """在**重算期间**阻止 BatchNorm 的 running 统计被第二次累加。
-
-    为什么需要：训练态下 `BatchNorm2d.forward` 会更新 `running_mean/var` 与
-    `num_batches_tracked`。开了梯度检查点，同一个 batch 的前向会跑**两遍**
-    （正常前向 + 反向时的重算）⇒ 统计被累加两次、EMA 被应用两遍 ⇒ 静默偏移。
-    这不是可忽略的数值噪声：`num_batches_tracked` 也被 +2，momentum 的累积
-    进度直接跑快一倍。
-
-    手法：把 `momentum` 置 0。PyTorch 的更新式是
-    `running = (1 - momentum) * running + momentum * batch`，于是 `momentum=0`
-    ⇒ running 原样不动；而**批次统计本身照常计算并用于归一化**（那才是前向
-    数值真正依赖的东西），所以前向结果逐位不变。
-
-    ⚠ `num_batches_tracked` 必须**单独回填**：它在 BatchNorm.forward 里是
-    `add_(1)` 无条件执行的，`momentum=0` 拦不住。不管它的话，重算会让它每步
-    +2（实测：关=1 / 开=2）。本仓 `momentum` 是写死的 0.1，running 统计不受
-    影响，所以这个偏差**当前不改变任何数值**；但它有两个后患 ——
-      * GC 开/关存出来的 checkpoint 里这个 buffer 不同 ⇒ 跨配置的 resume
-        对不上；
-      * 一旦有人用 `momentum=None`（累计移动平均，momentum 由
-        num_batches_tracked 决定），GC 开启就会把归一化尺度彻底带偏。
-    它是个 int64 标量，clone + 回填的代价可以忽略。
-
-    这是**标准做法**（fairscale / Megatron 的 recompute 路径同款）：不需要
-    clone `running_mean/running_var`（它们压根没被改动）。
-    """
-    saved = []
-    for m in module.modules():
-        if isinstance(m, nn.modules.batchnorm._BatchNorm):
-            saved.append((m, m.momentum,
-                          None if m.num_batches_tracked is None
-                          else m.num_batches_tracked.clone()))
-            m.momentum = 0.0
-    try:
-        yield
-    finally:
-        for m, mom, nbt in saved:
-            m.momentum = mom
-            if nbt is not None:
-                m.num_batches_tracked.copy_(nbt)
-
-
-def checkpointed(fn, *tensors, modules=None, enabled=False):
-    """用 `torch.utils.checkpoint` 包一次调用（`use_reentrant=False`）。
-
-    **为什么用标准实现而不是自定义 `autograd.Function`**：旧 GC 自己实现了一个
-    `trampoline_autograd_fwd`，它接受 tuple 非 Tensor 入参 ⇒ Dynamo 无法 trace
-    ⇒ 一旦与 `torch.compile` 同时开启，该区域**静默回退 eager**，主干融合全废、
-    compile 几乎白开（这正是 1024×2 实测更慢的根因）。官方
-    `use_reentrant=False` 实现在这两点上都被 Dynamo 正常 trace。
-
-    三个调用约定（都是为了保住上面的可 trace 性）：
-      * `fn` 的入参**必须全是 Tensor** —— tuple / list / int 都不能出现在位置
-        参数里，否则又退回「Dynamo 放弃」的老路；
-      * **位置传递**，不要 `*args` 展开；
-      * 返回单个 Tensor 或 tuple of Tensor，不要返回 dict。
-    所以包裹点必须选在「张量进、张量出」的位置上。
-
-    `modules`：传被包裹的那段**本身**，用于给重算挂 BN 统计守卫（见
-    `_bn_stat_frozen`）。**传 `None` 表示这段里没有 BatchNorm、守卫可省** ——
-    这个区分不是洁癖：`context_fn` 在 `torch.compile` 下**不被支持**（PyTorch
-    检测到 compile 模式传了 `context_fn` 就直接 assert 抛错），挂了它整段就
-    trace 不了。V7 主干里一个 BatchNorm 都没有（`Nbt2TransformerBlock` 是
-    MHSA+SwiGLU），守卫保护不了任何东西却要白赔 compile 兼容性，所以传 None；
-    12 通路的 SE 主干里有 6 个，才真的需要。
-
-    `enabled=False` 时**直接原样调用** `fn`，不建任何额外图结构 ⇒ 关闭时与
-    「没有这个函数」的基线逐位一致、开销为零。
-    """
-    if not enabled:
-        return fn(*tensors)
-
-    # GC + torch.compile 的组合在 PyTorch 2.x 下有 incompatibility：
-    # `use_reentrant=False` 的内部 `trampoline_autograd_fwd` 接受 tuple 参数，
-    # Dynamo 无法证明安全性，会 fallback 到 eager 并打印 speculate_subgraph /
-    # HigherOrderOperator warning。编译模式下跳过 GC（GC 默认关，零开销）；
-    # 非编译模式下正常走 checkpoint。
-    if torch._dynamo.is_compiling():
-        return fn(*tensors)
-    if modules is None:
-        return torch.utils.checkpoint.checkpoint(fn, *tensors,
-                                                 use_reentrant=False)
-    return torch.utils.checkpoint.checkpoint(
-        fn, *tensors,
-        use_reentrant=False,
-        context_fn=lambda: (contextlib.nullcontext(),
-                            _bn_stat_frozen(modules)))
 
 # 绝对导入而非 `from .se_bottleneck import …`：
 # `tests/test_backbone_block_classes.py` 用 `spec_from_file_location` 把本文件
@@ -907,8 +814,7 @@ class SharedBackbone(nn.Module):
                  num_heads=4, attention_dropout=0.0,
                  attn_mode="global", attn_window=7,
                  arch="convnext",
-                 res_blocks=0, convnext_blocks=0, attn_blocks=0,
-                 grad_checkpoint=False):
+                 res_blocks=0, convnext_blocks=0, attn_blocks=0):
         """
         Args:
             attention_mode:   主干堆叠模式 "none"|"mix"|"all"
@@ -948,19 +854,6 @@ class SharedBackbone(nn.Module):
                 num_res_blocks, attention_mode, num_attention_layers,
                 channels, num_heads, attention_dropout, attn_mode, attn_window, arch)
         self.blocks = nn.Sequential(*blocks)
-        # 梯度检查点（默认关）。**行为参数，不是结构参数**：形状仍只由上面的
-        # 块构造决定，这里只决定「反向时要不要重算前向」。
-        self.grad_checkpoint = bool(grad_checkpoint)
-        # 重算会把块内的 BatchNorm 前向**再跑一遍**，running 统计就被双累加
-        # （实测 running_mean 与基线不同、num_batches_tracked 1→2）。守卫要靠
-        # `context_fn` 挂，而 `context_fn` 与 `torch.compile` 互斥 —— 所以这里
-        # 只在**块里真有 BN** 时才把它交给 `checkpointed`；convnext 全是
-        # LayerNorm，一个 BN 都没有，直接省掉守卫好保住 compile 兼容性。
-        self._gc_bn_modules = (
-            self.blocks
-            if any(isinstance(m, nn.modules.batchnorm._BatchNorm)
-                   for m in self.blocks.modules())
-            else None)
 
         # 输出层
         if arch == "convnext":
@@ -1026,19 +919,12 @@ class SharedBackbone(nn.Module):
 
         return blocks
 
-    def _run_blocks(self, x):
-        """被检查点包裹的那一段。刻意抽成方法而不是 lambda/闭包：
-        Dynamo trace 时需要一个**具名**且只收 Tensor 的可调用对象。"""
-        return self.blocks(x)
-
     def forward(self, x):
         if self.arch == "convnext":
             out = self.norm(self.conv1(x))
         else:
             out = F.relu(self.bn1(self.conv1(x)))
-        out = checkpointed(self._run_blocks, out,
-                           modules=self._gc_bn_modules,
-                           enabled=self.grad_checkpoint)
+        out = self.blocks(out)
         if self.arch == "convnext":
             out = self.norm_out(self.conv_out(out))
         else:
@@ -1154,7 +1040,7 @@ class TransformerBlock(nn.Module):
 
 
 def _sdpa_math(q, k, v, dropout_p=0.0, scale=None):
-    """手写注意力（`_sdpa` 的 math 分支）：分块 + 逐 chunk 梯度检查点。
+    """手写注意力（`_sdpa` 的 math 分支）：按 query 分块。
 
     ## `dropout_p` 的来源（别把它当闸门看）
 

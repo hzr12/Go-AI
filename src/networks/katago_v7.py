@@ -44,13 +44,11 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.checkpoint
 
 from src.networks.backbone import (
     RMSNorm,
     _sdpa,
     _segment_runner,
-    checkpointed,
 )
 
 #: spec §3 的形状常量。结构**只由这张表**决定（与 `train_sft.KATAGO_SE_CFG`
@@ -1017,7 +1015,7 @@ class NbtTfNet(nn.Module):
 
 
 
-    def __init__(self, cfg=None, attn_dropout=None, grad_checkpoint=False):
+    def __init__(self, cfg=None, attn_dropout=None):
         super().__init__()
         c = dict(NBT_TF_CFG)
         if cfg:
@@ -1027,9 +1025,6 @@ class NbtTfNet(nn.Module):
                              else float(attn_dropout))
         C = c['trunk_channels']
         M = c['nbt_mid']
-        # 梯度检查点（默认关）。**行为参数，不是结构参数**：形状仍只由
-        # `NBT_TF_CFG` 决定，这里只决定「反向时要不要重算 trunk 的块序列」。
-        self.grad_checkpoint = bool(grad_checkpoint)
         self.stem = _ScaledConv2d(c['in_channels'], C, 3, padding=1, bias=False)
         self.global_fc = _ScaledLinear(c['global_channels'], C, bias=False)
         # RoPE 位置网格预计算（board_size 固定，每个 forward 省一次 arange+cat+expand）。
@@ -1080,11 +1075,6 @@ class NbtTfNet(nn.Module):
         return self
 
 
-    def _run_blocks(self, x, pos):
-        """被检查点包裹的那一段块序列。具名方法而非闭包：Dynamo 需要一个
-        签名固定、只收 Tensor 的可调用对象（`pos` 虽是常量张量，仍按张量传）。"""
-        return _segment_runner(self.blocks, ())(x, pos)
-
     def trunk(self, spatial, global_features):
         """stem + 10 个 nbt2 块 + trunk 末端归一化（spec §3.1）。"""
         x = self.stem(spatial)
@@ -1092,14 +1082,7 @@ class NbtTfNet(nn.Module):
                                                     1, 1)
         x = x + g
         pos = self._pos_grid[:1].expand(x.shape[0], -1, -1).to(x.device, x.dtype)
-        # 梯度检查点（默认关）。`pos` 是**张量**，所以 `(x, pos)` 两个位置参数
-        # 都满足「只收 Tensor」的约定，Dynamo 能 trace。`modules=None` ⇒ 不挂
-        # BN 守卫：`Nbt2TransformerBlock` 用的是 RMSNorm/SwiGLU，全网 0 个
-        # BatchNorm，守卫保护不了任何东西，而它要的 `context_fn` 会让
-        # `torch.compile` 整段 trace 不了。**这里不传守卫正是为了白拿 compile
-        # 兼容性**（实测 `fullgraph=True` 通过）。
-        x = checkpointed(self._run_blocks, x, pos,
-                         modules=None, enabled=self.grad_checkpoint)
+        x = _segment_runner(self.blocks, ())(x, pos)
         return F.silu(self.norm_trunkfinal(x))
 
     def forward(self, spatial, global_features, board_mask=None):
@@ -1116,19 +1099,14 @@ class NbtTfNet(nn.Module):
         return torch.tanh(out['ownership_pretanh'])
 
 
-def build_katago_v7_net(*, board_size=19, attn_dropout=None, cfg=None,
-                        grad_checkpoint=False):
+def build_katago_v7_net(*, board_size=19, attn_dropout=None, cfg=None):
     """按 `NBT_TF_CFG` 建 V7 网并跑一次 `initialize()`。
 
     **返回已初始化的模型**（不是随机权重）—— fson 的 γ 必须带 K，否则残差流
     方差随深度线性增长，深层一开始就饱和，而那种「模型能跑但 loss 离谱」的
     现象很难回溯到这里。`tests/test_katago_v7_budget.py` 也依赖这一点。
-
-    `grad_checkpoint` 是**纯行为开关**（默认关）：不影响任何形状与参数量，
-    开启前后前向/反向逐位一致。
     """
     c = dict(cfg or {})
     c.setdefault('board_size', int(board_size))
-    net = NbtTfNet(cfg=c, attn_dropout=attn_dropout,
-                  grad_checkpoint=grad_checkpoint)
+    net = NbtTfNet(cfg=c, attn_dropout=attn_dropout)
     return net.initialize()
