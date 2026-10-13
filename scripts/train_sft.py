@@ -3703,11 +3703,19 @@ def main():
                     help='torch.compile 模式（默认 None = 不显式指定，交给下方设备分支）。\n'
                          '  **A100(sm_80+)：未显式指定时取 `reduce-overhead`** —— 带 CUDA\n'
                          '  Graphs，消除 kernel launch 开销，常比 no-cudagraphs 快 10~30%%。\n'
-                         '  梯度累积（`--gradient-accumulation-steps`>1）与 cudagraph 可以\n'
-                         '  共存：训练循环在**每个 micro-batch 前**调\n'
-                         '  `torch.compiler.cudagraph_mark_step_begin()`，标记新一步开始后\n'
-                         '  cudagraph trees 就不重放覆盖上一次的输出了。\n'
-                         '  ⚠ 唯一顾虑是 CUDA Graphs 私有内存池不归还，长跑 `mem=` 会缓慢\n'
+                         '  🔴 `--gradient-accumulation-steps`>1 时**必须**用不带 cudagraph 的档：真机\n'
+                         '  实测 `torch.compiler.cudagraph_mark_step_begin()` 也挡不住（torch\n'
+                         '  2.10），会在第一个 backward 抛 `accessing tensor output of\n'
+                         '  CUDAGraphs that has been overwritten`。累积时自动取\n'
+                         '  `max-autotune-no-cudagraphs`。\n'
+                         '  accum==1 时 CUDA Graphs 消除 kernel launch 开销，常比\n'
+                         '  no-cudagraphs 快 10~30%%，但私有内存池不归还、长跑 `mem=`\n'
+                         '  会缓慢爬升；顶到 OOM 就换 `--compile-mode default`。\n'
+                         '  ⚠ 换档前先 `rm -rf ~/.cache/torch/inductor`\n'
+                         '  （FX 图缓存可能存着上一档的坏图，2026-10-11 本机\n'
+                         '  `max-autotune-no-cudagraphs` 曾报 misaligned address）。\n'
+                         '  非 Ampere+ 或显式指定时尊重用户值：\n'
+'  ⚠ 唯一顾虑是 CUDA Graphs 私有内存池不归还，长跑 `mem=` 会缓慢\n'
                          '  爬升；顶到 OOM 就换 `--compile-mode max-autotune-no-cudagraphs`。\n'
                          '  ⚠ 换档前先 `rm -rf ~/.cache/torch/inductor`\n'
                          '  （FX 图缓存可能存着上一档的坏图，2026-10-11 本机\n'
@@ -4076,11 +4084,16 @@ def main():
             # --compile-mode（默认 None）时覆盖；显式给什么档都尊重用户意图。
             # 非 Ampere+ 分支不动（留给 torch.compile 默认档）。
             #
-            # 梯度累积（accum>1）与 cudagraph 的冲突由下面 `_cudagraph_mark_step`
-            # 那一段的 `torch.compiler.cudagraph_mark_step_begin()` 处理 ——
-            # 每个 micro-batch 前标记一步开始即可，cudagraph 不用放弃。
+            # 梯度累积（accum>1）与 cudagraph 在 torch 2.10 上**真的**互斥：
+            # 真机实测 `torch.compiler.cudagraph_mark_step_begin()` 也挡不住
+            # （它只是把「重放覆盖」换成「每个 micro-batch 各录一张图」，录满
+            # 代数上限后撞同一堵墙），所以 accum>1 直接用不带 cudagraph 的档。
+            # 下面的预热（accum 次前向 + 一次 backward）会在启动时就抓到这个
+            # 冲突并自动降档，不必等到训练循环里炸。
             if args.compile_mode is None:
-                args.compile_mode = 'reduce-overhead'
+                args.compile_mode = ('reduce-overhead'
+                                     if args.gradient_accumulation_steps <= 1
+                                     else 'max-autotune-no-cudagraphs')
             logger.info("[device] %s (sm_%d%d) | 启用 A100 路径: BF16 + FlashAttn(优先,回退SDPA) + "
                         "channels_last + compile(卷积/线性/FFN, mode=%s)",
                         gpu_name, *compute_cap, args.compile_mode)
@@ -4575,9 +4588,13 @@ def main():
                     _x = (torch.zeros(1, KATAGO_SE_CFG['in_channels'],
                                       args.board_size, args.board_size,
                                       device=device),)
+                # 次数必须是**真实的 accum**：cudagraph 与梯度累积的冲突按
+                # 「前向了几次才 backward」触发，只跑 2 次抓不到 8 次的情形
+                # （2026-10-13 真机实测：2 次探热顺利通过，8 次照旧在 backward 炸）。
+                _n_fwd = max(1, int(args.gradient_accumulation_steps))
                 with maybe_autocast(device, amp_dtype):
-                    _m(*_x)
-                    out = _m(*_x)
+                    for _ in range(_n_fwd):
+                        out = _m(*_x)
                 if isinstance(out, dict):
                     _probe_loss = sum(v.float().square().mean() for v in out.values())
                 else:  # 12-通路：forward 返回 (policy_logits, value_logit)
@@ -4626,20 +4643,6 @@ def main():
     #   下面那处赋值删掉（全仓库只此一处定义）。
     _accum_steps = max(1, int(args.gradient_accumulation_steps))
 
-    # 🔴 CUDA Graphs + 梯度累积：每个 **micro-batch** 前都要标记一步开始。
-    #   累积时一个优化步里 forward N 次才 backward，而 cudagraph 管理的输出
-    #   张量在下一次 forward 重放时就被覆盖 ⇒ backward 读到别人的激活，直接抛
-    #   `RuntimeError: accessing tensor output of CUDAGraphs that has been
-    #   overwritten by a subsequent run`。这句报错自己的文案给的就是出路：
-    #   "call torch.compiler.cudagraph_mark_step_begin() before each model
-    #   invocation" —— 标记后 trees 不再重放覆盖，而是给每个 micro-batch 各录
-    #   一张图（累积数固定 ⇒ 录满 8 张后一直重放，摊销后可忽略）。
-    #   只在「真的编译了 + 带 cudagraph 的档 + accum>1」时开，其余情况这个
-    #   函数是 no-op，没必要每个 micro-batch 多调一次。
-    _cudagraph_mark_step = bool(
-        getattr(model, '_orig_mod', None) is not None
-        and _accum_steps > 1
-        and args.compile_mode in ('reduce-overhead', 'max-autotune'))
 
     if is_main:
         # 两个口径都打：调度器按 optimizer step 走，读日志的人常按 micro-batch 想。
@@ -4925,8 +4928,6 @@ def main():
                 if _dt > _t_data_max:
                     _t_data_max = _dt
                 _t_comp0 = time.perf_counter()
-                if _cudagraph_mark_step:
-                    torch.compiler.cudagraph_mark_step_begin()
                 if _v7_on:
                     # ---- B8 · V7：12 项 loss 一次算完 -----------------------------
                     # 与 12 通道的三处差异，全部是**结构**差异而不是口径差异：
