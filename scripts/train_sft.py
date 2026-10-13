@@ -3701,19 +3701,25 @@ def main():
                     choices=['default', 'max-autotune', 'max-autotune-no-cudagraphs',
                              'reduce-overhead'],
                     help='torch.compile 模式（默认 None = 不显式指定，交给下方设备分支）。\n'
-                         '  **A100(sm_80+)：未显式指定时，`--gradient-accumulation-steps`\n'
-                         '  为 1 才取 `reduce-overhead`，大于 1 取 `default`** —— CUDA\n'
-                         '  Graphs 与梯度累积互斥（accum>1 时 backward 会读到被下一次\n'
-                         '  forward 覆盖的激活，抛 `accessing tensor output of CUDAGraphs\n'
-                         '  that has been overwritten`）。accum=1 时 cudagraph 还能消掉\n'
-                         '  kernel launch 开销、常比 no-cudagraphs 快 10~30%%。\n'
+                         '  **A100(sm_80+)：未显式指定时按累积步数自动选档** ——\n'
+                         '  `--gradient-accumulation-steps` 为 1 取 `reduce-overhead`，\n'
+                         '  大于 1 取 `max-autotune-no-cudagraphs`。\n'
+                         '  🔴 **带 CUDA Graphs 的两档（`reduce-overhead` / `max-autotune`）\n'
+                         '  都不可与 `--gradient-accumulation-steps`>1 同用**：accum>1 时\n'
+                         '  一个优化步里 forward N 次才 backward，而 cudagraph 管理的输出\n'
+                         '  在下一次 forward 就被重放覆盖，抛 `accessing tensor output of\n'
+                         '  CUDAGraphs that has been overwritten`。\n'
                          '  ⚠ 换档前先 `rm -rf ~/.cache/torch/inductor`\n'
                          '  （FX 图缓存可能存着上一档的坏图，2026-10-11 本机\n'
                          '  `max-autotune-no-cudagraphs` 曾报 misaligned address）。\n'
                          '  非 Ampere+ 或显式指定时尊重用户值：\n'
                          '  default                       = 常规融合，编译最快，不带 CUDA Graphs。\n'
-                         '  reduce-overhead               = 小 batch 低开销（带 CUDA Graphs，\n'
-                         '                                 **不可与 --gradient-accumulation-steps>1 同用**）。\n'
+                         '  max-autotune-no-cudagraphs    = autotune 调优 + 不带 CUDA Graphs\n'
+                         '                                 （**accum>1 时的默认档**）。\n'
+                         '  reduce-overhead               = 带 CUDA Graphs（accum==1 时的默认档，\n'
+                         '                                 **不可与 accum>1 同用**）。\n'
+                         '  max-autotune                  = autotune + CUDA Graphs，同样不可\n'
+                         '                                 与 accum>1 同用。\n'
                          '  max-autotune                  = 全量 autotune + CUDA Graphs，最慢最吃显存。\n'
                          '  max-autotune-no-cudagraphs    = autotune 收益但不背 CUDA Graphs 的显存池。')
     ap.add_argument('--compile-fullgraph-probe', type=int, default=0, choices=[0, 1],
@@ -4065,13 +4071,11 @@ def main():
             # unfold 巨型中间张量会触发 inductor freezing 以 fp32 物化 (B,N,Hh,ws²,d)
             # 导致编译期 OOM（batch512 下单个 4.3GB），必须排除出编译图
             compile_disable_sparse = True
-            # A100/Ampere+ 默认 compile 档改为 `reduce-overhead`：带 CUDA Graphs，
-            # 消除 kernel launch 开销、常比 no-cudagraphs 再快 10~30%；2026-10-11 本机
-            # 实测可跑（原默认 `max-autotune-no-cudagraphs` 曾报 misaligned address，
-            # 疑 inductor bug / FX 图缓存脏图，见 run.txt）。唯一顾虑是 CUDA Graphs
-            # 私有内存池不归还、长跑显存爬升，盯 `memory_gb`；顶满 OOM 就显式给
-            # `--compile-mode default`。仅当用户**未显式**指定 --compile-mode（默认
-            # None）时覆盖；显式给 'default' / 'max-autotune' / 'max-autotune-no-cudagraphs'
+            # A100/Ampere+ 默认 compile 档：accum==1 取 `reduce-overhead`（带 CUDA
+            # Graphs，消除 kernel launch 开销）；accum>1 取
+            # `max-autotune-no-cudagraphs`（拿 inductor autotune 的 kernel 选择收益，
+            # 但不带 cudagraph）。仅当用户**未显式**指定 --compile-mode（默认
+            # None）时覆盖；显式给 'default' / 'max-autotune' / 'reduce-overhead'
             # 等一律尊重用户意图。非 Ampere+ 分支不动（留给 torch.compile 默认档）。
             if args.compile_mode is None:
                 # 🔴 CUDA Graphs 与**梯度累积**互斥：accum>1 时一个优化步里要 forward
@@ -4081,13 +4085,15 @@ def main():
                 #   overwritten by a subsequent run`。
                 #   A/B/C 三段都是 256×8（累积 8 次），所以这是**主路径**不是边角：
                 #   只有 accum=1 才配得上 `reduce-overhead` 的 cudagraph 收益。
-                #   累积时退回 `default`（无 cudagraphs 私有内存池，也不会像
-                #   `max-autotune-no-cudagraphs` 那样在 2026-10-11 报过
-                #   misaligned address）。想要 autotune 又不要 cudagraph 就显式
-                #   `--compile-mode max-autotune-no-cudagraphs`。
+                #   ⚠ `max-autotune` **含 cudagraphs**，同样不能用在 accum>1 上；
+                #   要 autotune 就必须是 `-no-cudagraphs` 那一档。
+                #   ⚠ 这一档 2026-10-11 在本机报过 `CUDA error: misaligned address`
+                #   （run.txt 归因为 inductor bug / FX 图缓存脏图）。若复现先
+                #   `rm -rf ~/.cache/torch/inductor`，仍崩就显式
+                #   `--compile-mode default`。
                 args.compile_mode = ('reduce-overhead'
                                      if args.gradient_accumulation_steps <= 1
-                                     else 'default')
+                                     else 'max-autotune-no-cudagraphs')
             logger.info("[device] %s (sm_%d%d) | 启用 A100 路径: BF16 + FlashAttn(优先,回退SDPA) + "
                         "channels_last + compile(卷积/线性/FFN, mode=%s)",
                         gpu_name, *compute_cap, args.compile_mode)
