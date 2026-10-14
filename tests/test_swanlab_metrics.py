@@ -431,8 +431,14 @@ def test_run_level_facts_are_logged_once(key):
 def test_reported_values_are_floats_not_tensors():
     """上报值必须是 python float —— swanlab 收到 tensor 的行为不可依赖。"""
     # `float(...)` 出现在关键标量转换处
-    for pat in ('float(l2_report)', 'float(opt_loss)', 'float(_gn)'):
+    # ⚠ `opt_loss` 带 requires_grad，必须 `.detach()` 再转 float，否则 PyTorch 发
+    #   UserWarning（Converting a tensor with requires_grad=True to a scalar）。
+    #   门禁跟着改成字面量 `float(opt_loss.detach())`，盯的是「上报的是 python
+    #   float 而不是张量」，与 detach 无关。
+    for pat in ('float(l2_report)', 'float(opt_loss.detach())', 'float(_gn)'):
         assert pat in SRC, f'缺少 {pat}'
+    assert 'float(opt_loss)' not in SRC, \
+        'opt_loss 带 requires_grad，float(opt_loss) 会触发 UserWarning'
     # `**_health_last` 里的值在构造时已 float()（逐项断言在下面）
     m = re.search(r"_health_last = \{(.*?)\n\s*\}", SRC, re.S)
     assert m, '找不到 _health_last 的构造'

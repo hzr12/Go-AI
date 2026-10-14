@@ -5554,7 +5554,7 @@ def main():
                         # 解耦衰减，按构造不在梯度里）。三条一起看才能判断「在降」
                         # 是模型在学还是正则项在缩。
                         "l2_report": float(l2_report),
-                        "opt_loss": float(opt_loss),
+                        "opt_loss": float(opt_loss.detach()),
                         "lr": lr,
                     "memory_gb": mem,
                     "speed": speed,
