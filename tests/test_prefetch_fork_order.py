@@ -12,8 +12,8 @@ AICore 0% 说明它们只占显存不干活（纯 numpy 取数）。
 
 根因：`_BatchPrefetcher` 用 `mp.Process`（Linux 默认 fork）构造于
 `torch.cuda.set_device` / 任何设备初始化**之后**。fork 复制
-地址空间 ⇒ CANN 设备上下文与显存映射被整份继承。GC 只管 torch 张量，管不到
-别的进程继承来的映射，所以任何 GC / batch / chunk 调整都治不了它。
+地址空间 ⇒ CANN 设备上下文与显存映射被整份继承。这份继承来的映射不在
+本进程的分配账本里，任何 batch / chunk 调整都治不了它。
 
  分布式包裹层（FSDP/DDP）已移除，本仓库现仅单卡训练。本文件钉的是「fork 必须
 早于**任何**设备初始化」，与是否分布式无关 ⇒ 断言不变。

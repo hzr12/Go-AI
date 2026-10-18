@@ -3,7 +3,7 @@
 这次改了两类东西，都容易「加了变量却没上报」或「上报了但没意义」：
 
 1. **config 面板此前记的是 9 个 D1 已归档的结构 flag** —— 它们完全不参与建网
-   （结构恒由 `KATAGO_SE_CFG` 这张表决定，v21 硬删除后旧 `V21_CFG` 已不存在），
+   （结构恒由 V7 的 `NBT_TF_CFG` 决定），
    而 config 面板是对比两次 run 时第一个看的东西。记虚构值比不记更糟。
 2. **一批「算了但没上报」或「上报了但没有参照」的量**：
    - `grad_norm`：`clip_grad_norm_` 的返回值此前被**丢弃** —— fp16 溢出/梯度爆炸
@@ -176,18 +176,17 @@ def test_config_panel_records_the_key(key):
     assert _has(INIT, key), f'config 面板缺 {key}'
 
 
-def test_config_arch_facts_come_from_katago_se_cfg():
-    """结构字段必须来自 `KATAGO_SE_CFG` 而不是 args（args 里那些是归档 flag）。
+def test_config_arch_facts_come_from_nbt_tf_cfg():
+    """结构字段必须来自 `NBT_TF_CFG` 而不是 args（args 里那些是归档 flag）。
 
-    v21 硬删除后 `V21_CFG` 不复存在，结构唯一真相源是 `scripts/train_sft.py` 里的
-    `KATAGO_SE_CFG` —— 断言的对象随之换轨，判据的形状不变：config 面板里的每一个
-    结构数字都必须直接引那张表，不得引 args。
+    结构唯一真相源是 `src/networks/katago_v7.py` 的 `NBT_TF_CFG` —— config
+    面板里的每一个结构数字都必须直接引那张表，不得引 args。
     """
     cfg = INIT[INIT.index('config={'):]
-    assert "KATAGO_SE_CFG['in_channels']" in cfg
-    assert "KATAGO_SE_CFG['channels']" in cfg
-    assert "KATAGO_SE_CFG['blocks']" in cfg
-    assert "KATAGO_SE_CFG['params_total']" in cfg
+    assert "NBT_TF_CFG['in_channels']" in cfg
+    assert "NBT_TF_CFG['trunk_channels']" in cfg
+    assert "NBT_TF_CFG['num_blocks']" in cfg
+    assert "NBT_TF_CFG['params_total']" in cfg
 
 
 def test_effective_batch_includes_accumulation():
@@ -372,7 +371,7 @@ def test_config_expression_actually_evaluates():
     """把 config 表达式用**真实 dest 集合**的 Namespace 真 eval 一遍。
 
     静态检查挡得住「属性不存在」，挡不住别的：表达式里除 args 还引用了
-    `KATAGO_SE_CFG` / `os` / `_ws` / `_accum` 等局部名，任何一个拼错或漏定义都会在
+    `NBT_TF_CFG` / `os` / `_ws` / `_accum` 等局部名，任何一个拼错或漏定义都会在
     `swanlab.init(...)` 那一步抛异常 —— 而那一步被 `except Exception` 吞掉，
     结果是**跟踪静默全丢、训练照跑**（2026-10-01 真发生过一次：`args.td`）。
 
@@ -394,8 +393,7 @@ def test_config_expression_actually_evaluates():
     expr = body[body.index('{') + 1:body.index('},\n')]
     # ⚠ 2026-10-11：`world_size` 已随 DDP 多卡支持整体删除（单卡恒为 1），
     # `effective_batch` 现在就是 `args.batch_size * _accum`，不再有第三个因子。
-    env = {'args': ns, 'KATAGO_SE_CFG': tsf.KATAGO_SE_CFG, 'os': os,
-           '_accum': 2, 'NBT_TF_CFG': tsf.NBT_TF_CFG}
+    env = {'args': ns, 'os': os, '_accum': 2, 'NBT_TF_CFG': tsf.NBT_TF_CFG}
     cfg = eval('{' + expr + '}', env)   # noqa: S307 — 测试内显式求值
 
     assert isinstance(cfg, dict) and len(cfg) >= 25, \
@@ -465,26 +463,6 @@ def test_reported_values_are_floats_not_tensors():
 def test_v7_config_keys_are_recorded(key):
     """V7 特有的结构维度必须进 config 面板（否则面板只剩 12 通道那套）。"""
     assert _has(INIT, key), f'config 面板缺 V7 键 {key}'
-
-
-def test_config_arch_numbers_follow_the_v7_flag():
-    """ 结构数字必须**按 `--v7` 分派**，不得无条件取 12 通道那张表。
-
-    这不是洁癖：一个 V7 run 的面板写着 `in_channels: 12` 时，「对比两次 run」
-    这件最常用的事会得到错误答案 —— 而面板恰恰是第一个看的东西。
-
-     判据跑在 `ast.unparse` 的输出上（`INIT`），那是一行、无换行的形式 ⇒
-      只能按「键名到下一个键名之间」切片，不能按源码的多行排版写正则。
-    """
-    for key in ('arch/in_channels', 'arch/channels', 'arch/params_total',
-                'arch/num_heads', 'arch/blocks'):
-        k = "'%s'" % key
-        assert k in INIT, f'config 里找不到 {key}'
-        i = INIT.index(k)
-        nxt = INIT.find("', '", i + len(k))
-        val = INIT[i + len(k):nxt if nxt > 0 else i + 220]
-        assert 'args.v7' in val, \
-            f'{key} 未按 --v7 分派（V7 run 的面板会显示 12 通道的数字）：{val!r}'
 
 
 def test_v7_config_references_nbt_tf_cfg_not_args():

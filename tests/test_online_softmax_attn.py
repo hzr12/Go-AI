@@ -13,8 +13,7 @@
 4. query 分块（Nq>chunk）与非分块（Nq<=chunk）两种形状都覆盖。
 
 **默认是关的**（`_attn_online = False`，需 `GOAI_ATTN_ONLINE=1`）：它不是逐位
-等价，而 `tests/test_mcts_in_channels.py::test_twelve_channel_path_bit_identical`
-靠逐位一致发现意外数值变化。下面用 fixture 保证每个用例都在**显式打开**的状态下
+等价。下面用 fixture 保证每个用例都在**显式打开**的状态下
 跑，避免哪天默认值被改动时这些用例集体变成「什么都没测」。
 """
 import math
@@ -195,8 +194,7 @@ def test_online_is_skipped_when_dropout_is_on():
     q = torch.randn(B, Hh, Nq, d)
     k = torch.randn(B, Hh, Nk, d)
     v = torch.randn(B, Hh, Nk, dv)
-    # materialize 也带 dropout：两次调用 mask 不同，只断言「不抛且形状对」，
-    # 真正的 dropout 行为由 test_attn_dropout_eval.py 负责
+    # materialize 也带 dropout：两次调用 mask 不同，只断言「不抛且形状对」
     out = _sdpa_math(q, k, v, dropout_p=0.1, scale=0.25)
     assert out.shape == (B, Hh, Nq, dv)
     print("[ok] dropout>0 falls back")

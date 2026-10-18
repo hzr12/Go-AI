@@ -1,25 +1,23 @@
 """
 围棋 AI 推理引擎（监督学习 / SFT 模型）
 
-兼容 src/networks.alphanet.AlphaGoNet 输出的 (policy, value)：
-    - policy: 棋盘上每点 + 虚着(pass) 的概率分布
-    - value : 当前执子方视角的局面胜率，tanh 后落在 [-1, 1]
+兼容 V7（`NbtTfNet`）输出的 dict：
+    - policy_logits: 棋盘上每点 + 虚着(pass) 的概率分布（取本方 `[:, 0]`）
+    - outcome_logits: 三分类胜负，映射成当前执子方视角的标量 [-1, 1]
 
-特征由 src.game.go_rules.GoBoard.feature_planes 统一生成，通道数与模型 stem 的
-in_channels 一致（现役 12，由 `_infer_in_channels` 从权重形状推断），
-与 src.data.dataset 使用同一套特征工程，避免训练/推理不一致。
+22 通道的 V7 特征由 `src.search.v7_features.v7_leaf_features` 生成（另带 19 维
+全局输入）；13..17 通道仍由 `GoBoard.feature_planes` 供给。通道数由
+`_infer_in_channels` 从权重形状推断，与训练侧使用同一套特征工程。
 """
 
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import re
 import numpy as np
 import torch
 
 from src.game.go_rules import GoBoard
-from src.networks.alphanet import AlphaGoNet
 
 
 # --------------------------------------------------------------------------- #
@@ -48,14 +46,14 @@ _IN_CHANNEL_BUILDERS = {}
 
 #: `GoAI` 认识的输入通道数集合。
 #:
-#: 12..17 由 `GoBoard.feature_planes_batched` 供给；22 是 V7 的
+#: 13..17 由 `GoBoard.feature_planes_batched` 供给；22 是 V7 的
 #: `fillRowV7` 空间通道数，必须由 `src/search/v7_features.py` 供给（还要额外的
 #: 19 维全局输入）。
 #:
-#: 刻意写成**集合**而不是区间：22 与 12..17 之间是「特征来源不同」的断裂，
-#: 写成 `range(12, 23)` 会把 18~21 也放进来，而那几档没有任何特征路径能供给
+#: 刻意写成**集合**而不是区间：22 与 13..17 之间是「特征来源不同」的断裂，
+#: 写成 `range(13, 23)` 会把 18~21 也放进来，而那几档没有任何特征路径能供给
 #: —— 那正是「白名单放行、特征给不出」的静默错配。
-_SUPPORTED_IN_CHANNELS = frozenset({12, 13, 14, 15, 16, 17, 22})
+_SUPPORTED_IN_CHANNELS = frozenset({13, 14, 15, 16, 17, 22})
 
 
 def _stem_in_channels(tensors):
@@ -83,75 +81,6 @@ def _state_key_sample(state, limit=6):
         return [type(state).__name__]
 
 
-#: 旧代 value 残差块的键名前缀（`value.resN.*`，N 从 1 起）。
-_LEGACY_VALUE_BLOCK_RE = re.compile(r'^value\.res(\d+)\.(.+)$')
-#: 当前 value 残差块的键名前缀（`value.res_blocks.N.*`，N 从 0 起）。
-_VALUE_BLOCK_RE = re.compile(r'^value\.res_blocks\.(\d+)\.')
-
-
-def remap_legacy_value_keys(sd):
-    """把旧版 `ValueNetwork` 的键名归一到当前代码；返回 (state_dict, 移动数)。
-
-    当前 `value_network.py` 用 `self.res_blocks = nn.ModuleList([...])`
-    → `value.res_blocks.0.*`；`e2d0b57` 之前直接在 value 下挂 `res1 / res2 / ...`
-    → `value.res1.*`。现役 `models/sft_19x19_v12.pth` 就是那一代的权重（2 块）。
-
-    只改键名、**不动任何数值**：块类（`_ValueResBlock`）、顺序、通道数都没变，
-    所以重映射后与源模型逐位等价。块数由 `_infer_architecture` 另外从权重
-    推断（`value_res_blocks`）—— 只重映射不改块数的话，建出来的 3 块 head 里
-    第 3 块仍然没有权重可载，那块还是随机的（这正是本函数存在的另一半理由）。
-
-    `scripts/inspect_ckpt.py` 复用本函数（同一份正则与口径），避免「加载能过
-    但 inspect 说缺键」这类两份实现互相打架的毛病。
-    """
-    if any(k.startswith('value.res_blocks.') for k in sd):
-        return sd, 0            # 已是当前命名：幂等
-    if not any(_LEGACY_VALUE_BLOCK_RE.match(k) for k in sd):
-        return sd, 0            # 没有旧版键也没得可映射
-    out = {}
-    moved = 0
-    for k, v in sd.items():
-        m = _LEGACY_VALUE_BLOCK_RE.match(k)
-        if m:
-            out['value.res_blocks.%d.%s' % (int(m.group(1)) - 1, m.group(2))] = v
-            moved += 1
-        else:
-            out[k] = v
-    return out, moved
-
-
-def infer_value_head(state):
-    """从 state_dict 读 value 头的两个形状参数：**两种命名都认**。
-
-    返回 `{'value_channels': int|None, 'value_res_blocks': int|None}`（读不到的
-    键给 None，调用方据此跳过重建）。
-
-    - `value_channels`：`value.downsample.0.weight` 的 out 维。两代都在，形状
-      不会说谎。 旧实现查的是 `value.value_head.0.weight` —— 那个键**两代都
-      不存在**（value 头一直是 `downsample` Sequential + 残差块 + `fc`），
-      所以过去这条推断等于没跑，value_channels 恒为默认 64。
-    - `value_res_blocks`：`res_blocks.N` 的最大 N+1（旧命名 `resN` 折成 N-1）。
-      不推断的后果就是「权重 2 块、模型 3 块 ⇒ 第 3 块随机初始化」。
-    """
-    out = {'value_channels': None, 'value_res_blocks': None}
-    for k, v in state.items():
-        if k == 'value.downsample.0.weight' and isinstance(v, torch.Tensor):
-            out['value_channels'] = int(v.shape[0])
-            break
-    idx = set()
-    for k in state:
-        m = _VALUE_BLOCK_RE.match(k)
-        if m:
-            idx.add(int(m.group(1)))
-            continue
-        m = _LEGACY_VALUE_BLOCK_RE.match(k)
-        if m:
-            idx.add(int(m.group(1)) - 1)
-    if idx:
-        out['value_res_blocks'] = max(idx) + 1
-    return out
-
-
 def _katago_v7_net(*, in_channels: int, **arch_kwargs):
     """22 通道 = KataGo NBT+Transformer（spec §3/§4，配置 `b11c256h4nbttflrs-...`）。
 
@@ -160,9 +89,8 @@ def _katago_v7_net(*, in_channels: int, **arch_kwargs):
     `Conv2d(22→256, 3×3)`，给它别的数就是建出了与 spec 不符的结构。
 
     `arch_kwargs` 里本模型**只认** `attn_dropout` 一个行为参数；结构键
-    **不接受覆盖**（与 `KATAGO_SE_CFG` 同一立场：结构只由 `NBT_TF_CFG`
-    决定）。传别的键会被静默忽略 —— 刻意不报错，因为 `GoAI.__init__` 会把
-    一整套 12 通道时代的结构参数一起透传下来。
+    **不接受覆盖**（结构只由 `NBT_TF_CFG` 决定）。传别的键会被静默忽略 ——
+    刻意不报错，因为 `GoAI.__init__` 会把一整套历史结构参数一起透传下来。
     """
     from src.networks.katago_v7 import NBT_TF_CFG, build_katago_v7_net
     if int(in_channels) != NBT_TF_CFG['in_channels']:
@@ -214,19 +142,6 @@ def _build_for_in_channels(in_channels, **arch_kwargs):
     return model
 
 
-def _legacy_alpha_go_net(in_channels, **arch_kwargs):
-    """12 通道现行结构（resnet / convnext / se_bottleneck）的构建器。
-
-    现在**只有这一个通道数接线**。17 路那一代（v21）随它的构建器一起退役，
-    未注册的通道数会走 `_build_for_in_channels` 的报错分支，那条分支已经把
-    「谁来接、怎么接」的契约写在消息里了。
-    """
-    return AlphaGoNet(in_channels=in_channels, **arch_kwargs)
-
-
-register_in_channels_builder(12, _legacy_alpha_go_net)
-
-
 class GoAI:
     """基于 SFT 模型的围棋对弈 / 分析引擎。
 
@@ -253,7 +168,7 @@ class GoAI:
         # CPU 不开 amp；CUDA 上由调用方的 amp 开关决定（A100=bf16、V100=fp16）
         self.use_amp = use_amp and self.device.startswith("cuda")
         self.board_size = board_size
-        # ---- 局级标量：V7 的 19 维全局输入要用（12 通道路径完全不用）----
+        # ---- 局级标量：V7 的 19 维全局输入要用 ----
         # 贴目/规则不是盘面状态，是「这局按什么下」。放这里是唯一的：全局特征
         # 由 `needs_global_features` 那条路造，而那条路只有本类知道这两个值。
         # 与训练口径必须一致，否则 ch5（selfKomi/20）与 ch18（贴目奇偶波）全错，
@@ -282,34 +197,24 @@ class GoAI:
             # 兼容直接保存的 state_dict 或 {"model": state_dict}
             if isinstance(state, dict) and "model" in state:
                 state = state["model"]
-        self._in_channels = 12  # 无 checkpoint → 旧默认（零回归）
+        self._in_channels = 22  # 无 checkpoint → V7 默认
         if state is not None:
-            # 读了 checkpoint 就必须能从中读出通道数。回退 12 是本设计里唯一
-            # 「不响就走」的路：回退后建出的是 12ch 模型，而未知架构的权重会被
-            # load_state_dict 整份报成 missing，strict=False 照单全收 —— 玩家
-            # 拿到的是一个随机初始化、形状却完全正常的模型（P4.8 fix 轮堵死）。
+            # 读了 checkpoint 就必须能从中读出通道数。无 checkpoint 时默认 22，
+            # 但**绝不**在「读到了 checkpoint 却推断不出」时回退 —— 那样会用
+            # 随机初始化的模型「装」一份陌生架构的权重并静默开跑。
             inferred_ic = self._infer_in_channels(state)
             if inferred_ic is None:
                 raise RuntimeError(
                     f"权重里找不到可识别的 stem 卷积（GoAI 只认: "
                     f"{', '.join(_STEM_WEIGHT_KEYS)}），无法确定 in_channels；"
-                    f"拒绝回退默认 12 —— 那样会用随机初始化的 12ch 模型"
+                    f"拒绝回退默认值 —— 那样会用随机初始化的模型"
                     f"「装」一份陌生架构的权重并静默开跑。checkpoint 顶层键样例: "
                     f"{_state_key_sample(state)}（GoAI 只解包 'model' 键下的 "
                     f"state_dict；若是 optimizer 打包形态请改存 "
                     f"{{'model': state_dict}}）。")
             self._in_channels = inferred_ic
-            if inferred_ic != 12:
-                print(f"[GoAI] 权重 stem 推断 in_channels={inferred_ic}，"
-                      f"特征/前向通道数随模型驱动")
-            # 旧代 value 头命名（value.res1/res2/...）归一到当前命名（e2d0b57
-            # 之前 vs 之后）。纯键名重映射，数值不动 —— 不做这一步的话旧权重
-            # 的 value 块会被 strict=False 报成 unexpected 丢掉、模型里的
-            # value 块则停在随机初始化，而这一切**不报错**。
-            state, _moved_value_keys = remap_legacy_value_keys(state)
-            if _moved_value_keys:
-                print(f"[GoAI] 旧版 value 头键名（value.res1/res2/...）已归一为 "
-                      f"value.res_blocks.*：{_moved_value_keys} 个张量（数值未改）")
+            print(f"[GoAI] 权重 stem 推断 in_channels={inferred_ic}，"
+                  f"特征/前向通道数随模型驱动")
 
         net_kwargs = dict(
             backbone_channels=backbone_channels,
@@ -328,11 +233,9 @@ class GoAI:
         )
         self.model = _build_for_in_channels(self.in_channels, **net_kwargs).to(
             self.device)
-        # 这里就进 eval，别等下面那行 —— torch.compile 的 warmup 前向在
-        # `self.model.eval()`（下面）**之前**就跑，而训练出来的模型可能带 grad
-        # checkpointing（train_sft 默认开）：GC 只在 training 态生效，warmup 时
-        # 模型默认 training=True 会让 compile 撞上 GC 互斥守卫并静默回退 eager
-        # （P4.6b §8.2④ 那组组合）。eval 下检查点恒关闭，compile 正常走。
+        # 先 eval，别等下面那行：torch.compile 的 warmup 前向在
+        # `self.model.eval()`（下面）之前就跑，模型默认 training=True 会让
+        # BN/dropout 干扰 warmup 的结果。
         self.model.eval()
         # torch.compile 融合算子（GPU 上约 20-40% 提速），不支持时回退 eager。
         # 注意：torch.compile 是惰性的，错误在首次前向才抛出，因此编译后用
@@ -472,10 +375,6 @@ class GoAI:
             if k == "policy.conv1.weight" and isinstance(v, torch.Tensor):
                 info["policy_channels"] = v.shape[0]
                 break
-        # value_channels / value_res_blocks: value 头形状（两代命名都认，见
-        # infer_value_head）。旧实现查的 `value.value_head.0.weight` 两代都不存在，
-        # 等于没查 ⇒ value_channels 恒默认、块数恒默认 3。
-        info.update(infer_value_head(state))
         # policy_layers: 检查是否有 conv3 和 bn2
         has_conv3 = any(k == "policy.conv3.weight" for k in state)
         has_bn2 = any(k == "policy.bn2.weight" for k in state)
@@ -487,15 +386,14 @@ class GoAI:
 
     @staticmethod
     def _infer_in_channels(state):
-        """从权重 stem 卷积的形状推断输入通道数（现役 12）。
+        """从权重 stem 卷积的形状推断输入通道数（现役 22）。
 
         判定依据：stem 是唯一消费输入特征平面的层，读它的 in 维（张量 shape[1]）；
         policy/value 头的第一层吃的是 backbone 输出通道，与输入通道数无关，
         不能用来判通道数。键按 `_STEM_WEIGHT_KEYS` 优先级回退。
         失败模式：
-        - 找不到任何可识别的 stem 键 → 返回 None，**调用方必须报错**（P4.8 fix
-          轮改的：原为「回退旧默认 12 + 告警」，那条路会拿随机 12ch 模型去装
-          一份陌生架构的权重并静默开跑）；
+        - 找不到任何可识别的 stem 键 → 返回 None，**调用方必须报错**（不能拿
+          随机初始化的模型去装一份陌生架构的权重并静默开跑）；
         - stem 通道数不在已支持集合里 → ValueError：
           特征端给不出对应通道，早失败优于前向时的形状错或静默错答案。
 
@@ -505,7 +403,7 @@ class GoAI:
         `_build_state` / `predict_batch` 必须改走
         `src/search/v7_features.v7_leaf_features`（它还要带 19 维全局输入）。
         绝不能只把 22 塞进白名单了事 —— 那会造出「模型声明 22 路、实际喂
-        12..17 路 feature_planes」的静默错配，正是本设计要消灭的那一类。
+        13..17 路 feature_planes」的静默错配，正是本设计要消灭的那一类。
         """
         ic = _stem_in_channels(state)
         if ic is None:
@@ -514,7 +412,7 @@ class GoAI:
             raise ValueError(
                 f"权重 stem 的 in_channels={ic} 不在已支持集合 "
                 f"{sorted(_SUPPORTED_IN_CHANNELS)} 内，无法加载"
-                f"（12..17 走 feature_planes；22 走 V7 特征路径）")
+                f"（13..17 走 feature_planes；22 走 V7 特征路径）")
         return ic
 
     def _verify_loaded_state(self, incompatible, state):
@@ -530,12 +428,6 @@ class GoAI:
         value/policy 层的张量。**这类缺口一律打印出来**（哪些键、缺几个），
         不能靠 strict=False 静默咽下。
 
-        注：旧版 value 头命名（`value.res1/res2/...`，`e2d0b57` 之前）过去
-        长期落在这一类里 —— 本仓库现役 `models/sft_19x19_v12.pth` 实测带 36 个
-        `value.res_blocks.*` missing + 24 个 `value.res1.*` unexpected，也就是
-        「模型跑得动、value 头却有一整块是随机初始化」。现已由
-        `remap_legacy_value_keys` + `infer_value_head` 修掉（加载前归一键名、
-        按权重推断块数与通道），不再依赖这条告警兜底。
         """
         missing = list(incompatible.missing_keys)
         unexpected = list(incompatible.unexpected_keys)
@@ -559,12 +451,12 @@ class GoAI:
 
     @property
     def in_channels(self):
-        """特征平面通道数（**只读**）：由 checkpoint 的 stem 形状推断，无 checkpoint 时 12。
+        """特征平面通道数（**只读**）：由 checkpoint 的 stem 形状推断，无 checkpoint 时 22。
 
         做成 property 而不是普通属性，是为了掐死 `ai.in_channels = 17` 这个
-        最顺手的「绕过 mcts.py 里还钉着 12 的预取路径」的写法：它会造出
-        12ch 模型吃 17ch 特征（或反之）的错配，而这种错配在本设计里**不报错**
-        —— 恰恰是本设计要消灭的那一类。要改通道数只能换 checkpoint。
+        最顺手的「绕过特征侧」的写法：它会造出通道数错配的模型吃错特征，而
+        这种错配**不报错** —— 恰恰是本设计要消灭的那一类。要改通道数只能换
+        checkpoint。
         """
         return self._in_channels
 
@@ -598,7 +490,7 @@ class GoAI:
         但对需要第二路输入的模型，**两者必须同时有或同时没有**：只给 planes
         意味着 19 路全局输入缺失，那两路是「形状对、内容错」，事后无法分辨。
 
-        返回的 `global_features` 在 12..17 通道下恒为 ``None``（那几档没有
+        返回的 `global_features` 在 13..17 通道下恒为 ``None``（那几档没有
         第二路输入）。
         """
         if self.needs_global_features:
@@ -677,7 +569,7 @@ class GoAI:
         value    : float, 当前 to_play 视角 [-1,1]
 
         `prev_board` / `prev_prev_board` 只有需要第二路输入的模型（V7）用得上：
-        ch15/ch16 要在前手盘上重算梯子。12..17 通道忽略它们。
+        ch15/ch16 要在前手盘上重算梯子。13..17 通道忽略它们。
         """
         built = self._build_state(board, my_hist, op_hist, to_play,
                                   prev_board=prev_board,
@@ -696,7 +588,7 @@ class GoAI:
                 需要第二路输入的模型（V7）此时**没有前两手盘面**，ch15/ch16 会
                 走「在当前盘上算」的回退路径 —— 形状正常、不报错，但语义不是
                 V7 该有的。搜索侧请用 6 元组。
-              - ``(board, my_hist, op_hist, to_play, planes)``：12..17 通道的
+              - ``(board, my_hist, op_hist, to_play, planes)``：13..17 通道的
                 预计算空间特征（`feature_planes` 口径）。
               - ``(board, my_hist, op_hist, to_play, planes, globals)``：V7 的
                 预计算**一对**特征。必须成对给：只给 planes 就等于把 22 路空间
@@ -791,8 +683,8 @@ class GoAI:
           取 ``[:,1]`` 会得到「对手会走哪」当作自己的策略，搜索方向直接反掉。
         - value 不是标量回归，而是 ``outcome_logits (B,3)``。按 KataGo 官方口径
           映射成标量：``P(win) - P(loss)``（中间那类是 draw/loss-not-determined，
-          自然被抵消）。这与本仓 12 通道路径的 tanh 标量 value 同一语义域
-          ``[-1,1]``，所以 MCTS 的 PUCT / value_sum / 符号约定都不用改。
+          自然被抵消），落在 ``[-1,1]``，所以 MCTS 的 PUCT / value_sum / 符号
+          约定都不用改。
         """
         B = x.shape[0]
         if self.needs_global_features and global_features is None:
@@ -821,7 +713,7 @@ class GoAI:
         """把模型输出归一成 ``(policy_logits (B,A), value (B,1))``。
 
         两种返回形态都要接：V7 返回 dict（`policy_logits` / `outcome_logits`），
-        12 通道等旧网络返回 ``(policy_logits, value)`` 元组。
+        其他网络返回 ``(policy_logits, value)`` 元组。
 
         V7 的两处口径转换（`policy_logits[:,0]` 取本方策略、outcome 三类映射成
         ``P(win)-P(loss)``）都收在这里，别散到调用点 —— 散开的写法一定会有人

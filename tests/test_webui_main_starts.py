@@ -7,7 +7,7 @@
 里 `_bs = args.board_size` 只写在引擎分支里，而原生分支去读它 ——
 Python 于是只在**没走引擎分支时**抛 `UnboundLocalError`。也就是说：
 
-    python scripts/webui.py --model models/sft_19x19_v12.pth
+    python scripts/webui.py --model models/sft_19x19.pth
 
 这条**最常用、看起来最正常**的命令直接崩，而整套 2141 条测试全绿。门禁抓不到它，
 因为没有任何测试真把 `main()` 跑到那一行 —— 现有测试都是 import `Session` 或
@@ -28,7 +28,6 @@ import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 V7_CKPT = os.path.join(ROOT, "tmp", "coding", "a_v7_npu4.pth")
-V12_CKPT = os.path.join(ROOT, "models", "sft_19x19_v12.pth")
 
 
 def _port_open(port, timeout=0.5):
@@ -80,17 +79,6 @@ def _diagnostics():
             if any(k in ln for k in ("Traceback", "Error", "error", "Unbound",
                                      "raise", "in_channels", "WebUI:"))]
     return "\n".join(keep[-25:])
-
-
-@pytest.mark.skipif(not os.path.isfile(V12_CKPT), reason="v12 权重不在")
-def test_main_starts_with_the_12_channel_model():
-    """原生 MCTS 路径（**默认**，不带 --engine-gtp）必须能起来。"""
-    port = _free_port()
-    ok, _ = _start_and_probe(
-        ["--model", V12_CKPT, "--device", "cpu", "--port", str(port),
-         "--num-threads", "1"], port)
-    assert ok, "webui 用 12 通道模型起不来：\n%s" % _diagnostics()
-    assert not _port_open(port), "进程退出后端口仍被占用（服务没干净收掉）"
 
 
 @pytest.mark.skipif(not os.path.isfile(V7_CKPT),

@@ -160,7 +160,6 @@ def _check_training_env(logger):
 
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.networks.alphanet import AlphaGoNet
 from src.networks.katago_v7 import NBT_TF_CFG
 from src.networks.katago_v7 import _migrate_ema_shadow_qkv
 from src.networks.katago_v7_loss import POLICY_SOFT_WEIGHT
@@ -169,87 +168,11 @@ from scripts.build_dataset import build
 
 
 # =========================================================================== #
-# 训练结构的**唯一真相源**（结构参数仍然归档在 CLI 之外）
+# V7（22 通道 NBT+Transformer）—— 训练结构**唯一**，结构只由 `NBT_TF_CFG` 决定。
 #
-# 这里替代（已随 v21 一并删除的）`alphanet.V21_CFG`：形状不再由某个专有主干类
-# 决定，而是一张喂给 `AlphaGoNet.__init__` 的 flag 表（arch="se_bottleneck" = KataGo
-# v4+ 的 bottleneck + SE 路线）。旧 CLI flag（--arch / --backbone-channels /
-# --res-blocks / --policy-layers …）**仍然不参与建网**，下面这张表才是真的。
-#
-# 参数量是**实测值**（19×19 / action_size=362 / 12 通道 / 随机初始化下数出来的，
-# 不是估算）：主干 8,392,995 + 头 719,010 = 全网 9,112,005
-#   主干 = stem 26,400 + 13 × SEBottleneck(240) 195,375
-#          + 4 × AttentionResBlock(240) 1,442,160 + out 58,080
-#   头   = ValueNetwork(96 宽 / 2 残差块) 540,193 + PolicyNetwork(128 宽 / 3 层) 178,817
-# 改这张表之后**必须**重数这两个数（启动时也会把实测值打出来，可对账）。
-#
-# 宽度为什么是 240 而不是 160：`SEBottleneck` 只 195,375 参数（C=160 时 87,050，
-# 而同宽度的 `ResBlock` 是 461,440，省下 5.3 倍）⇒ 160 宽 × 17 块只有约 4M，离 9M
-# 预算差一半多。这里**保留目标形状的块布局**（17 块 / mix / 4 个注意力 /
-# value_res_blocks=2），只把宽度从 160 提到 240 把参数填满。同布局宽度实测对照：
-#     C=192 → 6,050,622   C=208 → 6,996,907   C=224 → 8,017,368
-#     C=232 → 8,552,392   C=240 → 9,112,005   C=248 → 9,683,909
-#
-# 显存口径**尚未实测**：9.11M 的宽度是按参数量定的，而 240 通道 × 19×19 的激活
-# 比 160 通道大 2.25 倍，旧脚本里的 BATCH=1000 是按 184 通道那档定的。首跑请按
-# 报错往下调 BATCH。
-# =========================================================================== #
-KATAGO_SE_CFG = {
-    # ---- 形状（结构，全部对应 AlphaGoNet.__init__ 的参数名）----
-    'in_channels': 12,            # 与 AlphaGoNet 默认 / 数据集默认 / GoAI 注册的
-                                # 12 通道构建器一致
-    'arch': 'se_bottleneck',      # KataGo v4+ bottleneck + SE
-    'channels': 240,              # backbone_channels
-    'blocks': 17,                 # backbone_res_blocks（段内块数）
-    'attention_mode': 'mix',      # 卷积 + 注意力混排
-    'num_attention_layers': 4,    # 其中 4 个是 AttentionResBlock
-    'num_heads': 4,
-    'value_channels': 96,
-    'value_res_blocks': 2,
-    'policy_channels': 128,
-    'policy_layers': 3,
-    # ---- 行为（非结构，可被调用方覆盖）----
-    # ---- 预算锚（实测，硬数）----
-    'params_backbone': 8_392_995,
-    'params_total': 9_112_005,
-}
-
-
-def build_katago_se_net(*, action_size, attention_dropout=0.1,
-                        **overrides):
-    """按 `KATAGO_SE_CFG` 建网；返回 `(model, cfg)`，`cfg` 是**实际生效**的取值。
-
-    `overrides` 只用于行为参数（见调用点），结构键不接受覆盖 —— 与 D1 的
-    「结构只由这一张表决定」一致。实测参数量与 `cfg` 一并返回，好让日志 /
-    SwanLab config 面板里出现的数字与这张表对账（而不是各写一份）。
-
-    """
-    c = dict(KATAGO_SE_CFG)
-    c['attention_dropout'] = float(attention_dropout)
-    model = AlphaGoNet(
-        in_channels=c['in_channels'],
-        backbone_channels=c['channels'],
-        backbone_res_blocks=c['blocks'],
-        attention_mode=c['attention_mode'],
-        num_attention_layers=c['num_attention_layers'],
-        num_heads=c['num_heads'],
-        attention_dropout=c['attention_dropout'],
-        value_channels=c['value_channels'],
-        value_res_blocks=c['value_res_blocks'],
-        policy_channels=c['policy_channels'],
-        policy_layers=c['policy_layers'],
-        action_size=int(action_size),
-        arch=c['arch'],
-    )
-    return model, c
-
-
-# =========================================================================== #
-# V7 路径（22 通道 NBT+Transformer）—— **可选**，`--v7 1` 才走，默认关闭
-#
-# 与 `KATAGO_SE_CFG`（12 通道 / 9.11M）是**并排的第二条路**：`--v7 0`（默认）的
-# 建网/标签/损失一行都没动；V7 只在 `--v7 1` 时接管「造特征 + 前向 + 损失」，
-# EMA / 调度器 / 保存 / 评估两条路共用。
+# 旧 CLI flag（--arch / --backbone-channels / --res-blocks / --policy-layers …）
+# **仍然不参与建网**。V7 接管「造特征 + 前向 + 损失」，
+# EMA / 调度器 / 保存 / 评估共用同一条路。
 #
 # 段 1 的四个目标（系数见 `KataGoV7Loss`）：policy #1（1.0，行权重恒 1）、
 # π_opp #2（0.15，`w['policy_opp']`）、value #3（1.20，三分类 CE）、
@@ -329,8 +252,7 @@ def build_katago_v7_net(*, board_size=V7_BOARD_SIZE, attn_dropout=None,
     """按 `NBT_TF_CFG` 建 V7 网（已跑 `initialize()`），返回 `(model, cfg)`。
 
     `cfg` 是**实际生效**的取值（把 `attn_dropout` 回写进去），
-    好让启动日志里的参数量能与 `NBT_TF_CFG` 的预算锚对账 —— 与
-    `build_katago_se_net` 的返回契约一致。
+    好让启动日志里的参数量能与 `NBT_TF_CFG` 的预算锚对账。
     """
     from src.networks.katago_v7 import build_katago_v7_net as _build
     from src.networks.katago_v7 import NBT_TF_CFG
@@ -1459,11 +1381,9 @@ def narrow_to_soft_rows(train_idx, dataset):
 def load_dataset(path):
     """加载单个 .npz 训练集。"""
     d = np.load(path, allow_pickle=False)
-    # 通道数必须与**模型侧同改**（训练结构恒 = KATAGO_SE_CFG）。
-    # SupervisedDataset 的默认 12 是它自己的默认（dataset.py C7），这里不显式传
-    # 就等于赌「模型侧也是 12」—— 两者一旦分叉，第一个 batch 就形状错。
-    return SupervisedDataset({k: d[k] for k in d.files},
-                            n_channels=KATAGO_SE_CFG['in_channels'])
+    # 只作为 V7Dataset 的基类使用；V7 的特征装配固定 22 通道，与父类
+    # `n_channels`（特征平面布局）无关。
+    return SupervisedDataset({k: d[k] for k in d.files})
 
 
 # ---- eval 的确定性：固定采样源 + 与训练 RNG 流隔离 + 关闭数据增强 ----
@@ -1953,57 +1873,40 @@ def _concat_dicts(dicts):
     return out
 
 
-def load_from_path(path, board_size, max_games_per_tgz=0, v7=False,
+def load_from_path(path, board_size, max_games_per_tgz=0, v7=True,
                 games_npz=None):
-    """加载训练数据。
+    """加载 V7 训练数据（`v7` 参数仅为兼容旧调用，恒为 V7）。
 
-    - ``v7=True``：**必须**是 ``stdata_to_npz.py`` 产出的 V7 分片
-    （``spatial_packed`` + 全部 V7 标签），走 `V7PackedDataset`。
-    这条路是 V7 训练**唯一**可行的：``data/sgf_19x19_full.npz`` 那 3420 万行
-    虽然更���，但**没有** ``ownership`` / ``futurepos`` / ``scoring`` /
-    ``seki`` / ``scorebelief`` 标签，而 ``futurepos`` 是段1 四个主目标之一。
-    见 `src/data/v7_dataset.py` 模块 docstring。
-    - 否则：若 path 是文件，按 .npz 加载（兼容原行为）；若是目录，递归扫描
-    其下所有 .tgz/.tar.gz（用 build_dataset.build 解析）与 .npz（直接加载），
-    合并成一个 SupervisedDataset。这样可直接喂一个装着多个分片 tgz 的文件夹，
-    无需先手动 build_dataset 成单个 npz。
+    两种**布局**，都走同一个 22 通道模型（10,529,929 参数）：
+
+    - stdata 分片（含 ``spatial_packed``）→ `V7PackedDataset`；
+    - board 级语料（含 ``boards`` / ``my_hist`` / ``moves``）→ `V7Dataset`。
+
+    判据用「文件里有没有 `spatial_packed`」而不是文件名：目录模式下
+    一个目录里可能同时躺着两种分片。与早期守卫共用 `_npz_looks_packed`
+    （那里在加载数据集**之前**就要回答同一个问题），避免两份实现漂移。
     """
-    if v7:
-        # `--v7 1` 下有两种**布局**，都走同一个 22 通道模型（10,529,929 参数）：
-        #
-        #   stdata 分片（含 spatial_packed）→ `V7PackedDataset`
-        #       22 通道已预算好并位打包，每行自带 KataGo 搜索分布（C 段用）
-        #   board 级语料（含 boards/my_hist/moves）→ `V7Dataset`
-        #       22 通道在训练时实时算，policy 目标是人类着法 one-hot（A/B 段用）
-        #
-        # 两者不是替代关系，是**同一模型的不同数据源** —— 这样 A→B→C 才能
-        #   用 `load_state_dict` 连续承接（12 通道与 22 通道的 stem 形状不同，
-        #   跨不过去）。
-        #
-        # 判据用「文件里有没有 `spatial_packed`」而不是文件名：目录模式下
-        # 一个目录里可能同时躺着两种分片。与早期守卫共用 `_npz_looks_packed`
-        # （那里在加载数据集**之前**就要回答同一个问题），避免两份实现漂移。
-        import numpy as _np
+    import numpy as _np
 
-        def _looks_packed(p: str) -> bool:
-            try:
-                with _np.load(p, allow_pickle=False) as z:
-                    return 'spatial_packed' in z.files
-            except Exception:
-                return False
+    def _looks_packed(p: str) -> bool:
+        try:
+            with _np.load(p, allow_pickle=False) as z:
+                return 'spatial_packed' in z.files
+        except Exception:
+            return False
 
-        cands = ([path] if os.path.isfile(path)
-                else sorted(glob.glob(os.path.join(path, '**', '*.npz'),
-                                    recursive=True)))
-        packed = [p for p in cands if _looks_packed(p)]
-        if packed:
-            from src.data.v7_packed_dataset import load_v7_packed
+    if os.path.isfile(path):
+        cands = [path]
+    else:
+        cands = sorted(glob.glob(os.path.join(path, '**', '*.npz'),
+                                 recursive=True))
+    packed = [p for p in cands if _looks_packed(p)]
+    if packed:
+        from src.data.v7_packed_dataset import load_v7_packed
 
-            ds = load_v7_packed(packed[0] if len(packed) == 1 else path)
-            print(f"[data] V7 分片（预算特征）：{ds.describe()}")
-            return ds
-        # board 级：交给下面的常规路径，但升级成 V7Dataset
-        v7_board_level = True
+        ds = load_v7_packed(packed[0] if len(packed) == 1 else path)
+        print(f"[data] V7 分片（预算特征）：{ds.describe()}")
+        return ds
     if os.path.isdir(path):
         tgzs = (sorted(glob.glob(os.path.join(path, '**', '*.tgz'), recursive=True))
                 + sorted(glob.glob(os.path.join(path, '**', '*.tar.gz'), recursive=True)))
@@ -2045,24 +1948,17 @@ def load_from_path(path, board_size, max_games_per_tgz=0, v7=False,
                 f"目录 {path} 下未解析到任何有效棋谱，请检查 --board-size 是否与棋谱尺寸匹配")
         merged = _concat_dicts(dicts)
         print(f"[data] 合并后样本数 {merged['boards'].shape[0]}")
-        # 同 load_dataset：平面通道数随 KATAGO_SE_CFG 走（与模型侧同改）
-        if locals().get('v7_board_level'):
-            from src.data.v7_dataset import V7Dataset
-            return V7Dataset(merged, n_channels=KATAGO_SE_CFG['in_channels'],
-                            **_sidecar_kwargs(merged, games_npz))
-        return SupervisedDataset(merged, n_channels=KATAGO_SE_CFG['in_channels'])
-    if locals().get('v7_board_level'):
         from src.data.v7_dataset import V7Dataset
-        # `load_dataset` 返回的是**已构造好的 SupervisedDataset**，不是 dict。
-        # V7Dataset 是它的子类且只多两样东西（重建历史列 + 22 通道装配），
-        # 所以直接搬它已加载好的数组，比重新 np.load 一遍 469 MB 划算得多。
-        base = load_dataset(path)
-        return V7Dataset({k: getattr(base, k) for k in (
-            'boards', 'my_hist', 'op_hist', 'ko', 'moves', 'values', 'to_play',
-            'game_ids', 'game_weights', 'winrates') if hasattr(base, k)},
-            n_channels=KATAGO_SE_CFG['in_channels'],
-            **_sidecar_kwargs(base, games_npz))
-    return load_dataset(path)
+        return V7Dataset(merged, **_sidecar_kwargs(merged, games_npz))
+    from src.data.v7_dataset import V7Dataset
+    # `load_dataset` 返回的是**已构造好的 SupervisedDataset**，不是 dict。
+    # V7Dataset 是它的子类且只多两样东西（重建历史列 + 22 通道装配），
+    # 所以直接搬它已加载好的数组，比重新 np.load 一遍 469 MB 划算得多。
+    base = load_dataset(path)
+    return V7Dataset({k: getattr(base, k) for k in (
+        'boards', 'my_hist', 'op_hist', 'ko', 'moves', 'values', 'to_play',
+        'game_ids', 'game_weights', 'winrates') if hasattr(base, k)},
+        **_sidecar_kwargs(base, games_npz))
 
 
 _worker_dataset = None  # multiprocessing worker 进程中由 initializer 设置
@@ -2392,9 +2288,9 @@ class _BatchPrefetcher:
         # 护栏：**绝不能在设备运行时初始化之后**构造本类（fork 出的 worker 会继承设备
         # 上下文导致 OOM，2026-09-30）。`mp.Process` 默认 fork，子进程会整份继承父
         # 进程的 /CUDA 上下文与已分配显存映射 ⇒ 4 个 worker 各继承一份 ≈ 24 GiB，
-        # 而 PyTorch 自己只记 6.3 GB（实测 HBM 94% / 计算单元 0%）。GC 管不到
-        # 别的进程继承来的映射。正确做法见 main()：数据集加载与本类的构造都在
-        # `torch.cuda.set_device` **之前**。
+        # 而 PyTorch 自己只记 6.3 GB（实测 HBM 94% / 计算单元 0%）。这份继承
+        # 来的映射不在本进程账本里，回收不掉。正确做法见 main()：数据集加载与本类
+        # 的构造都在 `torch.cuda.set_device` **之前**。
         for _dev in ('cuda',):
             _is_init = getattr(getattr(torch, _dev, None), 'is_initialized', None)
             try:
@@ -2550,82 +2446,45 @@ def _init_swanlab(args, logger):
         if api_key:
             swanlab.login(api_key=api_key, save=True)
             logger.info("[swanlab] API key 已设置，自动登录")
-        # config 面板记的必须是**真值**：结构一律取 `KATAGO_SE_CFG`（唯一真相源），
+        # config 面板记的必须是**真值**：结构一律取 `NBT_TF_CFG`（唯一真相源），
         # **不记**任何已归档的 CLI 结构 flag（backbone_channels / res_blocks /
         # convnext_blocks / attn_blocks / value_channels / value_res_blocks /
         # policy_channels / policy_layers …）—— 它们完全不参与建网，记进去就是
         # 虚构值，而 config 面板恰恰是对比两次 run 时第一个看的东西。
-        # `blocks` 那个描述串同理：从真形状数出来（se×13 + attn×4），不是抄配置。
+        # `blocks` 那个描述串同理：从真形状数出来，不是抄配置。
         # 单卡训练：world_size 恒为 1。
         _accum = max(1, int(args.gradient_accumulation_steps))
         swanlab.init(
             project="go-ai",
             name=f"sft_{args.board_size}x{args.board_size}_{args.ver}",
             config={
-                # ---- 结构：新架构真值（唯一真相源是 KATAGO_SE_CFG）----
-                # **按 `--v7` 分派**（2026-10-04）：此前这一段无条件记 12 通道的
-                #   数字，于是**每个 V7 run 的 config 面板都写着
-                #   `in_channels: 12` / `params_total: 9,112,005`**，而它实际训练的是
-                #   22 通道 / 10,529,929。面板恰恰是对比两次 run 时第一个看的东西，
-                #   给它虚构值比不给更糟（正是本段原注释要防的那件事，只是当时
-                #   只考虑了「归档 flag」，没考虑「另一个架构」）。
-                # V7 的结构取 `NBT_TF_CFG`（唯一真相源），**不引 args** ——
-                #     args 里那些是归档 flag，引用它们等于把面板填成虚构值。
-                # `arch/params_total` 在 V7 下取 `NBT_TF_CFG` 的**预算值**
-                #     5,561,832，而实测建出来的模型是 **10,529,929**（差 289，
-                #     见 `tests/test_katago_v7_budget.py`）。面板记预算、真实值由
-                #     run 级 `run/params_actual` 给（那里模型已经建好）。
-                "arch/v7": bool(args.v7),
-                "arch/in_channels": (NBT_TF_CFG['in_channels'] if args.v7
-                                    else KATAGO_SE_CFG['in_channels']),
-                "arch/name": ("nbt_tf" if args.v7 else KATAGO_SE_CFG['arch']),
-                "arch/channels": (NBT_TF_CFG['trunk_channels'] if args.v7
-                                else KATAGO_SE_CFG['channels']),
-                # V7 另有一份 19 维全局输入（12 通道路径没有这个概念）
-                "arch/global_channels": (NBT_TF_CFG['global_channels']
-                                        if args.v7 else 0),
-                # 段内块描述串：从真形状数出来（12 通道是 se×13 + attn×4，
-                # V7 是 nbt2 × 11 段、每段含 2 个 inner 块），不是抄配置
-                "arch/blocks": (("nbt%d_inner%d_x%d"
+                # ---- 结构：唯一真相源是 NBT_TF_CFG，**不引 args** ----
+                "arch/v7": True,
+                "arch/in_channels": NBT_TF_CFG['in_channels'],
+                "arch/name": "nbt_tf",
+                "arch/channels": NBT_TF_CFG['trunk_channels'],
+                "arch/global_channels": NBT_TF_CFG['global_channels'],
+                # 段内块描述串：从真形状数出来（nbt2 × 10 段、每段 2 个 inner 块）
+                "arch/blocks": ("nbt%d_inner%d_x%d"
                                 % (NBT_TF_CFG['num_blocks'],
                                     NBT_TF_CFG['num_inner_blocks'],
-                                    NBT_TF_CFG['board_size']))
-                                if args.v7
-                                else "se13_attn4_of_%d" % KATAGO_SE_CFG['blocks']),
-                "arch/attention_mode": (("nbt+transformer_%dhead"
-                                        % NBT_TF_CFG['num_heads']) if args.v7
-                                    else KATAGO_SE_CFG['attention_mode']),
-                "arch/num_attention_layers": (
-                    NBT_TF_CFG['num_blocks'] if args.v7
-                    else KATAGO_SE_CFG['num_attention_layers']),
-                "arch/num_heads": (NBT_TF_CFG['num_heads'] if args.v7
-                                else KATAGO_SE_CFG['num_heads']),
-                # 注意力块里 FFN 的中间维 = 2×通道（12 通道）／显式 384（V7）
-                "arch/attn_ffn_hidden": (NBT_TF_CFG['ffn_hidden'] if args.v7
-                                        else KATAGO_SE_CFG['channels'] * 2),
-                # SE 瓶颈块的中段宽 = 通道/2（SEBottleneck 默认 mid_channels）；
-                # V7 没有这个结构，填 0 而不是编一个
-                "arch/se_mid_channels": (0 if args.v7
-                                        else KATAGO_SE_CFG['channels'] // 2),
-                "arch/params_total": (NBT_TF_CFG['params_total'] if args.v7
-                                    else KATAGO_SE_CFG['params_total']),
-                "arch/params_backbone": (NBT_TF_CFG['params_blocks_total']
-                                        if args.v7
-                                        else KATAGO_SE_CFG['params_backbone']),
-                # ---- V7 特有的头/输出维度（12 通道路径一律 0）----
+                                    NBT_TF_CFG['board_size'])),
+                "arch/attention_mode": ("nbt+transformer_%dhead"
+                                        % NBT_TF_CFG['num_heads']),
+                "arch/num_attention_layers": NBT_TF_CFG['num_blocks'],
+                "arch/num_heads": NBT_TF_CFG['num_heads'],
+                "arch/attn_ffn_hidden": NBT_TF_CFG['ffn_hidden'],
+                "arch/params_total": NBT_TF_CFG['params_total'],
+                "arch/params_backbone": NBT_TF_CFG['params_blocks_total'],
+                # ---- V7 特有的头/输出维度 ----
                 # 键名**刻意避开** `value_channels` / `policy_channels`：
                 #   `tests/test_swanlab_metrics.py::test_config_panel_has_no_archived_flags`
-                #   按**引号内字面量**判归档 flag 泄漏，写 `NBT_TF_CFG['value_channels']`
-                #   会让那条门禁误报（它要禁的是 args 上的归档开关，不是 V7 的
-                #   真实结构键）。这里改用 V7 自己的键名，不改名也不绕。
-                "arch/seki_classes": (NBT_TF_CFG['seki_classes'] if args.v7 else 0),
-                "arch/futurepos_ch": (NBT_TF_CFG['futurepos_channels']
-                                    if args.v7 else 0),
+                #   按**引号内字面量**判归档 flag 泄漏。这里改用 V7 自己的键名。
+                "arch/seki_classes": NBT_TF_CFG['seki_classes'],
+                "arch/futurepos_ch": NBT_TF_CFG['futurepos_channels'],
                 "arch/score_distr_bins": (2 * (NBT_TF_CFG['board_size'] ** 2
-                                            + NBT_TF_CFG['extra_score_distr_radius'])
-                                        if args.v7 else 0),
-                "arch/policy_outputs": (NBT_TF_CFG['policy_outputs']
-                                        if args.v7 else 1),
+                                            + NBT_TF_CFG['extra_score_distr_radius'])),
+                "arch/policy_outputs": NBT_TF_CFG['policy_outputs'],
                 # ---- batch/lr：有效 batch 含累积（漏乘会把学习率口径搞错）----
                 "batch_size_per_card": args.batch_size,
                 "grad_accum": _accum,
@@ -2678,7 +2537,7 @@ def _init_swanlab(args, logger):
                 # ---- 局级 sidecar（2026-10-04）----
                 # A/B 段不给它 ⇒ 逐局贴目按 0 ⇒ 全局 ch5 恒 0、ch18 三角波走偏。
                 # 面板记它是为了「对比两次 run」时能一眼看出那次是不是忘了给。
-                "data/games_npz": (args.games_npz or "") if args.v7 else "",
+                "data/games_npz": args.games_npz or "",
                 # C 段（stdata 分片）的贴目在行里，多给无意义 ⇒ 这里记 0 表示
                 # 「不适用」，而不是把空串与「忘了给」混成同一个值
                 "prefetch_workers": args.prefetch_workers,
@@ -3097,10 +2956,10 @@ def _build_param_groups(model, args) -> list[dict]:
     这两条判据双双失效的东西）。
 
     ---- V7（`NbtTfNet`）：value 头叫 `value_head`，不是 `value` ----------------
-    V7 的子模块命名与 `AlphaGoNet` 不同（`value_head` / `scorebelief_head` /
-    `policy_head`），而 `_build_param_groups` 的两条判据都写死在 `'value.'` 前缀
-    与 `model.value` 上。`getattr(model, 'value', None)` 在 V7 上是 `None` ⇒ 直接
-    找 `value_head`。 `scorebelief_head` **不**放进 value 组：它的行权重（`w_score`）
+    V7 的子模块命名是 `value_head` / `scorebelief_head` / `policy_head`，而
+    `_build_param_groups` 的两条判据都写死在 `'value.'` 前缀与 `model.value` 上。
+    `getattr(model, 'value', None)` 在 V7 上是 `None` ⇒ 直接找 `value_head`。
+    `scorebelief_head` **不**放进 value 组：它的行权重（`w_score`）
     在段 1 是 0、段 2/3 才打开，而它的输入是 `value_pooled`（已经过池化），
     与 19×19 平面小头（ownership / scoring / futurepos / seki）不同层 —— 混在一
     组里会让「value 头 LR 倍数」的含义随段位漂移。它留在 `other_*` 组里。
@@ -3111,18 +2970,15 @@ def _build_param_groups(model, args) -> list[dict]:
     if value_mod is None:
         raise ValueError(
             f'{type(model).__name__} 上既没有 .value 也没有 .value_head：'
-            f'无法划分 value 头的参数组（旧结构是 AlphaGoNet.value，V7 是 '
-            f'NbtTfNet.value_head）')
+            f'无法划分 value 头的参数组（V7 是 NbtTfNet.value_head）')
     no_decay_params = {p for p in model.parameters() if p.ndim == 1}
     value_params = {p for p in value_mod.parameters()}
     value_decay = [p for p in value_mod.parameters() if p not in no_decay_params]
     value_no_decay = [p for p in value_mod.parameters() if p in no_decay_params]
     # `other_*` 的排除条件是「前缀不是 'value.'」**且**「对象不属于 value 头」——
-    # 两个条件缺一不可：前缀条件对 AlphaGoNet 是充分的，但对 V7 无效
-    # （V7 的头叫 `value_head.`，不匹配 `'value.'`），少了对象条件就会让
-    # `value_head.*` 同时落进 value 组与 other 组 —— 也就是**同一个参数出现两次**
-    # （AdamW 会照单全收，梯度被更新两遍）。对象条件对 AlphaGoNet 是**空操作**
-    # （没有跨模块共享的参数），所以默认路径逐位不变。
+    # 两个条件缺一不可：V7 的头叫 `value_head.`，不匹配 `'value.'`，少了对象
+    # 条件就会让 `value_head.*` 同时落进 value 组与 other 组 —— 也就是**同一个
+    # 参数出现两次**（AdamW 会照单全收，梯度被更新两遍）。
     other_decay = [p for n, p in model.named_parameters()
                 if not n.startswith('value.') and p not in value_params
                 and p not in no_decay_params]
@@ -3771,11 +3627,11 @@ def main():
     #   —— 段位权重是**代码里的常量表**（`V7_STAGE1_SCORE_TERMS`），不是 CLI。
     #   加成 CLI 会让「段 1 不训 score」变成一个可以被人顺手关掉的参数，而那条
     #   判据的依据是数据集事实（81.09% 的 SGF 是认输），不是调参口味。
-    ap.add_argument('--v7', type=int, default=0, choices=[0, 1],
-                    help='启用 V7 的 22 通道 NBT+Transformer 路径'
-                        '（NbtTfNet + 12 项 KataGoV7Loss，0=关闭=12 通道旧路径，'
-                        '**默认**；1=开启）。开启时：特征改由 feature_v7 的 '
-                        'spatial_channels_v7/global_features_v7 在预取 worker 里造，'
+    ap.add_argument('--v7', type=int, default=1, choices=[0, 1],
+                    help='只支持 1（V7 的 22 通道 NBT+Transformer 路径）。'
+                        '旧的 12 通道 SE 模型已删除，--v7 0 会被拒绝。'
+                        '特征由 feature_v7 的 spatial_channels_v7/'
+                        'global_features_v7 在预取 worker 里造，'
                         'futurepos 自动 enable 并在**父进程 fork 前 warm**，'
                         '段 1 的四个目标 = policy / π_opp / value / futurepos，'
                         'score 系权重 0 但结构保留。'
@@ -3785,6 +3641,8 @@ def main():
                         '`policy_player`（人类 one-hot），软标签是段 2 的口径，'
                         '两条都开会静默互相覆盖 —— 给了就报错。')
     args = ap.parse_args()
+    if args.v7 != 1:
+        ap.error('12 通道 SE 模型已删除，只支持 --v7 1')
 
     # 单卡训练：rank 恒为 0、is_main 恒为 True（仅用于日志过滤，无分布式语义）。
     rank = 0
@@ -3826,7 +3684,7 @@ def main():
     # ---- B8 · V7：坏组合在加载数据集**之前**就拒掉 ----------------------------
     # 理由与上面 A4 那一段完全一样：等到第一个 batch 才炸，代价是先花几分钟把
     # 12.3 GB 灌进内存。四条约束逐条对应下面代码里的一个硬假设。
-    _v7_on = bool(args.v7)
+    _v7_on = True
     if _v7_on:
         if args.board_size != V7_BOARD_SIZE:
             # 不是「警告后继续」：`KataGoV7Loss.forward` 里 `n_sq = 19 * 19` 与
@@ -3851,8 +3709,7 @@ def main():
         if args.value_loss_weight != 1.0:
             logger.warning("[v7] --value-loss-weight=%s 在 V7 上**无效**：V7 的"
                         "value 是 `KataGoV7Loss` 内的 3 分类 CE（#3，系数 1.20），"
-                        "不经 `compute_value_loss`。该参数只作用于 12 通道路径。",
-                        args.value_loss_weight)
+                        "不经 `compute_value_loss`。", args.value_loss_weight)
         args.value_loss_weight = 1.0
         args.label_smoothing = 0.0
         args.policy_loss = 'ce'
@@ -3860,12 +3717,11 @@ def main():
         logger.info("[v7] 已启用 22 通道 V7 路径 | board=%d | 段 1 四目标=%s | "
                     "score 系权重 0（结构保留）",
                     V7_BOARD_SIZE, ' / '.join(V7_STAGE1_TERMS))
-        logger.info("[v7] 验证集评估：走 `evaluate_metrics_v7`（22 通道 + dict 返回，"
-                        "口径 top1/top5/top10/kl/brier 与 12 通道版同名同义）"
+        logger.info("[v7] 验证集评估：走 `evaluate_metrics_v7`（22 通道 + dict 返回）"
                         "⇒ `--early-stop` 与 best-model 判据均**生效**。")
         if args.export_onnx == 1:
-            logger.warning("[v7] --export-onnx 走 `GoAI`，它是 12 通道推理链；"
-                        "V7 需要另一条导出路径（本次未接），导出结果不可用。")
+            logger.warning("[v7] --export-onnx 走 `GoAI`；V7 需要另一条导出路径"
+                        "（本次未接），导出结果不可用。")
 
     logger.info("=" * 60)
     _check_training_env(logger)
@@ -4261,74 +4117,46 @@ def main():
     # （原 `train_sampler = None` 是 DDP 移除后的残留，删于 2026-10-11。）
 
 # ------------------------------------------------------ 结构（唯一）----
-    # 训练结构**唯一** = `KATAGO_SE_CFG`（本文件顶部那张表，KataGo
-    # SE-bottleneck 路线，形状喂给 `AlphaGoNet`）。
+    # 训练结构**唯一** = V7（`NBT_TF_CFG`）。
     # 旧结构 flag（--arch / --backbone-channels / --res-blocks / --policy-layers …
     # 与下面这一整串）**全部归档：不参与建网**，仍被 argparse 接受只为旧 shell
     # 不必改命令行（忽略而非报错，是这条约束的硬要求；运行日志里那句
     # 「结构参数已归档」就是这里）。
-    # 没有任何 arch 分支、也没有新增任何 CLI。
     _v7_lossf = None
-    if _v7_on:
-        # ---- B8 · V7（22 通道 NBT+Transformer）----------------------------
-        # 形状**只**由 `NBT_TF_CFG` 决定（in_channels=22 / global_channels=19 /
-        # board_size=19），与 CLI 上那些已归档的 12 通道结构旗无关。`--attention-dropout`
-        # 仍是行为参数，照旧透传（V7 的默认是 0.0）。
-        model, _eff_cfg = build_katago_v7_net(
-            board_size=V7_BOARD_SIZE,
-            attn_dropout=args.attention_dropout,
-        )
-        _v7_lossf = build_v7_stage1_loss(
-            action_size=args.board_size * args.board_size + 1).to(device)
-        # 启动前就把注意力显存算清楚（batch 3000 ⇒ 68.8 GB，真机实测 64 GB）
-        if is_main:
-            from src.networks.katago_v7 import MHSA as _MHSA
-            _n_att = sum(1 for m in model.modules() if isinstance(m, _MHSA))
-            v7_batch_memory_advice(
-                args, logger, device, n_layers=_n_att,
-                heads=NBT_TF_CFG['num_heads'],
-                tokens=V7_BOARD_SIZE * V7_BOARD_SIZE)
-    else:
-        model, _eff_cfg = build_katago_se_net(
-            action_size=args.board_size * args.board_size + 1,  # +1 为 pass 类别
-            attention_dropout=args.attention_dropout,           # 行为参数，仍生效
-        )
+    # ---- V7（22 通道 NBT+Transformer）------------------------------------
+    # 形状**只**由 `NBT_TF_CFG` 决定（in_channels=22 / global_channels=19 /
+    # board_size=19），与 CLI 上那些已归档的结构旗无关。`--attention-dropout`
+    # 仍是行为参数，照旧透传（V7 的默认是 0.0）。
+    model, _eff_cfg = build_katago_v7_net(
+        board_size=V7_BOARD_SIZE,
+        attn_dropout=args.attention_dropout,
+    )
+    _v7_lossf = build_v7_stage1_loss(
+        action_size=args.board_size * args.board_size + 1).to(device)
+    # 启动前就把注意力显存算清楚（batch 3000 ⇒ 68.8 GB，真机实测 64 GB）
+    if is_main:
+        from src.networks.katago_v7 import MHSA as _MHSA
+        _n_att = sum(1 for m in model.modules() if isinstance(m, _MHSA))
+        v7_batch_memory_advice(
+            args, logger, device, n_layers=_n_att,
+            heads=NBT_TF_CFG['num_heads'],
+            tokens=V7_BOARD_SIZE * V7_BOARD_SIZE)
     model = model.to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    # V7 没有 `backbone` 子模块（11 个 `Nbt2TransformerBlock` 直接挂在 `blocks`
-    # 上），主干参数量按「全网 − 三个头」算；12 通道路径仍读 `model.backbone`。
-    if _v7_on:
-        _n_backbone = n_params - sum(
-            sum(p.numel() for p in m.parameters())
-            for m in (model.policy_head, model.value_head, model.scorebelief_head))
-    else:
-        _n_backbone = sum(p.numel() for p in model.backbone.parameters())
-        # 实测 vs 锚：改了 `KATAGO_SE_CFG` 之后这两个数必须重数（构建器返回的
-        # `_eff_cfg` 里也有一份）。对不上说明表被改过而锚没更新 —— 直接在这里响，
-        # 别等到几天后拿一个「莫名涨了 2M 参数」的 run 去比 loss。
-        if (n_params, _n_backbone) != (_eff_cfg['params_total'],
-                                    _eff_cfg['params_backbone']):
-            logger.warning(
-                "[model] 参数量与 KATAGO_SE_CFG 的预算锚不符：实测 %d / %d"
-                "（全网 / 主干），锚 %d / %d。改了结构表就要重数这两个数。",
-                n_params, _n_backbone,
-                _eff_cfg['params_total'], _eff_cfg['params_backbone'])
-    if _v7_on:
-        # 预算锚不在本表里（`NBT_TF_CFG` 带的是 stem/block/head 的**分项**锚，
-        # 主干合计与全网合计由 tests/test_katago_v7_budget.py 钉），所以这里
-        # 只打实测值并指向那个测试，不做「与锚不符」的判定 —— 否则每次都误报。
-        logger.info("[model] v7 NBT2+Transformer (%dch / %d 段 / %d 头 / %dch 空间"
-                    "+%dch 全局) 参数量=%.2fM（主干 %.2fM）"
-                    " | 设备=%s（预算锚见 tests/test_katago_v7_budget.py）",
-                    _eff_cfg['trunk_channels'], _eff_cfg['num_blocks'],
-                    _eff_cfg['num_heads'], V7_SPATIAL_CHANNELS, V7_GLOBAL_CHANNELS,
-                    n_params / 1e6, _n_backbone / 1e6, device)
-    else:
-        logger.info("[model] %s (%dch / %d 段 / mix+%d 注意力) 参数量=%.2fM"
-                    "（主干 %.2fM）| 设备=%s",
-                    _eff_cfg['arch'], _eff_cfg['channels'], _eff_cfg['blocks'],
-                    _eff_cfg['num_attention_layers'],
-                    n_params / 1e6, _n_backbone / 1e6, device)
+    # V7 没有 `backbone` 子模块（`Nbt2TransformerBlock` 直接挂在 `blocks` 上），
+    # 主干参数量按「全网 − 三个头」算。
+    _n_backbone = n_params - sum(
+        sum(p.numel() for p in m.parameters())
+        for m in (model.policy_head, model.value_head, model.scorebelief_head))
+    # 预算锚不在本表里（`NBT_TF_CFG` 带的是 stem/block/head 的**分项**锚，
+    # 主干合计与全网合计由 tests/test_katago_v7_budget.py 钉），所以这里
+    # 只打实测值并指向那个测试，不做「与锚不符」的判定 —— 否则每次都误报。
+    logger.info("[model] v7 NBT2+Transformer (%dch / %d 段 / %d 头 / %dch 空间"
+                "+%dch 全局) 参数量=%.2fM（主干 %.2fM）"
+                " | 设备=%s（预算锚见 tests/test_katago_v7_budget.py）",
+                _eff_cfg['trunk_channels'], _eff_cfg['num_blocks'],
+                _eff_cfg['num_heads'], V7_SPATIAL_CHANNELS, V7_GLOBAL_CHANNELS,
+                n_params / 1e6, _n_backbone / 1e6, device)
 
 
     # 把卷积型特征（N,C,H,W）转 channels_last(NHWC)，卷积算子走更快内存布局。
@@ -4399,9 +4227,8 @@ def main():
     # scheduler 首次 step 在第一个 optimizer.step() 之后执行，避免 PyTorch 警告
 
     bs = args.batch_size
-    # V7 的动作空间（+1 为 pass 类别）。与 `build_katago_se_net` 的算法式
-    # `board_size*board_size+1` 同源，但在 V7 上它同时是 `KataGoV7Loss` 的
-    # `action_size`（policy_logits 的最后一维）⇒ 必须一致，故取自同一个常量。
+    # V7 的动作空间（+1 为 pass 类别）。它同时是 `KataGoV7Loss` 的
+    # `action_size`（policy_logits 的最后一维）⇒ 必须一致。
     _v7_action_size = args.board_size * args.board_size + 1
     # V7 的逐项 loss（沿用上一次 micro-batch 的值，供打点用；与 `_health_last`
     # 同样的「跨 micro-batch 沿用」语义）。空 dict = 还没跑过任何一步。
@@ -4580,14 +4407,9 @@ def main():
                 fp16/bf16，FP32 直灌会报 "FlashAttention only support fp16 and
                 bf16 data type"，被误判成 compile 不可用而静默回退 eager。
                 """
-                if _v7_on:
-                    _x = (torch.zeros(1, V7_SPATIAL_CHANNELS, args.board_size,
-                                      args.board_size, device=device),
-                          torch.zeros(1, V7_GLOBAL_CHANNELS, device=device))
-                else:
-                    _x = (torch.zeros(1, KATAGO_SE_CFG['in_channels'],
-                                      args.board_size, args.board_size,
-                                      device=device),)
+                _x = (torch.zeros(1, V7_SPATIAL_CHANNELS, args.board_size,
+                                  args.board_size, device=device),
+                      torch.zeros(1, V7_GLOBAL_CHANNELS, device=device))
                 # 次数必须是**真实的 accum**：cudagraph 与梯度累积的冲突按
                 # 「前向了几次才 backward」触发，只跑 2 次抓不到 8 次的情形
                 # （2026-10-13 真机实测：2 次探热顺利通过，8 次照旧在 backward 炸）。
@@ -4595,10 +4417,7 @@ def main():
                 with maybe_autocast(device, amp_dtype):
                     for _ in range(_n_fwd):
                         out = _m(*_x)
-                if isinstance(out, dict):
-                    _probe_loss = sum(v.float().square().mean() for v in out.values())
-                else:  # 12-通路：forward 返回 (policy_logits, value_logit)
-                    _probe_loss = sum(v.float().square().mean() for v in out)
+                _probe_loss = sum(v.float().square().mean() for v in out.values())
                 _probe_loss.backward()
                 _m.zero_grad(set_to_none=True)
 

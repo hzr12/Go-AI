@@ -80,10 +80,8 @@ class _FakeV7(nn.Module):
 def v7_ai(tmp_path):
     """注册 22 通道假 V7 builder，并造一份真 checkpoint 让 `GoAI` 推出 22。
 
-    走「存 checkpoint 再加载」而不是给 `GoAI` 直接传通道数：`GoAI` 无 checkpoint
-    时把 `in_channels` 硬编码成 12（那是刻意的零回归默认），所以想测 22 就必须
-    让它从 stem 形状**推断**出来 —— 这也顺带覆盖了 `_infer_in_channels` 放行 22
-    这条新路径。做法与 `test_mcts_in_channels._make_ckpt` 一致。
+    走「存 checkpoint 再加载」而不是给 `GoAI` 直接传通道数：加载时通道数由
+    stem 形状推断（`_infer_in_channels` 的 22 档），顺带覆盖这条路径。
     """
     from src import inference as inf
     saved = dict(inf._IN_CHANNEL_BUILDERS)
@@ -201,18 +199,6 @@ def test_giving_only_planes_is_rejected(v7_ai):
     with pytest.raises(RuntimeError, match="只给了一路"):
         v7_ai.predict_batch([(b, [-1, -1, -1], [-1, -1, -1], 1,
                               np.zeros((22, N, N), np.float16))])
-
-
-def test_giving_globals_to_a_non_v7_model_is_rejected():
-    """非 V7 模型收到全局输入 = 调用方搞错了对象，必须响亮。"""
-    ai = GoAI(model_path=None, device="cpu", use_amp=False)
-    assert not ai.needs_global_features
-    b = GoBoard(N)
-    b.play(61)
-    with pytest.raises(RuntimeError, match="没有第二路输入"):
-        ai.predict_batch([(b, [-1, -1, -1], [-1, -1, -1], 1,
-                           np.zeros((12, N, N), np.float16),
-                           np.zeros(19, np.float16))])
 
 
 def test_second_input_actually_reaches_the_model(v7_ai):
@@ -413,24 +399,6 @@ def test_search_features_use_the_v7_training_history_order(v7_ai):
     assert _pt(9) == (15, 15), "ch9 应是对方最近一手 Q16，实得 %r" % (_pt(9),)
     assert _pt(10) in ((4, 4), (15, 4)), \
         "ch10 应是我方最近一手 D5 或 Q5，实得 %r" % (_pt(10),)
-
-
-# --------------------------------------------------------------------------- #
-# 7. 12 通道路径零回归
-# --------------------------------------------------------------------------- #
-def test_12_channel_path_is_untouched():
-    """12 通道模型仍走 feature_planes，且**不**被要求提供全局输入。"""
-    ai = GoAI(model_path=None, device="cpu", use_amp=False)
-    assert ai.in_channels == 12 and not ai.needs_global_features
-    m = MCTS(ai, board_size=N, num_threads=1, expand_topk=8)
-    assert not m._v7
-    b = GoBoard(N)
-    b.play(61)
-    sp, gl = m._feature_inputs(b, [-1, -1, -1], [-1, -1, -1], 1)
-    assert sp.shape[0] == 12, sp.shape
-    assert gl is None, "12 通道不该有全局输入"
-    visits, probs, rv = m.search(b, [-1, -1, -1], [-1, -1, -1], 1, simulations=8)
-    assert _legal(b, int(np.argmax(visits)))
 
 
 # --------------------------------------------------------------------------- #

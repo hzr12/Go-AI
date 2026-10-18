@@ -82,7 +82,7 @@ from src.game.go_rules import GoBoard                  # noqa: E402
 TRAIN_SRC = os.path.join(ROOT, 'scripts', 'train_sft.py')
 TRAIN_SRC_TEXT = open(TRAIN_SRC, encoding='utf-8').read()
 
-BOARD = 9                # 9 路小棋盘（与 tests/test_attn_dropout_eval.py 一致，CPU 秒级）
+BOARD = 9                # 9 路小棋盘（CPU 秒级）
 BS2 = BOARD * BOARD      # 81：pass/越界标签的取值
 AMP = torch.float32
 EVAL_BS = 4              # 假 batch size

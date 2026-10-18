@@ -4,14 +4,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# 绝对导入而非 `from .se_bottleneck import …`：
-# `tests/test_backbone_block_classes.py` 用 `spec_from_file_location` 把本文件
-# **当独立脚本**加载（没有包上下文），相对导入会 `ImportError: attempted relative
-# import with no known parent package`。绝对导入与本仓其余跨包引用的写法一致
-# （见 `src/inference.py` / `src/search/*.py`），两条路径都能过。
-from src.networks.se_bottleneck import SEBottleneck
-
-
 class RMSNorm(nn.Module):
     """RMSNorm（兼容 PyTorch 2.1，不依赖 nn.RMSNorm）。
 
@@ -115,7 +107,7 @@ def _segment_runner(blocks, taps_want):
         for i, blk in enumerate(blocks):
             out = blk(*cur)
             # 段内的块不必是同一个签名：单输入块（如 `ResBlock` /
-            # `TransformerBlock` / `SEBottleneck`）收 `(x,)`，多输入块收
+            # `TransformerBlock`）收 `(x,)`，多输入块收
             # `(x, taps)` 并只返回新的 x。规则：
             # 返回张量 -> 只替换**第一个**实参、保留其余（`taps` 沿途不变）；
             # 返回 tuple -> 实参个数跟着返回值走。不假设整段同签名。
@@ -286,12 +278,10 @@ _attn_query_chunk = 64
 #: **默认 False**，虽然它已可用且有测试覆盖。三个理由：
 #:
 #: 1. **它不是逐位等价的** —— online 走 rescale 累加、materialize 走一次
-#:    softmax，算术次序不同，实测 fp32 下 `max|Δ| ≈ 7e-07`。而
-#:    `tests/test_mcts_in_channels.py::test_twelve_channel_path_bit_identical`
-#:    正是靠 12 通道路径**逐位一致**来发现意外的数值变化；默认打开会让那条
-#:    基线失效（实测 `search50_value` 漂到第 8 位有效数字）。
+#:    softmax，算术次序不同，实测 fp32 下 `max|Δ| ≈ 7e-07`；默认打开会让既有的
+#:    逐位基线失效。
 #: 2. **真机未验证** —— bf16/fp16 内核在 910A 上的实际加速比与数值稳定性都还没有
-#:    数据，而 12 通道的 window/sparse 路径也走这里。
+#:    数据。
 #: 3. `dropout_p > 0` 时它本来就会回退 materialize（V7 的 `attn_dropout` 默认
 #:    0.0，所以这条不构成日常约束）—— 也就是说它**总是**在关键路径上生效，
 #:    默认开关必须保守。
@@ -824,7 +814,6 @@ class SharedBackbone(nn.Module):
             attn_mode:         注意力计算模式 "global"|"window"|"axial"
             attn_window:       window 模式的窗口边长
             arch:              网络架构风格 "resnet" (默认，向后兼容) | "convnext"
-                                 | "se_bottleneck"（KataGo 风格 bottleneck+SE）
             res_blocks:        ResBlock 数量（浅层，局部细节），0 表示使用默认模式
             convnext_blocks:   ConvNeXtBlock 数量（中层，大感受野），0 表示使用默认模式
             attn_blocks:       AttentionResBlock 数量（深层，全局关系），0 表示使用默认模式
@@ -869,8 +858,6 @@ class SharedBackbone(nn.Module):
         if mode == "none" or num_attn <= 0:
             if arch == "convnext":
                 return [ConvNeXtBlock(channels) for _ in range(num_res_blocks)]
-            if arch == "se_bottleneck":
-                return [SEBottleneck(channels) for _ in range(num_res_blocks)]
             return [ResBlock(channels) for _ in range(num_res_blocks)]
         if mode == "all":
             return [AttentionResBlock(channels, num_heads, dropout, attn_mode, attn_window)
@@ -889,8 +876,6 @@ class SharedBackbone(nn.Module):
             else:
                 if arch == "convnext":
                     blocks.append(ConvNeXtBlock(channels))
-                elif arch == "se_bottleneck":
-                    blocks.append(SEBottleneck(channels))
                 else:
                     blocks.append(ResBlock(channels))
         return blocks
@@ -902,11 +887,9 @@ class SharedBackbone(nn.Module):
         """三段式架构：浅层 ResNet + 中层 ConvNeXt + 深层 Attention"""
         blocks = []
 
-        # 浅层：ResBlock (局部细节)。`arch="se_bottleneck"` 也落在这个槽位：
-        # 段内中/深层分别由 convnext_blocks / attn_blocks 显式指定，不看 arch。
-        shallow_cls = SEBottleneck if arch == "se_bottleneck" else ResBlock
+        # 浅层：ResBlock (局部细节)。
         for _ in range(res_count):
-            blocks.append(shallow_cls(channels))
+            blocks.append(ResBlock(channels))
 
         # 中层：ConvNeXtBlock (大感受野)
         for _ in range(convnext_count):
@@ -957,12 +940,10 @@ class MHSA(MultiHeadSelfAttention):
     ------------------------------------------------------------
     1) 参数预算：父类除融合 qkv 外还自带 `ln1/ln2/ffn/ffn_drop`，直接复用会
        多出一整套本块用不到的 FFN。故不能直接复用父类的 forward。
-    2) **注意力 dropout 的 eval 闸门（P2.2b）**：`_sdpa(..., dropout_p=...)` 是
-       文件级静态锁 `tests/test_attn_dropout_eval.py::test_all_five_attn_dropout_sites_are_gated`
-       的对象，它对本文件做**文件级** AST 扫描并断言取 `self.attn_drop_p` 的
-       `_sdpa` 站点**恰好 4 处**。在 backbone.py 里新增第 5 处 `_sdpa` 站点会
-       让那条既有测试变红。本类因此**不自己调 `_sdpa`**，而是复用父类
-       `_global_attn()`（闸门站点之一，`backbone.py` 内唯一的 global 注意力入口）。
+    2) **注意力 dropout 的 eval 闸门（P2.2b）**：`_sdpa(..., dropout_p=...)` 的
+       每个站点都必须取 `self.attn_drop_p`（eval 时恒 0）。本类因此**不自己调
+       `_sdpa`**，而是复用父类 `_global_attn()`（闸门站点之一，`backbone.py`
+       内唯一的 global 注意力入口）。
        这样既拿到 4 个独立无 bias Linear，又不多造一处未经闸门覆盖的站点。
 
     因此 `__init__` 刻意**不**调用 `MultiHeadSelfAttention.__init__`（那会建出融合
@@ -1053,9 +1034,7 @@ def _sdpa_math(q, k, v, dropout_p=0.0, scale=None):
       ``RuntimeError``）。
 
     闸门在**调用方**那一层，不在这里。所以 eval 下这里的 `dropout_p` 恒为 0.0，
-    行为证据见 `tests/test_attn_dropout_eval.py::
-    test_sdpa_runtime_fallback_respects_eval`（把 SDPA 打桩成必抛，验证 eval
-    下输出逐位可复现、train 下确实在丢）。
+    输出逐位可复现；train 下才真的在丢。
     """
 
     step = _attn_query_chunk

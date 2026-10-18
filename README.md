@@ -85,23 +85,22 @@ ko 规则、计分制度、tax、encore、`passWouldEndPhase`、komi 奇偶三�
 保留理由是严格复刻官方张量布局，未来接官方 checkpoint 零改形状；裁剪只省 0.3% 参数。
 
 **性能闸门**：训练侧（GPU）需 ~2635 行/s，`--prefetch-workers 8` 下每行预算 **3.04 ms**，
-现有 12 通道单盘基线 1.78 ms ⇒ **1.7× 余量**。贵的是 `iterLadders`（3 块盘面）与
+现有单盘基线 1.78 ms ⇒ **1.7× 余量**。贵的是 `iterLadders`（3 块盘面）与
 `calculateArea`（1 块）。
 
 ### 2.3 模型层
 
-**A→B→C 三段共用同一个模型**（`--v7 1` ⇒ `NbtTfNet`，22 通道，5,562,121 参数）。
-`KATAGO_SE_CFG` 那套 12 通道结构（9,112,005 参数）**只在不带 `--v7` 时**才建，
-不再是训练主路。
+**A→B→C 三段共用同一个模型**：`NbtTfNet`（22 输入通道 + 19 全局特征，5,562,121 参数）。
+旧的 12 通道 SE 结构已随代码一并删除。
 
-| | 12 通道（`KATAGO_SE_CFG`，现役默认） | **V7（`NbtTfNet`，A/B/C 共用）** |
-|---|---|---|
-| 输入通道 | 12 | 22 空间 + 19 全局 |
-| 主干 | 240 宽 · 13×SEBottleneck + 4×Attention | `C=256 M=128 H=4 F=384 B=11` nbt2 块 |
-| 归一化 | — | `fson` 固定方差标量 + `rsnh` 末端 RMSNorm，**全网无 BN** |
-| 头 | policy + value | policy(K=2) + value(3 分类 + scoremean/stdev/lead) + ownership + scorebelief(842 桶) |
-| 参数量 | 9,112,005 | **5,562,121**（硬预算 5,850,000，余量 4.9%） |
-| 代码 | `scripts/train_sft.py:444` `KATAGO_SE_CFG` | `src/networks/katago_v7.py` |
+| | **V7（`NbtTfNet`，A/B/C 共用）** |
+|---|---|
+| 输入通道 | 22 空间 + 19 全局 |
+| 主干 | `C=256 M=128 H=4 F=384 B=11` nbt2 块 |
+| 归一化 | `fson` 固定方差标量 + `rsnh` 末端 RMSNorm，**全网无 BN** |
+| 头 | policy(K=2) + value(3 分类 + scoremean/stdev/lead) + ownership + scorebelief(842 桶) |
+| 参数量 | **5,562,121**（硬预算 5,850,000，余量 4.9%） |
+| 代码 | `src/networks/katago_v7.py` |
 
 `NbtTfNet` 已实现并通过预算测试（`tests/test_katago_v7_budget.py` 断言精确值
 5,562,121），`src/inference.py:177` 已 `register_in_channels_builder(22, ...)`。
@@ -114,20 +113,18 @@ ko 规则、计分制度、tax、encore、`passWouldEndPhase`、komi 奇偶三�
 | `data/stdata_v7/`（C 段） | `V7PackedDataset` | 转换时算好并位打包（`spatial_packed`） |
 
 判据是「npz 里有没有 `spatial_packed`」，不是文件名 —— 判错的后果很隐蔽：
-A/B 段会静默退回 12 通道路径，V7 的 22 个平面**根本没参与训练**，
-loss 照降、指标照报，而模型学的是另一个结构。
+数据按错误的布局解出来，loss 照降、指标照报，而模型学的是错的内容。
 `tests/test_v7_single_model.py` 钉住分派结果、22 通道输出、以及
 A→B→C 的 `load_state_dict` 承接（strict 零缺失）。
 
-⚠️ eval / early-stop / best-model 走 `evaluate_metrics_v7`（与 12 通道版同名同义）；
-`--export-onnx` 对 V7 **无效**（走 `GoAI` 的 12 通道推理链），导出见 [§2.5](#25-导出到-kataGo-引擎)。
+⚠️ eval / early-stop / best-model 走 `evaluate_metrics_v7`；
+`--export-onnx` 对 V7 **无效**，导出见 [§2.5](#25-导出到-kataGo-引擎)。
 
 ### 2.4 训练层
 
 - **段 A/B/C SFT**：`scripts/train_sft.py --v7 1`，三段同一个 22 通道模型、
   `--model` 逐段承接（DDP + NCCL + BF16；无 BF16 的旧卡如 V100 / sm_70 才走 fp16+GradScaler）。
-  ⚠️ shell/ 里的 `train_sft_npu_4card_katago_se.sh` 是**NPU 专用**的旧入口
-  （不带 `--v7` 的 12 通道），非 NPU 环境别拿它跑；`run.txt` 里给的是直连 `torchrun` 命令。
+  `run.txt` 里给的是直连 `torchrun` 命令。
 - **⚙️ 调优开关一律是 CLI 参数，没有环境变量**（2026-08 起陆续登记；`GOAI_PROFILE`
   与 `GOAI_PROFILE_STEPS` 是仅有的例外——两个都是诊断开关，与训练配置无关，语义是
   「从第 N 步抓 M 步 kernel 表」，M 默认 50，`M=0` = 起点即终点、在起点后的第一个
@@ -223,9 +220,8 @@ kernel tiling（`ATTN_BLOCK_Q` 256 vs 128、`CHANNELSTRIDE` 2 vs 1），fp16 累
 ### 2.6 推理层
 
 `GoAI`（`src/inference.py`）按权重 stem 的形状读 `in_channels`，
-再查构建器注册表：`22 → NbtTfNet`、`12 → AlphaGoNet`。
-**读不到可识别的 stem 键直接 `RuntimeError`，不静默回退 12**
-（否则会拿随机 12ch 模型装一份陌生架构的权重）。
+再查构建器注册表（现役只有 `22 → NbtTfNet`）。
+**读不到可识别的 stem 键直接 `RuntimeError`，不静默猜一个通道数。**
 搜索侧 MCTS（PUCT + 批量叶子评估 + 虚拟损失）保留给 `webui` / `cli_play` /
 `evaluate` / `eval_elo`；`feature_planes` 取通道数时向所挂模型要，缺失即报错。
 
@@ -408,8 +404,7 @@ soft_cross_entropy(...) = (per_row * mask).mean()   # mask=0 的行贡献 0
 理由：同一个 head 同时收到「搜索分布」与「人类 one-hot」会去**折中**而不是学搜索。
 `mask=0` 的行贡献 0，不是「退化成 one-hot CE」。段 B 用独立采样器**只取软行**。
 
-🔴 两条容易被忽略的对齐口径（V7 与 12 通道**逐位相同**，由
-`tests/test_v7_soft_ce.py` 钉住）：
+🔴 两条容易被忽略的对齐口径（由 `tests/test_v7_soft_ce.py` 钉住）：
 
 - **分母恒为 B**，不是 `Σmask`。若改成 `sum/mask.sum()`，软项量级会随 batch
   组成漂移，`--soft-weight` 这个旋钮就失去意义。

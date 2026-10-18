@@ -24,7 +24,7 @@ import torch
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.train_sft import KATAGO_SE_CFG, build_katago_se_net  # noqa: E402
+from scripts.train_sft import build_katago_v7_net  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -87,7 +87,7 @@ def test_parameters_stay_fp32():
     本轮把激活/重算的计算降到 autocast 精度，但参数本身仍是 fp32；
     这两件事不能一起改，否则 Adam 的更新量在 fp16 下会下溢。
     """
-    net, _cfg = build_katago_se_net(action_size=362)
+    net, _cfg = build_katago_v7_net()
     for name, p in net.named_parameters():
         assert p.dtype == torch.float32, f'{name} 应为 fp32 参数，实为 {p.dtype}'
 

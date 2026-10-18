@@ -2,9 +2,9 @@
 
 守 scripts/webui.py main() 的模型构建段：
   1. **每一个** GoAI(...) 调用点都带 model_path，且其值可溯源到 args.model
-     （双代加载唯一入口，不许被绕开；只查第一个调用点会漏掉后来新增的第二个）
+     （唯一加载入口，不许被绕开；只查第一个调用点会漏掉后来新增的第二个）
   2. 按 main() **推导出的**（不是手抄的）同参构造真加载 checkpoint → 推断 / 前向全通
-  3. 通道数由权重形状驱动（17ch 走 webui 路径也得是 17），不是处处钉死 12
+  3. 通道数由权重形状驱动（V7 是 22），不是处处钉死
   4. 权重文件缺失时回退随机权重（model_path=None 分支）不崩
 
 用例 2/4 的构造参数从 main() 的 AST 现场推导：main() 加一个我们看不懂的参数
@@ -24,9 +24,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from scripts.webui import build_parser
 from src.game.go_rules import GoBoard
 from src.inference import GoAI
-from tests.test_katago_se import _make_ckpt, _register_17_placeholder
 
-N = 9
+N = 19
 REPO = pathlib.Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WEBUI_SRC = (REPO / "scripts" / "webui.py").read_text(encoding="utf-8")
 
@@ -92,14 +91,14 @@ def _main_goai_kwargs(argv):
     return out
 
 
-@pytest.fixture(autouse=True)
-def _restore_registry():
-    """17ch 占位构建器是进程级注册，17ch 用例用完即还原。"""
-    from src import inference as inf
-    saved = dict(inf._IN_CHANNEL_BUILDERS)
-    yield
-    inf._IN_CHANNEL_BUILDERS.clear()
-    inf._IN_CHANNEL_BUILDERS.update(saved)
+def _make_v7_ckpt(tmp_path):
+    """存一份未训练的 V7 权重（22 通道）供加载路径使用。"""
+    from src.networks.katago_v7 import build_katago_v7_net
+    torch.manual_seed(0)
+    net = build_katago_v7_net()
+    path = tmp_path / "v7_19x19.pth"
+    torch.save({"model": net.state_dict()}, path)
+    return str(path)
 
 
 # --------------------------------------------------------------------------- #
@@ -142,7 +141,7 @@ def test_every_webui_goai_call_site_loads_by_checkpoint_path():
 # --------------------------------------------------------------------------- #
 def test_webui_goai_loads_checkpoint_like_main(tmp_path):
     """用 main() 现场推导的参数构造 → 权重逐位进了模型 → 单/批量前向输出合法。"""
-    ck = _make_ckpt(tmp_path, 12)
+    ck = _make_v7_ckpt(tmp_path)
     argv = ["--model", ck, "--board-size", str(N), "--device", "cpu"]
     kwargs = _main_goai_kwargs(argv)
 
@@ -153,12 +152,12 @@ def test_webui_goai_loads_checkpoint_like_main(tmp_path):
     assert kwargs["model_path"] == ck, "model_path 没取到 argparse 的 --model"
 
     ai = GoAI(**kwargs)
-    assert ai.in_channels == 12
+    assert ai.in_channels == 22
     assert ai.board_size == N
     # 权重真的进了模型（抓「加载被跳过/状态字典没解包」这类静默随机权重）
     sd = torch.load(ck, map_location="cpu")["model"]
-    assert torch.equal(ai.model.state_dict()["backbone.conv1.weight"],
-                       sd["backbone.conv1.weight"]), "checkpoint 权重未加载进模型"
+    assert torch.equal(ai.model.state_dict()["stem.weight"],
+                       sd["stem.weight"]), "checkpoint 权重未加载进模型"
     board = GoBoard(N)
     board.play(20)
     pol, val = ai.predict(board, [20, -1, -1], [-1, -1, -1], -1)
@@ -169,46 +168,26 @@ def test_webui_goai_loads_checkpoint_like_main(tmp_path):
     p_b, v_b = ai.predict_batch([(board, [20, -1, -1], [-1, -1, -1], -1)])
     assert p_b.shape == (1, N * N + 1)
     assert v_b.shape == (1,)
-    # 5 元组预计算特征路径（webui MCTS 实际喂的形状）
-    planes = board.feature_planes_batched(
-        board.board[None], [[20, -1, -1]], [[-1, -1, -1]], [-1], [board.ko_point],
-        n_channels=ai.in_channels)[0]
-    p_p, v_p = ai.predict_batch([(None, [20, -1, -1], [-1, -1, -1], -1, planes)])
+    # 6 元组预计算特征路径（V7 的 planes + globals 必须成对）
+    from src.search.v7_features import v7_leaf_features
+    planes, globals_ = v7_leaf_features(
+        board, [20, -1, -1], [-1, -1, -1], -1)
+    p_p, v_p = ai.predict_batch(
+        [(board, [20, -1, -1], [-1, -1, -1], -1, planes, globals_)])
     assert p_p.shape == (1, N * N + 1) and v_p.shape == (1,)
 
 
 # --------------------------------------------------------------------------- #
-# 3. 通道数由权重形状驱动，不是钉死 12
-# --------------------------------------------------------------------------- #
-def test_webui_goai_infers_in_channels_from_checkpoint(tmp_path):
-    """17ch 权重走 webui 的同一入口 → in_channels 必须是 17。
-
-    只测 12ch 默认路径的话，把 GoAI 里的 in_channels 全程写死 12 也能全绿。
-    """
-    _register_17_placeholder()
-    ck = _make_ckpt(tmp_path, 17)
-    ai = GoAI(**_main_goai_kwargs(
-        ["--model", ck, "--board-size", str(N), "--device", "cpu"]))
-    assert ai.in_channels == 17, "webui 路径没有把通道数从权重带进来"
-    assert ai.model.state_dict()["backbone.conv1.weight"].shape[1] == 17
-    board = GoBoard(N)
-    board.play(20)
-    pol, val = ai.predict(board, [-1, -1, -1], [-1, -1, -1], 1)
-    assert pol.shape == (N * N + 1,)
-    assert np.isclose(pol.sum(), 1.0, atol=1e-5)
-
-
-# --------------------------------------------------------------------------- #
-# 4. 权重缺失 → 随机权重分支
+# 3. 权重缺失 → 随机权重分支
 # --------------------------------------------------------------------------- #
 def test_webui_missing_checkpoint_uses_random_weights(tmp_path):
-    """main() 的「文件不存在 → model_path=None」分支：随机权重不崩、默认 12ch。"""
+    """main() 的「文件不存在 → model_path=None」分支：随机权重不崩、默认 22ch。"""
     missing = str(tmp_path / "does_not_exist.pth")
     kwargs = _main_goai_kwargs(
         ["--model", missing, "--board-size", str(N), "--device", "cpu"])
     assert kwargs["model_path"] is None, \
         f"不存在的权重没有回退成 None（main() 的 isfile 守卫没走到）: {kwargs['model_path']}"
     ai = GoAI(**kwargs)
-    assert ai.in_channels == 12
+    assert ai.in_channels == 22
     pol, val = ai.predict(GoBoard(N), [-1, -1, -1], [-1, -1, -1], 1)
     assert pol.shape == (N * N + 1,)

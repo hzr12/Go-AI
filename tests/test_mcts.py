@@ -10,17 +10,31 @@ from src.search.mcts import MCTS
 from src.game.go_rules import GoBoard
 
 
+class _FakeAI:
+    """MCTS 只问 in_channels + predict_batch；V7 固定 19x19，9x9 用均匀先验替身。"""
+
+    in_channels = 17
+
+    def __init__(self, board_size=9):
+        self.n_actions = board_size * board_size + 1
+
+    def predict_batch(self, states):
+        n = len(states)
+        return (np.full((n, self.n_actions), 1.0 / self.n_actions, dtype=np.float32),
+                np.zeros(n, dtype=np.float32))
+
+
 def _make_ai(board_size=9):
-    return GoAI(board_size=board_size, device="cpu", compile=False)
+    return _FakeAI(board_size)
 
 
 def test_predict_batch_shape():
-    ai = _make_ai(9)
-    board = GoBoard(9)
+    ai = GoAI(board_size=19, device="cpu", compile=False)
+    board = GoBoard(19)
     hist = [[-1, -1, -3], [-1, -1, -3]]
     states = [(board, list(hist[0]), list(hist[1]), 1) for _ in range(4)]
     policies, values = ai.predict_batch(states)
-    assert policies.shape == (4, 9 * 9 + 1)
+    assert policies.shape == (4, 19 * 19 + 1)
     assert values.shape == (4,)
     # 策略应接近概率分布
     assert np.allclose(policies.sum(axis=1), 1.0, atol=1e-3)

@@ -6,9 +6,7 @@
 # 改参数前先看每段的「⚠」——那些不是建议，是不改就会静默出错的地方。
 #
 # 三个模型口径（别混）：
-#   12 通道  = KATAGO_SE_CFG，9,112,005 参数。sft_19x19_v12.pth。
-#             只在「4a 冒烟」和「WebUI 12 通道示例」里出现，不是 A/B/C 正式链路。
-#   22 通道  = katago_v7.py，**10,579,753 参数**（当前默认：纯 nbt）。
+#   22 通道  = katago_v7.py，**10,579,753 参数**（当前唯一模型路径：纯 nbt）。
 #             已对齐官方 KataGo `tf2-b10c384`（配置 `b10c384h6nbttflrs`：
 #             C384 / M192 / H6 / F512 / 10 块 / 每块 2 内层 / learnable RoPE）。
 #             Policy 头 K=6（官方结构），导出时 .bin 只写前 2 通道（格式限制）。
@@ -135,7 +133,7 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 #     1400 → 0.00266 ｜ 1536 → 0.00279 ｜ **2048 → 0.00322** ｜ 2800 → 0.00377 ｜ 5600 → 0.00533
 #   ⚠ **改 batch 必须按这条公式重算 LR**，别沿用上一段的旧值。
 # batch：V7 的 22 通道特征在训练时**不再实时计算**（分片里已预算并位打包），
-#   iterLadders 那 99.8% 的 CPU 开销在 V7 上不存在 ⇒ batch 可比 12 通道大。
+#   iterLadders 那 99.8% 的 CPU 开销在 V7 上不存在 ⇒ batch 可以更大。
 #   预取 worker 是**每 rank** 的：单卡 ⇒ 给 24（旧实测的 CPU 甜点，总量不变）。
 # ⚠ `--scaler-init-scale` / `--scaler-growth-interval` 在 **SFT（A100）上是死参数**：
 #   A100 是 Ampere+，走 BF16、`use_scaler=False`，GradScaler 根本不会被创建。
@@ -146,14 +144,14 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 #     （growth 调大 = 关掉自动增益，防震荡）。
 #   启动日志里 `[启动] amp_dtype=… scaler=…` 那行会直接告诉你走的是哪条 —— 别靠猜。
 # 🔴 `--attention-dropout 0` **必须显式给**（代码默认 0.1）：
-#   0.1 是 12 通道 SE 网的默认值，会经 `train_sft.py` 透传进 V7，覆盖掉
+#   0.1 是旧网络的默认值，会经 `train_sft.py` 透传进 V7，覆盖掉
 #   `NBT_TF_CFG['attn_dropout']=0.0`——而 katago_v7.py 明确写「**没有 dropout**」。
 #   实测：不给该 flag 时 MHSA.attn_dropout=0.1（与设计相反）。
 # ⚠ `--use-sdpa 1`（默认 1）：`0` 强制回退手写 math 注意力。**A100 上默认就已经
 #   走融合路径**（CUDA 分支直接 `sdpa_force_math=False` ⇒ FlashAttn 优先、回退内置
 #   SDPA），所以这条在 SFT 上基本不用给；给 0 是「关掉融合注意力做数值对拍」用的。
 # ⚠ `--attn-online` **默认不给**：online-softmax 注意力数值等价但**非逐位相同**
-#   （fp32 max|Δ|≈7e-07），开了会让 12 通道 bit-identical 基线失效；真机加速比未实测。
+#   （fp32 max|Δ|≈7e-07），开了会失去逐位可复现性；真机加速比未实测。
 #   且它只作用于**手写 math 路径** —— A100 上注意力走融合内核，给了也不生效。
 # ⚙️ **调优开关一律是 CLI 参数，没有环境变量**（2026-10-06 全部搬完）。仅有的例外：
 #   `GOAI_PROFILE` / `GOAI_PROFILE_STEPS`（诊断开关，语义见下）**与**
@@ -202,7 +200,7 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 #     `mem=37.96GB / 40GB`、`spd_inst=3169`、每步墙钟 485 ms（c=368/d=29/g=66/u=19）。
 #     速度与 256×8（3077 s/s，每步 665 ms）**几乎无差异**，但显存只剩 2GB，
 #     且把有效 batch 从 2048 降到 1536。⇒ 退回。
-#   ⚠ 下面这些是旧实测（含已删除的 GC 语义），仅供归因：
+#   ⚠ 下面这些是旧实测（当时训练还带梯度重算），仅供归因：
 #     micro 512 × accum 4 ≈ 1400 s/s；micro 1024 × accum 2 同有效却更慢（~1000+ s/s）；
 #     micro 2048 × accum 1 暴跌到 ~550 s/s（悬崖）。
 #   要加有效 batch 就加 accum（micro 别过 1024）。
@@ -216,14 +214,14 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 #
 # 🔴🔴 **上面那组 s/s 数字全部作废，需要重测**（2026-10-13 梯度检查点已整体删除，
 #   2026-10-11 起主干不再有任何重算路径）
-#   旧数字测的是「带 GC」的世界 ⇒ 同样的 micro 可能直接 OOM，或必须降 micro /
+#   旧数字测的是「有重算」的世界 ⇒ 同样的 micro 可能直接 OOM，或必须降 micro /
 #   加 accum 才能跑。这直接影响上面「512×4 是甜点、1024×2 更慢、2048×1 是悬崖」
 #   这三条结论 —— 它们测的是**吞吐**，而吞吐又依赖能不能装下。
 #   ⇒ **重测方法**：对每个候选 micro×accum 组合先看 `mem=` 是否贴顶/是否 OOM，
 #     再看 spd；两档都记。别只看 spd 就下结论（装不下的组合 spd 没意义）。
 #   ⇒ `v7_batch_memory_advice` 是「激活全驻留」口径的估算，可先拿它筛掉明显
 #     装不下的组合，但它的每样本 MB 常数仍来自 910A，当量级参考、不能当判据。
-#   ⇒ 在此重测完成前，A/B/C 三段的 micro/accum 属于**未经无-GC 世界验证**的配置。
+#   ⇒ 在此重测完成前，A/B/C 三段的 micro/accum 属于**未经当前主干验证**的配置。
 # ⚠ `--compile-mode` 2026-10-11 本机实测结论（Ampere+）：
 #   - 脚本默认已从 `max-autotune-no-cudagraphs` 改成 **`reduce-overhead`**（L4004）：
 #     原默认档在本机曾报 `CUDA error: misaligned address`——疑似刚启用的
@@ -415,17 +413,14 @@ python scripts/webui.py --model models/c_v7_a100.pth.latest --device cpu \
 # --- 4b V7 + 纯 MCTS ---
 python scripts/webui.py --model models/c_v7_a100.pth.latest --device cpu \
   --port 7860 --mode mcts --komi 7.5 --num-threads 8
-# --- 4c 12 通道（旧模型）---
-python scripts/webui.py --model models/sft_19x19_v12.pth --device cpu --port 7860 \
-  --mode mcts --expand-topk 8 --num-threads 4
-# --- 4d 命令行复盘/对局（--human-color black|white）---
+# --- 4c 命令行复盘/对局（--human-color black|white）---
 python scripts/cli_play.py --model models/c_v7_a100.pth.latest --device cpu \
   --komi 7.5 --simulations 400 --num-threads 8
 
 # ⚠🔴 **`--komi` 必须与训练口径一致**（webui 与 cli_play 都一样）。V7 的全局
 #   ch5=`currentSelfKomi/20`、ch18=贴目三角波都由它算，填错 ⇒ 模型拿到训练里
 #   没见过的输入，**且不报任何错**。默认 7.5；`--engine-komi` 只在 `--engine-gtp`
-#   时用，默认跟随 `--komi`。（12 通道那 12..17 个通道里没有这一路，给不给都一样。）
+#   时用，默认跟随 `--komi`。
 #   2026-10-06 修：此前 **webui 与 cli_play 构造 `MCTS(...)` 时都没传 komi**，
 #   两条路径恒用 MCTS 默认 7.5 且无任何 CLI 开关。
 # ⚠ **`--leaf-ab-depth > 0` 在 V7 上会被拒**：它走 `_batch_leaf_ab`，节点是 4 元组、
@@ -437,12 +432,10 @@ python scripts/cli_play.py --model models/c_v7_a100.pth.latest --device cpu \
 #   simulations=…)`），不是 CLI 参数。
 
 # 🔴 **V7 搜索特征的历史顺序**（2026-10-06 已修，钉在测试里）：
-#   同一个 `my_hist` 在 12 通道与 V7 上必须**反向解释**：
-#     12 通道 —— 训练与推理都是「最老在前」⇒ 自洽，**不要去统一它**；
-#     V7     —— 训练（v7_dataset 换过槽位）是「最近在前」，推理曾是最老在前
-#               ⇒ ch9..13 与全局 ch0..4 整体时间倒序（静默）。
+#   V7 训练（v7_dataset 换过槽位）是「最近在前」，推理曾是最老在前
+#   ⇒ ch9..13 与全局 ch0..4 整体时间倒序（静默）。
 #   修法：`src/search/v7_features.py` 的 `HIST_IS_OLDEST_FIRST_DEFAULT`，
-#   **只在 V7 这一侧**翻。12 通道逐位基线修复前后都是绿的 —— 那正是判据。
+#   **只在 V7 这一侧**翻。
 
 # ---------- 5. 导出到 KataGo 引擎（.bin.gz，modelVersion 17）----------
 python scripts/export_katago_bin.py export --checkpoint models/c_v7_a100.pth.latest \
@@ -470,7 +463,7 @@ echo -e "listgen\nquit" | katago/katago-v1.18.1-opencl-windows-x64/katago.exe \
 #   布局里不存在这两列（它们需要网络 raw 输出，而 stdata 生成时还没有）⇒ 权重恒 0、
 #   导出后是常量。对 MCTS 无害（仅 useUncertainty 时读），但**不得声称已训练**。
 #   第 4 路 varTimeLeft 是**真训练**出来的（见第 1 节 3 的校验命令）。
-# ⚠ `--export-onnx` 对 V7 **无效**（走 GoAI 的 12 通道推理链）。
+# ⚠ `--export-onnx` 对 V7 **无效**。
 
 # ---------- 6. 门禁 ----------
 # ⚠ pytest.ini 的 addopts 已含 `-n auto`，**别手动再加 -n**（会重复报错），也别删文件。

@@ -33,9 +33,9 @@
 ------------------------------
 本文件锁的是**采样源**（8 路对称增强）与**全局随机流**这两件事。用例 1 的假模型不含
 dropout，所以它证明的是「抽样固定后，同权重两次 eval 逐位相同」。真实模型那一路
-（注意力 dropout）由 `tests/test_attn_dropout_eval.py` 用**真模型**覆盖，本文件不重复。
+（注意力 dropout）由 backbone 的注意力实现覆盖，本文件不重复。
 
-真实 `AlphaGoNet` 的注意力 dropout 曾经走函数式 API：`F.dropout(..., p)` /
+真实模型的注意力 dropout 曾经走函数式 API：`F.dropout(..., p)` /
 `F.scaled_dot_product_attention(..., dropout_p=p)`（`src/networks/backbone.py:133,141-145`，
 内联那处在 `_sparse_attn` 的 `:413-414`）。这些 API 的 `training` 默认 True，模块级
 helper 又拿不到 `self.training`，于是 `model.eval()` **关不掉**它们。**该闸门已在
@@ -50,9 +50,8 @@ eval 前向在任何 device 上都不再抽 dropout 掩码，device 生成器不
 快照/还原的是 `np.random` 全局流与 **CPU** 的 MT19937（`torch.get_rng_state()`），
 **不覆盖 device 生成器**。也就是说 device 侧的「eval 频率改写训练轨迹」现在是被
 `64e382f` 的闸门挡住的，**不是**被这里的隔离挡住的：本文件这 8 条只看 CPU 流，
-闸门一旦被回退，它们仍然全绿，而 device 侧的缺陷会静默复活。守住那个前提是
-`tests/test_attn_dropout_eval.py` 的职责（它的用例 1 断言 eval 期间
-`torch.get_rng_state()` 不动）。别把这 8 条读成「device 侧也已由隔离机制兜底」。
+闸门一旦被回退，它们仍然全绿，而 device 侧的缺陷会静默复活。别把这 8 条读成
+「device 侧也已由隔离机制兜底」。
 
 全部 CPU、秒级：假 model（定长无并列 logits）+ 假 dataset（逐条照抄真实
 `sample_batch_numpy` 的随机源语义），不加载真模型、不读真数据。
@@ -221,8 +220,7 @@ def test_repeated_eval_is_bit_identical():
     0.0 —— 证明这套假数据对变换**真的敏感**，上面的相等不是因为它怎么算都一样。
 
     覆盖范围：只管**采样源**。真实模型的注意力 dropout 是另一条独立的随机源，已由
-    commit `64e382f` 的 `self.training` 闸门关掉，并由 `tests/test_attn_dropout_eval.py`
-    用真模型逐位锁住，本文件不重复覆盖。
+    commit `64e382f` 的 `self.training` 闸门关掉，本文件不重复覆盖。
     """
     ds = _FakeDataset()
     model = _FakeModel()
@@ -264,14 +262,12 @@ def test_eval_does_not_disturb_global_numpy_state():
     在问的是「eval 抽走的这些随机数会不会漏出去」。把 `_isolated_global_rng()` `finally`
     里的 `torch.set_rng_state(...)` 去掉，这条立刻红（报告里有自检输出）。
 
-    为什么用假模型手工制造消耗，而不是直接用真 `AlphaGoNet`：`64e382f` 给 functional
+    为什么用假模型手工制造消耗，而不是直接用真模型：`64e382f` 给 functional
     dropout 补上 `self.training` 闸门之后，真模型在 eval 期间**已经不消耗任何 torch 随机**
     （CPU 与 device 都不消耗，见模块 docstring「已知边界」）—— 拿真模型来测这段契约，
     窗口内根本没有消耗可还原，断言会退化成恒真。所以这里让假模型在 forward 里**真的抽**
     torch 随机（`consume_torch_rng=True`），人为造出「窗口内有消耗」这个前提，才能证明
-    `_isolated_global_rng()` 把它还原了回去。「eval 期的真模型不消耗 torch 随机」这个
-    前提本身由 `tests/test_attn_dropout_eval.py` 用真模型钉（它断言 eval 期间
-    `torch.get_rng_state()` 前后不变）。
+    `_isolated_global_rng()` 把它还原了回去。
 
     numpy 侧四段全比（算法名 / 624 个状态字 / pos / has_gauss+cached_gaussian）；torch 侧
     用 `torch.equal`（ByteTensor，同样要逐位比而不是 `==`，后者会得到逐元素布尔 Tensor）。

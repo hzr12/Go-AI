@@ -280,9 +280,7 @@ class MCTS:
         返回 ``(planes, globals)``；12..17 通道下 `globals` 恒为 ``None``。
 
         P4.13b 起通道数由 `_in_channels()` 向所挂模型要，不再钉死 12：
-        12 通道 checkpoint 拿 12（逐字节不变，见
-        `tests/baseline_in_channels.json`），声明其他通道数的模型拿它声明的
-        通道数（占位构建器可造 17 档，见 `tests/test_mcts_in_channels.py`）。
+        模型声明几通道就拿几通道（现役构建器只有 V7 的 22 档）。
         通道数与模型对不上的话，`GoAI.predict_batch` 的 F5 守卫会响亮地抛，
         不再靠这里「显式钉 12」去绕开形状错误。
 
@@ -348,8 +346,7 @@ class MCTS:
 
         薄转发：规范实现是 `src/search/lookahead.py::child_states`（2026-09-30
         从这里搬出去）。搬出去是因为 **RL 采集要用同一套推演逻辑但不该构造
-        MCTS**；留在这里的方法名是为了不动搜索侧的调用点与既有测试
-        （`tests/test_mcts_in_channels.py` 直接调它）。
+        MCTS**；留在这里的方法名是为了不动搜索侧的调用点与既有测试。
         """
         return lookahead_mod.child_states(board, moves, my_hist, op_hist, to_play)
 
@@ -788,9 +785,6 @@ class MCTS:
         `feature_planes_batched` + 5 元组，给不出 22 通道、也带不了 19 维全局输入。
         现已由 `v7_batch_features`（批量装配）+ `child_states(with_prev=True)`
         （携带前两手盘面）+ `feature_fn` 参数（6 元组入 `predict_batch`）解决。
-        **12 通道不传 `feature_fn`，走原路径一字未改** —— 这是
-        `tests/test_mcts_in_channels.py::test_twelve_channel_path_bit_identical`
-        逐位基线的前提。
 
         根局面的前两手盘面由 `lookahead()` 自己从 `move_history` 重放取回
         （`_prev_board_arrays`）：它们不进 MCTS 树（树里只存 prev_board 引用，

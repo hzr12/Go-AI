@@ -2,7 +2,7 @@
 
 为什么要有这个文件
 ------------------
-`tests/test_param_budget.py` 已经为 v18 立过一次规矩：run.txt 里写着
+run.txt 里为 v18 记过一次教训：写着
 「V17 Value 1.01M（96ch, 11 blocks）」，实测是 2.00M，1.01M 其实对应 5 块 ——
 文字与代码互相矛盾，于是「v18 是不是比 v12 差」这类对照建立在错误基准上。
 本文件是同一件事对 V7 的重演：把 spec §6.1 的每个数字用**实际实例化**钉死。
@@ -523,7 +523,7 @@ def test_nbt_block_inner_count_and_shapes():
 
 
 def test_default_net_uses_config_only():
-    """结构**只由 NBT_TF_CFG 决定**（与 KATAGO_SE_CFG 同一立场）。"""
+    """结构**只由 NBT_TF_CFG 决定**。"""
     net = NbtTfNet()
     assert net.cfg['trunk_channels'] == 384
     assert len(net.blocks) == 10

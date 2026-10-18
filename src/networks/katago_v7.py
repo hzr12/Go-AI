@@ -25,7 +25,7 @@
    BN，靠的是「残差流方差可解析」：第 i 个残差块给栈贡献方差 1，故该块读到的
    累计方差是 ``i+1``，把这个事实写进一个逐通道标量 ``K`` 里即可，见
    ``initialize`` 与 spec §3.3。
-2. **无 dropout。** 对齐官方；`AlphaGoNet` 的 ``attn_dropout=0.1`` 不进入本模型。
+2. **无 dropout。** 对齐官方；旧模型时代的 ``attn_dropout=0.1`` 不进入本模型。
    双重收益：省激活/掩码两份张量，且 dropout 常是融合注意力的阻碍。
 3. **注意力走 ``backbone._sdpa`` 同一个四站点机制**（`backbone.py:581`），
    ``head_dim`` 由 46 变 32。复用它而不是自己调 SDPA，是为了让
@@ -51,8 +51,7 @@ from src.networks.backbone import (
     _segment_runner,
 )
 
-#: spec §3 的形状常量。结构**只由这张表**决定（与 `train_sft.KATAGO_SE_CFG`
-#: 同一立场：结构不许由调用方零散覆盖）。
+#: spec §3 的形状常量。结构**只由这张表**决定（结构不许由调用方零散覆盖）。
 NBT_TF_CFG = {
     # ---- 输入（官方 fillRowV7）----
     'in_channels': 22,

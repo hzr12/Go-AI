@@ -16,7 +16,7 @@
      `n_channels`，且那个值不是写死的 12、不是 `getattr(..., 12)`；
   2. 行为级：把 `main()` 里那段装配代码**原样 exec 一遍**（不是手抄一份），
      17 通道模型 → 重建出来的 `FastPolicy.n_channels == 17`；
-     12 通道模型 → 12（零回归）；
+     13 通道模型 → 13（通道数完全跟随模型）；
   3. `MCTS.n_channels` 是只读 property，且仍然「问不到就报错」——
      有了它 webui 才不必自己再抄一遍 getattr，也就不必自己发明回退值。
 """
@@ -164,9 +164,9 @@ def test_webui_channel_count_reads_mcts_not_a_second_getattr():
 # --------------------------------------------------------------------------- #
 # 2. 行为：重建出来的 FastPolicy 按模型通道数
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("ic", (12, 17))
+@pytest.mark.parametrize("ic", (13, 17))
 def test_webui_rollout_policy_uses_model_channel_count(ic):
-    """17 通道模型 → `FastPolicy.n_channels == 17`；12 通道模型 → 12（零回归）。
+    """17 通道模型 → `FastPolicy.n_channels == 17`；13 通道模型 → 13。
 
     端到端走 `main()` 里真实的那段装配代码（`_run_rollout_setup`），不是复刻。
     """
@@ -190,7 +190,7 @@ def test_webui_rollout_policy_matches_mcts_constructed_one(ic=17):
 
     这是「同一个源」的最强证据：不只是数字相等，而是同参数构造出的同一份
     策略（`temperature` / 权重判等都一样），所以 webui 覆盖掉构造期那份
-    不会带来任何行为差异——除了通道数从 12 变成模型的真实值。
+    不会带来任何行为差异——除了通道数换成模型的真实值。
     """
     ai = _SpyAI(ic)
     session = _run_rollout_setup(ai)
@@ -208,11 +208,11 @@ def test_webui_rollout_policy_matches_mcts_constructed_one(ic=17):
 # --------------------------------------------------------------------------- #
 def test_mcts_n_channels_is_readonly_and_never_falls_back():
     """只读 property；模型问不到通道数时抛错（不是回退 12）。"""
-    for ic in (12, 17):
+    for ic in (13, 17):
         m = MCTS(_SpyAI(ic), board_size=N, num_threads=1)
         assert m.n_channels == ic
     with pytest.raises(AttributeError):
-        MCTS(_SpyAI(12), board_size=N, num_threads=1).n_channels = 99
+        MCTS(_SpyAI(13), board_size=N, num_threads=1).n_channels = 99
 
     class _NoChannelAI:
         def predict_batch(self, states):

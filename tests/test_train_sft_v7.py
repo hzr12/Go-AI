@@ -817,18 +817,9 @@ def test_prefetch_workers_default_is_twelve():
     assert _default_of('--prefetch-workers') == 12
 
 
-def test_v7_flag_defaults_to_off():
-    """`--v7` 默认 0 ⇒ 默认走 12 通道路径。"""
-    assert _default_of('--v7') == 0
-
-
-def test_katago_se_cfg_is_untouched():
-    """ `KATAGO_SE_CFG` 没被删也没被改（12 通道 / 9.11M 仍是唯一现役基线）。"""
-    from scripts.train_sft import KATAGO_SE_CFG
-    assert KATAGO_SE_CFG['in_channels'] == 12
-    assert KATAGO_SE_CFG['params_total'] == 9_112_005
-    assert KATAGO_SE_CFG['params_backbone'] == 8_392_995
-    assert KATAGO_SE_CFG['arch'] == 'se_bottleneck'
+def test_v7_flag_defaults_to_on():
+    """`--v7` 默认 1 —— 旧的 12 通道模型已删除，V7 是唯一结构。"""
+    assert _default_of('--v7') == 1
 
 
 def test_default_path_payload_is_unchanged_by_v7(ds):

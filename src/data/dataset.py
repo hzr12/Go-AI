@@ -188,9 +188,9 @@ class SupervisedDataset:
               （己方/对方眼位、双方块气=2、劫禁点掩码）**全部**从下面已有的
               `boards` / `to_play` / `ko` 三列现算，npz **不需要**新增列
               （键盘点见 P4.3 report）。
-         通道数必须在**数据侧与模型侧同时**改（模型侧 = `scripts/train_sft.py`
-          的 `KATAGO_SE_CFG['in_channels']`，现为 12），
-          只改一侧得到的是形状错或静默错值，不是零回归。
+         通道数必须在**数据侧与模型侧同时**改（现役 V7 固定 22 通道，由
+          `src/data/v7_dataset.py` 装配，与本参数无关），
+         只改一侧得到的是形状错或静默错值，不是零回归。
         """
         _check_n_channels(n_channels)
         self.n_channels = n_channels

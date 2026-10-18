@@ -274,10 +274,9 @@ def _check_n_channels(n_channels):
     13/14/15 这些中间值允许，是为了让「只加眼位」「只加 atari 梯度」这类实验
     不用改生产代码。
 
-     白名单按**通道表**（17 行）定，不按当前消费方收窄：现役一切模型都取 12
-    （`KATAGO_SE_CFG['in_channels']` / `AlphaGoNet` 默认 / 数据集默认），但 13..17
-    档的尾部通道仍在本模块实现且被 `tests/test_go_feature_planes_v21.py`、
-    `tests/test_katago_se.py` 钉住 —— 收窄成 `== 12` 会把它们一起砸掉。
+     白名单按**通道表**（17 行）定，不按当前消费方收窄：现役 V7 走 22 通道
+    特征、不消费本表，但 13..17 档的尾部通道仍在本模块实现且被
+    `tests/test_go_feature_planes_v21.py` 钉住 —— 收窄成 `== 12` 会把它们一起砸掉。
     """
     if not 12 <= n_channels <= 17:
         raise ValueError(
@@ -2380,13 +2379,11 @@ class GoBoard:
     # **0-11 的语义与下标一个字都没动** —— P4.3 只在尾部追加 5 格。尾部 5 格是
     # 为已退役的 v21 代 stem（`Conv3×3(17→184)`，用户给定规格）加的；v21 删除后
     # **默认值仍是 17**（`tests/test_go_feature_planes_v21.py` 逐字钉住默认与白名单
-    # 12..17），而现役全部模型路径都显式传通道数：数据集默认 12、
-    # `KATAGO_SE_CFG['in_channels']=12`。旧数据 / 旧权重
-    # 路径用 `n_channels=12` 裁回前 12 格，输出与 P4.3 之前**逐字节相同**
-    # （C7「12↔17，默认 12 保零回归」在 feature 侧的落法）。
-    # **通道定义是跨进程契约**：数据侧（`src/data/dataset.py`）、训练侧
-    # （`scripts/train_sft.py` 的 `KATAGO_SE_CFG['in_channels']`）、推理侧
-    # （`src/inference.py` 的 in_channels 构建器注册表，现役只注册了 12）
+    # 12..17），而现役 V7 走独立的 22 通道特征（`src/search/v7_features.py`），
+    # 不消费本表。旧数据 / 旧权重路径用 `n_channels=12` 裁回前 12 格，输出与
+    # P4.3 之前**逐字节相同**（C7「12↔17，默认 12 保零回归」在 feature 侧的落法）。
+    # **通道定义是跨进程契约**：数据侧（`src/data/dataset.py`）、训练侧、
+    # 推理侧（`src/inference.py` 的 in_channels 构建器注册表）
     # 必须同时改，只改一处会得到「模型与数据的通道数不一致」的静默错答案。
     #
     # ---- 为什么是 12-16 这 5 个（用户 2026-09-27 直接给定，不容改写）----
