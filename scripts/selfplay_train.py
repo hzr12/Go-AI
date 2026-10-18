@@ -61,6 +61,7 @@ from src.game.go_rules import GoBoard
 from src.search.policy_sampler import (DEFAULT_MIX, sample_move,
                                        temperature_sample as _temperature_sample)
 from src.search.light_rollout import FastPolicy, DiverseRolloutPolicy
+from src.search.v7_features import is_v7_spatial
 
 
 # --------------------------------------------------------------------------- #
@@ -948,9 +949,13 @@ def train_epochs(ai, buffer, args, device):
     #     读完后，pinned 源的 H2D 拷贝仍可能在途，短路会导致覆写仍在搬运的源缓冲。
     # 仅动训练循环的数据搬运，不触碰 self-play 数据生成 / 数据集。
     _bs = min(args.batch_size, n) if n > 0 else 0
+    _is_v7 = is_v7_spatial(getattr(ai, 'in_channels', 12))
     _slots = []
     if pin_mem and _bs > 0:
-        _n = int(np.asarray(buffer[0][0]).shape[-1])
+        _first = buffer[0][0]
+        _spatial = _first[0] if _is_v7 else _first          # V7: (spatial, global)
+        _n = int(np.asarray(_spatial).shape[-1])
+        _sp_ch = 22 if _is_v7 else 12
         # 动作数取自掩码（buffer 行 index 5）：n²+1 与网络 logits 同宽；
         # 旧版从 vt（index 1）取，vt 已随 PPO 移除
         _acts = int(np.asarray(buffer[0][5]).shape[0])
@@ -958,7 +963,10 @@ def train_epochs(ai, buffer, args, device):
             _ev = torch.cuda.Event()
             _ev.record()   # 显式置为已完成，首次复用该槽时等待立即返回
             _slots.append((
-                torch.empty((_bs, 12, _n, _n), dtype=torch.float32, pin_memory=True),
+                torch.empty((_bs, _sp_ch, _n, _n), dtype=torch.float32, pin_memory=True),
+                # V7：global 输入单独一槽 (B,19)。它同样是 buffer 字段、无梯度。
+                torch.empty((_bs, 19), dtype=torch.float32, pin_memory=True) if _is_v7
+                else None,
                 torch.empty((_bs, _acts), dtype=torch.bool, pin_memory=True),
                 torch.empty((_bs,), dtype=torch.long, pin_memory=True),
                 torch.empty((_bs,), dtype=torch.float32, pin_memory=True),
@@ -999,9 +1007,15 @@ def train_epochs(ai, buffer, args, device):
 
             if _slots:
                 m = len(batch)
-                sp, sm, sa, sl, sz, sv, ev, sq = _slots[_slot_i]
+                if _is_v7:
+                    sp, sg, sm, sa, sl, sz, sv, ev, sq = _slots[_slot_i]
+                else:
+                    sp, sm, sa, sl, sz, sv, ev, sq = _slots[_slot_i]
                 ev.synchronize()   # 只等本槽 H2D，不阻塞计算
-                torch.from_numpy(np.stack([b[0] for b in batch])).copy_(sp[:m])
+                _pl = [b[0][0] for b in batch] if _is_v7 else [b[0] for b in batch]
+                torch.from_numpy(np.stack(_pl)).copy_(sp[:m])
+                if _is_v7:
+                    torch.from_numpy(np.stack([b[0][1] for b in batch])).copy_(sg[:m])
                 torch.from_numpy(np.stack([b[5] for b in batch])).copy_(sm[:m])
                 torch.from_numpy(np.asarray([b[1] for b in batch],
                                             dtype=np.int64)).copy_(sa[:m])
@@ -1014,6 +1028,8 @@ def train_epochs(ai, buffer, args, device):
                 torch.from_numpy(np.asarray([b[6] for b in batch],
                                             dtype=np.float32)).copy_(sq[:m])
                 planes = sp[:m].to(device, non_blocking=True)
+                if _is_v7:
+                    gfeat = sg[:m].to(device, non_blocking=True)
                 mask_t = sm[:m].to(device, non_blocking=True)
                 action_t = sa[:m].to(device, non_blocking=True)
                 logp_old_t = sl[:m].to(device, non_blocking=True)
@@ -1023,7 +1039,11 @@ def train_epochs(ai, buffer, args, device):
                 ev.record()
                 _slot_i ^= 1
             else:
-                planes = torch.from_numpy(np.stack([b[0] for b in batch])).float()
+                if _is_v7:
+                    planes = torch.from_numpy(np.stack([b[0][0] for b in batch])).float()
+                    gfeat = torch.from_numpy(np.stack([b[0][1] for b in batch])).float()
+                else:
+                    planes = torch.from_numpy(np.stack([b[0] for b in batch])).float()
                 mask_t = torch.from_numpy(np.stack([b[5] for b in batch]))
                 action_t = torch.from_numpy(np.asarray([b[1] for b in batch],
                                                        dtype=np.int64))
@@ -1044,6 +1064,8 @@ def train_epochs(ai, buffer, args, device):
                     v_old = v_old.pin_memory()
                     logq_t = logq_t.pin_memory()
                 planes = planes.to(device, non_blocking=pin_mem)
+                if _is_v7:
+                    gfeat = gfeat.to(device, non_blocking=pin_mem)
                 mask_t = mask_t.to(device, non_blocking=pin_mem)
                 action_t = action_t.to(device, non_blocking=pin_mem)
                 logp_old_t = logp_old_t.to(device, non_blocking=pin_mem)
@@ -1052,7 +1074,13 @@ def train_epochs(ai, buffer, args, device):
                 logq_t = logq_t.to(device, non_blocking=pin_mem)
 
             with maybe_autocast(device):
-                policy, value = model(planes)
+                out = model(planes, gfeat) if _is_v7 else model(planes)
+                # V7 返回 dict（policy_logits / outcome_logits），12 通道返回
+                # (policy, value) 元组。`GoAI._split_model_output` 把两种形态
+                # 归一成 (policy_logits, value)，且 V7 的 value 口径转换
+                # （P(win)-P(loss)）收在这里。训练侧直接复用推理侧的同一套，
+                # 避免散落两处。
+                policy, value = GoAI._split_model_output(out)
                 # P3-C-c：A = z - v_old，按 minibatch 标准化（std 夹紧防 0 除）
                 adv = _compute_advantage(z, v_old)
                 loss_pi, ppo = _ppo_policy_loss(
@@ -1634,11 +1662,22 @@ def _process_game_data(game_data, score, bs, n_actions, buffer, args):
             players, v_collect, score, mc_idx,
             td, td_steps, td_ai, td_ae)
         v_old = float(v_collect[mc_idx])
-        if getattr(args, 'no_augment', 0) == 1:
-            buffer.append((planes, action, logp_old, z, v_old, mask, logq))
+        if isinstance(planes, tuple):
+            # V7: (spatial, global)。增强只作用于 spatial（贴目/规则是 D4 不变的
+            # 局级标量），global 原样跟着每一行走。buffer 行仍是 7 元组，
+            # 第一项是 (spatial, global) 元组 —— 训练循环按 b[0][0]/b[0][1] 解。
+            spatial, gfeat = planes
+            if getattr(args, 'no_augment', 0) == 1:
+                buffer.append(((spatial, gfeat), action, logp_old, z, v_old, mask, logq))
+            else:
+                for pl, mk, ac in augment8(spatial, mask, bs, action=action):
+                    buffer.append(((pl, gfeat), int(ac), logp_old, z, v_old, mk, logq))
         else:
-            for pl, mk, ac in augment8(planes, mask, bs, action=action):
-                buffer.append((pl, int(ac), logp_old, z, v_old, mk, logq))
+            if getattr(args, 'no_augment', 0) == 1:
+                buffer.append((planes, action, logp_old, z, v_old, mask, logq))
+            else:
+                for pl, mk, ac in augment8(planes, mask, bs, action=action):
+                    buffer.append((pl, int(ac), logp_old, z, v_old, mk, logq))
 
 
 if __name__ == "__main__":

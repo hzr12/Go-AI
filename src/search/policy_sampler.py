@@ -32,11 +32,17 @@ RL 采集原来每手跑 `MCTS.search(simulations=sims)`：1 卡 910A 上 `--sim
 「采样分布 = 温度作用后的分布」是本模块的契约，而 `logq` 必须取**同一次**
 采样分布上的 log-prob（动作与 logq 锚定同一个分布，否则重要性权重无意义）。
 """
-from typing import NamedTuple
+from typing import NamedTuple, Tuple, Union
 
 import numpy as np
 
 from src.search import lookahead as lookahead_mod
+from src.search.v7_features import (
+    DEFAULT_RULES_FLAGS,
+    is_v7_spatial,
+    v7_batch_features,
+    v7_leaf_features,
+)
 
 #: q 里分给「根策略」的混合质量（保证满支撑）。见模块 docstring。
 DEFAULT_MIX = 0.1
@@ -45,8 +51,12 @@ DEFAULT_MIX = 0.1
 class MoveSample(NamedTuple):
     """一次采样的全部产物（字段名即契约）。
 
-    planes   (C,n,n) float32，本手的特征平面 —— **与前瞻共用同一次计算**，
-             调用方直接把它写进 buffer，不必再算一遍
+    planes   **根局面的输入特征**：
+                - V7（22 通道）: ``(spatial, global_features)`` **元组**
+                  ``(22,19,19) float16`` / ``(19,) float16`` —— 与
+                  :func:`src.search.v7_features.v7_leaf_features` 一致。
+                - 12 通道: ``(C,n,n) float32`` 单数组。
+                **与前瞻共用同一次计算**，调用方直接把它写进 buffer，不必再算一遍。
     action   实际采到的动作（含 pass = n_actions-1）
     logq     log q(action)，q = 温度作用后的行为分布
     logp_old log π_θold(action)，π_θold = 根 masked policy（**不带温度**：
@@ -60,7 +70,7 @@ class MoveSample(NamedTuple):
              悄悄从 π/q 退化成 1，PPO 直接有偏。
     """
 
-    planes: np.ndarray
+    planes: Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]
     action: int
     logq: float
     logp_old: float
@@ -154,15 +164,38 @@ def sample_move(ai, board, my_hist, op_hist, to_play, topk=12, width=4, depth=2,
     """
     n = board.board_size * board.board_size + 1
     n_channels = getattr(ai, 'in_channels', 12)
-    planes = np.ascontiguousarray(board.feature_planes_batched(
-        board.board[None], [list(my_hist)], [list(op_hist)], [to_play],
-        [board.ko_point], n_channels=n_channels)[0], dtype=np.float32)
     legal = board.get_legal_moves()
     mask = np.concatenate((legal, np.array([True])))
 
-    res = lookahead_mod.lookahead(
-        ai, board, my_hist, op_hist, to_play, n_actions=n, n_channels=n_channels,
-        topk=topk, width=width, depth=depth, planes=planes)
+    if is_v7_spatial(n_channels):
+        # V7 是 (spatial, global) 双输入。`lookahead` 已支持 `feature_fn`
+        # （见其 docstring），这里只负责：根特征算一次供 buffer 复用，逐层
+        # 批量特征交给 `v7_batch_features`。两者同口径（都走 `feature_v7`）。
+        #
+        # komi / rules_flags 整局不变 → 闭包捕获，`feature_fn(nodes)` 不用
+        # 每个节点各自猜。默认值与 `GoBoard(board_size)` 一致（7.5 / 0），
+        # 但仍从 board 读：换 komi 的对局不该被静默按默认值算特征。
+        komi = float(getattr(board, 'komi', 7.5))
+
+        def _feat(nodes):
+            return v7_batch_features(nodes, komi=komi,
+                                    rules_flags=DEFAULT_RULES_FLAGS)
+
+        sp, gl = v7_leaf_features(board, my_hist, op_hist, to_play,
+                                  komi=komi, rules_flags=DEFAULT_RULES_FLAGS)
+        res = lookahead_mod.lookahead(
+            ai, board, my_hist, op_hist, to_play, n_actions=n,
+            n_channels=n_channels, topk=topk, width=width, depth=depth,
+            feature_fn=_feat)
+        planes = (sp, gl)
+    else:
+        planes = np.ascontiguousarray(board.feature_planes_batched(
+            board.board[None], [list(my_hist)], [list(op_hist)], [to_play],
+            [board.ko_point], n_channels=n_channels)[0], dtype=np.float32)
+        res = lookahead_mod.lookahead(
+            ai, board, my_hist, op_hist, to_play, n_actions=n,
+            n_channels=n_channels, topk=topk, width=width, depth=depth,
+            planes=planes)
 
     q0 = behavior_distribution(res.values, res.policy, n, lookahead_temp, mix)
     mv, _, p_norm = temperature_sample(q0, mc, rng=rng)
