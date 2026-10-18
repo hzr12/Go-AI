@@ -245,12 +245,12 @@ def test_stripped_heads_do_not_appear_in_the_file(desc, sd):
 def test_exported_param_count_is_model_minus_stripped_heads(desc):
     """导出参数量 = V7 总数 − 被剥离的头。
 
-    实测 10,529,929 − 16,384 = **10,513,545**，引擎报的也是这个数。
+    实测导出 = **10,545,753**，与官方 b10c384 引擎报的数字完全一致。
     """
     net = build_katago_v7_net()
     total = sum(p.numel() for p in net.parameters())
     got = kb.count_parameters(desc)
-    assert got == 10_545_945, f'导出参数 {got:,}，实测应为 10,545,945'
+    assert got == 10_545_753, f'导出参数 {got:,}，实测应为 10,545,753'
     assert got < total, '导出参数不应多于 V7 总数'
 
 
@@ -330,14 +330,22 @@ def test_model_version_16_is_impossible_and_17_is_not(monkeypatch):
 def test_batchnorm_is_identity_by_construction(desc):
     """``mean=0 / variance=1`` ⇒ BN 退化为恒等，与我们的 ``NormAct`` 等价。
 
-    官方 b10c384 的 ``v1BN``/``p1BN`` 实测就是这个值。显式写出来是为了让
-    这个等价关系在文件里**可见** —— 否则读代码的人会以为 BN 在做归一化。
+    官方 b10c384 的 ``v1BN`` / ``p1BN`` / ``biasg`` 三个头 BN 实测是
+    ``has_scale=False``（文件里**没有** scale 数组，``desc.cpp:235-249`` 让
+    C++ 自己按 1.0 填）；trunk 的 ``pre_bn`` / ``post_bn`` 才是 ``has_scale=True``。
+    这条测试把两种口径都钉死：头 BN 一旦退回 ``has_scale=True``，导出文件就会
+    比官方的 10,545,753 多出 4·C 字节、结构对不上。
     """
     bn = desc.value_head.v1_bn
-    assert bn.has_scale is True and bn.has_bias is True
+    assert bn.has_scale is False and bn.has_bias is True
     assert np.allclose(bn.mean, 0.0)
     assert np.allclose(bn.variance, 1.0)
-    assert not np.allclose(bn.scale, 0.0), 'scale 不该全 0，否则网络无输出'
+    assert np.allclose(bn.scale, 1.0), 'has_scale=False ⇒ 引擎按 1.0 处理'
+    # 三个头 BN 都是 has_scale=False（官方口径）
+    assert desc.policy_head.p1_bn.has_scale is False
+    assert desc.policy_head.g1_bn.has_scale is False
+    trunk_bn = desc.trunk.blocks[0].desc.pre_bn
+    assert trunk_bn.has_scale is True and trunk_bn.has_bias is True
 
 
 # --------------------------------------------------------------------------- #
@@ -457,4 +465,4 @@ def test_export_accepts_wrapped_state_dict(tmp_path):
     out = tmp_path / 'o.bin.gz'
     kx.export_checkpoint(str(p), str(out))
     back = kb.parse_model(kb.maybe_gunzip(out.read_bytes()))
-    assert kb.count_parameters(back) == 10_545_945
+    assert kb.count_parameters(back) == 10_545_753

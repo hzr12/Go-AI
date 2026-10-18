@@ -17,6 +17,7 @@ models/
 *.pt
 *.ckpt
 *.onnx
+*.bin.gz
 
 # 数据集（原始 SGF / 生成的 npz 较大）
 # ⚠ 必须是 `/data`：**裸 `data` 会匹配任意层级的 data 目录**，包括

@@ -61,7 +61,7 @@ BUDGET_TOTAL = 11_000_000
 #:   - 对齐官方 KataGo `tf2-b10c384`（配置 `b10c384h6nbttflrs`）：C 256→384、
 #:     M 128→192、H 4→6、F 384→512、B 11→10 ⇒ **10,529,929**。
 #:     ⚠ 这同时废掉了旧的 5.85M 硬预算（超 4.68M），下面 margin 那条不再适用。
-SPEC_TOTAL = 10_579_753
+SPEC_TOTAL = 10_579_561
 
 #: 各子模块期望值（spec §6.1）。`value_head` 含 spec 未单列的
 #: ownership/scoring/futurepos/seki 四个 1×1 小头（共 384 参数），
@@ -73,8 +73,8 @@ EXPECTED = {
     'blocks_each': 1_034_496,   # 每个 nbt 块：[nbt, nbt]
     'blocks_total': 10_344_960, # 10×1_034_496
     'trunkfinal': 768,
-    'policy_head': 51_504,
-    'value_head_with_small': 68_169,   # = 65_673 + 2_496
+    'policy_head': 51_408,
+    'value_head_with_small': 68_073,   # = 65_673 + 2_400
     'scorebelief_head': 31_024,
 }
 
@@ -102,7 +102,7 @@ def test_total_is_under_hard_budget(net):
     got = _n(net)
     assert got <= BUDGET_TOTAL, f'超硬预算 {BUDGET_TOTAL:,}：{got:,}'
     margin = BUDGET_TOTAL - got
-    assert margin == 420_247, f'余量应为 420,247（约 4.0%），实测 {margin:,}'
+    assert margin == 420_439, f'余量应为 420,439（约 3.8%），实测 {margin:,}'
 
 
 def test_submodule_param_counts_match_spec(net):
@@ -505,7 +505,7 @@ def test_score_stdev_beta_is_a_pure_constant_so_params_are_untouched():
     sa = a.state_dict()
     assert set(sa) == set(sb)
     assert all(tuple(sa[k].shape) == tuple(sb[k].shape) for k in sa)
-    assert _n(a) == _n(b) == SPEC_TOTAL == 10_579_753
+    assert _n(a) == _n(b) == SPEC_TOTAL == 10_579_561
 
 
 # --------------------------------------------------------------------------- #

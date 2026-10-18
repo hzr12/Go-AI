@@ -156,25 +156,33 @@ def _t(sd: Dict[str, Any], key: str) -> torch.Tensor:  # type: ignore[name-defin
     return sd[key]
 
 
-def _bn(name: str, channels: int, scale: np.ndarray, bias: np.ndarray) -> BatchNormDesc:
+def _bn(name: str, channels: int, scale: Optional[np.ndarray],
+        bias: np.ndarray, has_scale: bool = True) -> BatchNormDesc:
     """构造一个 ``mean=0 / variance=1`` 的 BatchNormDesc。
 
-    官方 b10c384 的 ``v1BN`` / ``p1BN`` 实测就是 ``mean=0, variance=1``
-    （即恒等），我们的 `NormAct` 是 ``x*gamma + beta``，两者**完全等价**。
+    官方 b10c384 的 ``v1BN`` / ``p1BN`` / ``p1BN`` 三个头 BN 都是
+    ``HasScale=False``（文件里没有 scale 数组，``desc.cpp:235-249`` 让 C++ 自己
+    按 1.0 填），trunk 的 ``pre_bn`` / ``post_bn`` 才是 ``HasScale=True``。
+    我们的 `NormAct` 是 ``x*gamma + beta``，因此 ``has_scale=False`` 的层**不能
+    传 scale** —— 传了会多写一个数组、多出 4*C 字节，与官方结构对不上。
     把 mean/variance 显式写成 0/1 是为了让这个等价关系在文件里可见 ——
     引擎读到的就是恒等 BN，不会因为 ``epsilon=1e-20`` 而放大数值。
     """
     c = int(channels)
-    s = np.ascontiguousarray(np.asarray(scale, dtype=np.float32).reshape(-1))
     b = np.ascontiguousarray(np.asarray(bias, dtype=np.float32).reshape(-1))
-    if s.size != c or b.size != c:
-        raise ExportError(
-            f'{name}: gamma/beta 长度应为 {c}，实得 {s.size}/{b.size}')
+    if b.size != c:
+        raise ExportError(f'{name}: beta 长度应为 {c}，实得 {b.size}')
+    if has_scale:
+        s = np.ascontiguousarray(np.asarray(scale, dtype=np.float32).reshape(-1))
+        if s.size != c:
+            raise ExportError(f'{name}: gamma 长度应为 {c}，实得 {s.size}')
+    else:
+        s = np.ones(c, np.float32)  # 不写进文件，仅占位
     return BatchNormDesc(
         name=name,
         num_channels=c,
         epsilon=TextFloat(BATCHNORM_EPS),
-        has_scale=True,
+        has_scale=bool(has_scale),
         has_bias=True,
         mean=np.zeros(c, np.float32),
         variance=np.ones(c, np.float32),
@@ -374,17 +382,15 @@ def _build_policy_head(sd: Dict[str, Any], cfg: Dict[str, Any]) -> PolicyHeadDes
         policy_options=(0, 0, 0),
         p1_conv=_conv('model.policy_head.conv1p', _t(sd, 'policy_head.conv.weight')),
         g1_conv=_conv('model.policy_head.conv1g', _t(sd, 'policy_head.conv_g.weight')),
-        g1_bn=_bn('model.policy_head.biasg', G,
-                  _t(sd, 'policy_head.normact_g.gamma'),
-                  _t(sd, 'policy_head.normact_g.beta')),
+        g1_bn=_bn('model.policy_head.biasg', G, None,
+                  _t(sd, 'policy_head.normact_g.beta'), has_scale=False),
         g1_activation=ActivationDesc(
             name='model.policy_head.actg',
             activation=ACTIVATION_SILU_OFFICIAL),
         gpool_to_bias_mul=_mm('model.policy_head.linear_g',
                               _t(sd, 'policy_head.fuse.weight')),
-        p1_bn=_bn('model.policy_head.bias1p', P,
-                  _t(sd, 'policy_head.normact.gamma'),
-                  _t(sd, 'policy_head.normact.beta')),
+        p1_bn=_bn('model.policy_head.bias1p', P, None,
+                  _t(sd, 'policy_head.normact.beta'), has_scale=False),
         p1_activation=ActivationDesc(
             name='model.policy_head.actp',
             activation=ACTIVATION_SILU_OFFICIAL),
@@ -436,9 +442,8 @@ def _build_value_head(sd: Dict[str, Any], cfg: Dict[str, Any]) -> ValueHeadDesc:
         name='model.value_head',
         value_options=(0, 0, 0),
         v1_conv=_conv('model.value_head.conv1', _t(sd, 'value_head.conv.weight')),
-        v1_bn=_bn('model.value_head.bias1', V,
-                  _t(sd, 'value_head.normact.gamma'),
-                  _t(sd, 'value_head.normact.beta')),
+        v1_bn=_bn('model.value_head.bias1', V, None,
+                  _t(sd, 'value_head.normact.beta'), has_scale=False),
         v1_activation=ActivationDesc(
             name='model.value_head.act1',
             activation=ACTIVATION_SILU_OFFICIAL),

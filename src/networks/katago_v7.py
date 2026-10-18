@@ -99,11 +99,11 @@ NBT_TF_CFG = {
                                        # 的数字，重开 GAU 前必须重算
     'params_blocks_total': 10_344_960, # 10×1_034_496（全 nbt）
     'params_trunkfinal': 768,
-    'params_policy_head': 51_504,
-    'params_value_head': 65_673,       # value 头本体（不含 4 个小头）
-    'params_small_heads': 2_496,       # 4 个小头（ownership 1ch + scoring 1ch + futurepos 2ch + seki 4ch），接法：own/scoring 用 v1=96，fut/seki 用 c_in=384
+    'params_policy_head': 51_408,
+    'params_value_head': 65_673,       # 导出的 value 头（含 ownership，与官方 b10c384 同数）
+    'params_small_heads': 2_400,       # 未导出的 3 个小头（scoring 1ch + futurepos 2ch + seki 4ch），接法：scoring 用 v1=96，fut/seki 用 c_in=384
     'params_scorebelief_head': 31_024,
-    'params_total': 10_579_753,       # 10,579,753（对齐官方 b10c384h6nbttflrs 结构）
+    'params_total': 10_579_561,       # 头 BN 去掉可学习 gamma 后 -192（对齐官方 10,545,753 结构）
 }
 
 #: off-board 位置的 logits 惩罚（spec §4.1）。常量、不参与学习 —— 因此
@@ -168,20 +168,27 @@ class NormAct(nn.Module):
     忘了乘它，残差流的方差会随深度线性增长，深层激活直接饱和。
     """
 
-    def __init__(self, channels, eps=1e-5):
+    def __init__(self, channels, eps=1e-5, has_scale=True):
         super().__init__()
         self.channels = int(channels)
         self.eps = float(eps)
+        # has_scale=False 时**不建 gamma**：官方 b10c384 的 p1_bn / g1_bn / v1_bn
+        # 都是 HasScale=False（文件里没有 scale 数组，引擎按 1.0 处理）。结构对齐
+        # 后 PyTorch 侧与引擎同算 `x*1 + beta`，不再有单侧可学习 gamma 造成的分歧。
+        self.has_scale = bool(has_scale)
+        self.gamma = nn.Parameter(torch.zeros(self.channels)) if self.has_scale else None
         # 刻意初始化为 0：未经 `initialize()` 的模块不应假装自己已归一化过。
-        self.gamma = nn.Parameter(torch.zeros(self.channels))
         self.beta = nn.Parameter(torch.zeros(self.channels))
 
     def initialize(self, scale=1.0, norm_scale=1.0):
-        nn.init.constant_(self.gamma, float(norm_scale) / float(scale))
+        if self.gamma is not None:
+            nn.init.constant_(self.gamma, float(norm_scale) / float(scale))
         nn.init.zeros_(self.beta)
         return self
 
     def forward(self, x):
+        if self.gamma is None:
+            return F.silu(x + self.beta.view(1, -1, 1, 1))
         y = torch.addcmul(self.beta.view(1, -1, 1, 1), x, self.gamma.view(1, -1, 1, 1))
         return F.silu(y)
 
@@ -706,11 +713,11 @@ class PolicyHead(nn.Module):
         self.num_outputs = int(num_outputs)
         # p1 分支：1×1 conv 直接吐 logits
         self.conv = _ScaledConv2d(in_channels, channels, 1, bias=False)
-        self.normact = NormAct(channels)
+        self.normact = NormAct(channels, has_scale=False)
         self.out = _ScaledConv2d(channels, self.num_outputs, 1, bias=False)
         # g1 分支：1×1 conv → BN → gpool(3G)，再分别投到 bias 与 pass
         self.conv_g = _ScaledConv2d(in_channels, gpool_channels, 1, bias=False)
-        self.normact_g = NormAct(gpool_channels)
+        self.normact_g = NormAct(gpool_channels, has_scale=False)
         self.fuse = _ScaledLinear(3 * gpool_channels, channels, bias=False)
         self.pass_fc1 = _ScaledLinear(3 * gpool_channels, channels, bias=True)
         self.pass_fc2 = _ScaledLinear(channels, self.num_outputs, bias=False)
@@ -860,7 +867,7 @@ class ValueHead(nn.Module):
                  futurepos_channels=2):
         super().__init__()
         self.conv = _ScaledConv2d(in_channels, channels, 1, bias=False)
-        self.normact = NormAct(channels)
+        self.normact = NormAct(channels, has_scale=False)
         self.fc = _ScaledLinear(3 * channels, hidden, bias=True)
         self.outcome = _ScaledLinear(hidden, 3, bias=True)
         # 3 → 6：官方 sv3Mul 的 out_channels=6。用户 2026-10-03 明确要求

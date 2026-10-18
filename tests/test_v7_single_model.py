@@ -113,8 +113,8 @@ def test_both_sources_feed_the_identical_architecture():
     se = SupervisedDataset.__mro__  # 仅确认父类还在位
     assert SupervisedDataset is not None and len(se) >= 2
     # 默认纯 nbt（GAU 已关，gau_positions=None），全 10 块 [nbt,nbt]；
-    # 总参 10,529,929（见 `NBT_TF_CFG['params_total']` / `SPEC_TOTAL`）。
-    assert n_v7 == 10_579_753, n_v7
+    # 总参 10,579,561（头 BN 去 gamma 后，见 `NBT_TF_CFG['params_total']`）。
+    assert n_v7 == 10_579_561, n_v7
 
 
 # --------------------------------------------------------------------------- #
