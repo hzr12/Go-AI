@@ -2445,7 +2445,7 @@ def _init_swanlab(args, logger):
                 "scaler_init_scale": args.scaler_init_scale,
                 "scaler_growth_interval": args.scaler_growth_interval,
                 # ---- 注意力内核：固定走 torch 内置 SDPA ----
-                "attn_backend": "sdpa",
+                "attn_backend": 1,
                 # ---- 数据/运行 ----
                 "data": args.data,
                 "board_size": args.board_size,
@@ -3644,13 +3644,6 @@ def main():
                     "0 表示跟随 --log-every=%d）",
                     bool(use_swanlab), swanlab_logger is not None,
                     _se_eff, args.swanlab_every, args.log_every)
-        # B 段启动卡在此处（2026-10-18）：swanlab 初始化完成，但后续无 log。
-        # 原因：`swanlab.init` 的 config dict 里 `"amp_dtype": "float16"` 是硬编码字符串，
-        # 实际 `amp_dtype` 在 A100（sm_80+）路径上是 `bfloat16`。swanlab 的 pydantic
-        # schema 校验会卡住。修法：把 AMP 段改成实际取 `amp_dtype` 变量（main 的设备分支
-        # 已写好，但 init 在此处早于设备分支，取不到——所以这里只改字符串，设备分支
-        # 的 swanlab.config.update 会回填真值）。
-        logger.info("[swanlab] 初始化完成，开始数据集与预取器构建...")
 
     # ---- 数据集 + 预取 worker：**必须在设备初始化之前**（2026-09-30）----
     # 顺序是硬要求，不是风格问题：本段的 `mp.Process` 默认 fork，若排在
