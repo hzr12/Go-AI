@@ -3649,9 +3649,13 @@ def main():
     # 顺序是硬要求，不是风格问题：本段的 `mp.Process` 默认 fork，若排在
     # 设备初始化（如 set_device / 分布式上下文）之后，worker 会继承父进程的
     # CUDA 上下文与显存映射 ⇒ 每卡凭空多占 ~24 GiB ⇒ OOM。数据集加载是纯 numpy，提前无语义影响。
+    logger.info("[data] 开始 load_from_path %s ...", args.data)
+    logger.info("[data] 开始 load_from_path %s ...", args.data)
     dataset = load_from_path(args.data, args.board_size,
                                 args.max_games_per_tgz, v7=bool(args.v7),
                                 games_npz=args.games_npz)
+    logger.info("[data] 数据集加载完成，类型=%s", type(dataset).__name__)
+    logger.info("[data] 数据集加载完成，类型=%s", type(dataset).__name__)
     # ---- V7 分片的软标签是**内建**的 ⇒ 这里复算一次 policy 口径 -------------
     # 上面那一次发生在数据集建好之前，只能看见 `--soft-index`；而段 3（stdata
     # 分片）的 `soft` / `soft_mask` 直接来自行内，不需要索引文件。
@@ -3713,8 +3717,10 @@ def main():
     _fp_status = None
     if _v7_on:
         if hasattr(dataset, 'attach_futurepos'):
+            logger.info("[v7] warm_futurepos 开始 ...")
             _fp_status = dataset.attach_futurepos(source=None, mode='live')
             _fp_status = dataset.warm_futurepos()   # 必须在 worker 起来之前 warm
+            logger.info("[v7] warm_futurepos 完成")
         else:
             _fp_status = {'mode': 'packed', 'offsets': None,
                         'resolved': True, 'source': 'shard:futurepos'}
@@ -3725,9 +3731,13 @@ def main():
 
     pf = None
     if args.prefetch_workers > 1:
+        logger.info("[data] 开始构造 _BatchPrefetcher（workers=%d）...",
+                    args.prefetch_workers)
         pf = _BatchPrefetcher(dataset, num_workers=args.prefetch_workers,
                             prefetch=args.prefetch_depth, labels=_soft_on,
                             v7=_v7_on)
+        logger.info("[data] _BatchPrefetcher 构造完成，fork 了 %d 个 worker",
+                    args.prefetch_workers)
         logger.info("[data] 预取器已启用（在设备初始化之前 fork）| workers=%d depth=%d"
                     " | labels=%s | v7=%s", args.prefetch_workers, args.prefetch_depth,
                     _soft_on, _v7_on)

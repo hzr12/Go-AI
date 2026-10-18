@@ -17,6 +17,9 @@
 # Requires models/b_v7_a100.pth from run_b.sh to exist.
 # Usage: bash run_c.sh    (run from the repo root)
 set -euo pipefail
+# 每个预取 worker 只占 1 核（否则 24 worker × 满核 OMP 线程互相抢核，
+# top 退化成单核 100%，见 run.txt 第 21 行）。
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 
 exec python scripts/train_sft.py \
   --data data/stdata --v7 1 --device cuda --board-size 19 \
