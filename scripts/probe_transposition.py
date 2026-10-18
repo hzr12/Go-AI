@@ -61,7 +61,7 @@ from src.game.go_rules import GoBoard  # noqa: E402
 from src.inference import GoAI  # noqa: E402
 from src.search.mcts import MCTS  # noqa: E402
 
-DEFAULT_MODEL = os.path.join("models", "sft_19x19_v12.pth")
+DEFAULT_MODEL = "none"   # 随机权重（只验脚本）；真实对局用 --model <V7 checkpoint>
 DEFAULT_SGF_DIR = os.path.join("data", "games", "games")
 
 
