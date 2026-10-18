@@ -3650,11 +3650,9 @@ def main():
     # 设备初始化（如 set_device / 分布式上下文）之后，worker 会继承父进程的
     # CUDA 上下文与显存映射 ⇒ 每卡凭空多占 ~24 GiB ⇒ OOM。数据集加载是纯 numpy，提前无语义影响。
     logger.info("[data] 开始 load_from_path %s ...", args.data)
-    logger.info("[data] 开始 load_from_path %s ...", args.data)
     dataset = load_from_path(args.data, args.board_size,
                                 args.max_games_per_tgz, v7=bool(args.v7),
                                 games_npz=args.games_npz)
-    logger.info("[data] 数据集加载完成，类型=%s", type(dataset).__name__)
     logger.info("[data] 数据集加载完成，类型=%s", type(dataset).__name__)
     # ---- V7 分片的软标签是**内建**的 ⇒ 这里复算一次 policy 口径 -------------
     # 上面那一次发生在数据集建好之前，只能看见 `--soft-index`；而段 3（stdata
