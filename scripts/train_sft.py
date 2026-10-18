@@ -2340,11 +2340,71 @@ class _BatchPrefetcher:
                 _labels_dict_to_tensors(labels_dict, device=device))
 
 
+class _SafeguardedSwanlab:
+    """`swanlab.log` 的后台队列代理（见模块 docstring 的「Commit 1」）。
+
+    把热路径上的 `swanlab.log(...)` 变成「塞队列、立即返回」，真正的上传/上报
+    交给一个 daemon 线程。swanlab 云端模式下若卡死或崩，影响面是那个线程，
+    不是整个训练主循环。其它方法/属性透明转发到真正的 swanlab 模块。
+    """
+
+    def __init__(self, mod, logger):
+        self._mod = mod
+        self._logger = logger
+        import queue
+        import threading
+        self._q = queue.Queue()
+        self._worker = threading.Thread(target=self._run, name='swanlab-log',
+                                        daemon=True)
+        self._worker.start()
+
+    def _run(self):
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            d, step = item
+            try:
+                self._mod.log(d, step=step)
+            except Exception as e:  # noqa: BLE001
+                self._logger.warning('[swanlab] log 后台失败（训练不受影响）: %r', e)
+
+    def log(self, d, step=None):
+        # 永不阻塞主循环：塞进队列即可。无界队列 put 不阻塞。
+        self._q.put((d, step))
+
+    def finish(self):
+        # 收尾：排空队列（带超时防死锁），再 finish 真正的 swanlab。
+        import queue
+        try:
+            while True:
+                item = self._q.get(timeout=2.0)
+                if item is None:
+                    break
+                try:
+                    self._mod.log(item[0], step=item[1])
+                except Exception:  # noqa: BLE001
+                    pass
+        except queue.Empty:
+            pass
+        try:
+            self._mod.finish()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def __getattr__(self, name):
+        # log/finish 已被上面定义，转发其余到真模块。
+        return getattr(self._mod, name)
+
+
 def _init_swanlab(args, logger):
     """初始化 SwanLab 跟踪，返回 swanlab 模块；失败返回 None（训练照常进行）。
 
     单独抽出来是为了让 main() 保持扁平：main 只负责"是否启用 + 能否连通"的
     决策，本函数只负责"装/登录/init"。任何异常都吞掉并降级为 None。
+
+    **返回的是 `_SafeguardedSwanlab` 代理**（不是裸 swanlab）：`.log` 走后台
+    队列，云端卡死/崩溃不再拖主循环。
     """
     try:
         # 刻意**不在训练进程内** pip install swanlab。调用点在 torch
@@ -2459,8 +2519,8 @@ def _init_swanlab(args, logger):
                 "prefetch_depth": args.prefetch_depth,
                         },
         )
-        logger.info("[swanlab] 实验跟踪已启用")
-        return swanlab
+        logger.info("[swanlab] 实验跟踪已启用（log 走后台队列，卡死不影响训练）")
+        return _SafeguardedSwanlab(swanlab, logger)
     except Exception as e:  # noqa: BLE001
         logger.warning("[swanlab] 初始化失败: %s（指标请看 stdout 日志）", e)
         _emsg = str(e)
