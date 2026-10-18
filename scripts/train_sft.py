@@ -2445,7 +2445,7 @@ def _init_swanlab(args, logger):
                 "scaler_init_scale": args.scaler_init_scale,
                 "scaler_growth_interval": args.scaler_growth_interval,
                 # ---- 注意力内核：固定走 torch 内置 SDPA ----
-                "attn_backend": 1,
+                "attn_backend": "sdpa",
                 # ---- 数据/运行 ----
                 "data": args.data,
                 "board_size": args.board_size,
