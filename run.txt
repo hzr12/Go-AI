@@ -36,16 +36,14 @@ pip install onnx onnxruntime
 #
 # ---- SFT：A100 40G 单卡（本节 A/B/C 全部命令）----
 #   `train_sft.py` 的 `_backend == 'cuda' and compute_cap >= (8,0)` 分支（唯一事实源）
-#   自动给：BF16 + `use_scaler=False` + `channels_last=True` + `sdpa_force_math=False`
-#   （⇒ FlashAttn 优先，回退内置 SDPA）+ TF32（`set_float32_matmul_precision('high')`）
+#   自动给：BF16 + `use_scaler=False` + `channels_last=True` + 内置 SDPA
+#   + TF32（`set_float32_matmul_precision('high')`）
 #   + fused AdamW + `--compile` 按设备自动开 1。
 #   ⇒ **`--scaler-init-scale` / `--scaler-growth-interval` 在 SFT 上是死参数**
 #     （GradScaler 根本不会被创建），下面所有 SFT 命令都不给它们。
 #     与 RL 的 V100 路径不同：A100 是 Ampere+，BF16 原生支持，不需要 scaler。
 #   ⇒ `--compile` **不给即可**（自动开）。要关就显式 `--compile 0`。
 #     启动日志看两行：`[device] --compile 未指定 ⇒ 按设备自动取 1` 与 `[train] 已启用 torch.compile 算子融合`。
-#   ⚠ flash-attn 需 `pip install flash-attn`；加载失败**自动回退内置 SDPA**，
-#     只少速度不会崩。`--flash-attn 0` 可强制禁用。启动日志看 `[env]` 那行。
 #   ✅ 8 路对称增强已迁 GPU：训练侧 dihedral 增强走 `_dihedral_batch_torch`
 #     （`train_sft.py` L2274），在 GPU 上施加并与前后向重叠（prefetch worker 只递
 #     raw spatial + tforms），不再占 CPU。与 eval 的 `augment=False`（指标逐位不变）
@@ -147,12 +145,6 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 #   0.1 是旧网络的默认值，会经 `train_sft.py` 透传进 V7，覆盖掉
 #   `NBT_TF_CFG['attn_dropout']=0.0`——而 katago_v7.py 明确写「**没有 dropout**」。
 #   实测：不给该 flag 时 MHSA.attn_dropout=0.1（与设计相反）。
-# ⚠ `--use-sdpa 1`（默认 1）：`0` 强制回退手写 math 注意力。**A100 上默认就已经
-#   走融合路径**（CUDA 分支直接 `sdpa_force_math=False` ⇒ FlashAttn 优先、回退内置
-#   SDPA），所以这条在 SFT 上基本不用给；给 0 是「关掉融合注意力做数值对拍」用的。
-# ⚠ `--attn-online` **默认不给**：online-softmax 注意力数值等价但**非逐位相同**
-#   （fp32 max|Δ|≈7e-07），开了会失去逐位可复现性；真机加速比未实测。
-#   且它只作用于**手写 math 路径** —— A100 上注意力走融合内核，给了也不生效。
 # ⚙️ **调优开关一律是 CLI 参数，没有环境变量**（2026-10-06 全部搬完）。仅有的例外：
 #   `GOAI_PROFILE` / `GOAI_PROFILE_STEPS`（诊断开关，语义见下）**与**
 #   `TORCHINDUCTOR_FX_GRAPH_CACHE`（inductor 图缓存：2026-10-11 起由代码在 import torch
@@ -164,13 +156,10 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 #   **只慢不坏**（数值口径不变），出问题置 0 即回到已验证配置。
 #   **A100/SFT 上有意义的全部开关**（2026-10-08：NPU 后端下线，原来那批 `--npu-*`
 #   旗与 TorchAir 路径已一并删除）：
-#     --flash-attn 1|0      融合注意力独立库（默认 1=自动优先；加载失败回退内置 SDPA）
 #     --compile 1|0         inductor 算子融合（**不给=按设备自动**，A100 上自动 1）
 #     --compile-mode ...    见下方「⚠ --compile-mode 实测结论」；2026-10-11 本机推荐
 #                          `reduce-overhead`（带 CUDA Graphs，已实测可跑且常更快）；
 #                          带 CUDA Graphs 的档仍需注意私有内存池不归还、长跑吃显存
-#     --use-sdpa 1|0        0 = 强制回退手写 math（默认 1）
-#     --attn-query-chunk N  math 注意力 query 分块（默认 64；只影响 math 路径）
 # ✅ eval 特征预取池（2026-10-06）：eval 的梯子特征曾是主进程串行计算，10 万行磨
 #   25-30 分钟（GPU 归零、无日志，两次被当成挂死）。现在与训练预取器同点 fork 一个
 #   2-4 worker 的 eval 池（augment=False，指标逐位不变），墙钟 ÷ worker 数；
@@ -239,8 +228,7 @@ python scripts/train_sft.py \
   --data data/sgf_19x19_full.npz --v7 1 --device cuda --board-size 19 \
   --games-npz data/labels/games.npz \
   --batch-size 256 --epochs 1 --lr 0.00322 --weight-decay 0.0001 \
-  --gradient-accumulation-steps 8 --use-amp 1 --use-ema 0 \
-  --flash-attn 1 --attention-dropout 0 \
+  --gradient-accumulation-steps 8 --use-amp 1 --attention-dropout 0 \
   --prefetch-workers 24 --prefetch-depth 8 \
   --log-every 25 --eval-every 500 --save-every 1674 \
   --early-stop 1 --early-stop-patience 3 \
@@ -286,8 +274,7 @@ python scripts/train_sft.py \
   --soft-index data/labels/soft_index.npz --soft-only-sampling 1 \
   --soft-weight 1.0 --soft-every 1 --policy-loss soft_ce \
   --batch-size 256 --epochs 30 --lr 0.00322 --weight-decay 0.0001 \
-  --gradient-accumulation-steps 8 --use-amp 1 --use-ema 1 \
-  --flash-attn 1 --attention-dropout 0 \
+  --gradient-accumulation-steps 8 --use-amp 1 --attention-dropout 0 \
   --prefetch-workers 24 --prefetch-depth 8 \
   --log-every 25 --eval-every 100 --eval-max-batches 5 --save-every 20 \
   --early-stop 1 --early-stop-patience 3 \
@@ -305,8 +292,7 @@ python scripts/train_sft.py \
   --model models/b_v7_a100.pth \
   --policy-loss soft_ce --soft-weight 1.0 \
   --batch-size 256 --epochs 1 --lr 0.00322 --weight-decay 0.0001 \
-  --gradient-accumulation-steps 8 --use-amp 1 --use-ema 0 \
-  --flash-attn 1 --attention-dropout 0 \
+  --gradient-accumulation-steps 8 --use-amp 1 --attention-dropout 0 \
   --prefetch-workers 24 --prefetch-depth 8 \
   --log-every 50 --eval-every 500 --save-every 20 \
   --early-stop 1 --early-stop-patience 3 \

@@ -1,4 +1,3 @@
-import math
 
 import torch
 import torch.nn as nn
@@ -123,277 +122,15 @@ def _segment_runner(blocks, taps_want):
         return cur[0]
 
     return run
+def _sdpa(q, k, v, dropout_p=0.0, scale=None):
+    """注意力计算，唯一后端 = ``F.scaled_dot_product_attention``。
 
-
-
-
-
-
-
-
-
-
-# flash-attn 内核的 batch 维参与 CUDA grid 坐标，受 grid y/z 维上限 65535 约束。
-# window/sparse 注意力把 batch 展开为 B*G（如 512*128=65536，恰好超限 1），会报
-# "CUDA error: invalid configuration argument"。阈值需低于 flash 内核 grid 上限 65535：
-# 取 60000，使 ws=7、B=4800 时 B*nW=43200 可走 flash；超过则强制回退
-# 手写 math——这些分块调用的 seq 仅 ~50（49 窗口 + 全局 token），math 成本可忽略。
-_FLASH_BATCH_LIMIT = 60000  # ws=7, B=4800 -> B*nW=43200 < 60000
-
-def _sdpa(q, k, v, dropout_p=0.0, use_math=False, scale=None):
-    """注意力计算。
-
-    q,k,v: (B, Hh, N, head_dim)。q 已在调用处预乘 scale。
-    use_math: 跳过 F.scaled_dot_product_attention 的所有后端，直接走手写 softmax 注意力。
-        用于 window 注意力：其 batch 维被展开为 B*N（可能极大，如 512*361≈18万），
-        且序列长度仅 ws*ws（很小）。在 Volta(V100, sm_70) 等老架构上 FlashAttention 内核
-        不可用（会报 "invalid configuration argument"），故走手写 math 路径最稳；
-        window 的 seq=49，49×49 注意力成本可忽略。
-        在 Ampere+(A100/H100, sm_80+) 上则由调用方传 use_math=False，自动走
-        FlashAttention / Memory-Efficient 后端，速度更快、显存更省，且能被 torch.compile 融合。
-
-    模块级开关 _sdpa_force_math（在 train_sft.py 里按 GPU 能力设置）会覆盖 use_math：
-    V100 强制 math，A100 强制走 SDPA 后端。
-
-    注意力后端优先级（非 math 时）：
-      1. flash-attn 独立库（set_flash_attn(True) 成功加载时）——最快、显存最低，
-         仅 Ampere+ CUDA 可用；
-      2. torch 内置 F.scaled_dot_product_attention（自动选 flash/mem-efficient 后端）；
-      3. 手写 math（use_math=True 时直接走这条）。
+    q,k,v: (B, Hh, N, head_dim)。torch 按设备与形状自选 flash /
+    mem-efficient / math 内核；``scale=None`` 用 SDPA 原生默认 1/sqrt(d)，
+    调用方传值则透传（PyTorch>=2.1 支持显式 ``scale=``）。
     """
-    # 模块级覆盖：训练脚本按 GPU 能力设置（A100 走 Flash，V100 走 math）
-    if _sdpa_force_math:
-        use_math = True
-    # batch 超过 flash 内核 grid 上限时强制 math（内置 SDPA 的 flash/mem-efficient
-    # 后端对同配置有相同限制，一并排除）。典型触发：window/sparse 的 B*G=65536。
-    if q.shape[0] > _FLASH_BATCH_LIMIT:
-        use_math = True
-    if not use_math and _flash_attn_func is not None:
-        # flash-attn 只接受 fp16/bf16。正常由 autocast 保证 bf16；若上游发生 dtype
-        # 泄漏（如 graph-break resume 段的 eager 重算），这里兜底转 bf16，避免
-        # "FlashAttention only support fp16 and bf16 data type" 直接崩溃。
-        _flash_orig_dtype = q.dtype
-        if q.dtype not in (torch.float16, torch.bfloat16):
-            q = q.to(torch.bfloat16)
-            k = k.to(torch.bfloat16)
-            v = v.to(torch.bfloat16)
-        # flash-attn 的 `scale` 在 kernel 里写死为 1/sqrt(head_dim)，Python 侧没有
-        # 参数可传。调用方若传了别的 `scale`，必须在这里手动预乘 q 把它抵消掉，
-        # 否则 SDPA 路径（已透传 scale）和 flash 路径会给出不同结果。
-        if scale is not None:
-            q = q * scale * math.sqrt(q.shape[-1])
-        # flash-attn 独立库：要求 (B, S, Hh, d) 布局（头维 -2、head_dim -1）。
-        # 我们的 (B, Hh, N, d) 中 head_dim 为最内层（stride=1），transpose 后满足
-        # flash-attn 的 last-dim contiguous 要求，无需显式 .contiguous() 拷贝。
-        out = _flash_attn_func(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-            dropout_p=dropout_p, causal=False)
-        out = out.transpose(1, 2)
-        # 仅在原输入非 fp16/bf16（被兜底转 bf16）时转回，保持与 math/SDPA 路径一致的
-        # dtype；fp16/bf16 输入则维持 flash 原生输出（默认不开 flash，V7 走 force_math）。
-        return out.to(_flash_orig_dtype) if _flash_orig_dtype not in (
-            torch.float16, torch.bfloat16) else out
-    if use_math or not hasattr(F, "scaled_dot_product_attention"):
-        return _sdpa_math(q, k, v, dropout_p=dropout_p, scale=scale)
-    # SDPA 路径：SDPA 自带默认缩放 1/sqrt(d)，但 PyTorch>=2.1 支持显式 `scale=`。
-    # 必须把调用方传入的 `scale` 透传进去，否则本函数会**无条件**套用 1/sqrt(d)：
-    #   - 调用方传 `scale=None`（V7 的 MHSA，旧写法预乘过 q）⇒ 恰好 1/sqrt(d)，巧合正确
-    #   - 调用方传 `scale=self.scale`（本文件里 815/882/1040 三处）⇒ 被**忽略**，
-    #     只剩 1/sqrt(d)。当 self.scale != 1/sqrt(head_dim) 时结果就是错的。
-    # scale=None 时保持 SDPA 的原生默认（等价 1/sqrt(d)），向后兼容。
-    # 运行时兜底：部分环境「有 API 但调用即抛 RuntimeError」（如 invalid
-    # configuration argument）。静态判定放开了 SDPA 后若撞上这类版本会直接整训
-    # 崩溃，故捕获一次并回退手写 math（与 set_sdpa_force_math 的静态判定互补）。
-    try:
-        return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p,
-                                              scale=scale)
-    except RuntimeError as _sdpa_err:
-        if _sdpa_force_math:
-            # 本就强制 math，不该走到这；如实抛出便于定位。
-            raise
-        import logging as _logging
-        _logging.getLogger(__name__).warning(
-            "[_sdpa] F.scaled_dot_product_attention 运行时失败，回退 math: %s",
-            _sdpa_err)
-        return _sdpa_math(q, k, v, dropout_p=dropout_p, scale=scale)
-
-
-# flash-attn 独立库的内核句柄（None=未启用）。由 train_sft.py 启动时按
-# 「库已安装 + Ampere+ CUDA」条件调用 set_flash_attn(True) 加载。
-_flash_attn_func = None
-
-
-def set_flash_attn(enabled: bool):
-    """尝试加载 flash-attn 独立库内核。返回 (是否启用, 状态描述)。
-
-    enabled=False 直接卸载回退 SDPA；enabled=True 时 import flash_attn，
-    成功则 _sdpa 优先走 flash-attn 内核，失败（未安装/导入错误）返回原因并回退。
-    注意：window/sparse 注意力不走 flash（形状为每窗口 1×S 微序列），
-    flash 仅用于 global/axial 等标准 MHA 形状。
-    """
-    global _flash_attn_func
-    if not enabled:
-        _flash_attn_func = None
-        return False, "已禁用"
-    try:
-        import flash_attn  # type: ignore[import-not-found]
-        from flash_attn import flash_attn_func  # type: ignore[import-not-found]  # noqa: F401
-        _flash_attn_func = flash_attn_func
-        return True, "已启用 (v%s)" % getattr(flash_attn, "__version__", "?")
-    except Exception as e:
-        _flash_attn_func = None
-        return False, "不可用: %s" % e
-
-
-# 模块级开关：是否强制走手写 math 注意力。
-# 默认 False（启用 FlashAttention 后端：优先 flash-attn 独立库，否则 torch SDPA 自动选
-# flash/mem-efficient）；V100 等老卡（无 flash 内核）由 train_sft.py 检测后设为 True。
-# 窗口/稀疏注意力在 A100 上 batch 维被展开为 B*N，但若序列长度极小（ws²+ng≈数十），
-# 较新 torch 的 SDPA 后端能正常处理，无需 math。
-_sdpa_force_math = False
-
-
-def set_sdpa_force_math(flag: bool) -> None:
-    """由训练脚本在启动时按 GPU 能力设置。flag=True 强制手写 math（V100）。"""
-    global _sdpa_force_math
-    _sdpa_force_math = bool(flag)
-
-
-# 模块级开关：手写 math 注意力的 **query 分块长度**（0 = 关闭，走整条 N×N）。
-#
-# 为什么粒度要在**算子内部**：Mamba 那边外层循环本来就按 chunk 走，但 `drive`
-# 是在进循环之前整条物化的 ⇒ 外层分块对峰值毫无帮助，赢在把乘法搬进循环内部。
-# 注意力没有外层循环，整个 N×N 是一次算子，所以必须新增一层循环。
-#
-# 默认 64：19 路棋盘 N=361 ⇒ 6 块，每份 (B,4,64,361) fp16 在 B=1000 下
-# 0.17 GiB（原 0.97）。设 0 或 ≥N 即退回原路径（逐位不变）。
-_attn_query_chunk = 64
-
-
-
-# ---- online-softmax 注意力（flash 风格，不物化 (Nq,Nk) 注意力矩阵）----
-#: 是否启用 online-softmax 注意力（False ⇒ 走 `_sdpa_math` 的 materialize 实现）。
-#: 由 `set_attn_online` / 训练脚本（`GOAI_ATTN_ONLINE=1`）设置。
-#:
-#: **默认 False**，虽然它已可用且有测试覆盖。三个理由：
-#:
-#: 1. **它不是逐位等价的** —— online 走 rescale 累加、materialize 走一次
-#:    softmax，算术次序不同，实测 fp32 下 `max|Δ| ≈ 7e-07`；默认打开会让既有的
-#:    逐位基线失效。
-#: 2. **真机未验证** —— bf16/fp16 内核在 910A 上的实际加速比与数值稳定性都还没有
-#:    数据。
-#: 3. `dropout_p > 0` 时它本来就会回退 materialize（V7 的 `attn_dropout` 默认
-#:    0.0，所以这条不构成日常约束）—— 也就是说它**总是**在关键路径上生效，
-#:    默认开关必须保守。
-_attn_online = False
-
-
-def set_attn_online(flag):
-    """开关 online-softmax 注意力（False = 走 materialize 实现）。
-
-    打开前请先跑 `tests/test_online_softmax_attn.py`（前向等价 + 梯度 gradcheck），
-    并知道它会让 12 通道的 bit-identical 基线失效。
-    """
-    global _attn_online
-    _attn_online = bool(flag)
-
-
-class _OnlineSoftmaxAttn(torch.autograd.Function):
-    """flash 风格 online-softmax 注意力（纯 math，不物化 (Nq,Nk) 注意力矩阵）。
-
-    forward 在 ``no_grad`` 下沿 **K 维**流式分 tile 累积输出与统计量 ``(m, l)``，
-    注意力权重 ``P`` 不进入 autograd 图；backward 沿 K 重算 ``P`` 并用标准
-    softmax 反向公式累积梯度。``dropout_p`` 必须为 0 —— 训练态带 dropout 时
-    调用方应回退 `_sdpa_math` 的 materialize 路径（保证 dropout mask 行为）。
-
-    数值上 online 的 ``P = exp(s-m)/l`` 与标准 ``softmax(s)`` 等价（fp 下仅细微
-    差异），故 ``dropout=0`` 时与原 materialize 路径**逐位等价**。相比 materialize
-    路径它还带来两个好处：不把 ``(Nq,Nk)`` 矩阵留在 autograd 图里（省反向保留
-    显存），且 online rescaling 在 fp16 下比标准 softmax 更不易溢出。
-    """
-
-    @staticmethod
-    def forward(ctx, q, k, v, scale):
-        # q:(B,Hh,Nq,d) k:(B,Hh,Nk,d) v:(B,Hh,Nk,dv)
-        if scale is None:
-            scale = 1.0
-        scale = float(scale)
-        B, Hh, Nq, d = q.shape
-        Nk = k.shape[-2]
-        dv = v.shape[-1]
-        tile = Nk if Nk <= 512 else 512
-        # ---- 统计量与累加的 dtype：**至少 fp32**，但不降精度 ----
-        # `promote_types(q.dtype, float32)` 而不是写死 `float32`：
-        #  - fp16 / bf16 → fp32：autocast 下 `q @ kj.T` 出 bf16，若 m/l/acc 按
-        #    `q.dtype` 建就是 fp32 减 bf16，直接
-        #    `RuntimeError: expected m1 and m2 to have the same dtype`
-        #    （V7 head 重算那条用例就是这么炸的）；
-        #  - fp32 → fp32；
-        #  - **fp64 → fp64**：写死 fp32 会把 `gradcheck`（用 double）打挂 ——
-        #    `dS @ kj` 变成 fp32 混 fp64。降精度同样是一种静默的错。
-        # 而 **matmul 始终留在计算 dtype**（autocast 的低精度内核照用），不为
-        # 数值稳就把 GEMM 拉回 fp32 那种慢路径。
-        acc_dtype = torch.promote_types(q.dtype, torch.float32)
-        m = torch.full((B, Hh, Nq, 1), float('-inf'), dtype=acc_dtype,
-                       device=q.device)
-        l = torch.zeros((B, Hh, Nq, 1), dtype=acc_dtype, device=q.device)
-        acc = torch.zeros((B, Hh, Nq, dv), dtype=acc_dtype, device=q.device)
-        with torch.no_grad():
-            for j in range(0, Nk, tile):
-                kj = k[..., j:j + tile, :]            # (B,Hh,tile,d)
-                vj = v[..., j:j + tile, :]            # (B,Hh,tile,dv)
-                # GEMM 走计算 dtype（autocast 内核），随后升到 acc_dtype 做统计
-                s = ((q @ kj.transpose(-2, -1)) * scale).to(acc_dtype)
-                m_new = torch.maximum(m, s.max(dim=-1, keepdim=True).values)
-                p = torch.exp(s - m_new)              # ∈(0,1]
-                corr = torch.exp(m - m_new)           # 首轮为 exp(-inf)=0
-                l = l * corr + p.sum(dim=-1, keepdim=True)
-                # p 回到 vj 的 dtype 再做第二个 GEMM（acc 仍按 acc_dtype 累加）
-                acc = acc * corr + (p.to(vj.dtype) @ vj).to(acc_dtype)
-                m = m_new
-            out = acc / l
-        ctx.save_for_backward(q, k, v, acc, l, m)
-        ctx.scale = scale
-        ctx.acc_dtype = acc_dtype
-        # 输出回落到 q.dtype：调用方（MHSA）拿到的必须是它传进来的那个 dtype，
-        # 否则下一层 Linear 在 autocast 下会遇到意外 promotion。
-        return out.to(q.dtype)
-
-    @staticmethod
-    def backward(ctx, d_out):
-        q, k, v, acc, l, m = ctx.saved_tensors
-        scale = ctx.scale
-        acc_dtype = ctx.acc_dtype
-        Nk = k.shape[-2]
-        tile = Nk if Nk <= 512 else 512
-        dq = torch.zeros_like(q)
-        dk = torch.zeros_like(k)
-        dv = torch.zeros_like(v)
-        O = acc / l
-        # d_out 是 q.dtype（可能低精度），D 必须按 acc_dtype 算 —— 与 forward 同口径
-        D = (d_out.to(acc_dtype) * O).sum(dim=-1, keepdim=True)   # (B,Hh,Nq,1)
-        with torch.no_grad():
-            for j in range(0, Nk, tile):
-                kj = k[..., j:j + tile, :]
-                vj = v[..., j:j + tile, :]
-                s = ((q @ kj.transpose(-2, -1)) * scale).to(acc_dtype)
-                p = torch.exp(s - m) / l               # = softmax(s)
-                dP = (d_out @ vj.transpose(-2, -1)).to(acc_dtype)
-                dS = p * (dP - D)                      # softmax 反向
-                # dS 回到 kj 的 dtype 再做 GEMM：梯度按入参 dtype 累加，
-                # 不把 fp32 的中间结果直接加进 fp16 的 dq（那是隐式降精度）。
-                dq = dq + (dS.to(kj.dtype) @ kj) * scale
-                dk = dk + (dS.to(q.dtype).transpose(-2, -1)
-                           @ (q * scale))
-                dv = dv + (p.to(d_out.dtype).transpose(-2, -1) @ d_out)
-        return dq, dk, dv, None
-
-
-def set_attn_query_chunk(n: int) -> None:
-    """设置 query 分块长度（0/负数 = 关闭）。由训练脚本启动时调用。"""
-    global _attn_query_chunk
-    n = int(n)
-    _attn_query_chunk = n if n > 0 else 0
+    return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p,
+                                          scale=scale)
 
 
 # 模块级开关：是否将 window/sparse 注意力排除出 torch.compile 图。
@@ -414,12 +151,11 @@ def _run_with_optional_disable(fn, *args):
 
     注意：不能用装饰器在类定义时静态包装——装饰器在 import 求值时模块开关还是
     默认值 True，运行时 set_compile_disable_sparse(False)（A100）无法撤销已应用的
-    torch._dynamo.disable。disable 会造成 graph break，break 后的 eager resume 段
-    中 autocast 已退出，qkv Linear 以 FP32 执行，进而让 flash-attn 收到 fp32 报错。
-    这里改为调用时动态包装。注意不能每次调用都 torch.compiler.disable(fn)——
-    那会为每次调用生成新包装器对象，dynamo 视其为新函数反复 trace，64 次后触发
-    cache_size_limit 告警并整体放弃。此处按 fn（bound method 按 __func__+__self__
-    相等）缓存包装器，实例数有限（每注意力块一个），trace 一次后稳定复用。
+    torch._dynamo.disable。这里改为调用时动态包装。注意不能每次调用都
+    torch.compiler.disable(fn)——那会为每次调用生成新包装器对象，dynamo 视其为新
+    函数反复 trace，64 次后触发 cache_size_limit 告警并整体放弃。此处按 fn
+    （bound method 按 __func__+__self__ 相等）缓存包装器，实例数有限（每注意力块
+    一个），trace 一次后稳定复用。
     """
     if _compile_disable_sparse:
         wrapped = _disabled_wrapper_cache.get(fn)
@@ -477,7 +213,7 @@ class MultiHeadSelfAttention(nn.Module):
 
         为什么需要这个派生属性：注意力 dropout 走的是**函数式** API
         （`F.scaled_dot_product_attention(..., dropout_p=p)` /
-        `F.dropout(x, p)` / `_flash_attn_func(..., dropout_p=p)`），
+        `F.dropout(x, p)`），
         它们的 `training` 形参**默认 True**，而 `_sdpa` 是模块级函数、内联的
         `F.dropout` 在方法体里，两者都拿不到 `self.training` → `model.eval()`
         关不掉注意力 dropout，SFT 评估的 logits 会逐次抖动、最佳模型选择是在噪声上做的。
@@ -741,8 +477,8 @@ class MultiHeadSelfAttention(nn.Module):
         h = self.ln1(seq)
         qkv = self.qkv(h)  # (B, N, 3C)
         q, k, v = qkv.view(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4).unbind(0)
-        # 注意：不对 q 预乘 scale。_sdpa 的 math 路径内部处理缩放，
-        # SDPA/flash 路径自带 1/sqrt(d)，预乘会导致双重缩放。
+        # 注意：不对 q 预乘 scale。_sdpa 内部处理缩放，
+        # SDPA 自带 1/sqrt(d)，预乘会导致双重缩放。
 
         if self.mode == "window":
             out = _run_with_optional_disable(self._window_attn, q, k, v, H, W)
@@ -1020,66 +756,3 @@ class TransformerBlock(nn.Module):
         return x
 
 
-def _sdpa_math(q, k, v, dropout_p=0.0, scale=None):
-    """手写注意力（`_sdpa` 的 math 分支）：按 query 分块。
-
-    ## `dropout_p` 的来源（别把它当闸门看）
-
-    本函数**不**做任何 training 判断，只把形参原样用掉。它之所以受管，是因为
-    它的**所有**调用方传进来的都是 `self.attn_drop_p`
-    （= ``self.attn_drop if self.training else 0.0``）：
-
-    - `_sdpa` 的 math 路径（`use_math=True` / V100 / batch 超限 / 无 SDPA API）；
-    - `_sdpa` 的 SDPA 运行时回退（部分环境有 API 但调用即抛
-      ``RuntimeError``）。
-
-    闸门在**调用方**那一层，不在这里。所以 eval 下这里的 `dropout_p` 恒为 0.0，
-    输出逐位可复现；train 下才真的在丢。
-    """
-
-    step = _attn_query_chunk
-    nq = q.shape[-2]
-
-    # online-softmax 分支（flash 风格）：仅 `dropout_p == 0` 时启用；训练态带
-    # dropout 回退下方 materialize 实现以保证 dropout mask 行为。不物化 (Nq,Nk)
-    # 注意力矩阵 ⇒ 反向不保留该矩阵（省显存），且 online rescaling 在 fp16 下更
-    # 不易溢出。**数值等价但非逐位相同**（实测 fp32 `max|Δ| ≈ 7e-07`），
-    # 所以默认关闭、由 `GOAI_ATTN_ONLINE=1` 显式打开；见 `_attn_online` 的理由
-    # 与 `tests/test_online_softmax_attn.py`（前向等价 + 梯度 gradcheck + bf16）。
-    use_online = _attn_online and dropout_p == 0.0
-    if use_online:
-        if step and nq > step:
-            outs = [_OnlineSoftmaxAttn.apply(
-                q[..., i:i + step, :], k, v, scale) for i in range(0, nq, step)]
-            return torch.cat(outs, dim=-2)
-        return _OnlineSoftmaxAttn.apply(q, k, v, scale)
-
-    # 手写注意力：math 路径需手动缩放 q
-    if scale is not None:
-        q = q * scale
-    # query 分块（2026-10-01）：**峰值**显存由「同时活着的最大张量」决定，
-    # 不是总量。整条 (B,Hh,N,N) 分数矩阵在 N=361、4 head、fp16 下是
-    #   1000×4×361×361×2B = 0.97 GiB/份，softmax+dropout 再各留一份 ⇒
-    # 一次调用峰值约 2.9 GiB、反向要重取约 2 份。
-    # 而 softmax 沿 **key 轴**（dim=-1），每行 query 只跟自己那 N 个 key
-    # 有关 ⇒ 按 query 切块在数学上**精确**，峰值变成 ∝ chunk 而不是 ∝ N。
-    # chunk=64 时每份 0.97 → 0.17 GiB（5.6×）。
-    #
-    # 唯一的**行为**变化：`dropout_p > 0`（训练态）时 mask 的随机取样位置
-    # 会变（分布等价、**不逐位相同**）。eval 态 dropout 恒为 0（见
-    # `attn_drop_p`），故评估指标不受影响。
-    if step and nq > step:
-        kt = k.transpose(-2, -1)
-        outs = []
-        # 按 query 切块计算（降**瞬时**峰值，数学精确；不重算）。
-        for i in range(0, nq, step):
-            a = (q[..., i:i + step, :] @ kt).softmax(dim=-1)
-            if dropout_p > 0.0:
-                a = torch.nn.functional.dropout(a, p=dropout_p)
-            outs.append(a @ v)
-        return torch.cat(outs, dim=-2)
-    attn = (q @ k.transpose(-2, -1))
-    attn = attn.softmax(dim=-1)
-    if dropout_p > 0.0:
-        attn = torch.nn.functional.dropout(attn, p=dropout_p)
-    return attn @ v

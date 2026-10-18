@@ -157,8 +157,8 @@ def test_skip_rate_denominator_cannot_exceed_100():
         '两者必须在同一次 scaler.unscale_ 的紧邻前后自增（同一个 step 块内）'
 
 
-def test_scheduler_and_ema_do_not_advance_on_skipped_steps():
-    """ 跳过的步**不许**推进 LR 计划与 EMA。
+def test_scheduler_does_not_advance_on_skipped_steps():
+    """ 跳过的步**不许**推进 LR 计划。
 
     `scaler.step()` 在检出 inf 时**内部跳过** `optimizer.step()`，但对调用方
     是「成功返回」的 ⇒ 无条件 `scheduler.step()` 会让 warmup/cosine 在
@@ -168,17 +168,11 @@ def test_scheduler_and_ema_do_not_advance_on_skipped_steps():
     消耗掉，等于训练一开始就拿到一个已经退火的 LR。PyTorch 为此打的
     `Detected call of lr_scheduler.step() before optimizer.step()` 警告
     **正是在说这件事**，之前被当噪音忽略了。
-
-    EMA 同理：`ema.update()` 会把 shadow 朝当前权重多拉一次且 step 计数 +1，
-    而 eval 是在 EMA shadow 上评的（`eval_used_ema`）⇒ 100% 跳步时 shadow
-    会一路收敛到**初始权重**。
     """
     assert '_real_step = _scaler_step_global(' in SRC, \
         '跳步必须由全局判定给出（不能再从缩放值反推）'
     assert 'if _real_step:\n                    scheduler.step()' in SRC, \
         'scheduler.step() 必须在 _real_step 门控内'
-    assert 'if ema is not None and _real_step:' in SRC, \
-        'ema.update() 必须在 _real_step 门控内'
     assert '_n_lr_frozen += 1' in SRC, \
         '跳过的步要单独计数（否则「LR 计划被空跑」这件事不可见）'
 

@@ -358,7 +358,6 @@ _EXPECTED_PARAM_SURFACE = (
     ('--ddp', 'int', 0),
     ('--device', None, 'auto'),
     ('--no-augment', 'int', 0),
-    ('--use-ema', 'int', 0),
     ('--clip-grad', 'float', 1.0),
     ('--grad-accum-steps', 'int', 1),
     ('--out', 'str', 'models/az'),
@@ -470,15 +469,16 @@ def test_param_surface_matches_itemised_list_exactly():
                        f'路线图 D11 只允许 P3.0 +3 个参数，不许顺手多加')
     assert not wrong, (f'这些参数的 type/default 与清单不符（实为 type, default, 期望）: '
                        f'{wrong}')
-    assert len(surface) == len(_EXPECTED_PARAM_SURFACE) == 61, \
-        f'参数面应恰好 61 项（P3.0 前 52 + 3，去 MCTS 后 +5 推演 +1 权重），实为 {len(surface)}'
+    assert len(surface) == len(_EXPECTED_PARAM_SURFACE) == 60, \
+        f'参数面应恰好 60 项（P3.0 前 51 + 3，去 MCTS 后 +5 推演 +1 权重，2026-10-18 删 --use-ema），实为 {len(surface)}'
 
 
 def test_delta_is_exactly_three_ppo_kl_params():
     """P3.0 的增量恰好是那 3 个 PPO/KL 参数；去 MCTS 的增量恰好是 5 个推演参数。
 
     把路线图 D11 的算式整条钉住：
-      52（P3.0 前） → 55（P3.0 后） →(去 MCTS +5 推演参数)→ 61（现在）
+      51（P3.0 前） → 54（P3.0 后） →(去 MCTS +5 推演参数)→ 60（现在，
+      再 −1 为 2026-10-18 删除的 `--use-ema`）
      2026-09-30：MCTS 参数**没有**被删除 —— 它们按 D1「忽略但留痕」保留在
     argparse 里（旧命令行一个字不用改），只是不再转发给任何接收方。所以这里
     不再断言「55 − 19 = 37」，而是断言「旧参数一个没少 + 新增恰好 5 个」。
@@ -487,11 +487,12 @@ def test_delta_is_exactly_three_ppo_kl_params():
     `--c2net`。那笔提交改了本清单里的条目却漏改这两处硬编码计数，于是算式整体
     偏移 1。而这条用例的全部价值就在于「算式逐项相等」，偏移 1 会让它红在一个
     与被测行为无关的地方 —— 这是「删条目必须同步改算式」的又一个实例。
+    ⚠ 2026-10-18：基线 52 → 51 —— 删除 `--use-ema`（EMA 整体下线）。
     """
     surface = _surface_by_flag()
     before = (set(_EXPECTED_PARAM_SURFACE) - set(_P3_0_NEW_PARAMS)
               - set(_LOOKAHEAD_NEW_PARAMS))
-    assert len(before) == 52, f'P3.0 前的基线应是 52 项，实为 {len(before)}'
+    assert len(before) == 51, f'P3.0 前的基线应是 51 项，实为 {len(before)}'
     for flag, type_name, default in _P3_0_NEW_PARAMS:
         got = surface.get(flag, (None, _NO_DEFAULT))
         assert (got[0], got[1]) == (type_name, default), \

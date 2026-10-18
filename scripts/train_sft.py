@@ -118,20 +118,13 @@ def _cuda_name_and_capability(idx=0):
 
 
 def _check_training_env(logger):
-    """启动时检查三大加速能力并打印诊断：flash-attn 库 / torch.compile / 混合精度。
+    """启动时检查两大加速能力并打印诊断：torch.compile / 混合精度。
 
     纯检测不改变行为；实际的启用决策在设备路径确定后进行（见 main 中
-    set_flash_attn / args.compile / amp_dtype 分支）。检测结果会写入日志，
-    便于比对云端/本地环境差异。
+    args.compile / amp_dtype 分支）。检测结果会写入日志，便于比对云端/本地
+    环境差异。
     """
-    # 1) flash-attn 独立库（可选依赖，仅 Ampere+ CUDA 有收益）
-    try:
-        import flash_attn  # type: ignore[import-not-found]
-        fa_status = "已安装 v%s" % getattr(flash_attn, "__version__", "?")
-    except Exception:
-        fa_status = ("未安装（可选；Ampere+ CUDA 上比内置 SDPA 再快 20-30%%，"
-                    "安装: pip install flash-attn --no-build-isolation）")
-    # 2) torch.compile（inductor 后端）
+    # 1) torch.compile（inductor 后端）
     if hasattr(torch, 'compile'):
         try:
             from torch._inductor import config as _ind_cfg  # noqa: F401
@@ -140,7 +133,7 @@ def _check_training_env(logger):
             comp_status = "可用"
     else:
         comp_status = "不可用（torch<2.0）"
-    # 3) 混合精度（按后端能力）
+    # 2) 混合精度（按后端能力）
     if torch.cuda.is_available():
         # ⚠ 不能用 `torch.cuda.get_device_properties`：它会 `_lazy_init()` 建
         #   CUDA context。本函数在 `_BatchPrefetcher` 构造**之前**跑，预取
@@ -155,13 +148,11 @@ def _check_training_env(logger):
             amp_status = "仅 fp16（%s, sm_%d%d，Volta/Turing 无 bf16）" % (name, cap[0], cap[1])
     else:
         amp_status = "不支持（CPU 走 FP32）"
-    logger.info("[env] flash-attn: %s", fa_status)
     logger.info("[env] torch.compile: %s | 混合精度: %s", comp_status, amp_status)
 
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.networks.katago_v7 import NBT_TF_CFG
-from src.networks.katago_v7 import _migrate_ema_shadow_qkv
 from src.networks.katago_v7_loss import POLICY_SOFT_WEIGHT
 from src.data.dataset import SupervisedDataset
 from scripts.build_dataset import build
@@ -172,7 +163,7 @@ from scripts.build_dataset import build
 #
 # 旧 CLI flag（--arch / --backbone-channels / --res-blocks / --policy-layers …）
 # **仍然不参与建网**。V7 接管「造特征 + 前向 + 损失」，
-# EMA / 调度器 / 保存 / 评估共用同一条路。
+# 调度器 / 保存 / 评估共用同一条路。
 #
 # 段 1 的四个目标（系数见 `KataGoV7Loss`）：policy #1（1.0，行权重恒 1）、
 # π_opp #2（0.15，`w['policy_opp']`）、value #3（1.20，三分类 CE）、
@@ -736,7 +727,7 @@ def save_model(model, path):
 def _clone_to_cpu(obj):
     """递归把嵌套结构里的**张量换成独立的 CPU 副本**，其余原样返回。
 
-    为什么必须是「独立副本」而不是视图：optimizer state 与 `ema.shadow` 在
+    为什么必须是「独立副本」而不是视图：optimizer state 在
     提交之后仍会被每个 step 改写，若后台线程去序列化同一块显存，写出来的文件
     可能是**撕裂的**（前半是旧值、后半是新值）。这条在同步保存时不存在 ——
     那时训练线程就卡在 `torch.save` 上，不可能有并发写。
@@ -758,7 +749,7 @@ class _AsyncSnapshotWriter:
     为什么需要：2026-10-08 的 A100 40G 实测，GPU 利用率每~25 秒准时跌到 **0**，
     形状与「GPU Time Spent Accessing Memory」一致 ⇒ 卡的是 host。eval 期间 GPU
     是**忙**的（只有 60-70% 的浅谷），能把利用率打到 0 的只有保存：模型 +
-    optimizer state（Adam 的 m/v 是参数量的两倍）+ EMA 一次性 D2H 再
+    optimizer state（Adam 的 m/v 是参数量的两倍）一次性 D2H 再
     `torch.save`，全在 step 循环里。
 
     契约
@@ -1018,70 +1009,6 @@ def _scaler_step_global(scaler, optimizer, *, scale_before, use_scaler,
     optimizer.step()
     scaler.update()
     return True
-
-
-def _ema_key(name: str) -> str:
-    """EMA shadow 的键：去掉 torch.compile 往参数名里插的 '_orig_mod.' 段。
-
-    必须去，否则编译一开就 KeyError：EMA 在**编译之前**按当时的
-    `named_parameters()` 名字建 shadow，而 update / apply_shadow / restore 是按
-    **运行时**的名字取键的。torch.compile 无论哪种形态都会改名字（整模型 compile
-    插在开头，Linear-only compile 插在路径中段），键空间一变就再也对不上。
-    这条路径此前是直接崩的、而非被跳过：`shell/train_sft_a100_1card.sh` 同时开了
-    `--compile 1` 与 `--use-ema 1`，5 个 加速器 SFT 脚本也都开了 `--use-ema 1`。
-
-    去段后 shadow 的键停在「未编译布局」，与 train_state 里的 `ema_shadow` 键一致，
-    旧 checkpoint 不受影响（它们的键本来就没有这一段）。
-    """
-    return name.replace('_orig_mod.', '')
-
-
-class EMA:
-    """指数移动平均（Exponential Moving Average）权重。
-
-    维护模型参数的 shadow copy，eval/save 时用 EMA 权重可提升 1-3% accuracy。
-    键一律经 `_ema_key` 归一，理由见该函数。
-    """
-
-    def __init__(self, model, decay=0.999):
-        self.model = model
-        self.decay = decay
-        self.shadow = {_ema_key(name): param.clone().detach()
-                    for name, param in model.named_parameters()}
-
-    @torch.no_grad()
-    def update(self):
-        if _HAS_FOREACH:
-            # 原实现是逐参数 Python 循环，每参数 2 次独立设备 kernel 启动。
-            # 本模型 depth 很深（backbone 17 + res 8 + convnext 4 + attn 5
-            # + value 8 + policy 3），参数张量达数百个，即每步数百次启动；
-            #  的 ACL 单次启动开销明显高于 CUDA，累积可观。
-            # foreach 把它们合并成两次批量调用，数值语义与循环完全一致。
-            # 刻意不缓存张量列表：resume 时 ema.shadow 会被整体替换
-            # （见 main 的 resume 分支），缓存会持有失效张量。每步重建
-            # 列表的 Python 开销可忽略，收益全在 kernel 启动数上。
-            sh = []
-            ps = []
-            for name, param in self.model.named_parameters():
-                sh.append(self.shadow[_ema_key(name)])
-                ps.append(param)
-            torch._foreach_mul_(sh, self.decay)
-            torch._foreach_add_(sh, ps, alpha=1 - self.decay)
-            return
-        for name, param in self.model.named_parameters():
-            k = _ema_key(name)
-            self.shadow[k].data.mul_(self.decay).add_(param.data, alpha=1 - self.decay)
-
-    def apply_shadow(self):
-        self.backup = {_ema_key(name): param.clone()
-                    for name, param in self.model.named_parameters()}
-        for name, param in self.model.named_parameters():
-            param.data = self.shadow[_ema_key(name)].data
-
-    def restore(self):
-        for name, param in self.model.named_parameters():
-            param.data = self.backup[_ema_key(name)].data
-        del self.backup
 
 
 def maybe_autocast(device, dtype=torch.float16):
@@ -1565,14 +1492,14 @@ _EVAL_BATCH_CAP = 2048
 #:     日常恒平；
 #:   · `train_top5`/`policy_ce_random`/`value_rmse(_zero)`：基线与近失信号，
 #:     stdout/诊断保留，曲线与 top1 高度重合；
-#:   · eval 侧只留 top1/kl/brier + `best_eval_acc`，其余（ema/lr/gap/覆盖度）
+#:   · eval 侧只留 top1/kl/brier + `best_eval_acc`，其余（lr/gap/覆盖度）
 #:     进 stdout 的 [eval] 行。
 _SWANLAB_DROP_KEYS = frozenset({
     'l2_report', 'opt_loss', 'speed', 'speed_inst', 'elapsed_min',
     'scaler_scale', 't_data_ms', 't_comp_ms', 't_save_ms', 't_eval_ms',
     't_data_max_ms', 'train_top5', 'policy_ce_random',
     'value_rmse', 'value_rmse_zero',
-    'eval_top5', 'eval_top10', 'eval_used_ema', 'eval_lr', 'eval_gap_to_best',
+    'eval_top5', 'eval_top10', 'eval_lr', 'eval_gap_to_best',
     'eval_n', 'eval_batches', 'eval_truncated',
     'final_kl', 'final_brier', 'final_batches', 'final_truncated',
 })
@@ -1622,7 +1549,7 @@ def evaluate_metrics_v7(model, dataset, idxs, bs, device, amp_dtype, *,
     ------------------
     12 通道的 :func:`evaluate_metrics` 建的是 ``sample_batch(n_channels=12)``
     + ``model(state)`` 二元返回的评估器，对 V7（22 通道 19 维全局 + dict 返回）
-    会直接形状错。与其在这里猜，不如把口径对齐 —— 否则 V7 训��永远看不到
+    会直接形状错。与其在这里猜，不如把口径对齐 —— 否则 V7 训练永远看不到
     top1，`--early-stop` 也跟着形同虚设。
 
     指标口径（与 12 通道版刻意保持同名同义，便于 early-stop / best-model
@@ -2513,24 +2440,12 @@ def _init_swanlab(args, logger):
                 "soft_only_sampling": bool(args.soft_only_sampling),
                 "soft_every": args.soft_every,
                 "attention_dropout": args.attention_dropout,
-                # 行为开关，进面板是为了「跨 run 对比时能分组」。
-                "ema_enabled": bool(args.use_ema),
-                "ema_decay": 0.999,
                 # ---- AMP：旧多卡环境 无 BF16，FP16 必须配 GradScaler ----
                 "amp_dtype": "float16",
                 "scaler_init_scale": args.scaler_init_scale,
                 "scaler_growth_interval": args.scaler_growth_interval,
-                # ---- 注意力内核（决定显存口径，见 backbone._sdpa）----
-                "attn_sdpa_force_math": True,
-                # online-softmax 注意力开关：登记进来是为了**面板能看到本次到底
-                # 开没开**。静默的开关是排查噩梦 —— 尤其它与 materialize 路径
-                # 非逐位相同，出了问题得先知道它开过。
-                "attn_online": int(args.attn_online),
-                # SDPA（ 融合注意力）开关：登记进来同样为了面板可见 ——
-                # 它直接决定注意力走融合内核还是手写 math，是 加速器 上最关键的
-                # 显存/速度/数值口径之一。
-                "use_sdpa": int(args.use_sdpa),
-                "attn_query_chunk": int(args.attn_query_chunk or 0),
+                # ---- 注意力内核：固定走 torch 内置 SDPA ----
+                "attn_backend": "sdpa",
                 # ---- 数据/运行 ----
                 "data": args.data,
                 "board_size": args.board_size,
@@ -3215,7 +3130,7 @@ def _load_optimizer_state(optimizer, state, logger) -> bool:
             "[resume] 【注意】优化器状态与当前参数分组不兼容，已跳过加载。"
             "checkpoint 里的组大小 %s ≠ 当前 %s（torch: %s）。分组方案变了之后，旧的 "
             "Adam 动量是按旧分组的参数下标记的，映射到新分组上已无意义，"
-            "因此优化器状态已重置，Adam 动量从零开始。模型权重 / EMA shadow / scaler / "
+            "因此优化器状态已重置，Adam 动量从零开始。模型权重 / scaler / "
             "step / epoch / rng 仍照常恢复，训练可以继续，但开头若干步的等效学习率会有"
             "一次跳变。要保留动量，请用当前代码写出的 checkpoint 续训。",
             _param_group_sizes(state, 'param_groups'),
@@ -3360,27 +3275,8 @@ def main():
     ap.add_argument('--attn-mode', default='global',
                     choices=['global', 'window', 'axial', 'sparse', 'window_global'],
                     help='注意力计算模式: global=全配对, window=块状窗口, '
-                        'sparse=窗口+全局token, window_global=块状窗口+全局token(手写math)')
+                        'sparse=窗口+全局token, window_global=块状窗口+全局token')
     ap.add_argument('--attn-window', type=int, default=7, help='window 模式窗口边长')
-    ap.add_argument('--attn-query-chunk', type=int, default=64,
-                    help='手写 math 注意力按 query 分块的长度（0=关闭）：softmax 沿 '
-                        'key 轴 ⇒ 分块数学精确，峰值 ∝ chunk。只影响 math 路径，'
-                        'SDPA/SFA 融合路径自行管理显存（默认 64，0=关闭）')
-
-    ap.add_argument('--attn-online', type=int, default=0, choices=[0, 1],
-                    help='手写 math 注意力改用 online-softmax（flash 风格）实现：'
-                        '不物化 (Nq,Nk) 分数矩阵 ⇒ 反向不保留它（省显存），'
-                        '且最大值被归一、低精度下更不易溢出（0=关闭，1=开启）。'
-                        '与 materialize 路径**数值等价但非逐位相同**'
-                        '（实测 fp32 max|Δ|≈7e-07），开启会让 12 通道的 '
-                        'test_twelve_channel_path_bit_identical 基线失效；'
-                        '真机加速比尚未实测，故默认关闭')
-    ap.add_argument('--use-sdpa', type=int, default=1, choices=[0, 1],
-                    help='是否走 F.scaled_dot_product_attention：'
-                        '1=放开（默认，省算力、fp32 累加更稳，顺带缓解 warmup 后 NaN）；'
-                        '0=强制回退手写 math（调试数值差异用）。'
-                        '仍受 _sdpa 内部 batch 上限保护（B>60000 自动回退 math）。'
-                        ' 取代原环境变量 GOAI_SDPA（0=math 的语义）')
     ap.add_argument('--eval-every', type=int, default=5000)
     ap.add_argument('--eval-max-batches', type=int, default=50,
                     help='验证集评估最多跑多少个 batch；<=0 表示不截断（跑满全部验证集）')
@@ -3527,8 +3423,6 @@ def main():
                         '点名的「混合训练 ⇒ index 0 向两种语义折中」，只在'
                         '明确知道后果时才用。必须 >= 1')
 
-    ap.add_argument('--use-ema', type=int, default=0, choices=[0, 1],
-                    help='启用 EMA（指数移动平均）权重，eval/save 时用 shadow 权重，提升 1-3%% accuracy (0=关闭, 1=开启)')
     ap.add_argument('--gradient-accumulation-steps', type=int, default=1,
                     help='梯度累积步数（模拟更大 batch size，效果等同于 batch_size * N）')
     ap.add_argument('--clip-every', type=int, default=1,
@@ -3593,11 +3487,6 @@ def main():
 
     ap.add_argument('--scaler-growth-interval', type=int, default=0,
                     help='连续多少个无溢出 step 后把缩放值翻倍')
-    ap.add_argument('--flash-attn', type=int, default=1, choices=[0, 1],
-                    help='flash-attn 独立库开关：A100(Ampere+) 上优先于内置 SDPA（最快，需 '
-                        'pip install flash-attn），加载失败自动回退内置 SDPA。'
-                        '1=自动优先（默认：A100 优先 flash-attn，其他后端不用）；'
-                        '0=强制禁用（A100 也走内置 SDPA）。原环境变量副本 GOAI_FLASH 已于 2026-10-06 删除')
     ap.add_argument('--arch', default='resnet',
                     choices=['resnet', 'convnext'],
                     help='网络架构风格: resnet=传统 ResBlock (默认，兼容旧权重) | convnext=ConvNeXt 风格 (5x5 深度卷积 + LayerNorm + GELU)')
@@ -3886,9 +3775,6 @@ def main():
     #                     且两个参数仍要给（默认 0.0 = PyTorch 的 65536，大
     #                     batch 下必炸）
     #   - use_channels_last: A100 卷积走 NHWC 更快；CPU 收益有限，默认关
-    #   - sdpa_force_math: A100 走 SDPA/FlashAttn（False），V100/CPU 强制手写
-    #                     math（True）。随后由 --use-sdpa 总开关覆盖：0 强制全部
-    #                     回退 math（调试/兼容），1（默认）保留上述默认。
     #   - compile_disable_sparse: 全后端统一禁用 —— unfold 产生
     #                     (B, Hh*d, N, ws²) 巨型中间张量，inductor 常量折叠会以
     #                     fp32 物化 (B,N,Hh,ws²,d)（batch512 下单个 4.3GB），
@@ -3897,7 +3783,6 @@ def main():
     amp_dtype = torch.float16
     use_scaler = use_amp
     use_channels_last = False
-    sdpa_force_math = True
     compile_disable_sparse = True
     gpu_name = 'N/A'
     compute_cap = (0, 0)
@@ -3929,7 +3814,6 @@ def main():
             amp_dtype = torch.bfloat16
             use_scaler = False  # BF16 几乎不下溢，去掉 GradScaler 省一次 CUDA 同步
             use_channels_last = True
-            sdpa_force_math = False  # A100 走 FlashAttention 后端
             # unfold 巨型中间张量会触发 inductor freezing 以 fp32 物化 (B,N,Hh,ws²,d)
             # 导致编译期 OOM（batch512 下单个 4.3GB），必须排除出编译图
             compile_disable_sparse = True
@@ -3950,24 +3834,21 @@ def main():
                 args.compile_mode = ('reduce-overhead'
                                      if args.gradient_accumulation_steps <= 1
                                      else 'max-autotune-no-cudagraphs')
-            logger.info("[device] %s (sm_%d%d) | 启用 A100 路径: BF16 + FlashAttn(优先,回退SDPA) + "
+            logger.info("[device] %s (sm_%d%d) | 启用 A100 路径: BF16 + SDPA + "
                         "channels_last + compile(卷积/线性/FFN, mode=%s)",
                         gpu_name, *compute_cap, args.compile_mode)
-            # flash-attn 的实际加载/回退统一在下方「flash-attn 独立库启用决策」块处理
-            # （A100 默认优先尝试，--flash-attn 0 才禁用），此处不再重复。
         else:
             # V100 等老卡：保守路径（与原行为一致）
             amp_dtype = torch.float16
             use_scaler = use_amp
             use_channels_last = False
-            sdpa_force_math = True
             compile_disable_sparse = True
-            logger.info("[device] %s (sm_%d%d) | 走保守路径: FP16 + 手写 math 注意力 + "
+            logger.info("[device] %s (sm_%d%d) | 走保守路径: FP16 + SDPA + "
                         "稀疏注意力禁用编译", gpu_name, *compute_cap)
 
         # `--compile` 不给时的自动判定。判据只用「CUDA 且 sm_80+」，与上面
         # 走 A100 路径的判据**故意用同一个**（`is_ampere_plus`）：那条路径已经
-        # 把 BF16 + channels_last + FlashAttn 都默认打开了，compile 单独默认关
+        # 把 BF16 + channels_last 都默认打开了，compile 单独默认关
         # 只会让「A100 路径」的收益少一块。V100 等老卡维持默认关。
         if args.compile is None:
             args.compile = 1 if is_ampere_plus else 0
@@ -3981,7 +3862,6 @@ def main():
         amp_dtype = torch.float32
         use_scaler = False
         use_channels_last = False
-        sdpa_force_math = True
         compile_disable_sparse = True
         logger.info("[device] CPU | 走 FP32 路径（无 AMP/编译）")
 
@@ -3990,81 +3870,19 @@ def main():
     if args.compile is None:
         args.compile = 0
 
-    # 全局 SDPA 总开关（--use-sdpa）：在各后端选定天然默认后做一次统一覆盖，
-    # 让该参数对 CUDA / CPU 全部后端生效。
-    #   - 默认 1：保留各后端天然选择（A100=SDPA/FlashAttn，V100/CPU=手写 math）。
-    #   - 0：强制所有后端回退手写 _sdpa_math（跨后端统一关闭融合注意力，便于
-    #     调试数值差异 / 兼容不支持 SDPA 的环境）。
-    if args.use_sdpa == 0 and not sdpa_force_math:
-        sdpa_force_math = True
-        logger.warning("[device] --use-sdpa 0：强制 %s 后端回退手写 math 注意力"
-                    "（覆盖其天然默认）", _backend)
-
-    # 把注意力后端/编译开关透传给 backbone 模块（所有分支统一设置）
+    # 把编译开关透传给 backbone 模块（所有分支统一设置）
     from src.networks import backbone as _backbone
-    _backbone.set_sdpa_force_math(sdpa_force_math)
     _backbone.set_compile_disable_sparse(compile_disable_sparse)
-    # config 面板回填真实注意力后端：swanlab.init 在设备分支之前已上传写死的
-    # `attn_sdpa_force_math: True`，这里用运行时真值覆盖。 SDPA 放开后该键应为
-    # False。API 不支持 init 后更新时静默忽略，启动日志才是真相源。
-    # `amp_dtype` 同理：init 时写死的 'float16' 在 加速器 bf16 路径下是错的，回填真值。
+    # config 面板回填真实 amp dtype：swanlab.init 时写死的 'float16' 在 Ampere+
+    # bf16 路径下是错的。API 不支持 init 后更新时静默忽略，启动日志才是真相源。
     if swanlab_logger is not None:
         try:
             swanlab_logger.config.update({
-                "attn_sdpa_force_math": bool(sdpa_force_math),
                 "amp_dtype": str(amp_dtype).split('.')[-1],
             })
         except Exception:
             pass
-    # 注意力 query 分块（2026-10-01）：math 路径下整条 (B,Hh,N,N) 分数矩阵
-    # @N=361/4head/fp16 在 B=1000 时 0.97 GiB 一份、softmax+dropout 再各一份。
-    # softmax 沿 key 轴 ⇒ 按 query 切块**数学精确**，峰值 ∝ chunk（默认 64 ⇒ 5.6×）。
-    # 只加在 math 分支；SDPA/flash 融合路径自行管理显存，不受影响（加速器 默认已放开
-    # 走  SDPA，故该分块在 加速器 上通常不再生效，见上方日志提示）。
-    # （2026-10-06：三个融合/分块开关的环境变量已全部换成 CLI 参数）
-    _attn_chunk = int(args.attn_query_chunk or 0)
-    _backbone.set_attn_query_chunk(_attn_chunk)
-    # 加速器 融合算子总闸（置 0 只慢不坏，数值口径不变）。
-
-    # online-softmax 注意力（flash 风格）：由 `--attn-online` 控制（默认关）。
-    # 与 materialize 路径**数值等价但非逐位相同**（实测 fp32 max|Δ|≈7e-07），
-    # 而 12 通路的 test_twelve_channel_path_bit_identical 正是靠逐位一致发现
-    # 意外的数值变化 ⇒ 默认关闭，开关走命令行而不是环境变量。
-    #
-    # 打开前建议先跑 `pytest tests/test_online_softmax_attn.py`（前向等价 + 梯度
-    # gradcheck + bf16/autocast）。`dropout_p > 0` 时它自动回退 materialize
-    # （online 不实现 dropout mask）；V7 的 attn_dropout 默认 0.0 ⇒ 那条不构成
-    # 日常约束，也就是说开关一旦打开就**总是**生效。
-    _backbone.set_attn_online(bool(args.attn_online))
-    if args.attn_online:
-        logger.warning("[model] online-softmax 注意力已开启：与 materialize 路径"
-                    "数值等价但非逐位相同，12 通道 bit-identical 基线会失效")
-
-    # flash-attn 独立库启用决策（A100 优先）：仅「Ampere+ CUDA 且走非 math 路径」时
-    # 优先尝试加载 flash-attn，加载成功则 _sdpa 优先走 flash-attn 内核，失败回退内置 SDPA。
-    # 开关就是 `--flash-attn`（1=A100 优先尝试，默认；0=禁用）——2026-10-06 起不再有
-    # 环境变量副本（GOAI_FLASH 已删，CLI 完全覆盖它的语义）。
-    _flash_disabled = (args.flash_attn == 0)
-    if (not _flash_disabled) and _backend == 'cuda' and compute_cap >= (8, 0) and not sdpa_force_math:
-        fa_ok, fa_msg = _backbone.set_flash_attn(True)
-        if fa_ok:
-            logger.info("[env] 注意力内核: flash-attn %s（A100 优先，回退 SDPA）", fa_msg)
-        else:
-            logger.info("[env] 注意力内核: 内置 SDPA（flash-attn %s）", fa_msg)
-    else:
-        _backbone.set_flash_attn(False)
-        if _flash_disabled:
-            logger.info("[env] 注意力内核: 内置 SDPA / 手写 math"
-                        "（flash-attn 已被 --flash-attn 0 禁用）")
-        else:
-            logger.info("[env] 注意力内核: %s",
-                        ("手写 math（%s 不支持 Flash）" % _backend.upper())
-                        if sdpa_force_math else
-                        "内置 SDPA")
-            logger.info("[env] 注意力 query 分块: %s",
-                        "关闭（或走 SDPA 路径不生效）" if _attn_chunk <= 0 else
-                        "%d（仅手写 math 路径生效；峰值 ∝ chunk；eval 逐位不变，"
-                        "训练态 dropout 取样位置变）" % _attn_chunk)
+    logger.info("[env] 注意力内核: 内置 SDPA")
 
     logger.info("启动训练 | torch=%s | device=%s | amp_dtype=%s scaler=%s channels_last=%s",
                 torch.__version__, device, amp_dtype, use_scaler, use_channels_last)
@@ -4197,9 +4015,6 @@ def main():
                     scaler.get_scale(),
                     args.scaler_growth_interval or '默认 2000')
 
-    # EMA（指数移动平均）：eval/save 时用 shadow 权重，提升 1-3% accuracy
-    ema = EMA(model, decay=0.999) if args.use_ema == 1 else None
-
     # ---- 学习率调度：基于“总 step 数”而非 epoch 数 ----
     # 旧版用 T_max=args.epochs 导致余弦在第 1 个 epoch 结束就被砍到 ~0，
     # 后续 epoch 在 lr≈0 附近横盘。这里用真实总 step 数，并加前 5% step 线性 warmup。
@@ -4298,41 +4113,6 @@ def main():
             start_epoch = tstate.get('epoch', 0)
             if 'rng' in tstate:
                 torch.set_rng_state(tstate['rng'].cpu())
-            # 恢复 EMA shadow 状态
-            if ema is not None and 'ema_shadow' in tstate:
-                shadow, moved = _migrate_ema_shadow_qkv(tstate['ema_shadow'])
-                if moved:
-                    # 旧 ckpt 的 shadow 是 attn.q/k/v 三键，MHSA 内部已合成
-                    # qkv（见 katago_v7.MHSA）。不迁移会在这里之后第一次
-                    # EMA.update() 时抛 KeyError —— 那种崩法离现场很远，
-                    # 所以显式记一条。
-                    logger.info("[resume] EMA shadow: %d 处 attn.q/k/v 已合并为 qkv",
-                                moved)
-                # 丢弃「模型里根本没有」的 shadow 项。
-                # 判据是**对 named_parameters 求差**，不是按 `.q.weight` 之类的
-                # 后缀猜 —— 后缀那种写法在今天两个现役模型上都恰好安全（两者
-                # named_parameters 里 `.q/.k/.v.weight` 都是 0 个），但哪天有
-                # 模块真的加了 `.q.weight` 参数，删掉的就是**活参数**的 shadow
-                # 项，`EMA.update()` 第一步就 KeyError。
-                #
-                # 为什么这些多余项无害、可以放心丢：`EMA.update()` 是遍历
-                # `model.named_parameters()` 再去 shadow 取键，**从不遍历 shadow
-                # 自己的键**，所以多余项从来不会被读到（既不会算错也不会报错）。
-                # 反过来「模型有、shadow 没有」才会 KeyError —— 那才是要防的方向。
-                # 典型来源：某次 snapshot 恰好在 qkv 迁移过程中落盘，于是
-                # `attn.qkv.weight` 与残留的 `attn.q/k/v.weight` 并存；不清掉
-                # 它们会一直躺在每个 checkpoint 里白占空间。
-                _known = {_ema_key(n) for n, _ in model.named_parameters()}
-                _stale = [k for k in shadow if k not in _known]
-                if _stale:
-                    shadow = {k: v for k, v in shadow.items() if k in _known}
-                    logger.warning(
-                        "[resume] EMA shadow: 丢弃 %d 个模型中不存在的项（%s…）",
-                        len(_stale), _stale[:3])
-                ema.shadow = shadow
-                logger.info("[resume] 恢复 EMA shadow 状态")
-            elif ema is not None:
-                logger.warning("[resume] 未找到 EMA shadow 状态，EMA 从头开始")
             logger.info("[resume] 恢复训练状态 | step=%d best_eval_acc=%.4f epoch=%d",
                         step, best_eval_acc, start_epoch)
         else:
@@ -4403,9 +4183,8 @@ def main():
                 `torch.no_grad()` 的，永远碰不到它，于是 compile 看起来配好了、
                 却在训练循环第一个 backward 才炸（`accessing tensor output of
                 CUDAGraphs that has been overwritten by a subsequent run`）。
-                forward 必须与真实训练一致地包 autocast：flash-attn 只吃
-                fp16/bf16，FP32 直灌会报 "FlashAttention only support fp16 and
-                bf16 data type"，被误判成 compile 不可用而静默回退 eager。
+                forward 必须与真实训练一致地包 autocast：预热若走 FP32 而训练走
+                AMP，低精度算子与显存形状都对不上，预热结论不代表真实路径。
                 """
                 _x = (torch.zeros(1, V7_SPATIAL_CHANNELS, args.board_size,
                                   args.board_size, device=device),
@@ -4451,7 +4230,7 @@ def main():
         else:
             logger.info("[train] 当前 torch 版本不支持 torch.compile，跳过")
 
-    # 单卡训练：不做任何分布式包裹，EMA 构造与参数分组直接在裸模块上进行。
+    # 单卡训练：不做任何分布式包裹，参数分组直接在裸模块上进行。
 
     # `_accum_steps` 必须定义在**任何**用它之前（2026-10-01 云端教训）。
     #   它原先在下面训练循环的开头才赋值，而上面「run 级指标上报」已经用它算
@@ -4580,14 +4359,13 @@ def main():
         # 每 optimizer step 才发生一次，除以 `_n_timed` 会缩小 accum 倍）：
         #   g = unscale_ + 溢出探测 + clip_grad_norm_（含全局范数归约的同步）
         #   o = optimizer.step + zero_grad
-        #   m = EMA update（foreach_mul_/foreach_add_）
         # `g` 再劈三段（实测 `g` 独占 79.9%，必须分清是 clip 有病还是队列在此 drain）：
         #     g1 = unscale_ + 溢出探测（BF16 下应 ≈0）
         #     g2 = clip_grad_norm_ 调用本身（返回 device 张量 ⇒ 纯发射）
         #     g3 = float(_gn) 的设备→主机同步 = 队列 drain（真正干活的地方）
         # 判读：g2 ≫ g3 ⇒ clip 在同步，改 foreach；g3 ≫ g2 ⇒ clip 无辜，瓶颈在
         #       graph-compile / channels-last A/B。
-        _t_clip = _t_opt = _t_ema = 0.0
+        _t_clip = _t_opt = 0.0
         _t_g1 = _t_g2 = _t_g3 = 0.0
         _n_opt = 0
         _n_skipped = 0
@@ -5039,7 +4817,7 @@ def main():
                     #   ⇒ 四份权重从此永久不同，之后每次 all_reduce 都在混合四个
                     #   不同模型的梯度 ⇒ **训练从此无效**。而且各 rank 的 scale 各自
                     #   独立减半、进一步漂移（报出来的 `skip` 占比也是 per-rank 的）。
-                    # 实测当时：50 ���内 1024 -> 8、skip=7/50，而"四张卡同一步一起
+                    # 实测当时：50 步内 1024 -> 8、skip=7/50，而"四张卡同一步一起
                     #   溢出"的概率极低 ⇒ 分叉几乎立刻发生。
                     # 详见 `_grads_nonfinite_any_rank` / `_scaler_step_global`。
                     _t_opt0 = time.perf_counter()
@@ -5074,16 +4852,6 @@ def main():
                     # `o` 段结算：optimizer.step + zero_grad。
                     _t_opt += time.perf_counter() - _t_opt0
                     _n_opt += 1
-                    # EMA 与 scheduler 同理：**跳过的步权重一动没动**，
-                    #   此时 `ema.update()` 会把 shadow 朝当前权重多拉一次
-                    #   （step 计数也照样 +1）⇒ EMA 的时间常数被"跳步"稀释，
-                    #   而 eval 又是在 EMA shadow 上评的（`eval_used_ema`）。
-                    #   100% 跳步时 shadow 会一路收敛到**初始权重**。
-                    if ema is not None and _real_step:
-                        # `m` 段：EMA（278 个参数的 foreach_mul_/foreach_add_）
-                        _t_ema0 = time.perf_counter()
-                        ema.update()
-                        _t_ema += time.perf_counter() - _t_ema0
             except Exception as oom_exc:
                 # 只捕获 CUDA 的 OOM：其他异常照原样上抛（别把真 bug 吞成 OOM）
                 if not isinstance(oom_exc, torch.cuda.OutOfMemoryError):
@@ -5180,21 +4948,20 @@ def main():
                 _g2ms = _t_g2 * 1000.0 / _no
                 _g3ms = _t_g3 * 1000.0 / _no
                 _oms = _t_opt * 1000.0 / _no
-                _mms = _t_ema * 1000.0 / _no
-                # `u` = 未归因 = 墙钟 −(d+c+g+o+m+s+e)。它不是残差噪声，而是
+                # `u` = 未归因 = 墙钟 −(d+c+g+o+s+e)。它不是残差噪声，而是
                 # 「**当前已知但尚未分段**」的部分（Python 与
                 # 调度开销、log-every 处的同步）。2026-10-07 真机 a_v7.4_npu2：
                 # 墙钟 12.0 s/step、c=2.29、d=0.03 ⇒ 这 9.7 s 全落进 `u`。
-                # 加 g/o/m 就是为了把它劈开。
+                # 加 g/o 就是为了把它劈开。
                 _wall_ms = ((_now - _last_stdout_t) * 1000.0
                              / max(1, step - _last_stdout_step))
-                _ums = (_wall_ms - _dms - _cms - _gms - _oms - _mms
+                _ums = (_wall_ms - _dms - _cms - _gms - _oms
                         - _sms - _ems)
                 _dmax = _t_data_max * 1000.0
                 # 重置放在打点处：某步的 save/eval 发生在其打点之后，
                 # 因此计入下一个区间，与墙钟口径一致
                 _t_data = _t_comp = _t_save = _t_eval = 0.0
-                _t_clip = _t_opt = _t_ema = 0.0
+                _t_clip = _t_opt = 0.0
                 _t_g1 = _t_g2 = _t_g3 = 0.0
                 _t_data_max = 0.0
                 _n_timed = 0
@@ -5208,14 +4975,14 @@ def main():
                             "elapsed=%.0fs skip=%d | "
                             "d=%.0f c=%.0f g=%.0f "
                             "g1=%.0f g2=%.0f g3=%.0f "
-                            "o=%.0f m=%.0f s=%.0f e=%.0f "
+                            "o=%.0f s=%.0f e=%.0f "
                             "u=%.0f dmax=%.0f ms",
                             step, total_steps, _lv, _pv, _vv,
                             lr, _scale, mem,
                             speed, spd_inst, _now - t0, _n_skipped,
                             _dms, _cms, _gms,
                             _g1ms, _g2ms, _g3ms,
-                            _oms, _mms, _sms, _ems, _ums,
+                            _oms, _sms, _ems, _ums,
                             _dmax)
                 _last_stdout_t = time.time()
                 _last_stdout_step = step
@@ -5492,8 +5259,6 @@ def main():
                     'best_eval_acc': best_eval_acc,
                     'rng': torch.get_rng_state(),
                 }
-                if ema is not None:
-                    _state['ema_shadow'] = ema.shadow
                 _snap_writer.submit(_plain_state_dict(model), _state,
                                     args.out + '.latest',
                                     args.out + '.latest.train_state')
@@ -5504,8 +5269,6 @@ def main():
             # 两版**返回同构**，所以下面的 best-model / early-stop 逻辑零改动。
             if (args.eval_every > 0 and step % args.eval_every == 0
                     and len(eval_idx) > 0):
-                if ema is not None:
-                    ema.apply_shadow()
                 _t_eval0 = time.perf_counter()
                 if _v7_on:
                     metrics = evaluate_metrics_v7(
@@ -5518,8 +5281,6 @@ def main():
                         max_batches=args.eval_max_batches,
                         use_channels_last=use_channels_last)
                 _t_eval += time.perf_counter() - _t_eval0
-                if ema is not None:
-                    ema.restore()
                 # 曾经在这里周期性 `empty_cache()` 回收分配器缓存段，2026-10-01 撤掉：
                 # 它在 加速器 上没验证过，且**每次 eval 都调**（默认 ~35 分钟一次）在训练
                 # 主路径上；等真机上确认了碎片确实在爬升、再按实测收益决定值不值得加。
@@ -5554,14 +5315,10 @@ def main():
                                 "eval_batches": metrics['batches'],
                                 "eval_truncated": metrics['truncated'],
                                 "best_eval_acc": best_eval_acc,
-                                # ---- 补三项（2026-10-01）----
-                                # eval_used_ema: eval 跑的是 **EMA shadow** 还是原权重。
-                                #   不报这个就不知道在评什么 —— `--use-ema 1` 时曲线上的
-                                #   eval_top1 与训练 loss 不是同一个模型的两个量。
+                                # ---- 补两项（2026-10-01）----
                                 # eval_lr: 把 eval 点与 lr 曲线对齐（lr 已退火到多少时
                                 #   评的，这在做「早停/最佳模型」判断时需要。
                                 # eval_gap_to_best: 早停判据（--early-stop-metric）直接可见。
-                                "eval_used_ema": bool(ema is not None),
                                 "eval_lr": float(optimizer.param_groups[0]['lr']),
                                 "eval_gap_to_best": (best_eval_acc - metrics['top1']
                                                     if best_eval_metric >= 0
@@ -5578,8 +5335,6 @@ def main():
                 if metrics['top1'] > best_eval_acc:
                     best_eval_acc = metrics['top1']
                     if is_main:
-                        if ema is not None:
-                            ema.apply_shadow()
                         # 先 join 掉在飞的后台快照：它写的也是 `.latest` 系列，
                         # 不等它收尾就写 `args.out` 之外的最终件没问题，但
                         # 收尾前必须确保没有半份文件留在盘上。
@@ -5596,11 +5351,7 @@ def main():
                             'best_eval_acc': best_eval_acc,
                             'rng': torch.get_rng_state(),
                         }
-                        if ema is not None:
-                            _state['ema_shadow'] = ema.shadow
                         torch.save(_state, args.out + '.train_state')
-                        if ema is not None:
-                            ema.restore()
 
                 # 早停检查：判定只在 rank0 做（计数器语义不变），结论写进 stop_flag
                 if args.early_stop == 1 and is_main:
@@ -5652,12 +5403,10 @@ def main():
         ai.export_onnx(onnx_path, quantize_int8=args.onnx_quantize == 1)
         logger.info("[train] ONNX 导出完成: %s", onnx_path)
 
-    # 最后一步评估：使用 EMA 权重（如果启用）
+    # 最后一步评估
     if len(eval_idx) > 0:
         if is_main:
             logger.info("[train] 开始最终评估...")
-        if ema is not None:
-            ema.apply_shadow()
         if _v7_on:
             final_metrics = evaluate_metrics_v7(
                 model, dataset, eval_idx, bs, device, amp_dtype,
@@ -5668,8 +5417,6 @@ def main():
                 model, dataset, eval_idx, bs, device, amp_dtype,
                 max_batches=args.eval_max_batches,
                 use_channels_last=use_channels_last)
-        if ema is not None:
-            ema.restore()
         if is_main:
             # 同上：FINAL 行也不打 seed（`augment=off` 才是这批数字的真实前提）
             logger.info(

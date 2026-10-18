@@ -31,8 +31,7 @@ V100 32GB 单卡正式训练:
   ⚠ V100 是 sm_70：**没有 bf16**，所以本入口恒为 **FP16 + GradScaler**
     （`maybe_autocast` 默认 float16，`_scaler` 在 cuda 上恒建）。SFT 那边在
     A100 上是 BF16 无 scaler，两条链路的精度口径**不同**、别互相套用。
-  ⚠ V100 也**没有 flash-attn**（需 sm_80+），注意力走
-    `F.scaled_dot_product_attention` 的内置后端。
+  ⚠ 注意力统一走 `F.scaled_dot_product_attention` 的内置后端。
   ⚠ 没有多卡 RL：`--ddp 1` 默认 0，多卡未验证。
 """
 import sys
@@ -104,35 +103,6 @@ def maybe_autocast(device, dtype=torch.float16):
 
 
 from contextlib import nullcontext
-
-
-# --------------------------------------------------------------------------- #
-# EMA（指数移动平均）权重
-# --------------------------------------------------------------------------- #
-class EMA:
-    """指数移动平均（Exponential Moving Average）权重。"""
-
-    def __init__(self, model, decay=0.999):
-        self.model = model
-        self.decay = decay
-        self.shadow = {name: param.clone().detach()
-                       for name, param in model.named_parameters()}
-
-    @torch.no_grad()
-    def update(self):
-        for name, param in self.model.named_parameters():
-            self.shadow[name].data.mul_(self.decay).add_(param.data, alpha=1 - self.decay)
-
-    def apply_shadow(self):
-        self.backup = {name: param.clone()
-                       for name, param in self.model.named_parameters()}
-        for name, param in self.model.named_parameters():
-            param.data = self.shadow[name].data
-
-    def restore(self):
-        for name, param in self.model.named_parameters():
-            param.data = self.backup[name].data
-        del self.backup
 
 
 # --------------------------------------------------------------------------- #
@@ -891,8 +861,8 @@ def train_epochs(ai, buffer, args, device):
 
     N1: 旧卡（如 V100/sm_70）无 BF16，FP16 autocast 配 GradScaler 防下溢；
         CUDA 旧卡 FP16 同样需要。
-    C3: optimizer/EMA/GradScaler 跨迭代挂在 ai 上复用（保留 Adam 动量与 EMA
-        shadow 轨迹），LR scheduler 每轮按当前 buffer 大小重建。
+    C3: optimizer/GradScaler 跨迭代挂在 ai 上复用（保留 Adam 动量），
+        LR scheduler 每轮按当前 buffer 大小重建。
     N4: pin_memory 收窄为仅 CUDA（与 train_sft 对齐）。
     """
     if buffer and len(buffer[0]) != 7:
@@ -904,7 +874,7 @@ def train_epochs(ai, buffer, args, device):
     model = ai.model
     model.train()
 
-    # P3-C：β 状态挂 ai（与 ai._opt/_ema 同生命周期）；--kl-coef 只是初值，
+    # P3-C：β 状态挂 ai（与 ai._opt 同生命周期）；--kl-coef 只是初值，
     # 首次创建后不再重读（接线契约 §5.2）
     if getattr(ai, '_kl_beta', None) is None:
         ai._kl_beta = float(getattr(args, 'kl_coef', 0.01))
@@ -936,7 +906,7 @@ def train_epochs(ai, buffer, args, device):
          'weight_decay': args.weight_decay},
         {'params': value_no_decay, 'lr': args.lr * args.value_lr_mult, 'weight_decay': 0.0},
     ]
-    # C3: 首轮创建 optimizer/scaler/EMA 并缓存到 ai，后续迭代复用
+    # C3: 首轮创建 optimizer/scaler 并缓存到 ai，后续迭代复用
     if getattr(ai, '_opt', None) is None:
         ai._opt = torch.optim.AdamW(opt_groups)
         if device_prefix == 'cuda':
@@ -946,11 +916,8 @@ def train_epochs(ai, buffer, args, device):
                 ai._scaler = torch.cuda.amp.GradScaler(enabled=True)
         else:
             ai._scaler = None
-        if args.use_ema == 1:
-            ai._ema = EMA(model, decay=0.999)
     opt = ai._opt
     scaler = getattr(ai, '_scaler', None)
-    ema = getattr(ai, '_ema', None) if args.use_ema == 1 else None
 
     # Cosine LR Schedule with Warmup（每轮按 buffer 重建）
     n = len(buffer)
@@ -1120,16 +1087,14 @@ def train_epochs(ai, buffer, args, device):
                 continue
 
             accum_counter = 0
-            # 跳过的步**不许**推进 LR 计划与 EMA（2026-10-05 补上，与
+            # 跳过的步**不许**推进 LR 计划（2026-10-05 补上，与
             # `scripts/train_sft.py` 的 `_real_step` 门控对齐 —— SFT 路径在
             # `91c7d53` 修过这个，RL 路径一直没有）。
             #
             # 为什么：fp16 溢出时 `GradScaler` **内部跳过** `optimizer.step()`，
             # 但对调用方是「成功返回」的。权重一动没动，而无条件
             # `scheduler.step()` 会让 warmup/cosine 在空步上照样前进 ——
-            # 真机 SFT 那轮 558 步的 warmup 被 0 次学习消耗掉，等于训练一开��
-            # 就拿到一个已经退火的 LR。EMA 同理：shadow 被多拉一次且计数 +1，
-            # 而 eval 是在 shadow 上评的 ⇒ 100% 跳步时 shadow 一路收敛到初始权重。
+            # 真机 SFT 那轮 558 步的 warmup 被 0 次学习消耗掉，等于训练一开始就拿到一个已经退火的 LR。
             #
             # 判据用**缩放值有没有下降**，而不是去扫梯度：`GradScaler` 只在跳步时
             # 降 scale（成功时它只等 `growth_interval` 到才 ×2），而扫 5.5M 个参数
@@ -1155,12 +1120,10 @@ def train_epochs(ai, buffer, args, device):
                 if _n_skipped == 1 or _n_skipped % 50 == 0:
                     print(f'[fp16] PPO 第 {_n_skipped} 次跳步（scale '
                           f'{_scale_before:.0f} -> {scaler.get_scale():.0f}）；'
-                          f'LR 计划与 EMA 不推进')
+                          f'LR 计划不推进')
             opt.zero_grad()  # 每次 step 后立即清零，防止跨 step 陈旧梯度叠加污染
             if _real_step:
                 scheduler.step()
-                if ema is not None:
-                    ema.update()
             losses.append(float(loss_raw.item()))
 
             # ---- P3-C：optimizer step 边界 —— 先 β 自适应，再信任域硬约束 ----
@@ -1199,15 +1162,8 @@ def train_epochs(ai, buffer, args, device):
         'w_clip_frac': stat_wclip / max(stat_steps, 1),
     }
 
-    # eval 时用 EMA 权重
-    if ema is not None:
-        ema.apply_shadow()
-        model.eval()
-    else:
-        model.eval()
+    model.eval()
     ret = sum(losses) / max(len(losses), 1)
-    if ema is not None:
-        ema.restore()
     return ret
 
 
@@ -1298,8 +1254,6 @@ def main():
     
     ap.add_argument("--no-augment", type=int, default=0, choices=[0, 1],
                     help="关闭 8 对称增强 (0=开启, 1=关闭)")
-    ap.add_argument("--use-ema", type=int, default=0, choices=[0, 1],
-                    help="启用 EMA 权重 (0=关闭, 1=开启)")
     ap.add_argument("--clip-grad", type=float, default=1.0, help="梯度裁剪范数（0=关闭）")
     ap.add_argument("--grad-accum-steps", type=int, default=1,
                     help="梯度累积 micro-batch 数（1=每批即更新，默认 1 保持现状；"
@@ -1352,7 +1306,7 @@ def main():
     ap.add_argument("--kl-coef", type=float, default=0.01,
                     help="KL 惩罚系数 β 的**初值**（不是常数）：L_pi -= β·KL_k1，"
                          "P3-C 另做 β 自适应朝 --kl-target 走，"
-                         "自适应状态挂 ai 上（与 optimizer/EMA 同生命周期），"
+                         "自适应状态挂 ai 上（与 optimizer 同生命周期），"
                          "不每轮从本参数重读")
     ap.add_argument("--kl-target", type=float, default=0.01,
                     help="目标 KL。P3-C 两处都读它：① β 自适应的调节目标；"

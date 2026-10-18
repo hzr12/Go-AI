@@ -70,7 +70,7 @@ def test_health_metric_is_reported(key):
 
 
 @pytest.mark.parametrize('key', [
-    'eval_used_ema', 'eval_lr', 'eval_gap_to_best',
+    'eval_lr', 'eval_gap_to_best',
 ])
 def test_eval_metric_is_reported(key):
     assert _has(MAIN, key), f'eval 侧 {key} 未上报'
@@ -168,9 +168,9 @@ def test_config_panel_has_no_archived_flags():
     'arch/in_channels', 'arch/channels', 'arch/blocks', 'arch/params_total',
     'batch_size_per_card', 'grad_accum', 'world_size',
     'effective_batch', 'lr', 'weight_decay', 'clip_grad_max_norm',
-    'label_smoothing', 'attention_dropout', 'ema_enabled', 'ema_decay',
-    'amp_dtype', 'scaler_init_scale', 'attn_sdpa_force_math',
-    'attn_query_chunk', 'effective_batch',
+    'label_smoothing', 'attention_dropout',
+    'amp_dtype', 'scaler_init_scale',
+    'attn_backend', 'effective_batch',
 ])
 def test_config_panel_records_the_key(key):
     assert _has(INIT, key), f'config 面板缺 {key}'
@@ -385,7 +385,6 @@ def test_config_expression_actually_evaluates():
     ns.batch_size = 1000
     ns.lr = 0.0045
     ns.epochs = 1
-    ns.use_ema = 1
     ns.scaler_init_scale = 1024.0
     ns.scaler_growth_interval = 100000
 
@@ -396,11 +395,11 @@ def test_config_expression_actually_evaluates():
     env = {'args': ns, 'os': os, '_accum': 2, 'NBT_TF_CFG': tsf.NBT_TF_CFG}
     cfg = eval('{' + expr + '}', env)   # noqa: S307 — 测试内显式求值
 
-    assert isinstance(cfg, dict) and len(cfg) >= 25, \
+    assert isinstance(cfg, dict) and len(cfg) >= 20, \
         f'config 键数异常：{len(cfg) if isinstance(cfg, dict) else type(cfg)}'
     for k in ('arch/in_channels', 'arch/blocks', 'effective_batch',
               'grad_accum', 'lr', 'amp_dtype',
-              'attn_query_chunk', 'ema_decay'):
+              'attn_backend'):
         assert k in cfg, f'config 实跑后缺 {k}'
     # 实跑而非静态：bs × accum（1000 × 2）。多卡已退役，不能再乘 world_size。
     assert cfg['effective_batch'] == ns.batch_size * 2, cfg['effective_batch']
@@ -645,8 +644,8 @@ def test_no_string_reaches_the_metric_channel(src_name):
 def test_bool_metrics_are_accepted_by_the_sdk():
     """ bool 是**合法** metric（SDK 先判 bool，因为 bool 是 int 的子类）。
 
-    这条把「bool 也要转成 0/1」这类过度修正挡住 —— `eval_truncated` /
-    `eval_used_ema` 直接报 bool 才是对的。
+    这条把「bool 也要转成 0/1」这类过度修正挡住 —— `eval_truncated` 直接报
+    bool 才是对的。
     """
     pytest.importorskip('swanlab', reason='swanlab 未装')
     from swanlab.sdk.internal.run.transforms.scalar import (  # noqa: PLC0415

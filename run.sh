@@ -19,8 +19,7 @@ exec python scripts/train_sft.py \
   --data data/sgf_19x19_full.npz --v7 1 --device cuda --board-size 19 \
   --games-npz data/labels/games.npz \
   --batch-size 256 --epochs 1 --lr 0.00322 --weight-decay 0.0001 \
-  --gradient-accumulation-steps 8 --use-amp 1 --use-ema 0 \
-  --flash-attn 1 --attention-dropout 0 \
+  --gradient-accumulation-steps 8 --use-amp 1 --attention-dropout 0 \
   --prefetch-workers 24 --prefetch-depth 8 \
   --log-every 25 --eval-every 500 --save-every 1674 \
   --early-stop 1 --early-stop-patience 3 \

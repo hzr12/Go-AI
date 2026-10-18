@@ -106,7 +106,6 @@ def run_sft(argv=None):
         '--label-smoothing', '0.1',
         '--gradient-accumulation-steps', '1',
         '--use-amp', '1',
-        '--use-ema', '1',
         '--compile', '1',
         '--compile-mode', 'reduce-overhead',
         '--prefetch-workers', '32',

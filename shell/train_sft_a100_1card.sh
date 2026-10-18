@@ -54,9 +54,8 @@ torchrun --nproc_per_node="$WORLD_SIZE" scripts/train_sft.py \
   --attn-mode window_global --attn-window 5 \
   --attention-dropout 0.1 --label-smoothing 0.1 \
   --gradient-accumulation-steps 1 \
-  --use-amp 1 --use-ema 1 \
+  --use-amp 1 \
   --compile 1 \
-  --flash-attn 1 \
   --prefetch-workers "$PREFETCH_W" --prefetch-depth "$PREFETCH_D" \
   --log-every 50 --swanlab-every 10 --eval-every 2000 --save-every 500 \
   --early-stop 1 --early-stop-patience 3 \

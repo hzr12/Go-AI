@@ -129,10 +129,8 @@ A→B→C 的 `load_state_dict` 承接（strict 零缺失）。
   与 `GOAI_PROFILE_STEPS` 是仅有的例外——两个都是诊断开关，与训练配置无关，语义是
   「从第 N 步抓 M 步 kernel 表」，M 默认 50，`M=0` = 起点即终点、在起点后的第一个
   打点步出表）：
-  - `--use-sdpa 0/1`（默认 1）：注意力走融合 SDPA（CUDA SDPA / FlashAttn）；0 = 全后端手写 math。
-  - `--attn-query-chunk 0|64`（默认 64）/ `--attn-chunk-ckpt 0/1`（默认 1）：手写
-    math 注意力的分块与逐块检查点（只影响 math 路径，SDPA 融合路径不生效）。
-  这几个都是**只慢不坏**的总闸（数值口径不变），出问题置 0 即回到已验证配置。
+  - 注意力内核固定走 torch 内置 `F.scaled_dot_product_attention`（不再有
+    flash-attn 独立库 / 手写 math / query 分块那几个开关）。
 - **V7 tracer bullet**：`scripts/smoke_train_v7.py` —— 302 行 / batch 8 / 40 步，
   直接吃 stdata，用来回答「12 项 loss 每项到底降不降」。
 

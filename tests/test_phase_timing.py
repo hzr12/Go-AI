@@ -14,7 +14,7 @@
 1. 绝不插 synchronize() —— 会打断预取与双缓冲流水，反而更慢；
 2. 累加器必须在打点处统一重置，否则跨区间累加导致数值虚高；
 3. save/eval 发生在其打点之后，因此计入下一区间（墙钟口径正确）；
-4. g/o/m（backward 之后的 clip / optimizer.step / EMA）按 **optimizer step**
+4. g/o（backward 之后的 clip / optimizer.step）按 **optimizer step**
    归一，不能除以 micro-batch 数 `_n_timed` —— accum>1 时会缩小 accum 倍，
    把要找的瓶颈读成「几乎不耗时」；
 5. g 还要拆成 g1（unscale_）/ g2（clip 调用）/ g3（float(_gn) 的 D2H 同步）
@@ -190,12 +190,12 @@ def test_accumulators_reset_together_at_logging():
         f'打点块内应有且仅有一处累加器重置，实得 {len(chains)} 处'
     reset = chains[0]
     j = metrics.body.index(reset)
-    # 「齐全」= 紧跟其后必须依次是 g/o/m 那组、g1/g2/g3、_t_data_max、_n_timed、_n_opt。
-    # 2026-10-07 加 g/o/m 后重置点从 3 行变 5 行，再拆 g1/g2/g3 变 6 行；这里按
+    # 「齐全」= 紧跟其后必须依次是 g/o 那组、g1/g2/g3、_t_data_max、_n_timed、_n_opt。
+    # 2026-10-07 加 g/o 后重置点从 3 行变 5 行，再拆 g1/g2/g3 变 6 行；这里按
     # **语句**判定而非正则，注释与空行不会插进来，也不会因「有人多加了一个计时器」
     # 而静默放行。
     _expect_after = [
-        (['_t_clip', '_t_opt', '_t_ema'], '0.0'),
+        (['_t_clip', '_t_opt'], '0.0'),
         (['_t_g1', '_t_g2', '_t_g3'], '0.0'),
         (['_t_data_max'], '0.0'),
         (['_n_timed'], '0'),
@@ -252,8 +252,8 @@ def test_data_wait_peak_is_tracked():
 
 
 def test_segments_logged_and_uploaded():
-    # 2026-10-07：日志行从 `d c s e dmax` 扩成 `d c g o m s e u dmax`。
-    # g/o/m 是 backward() 之后的三段、u 是未归因余量 —— 真机 a_v7.4_npu2 上
+    # 2026-10-07：日志行从 `d c s e dmax` 扩成 `d c g o s e u dmax`。
+    # g/o 是 backward() 之后的两段、u 是未归因余量 —— 真机 a_v7.4_npu2 上
     # 墙钟 12.0 s/step 而 c 只有 2.29 s，那 81% 正是靠这一行才第一次可见。
     # 同日再把 `g` 拆成 g1/g2/g3（13.09 s/step 里 g 独占 79.9%，但分不清是
     # clip 有病还是队列 drain）。格式串在源码里被拆成多行字面量，故分段断言。
@@ -261,8 +261,8 @@ def test_segments_logged_and_uploaded():
         '日志行缺少 d/c/g 字段'
     assert re.search(r'g1=%.0f g2=%.0f g3=%.0f', SRC), \
         '日志行缺少 g 的三段拆分（g1/g2/g3）'
-    assert re.search(r'o=%.0f m=%.0f s=%.0f e=%.0f', SRC), \
-        '日志行缺少 o/m/s/e 字段'
+    assert re.search(r'o=%.0f s=%.0f e=%.0f', SRC), \
+        '日志行缺少 o/s/e 字段'
     assert re.search(r'u=%.0f dmax=%.0f ms', SRC), \
         '日志行缺少未归因 u 与 dmax'
     for key in ('"t_data_ms": _dms', '"t_comp_ms": _cms',
@@ -271,34 +271,34 @@ def test_segments_logged_and_uploaded():
 
 
 def test_backward_tail_segments_are_measured():
-    """g/o/m 三段必须起止齐全，且按 optimizer step 归一。
+    """g/o 两段必须起止齐全，且按 optimizer step 归一。
 
     动机见 `_t_clip` 初始化处的注释：旧口径只有 d/c/s/e，2026-10-07 真机
     实测 81% 的步时落在 `c` 结算之后 —— 即 backward 之后的 clip /
-    optimizer.step / EMA，旧计时完全没看它们。
+    optimizer.step，旧计时完全没看它们。
 
-    归一口径是这里的**关键不变量**：accum>1 时这三段每个 optimizer step
+    归一口径是这里的**关键不变量**：accum>1 时这两段每个 optimizer step
     才发生一次，若除以 `_n_timed`（micro-batch 数）会缩小 accum 倍、
     被读成「这几段几乎不耗时」，正好把要找的瓶颈藏起来。
     """
-    for tag in ('_t_clip0', '_t_opt0', '_t_ema0'):
+    for tag in ('_t_clip0', '_t_opt0'):
         assert f'{tag} = time.perf_counter()' in SRC, f'缺少 {tag} 起点'
-    for acc in ('_t_clip', '_t_opt', '_t_ema'):
+    for acc in ('_t_clip', '_t_opt'):
         assert re.search(re.escape(acc) + r' \+= time\.perf_counter\(\) - ', SRC), \
             f'{acc} 未被累加'
     # 入口初始化（g1/g2/g3 紧跟在 g 后面、`_n_opt` 之前）
     assert re.search(
-        r'_t_clip = _t_opt = _t_ema = 0\.0\s*\n'
+        r'_t_clip = _t_opt = 0\.0\s*\n'
         r'\s*_t_g1 = _t_g2 = _t_g3 = 0\.0\s*\n\s*_n_opt = 0', SRC), \
-        '循环入口未初始化 g/o/m 与 g1/g2/g3 计数'
+        '循环入口未初始化 g/o 与 g1/g2/g3 计数'
     # 归一必须走 `_n_opt`，不能走 `_n_timed`
-    for acc, var in (('_t_clip', '_gms'), ('_t_opt', '_oms'), ('_t_ema', '_mms'),
+    for acc, var in (('_t_clip', '_gms'), ('_t_opt', '_oms'),
                      ('_t_g1', '_g1ms'), ('_t_g2', '_g2ms'), ('_t_g3', '_g3ms')):
         assert re.search(
             re.escape(var) + r'\s*=\s*' + re.escape(acc)
             + r' \* 1000\.0 / _no', SRC), \
             f'{acc} 的归一未走 optimizer-step 口径（应为 … / _no，不是 / _nd）'
-    # `u` = 墙钟 −(d+c+g+o+m+s+e)：未归因余量必须真的被算出来
+    # `u` = 墙钟 −(d+c+g+o+s+e)：未归因余量必须真的被算出来
     assert re.search(r'_ums = \(_wall_ms', SRC), '缺少未归因 u 的计算'
 
 

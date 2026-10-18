@@ -23,8 +23,7 @@ exec python scripts/train_sft.py \
   --model models/b_v7_a100.pth \
   --policy-loss soft_ce --soft-weight 1.0 \
   --batch-size 256 --epochs 1 --lr 0.00322 --weight-decay 0.0001 \
-  --gradient-accumulation-steps 8 --use-amp 1 --use-ema 0 \
-  --flash-attn 1 --attention-dropout 0 \
+  --gradient-accumulation-steps 8 --use-amp 1 --attention-dropout 0 \
   --prefetch-workers 24 --prefetch-depth 8 \
   --log-every 50 --eval-every 500 --save-every 20 \
   --early-stop 1 --early-stop-patience 3 \

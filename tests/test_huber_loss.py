@@ -1571,10 +1571,10 @@ def test_no_new_cli_params():
         '--value-channels', '--policy-channels', '--policy-layers',
         '--prefetch-workers', '--prefetch-depth', '--resume', '--model',
         '--value-loss-weight', '--policy-loss', '--value-loss', '--huber-beta',
-        '--value-lr-mult', '--label-smoothing', '--use-ema',
+        '--value-lr-mult', '--label-smoothing',
         '--gradient-accumulation-steps', '--scaler-init-scale',
         '--scaler-growth-interval', '--compile',
-        '--compile-mode', '--flash-attn', '--arch', '--export-onnx',
+        '--compile-mode', '--arch', '--export-onnx',
         '--onnx-quantize', '--swanlab', '--swanlab-api-key', '--swanlab-every',
         '--early-stop', '--early-stop-patience', '--early-stop-metric',
         '--max-gpu-memory',
@@ -1606,19 +1606,11 @@ def test_no_new_cli_params():
         # 段位权重仍**不**做成 CLI：V7 的段位表是常量
         #   （`V7_STAGE1_SCORE_TERMS`），理由同上。
         '--games-npz',
-        # ---- online-softmax 注意力开关（预先存在，补登记留痕）----
-        # `--attn-online`（默认 0）开启手写 math 注意力的 online-softmax（flash 风格）
-        # 实现，定义于 scripts/train_sft.py 的 argparse（约 line 3431）。该参数早于
-        # 本测试历次更新加入，当时未在冻结集留痕，导致本测试红；现补登。与 D1 门禁
-        # 哲学一致：登记是把"为什么有这个旗"钉死，后续改名/删除仍会在此报警。
-        '--attn-online',
-        # ---- 2026-10-06 新增的 1 个：SDPA 融合注意力总开关 ----
-        # `--use-sdpa`（默认 1）把原环境变量 GOAI_SDPA 搬成 CLI 参数：NPU 上放开
-        # CANN 融合 SDPA（更省算力、fp32 累加更稳），0 强制所有后端回退手写 math。
-        # 与 D1 门禁哲学一致：登记是把"为什么有这个旗"钉死，后续改名/删除仍会在此报警。
-        '--use-sdpa',
-        # ---- math 注意力的分块开关 ----
-        '--attn-query-chunk',     # math 注意力 query 分块
+        # ---- 2026-10-18 删除 5 个注意力 / EMA 开关（留痕）----
+        # `--use-ema` / `--flash-attn` / `--attn-online` / `--use-sdpa` /
+        #   `--attn-query-chunk`：注意力内核统一为 torch 内置 SDPA（不再有
+        #   flash-attn 独立库 / 手写 math / 分块），模型权重 EMA 整体删除。
+        #   与 D1 门禁哲学一致：删除同样是一次**留痕**的改动，故在此记录理由。
         # ---- 2026-10-11 新增的 2 个 ----
         '--clip-every',                  # 稀疏梯度裁剪周期
         '--compile-fullgraph-probe',     # fullgraph 探针
@@ -1631,17 +1623,13 @@ def test_no_new_cli_params():
         f'个数 {len(got)} vs {len(expected)}'
         + (f'  仅顺序不同（不算违规）: '
            f'{[k for k in kw if k in expected]}' if got == expected else ''))
-    # 基线 = 61 原始 + A4 的 4 个软标签 + B8 的 `--v7` + 2026-10-04 的 `--games-npz`
-    #        + online-softmax 开关 `--attn-online`（补登）+ 2026-10-06 的 `--use-sdpa`
-    #        + 2026-10-06 的 5 个 GOAI_* 环境变量搬家旗
-    #        + 2026-10-11 的 `--clip-every` / `--compile-fullgraph-probe`
-    #        − 已删除的 4 个旗
-    #        ⇒ 相对 69 那版基线 0
-    assert len(expected) == 69, (
-        f'冻结的基线本身变了：{len(expected)} != 69'
-        f'（61 + A4 的 4 个 + B8 的 1 个 + --games-npz 的 1 个 + --attn-online 的 1 个'
-        f' + --use-sdpa 的 1 个 + GOAI_* 搬家里留下的 2 个'
-        f' + 2026-10-11 的 2 个 − 已删除的 4 个）')
+    # 基线 = 69 那版（见 git 历史）
+    #        − 2026-10-18 删掉的 5 个注意力/EMA 开关
+    #        ⇒ 64
+    assert len(expected) == 64, (
+        f'冻结的基线本身变了：{len(expected)} != 64'
+        f'（69 − 2026-10-18 删掉的 5 个：--use-ema / --flash-attn / --attn-online'
+        f' / --use-sdpa / --attn-query-chunk）')
     # 特别地：L2 系数不许有独立参数，label smoothing 也不许有第二个旋钮
     for banned in ('--l2-coef', '--l2-weight', '--weight-decay-l2',
                    '--l2-report', '--label-smoothing-ce'):

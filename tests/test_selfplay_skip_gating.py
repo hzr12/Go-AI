@@ -1,20 +1,17 @@
-r"""`selfplay_train.py`（RL/PPO）的跳步不得推进 LR 计划与 EMA。
+r"""`selfplay_train.py`（RL/PPO）的跳步不得推进 LR 计划。
 
 与 SFT 路径的同一类缺陷，2026-10-05 补上
 ------------------------------------------
-`scripts/train_sft.py` 在 `91c7d53`「跳过的步不再消耗 LR 计划与 EMA」修过一次，
+`scripts/train_sft.py` 在 `91c7d53`「跳过的步不再消耗 LR 计划」修过一次，
 但 **RL 路径从来没修**：
 
     scaler.step(opt)        # 内部跳过 optimizer.step()，但对调用方「成功返回」
     scaler.update()
     opt.zero_grad()
     scheduler.step()        # ← 权重一动没动，warmup/cosine 照样前进
-    if ema is not None:
-        ema.update()        # ← shadow 被多拉一次且计数 +1
 
 后果与 SFT 那次实测一样：100% 跳步时 558 步的 warmup 被 **0 次学习**消耗掉，
-等于训练一开始就拿到一个已经退火的 LR；而 eval 是在 EMA shadow 上评的 ⇒ shadow
-会一路收敛到**初始权重**。真机 SFT 那轮就是这样被带偏的。
+等于训练一开始就拿到一个已经退火的 LR。真机 SFT 那轮就是这样被带偏的。
 
 另外 RL 侧此前**一个跳步计数都没有** —— 于是「这段训练是否有效」完全不可观测，
 而 SFT 侧有 `skipped_steps` / `skip_rate_pct`。
@@ -71,18 +68,6 @@ def test_scheduler_step_is_gated_on_real_step():
     indent_sched = len(lines[idx_sched]) - len(lines[idx_sched].lstrip())
     assert indent_sched > indent_gate, \
         'scheduler.step() 与 if _real_step: 同级 ⇒ 跳步时仍在推进 LR 计划'
-
-
-def test_ema_update_is_gated_on_real_step():
-    blk = _ppo_step_block()
-    lines = blk.splitlines()
-    idx_gate = next(k for k, ln in enumerate(lines)
-                    if ln.strip().startswith('if _real_step:'))
-    indent_gate = len(lines[idx_gate]) - len(lines[idx_gate].lstrip())
-    idx_ema = next(k for k, ln in enumerate(lines) if 'ema.update()' in ln)
-    indent_ema = len(lines[idx_ema]) - len(lines[idx_ema].lstrip())
-    assert indent_ema > indent_gate, \
-        'ema.update() 与 if _real_step: 同级 ⇒ 跳步时 shadow 仍被拉向当前权重'
 
 
 def test_skipped_steps_are_counted_and_reported():

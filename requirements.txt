@@ -6,5 +6,3 @@ torchao>=0.1.0         # 可选，GPU weight-only INT4 量化
 # ---- 可选依赖 ----
 # 实验跟踪
 swanlab>=0.10.0         # pip install .[tracking]
-# 快速注意力 (仅 Linux/CUDA)
-flash-attn>=2.0.0       # pip install .[attention]

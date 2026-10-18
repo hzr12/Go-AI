@@ -11,8 +11,7 @@ V7 的 dim=128，MHSA 里 q/k/v 各是一个 ``Linear(128,128)``。M 极小，
   1. ``state_dict()`` 仍给 ``attn.q/k/v.weight`` 三个键（所以导出器
      ``katago_export.py:268-270`` 读的键没变、``.bin.gz`` 逐字节相同）；
   2. 旧 checkpoint 的三键能直接 ``load_state_dict``（``strict=True``）；
-  3. ``named_parameters()`` 是 ``qkv``（EMA 用），旧 ckpt 的 EMA shadow
-     由 ``_migrate_ema_shadow_qkv`` 迁移。
+  3. ``named_parameters()`` 是 ``qkv``。
 
 这些是**契约**，不是实现细节：一旦破坏，症状是「引擎加载失败」或
 「resume 崩」，而且往往离现场很远。所以逐条钉住。
@@ -27,7 +26,6 @@ from src.networks.katago_v7 import (
     MHSA,
     NBT_TF_CFG,
     RoPE2D,
-    _migrate_ema_shadow_qkv,
     _ScaledLinear,
     _sdpa,
     build_katago_v7_net,
@@ -149,8 +147,8 @@ def test_whole_net_param_count_and_key_count_unchanged():
     assert not [k for k in sd if 'qkv' in k], '对外不该出现 qkv 键'
 
 
-def test_named_parameters_exposes_qkv_for_ema():
-    """EMA 以 ``named_parameters()`` 为键 ⇒ 新 shadow 必须是 qkv。"""
+def test_named_parameters_exposes_qkv():
+    """``named_parameters()`` 必须是 ``qkv``（内部就只存这一个权重）。"""
     net = build_katago_v7_net()
     keys = [n for n, _ in net.named_parameters() if 'qkv' in n]
     assert len(keys) == N_BLOCKS * INNER, len(keys)
@@ -172,41 +170,6 @@ def test_legacy_three_key_checkpoint_loads_strict():
     out = dst.state_dict()
     for k, v in legacy.items():
         assert torch.equal(out[k], v), k
-
-
-def test_legacy_ema_shadow_is_migrated():
-    """旧 ckpt 的 EMA shadow（q/k/v）迁移成 qkv，非 MHSA 键原样透传。"""
-    legacy = {}
-    for bi in (0, 5):
-        for ui in range(INNER):
-            for nm in ('q', 'k', 'v'):
-                legacy['blocks.%d.inner.%d.attn.%s.weight' % (bi, ui, nm)] = \
-                    torch.randn(DIM, DIM)
-    legacy['stem.conv.weight'] = torch.randn(8, 32, 3, 3)
-
-    migrated, moved = _migrate_ema_shadow_qkv(legacy)
-
-    assert moved == 4, moved
-    assert 'stem.conv.weight' in migrated
-    assert torch.equal(migrated['stem.conv.weight'], legacy['stem.conv.weight'])
-    assert not [k for k in migrated if k.endswith('.q.weight')], '旧三键应被消费'
-    for bi in (0, 5):
-        for ui in range(INNER):
-            base = 'blocks.%d.inner.%d.attn' % (bi, ui)
-            assert base + '.qkv.weight' in migrated
-            for i, nm in enumerate(('q', 'k', 'v')):
-                seg = migrated[base + '.qkv.weight'][i * DIM:(i + 1) * DIM]
-                assert torch.equal(seg, legacy['%s.%s.weight' % (base, nm)])
-
-
-def test_migrate_is_identity_when_already_fused():
-    """已是 qkv 的 shadow 不该被改动（幂等）。"""
-    fused = {'blocks.0.inner.0.attn.qkv.weight': torch.randn(3 * DIM, DIM),
-             'stem.conv.weight': torch.randn(8, 32, 3, 3)}
-    migrated, moved = _migrate_ema_shadow_qkv(fused)
-    assert moved == 0
-    assert set(migrated) == set(fused)
-    assert all(torch.equal(migrated[k], fused[k]) for k in fused)
 
 
 def test_works_without_torch22_state_dict_post_hook():
@@ -257,72 +220,6 @@ def test_state_dict_expansion_works_when_nested_in_parent():
                       dim=0)
     assert fused.shape == (3 * dim, dim), fused.shape
     assert torch.equal(fused, net.blocks[0].inner[0].attn.qkv.weight.detach())
-
-
-def test_migrate_passes_stray_q_weight_through_untouched():
-    """只有 q 而没有 k/v 时**不拼**，原样透传。
-
-    ⚠ 别把这条读成「多余项要保留到 EMA 报错为止」—— 那是错的：
-    `EMA.update()`（`train_sft.py` 的 `EMA` 类）是遍历
-    `model.named_parameters()` 再去 shadow 取键，**从不遍历 shadow 自己的键**
-    ⇒ 多余项永远不会被读到，既不会算错值也**不会抛 KeyError**。
-    真正会 KeyError 的是反方向：「模型有、shadow 没有」。
-    真正丢弃多余项的动作在 resume 分支做，且判据是对 `named_parameters`
-    求差（那里拿得到 `model`）—— 见 `train_sft.py` 同名注释。
-    """
-    odd = {'blocks.0.inner.0.attn.q.weight': torch.randn(DIM, DIM)}
-    migrated, moved = _migrate_ema_shadow_qkv(odd)
-    assert moved == 0
-    # 透传 = 本函数不越权判断「模型里没有它」。丢弃是调用点的职责。
-    assert set(migrated) == set(odd)
-
-
-def test_stale_shadow_pruning_never_drops_a_real_q_parameter():
-    """**模型里真的有 `.q.weight` 参数时，清理逻辑不许把它当垃圾丢掉。**
-
-    这是把判据从「后缀长得像」改成「对 `named_parameters()` 求差」的原因。
-    今天的两个现役模型（V7 278 个 / 12 通道 226 个参数）里 `.q/.k/.v.weight`
-    都是 0 个，所以按后缀删**今天也安全** —— 正因为安全，这个 bug 不会有任何
-    现存测试能抓到，直到有人给某个模块加一个真的 `.q.weight` 参数那天。
-    那时按后缀删掉的就是**活参数**的 shadow 项，`EMA.update()` 第一步直接
-    KeyError —— 恰好是它本想防止的故障。
-    """
-    from scripts.train_sft import EMA, _ema_key
-
-    class _Attn(torch.nn.Module):
-        """真的带 `.q/.k/.v.weight` 三个参数（必须**嵌套**，顶层 `self.q`
-        的参数名是 `q.weight`，没有前导的点，测不到后缀陷阱）。"""
-
-        def __init__(self):
-            super().__init__()
-            self.q = torch.nn.Linear(2, 2)
-            self.k = torch.nn.Linear(2, 2)
-            self.v = torch.nn.Linear(2, 2)
-
-    class _Fake(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.attn = _Attn()
-
-    net = _Fake()
-    ema = EMA(net)
-    live = {_ema_key(n) for n, _ in net.named_parameters()}
-    assert {'attn.q.weight', 'attn.k.weight', 'attn.v.weight'} <= live, \
-        sorted(live)
-
-    # shadow 里既有活键、也有一个模型里不存在的垃圾键
-    shadow = dict(ema.shadow)
-    shadow['blocks.0.inner.0.attn.q.weight'] = torch.randn(2, 2)
-    kept = {k: v for k, v in shadow.items() if k in live}
-
-    assert any(k.endswith('.q.weight') for k in kept), \
-        '活着的 .q.weight 被误当成残留删掉了 —— 这就是按后缀匹配的陷阱'
-    assert 'blocks.0.inner.0.attn.q.weight' not in kept, \
-        '模型里不存在的残留项应当被丢掉'
-    # 关键：剩下的是一套完整、可直接挂回去的 shadow
-    ema.shadow = kept
-    ema.update()          # 缺键 / 多键都不会炸，缺键才会
-    ema.apply_shadow()
 
 
 # --------------------------------------------------------------------------- #

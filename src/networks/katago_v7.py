@@ -27,10 +27,9 @@
    ``initialize`` 与 spec §3.3。
 2. **无 dropout。** 对齐官方；旧模型时代的 ``attn_dropout=0.1`` 不进入本模型。
    双重收益：省激活/掩码两份张量，且 dropout 常是融合注意力的阻碍。
-3. **注意力走 ``backbone._sdpa`` 同一个四站点机制**（`backbone.py:581`），
-   ``head_dim`` 由 46 变 32。复用它而不是自己调 SDPA，是为了让
-   ``_sdpa_force_math`` / flash-attn 开关 / batch 上限对两个模型一致生效 ——
-   spec §6.2 的注意力显存账就是按这条路径估的。
+3. **注意力走 ``backbone._sdpa`` 同一个站点机制**，
+   ``head_dim`` 由 46 变 32。复用它而不是自己调 SDPA，是为了让缩放与
+   后端口径全仓一致 —— spec §6.2 的注意力显存账就是按这条路径估的。
 
  **RoPE 的形状是 spec 唯一未逐字确定的一处**：spec §3.2 只给出参数形状
 ``(H, 16, 2)``，没有给「2」的语义。本实现取**二维频率**（``[...,0]`` 乘行坐标、
@@ -303,57 +302,17 @@ class RoPE2D(nn.Module):
         return self._rotate(x, ang.cos(), ang.sin())
 
 
-def _migrate_ema_shadow_qkv(shadow):
-    """把旧 ckpt 的 EMA shadow（``...attn.q/k/v.weight``）并成 ``qkv.weight``。
-
-    MHSA 现在内部只存 ``qkv``（见 `MHSA` 类文档），EMA 以
-    ``named_parameters()`` 为键 ⇒ 新 shadow 用 ``qkv``。旧 checkpoint 存的是
-    三个独立键，直接换上去会让 `EMA.update()` 抛 KeyError。三者按 q,k,v 顺序
-    沿 dim0 拼接即可（与 `qkv_to_qkv` 的逆运算，**无损**）。
-
-    返回 ``(新 shadow, 迁移了几处)``。不是 MHSA 的键原样透传。
-
-    **刻意不在这里丢弃「模型里没有」的键**（例如残缺的 ``attn.q.weight``）：
-    本函数拿不到模型，无法判断某个键是「多余」还是「未来某个模块真的叫这个名」。
-    按 ``.q.weight`` 这类**后缀**去删尤其危险：哪天有模块真的有个 ``.q.weight``
-    参数，删掉的就是活参数的 shadow 项，``EMA.update()`` 第一步直接 KeyError ——
-    正好是它本想防的故障。判「模型里没有」这件事留给调用点做（那里有 ``model``），
-    见 ``train_sft.py`` 的 resume 分支。
-    """
-    out, moved = {}, 0
-    i = 0
-    keys = list(shadow.keys())
-    while i < len(keys):
-        k = keys[i]
-        if k.endswith('.q.weight'):
-            # k[:-len('.q.weight')] 会把 q 前的那个点一起吃掉，所以下面补回。
-            base = k[:-len('.q.weight')]
-            trip = [shadow.get(base + '.' + n + '.weight') for n in ('q', 'k', 'v')]
-            if all(t is not None for t in trip):
-                out[base + '.qkv.weight'] = torch.cat(
-                    [t.detach().clone() for t in trip], dim=0)
-                i += 3
-                moved += 1
-                continue
-        out[k] = shadow[k]
-        i += 1
-    return out, moved
-
-
 class MHSA(nn.Module):
     """多头自注意力，``head_dim = nbt_mid / num_heads``（spec §3.2）。
 
-    ``q`` 在调用 ``_sdpa`` **之前**已乘 ``1/√head_dim``（`_sdpa`` 的契约，见
-    `backbone.py:584`），这样 flash / mem-efficient 后端与 math 路径拿到的是
-    同一份缩放后的输入。
+    ``scale`` 由 ``_sdpa`` 透传给 SDPA（``q`` 不预乘），见下方 ``forward``。
 
     **q/k/v 合成（训练侧优化）**：内部只存一个 ``qkv`` 权重（一次 GEMM），但
     ``state_dict()`` 仍以 ``q/k/v`` 三个键对外暴露。因此：
       - 旧 checkpoint（``attn.q/k/v.weight``）可直接 ``load_state_dict``；
       - ``katago_export.py`` 读的三个键不变，导出的 .bin.gz 与合成前**逐字节相同**
         ⇒ KataGo 引擎加载零影响；
-      - EMA（``named_parameters`` 键）只在训练期新起的 shadow 里是 ``qkv``，
-        见 `scripts/train_sft.py` resume 分支的迁移。
+      - ``named_parameters()`` 的键是 ``qkv``，``state_dict()`` 的键是 ``q/k/v``。
     """
 
 
@@ -400,11 +359,10 @@ class MHSA(nn.Module):
     def forward(self, t, pos):
         """``t``: ``(B, N, C)`` token 序列；``pos``: ``(B, N, 2)`` 行列坐标。"""
         b, n, c = t.shape
-        # q **不**预乘 scale。scale 作为参数交给 `_sdpa`，由它按所选后端决定
-        #    怎么施加（math 手动乘、SDPA 透传 scale=、flash 手动抵消它的写死值）。
-        #    旧写法「预乘 q + scale=None」只在 math 路径（V100/910A）正确；
-        #    走 SDPA 路径时 SDPA 会再乘一次 1/sqrt(d) ⇒ 注意力 logits 小 32 倍，
-        #    softmax 被压平、注意力趋近均值，实测相对误差 82%。
+        # q **不**预乘 scale。scale 作为参数交给 `_sdpa`，由它透传给 SDPA。
+        #    旧写法「预乘 q + scale=None」会双重缩放：SDPA 再乘一次 1/sqrt(d)
+        #    ⇒ 注意力 logits 小 32 倍，softmax 被压平、注意力趋近均值，
+        #    实测相对误差 82%。
         # 一次 GEMM 出 q/k/v，按行切成三段（chunk 只是 view，不额外拷贝）。
         qkv = self.qkv(t)
         q = self._heads(qkv[..., :c])

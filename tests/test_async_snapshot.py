@@ -3,11 +3,11 @@ r"""定期快照走后台线程写盘（`_AsyncSnapshotWriter`）。
 为什么：2026-10-08 的 A100 40G 实测，GPU 利用率每 ~25 秒准时跌到 **0**，且与
 「GPU Time Spent Accessing Memory」曲线同形 ⇒ 卡的是 host。eval 期间 GPU 是**忙**的
 （只有 60-70% 的浅谷），能把利用率打到 0 的只有保存：模型 + optimizer state
-（Adam 的 m/v 是参数量的两倍）+ EMA 一次性 D2H 再 `torch.save`，全在 step 循环里。
+（Adam 的 m/v 是参数量的两倍）一次性 D2H 再 `torch.save`，全在 step 循环里。
 
 三件容易写错、且错了会**静默**的事：
 
-1. 快照必须是**独立副本**。optimizer state 与 `ema.shadow` 在提交后仍被每个 step
+1. 快照必须是**独立副本**。optimizer state 在提交后仍被每个 step
    改写，后台线程去序列化同一块显存 ⇒ **撕裂**的 checkpoint（能 load、半新半旧）。
    同步保存时不可能出现（训练线程就卡在 save 上），这是异步化**引入**的新风险。
 2. **至多一个在飞**。否则写盘慢时快照堆积，而堆积吃的是显存 —— 与目的相反。
