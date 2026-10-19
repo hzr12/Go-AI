@@ -3502,7 +3502,7 @@ def main():
                          '首次迭代较慢）。\n'
                          '**不给 = 按设备自动**：CUDA 且 sm_80 以上（A100 等）'
                          '自动开 1，其余后端 0。本仓 CUDA 分支本来就把 BF16 + '
-                         'channels_last + FlashAttn 都默认打开了，compile 却是'
+                         'channels_last + SDPA 都默认打开了，compile 却是'
                          '默认关的 —— 那是 加速器 时期「inductor 不可用」留下的默认值，'
                          '对 A100 是白丢的收益。\n'
                          '显式给 0/1 覆盖自动判定。compile 失败会自动回退 eager，'
@@ -3511,8 +3511,9 @@ def main():
                     choices=['default', 'max-autotune', 'max-autotune-no-cudagraphs',
                              'reduce-overhead'],
                     help='torch.compile 模式（默认 None = 不显式指定，交给下方设备分支）。\n'
-                         '  **A100(sm_80+)：未显式指定时取 `reduce-overhead`** —— 带 CUDA\n'
-                         '  Graphs，消除 kernel launch 开销，常比 no-cudagraphs 快 10~30%%。\n'
+                         '  **A100(sm_80+)：未显式指定时取 `max-autotune`** —— Triton\n'
+                         '  autotuning + CUDA Graphs 两者都要（2026-10-18 从\n'
+                         '  `reduce-overhead` 切过来：后者只给 cudagraphs、不含 autotuning）。\n'
                          '  🔴 `--gradient-accumulation-steps`>1 时**必须**用不带 cudagraph 的档：真机\n'
                          '  实测 `torch.compiler.cudagraph_mark_step_begin()` 也挡不住（torch\n'
                          '  2.10），会在第一个 backward 抛 `accessing tensor output of\n'
@@ -3521,22 +3522,14 @@ def main():
                          '  accum==1 时 CUDA Graphs 消除 kernel launch 开销，常比\n'
                          '  no-cudagraphs 快 10~30%%，但私有内存池不归还、长跑 `mem=`\n'
                          '  会缓慢爬升；顶到 OOM 就换 `--compile-mode default`。\n'
-                         '  ⚠ 换档前先 `rm -rf ~/.cache/torch/inductor`\n'
-                         '  （FX 图缓存可能存着上一档的坏图，2026-10-11 本机\n'
-                         '  `max-autotune-no-cudagraphs` 曾报 misaligned address）。\n'
-                         '  非 Ampere+ 或显式指定时尊重用户值：\n'
-'  ⚠ 唯一顾虑是 CUDA Graphs 私有内存池不归还，长跑 `mem=` 会缓慢\n'
-                         '  爬升；顶到 OOM 就换 `--compile-mode max-autotune-no-cudagraphs`。\n'
+                         '  ⚠ max-autotune 首次编译显著变久（要跑 autotune 搜索，几分钟起）。\n'
                          '  ⚠ 换档前先 `rm -rf ~/.cache/torch/inductor`\n'
                          '  （FX 图缓存可能存着上一档的坏图，2026-10-11 本机\n'
                          '  `max-autotune-no-cudagraphs` 曾报 misaligned address）。\n'
                          '  非 Ampere+ 或显式指定时尊重用户值：\n'
                          '  default                       = 常规融合，编译最快，不带 CUDA Graphs。\n'
-                         '  reduce-overhead               = 带 CUDA Graphs（**A100 默认**）。\n'
-                         '  max-autotune-no-cudagraphs    = autotune 调优 + 不带 CUDA Graphs\n'
-                         '                                 （显存吃紧时的退路）。\n'
-                         '  max-autotune                  = autotune + CUDA Graphs。\n'
-                         '  max-autotune                  = 全量 autotune + CUDA Graphs，最慢最吃显存。\n'
+                         '  reduce-overhead               = 带 CUDA Graphs（无 autotuning）。\n'
+                         '  max-autotune                  = autotune + CUDA Graphs（**A100 默认**）。\n'
                          '  max-autotune-no-cudagraphs    = autotune 收益但不背 CUDA Graphs 的显存池。')
     ap.add_argument('--compile-fullgraph-probe', type=int, default=0, choices=[0, 1],
                     help='诊断用：编译时额外用 `fullgraph=True` 探测一次，把所有 '
@@ -3885,12 +3878,25 @@ def main():
             # unfold 巨型中间张量会触发 inductor freezing 以 fp32 物化 (B,N,Hh,ws²,d)
             # 导致编译期 OOM（batch512 下单个 4.3GB），必须排除出编译图
             compile_disable_sparse = True
-            # A100/Ampere+ 默认 compile 档 `reduce-overhead`：带 CUDA Graphs，消除
-            # kernel launch 开销、常比 no-cudagraphs 再快 10~30%。代价是私有内存池
-            # 不归还、长跑显存爬升，盯 `memory_gb`；顶满 OOM 就显式给
-            # `--compile-mode max-autotune-no-cudagraphs`。仅当用户**未显式**指定
-            # --compile-mode（默认 None）时覆盖；显式给什么档都尊重用户意图。
-            # 非 Ampere+ 分支不动（留给 torch.compile 默认档）。
+            # A100/Ampere+ 默认 compile 档 `max-autotune`（2026-10-18 从
+            # `reduce-overhead` 切过来）：**Triton autotuning + CUDA Graphs**。
+            # 两者的区别是 `reduce-overhead` 只给 cudagraphs、**不含** Triton
+            # autotuning（inductor 的 coordinate-descent 选 kernel + epilogue
+            # 融合）；`max-autotune` 两者都有，典型再快 5~15%。
+            #
+            # 为什么现在才切：accum=8 时代 cudagraph 与梯度累积在 torch 2.10 上
+            # 真互斥（`cudagraph_mark_step_begin()` 挡不住），只能退到
+            # no-cudagraph 档 ⇒ 两个都拿不到。2026-10-18 起 A/B/C 三段切到
+            # accum=1，限制解开，于是可以同时要 autotuning 与 cudagraphs。
+            #
+            # 代价：① 首次编译显著变久（max-autotune 要跑 autotune 搜索，几分钟
+            # 起）；② 私有内存池不归还、长跑显存爬升，盯 `mem=`；顶满 OOM 就
+            # 显式给 `--compile-mode max-autotune-no-cudagraphs`。
+            # ⚠ **换档前先 `rm -rf ~/.cache/torch/inductor`**：FX 图缓存可能存着
+            # 上一档的坏图（2026-10-11 真机见过 `max-autotune-no-cudagraphs`
+            # 报 misaligned address）。
+            # 仅当用户**未显式**指定 --compile-mode（默认 None）时覆盖；显式给
+            # 什么档都尊重用户意图。非 Ampere+ 分支不动（留给 torch.compile 默认档）。
             #
             # 梯度累积（accum>1）与 cudagraph 在 torch 2.10 上**真的**互斥：
             # 真机实测 `torch.compiler.cudagraph_mark_step_begin()` 也挡不住
@@ -3899,7 +3905,7 @@ def main():
             # 下面的预热（accum 次前向 + 一次 backward）会在启动时就抓到这个
             # 冲突并自动降档，不必等到训练循环里炸。
             if args.compile_mode is None:
-                args.compile_mode = ('reduce-overhead'
+                args.compile_mode = ('max-autotune'
                                      if args.gradient_accumulation_steps <= 1
                                      else 'max-autotune-no-cudagraphs')
             logger.info("[device] %s (sm_%d%d) | 启用 A100 路径: BF16 + SDPA + "
@@ -4268,9 +4274,9 @@ def main():
                 _probe_loss.backward()
                 _m.zero_grad(set_to_none=True)
 
-            # 档位序列：默认 `reduce-overhead`（带 CUDA Graphs）。它一旦在预热里
-            # 就撞上 cudagraph 冲突，**自动**退到不带 cudagraph 的档，而不是一路
-            # 退到 eager 把算子融合整个丢掉 —— 那比慢更糟。
+            # 档位序列：默认 `max-autotune`（autotuning + CUDA Graphs）。它一旦在
+            # 预热里就撞上 cudagraph 冲突，**自动**退到不带 cudagraph 的档，而不是
+            # 一路退到 eager 把算子融合整个丢掉 —— 那比慢更糟。
             _base_model = model
             _modes = [args.compile_mode]
             if args.compile_mode in ('reduce-overhead', 'max-autotune'):

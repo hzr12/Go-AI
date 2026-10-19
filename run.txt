@@ -212,19 +212,24 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 #   ⇒ 改 micro 时先看 `mem=` 是否贴顶/是否 OOM，再看 spd；两档都记。
 #     `v7_batch_memory_advice` 是「激活全驻留」口径的估算，可先拿它筛掉明显
 #     装不下的组合，但它的每样本 MB 常数仍来自 910A，当量级参考、不能当判据。
-# ⚠ `--compile-mode` 2026-10-11 本机实测结论（Ampere+）：
-#   - 脚本默认已从 `max-autotune-no-cudagraphs` 改成 **`reduce-overhead`**（L4004）：
-#     原默认档在本机曾报 `CUDA error: misaligned address`——疑似刚启用的
-#     `TORCHINDUCTOR_FX_GRAPH_CACHE=1` 缓存到坏图，或该 mode 的 inductor bug；先
-#     `rm -rf ~/.cache/torch/inductor` 清缓存重测原默认档，仍崩即属后者。
-#   - `reduce-overhead` **实测可跑**，且带 CUDA Graphs（消除 kernel launch 开销，常比
-#     no-cudagraphs 再快 10~30%）。**当前默认即它，无需显式传**。
-#   - 唯一顾虑：CUDA Graphs 私有内存池不归还，长跑 `memory_gb` 会爬升；盯 `memory_gb`，
-#     顶到 OOM 就显式 `--compile-mode default`（注意：别退回 `max-autotune-no-cudagraphs`，
-#     本机会崩）。
-#   - 也可试 `max-autotune`（同样带 Graphs + 全量 autotune），可能更顺也可能同样崩。
-#   ⚠ 用 `reduce-overhead`/`max-autotune` 配 FX 图缓存时，换 mode / torch 版本前先
-#     `rm -rf ~/.cache/torch/inductor`，避免复用错档的缓存图。
+# ⚠ `--compile-mode` 2026-10-18 定的档（Ampere+，accum=1）：
+#   - 脚本默认档 = **`max-autotune`**（Triton autotuning **+** CUDA Graphs）。
+#     2026-10-11 时默认是 `reduce-overhead`，它**只给 cudagraphs、不含** autotuning；
+#     2026-10-18 起 A/B/C 三段切 accum=1，解开了「accum>1 与 cudagraph 真互斥」
+#     这道限制（accum=8 时代只能退到 no-cudagraph 档，两个都拿不到），
+#     于是可以同时要 autotuning 与 cudagraphs，典型再快 5~15%。
+#   - `reduce-overhead` 2026-10-11 实测可跑、带 CUDA Graphs（常比 no-cudagraphs
+#     快 10~30%），但没有 autotuning ⇒ 现在只是 `max-autotune` 的退路档。
+#   - ⚠ **max-autotune 首次编译显著变久**（要跑 autotune 搜索，几分钟起）；
+#     每次换 batch/模型都会重来一遍。
+#   - 唯一顾虑：CUDA Graphs 私有内存池不归还，长跑 `mem=` 会缓慢爬升；顶到 OOM
+#     就显式 `--compile-mode max-autotune-no-cudagraphs` 或 `default`。
+#   - ⚠ **换档 / 换 torch 版本前先 `rm -rf ~/.cache/torch/inductor`**：FX 图缓存
+#     可能存着上一档的坏图（2026-10-11 本机 `max-autotune-no-cudagraphs` 曾报
+#     `CUDA error: misaligned address`，疑似 `TORCHINDUCTOR_FX_GRAPH_CACHE=1`
+#     缓存到坏图）。清缓存后重测。
+#   - 启动日志核对这一行确认没退档（退档 = 白丢 cudagraphs 的收益）：
+#     `[train] 已启用 torch.compile 算子融合 | mode=max-autotune`
 python scripts/train_sft.py \
   --data data/sgf_19x19_full.npz --v7 1 --device cuda --board-size 19 \
   --games-npz data/labels/games.npz \
