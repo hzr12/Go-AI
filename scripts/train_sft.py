@@ -3006,8 +3006,21 @@ def compose_losses(policy_loss, value_loss, value_loss_weight, l2_report):
     return opt_loss, log_loss
 
 
-def compute_l2_report(param_groups):
+def compute_l2_report(param_groups, *, defer=False):
     """**只用于报告**的 c·Σ‖p‖²：恒等式 L = L_policy + L_value + c‖θ‖² 的第三项。
+
+    ``defer=True`` ⇒ **不做设备→主机读回**，返回 ``(wds, sqs_device_tensor)``，
+    由调用方在**真正要打日志时**调 :func:`l2_report_resolve` 读回。
+
+    为什么需要 defer（2026-10-18）：本函数在训练循环里**每个 micro-batch 都跑**
+    （不在 `if _do_stdout or _do_swanlab:` 门控里），而读回是一次**强制 D2H 同步**
+    —— 位置还卡在 forward 之后 / backward 之前，等于每步把 CUDA 队列排空一次，
+    CPU 无法提前发射 backward。改成 defer 后：设备侧求和照旧每步做（只是 154 MB
+    流量，约 0.1 ms，**不**同步），**读回**移到日志打点处（每 log 步一次）。
+
+    值**逐位不变**：设备张量在 step 之前就固化了（`p.detach().pow(2).sum()`
+    产生的是新张量，不随 AdamW 的原地更新而变），读回时机不影响它对应的是
+    「同一个 θ」。
 
     P4.5b 用户裁决（2026-09-27）：总损失按 `L = L_policy + L_value + c‖θ‖²`
     报告，c 通常取 1e-4。**c 不是新参数** —— 它就是 `--weight-decay`（默认
@@ -3035,6 +3048,10 @@ def compute_l2_report(param_groups):
     **不做任何跨进程归约**（`_read_log_scalars` 直接 `.item()`，stdout 由
     rank0 的 logger 过滤、swanlab 只在 is_main 建），本项跟随同一口径：本地
     计算、本地 `.item()`、无 collective、无同步点。
+
+    `defer=True` 时**没有**任何主机侧读回（也就没有同步点）；主机侧的 fp64
+    乘加由 :func:`l2_report_resolve` 在打点处完成 —— 精度与原来完全一致
+    （见下面「一次读回，但加法留到主机侧的 fp64」那段）。
 
     代价（ 分清「参数字节」与「实际流量」，两者差 ~3×）：`p.detach().pow(2).sum()`
     是「逐元素 kernel + 归约 kernel」两段，流量是 **读 θ + 写 θ² + 读 θ²**
@@ -3076,6 +3093,9 @@ def compute_l2_report(param_groups):
     if not _sqs:
         return 0.0
 
+    if not _sqs:
+        return ([], None) if defer else 0.0
+
     # **一次**读回，但加法留到主机侧的 fp64：
     #   `torch.stack(_sqs).tolist()` 是**一发 D2H**（2 个标量），之后所有乘加都在
     #   Python float（fp64）里做。
@@ -3089,7 +3109,29 @@ def compute_l2_report(param_groups):
     #   匹配 `item`/`_local_scalar_dense`，而 stacked 读回落在这两者之外），所以那条
     #   测试现在断言的是「≤ 1 次代理可见同步」，真实的「恰好一次 D2H」由
     #   `tests/test_no_aicpu_ops_in_startup_check.py` 用结构检查钉住。
-    _vals = torch.stack(_sqs).tolist()
+    _stacked = torch.stack(_sqs)
+    if defer:
+        # **不读回**：把设备张量交给调用方，读回推迟到打点处。
+        return _wds, _stacked
+    return l2_report_resolve((_wds, _stacked))
+
+
+def l2_report_resolve(parts):
+    """把 `compute_l2_report(..., defer=True)` 的结果读回主机并算成 python float。
+
+    **一次** D2H（`torch.stack` 出来的 2 个标量）+ 主机侧 fp64 乘加 ——
+    精度与「同步版」逐位相同（乘加顺序、量级都不变），只是**读回时机**不同。
+
+    之所以乘加必须在主机侧：`_sqs[0] + _sqs[1]` 是 fp32 加法，而组平方和量级
+    ~600 ⇒ fp32 的 ulp ≈ 6.1e-5，一次加法就引入 ~3e-5 误差，直接吃掉
+    `test_l2_report_uses_decay_group_only` 的 1.2e-6 容差（实测 got=1200.0335
+    vs want=1200.0335471477）。Python float 是 fp64，所以乘加放主机侧既不降精度、
+    还少一次设备侧舍入。
+    """
+    _wds, _sqs = parts
+    if _sqs is None:
+        return 0.0
+    _vals = _sqs.tolist()
     _total = 0.0
     for _wd, _sq in zip(_wds, _vals):
         _total += float(_sq) * _wd
@@ -4432,6 +4474,9 @@ def main():
         # 重置放在打点处，故某步的 save/eval（发生在其打点之后）计入
         # 下一个区间 —— 这与墙钟口径一致。
         _t_data = _t_comp = _t_save = _t_eval = 0.0
+        # c 段的两个子分量（V7 路径）：forward / loss。12 通道路径不填
+        # （那条路已删除），日志里显示为 0。
+        _t_fwd = _t_loss = 0.0
         _t_data_max = 0.0
         _n_timed = 0
         # ---- backward() 之后的三个区间（g/o/m）-----------------------------
@@ -4624,9 +4669,18 @@ def main():
                     #     `_read_log_scalars(log_loss, policy_loss, value_loss)`
                     #     与 12 通道路径共用。
                     with maybe_autocast(device, amp_dtype):
+                        # f/l 两段分开计时（2026-10-18）：c 段原本是
+                        # forward + loss + 设备侧 l2 求和混在一起，分不清
+                        # 「模型慢」还是「loss 慢」—— 而这决定该不该编译 loss。
+                        # 计时语句**插在 with 块内部**（不拆 with），是为了
+                        # 不动任何按 AST 取语句形状的测试。
+                        _t_fwd0 = time.perf_counter()
                         out = model(state, gl)
+                        _t_fwd += time.perf_counter() - _t_fwd0
+                        _t_loss0 = time.perf_counter()
                         _v7_res = _v7_lossf(out, v7_loss_labels(
                             lbl, move_t, action_size=_v7_action_size))
+                        _t_loss += time.perf_counter() - _t_loss0
                     # **不要**用 `sum(_v7_res['terms'])`：那是**未乘系数**的逐项
                     # 值。`weighted` 才是真正被优化的量（系数乘两次是
                     # `test_katago_v7_loss.py::test_coefficients_are_applied
@@ -4641,8 +4695,13 @@ def main():
                     # 加权后恒 0，`sum(weighted)` 恰好 = policy_loss + value_loss
                     # ⇒ 恒等式在 V7 上**仍然精确成立**。
                     value_loss = _w['value'] + _w['futurepos']
-                    l2_report = compute_l2_report(optimizer.param_groups)
-                    log_loss = opt_loss + l2_report
+                    # l2 报告项：**只做设备侧求和，不读回**（defer=True）。
+                    # 读回（一次 D2H 同步）推迟到日志打点处 —— 以前每个
+                    # micro-batch 一次同步，位置还卡在 forward 之后 / backward
+                    # 之前，等于每步把 CUDA 队列排空一次。值逐位不变（设备
+                    # 张量在 step 前已固化，AdamW 的原地更新动不了它）。
+                    _l2_parts = compute_l2_report(optimizer.param_groups,
+                                                  defer=True)
                     # **不要**在这里 `float(x)`：那是每项一次 D2H 同步 —— 13 项
                     #   × 每个 micro-batch，全部是为打点服务的纯浪费（两个消费点
                     #   `_v7_terms_swanlab` / `[step N v7]` 都只在 `--log-every`
@@ -4996,6 +5055,12 @@ def main():
                 # backward 的 opt_loss —— 日志的 `loss` 键按用户裁决报
                 # L_policy + L_value + c‖θ‖²，与优化器实际最小化的量差一个
                 # 纯报告项（见 compute_l2_report docstring 的 §3.1 说明）。
+                #
+                # V7 路径：log_loss 在**这里**现算（l2 的读回也在这里，一次 D2H）。
+                # 12 通道路径（已删除、仅存于 `compose_losses` 的契约里）：log_loss
+                # 已在它自己的分支里算好，直接用。
+                if _v7_on:
+                    log_loss = opt_loss + l2_report_resolve(_l2_parts)
                 _lv, _pv, _vv = _read_log_scalars(log_loss, policy_loss, value_loss)
                 lr = optimizer.param_groups[0]['lr']
                 # 内存只打 reserved —— **刻意不**在这里加 allocated / peak。
@@ -5025,6 +5090,10 @@ def main():
                 _no = max(1, _n_opt)
                 _dms = _t_data * 1000.0 / _nd
                 _cms = _t_comp * 1000.0 / _nd
+                # c 段的两个子分量（V7 路径）：f = forward，l = loss。
+                # 二者之和 ≤ c（c 还含设备侧 l2 求和等零头）。
+                _fms = _t_fwd * 1000.0 / _nd
+                _lms = _t_loss * 1000.0 / _nd
                 _sms = _t_save * 1000.0 / _nd
                 _ems = _t_eval * 1000.0 / _nd
                 _gms = _t_clip * 1000.0 / _no
@@ -5047,6 +5116,7 @@ def main():
                 _t_data = _t_comp = _t_save = _t_eval = 0.0
                 _t_clip = _t_opt = 0.0
                 _t_g1 = _t_g2 = _t_g3 = 0.0
+                _t_fwd = _t_loss = 0.0
                 _t_data_max = 0.0
                 _n_timed = 0
                 _n_opt = 0
@@ -5057,14 +5127,14 @@ def main():
                             "scale=%.0f mem=%.2fGB "
                             "spd=%.0f spd_inst=%.0f s/s "
                             "elapsed=%.0fs skip=%d | "
-                            "d=%.0f c=%.0f g=%.0f "
+                            "d=%.0f c=%.0f (f=%.0f l=%.0f) g=%.0f "
                             "g1=%.0f g2=%.0f g3=%.0f "
                             "o=%.0f s=%.0f e=%.0f "
                             "u=%.0f dmax=%.0f ms",
                             step, total_steps, _lv, _pv, _vv,
                             lr, _scale, mem,
                             speed, spd_inst, _now - t0, _n_skipped,
-                            _dms, _cms, _gms,
+                            _dms, _cms, _fms, _lms, _gms,
                             _g1ms, _g2ms, _g3ms,
                             _oms, _sms, _ems, _ums,
                             _dmax)

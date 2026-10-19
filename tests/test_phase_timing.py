@@ -152,9 +152,10 @@ def test_all_four_accumulators_initialised():
         assert name in SRC, f'缺少计时累加器 {name}'
     assert re.search(
         r'_t_data = _t_comp = _t_save = _t_eval = 0\.0\s*\n'
+        r'(?:\s*#.*\n)*\s*_t_fwd = _t_loss = 0\.0\s*\n'
         r'\s*_t_data_max = 0\.0\s*\n\s*_n_timed = 0',
         SRC,
-    ), '循环入口未初始化四个累加器'
+    ), '循环入口未初始化四个累加器（及 c 段的 f/l 子分量）'
 
 
 def test_every_segment_is_measured():
@@ -190,13 +191,14 @@ def test_accumulators_reset_together_at_logging():
         f'打点块内应有且仅有一处累加器重置，实得 {len(chains)} 处'
     reset = chains[0]
     j = metrics.body.index(reset)
-    # 「齐全」= 紧跟其后必须依次是 g/o 那组、g1/g2/g3、_t_data_max、_n_timed、_n_opt。
-    # 2026-10-07 加 g/o 后重置点从 3 行变 5 行，再拆 g1/g2/g3 变 6 行；这里按
-    # **语句**判定而非正则，注释与空行不会插进来，也不会因「有人多加了一个计时器」
-    # 而静默放行。
+    # 「齐全」= 紧跟其后必须依次是 g/o 那组、g1/g2/g3、c 段的 f/l、_t_data_max、
+    # _n_timed、_n_opt。2026-10-07 加 g/o 后重置点从 3 行变 5 行，再拆 g1/g2/g3
+    # 变 6 行，2026-10-18 再加 f/l 变 7 行；这里按**语句**判定而非正则，注释与
+    # 空行不会插进来，也不会因「有人多加了一个计时器」而静默放行。
     _expect_after = [
         (['_t_clip', '_t_opt'], '0.0'),
         (['_t_g1', '_t_g2', '_t_g3'], '0.0'),
+        (['_t_fwd', '_t_loss'], '0.0'),
         (['_t_data_max'], '0.0'),
         (['_n_timed'], '0'),
         (['_n_opt'], '0'),
@@ -257,8 +259,9 @@ def test_segments_logged_and_uploaded():
     # 墙钟 12.0 s/step 而 c 只有 2.29 s，那 81% 正是靠这一行才第一次可见。
     # 同日再把 `g` 拆成 g1/g2/g3（13.09 s/step 里 g 独占 79.9%，但分不清是
     # clip 有病还是队列 drain）。格式串在源码里被拆成多行字面量，故分段断言。
-    assert re.search(r'd=%.0f c=%.0f g=%.0f ', SRC), \
-        '日志行缺少 d/c/g 字段'
+    # 2026-10-18：c 段再拆出 f=（forward）/ l=（loss）两个子分量。
+    assert re.search(r'd=%.0f c=%.0f \(f=%.0f l=%.0f\) g=%.0f ', SRC), \
+        '日志行缺少 d/c/f/l/g 字段'
     assert re.search(r'g1=%.0f g2=%.0f g3=%.0f', SRC), \
         '日志行缺少 g 的三段拆分（g1/g2/g3）'
     assert re.search(r'o=%.0f s=%.0f e=%.0f', SRC), \

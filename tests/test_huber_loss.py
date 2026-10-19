@@ -1306,6 +1306,56 @@ def test_l2_report_uses_decay_group_only():
         f'末尾一次读回），实得 {counter.n} 次 —— 退化成逐组读回了？')
     assert again == got, '同步点改造把返回值改了（必须逐位相同）'
 
+    # (6) defer=True：**不读回**、**不产生任何 host 同步**，且解出来的值与
+    #     同步版**逐位相同**（2026-10-18）。
+    #     动机：本函数在训练循环里**每个 micro-batch 都跑**，而读回是一次强制
+    #     D2H 同步（位置卡在 forward 之后 / backward 之前）⇒ 每步排空一次
+    #     CUDA 队列。defer 把读回推迟到日志打点处，值不变。
+    with _count_host_syncs() as counter:
+        parts = t.compute_l2_report(groups4, defer=True)
+    assert counter.n == 0, (
+        f'defer=True 必须**零** host 同步（读回推迟到打点处），实得 {counter.n} 次')
+    wds_d, sqs_d = parts
+    assert isinstance(sqs_d, torch.Tensor), \
+        f'defer=True 必须返回设备张量，实得 {type(sqs_d)}'
+    resolved = t.l2_report_resolve(parts)
+    assert isinstance(resolved, float), \
+        f'l2_report_resolve 必须返回 python float，实得 {type(resolved)}'
+    assert resolved == got, (
+        f'defer 版解出来的值与同步版不一致：{resolved} vs {got} '
+        f'（乘加必须在主机侧 fp64 做，见 l2_report_resolve 的 docstring）')
+    # 设备张量必须**与参数断开**（否则 L2 项会进计算图，见上面 (4)）
+    assert not sqs_d.requires_grad, 'defer 返回的张量不能带图'
+
+    # (7) 读回次数：**设备无关**地钉住「defer=True 一次读回都不做」。
+    #     为什么不能只靠上面的 `_count_host_syncs`：它在 CPU 上**看不见**
+    #     `torch.stack(...).tolist()`（纯内存读、不派发 aten 算子）⇒ 在 CPU 上
+    #     「同步版」也会报 0 次，看起来两条路径一样。而**在 CUDA 上那一次
+    #     `.tolist()` 就是真正的 D2H 拷贝**（强制排空设备流水线）—— 正是 ① 要
+    #     去掉的东西。这里直接给 `Tensor.tolist` 打桩计数，数「读回动作」本身。
+    def _count_reads(fn):
+        n = {'k': 0}
+        orig = torch.Tensor.tolist
+
+        def patched(self, *a, **k):
+            n['k'] += 1
+            return orig(self, *a, **k)
+        torch.Tensor.tolist = patched
+        try:
+            ret = fn()
+        finally:
+            torch.Tensor.tolist = orig
+        return n['k'], ret
+
+    n_sync, _ = _count_reads(lambda: t.compute_l2_report(groups4))
+    n_defer, _ = _count_reads(lambda: t.compute_l2_report(groups4, defer=True))
+    n_resolve, _ = _count_reads(lambda: t.l2_report_resolve(parts))
+    assert n_sync >= 1, '同步版至少要读回一次（否则 defer 的对比无意义）'
+    assert n_defer == 0, (
+        f'defer=True 必须**零**读回（CUDA 上每次读回都是一次强制 D2H 同步，'
+        f'位置还卡在 forward 之后 / backward 之前），实得 {n_defer} 次')
+    assert n_resolve >= 1, 'resolve 必须读回一次（否则拿不到主机侧的 fp64 值）'
+
 
 def test_l2_report_scales_with_weight_decay():
     """c 就是 `--weight-decay`，没有被硬编码成别的常数（§4.3 / D1）。
