@@ -3,14 +3,15 @@
 # from run.txt's segment C.
 #
 # Uses whichever `python` is on PATH, so activate the right env first:
-#   torch 2.10.0+cu128 + flash-attn 2.8.3 (python3.11) is the one where
-#   flash-attn and torch.compile coexist. /opt/conda (python3.10 + torch 2.1.2
-#   + flash-attn 2.3.3) makes Dynamo graph-break on FlashAttnFunc.apply.
+#   torch 2.10.0+cu128 (python3.11) is the current cloud env. The attention
+#   kernel is torch's built-in SDPA (no flash-attn library needed).
+#
+# --gradient-accumulation-steps 1 (2026-10-18): accum=8 is retired, same as A/B.
 #
 # No --games-npz: the label is already in the row.
 # No --soft-index: each stdata row carries policy_player_prob /
 #   policy_opp_prob, which is the soft label once normalized.
-# Batch and LR match A and B on purpose: 256x8 (effective 2048, LR 0.00322).
+# Batch and LR match A and B on purpose: 256x1 (effective 256, LR 0.00322).
 #   The 384x4 config measured mem=37.96GB of 40GB on 2026-10-11, and it would
 #   break the "one effective batch across A->B->C" chain.
 #
@@ -26,7 +27,7 @@ exec python scripts/train_sft.py \
   --model models/b_v7_a100.pth \
   --policy-loss soft_ce --soft-weight 1.0 \
   --batch-size 256 --epochs 1 --lr 0.00322 --weight-decay 0.0001 \
-  --gradient-accumulation-steps 8 --use-amp 1 --attention-dropout 0 \
+  --gradient-accumulation-steps 1 --use-amp 1 --attention-dropout 0 \
   --prefetch-workers 24 --prefetch-depth 8 \
   --log-every 50 --eval-every 500 --save-every 20 \
   --early-stop 1 --early-stop-patience 3 \

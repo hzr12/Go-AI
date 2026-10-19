@@ -26,11 +26,13 @@ sys.path.insert(0, ROOT)
 
 
 def _list_shell_scripts():
-    """列出仓库内可用的 shell 脚本（相对仓库根的路径）。"""
-    d = os.path.join(ROOT, 'shell')
-    if not os.path.isdir(d):
-        return []
-    return sorted('shell/' + f for f in os.listdir(d) if f.endswith('.sh'))
+    """列出仓库内可用的 shell 脚本（相对仓库根的路径）。
+
+    2026-10-18：旧的 `shell/` 目录（12 通道时代的 train_sft_a100_1card.sh）已删除，
+    A/B/C 三段改由仓库根的 run.sh / run_b.sh / run_c.sh 承担 ⇒ 这里列根目录。
+    """
+    return sorted(f for f in os.listdir(ROOT)
+                  if f.startswith('run') and f.endswith('.sh'))
 
 
 def run_sh(argv=None):
@@ -59,7 +61,7 @@ def run_sh(argv=None):
             for a in avail:
                 print("   ", a)
         else:
-            print("[run] shell/ 目录下暂无 .sh 脚本")
+            print("[run] 仓库根目录下暂无 .sh 脚本")
         sys.exit(1)
 
     bash = shutil.which('bash') or shutil.which('sh')

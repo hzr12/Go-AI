@@ -176,41 +176,42 @@ python -c "import numpy as np; z=np.load('data/stdata/stdata_v7_s0.npz',allow_pi
 #   读 37.6GB 分片的静默加载期（无日志），不是挂死。
 
 # --- A 段：board 级 full.npz（人类着法 one-hot），单卡 A100 40G ---
-# 🔴 **2026-10-11 换结构后，本段 micro/accum 必须实测确认**（不是微调，是重新定档）。
-#   主干从 C256/M128/11 块 换成官方 `tf2-b10c384`（C384/M192/10 块，总参 10,579,753），
-#   参数量 1.90×、块内激活约 1.5× ⇒ **256×8 大概率仍装得下，但会从 25.40GB 贴近上限
-#   （粗估 ~35-38GB/40GB）**。装不下就退 micro（256→192 或 →128），accum 相应调，
-#   ⚠ 一旦有效 batch 不是 2048，LR 必须按下面公式重算，**别沿用 0.00322**。
-#   在实测确认前，下面的 256×8 / 0.00322 属于**沿用旧档、未验证**。
+# ✅ **2026-10-18 实跑定档：micro 256 × accum 1（有效 256）**。A/B/C 三段统一。
+#   这不是微调，是**换定档**：accum 8 → 1 后每个 optimizer step 都是真 step，
+#   换来三件事（都已在实跑日志里验证）：
+#     ① torch.compile 能用 `reduce-overhead`（CUDA Graphs）——accum>1 与 cudagraph
+#        在 torch 2.10 上真互斥（`cudagraph_mark_step_begin` 挡不住），accum=1 解开；
+#     ② grad-norm 的 D2H 同步从「每 8 micro-batch 一次」降到「每 step 一次」；
+#     ③ step 数 ×8（A 段 16,397 → 131,169），LR 余弦铺得更细。
+#   ⚠ **代价（已知且接受）：有效 batch 从 2048 降到 256** ⇒ 梯度噪声 8× ⇒
+#     最终棋力会低于 accum=8 那套。这是为了"每步都更新 + 吃 CUDA Graphs"付的价。
+#     要回退只需把 `--gradient-accumulation-steps` 改回 8（LR 保持 0.00322 不变）。
+#   ✅ **peak LR 仍是 0.00322**（不是按 √ 规则缩到 0.00114）——这是实跑反推出来的：
+#     A 段日志 `[step 3925/131169] lr=1.19e-03`、B 段 `[step 975/4405] lr=3.08e-03`，
+#     两者都用 train_sft.py 的真实调度器（LinearLR 0.1→1.0 前 10% + 之后 cosine）
+#     反解，peak 都精确落在 0.00322（1.1892e-3 / 3.0775e-3）。loss 按比例正常下降。
+#     ⇒ **有效 batch 缩小到 256 时 LR 不缩**，已由实跑验证；下文那条 √ 公式
+#       只适用于"换 micro 且保持 accum=1"的场景。
 #
 # ⚠ **batch 用「micro × accum」表达**（有效 batch = micro × 卡数 × accum）。
-#   上一版定档（C256 时代实测）：**micro 256 × accum 8 = 有效 2048**。
-#   曾因显存把它改成 384×4（2026-10-11），实测结果：
-#     `mem=37.96GB / 40GB`、`spd_inst=3169`、每步墙钟 485 ms（c=368/d=29/g=66/u=19）。
-#     速度与 256×8（3077 s/s，每步 665 ms）**几乎无差异**，但显存只剩 2GB，
-#     且把有效 batch 从 2048 降到 1536。⇒ 退回。
-#   ⚠ 下面这些是旧实测（当时训练还带梯度重算），仅供归因：
-#     micro 512 × accum 4 ≈ 1400 s/s；micro 1024 × accum 2 同有效却更慢（~1000+ s/s）；
-#     micro 2048 × accum 1 暴跌到 ~550 s/s（悬崖）。
-#   要加有效 batch 就加 accum（micro 别过 1024）。
+#   当前档：**micro 256 × accum 1 = 有效 256**（三段统一）。
+#   ⚠ 下面这些是 **accum=8 时代**的旧实测（当时还带梯度重算），**全部作废**，
+#     仅供归因，**不要拿来推当前档**：
+#     micro 256 × accum 8 = 有效 2048；micro 384 × accum 4（mem=37.96GB/40GB、
+#     spd_inst=3169）；micro 512 × accum 4 ≈ 1400 s/s；micro 1024 × accum 2 同有效
+#     却更慢（~1000+ s/s）；micro 2048 × accum 1 暴跌到 ~550 s/s（悬崖）。
+#   ⇒ 2026-10-13 梯度检查点整体删除、2026-10-11 主干不再有重算路径 ⇒ 上述吞吐
+#     数字测的是"有重算"的世界。**要加有效 batch 就加 accum**（micro 别过 1024）。
 #   仓库里 `v7_batch_memory_advice` 的每样本 MB（4.65/12.67/277）是 910A/NPU 口径、
-#   对 A100 不可信，只当量级参考。**定档后把下面 B/C 的 `--batch-size` /
-#   `--gradient-accumulation-steps` 与 LR 一起改掉**（LR 必须跟着有效 batch 走）。
+#   对 A100 不可信，只当量级参考。
 # ⚠ LR = 0.00356 × √(有效batch / 2500)，有效batch = batch × 卡数 × accum。
-#   单卡 ⇒ 卡数 = 1。**当前档 256×8 = 有效 2048 → 0.00322**（三段统一）；
-#   有效 1536（384×4）→ 0.00279；2800 → 0.00377；1400 → 0.00266；5600 → 0.00533。
-#   **换了有效 batch 一定要按公式重算 LR**，别沿用旧值。
-#
-# 🔴🔴 **上面那组 s/s 数字全部作废，需要重测**（2026-10-13 梯度检查点已整体删除，
-#   2026-10-11 起主干不再有任何重算路径）
-#   旧数字测的是「有重算」的世界 ⇒ 同样的 micro 可能直接 OOM，或必须降 micro /
-#   加 accum 才能跑。这直接影响上面「512×4 是甜点、1024×2 更慢、2048×1 是悬崖」
-#   这三条结论 —— 它们测的是**吞吐**，而吞吐又依赖能不能装下。
-#   ⇒ **重测方法**：对每个候选 micro×accum 组合先看 `mem=` 是否贴顶/是否 OOM，
-#     再看 spd；两档都记。别只看 spd 就下结论（装不下的组合 spd 没意义）。
-#   ⇒ `v7_batch_memory_advice` 是「激活全驻留」口径的估算，可先拿它筛掉明显
+#   单卡 ⇒ 卡数 = 1。参考值：有效 2048 → 0.00322；1536 → 0.00279；2800 → 0.00377；
+#   1400 → 0.00266；5600 → 0.00533。
+#   ⚠ **这条公式用于"改 micro"时重算 LR；不用于"改 accum"** —— 改 accum 只改
+#     有效 batch，**当前档实测表明 LR 不动**（见上面 A/B 段日志反推）。
+#   ⇒ 改 micro 时先看 `mem=` 是否贴顶/是否 OOM，再看 spd；两档都记。
+#     `v7_batch_memory_advice` 是「激活全驻留」口径的估算，可先拿它筛掉明显
 #     装不下的组合，但它的每样本 MB 常数仍来自 910A，当量级参考、不能当判据。
-#   ⇒ 在此重测完成前，A/B/C 三段的 micro/accum 属于**未经当前主干验证**的配置。
 # ⚠ `--compile-mode` 2026-10-11 本机实测结论（Ampere+）：
 #   - 脚本默认已从 `max-autotune-no-cudagraphs` 改成 **`reduce-overhead`**（L4004）：
 #     原默认档在本机曾报 `CUDA error: misaligned address`——疑似刚启用的
@@ -228,7 +229,7 @@ python scripts/train_sft.py \
   --data data/sgf_19x19_full.npz --v7 1 --device cuda --board-size 19 \
   --games-npz data/labels/games.npz \
   --batch-size 256 --epochs 1 --lr 0.00322 --weight-decay 0.0001 \
-  --gradient-accumulation-steps 8 --use-amp 1 --attention-dropout 0 \
+  --gradient-accumulation-steps 1 --use-amp 1 --attention-dropout 0 \
   --prefetch-workers 24 --prefetch-depth 8 \
   --log-every 25 --eval-every 500 --save-every 1674 \
   --early-stop 1 --early-stop-patience 3 \
@@ -247,16 +248,17 @@ python scripts/train_sft.py \
 
 # --- B 段：+ KataGo 软标签（承接 A 段，单卡 A100）---
 # ⚠ `--policy-loss soft_ce` 不写也行：给了 --soft-index 会自动选中。
-# 🔴 `--epochs 30` 不是笔误：--soft-only-sampling 把训练集从 3426 万行收窄到
-#   225,399 行（实测启动日志）。单卡 micro 256（accum 8，有效 2048）约 881
-#   微步/epoch = **111 优化步/epoch**。epochs=1 ⇒ cosine 在 step ~100 就退火到 0
-#   （2026-10-06 实测：policy 纹丝不动）。**30 epochs × 111 = 3330 优化步**，
-#   与真机启动日志的 `总 steps≈3330` 逐字一致。
-#   🔴 **micro/accum 一改，这里的 epochs 必须重算**：目标总优化步 ≈ 3300。
+# 🔴 `--epochs 5` 不是笔误：--soft-only-sampling 把训练集从 3426 万行收窄到
+#   225,399 行（实测启动日志）。单卡 micro 256（**accum 1**）= 881
+#   微步/epoch = **881 优化步/epoch**。epochs=1 ⇒ cosine 在 step ~880 就退火到 0
+#   （2026-10-06 实测：policy 纹丝不动）。**5 epochs × 881 = 4405 优化步**，
+#   与 2026-10-18 实跑日志的 `总 steps=4405` 逐字一致。
+# 🔴 **micro/accum 一改，这里的 epochs 必须重算**：目标总优化步 ≈ 4405。
 #   算式（与代码逐字对应，已用日志校验）：微步/epoch = ceil(行数/micro)，
-#   优化步/epoch = ceil(微步/accum)，总步 = epochs × 优化步。对照 256×8 那次实测：
-#   ceil(225399/256)=881 微步 → 111 优化步 → ×30 = 3330，与启动日志的
-#   `micro-batches/epoch=881 optimizer-steps/epoch=111 总 steps=3330` 逐字一致。
+#   优化步/epoch = ceil(微步/accum)，总步 = epochs × 优化步。对照 accum=1 那次实测：
+#   ceil(225399/256)=881 微步 → 881 优化步 → ×5 = 4405，与启动日志的
+#   `micro-batches/epoch=881 optimizer-steps/epoch=881 总 steps=4405` 逐字一致。
+#   （accum=8 时代是 ×30 = 3330 步 —— 那是**另一个档**，不要混用。）
 # ⚠ `--eval-max-batches 5`：eval 特征已池化（多 worker），但跑满仍要数分钟；
 #   5 批对 top1/kl 的估计精度足够。
 # 🔴 soft_index.npz **必须对当前数据集/标签构建**（行数变了行号全体平移——
@@ -273,8 +275,8 @@ python scripts/train_sft.py \
   --model models/a_v7_a100.pth.latest \
   --soft-index data/labels/soft_index.npz --soft-only-sampling 1 \
   --soft-weight 1.0 --soft-every 1 --policy-loss soft_ce \
-  --batch-size 256 --epochs 30 --lr 0.00322 --weight-decay 0.0001 \
-  --gradient-accumulation-steps 8 --use-amp 1 --attention-dropout 0 \
+  --batch-size 256 --epochs 5 --lr 0.00322 --weight-decay 0.0001 \
+  --gradient-accumulation-steps 1 --use-amp 1 --attention-dropout 0 \
   --prefetch-workers 24 --prefetch-depth 8 \
   --log-every 25 --eval-every 100 --eval-max-batches 5 --save-every 20 \
   --early-stop 1 --early-stop-patience 3 \
@@ -283,16 +285,16 @@ python scripts/train_sft.py \
 # --- C 段：stdata 分片（搜索分布内建），单卡 A100 ---
 # ⚠ C 段**不要** `--games-npz`（贴目已在行里）、也**不需要** `--soft-index`
 #   （stdata 每行自带 policy_player_prob/policy_opp_prob，归一化即软标签）。
-# ⚠ batch 与 LR 同 A 段：**256×8（有效 2048，LR 0.00322）**，三段统一。
+# ⚠ batch 与 LR 同 A 段：**256×1（有效 256，LR 0.00322）**，三段统一。
 #   ⚠ 2026-10-11 实测：384×4 跑到 `mem=37.96GB / 40GB`（仅剩 2GB）。退回主要为了长跑的
 #   显存余量；每样本速度几乎无差异（256×8=3077 s/s vs 384×4=3169 s/s），
-#   但 256×8 **把有效 batch 拿回 2048**，与已训完的 B 段一致 ⇒ A→B→C 整条链不再中途换 batch。
+#   但 256×1 **把有效 batch 拿回 256**，与已训完的 B 段一致 ⇒ A→B→C 整条链不再中途换 batch。
 python scripts/train_sft.py \
   --data data/stdata --v7 1 --device cuda --board-size 19 \
   --model models/b_v7_a100.pth \
   --policy-loss soft_ce --soft-weight 1.0 \
   --batch-size 256 --epochs 1 --lr 0.00322 --weight-decay 0.0001 \
-  --gradient-accumulation-steps 8 --use-amp 1 --attention-dropout 0 \
+  --gradient-accumulation-steps 1 --use-amp 1 --attention-dropout 0 \
   --prefetch-workers 24 --prefetch-depth 8 \
   --log-every 50 --eval-every 500 --save-every 20 \
   --early-stop 1 --early-stop-patience 3 \

@@ -635,10 +635,12 @@ def test_value_loss_weight_default_is_one_no_compensation():
         f'--help 仍在把 5.0 说成默认值: {entry}'
     assert '1.0' in entry, f'--help 未写明默认值 1.0: {entry}'
 
-    # run.txt / shell/** 不是本任务的文件：只扫描、不修改。若哪天有人往里
+    # run.txt / run*.sh 不是本任务的文件：只扫描、不修改。若哪天有人往里
     # 加了显式的 --value-loss-weight，这个断言会红 —— 那正是需要复核的信号。
-    for rel in (['run.txt'] + [os.path.join('shell', f) for f in
-                               sorted(os.listdir(os.path.join(ROOT, 'shell')))]):
+    # （旧的 shell/ 目录已于 2026-10-18 删除，脚本改由仓库根的 run*.sh 承担。）
+    _sh_files = [f for f in sorted(os.listdir(ROOT))
+                 if f.startswith('run') and f.endswith('.sh')]
+    for rel in (['run.txt'] + _sh_files):
         path = os.path.join(ROOT, rel)
         if not os.path.isfile(path):
             continue
