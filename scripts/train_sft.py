@@ -2374,7 +2374,12 @@ class _SafeguardedSwanlab:
         self._q.put((d, step))
 
     def finish(self):
-        # 收尾：排空队列（带超时防死锁），再 finish 真正的 swanlab。
+        # 收尾三步（顺序要紧）：
+        #   ① 排空队列（带超时防死锁）—— 真模块的 log 由**主线程**做，
+        #      不让后台线程与主线程同时调 swanlab（SDK 未必线程安全）。
+        #   ② 塞 None 叫停后台线程并 join（有界超时）—— 不然它会在
+        #      finish() 之后又调一次 log，报一堆无谓的 warning。
+        #   ③ finish 真模块。
         import queue
         try:
             while True:
@@ -2386,6 +2391,11 @@ class _SafeguardedSwanlab:
                 except Exception:  # noqa: BLE001
                     pass
         except queue.Empty:
+            pass
+        self._q.put(None)
+        try:
+            self._worker.join(timeout=5.0)
+        except Exception:  # noqa: BLE001
             pass
         try:
             self._mod.finish()
