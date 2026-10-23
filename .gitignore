@@ -42,6 +42,10 @@ wandb/
 .idea/
 *.swp
 
+# C++ 扩展构建产物（平台相关，不进版本库）
+*.so
+*.pyd
+
 # 工具缓存（CodeGraph 的 SQLite 索引，本机 19.6 MB，随代码自动重建）
 # ⚠ 必须锚定：裸 `.codegraph` 会匹配任意层级
 /.codegraph/

@@ -2,6 +2,7 @@ torch>=1.9.0
 numpy>=1.19.0
 pytest>=6.0.0
 torchao>=0.1.0         # 可选，GPU weight-only INT4 量化
+pybind11>=2.10         # C++ 空间特征扩展（首次 import 自动编译）
 
 # ---- 可选依赖 ----
 # 实验跟踪
