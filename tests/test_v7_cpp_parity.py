@@ -45,8 +45,9 @@ def test_parity_all_channels(n_rows):
                             prev_board=prev_board, prev_prev_board=prev_prev_board)
 
     assert out_cpp.shape == out_py.shape == (B, 22, 19, 19)
-    # C++ returns float32, Python returns float16 — compare as float32
-    assert out_cpp.dtype == np.float32
+    # Both should be float16 now
+    assert out_cpp.dtype == np.float16
+    assert out_py.dtype == np.float16
 
     diff = np.abs(out_cpp.astype(np.float32) - out_py.astype(np.float32))
     max_diff = diff.max()

@@ -103,7 +103,7 @@ static void copy_area_to_float(py::array_t<float>& out,
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
-py::array_t<float> spatial_spatial(
+py::object spatial_spatial(
     py::array_t<int> boards,
     py::array_t<int> to_play,
     py::array_t<int> ko,
@@ -152,7 +152,11 @@ py::array_t<float> spatial_spatial(
 
     // ch7, ch8, ch20, ch21 remain zero
 
-    return out;
+    // Convert to float16 to match SPATIAL_DTYPE via numpy
+    py::module_ np = py::module_::import("numpy");
+    py::object out_obj = py::reinterpret_borrow<py::object>(out.ptr());
+    py::object out_f16 = out_obj.attr("astype")(np.attr("float16"));
+    return out_f16;
 }
 
 PYBIND11_MODULE(_feature_v7_cpp, m) {
