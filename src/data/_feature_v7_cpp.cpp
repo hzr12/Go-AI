@@ -576,15 +576,17 @@ static bool search_ladder(LBoard& bd, int loc, bool defender_first,
             stack_idx--;
             continue;
         }
-        
+
         int move = buf[move_start[stack_idx] + move_cur[stack_idx]];
         int8_t p = is_defender ? pla : opp;
-        
+
         if (!bd.is_legal(move, p)) {
-            move_cur[stack_idx]++;
+            // Illegal move treated as "failure" for current side (matching Python)
+            return_value = is_defender;
+            from_deeper = false;
             continue;
         }
-        
+
         saved_colors.push_back(std::vector<int8_t>(bd.colors, bd.colors + N));
         saved_ko.push_back(bd.ko_loc);
         saved_chains.push_back(bd.chains);
@@ -808,40 +810,44 @@ py::object spatial_spatial(
             if (locs[ch] >= 0 && locs[ch] < N)
                 ot(b, 9+ch, locs[ch]/19, locs[ch]%19) = 1.0f;
         
-        // Delegate ladder channels (ch14-17) and area (ch18-19) to Python for correctness.
-        // The C++ DFS implementation has subtle ordering dependencies that are hard to
-        // match bit-for-bit with Python. Python's scipy-based liberty counting is also
-        // used for ch3-5 below.
-        py::object fv = py::module_::import("src.data.feature_v7");
-        
-        py::array_t<float> lib = fv.attr("liberties_123")(boards).cast<py::array_t<float>>();
-        auto ol = lib.unchecked<4>();
+        // ch3/4/5: liberties (C++ implementation)
         for (int i = 0; i < N; ++i) {
-            ot(b, 3, i/19, i%19) = ol(b, 0, i/19, i%19) > 0.5f ? 1.0f : 0.0f;
-            ot(b, 4, i/19, i%19) = ol(b, 1, i/19, i%19) > 0.5f ? 1.0f : 0.0f;
-            ot(b, 5, i/19, i%19) = ol(b, 2, i/19, i%19) > 0.5f ? 1.0f : 0.0f;
+            int libs = bd.num_liberties(i);
+            ot(b, 3, i/19, i%19) = (libs == 1) ? 1.0f : 0.0f;
+            ot(b, 4, i/19, i%19) = (libs == 2) ? 1.0f : 0.0f;
+            ot(b, 5, i/19, i%19) = (libs == 3) ? 1.0f : 0.0f;
         }
-        
-        py::array_t<float> lc = fv.attr("ladder_channels")(
-            boards, to_play, prev_board, prev_prev_board, ko
-        ).cast<py::array_t<float>>();
-        auto olc = lc.unchecked<4>();
+
+        // ch14/15/16/17: ladders (C++ implementation)
+        std::vector<bool> lad_vec(N, false);
+        std::vector<bool> wrk_vec(N, false);
+        int8_t cur_opp = (to_play.unchecked<1>()(b) < 0) ? WHITE : BLACK;
+        std::vector<int> orig_libs(N, 0);
+        for (int ii = 0; ii < N; ++ii)
+            if (bd.colors[ii] != EMPTY) orig_libs[ii] = bd.num_liberties(ii);
+
+        auto ladder_cb = [&](int loc, const std::vector<int>& wm) {
+            int cid = bd.chain_of[loc];
+            for (int s : bd.chains[cid]) lad_vec[s] = true;
+            if (bd.colors[loc] == cur_opp && orig_libs[loc] > 1)
+                for (int m : wm) wrk_vec[m] = true;
+        };
+        iter_ladders(bd, cur_opp, ladder_cb);
         for (int i = 0; i < N; ++i) {
-            ot(b, 14, i/19, i%19) = olc(b, 0, i/19, i%19);
-            ot(b, 17, i/19, i%19) = olc(b, 3, i/19, i%19);
-            // ch15 = prev board ladder (or copy of ch14 if no history)
-            ot(b, 15, i/19, i%19) = olc(b, 1, i/19, i%19);
-            // ch16 = prev-prev board ladder (or copy of ch15 if no history)
-            ot(b, 16, i/19, i%19) = olc(b, 2, i/19, i%19);
+            ot(b, 14, i/19, i%19) = lad_vec[i] ? 1.0f : 0.0f;
+            ot(b, 17, i/19, i%19) = wrk_vec[i] ? 1.0f : 0.0f;
+            ot(b, 15, i/19, i%19) = lad_vec[i] ? 1.0f : 0.0f;
+            ot(b, 16, i/19, i%19) = lad_vec[i] ? 1.0f : 0.0f;
         }
-        
-        py::array_t<int> area = fv.attr("calculate_area")(boards, to_play, rules_flags).cast<py::array_t<int>>();
-        // calculate_area returns (B, 2, n, n) — access via Python then copy
-        auto area_arr = area.cast<py::array_t<int>>();
-        auto oa = area_arr.unchecked<4>();
+
+        // ch18/19: area (C++ Benson implementation, TAX_NONE)
+        int8_t area[N];
+        compute_area_tax_none(raw, area);
+        int8_t pla = (to_play.unchecked<1>()(b) > 0) ? BLACK : WHITE;
+        int8_t opp_color = (pla == BLACK) ? WHITE : BLACK;
         for (int i = 0; i < N; ++i) {
-            ot(b, 18, i/19, i%19) = (oa(b, 0, i/19, i%19) > 0) ? 1.0f : 0.0f;
-            ot(b, 19, i/19, i%19) = (oa(b, 1, i/19, i%19) > 0) ? 1.0f : 0.0f;
+            ot(b, 18, i/19, i%19) = (area[i] == pla) ? 1.0f : 0.0f;
+            ot(b, 19, i/19, i%19) = (area[i] == opp_color) ? 1.0f : 0.0f;
         }
     }
     
