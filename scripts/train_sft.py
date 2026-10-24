@@ -5293,7 +5293,8 @@ def main():
                         # opt_loss 才是被 backward 的量（不含 L2 —— 正则走 AdamW 的
                         # 解耦衰减，按构造不在梯度里）。三条一起看才能判断「在降」
                         # 是模型在学还是正则项在缩。
-                        "l2_report": float(l2_report),
+                        "l2_report": float(l2_report_resolve(_l2_parts)
+                                           if _v7_on else l2_report),
                         "opt_loss": float(opt_loss.detach()),
                         "lr": lr,
                     "memory_gb": mem,
