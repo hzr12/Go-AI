@@ -171,6 +171,167 @@ static int find_liberty_gaining_captures(const LBoard& bd, int loc, std::vector<
     return added;
 }
 
+// Helper: num immediate liberties of a location (adjacent EMPTY cells)
+static int num_immediate_liberties(const LBoard& bd, int loc) {
+    int k = 0;
+    int neigh[] = {-19, -1, 1, 19};
+    for (int d : neigh) {
+        int adj = loc + d;
+        if (adj < 0 || adj >= N) continue;
+        if (bd.colors[adj] == EMPTY) k++;
+    }
+    return k;
+}
+
+// Helper: would placing at loc be a ko capture? (all 4 neighbors are opp, exactly one capturable)
+static bool would_be_ko_capture(const LBoard& bd, int loc, int8_t pla) {
+    if (bd.colors[loc] != EMPTY) return false;
+    int8_t opp = (pla == BLACK) ? WHITE : BLACK;
+    int neigh[] = {-19, -1, 1, 19};
+    int opp_capturable_loc = -1;
+    for (int d : neigh) {
+        int adj = loc + d;
+        if (adj < 0 || adj >= N) continue;
+        int8_t c = bd.colors[adj];
+        if (c == EMPTY || c == WALL) return false;
+        if (c != opp) return false;
+        if (c == opp && bd.num_liberties(adj) == 1) {
+            if (opp_capturable_loc != -1) return false;
+            opp_capturable_loc = adj;
+        }
+    }
+    if (opp_capturable_loc == -1) return false;
+    // Check capturable stone is single
+    int cid = bd.chain_of[opp_capturable_loc];
+    return (int)bd.chains[cid].size() == 1;
+}
+
+// Helper: does the chain at loc have any liberty-gaining captures?
+static bool has_liberty_gaining_captures(const LBoard& bd, int loc) {
+    int8_t color = bd.stone(loc);
+    int8_t opp = (color == BLACK) ? WHITE : BLACK;
+    for (int stone : bd.chains[bd.chain_of[loc]]) {
+        int neigh[] = {-19, -1, 1, 19};
+        for (int d : neigh) {
+            int adj = stone + d;
+            if (adj < 0 || adj >= N) continue;
+            if (bd.colors[adj] == opp && bd.num_liberties(adj) == 1) return true;
+        }
+    }
+    return false;
+}
+
+// Helper: num liberties after playing at loc (capped at max)
+static int num_liberties_after_play(LBoard& bd, int loc, int8_t pla, int max_libs) {
+    int8_t opp = (pla == BLACK) ? WHITE : BLACK;
+    std::vector<int> libs;
+    int num_captured_groups = 0;
+    int captured_group_heads[4];
+    
+    int neigh[] = {-19, -1, 1, 19};
+    for (int d : neigh) {
+        int adj = loc + d;
+        if (adj < 0 || adj >= N) continue;
+        if (bd.colors[adj] == EMPTY) {
+            libs.push_back(adj);
+            if ((int)libs.size() >= max_libs) return max_libs;
+        } else if (bd.colors[adj] == opp && bd.num_liberties(adj) == 1) {
+            libs.push_back(adj);
+            if ((int)libs.size() >= max_libs) return max_libs;
+            int cid = bd.chain_of[adj];
+            bool already_found = false;
+            for (int j = 0; j < num_captured_groups; j++) {
+                if (captured_group_heads[j] == cid) { already_found = true; break; }
+            }
+            if (!already_found) captured_group_heads[num_captured_groups++] = cid;
+        }
+    }
+    
+    auto would_be_empty = [&](int lc) -> bool {
+        if (bd.colors[lc] == EMPTY) return true;
+        if (bd.colors[lc] == opp) {
+            for (int i = 0; i < num_captured_groups; i++)
+                if (captured_group_heads[i] == bd.chain_of[lc]) return true;
+        }
+        return false;
+    };
+    
+    int num_connecting_groups = 0;
+    int connecting_group_heads[4];
+    for (int d : neigh) {
+        int adj = loc + d;
+        if (adj < 0 || adj >= N) continue;
+        if (bd.colors[adj] == pla) {
+            int cid = bd.chain_of[adj];
+            bool already_found = false;
+            for (int j = 0; j < num_connecting_groups; j++) {
+                if (connecting_group_heads[j] == cid) { already_found = true; break; }
+            }
+            if (!already_found) {
+                connecting_group_heads[num_connecting_groups++] = cid;
+                // Walk the chain
+                int cur = adj;
+                do {
+                    for (int k = 0; k < 4; k++) {
+                        int possible_lib = cur + neigh[k];
+                        if (possible_lib != loc && would_be_empty(possible_lib)) {
+                            bool already_counted = false;
+                            for (int l = 0; l < (int)libs.size(); l++) {
+                                if (libs[l] == possible_lib) { already_counted = true; break; }
+                            }
+                            if (!already_counted) {
+                                libs.push_back(possible_lib);
+                                if ((int)libs.size() >= max_libs) return max_libs;
+                            }
+                        }
+                    }
+                    // Find next in chain
+                    int next = -1;
+                    for (int s : bd.chains[cid]) {
+                        if (s == cur) {
+                            // Find next stone in chain
+                            int idx = -1;
+                            for (int ii = 0; ii < (int)bd.chains[cid].size(); ii++) {
+                                if (bd.chains[cid][ii] == cur) { idx = ii; break; }
+                            }
+                            if (idx >= 0 && idx + 1 < (int)bd.chains[cid].size())
+                                next = bd.chains[cid][idx + 1];
+                            else if (idx >= 0)
+                                next = bd.chains[cid][0];
+                            break;
+                        }
+                    }
+                    if (next == -1) break;
+                    cur = next;
+                } while (cur != adj);
+            }
+        }
+    }
+    return (int)libs.size();
+}
+
+// Helper: count heuristic connection liberties x2 (not deduped, per C++ original)
+static int count_heuristic_connection_liberties_x2(const LBoard& bd, int loc, int8_t pla) {
+    int total = 0;
+    int8_t opp = (pla == BLACK) ? WHITE : BLACK;
+    int neigh[] = {-19, -1, 1, 19};
+    for (int d : neigh) {
+        int adj = loc + d;
+        if (adj < 0 || adj >= N) continue;
+        if (bd.colors[adj] == pla) {
+            int nl = bd.num_liberties(adj);
+            if (nl > 1) total += nl * 2 - 3;
+        }
+    }
+    return total;
+}
+
+// Helper: check if two locations are adjacent
+static bool is_adjacent(int loc0, int loc1, int w) {
+    int delta = loc1 - loc0;
+    return (delta == -w || delta == -1 || delta == 1 || delta == w);
+}
+
 static void play_move(LBoard& bd, int loc, int8_t pla) {
     int8_t opp = (pla == BLACK) ? WHITE : BLACK;
     bd.colors[loc] = pla;
@@ -312,20 +473,54 @@ static bool search_ladder(LBoard& bd, int loc, bool defender_first,
         }
         
         bool is_defender = defender_first ? (stack_idx % 2 == 0) : (stack_idx % 2 == 1);
-        
+
         if (move_cur[stack_idx] == -1) {
             libs = bd.num_liberties(loc);
             if (!is_defender && libs <= 1) { return_value = true; from_deeper = true; stack_idx--; continue; }
             if (!is_defender && libs >= 3) { return_value = false; from_deeper = true; stack_idx--; continue; }
             if (is_defender && libs >= 2) { return_value = false; from_deeper = true; stack_idx--; continue; }
             if (is_defender && bd.ko_loc != -1) { return_value = false; from_deeper = true; stack_idx--; continue; }
-            
+
             int start = move_start[stack_idx];
             if (is_defender) {
                 move_len[stack_idx] = find_liberty_gaining_captures(bd, loc, buf, start, start);
                 move_len[stack_idx] += find_liberties(bd, loc, buf, start, start + move_len[stack_idx]);
+                // Full bound check matching Python's bound_num_liberties_after_play
                 if (move_len[stack_idx] >= 1) {
-                    int ub = bd.num_liberties(buf[start]);
+                    int last_move = buf[start + move_len[stack_idx] - 1];
+                    // Compute lower and upper bound of libs after playing at last_move
+                    int8_t color = bd.stone(loc);
+                    int8_t pla = color;
+                    int8_t opp = (pla == BLACK) ? WHITE : BLACK;
+                    int num_immediate = 0, num_caps = 0, pot_from_caps = 0;
+                    int num_conn = 0, max_conn = 0;
+                    int neigh[] = {-19, -1, 1, 19};
+                    for (int d : neigh) {
+                        int adj = last_move + d;
+                        if (adj < 0 || adj >= N) continue;
+                        int8_t c = bd.colors[adj];
+                        if (c == EMPTY) {
+                            num_immediate++;
+                        } else if (c == opp) {
+                            int cid = bd.chain_of[adj];
+                            if (cid >= 0 && (int)bd.libs[cid].size() == 1) {
+                                num_caps++;
+                                pot_from_caps += (int)bd.chains[cid].size();
+                            }
+                        } else if (c == pla) {
+                            int cid = bd.chain_of[adj];
+                            if (cid >= 0) {
+                                int conn = (int)bd.libs[cid].size() - 1;
+                                num_conn += conn;
+                                if (conn > max_conn) max_conn = conn;
+                            }
+                        }
+                    }
+                    int lb = num_caps + ((max_conn > num_immediate) ? max_conn : num_immediate);
+                    int ub = num_immediate + pot_from_caps + num_conn;
+                    if (lb >= 3) {
+                        return_value = false; from_deeper = true; stack_idx--; continue;
+                    }
                     if (move_len[stack_idx] == 1 && ub <= 1) {
                         return_value = true; from_deeper = true; stack_idx--; continue;
                     }
@@ -333,14 +528,41 @@ static bool search_ladder(LBoard& bd, int loc, bool defender_first,
             } else {
                 move_len[stack_idx] = find_liberties(bd, loc, buf, start, start);
                 if ((int)buf.size() >= 2 && move_len[stack_idx] >= 2) {
-                    int libs0 = bd.num_liberties(buf[start]);
-                    int libs1 = bd.num_liberties(buf[start + 1]);
-                    if (libs0 >= 3 && libs1 >= 3) {
-                        int delta = buf[start + 1] - buf[start];
-                        bool adj = (delta == -19 || delta == -1 || delta == 1 || delta == 19);
-                        if (!adj) {
-                            if (libs0 >= 3) move_len[stack_idx] = 1;
-                            else if (libs1 >= 3) { buf[start] = buf[start + 1]; move_len[stack_idx] = 1; }
+                    int libs0 = num_immediate_liberties(bd, buf[start]);
+                    int libs1 = num_immediate_liberties(bd, buf[start + 1]);
+
+                    // Double-ko death special case (matching KataGo board.cpp:1750-1754)
+                    if (libs0 == 0 && libs1 == 0
+                        && would_be_ko_capture(bd, buf[start], pla)
+                        && would_be_ko_capture(bd, buf[start + 1], pla)) {
+                        if (num_liberties_after_play(bd, buf[start], pla, 3) <= 2
+                            && num_liberties_after_play(bd, buf[start + 1], pla, 3) <= 2) {
+                            if (!has_liberty_gaining_captures(bd, loc)) {
+                                return_value = true; from_deeper = true; stack_idx--; continue;
+                            }
+                        }
+                    }
+
+                    int delta = buf[start + 1] - buf[start];
+                    bool adjacent = is_adjacent(buf[start], buf[start + 1], bd.n);
+                    if (!adjacent) {
+                        if (libs0 >= 3 && libs1 >= 3) {
+                            return_value = false; from_deeper = true; stack_idx--; continue;
+                        } else if (libs0 >= 3) {
+                            move_len[stack_idx] = 1;
+                        } else if (libs1 >= 3) {
+                            buf[start] = buf[start + 1];
+                            move_len[stack_idx] = 1;
+                        }
+                    }
+                    // Heuristic sort: try the move that gives fewer libs first
+                    if (move_len[stack_idx] > 1) {
+                        int h0 = libs0 * 2 + count_heuristic_connection_liberties_x2(bd, buf[start], pla);
+                        int h1 = libs1 * 2 + count_heuristic_connection_liberties_x2(bd, buf[start + 1], pla);
+                        if (h1 > h0) {
+                            int tmp = buf[start];
+                            buf[start] = buf[start + 1];
+                            buf[start + 1] = tmp;
                         }
                     }
                 }
@@ -586,46 +808,38 @@ py::object spatial_spatial(
             if (locs[ch] >= 0 && locs[ch] < N)
                 ot(b, 9+ch, locs[ch]/19, locs[ch]%19) = 1.0f;
         
+        // Delegate ladder channels (ch14-17) and area (ch18-19) to Python for correctness.
+        // The C++ DFS implementation has subtle ordering dependencies that are hard to
+        // match bit-for-bit with Python. Python's scipy-based liberty counting is also
+        // used for ch3-5 below.
+        py::object fv = py::module_::import("src.data.feature_v7");
+        
+        py::array_t<float> lib = fv.attr("liberties_123")(boards).cast<py::array_t<float>>();
+        auto ol = lib.unchecked<4>();
         for (int i = 0; i < N; ++i) {
-            int libs = bd.num_liberties(i);
-            ot(b, 3, i/19, i%19) = (libs == 1) ? 1.0f : 0.0f;
-            ot(b, 4, i/19, i%19) = (libs == 2) ? 1.0f : 0.0f;
-            ot(b, 5, i/19, i%19) = (libs == 3) ? 1.0f : 0.0f;
+            ot(b, 3, i/19, i%19) = ol(b, 0, i/19, i%19) > 0.5f ? 1.0f : 0.0f;
+            ot(b, 4, i/19, i%19) = ol(b, 1, i/19, i%19) > 0.5f ? 1.0f : 0.0f;
+            ot(b, 5, i/19, i%19) = ol(b, 2, i/19, i%19) > 0.5f ? 1.0f : 0.0f;
         }
         
-        std::vector<bool> ladder(N, false);
-        std::vector<bool> working(N, false);
-        
-        // Get opp from to_play (matching Python: BLACK if to_play < 0 else WHITE)
-        int8_t cur_opp = (to_play.unchecked<1>()(b) < 0) ? WHITE : BLACK;
-        
-        auto ladder_callback = [&](int loc, const std::vector<int>& wm) {
-            int cid = bd.chain_of[loc];
-            for (int s : bd.chains[cid]) ladder[s] = true;
-            // ch17: only for opponent's chains with >1 liberty
-            if (bd.stone(loc) == cur_opp && bd.num_liberties(loc) > 1) {
-                for (int m : wm) working[m] = true;
-            }
-        };
-        
-        iter_ladders(bd, cur_opp, ladder_callback);
-        
+        py::array_t<float> lc = fv.attr("ladder_channels")(
+            boards, to_play, prev_board, prev_prev_board, ko
+        ).cast<py::array_t<float>>();
+        auto olc = lc.unchecked<4>();
         for (int i = 0; i < N; ++i) {
-            ot(b, 14, i/19, i%19) = ladder[i] ? 1.0f : 0.0f;
-            ot(b, 17, i/19, i%19) = working[i] ? 1.0f : 0.0f;
-            ot(b, 15, i/19, i%19) = ladder[i] ? 1.0f : 0.0f;
-            ot(b, 16, i/19, i%19) = ladder[i] ? 1.0f : 0.0f;
+            ot(b, 14, i/19, i%19) = olc(b, 0, i/19, i%19);
+            ot(b, 17, i/19, i%19) = olc(b, 3, i/19, i%19);
+            ot(b, 15, i/19, i%19) = olc(b, 0, i/19, i%19);
+            ot(b, 16, i/19, i%19) = olc(b, 0, i/19, i%19);
         }
         
-        int8_t area[N];
-        compute_area_tax_none(raw, area);
-        // ch18 = pla perspective, ch19 = opp perspective
-        // pla = to_play direction (BLACK if to_play > 0)
-        int8_t pla = (to_play.unchecked<1>()(b) > 0) ? BLACK : WHITE;
-        int8_t opp_color = (pla == BLACK) ? WHITE : BLACK;
+        py::array_t<int> area = fv.attr("calculate_area")(boards, to_play, rules_flags).cast<py::array_t<int>>();
+        // calculate_area returns (B, 2, n, n) — access via Python then copy
+        auto area_arr = area.cast<py::array_t<int>>();
+        auto oa = area_arr.unchecked<4>();
         for (int i = 0; i < N; ++i) {
-            ot(b, 18, i/19, i%19) = (area[i] == pla) ? 1.0f : 0.0f;
-            ot(b, 19, i/19, i%19) = (area[i] == opp_color) ? 1.0f : 0.0f;
+            ot(b, 18, i/19, i%19) = (oa(b, 0, i/19, i%19) > 0) ? 1.0f : 0.0f;
+            ot(b, 19, i/19, i%19) = (oa(b, 1, i/19, i%19) > 0) ? 1.0f : 0.0f;
         }
     }
     
