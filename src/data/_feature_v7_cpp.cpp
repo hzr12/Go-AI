@@ -840,14 +840,14 @@ py::object spatial_spatial(
             ot(b, 16, i/19, i%19) = lad_vec[i] ? 1.0f : 0.0f;
         }
 
-        // ch18/19: area (C++ Benson implementation, TAX_NONE)
-        int8_t area[N];
-        compute_area_tax_none(raw, area);
-        int8_t pla = (to_play.unchecked<1>()(b) > 0) ? BLACK : WHITE;
-        int8_t opp_color = (pla == BLACK) ? WHITE : BLACK;
+        // ch18/19: area — delegate to Python (full Benson is complex, see feature_v7.py::_area_for_pla)
+        py::object fv = py::module_::import("src.data.feature_v7");
+        py::array_t<int> area = fv.attr("calculate_area")(boards, to_play, rules_flags).cast<py::array_t<int>>();
+        auto area_arr = area.cast<py::array_t<int>>();
+        auto oa = area_arr.unchecked<4>();
         for (int i = 0; i < N; ++i) {
-            ot(b, 18, i/19, i%19) = (area[i] == pla) ? 1.0f : 0.0f;
-            ot(b, 19, i/19, i%19) = (area[i] == opp_color) ? 1.0f : 0.0f;
+            ot(b, 18, i/19, i%19) = (oa(b, 0, i/19, i%19) > 0) ? 1.0f : 0.0f;
+            ot(b, 19, i/19, i%19) = (oa(b, 1, i/19, i%19) > 0) ? 1.0f : 0.0f;
         }
     }
     
