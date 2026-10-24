@@ -829,8 +829,10 @@ py::object spatial_spatial(
         for (int i = 0; i < N; ++i) {
             ot(b, 14, i/19, i%19) = olc(b, 0, i/19, i%19);
             ot(b, 17, i/19, i%19) = olc(b, 3, i/19, i%19);
-            ot(b, 15, i/19, i%19) = olc(b, 0, i/19, i%19);
-            ot(b, 16, i/19, i%19) = olc(b, 0, i/19, i%19);
+            // ch15 = prev board ladder (or copy of ch14 if no history)
+            ot(b, 15, i/19, i%19) = olc(b, 1, i/19, i%19);
+            // ch16 = prev-prev board ladder (or copy of ch15 if no history)
+            ot(b, 16, i/19, i%19) = olc(b, 2, i/19, i%19);
         }
         
         py::array_t<int> area = fv.attr("calculate_area")(boards, to_play, rules_flags).cast<py::array_t<int>>();
