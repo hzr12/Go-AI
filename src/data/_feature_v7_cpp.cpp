@@ -165,8 +165,4 @@ PYBIND11_MODULE(_feature_v7_cpp, m) {
           py::arg("prev_board"), py::arg("prev_prev_board"),
           py::arg("prev_valid"), py::arg("prev_prev_valid"),
           py::arg("rules_flags") = 0);
-
-    // Fix pytest cleanup: empty capsule has no destructor, avoids GIL crash
-    py::module_ sys = py::module_::import("atexit");
-    sys.attr("register")(py::cpp_function([]() {}));
 }

@@ -72,3 +72,7 @@ else:
     # Fallback: import from feature_v7.py
     from src.data.feature_v7 import spatial_channels_v7  # noqa: E402, F401
 
+# Fix pytest cleanup: register empty atexit to avoid GIL crash on interpreter shutdown
+import atexit
+atexit.register(lambda: None)
+
